@@ -1,0 +1,35 @@
+{
+  "script_version_id": "wk1-relationship-v1-20260702rev",
+  "phase_type": "关系建立",
+  "event_line": "关系建立环节",
+  "source": "第一周训练内容 20260702 修订版.docx（不判分/不计分）",
+  "robot_name_config_key": "robot_name",
+  "zodiac_closed_list": ["鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"],
+  "slots": {
+    "称呼": {"source": "profile.preferred_appellation", "fallback": "老人家"},
+    "老人所说的属相": {"extract": "zodiac_closed_list", "inject_hotword": true, "fallback_line": "好的，谢谢您告诉我。"},
+    "老人所说的兴趣": {"extract": "open_phrase", "fallback_line": "好的，谢谢您告诉我。"},
+    "老人所说的活动": {"extract": "open_phrase", "fallback_line": "好的，谢谢您告诉我。"},
+    "老人所说的地点": {"extract": "open_phrase", "fallback_line": "好的，谢谢您告诉我。"},
+    "老人所说的物品": {"extract": "open_phrase", "fallback_line": "好的，谢谢您告诉我。"}
+  },
+  "silence_seconds": 10,
+  "generic_fallback_line": "没关系，那我们聊点别的吧。",
+  "sections": [
+    {"key": "认识机器人", "speaker": "研究者", "note": "当面话术，不进 TTS；分层同意/开场白见修订版脚本"},
+    {"key": "自我介绍", "speaker": "机器人", "questions": [
+      {"slot_field": "preferred_appellation", "ask": "请问您叫什么名字呀？", "success": "好的，认识您真开心。"},
+      {"slot_field": "age", "ask": "请问您今年多大年纪啦？", "success": "好的，谢谢您告诉我。"},
+      {"slot_field": "zodiac", "ask": "您属什么呀？比如属鼠、属牛、属虎。", "success": "好的，属【老人所说的属相】啊，谢谢您告诉我。"},
+      {"slot_field": "interests", "ask": "您平时喜欢做些什么呢？比如听听戏、看看电视，或者出去走走。", "success": "您喜欢【老人所说的兴趣】呀，挺好的，谢谢您告诉我。"},
+      {"slot_field": "daily_activities", "ask": "您在这里平时一天会做些什么呢？", "success": "您平时会【老人所说的活动】呀，挺好的，谢谢您告诉我。"}
+    ]},
+    {"key": "介绍机构环境", "speaker": "机器人", "questions": [
+      {"slot_field": "familiar_places", "ask": "您平时在这里最常去什么地方呢？"},
+      {"slot_field": "familiar_people", "ask": "这里有没有您熟悉的朋友、同伴或者工作人员呢？"},
+      {"slot_field": "common_objects", "ask": "您看看这桌子上，每天都会用到哪些东西呢？", "note": "研究者提前摆水杯/毛巾/梳子；关系建立周允许研究者代说物品名（正式训练周则属违规介入）"},
+      {"slot_field": "daily_activities", "ask": "您在这里平时喜欢参加什么活动呢？"}
+    ]},
+    {"key": "道别", "speaker": "机器人", "line": "今天和您聊得很开心，谢谢您陪我聊天。您好好休息，咱们下次接着聊，好吗？再见。"}
+  ]
+}

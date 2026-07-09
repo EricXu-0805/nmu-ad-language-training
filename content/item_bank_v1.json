@@ -1,0 +1,699 @@
+{
+ "item_bank_version_id": "wk2-v1-20260707",
+ "source": "第二周训练内容.docx（逐字抽取；第2–8周据会议决策重复同一批题，绑本版本号）",
+ "note": "本文件由解析器从源脚本抽取，供内容组核对补全（acceptable_expressions/image_id/难度/探针集标识等）。raw_source 见 _wk2parsed.json；上线前须双人校对并冻结版本。",
+ "errata_fixed": [
+  {
+   "item": "斧子+树",
+   "field": "right_word",
+   "source_value": "衬衫",
+   "corrected_to": "树",
+   "note": "源右词提示话术疑复制粘贴错误，按标题校正；原文见 raw_source"
+  }
+ ],
+ "single_element": [
+  {
+   "item_id": "SE_胡萝卜",
+   "task_type": "单要素",
+   "target_word": "胡萝卜",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "蔬菜”“萝卜"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种生活中很常见的蔬菜，通常可以吃它的根，形状有点像圆锥形或圆柱形，常见颜色有橘红色、黄色或紫红色。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的白萝卜，而是常见的橘红色萝卜，根是肉质的，形状长长的，常用来炒菜、炖汤，也可以生吃。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个蔬菜叫胡萝卜。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:胡萝卜"
+  },
+  {
+   "item_id": "SE_熨斗",
+   "task_type": "单要素",
+   "target_word": "熨斗",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "烙铁"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种生活中常见的金属器具，形状有点像斗，主要用来把衣服烫平。旧式的中间可以烧木炭，新式的一般是用电发热。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的电器，而是一种专门用来烫平衣服的金属器具，形状像斗，插电加热后可以把衣服上的褶皱压平。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫熨斗。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:熨斗"
+  },
+  {
+   "item_id": "SE_锚",
+   "task_type": "单要素",
+   "target_word": "锚",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "剑",
+    "弓箭",
+    "标志"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种船停泊时会用到的器具，通常是铁制的，一端有两个或两个以上带倒钩的爪儿，另一端用铁链连在船上。停船时，会把它抛到水底或岸边，用来稳定船舶。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的钩子，而是船停泊时用来稳定船舶的铁制器具，一端有倒钩，另一端连着铁链。船停下时会把它抛到水底或岸边。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫锚。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:锚"
+  },
+  {
+   "item_id": "SE_树",
+   "task_type": "单要素",
+   "target_word": "树",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "植物"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种生活中很常见的木本植物，通常有干、枝和叶，可以长在路边、公园或山上。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的小草，而是一种木本植物，通常有干、枝和叶。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫树。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:树"
+  },
+  {
+   "item_id": "SE_狐狸",
+   "task_type": "单要素",
+   "target_word": "狐狸",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "动物",
+    "狼",
+    "狗"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种哺乳动物，外形有点像狼，面部比较长，耳朵通常是三角形的，尾巴比较长，毛色常见的是赤黄色。生性狡猾多疑，昼伏夜出。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是狼，也不是狗，而是一种面部较长、耳朵呈三角形、尾巴很长的动物，毛通常是赤黄色的。生性狡猾多疑，昼伏夜出。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫狐狸。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:狐狸"
+  },
+  {
+   "item_id": "SE_针",
+   "task_type": "单要素",
+   "target_word": "针",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "缝衣服的",
+    "尖尖的",
+    "筷子"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种缝衣物用的工具，通常细长而小，多用金属制成，一头比较尖锐，另一头有孔或钩，可以用来引线。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是线，而是缝衣物用的小工具，细长而小，一头尖锐，一头有孔或钩，可以引线。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫针。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:针"
+  },
+  {
+   "item_id": "SE_船",
+   "task_type": "单要素",
+   "target_word": "船",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "汽艇",
+    "快艇"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种水上的主要运输工具，可以在河里、湖里或海上行驶，用来载人或运东西。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是陆地上的车，而是在水上行驶的主要运输工具，可以载人，也可以运东西。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫船。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:船"
+  },
+  {
+   "item_id": "SE_纽扣",
+   "task_type": "单要素",
+   "target_word": "纽扣",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "扣",
+    "衣服”或“圆球"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种生活中常见的小物件，常常在衣服上，可以把衣服扣起来。它可能是小小的球状物，也可能是片状物。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是拉链，而是衣服上用来扣住的小物件，可以是球状的，也可以是片状的。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫纽扣。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:纽扣"
+  },
+  {
+   "item_id": "SE_烟灰缸",
+   "task_type": "单要素",
+   "target_word": "烟灰缸",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "烟"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种生活中常见的小器皿，通常放在桌子上，可以用来盛烟灰、烟蒂。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的杯子或盘子，而是抽烟时用来盛烟灰、放烟蒂的小器皿。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫烟灰缸。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:烟灰缸"
+  },
+  {
+   "item_id": "SE_鸡",
+   "task_type": "单要素",
+   "target_word": "鸡",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "动物",
+    "家禽",
+    "鸟"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种常见的家禽，品种很多。它的嘴比较短，上嘴稍微弯曲，头部通常有红色的肉冠，翅膀比较短，一般不能高飞。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是鸭，也不是鹅，而是一种常见家禽，头上有红色肉冠，翅膀短，通常不能高飞。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫鸡。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:鸡"
+  },
+  {
+   "item_id": "SE_蜜蜂",
+   "task_type": "单要素",
+   "target_word": "蜜蜂",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "动物”“昆虫"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种昆虫，体表有很密的绒毛，翅膀前面的比后面的要大。它们常常成群居住，工蜂会采花粉、酿蜜，还能帮助植物传粉。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的小虫子，而是一种会飞、会采花粉、能酿蜜的昆虫，常常成群居住，有些还能蜇人。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫蜜蜂。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:蜜蜂"
+  },
+  {
+   "item_id": "SE_螺丝钉",
+   "task_type": "单要素",
+   "target_word": "螺丝钉",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "钉子",
+    "工具"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种常见的金属零件，形状像圆柱形或圆锥形的小杆，表面带有一圈一圈的螺纹，一端通常有帽。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的钉子，而是一种带螺纹的金属零件，一端有帽，可以拧进去固定东西。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫螺丝钉。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:螺丝钉"
+  },
+  {
+   "item_id": "SE_斧子",
+   "task_type": "单要素",
+   "target_word": "斧子",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "工具"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种常见的金属工具，主要用来砍竹子、木头等。它的头部呈楔形，通常装有木柄。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的刀，也不是锤子，而是一种用来砍竹子、木头的金属工具，头呈楔形，装有木柄。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫斧子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:斧子"
+  },
+  {
+   "item_id": "SE_花",
+   "task_type": "单要素",
+   "target_word": "花",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "植物"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": null
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是叶子，也不是普通的小草，而是植物上有瓣、颜色多样、有的很艳丽并带有香味的部分。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫花。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:花"
+  },
+  {
+   "item_id": "SE_鞋",
+   "task_type": "单要素",
+   "target_word": "鞋",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "穿脚上的",
+    "走路用的",
+    "保暖的",
+    "踩地上的"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种生活中很常见的物品，通常穿在脚上，走路的时候会着地，可以保护脚。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是袜子，而是穿在脚上、走路时会着地的东西。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫鞋。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:鞋"
+  },
+  {
+   "item_id": "SE_衬衫",
+   "task_type": "单要素",
+   "target_word": "衬衫",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "衣服",
+    "穿的",
+    "上衣"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种常见的西式单上衣，可以穿在里面，也可以单独穿在外面。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是外套，也不是T恤，而是一种可以穿在里面、也可以单穿的西式单上衣。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫衬衫。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:衬衫"
+  },
+  {
+   "item_id": "SE_螺丝刀",
+   "task_type": "单要素",
+   "target_word": "螺丝刀",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "工具",
+    "修东西的",
+    "拧螺丝的”或“把手"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种常见的工具，主要用来装上或拆下螺钉。它的尖端可能是扁平的，也可能是十字形的，适合用在钉帽上有槽纹的螺钉上。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的刀，而是专门用来装卸螺钉的工具，尖端有扁平或十字等形状，可以拧钉帽上有槽纹的螺钉。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫螺丝刀。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:螺丝刀"
+  },
+  {
+   "item_id": "SE_烟",
+   "task_type": "单要素",
+   "target_word": "烟",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "抽的",
+    "冒烟的",
+    "点火的”或“细长的"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种生活中常见的条状物，外面通常用纸包着，里面有丝和配料，是供人吸用的。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的纸卷，而是用纸包着丝和配料卷成的条状物，供人吸用。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫烟。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:烟"
+  },
+  {
+   "item_id": "SE_兔子",
+   "task_type": "单要素",
+   "target_word": "兔子",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "动物"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种哺乳动物，头部有点像鼠，耳朵很大，上唇中间分裂，尾巴短而向上翘，前肢比后肢短，善于跳跃，跑得也很快。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是老鼠，也不是猫，而是一种耳朵很大、尾巴短、善于跳跃的小动物，有家养的，也有野生的。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫兔子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:兔子"
+  },
+  {
+   "item_id": "SE_刷子",
+   "task_type": "单要素",
+   "target_word": "刷子",
+   "acceptable_expressions": [],
+   "related_but_inaccurate": [
+    "鞋刷",
+    "梳子"
+   ],
+   "initial_prompt": "请看这张图片，您能告诉我这是什么吗？",
+   "success_line": "非常不错！您的反应很快，命名非常准确。我们继续下一个。",
+   "cues": {
+    "1": {
+     "cue_type": "语义",
+     "text": "没关系，您可以再想一想。它是一种常见的用具，可以用来清除脏物，也可以用来涂抹膏油等。它通常由毛、棕、塑料丝或金属丝等制成，一般是长形或椭圆形，有的还带有柄。您觉得它叫什么？"
+    },
+    "2": {
+     "cue_type": "排除式",
+     "text": "您已经很接近了。它不是普通的扫把，而是一种由毛、棕、塑料丝或金属丝等制成的用具，可以清除脏物，也可以涂抹膏油等，一般为长形或椭圆形，有的带柄。它叫什么？"
+    }
+   },
+   "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫刷子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:刷子"
+  }
+ ],
+ "double_element": [
+  {
+   "item_id": "DE_烟灰缸+烟",
+   "task_type": "双要素",
+   "pair_title": "烟灰缸+烟",
+   "left_word": "烟",
+   "right_word": "烟灰缸",
+   "left_function_cue": "没关系，左边这是生活中常见的一种条状物，外面通常用纸包着，里面有烟丝和配料，是供人吸用的。",
+   "right_function_cue": "没关系，右边这是一件常见的桌面容器，四周通常有几个小凹槽，专门用来收集烟灰、放烟蒂。",
+   "relation_cue": "抽烟时产生的烟灰需要弹在烟灰缸里，吸完的烟头也会在里面掐灭。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:烟灰缸+烟"
+  },
+  {
+   "item_id": "DE_狐狸+鸡",
+   "task_type": "双要素",
+   "pair_title": "狐狸+鸡",
+   "left_word": "狐狸",
+   "right_word": "鸡",
+   "left_function_cue": "没关系，左边这是一种哺乳动物，外形有点像狼，面部比较长，耳朵通常是三角形的，尾巴比较长，毛色常见的是赤黄色。它常常昼伏夜出，给人的印象是比较狡猾、多疑。",
+   "right_function_cue": "没关系，右边这是一种常见的家禽，品种很多。它的嘴比较短，上嘴稍微弯曲，头部通常有红色的肉冠，翅膀比较短，一般不能高飞。",
+   "relation_cue": "在自然界中，狐狸是肉食动物，经常会去农场里抓鸡、偷鸡吃。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:狐狸+鸡"
+  },
+  {
+   "item_id": "DE_螺丝刀+螺丝钉",
+   "task_type": "双要素",
+   "pair_title": "螺丝刀+螺丝钉",
+   "left_word": "螺丝刀",
+   "right_word": "螺丝钉",
+   "left_function_cue": "没关系，左边这是一种装卸螺钉用的工具。它的尖端有扁平、十字等形状，适合用在钉帽上有槽纹的螺钉上。",
+   "right_function_cue": "没关系，右边这是一种常见的金属零件，形状像圆柱形或圆锥形的金属杆，杆上带有螺纹，一端有帽。",
+   "relation_cue": "螺丝刀是专门用来拧螺丝钉的工具，我们在修理或组装东西时，需要用螺丝刀把螺丝钉拧紧或者松开。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:螺丝刀+螺丝钉"
+  },
+  {
+   "item_id": "DE_针+纽扣",
+   "task_type": "双要素",
+   "pair_title": "针+纽扣",
+   "left_word": "针",
+   "right_word": "纽扣",
+   "left_function_cue": "没关系，左边这是生活中常见的一种家用小工具。它非常细小，一头很尖，另一头有个小孔用来穿线，平时缝补衣服常常会用到它。",
+   "right_function_cue": "没关系，右边这是衣服上常见的小物件，可以把衣服等扣起来。它通常比较小，可以是球状的，也可以是片状的。",
+   "relation_cue": "衣服上的纽扣掉了或者需要固定时，我们需要用针穿着线，把纽扣缝在衣服上。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:针+纽扣"
+  },
+  {
+   "item_id": "DE_兔子+胡萝卜",
+   "task_type": "双要素",
+   "pair_title": "兔子+胡萝卜",
+   "left_word": "兔子",
+   "right_word": "胡萝卜",
+   "left_function_cue": "没关系，左边这是一种哺乳动物，头部有点像鼠，耳朵很大，上唇中间分裂，尾巴短而向上翘，前肢比后肢短，善于跳跃，跑得也很快。",
+   "right_function_cue": "没关系，右边这是一种常见蔬菜。它的根通常是肉质的，形状多为圆锥形或圆柱形，颜色有紫红、橘红、黄色等多种，可以作为食物。",
+   "relation_cue": "兔子喜欢吃胡萝卜。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:兔子+胡萝卜"
+  },
+  {
+   "item_id": "DE_船+锚",
+   "task_type": "双要素",
+   "pair_title": "船+锚",
+   "left_word": "船",
+   "right_word": "锚",
+   "left_function_cue": "没关系，左边这是一种水上的主要运输工具，可以在江河湖海上行驶，用来载人或运输物品。",
+   "right_function_cue": "没关系，右边这是船停泊时所用的器具，通常用铁制成。一端有两个或两个以上带倒钩的爪儿，另一端用铁链连在船上。停船时，会把带倒钩的一端抛到水底或岸边，用来稳定船舶。",
+   "relation_cue": "锚是船上用来停泊固定的重要工具。当船需要停留在水面上不被冲走时，就需要把锚抛入水中。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:船+锚"
+  },
+  {
+   "item_id": "DE_刷子+鞋",
+   "task_type": "双要素",
+   "pair_title": "刷子+鞋",
+   "left_word": "刷子",
+   "right_word": "鞋",
+   "left_function_cue": "没关系，左边这是一种常见的用具，通常用毛、棕、塑料丝或金属丝等制成，可以用来清除脏物，也可以用来涂抹膏油等。它一般是长形或椭圆形，有的还带有柄。",
+   "right_function_cue": "没关系，右边这是生活中常见的物品，通常穿在脚上，走路的时候会着地，可以保护我们的脚。",
+   "relation_cue": "刷子是可以用来清除脏物的用具，鞋是穿在脚上、走路时着地的东西。鞋子脏了以后，可以用刷子把鞋面或鞋底上的脏东西刷干净。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:刷子+鞋"
+  },
+  {
+   "item_id": "DE_蜜蜂+花",
+   "task_type": "双要素",
+   "pair_title": "蜜蜂+花",
+   "left_word": "蜜蜂",
+   "right_word": "花",
+   "left_function_cue": "没关系，左边这是一种昆虫，体表有很密的绒毛，前翅比后翅大。它们常常成群居住，工蜂能采花粉、酿蜜，还能帮助某些植物传粉，有些蜜蜂还有毒刺，能蜇人。",
+   "right_function_cue": "没关系，右边这是种子植物的有性繁殖器官，通常由花瓣、花萼、花托、花蕊组成，有各种颜色，有的很艳丽，也有香味。",
+   "relation_cue": "蜜蜂最喜欢停在花朵上，它们从花朵里采集花蜜来做蜂蜜，同时也能帮助花儿传授花粉。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:蜜蜂+花"
+  },
+  {
+   "item_id": "DE_熨斗+衬衫",
+   "task_type": "双要素",
+   "pair_title": "熨斗+衬衫",
+   "left_word": "熨斗",
+   "right_word": "衬衫",
+   "left_function_cue": "没关系，左边这是一种用来烫平衣物的金属器具，形状像斗。旧式熨斗中间可以烧木炭，新式熨斗一般用电发热。",
+   "right_function_cue": "没关系，右边这是一种西式单上衣，可以穿在里面，也可以单独穿在外面。",
+   "relation_cue": "当衬衫洗完变皱了之后，我们需要用加热后的熨斗在衬衫上推移，把上面的皱褶烫平整。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:熨斗+衬衫"
+  },
+  {
+   "item_id": "DE_斧子+树",
+   "task_type": "双要素",
+   "pair_title": "斧子+树",
+   "left_word": "斧子",
+   "right_word": "树",
+   "left_function_cue": "没关系，左边这是一种砍竹子、木头等用的金属工具，头部呈楔形，通常装有木柄。",
+   "right_function_cue": "没关系，右边这是一种木本植物，是自然界中很常见的植物类型，通常有树干、树枝和树叶。",
+   "relation_cue": "斧子是专门用来砍伐树木的工具。人们经常挥动斧子把大树砍倒，用来劈柴或者获取木材。",
+   "image_id": null,
+   "item_set_type": "训练集",
+   "difficulty_level": null,
+   "raw_source_ref": "week2:斧子+树"
+  }
+ ]
+}

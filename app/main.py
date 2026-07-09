@@ -1,0 +1,426 @@
+"""FastAPI 应用骨架——把阶段0 地基接成可运行服务。
+
+已接：健康检查 / 建档(含合规字段) / 建场次 / 题库加载+校验 / 单双多要素评分 /
+判分入口(★画像守卫在 API 边界拒绝画像键) / 音频删除闸门(DELETE 未达条件返回 409)。
+未接（下一步）：ASR/LLM(本地、可关闭)、导出通道、前端。
+"""
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel
+from sqlmodel import Session as DBSession
+
+from datetime import datetime
+
+from . import audio_gate, content, export, judging, rule_judge, runtime, scoring
+from .db import engine, get_session, init_db
+from .enums import AudioStatus
+from .models import AbnormalEvent, AudioAssetRow, ItemEvent, Patient, TurnEvent
+from .models import Session as TrainSession
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db(engine)
+    yield
+
+
+app = FastAPI(title="南医大 · AI 语言沟通训练系统", version="0.0.1", lifespan=lifespan)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "language-training-platform"}
+
+
+# ---------------- 患者 / 场次 ----------------
+@app.post("/patients", response_model=Patient)
+def create_patient(p: Patient, s: DBSession = Depends(get_session)):
+    if s.get(Patient, p.patient_id):
+        raise HTTPException(409, f"patient_id {p.patient_id} 已存在")
+    s.add(p); s.commit(); s.refresh(p)
+    return p
+
+
+@app.get("/patients/{patient_id}", response_model=Patient)
+def get_patient(patient_id: str, s: DBSession = Depends(get_session)):
+    p = s.get(Patient, patient_id)
+    if not p:
+        raise HTTPException(404, "患者不存在")
+    return p
+
+
+@app.post("/sessions", response_model=TrainSession)
+def create_session(sess: TrainSession, s: DBSession = Depends(get_session)):
+    if not s.get(Patient, sess.patient_id):
+        raise HTTPException(404, "患者不存在，先建档")
+    if not sess.item_bank_version_id:
+        raise HTTPException(422, "场次须绑题库版本号 item_bank_version_id")
+    s.add(sess); s.commit(); s.refresh(sess)
+    return sess
+
+
+# ---------------- 内容 ----------------
+@app.get("/content/item-bank")
+def get_item_bank():
+    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    v = content.validate_item_bank(bank)
+    return {
+        "version_id": bank.version_id,
+        "single_count": len(bank.single_element),
+        "double_count": len(bank.double_element),
+        "errata_fixed": bank.errata_fixed,
+        "errors": v["errors"], "warnings": v["warnings"],
+    }
+
+
+# ---------------- 评分（接纯函数）----------------
+class SingleItemIn(BaseModel):
+    item_id: str
+    final_correct: int
+    spontaneous_correct: int
+    prompt_level: int
+    duration_seconds: float | None = None
+
+
+class DoubleItemIn(BaseModel):
+    item_id: str
+    left_name: int
+    left_function: int
+    right_name: int
+    right_function: int
+    relation: float
+
+
+class MultiItemIn(BaseModel):
+    item_id: str
+    key_elements: dict
+
+
+@app.post("/score/single")
+def score_single(items: list[SingleItemIn]):
+    try:
+        return scoring.score_single_element(
+            [scoring.SingleElementItem(**i.model_dump()) for i in items])
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.post("/score/double")
+def score_double(items: list[DoubleItemIn]):
+    try:
+        return scoring.score_double_element(
+            [scoring.DoubleElementItem(**i.model_dump()) for i in items])
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.post("/score/multi")
+def score_multi(items: list[MultiItemIn]):
+    try:
+        return scoring.score_multi_element(
+            [scoring.MultiElementItem(**i.model_dump()) for i in items])
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+# ---------------- 判分入口：★画像守卫在边界 ----------------
+@app.post("/judge/build-input")
+def judge_build_input(payload: dict):
+    """构造判分输入。若载荷混入任何画像字段 → 400（画像不进判分的边界防线）。"""
+    try:
+        ji = judging.build_judge_input(**payload)
+    except judging.PortraitLeakError as e:
+        raise HTTPException(400, str(e))
+    except (ValueError, TypeError) as e:
+        raise HTTPException(422, str(e))
+    return {"resolved_text": judging.resolve_response_text(ji),
+            "judge_portrait_used": ji.judge_portrait_used}
+
+
+# ---------------- 音频删除闸门 ----------------
+def _row_to_asset(r: AudioAssetRow) -> audio_gate.AudioAsset:
+    return audio_gate.AudioAsset(raw_audio_id=r.raw_audio_id, status=r.status,
+                                 is_reliability_sample=r.is_reliability_sample, withdrawn=r.withdrawn)
+
+
+def _load_row(raw_audio_id: str, s: DBSession) -> AudioAssetRow:
+    r = s.get(AudioAssetRow, raw_audio_id)
+    if not r:
+        raise HTTPException(404, "音频不存在")
+    return r
+
+
+class AudioIn(BaseModel):
+    raw_audio_id: str
+    session_id: str | None = None
+    is_reliability_sample: bool = False
+    contains_direct_identifier: bool = False
+
+
+@app.post("/audio", response_model=AudioAssetRow)
+def create_audio(a: AudioIn, s: DBSession = Depends(get_session)):
+    if s.get(AudioAssetRow, a.raw_audio_id):
+        raise HTTPException(409, "音频已存在")
+    r = AudioAssetRow(**a.model_dump())
+    s.add(r); s.commit(); s.refresh(r)
+    return r
+
+
+def _transition(raw_audio_id: str, s: DBSession, fn) -> AudioAssetRow:
+    r = _load_row(raw_audio_id, s)
+    asset = _row_to_asset(r)
+    try:
+        fn(asset)
+    except audio_gate.AudioGateError as e:
+        raise HTTPException(409, str(e))
+    r.status = asset.status
+    s.add(r); s.commit(); s.refresh(r)
+    return r
+
+
+@app.post("/audio/{raw_audio_id}/export", response_model=AudioAssetRow)
+def audio_export(raw_audio_id: str, s: DBSession = Depends(get_session)):
+    return _transition(raw_audio_id, s, audio_gate.mark_exported)
+
+
+@app.post("/audio/{raw_audio_id}/checksum", response_model=AudioAssetRow)
+def audio_checksum(raw_audio_id: str, s: DBSession = Depends(get_session)):
+    return _transition(raw_audio_id, s, audio_gate.mark_checksum_verified)
+
+
+@app.post("/audio/{raw_audio_id}/reliability-review", response_model=AudioAssetRow)
+def audio_reliability_review(raw_audio_id: str, s: DBSession = Depends(get_session)):
+    return _transition(raw_audio_id, s, audio_gate.mark_reliability_review_done)
+
+
+@app.delete("/audio/{raw_audio_id}")
+def audio_delete(raw_audio_id: str, source: str = "auto", s: DBSession = Depends(get_session)):
+    """删除音频。未达闸门条件（导出+校验[+信度复核]）→ 409，杜绝到期盲删。"""
+    r = _load_row(raw_audio_id, s)
+    asset = _row_to_asset(r)
+    try:
+        audio_gate.request_delete(asset, source=source)
+    except audio_gate.AudioGateError as e:
+        raise HTTPException(409, str(e))
+    r.status = asset.status
+    s.add(r); s.commit()
+    return {"raw_audio_id": raw_audio_id, "status": r.status, "deleted_by": source}
+
+
+@app.get("/audio/{raw_audio_id}", response_model=AudioAssetRow)
+def audio_get(raw_audio_id: str, s: DBSession = Depends(get_session)):
+    return _load_row(raw_audio_id, s)
+
+
+# ---------------- R 会话编排 + 逐环节录音/判分/锁分 ----------------
+def _load_bank_for_session(sess: TrainSession) -> content.ItemBank:
+    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    if sess.item_bank_version_id and bank.version_id != sess.item_bank_version_id:
+        raise HTTPException(409, f"场次绑版本 {sess.item_bank_version_id} 与题库 {bank.version_id} 不符")
+    return bank
+
+
+def _find_bank_item(bank: content.ItemBank, item_id: str) -> dict | None:
+    for it in list(bank.single_element) + list(bank.double_element):
+        if it.get("item_id") == item_id:
+            return it
+    return None
+
+
+def _role_target(bank_item: dict, response_role: str) -> str | None:
+    """该环节的确定式判分目标词；作用/关系/关键要素类无确定式口径 → None（纯人工）。"""
+    return {"命名": bank_item.get("target_word"),
+            "左命名": bank_item.get("left_word"),
+            "右命名": bank_item.get("right_word")}.get(response_role)
+
+
+@app.get("/sessions/{session_id}/plan")
+def session_plan(session_id: str, week_no: int, event_line: str,
+                 max_items: int | None = None, s: DBSession = Depends(get_session)):
+    sess = s.get(TrainSession, session_id)
+    if not sess:
+        raise HTTPException(404, "场次不存在")
+    bank = _load_bank_for_session(sess)
+    plan = runtime.build_session_plan(bank, week_no, event_line, max_items)
+    return {"item_bank_version_id": plan.item_bank_version_id, "week_no": plan.week_no,
+            "event_line": plan.event_line, "total_items": len(plan.items),
+            "total_turns": plan.total_turns(),
+            "items": [{"item_id": it.item_id, "task_type": it.task_type, "image_id": it.image_id,
+                       "presentation_order": it.presentation_order, "display": it.display,
+                       "turns": [{"turn_seq": t.turn_seq, "response_role": t.response_role,
+                                  "scoring_key": t.scoring_key} for t in it.turns]}
+                      for it in plan.items]}
+
+
+class ItemIn(BaseModel):
+    item_id: str
+    task_type: str
+    item_set_type: str = "训练集"
+    image_id: str | None = None
+    difficulty_level: str | None = None
+    presentation_order: int | None = None
+
+
+@app.post("/sessions/{session_id}/items", response_model=ItemEvent)
+def create_item(session_id: str, body: ItemIn, s: DBSession = Depends(get_session)):
+    if not s.get(TrainSession, session_id):
+        raise HTTPException(404, "场次不存在")
+    ie = ItemEvent(session_id=session_id, **body.model_dump())
+    s.add(ie); s.commit(); s.refresh(ie)
+    return ie
+
+
+class TurnIn(BaseModel):
+    turn_seq: int
+    response_role: str | None = None
+    raw_audio_id: str | None = None
+    asr_text: str | None = None
+    asr_confidence: float | None = None
+    prompt_level: int | None = None
+    duration_seconds: float | None = None
+
+
+@app.post("/items/{item_event_id}/turns", response_model=TurnEvent)
+def create_turn(item_event_id: int, body: TurnIn, s: DBSession = Depends(get_session)):
+    if not s.get(ItemEvent, item_event_id):
+        raise HTTPException(404, "题目事件不存在")
+    te = TurnEvent(item_event_id=item_event_id, **body.model_dump())
+    s.add(te); s.commit(); s.refresh(te)
+    return te
+
+
+def _load_turn(turn_id: int, s: DBSession) -> TurnEvent:
+    t = s.get(TurnEvent, turn_id)
+    if not t:
+        raise HTTPException(404, "环节不存在")
+    return t
+
+
+class ConfirmIn(BaseModel):
+    confirmed_response_text: str
+
+
+@app.patch("/turns/{turn_id}/confirm", response_model=TurnEvent)
+def confirm_turn(turn_id: int, body: ConfirmIn, s: DBSession = Depends(get_session)):
+    """人工改写为 confirmed（分字段，不覆盖 asr_text 原文）。锁定后不得再改。"""
+    t = _load_turn(turn_id, s)
+    if t.score_locked:
+        raise HTTPException(409, "已锁分，不得再改 confirmed 文本")
+    t.confirmed_response_text = body.confirmed_response_text
+    s.add(t); s.commit(); s.refresh(t)
+    return t
+
+
+@app.post("/turns/{turn_id}/ai-judge", response_model=TurnEvent)
+def ai_judge_turn(turn_id: int, s: DBSession = Depends(get_session)):
+    """规则确定式 AI 初评（永不锁分）。经画像守卫构造 JudgeInput；无确定式口径的环节纯人工。"""
+    t = _load_turn(turn_id, s)
+    if t.score_locked:
+        raise HTTPException(409, "已锁分，AI 初评不再更新锁定分")
+    ie = s.get(ItemEvent, t.item_event_id)
+    sess = s.get(TrainSession, ie.session_id)
+    bank = _load_bank_for_session(sess)
+    bi = _find_bank_item(bank, ie.item_id) or {}
+    target = _role_target(bi, t.response_role or "命名")
+    if not target:
+        # 作用/关系/关键要素等：无确定式判分口径，纯人工。
+        t.ai_answer_type = None; t.ai_score = None; t.ai_needs_review = True
+        s.add(t); s.commit(); s.refresh(t)
+        return t
+    ji = judging.build_judge_input(                       # 过画像守卫（混入画像→PortraitLeakError）
+        item_id=ie.item_id, task_type=str(ie.task_type), target_word=target,
+        acceptable_expressions=tuple(bi.get("acceptable_expressions", []) or []),
+        upper_terms=tuple(bi.get("upper_terms", []) or []),
+        dialect_synonyms=tuple(bi.get("dialect_synonyms", []) or []),
+        asr_text=t.asr_text, confirmed_response_text=t.confirmed_response_text)
+    res = rule_judge.judge_rule_based(ji)
+    t.ai_answer_type = res.answer_type.value if res.answer_type else res.interaction_state
+    t.ai_score = res.ai_score
+    t.ai_needs_review = res.ai_needs_review
+    t.judge_portrait_used = False
+    s.add(t); s.commit(); s.refresh(t)
+    return t
+
+
+class LockIn(BaseModel):
+    reviewer_id: str
+    element_value: float                     # 单要素 final_correct(0/1) / 双要素分环节(0/1，关系0/0.5/1) / 多要素(0/1)
+    reviewed_score: float | None = None       # 缺省取 element_value
+    prompt_level: int | None = None
+
+
+@app.patch("/turns/{turn_id}/lock", response_model=TurnEvent)
+def lock_turn(turn_id: int, body: LockIn, s: DBSession = Depends(get_session)):
+    """人工锁定评分（研究数据真值）。一旦锁定不得重复锁。"""
+    t = _load_turn(turn_id, s)
+    if t.score_locked:
+        raise HTTPException(409, "该环节已锁分，不可重复锁定")
+    t.reviewer_id = body.reviewer_id
+    t.element_value = body.element_value
+    t.reviewed_score = body.reviewed_score if body.reviewed_score is not None else body.element_value
+    if body.prompt_level is not None:
+        t.prompt_level = body.prompt_level
+    t.score_locked = True
+    s.add(t); s.commit(); s.refresh(t)
+    return t
+
+
+# ---------------- 异常/介入（phase 感知）----------------
+class AbnormalIn(BaseModel):
+    item_event_id: int | None = None
+    abnormal_type: str | None = None
+    intervention_type: str | None = None
+    affects_scoring_validity: bool = False
+    note: str | None = None
+
+
+_CUE_INTERVENTIONS = {"代说物品名", "代说称呼"}
+
+
+@app.post("/sessions/{session_id}/abnormal", response_model=AbnormalEvent)
+def record_abnormal(session_id: str, body: AbnormalIn, s: DBSession = Depends(get_session)):
+    """记异常/介入。正式训练周的代说物品名/称呼 → 自动判为线索性介入且影响判分有效性。"""
+    sess = s.get(TrainSession, session_id)
+    if not sess:
+        raise HTTPException(404, "场次不存在")
+    data = body.model_dump()
+    phase = sess.phase_type.value if hasattr(sess.phase_type, "value") else sess.phase_type
+    if data.get("intervention_type") in _CUE_INTERVENTIONS and phase == "正式训练":
+        data["abnormal_type"] = data.get("abnormal_type") or "线索性介入"
+        data["affects_scoring_validity"] = True
+    ev = AbnormalEvent(session_id=session_id, phase_type=sess.phase_type,
+                       created_at=datetime.now(), **data)
+    s.add(ev); s.commit(); s.refresh(ev)
+    return ev
+
+
+# ---------------- 评分重建（只读）+ 去标识化导出 ----------------
+@app.get("/sessions/{session_id}/scores")
+def session_scores(session_id: str, s: DBSession = Depends(get_session)):
+    """从已锁定分环节值重建综合指标（单一事实源，不落库）。只读，不触发导出。"""
+    if not s.get(TrainSession, session_id):
+        raise HTTPException(404, "场次不存在")
+    items = list(s.exec(_select(ItemEvent, ItemEvent.session_id == session_id)))
+    tbi = {it.id: list(s.exec(_select(TurnEvent, TurnEvent.item_event_id == it.id))) for it in items}
+    return export._reconstruct_scores(items, tbi)
+
+
+@app.post("/sessions/{session_id}/export")
+def session_export(session_id: str, deidentify: bool = True, s: DBSession = Depends(get_session)):
+    """场次收尾去标识化导出（默认走去标识通道，不带直接标识符）。触发音频导出闸门第一关。"""
+    try:
+        res = export.export_session_bundle(s, session_id, deidentify=deidentify)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return {"batch_id": res["batch_id"], "deidentified": res["deidentified"],
+            "files": res["files"], "audio_touched": res["audio_touched"],
+            "excluded_items": res["excluded_items"],
+            "sheet_counts": {k: len(v) for k, v in res["sheets"].items()}}
+
+
+def _select(model, where):
+    from sqlmodel import select
+    return select(model).where(where)
