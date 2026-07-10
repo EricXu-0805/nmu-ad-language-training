@@ -32,7 +32,9 @@ export function PatientStage({ plan, cursor, sessionId }: { plan: SessionPlan | 
       await blobStore.put(rid, rec.blob);                       // 本地 IndexedDB 兜底副本
       await api.createAudio({ raw_audio_id: rid, session_id: sessionId });
       await api.uploadAudioBlob(rid, rec.blob).catch(() => {}); // 字节落库(本机);失败仍有本地副本
-      bus.post({ type: "audioSaved", rawAudioId: rid, durationSeconds: rec.durationSeconds, turnKey: tk });
+      const saved = { rawAudioId: rid, durationSeconds: rec.durationSeconds, turnKey: tk };
+      bus.post({ type: "audioSaved", ...saved });               // 同机秒推
+      api.putLiveState("audioSaved", saved).catch(() => {});    // 跨设备回报(操作端轮询取)
     } catch { /* 录音失败对老人不可见:错误宽容 */ }
     finally { setSaving(false); }
   }, [sessionId, tk, saving]);

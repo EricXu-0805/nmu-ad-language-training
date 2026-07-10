@@ -60,6 +60,12 @@ export const api = {
   lockTurn: (turnId: number, body: { reviewer_id: string; element_value: number; reviewed_score?: number | null; prompt_level?: number | null }) =>
     req<TurnEvent>("PATCH", `/turns/${turnId}/lock`, body),
 
+  // 跨设备实时状态(内网双设备;同机双窗时 BroadcastChannel 仍是快路径)
+  getLiveState: () =>
+    req<{ seq: number; session: unknown; cursor: unknown; rapportStep: unknown; audioSaved: unknown }>("GET", "/live/state"),
+  putLiveState: (kind: "session" | "cursor" | "rapportStep" | "audioSaved", payload: object) =>
+    req<{ seq: number }>("PUT", "/live/state", { kind, payload }),
+
   // 前后测量表(scale_result 容器)
   createScale: (patientId: string, body: { phase_type: string; scale_name: string; subscale?: string | null; score?: number | null; assessor_id?: string | null }) =>
     req<ScaleResult>("POST", `/patients/${encodeURIComponent(patientId)}/scales`, body),

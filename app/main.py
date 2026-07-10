@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse
 from . import asr, audio_gate, audio_store, content, export, judging, rule_judge, runtime, scoring
 from .db import engine, get_session, init_db
 from .enums import AudioStatus
-from .models import AbnormalEvent, AudioAssetRow, ItemEvent, Patient, ScaleResult, TurnEvent
+from .models import AbnormalEvent, AudioAssetRow, ItemEvent, LiveState, Patient, ScaleResult, TurnEvent
 from .models import Session as TrainSession
 
 
@@ -253,6 +253,47 @@ def audio_download_blob(raw_audio_id: str, s: DBSession = Depends(get_session)):
     if not p:
         raise HTTPException(404, "无音频字节(未上传或已删除)")
     return FileResponse(p)
+
+
+# ---------------- 跨设备实时状态(内网双设备:平板老人端 + 电脑操作端)----------------
+import json as _json
+
+
+class LiveIn(BaseModel):
+    kind: str                                # session / cursor / rapportStep / audioSaved
+    payload: dict
+
+
+_LIVE_SLOT = {"session": "session_json", "cursor": "cursor_json",
+              "rapportStep": "rapport_json", "audioSaved": "audio_json"}
+
+
+@app.put("/live/state")
+def live_put(body: LiveIn, s: DBSession = Depends(get_session)):
+    """写实时状态(操作端为唯一写者;老人端仅写 audioSaved 回报)。seq 单调递增。"""
+    slot = _LIVE_SLOT.get(body.kind)
+    if not slot:
+        raise HTTPException(422, f"未知 kind {body.kind!r}")
+    row = s.get(LiveState, 1) or LiveState(id=1, seq=0)
+    if body.kind == "session":
+        # 新场次握手 → 清掉旧游标/步进/录音回报,防老人端串到上一场
+        row.cursor_json = None; row.rapport_json = None; row.audio_json = None
+    setattr(row, slot, _json.dumps(body.payload, ensure_ascii=False))
+    row.seq += 1
+    row.updated_at = datetime.now()
+    s.add(row); s.commit(); s.refresh(row)
+    return {"seq": row.seq}
+
+
+@app.get("/live/state")
+def live_get(s: DBSession = Depends(get_session)):
+    """读实时状态(两端轮询)。seq 不变即无新事,客户端可跳过处理。"""
+    row = s.get(LiveState, 1)
+    if not row:
+        return {"seq": 0, "session": None, "cursor": None, "rapportStep": None, "audioSaved": None}
+    load = lambda t: _json.loads(t) if t else None  # noqa: E731
+    return {"seq": row.seq, "session": load(row.session_json), "cursor": load(row.cursor_json),
+            "rapportStep": load(row.rapport_json), "audioSaved": load(row.audio_json)}
 
 
 # ---------------- M3 ASR(本地、可插拔;M0=Null 引擎降级人工)----------------

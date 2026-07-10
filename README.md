@@ -1,43 +1,57 @@
 # 南医大 · AI 语言沟通训练系统 — platform
 
-轻中度痴呆老人 AI 语音机器人语言沟通训练系统。**本地部署，音频与数据不出机构、不上云端。**
+轻中度痴呆老人 AI 语音机器人语言沟通训练系统。**本地部署,音频与数据不出机构、不上云端。**
 
-口径基准（改动前先读）：
+口径基准(改动前先读):
 - `../模块级开发计划_开工蓝图_20260707.md` — 模块划分、共享数据契约、M0 最小闭环、构建顺序、硬约束检查表
 - `../项目状态基线_开工版_20260707.md` — 已定死的开发口径
 - `../会议决策补充与待办_20260706.md` — 会议拍板 + 待 PI 项
 
-## 当前进度
+## 当前进度(2026-07-10)
 
-**阶段0 地基（进行中）** — 已落地并全部测试通过：
+**后端 M0 已闭环 + 阶段1 骨架 + 阶段2 两端前端已建**,69 项 pytest 全绿:
 
-| 文件 | 内容 |
+| 层 | 内容 |
 |---|---|
-| `app/enums.py` | 枚举注册表（冻结）：phase_type / task_type / item_set_type / cue_type / audio_status … |
-| `app/scoring.py` | 评分纯函数：单要素、双要素（0.15/0.10/0.15/0.10/0.5，关系 1/0.5/0）、多要素（只算关键要素） |
-| `app/audio_gate.py` | 音频删除闸门状态机（护栏1）：导出+校验(+信度复核)才准删，禁止到期盲删；撤回优先 |
-| `app/judging.py` | ★画像不进判分：判分输入契约 + 运行时守卫 + 静态自检 |
-| `app/models.py` | 数据表模型（SQLModel）：Patient/Session/ItemEvent/TurnEvent/Week1Profile(隔离)/ScaleResult/AudioAsset |
+| 地基 | 冻结枚举 · 评分纯函数(单/双/多要素,de_total 单一事实源)· 音频删除闸门 · ★画像不进判分(结构+运行时+API 边界三重设防) |
+| 数据 | SQLModel 全表(TurnEvent 每环节一行 · Week1Profile 隔离 · LiveState 跨设备状态)· **Alembic 迁移**(真机数据禁止删库重建) |
+| API | FastAPI 40+ 路由:建档/建场次/会话计划/逐环节采集/AI初评/人工锁分/异常介入/量表录入/评分重建/去标识导出/音频字节+闸门/ASR/跨设备状态 |
+| 音频 | 字节落本机 `data/audio/`,checksum 真 sha256 校验(篡改被拒),导出真打包,删除闸门放行才物理删 |
+| ASR | M3 可插拔接口,M0=Null 引擎恒降级人工;热词自动从冻结题库生成;`ASR_ENGINE` 环境变量切换真引擎 |
+| 前端 | `web/` Vite+React+TS:`/console` 操作端(建档→建场次→逐环节判分→收尾导出)+ `/patient` 老人端(大图大字/VOX录音);构建为纯静态 dist 由本服务同源托管 |
+| 同步 | 双通道:BroadcastChannel(同机秒推)+ `/live/state` 服务端轮询(**内网双设备可用**) |
 
-尚未做（下一步）：DB 接线与迁移、FastAPI 接口层、导出通道、内容/题库结构化（M5）、两端前端（阶段2）、ASR/LLM（本地、阶段1/4，可关闭）。
+尚未接:真 ASR 引擎(待机构 GPU)· LLM 判分(阶段4,可关闭)· TTS · 题图(内容组回填,week≥2 真实采集的阻断项)。
 
-## 跑测试
+## 跑测试 / 开发
 
 ```bash
 cd platform
-python3 -m pytest        # 纯逻辑测试（scoring / audio_gate / judging / enums），无需装依赖
+./.venv/bin/python -m pytest              # 69 项(无 .venv 先: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt)
+cd web && npm run dev                     # 前端热更(另开 ./scripts/serve.sh 或 uvicorn 起后端)
 ```
 
-接 DB/API 时：`pip install -r requirements.txt`。
+## 部署(医院内网/科室专机,全程离线)
 
-## 不可触碰的硬约束（提测逐条对）
+```bash
+./scripts/serve.sh                        # 单机双窗:同机开 /console 与 /patient(localhost 麦克风可用)
+INTRANET=1 ./scripts/serve.sh             # 内网双设备:0.0.0.0:8443 + 自签 TLS
+                                          #   平板开 https://<本机IP>:8443/patient(首次信任证书)
+                                          #   操作电脑开 https://<本机IP>:8443/console
+```
 
-1. **★画像不进判分**：画像只喂交互（称呼/鼓励/提示措辞/拉回），绝不进判分与评分口径。`judging.py` 已在结构+运行时双重设防；`Week1Profile` 独立成表、判分侧不得 join。
-2. **音频删除闸门**：原始音频导出成功+校验通过（信度样本还需人工复核完成）才准删；禁止无条件到期自动删。定时清理必须先过 `guard_time_based_purge`。
-3. **人工锁定分**：研究数据以人工锁定分为准，AI 判分只作初评/辅助，永不覆盖锁定分。
-4. **本地/不上云**：ASR 走本地转录（导出→本地转写→人工校对→回填），音频不出机构。
-5. **最小闭环优先**：动态判分/动态提示/情绪疲劳/第1周插槽一律先做成可关闭模块，默认走降级口径。
+- 启动自动 `alembic upgrade head`(幂等);schema 变更一律走 `alembic revision --autogenerate`,**真机严禁删库重建**。
+- 内网模式必须 https:平板浏览器麦克风(getUserMedia)仅在 secure context 开放。证书/私钥在 `data/certs/`(gitignored),不外发。
+- 换 PostgreSQL:改 `app/db.py` 的 URL + `alembic upgrade head`。
+
+## 不可触碰的硬约束(提测逐条对)
+
+1. **★画像不进判分**:画像只喂交互,绝不进判分与评分口径。结构(JudgeInput 无画像字段)+运行时守卫+API 边界 400+前端 oxlint 导入守卫,四层设防;`Week1Profile` 独立成表、判分侧不得 join。
+2. **音频删除闸门**:导出成功+真校验通过(信度样本还需人工复核)才准删;禁止无条件到期自动删;放行才物理删字节。
+3. **人工锁定分**:研究数据以人工锁定分为准,AI 判分只作初评,永不覆盖锁定分。
+4. **本地/不上云**:ASR 本地转录、音频字节只落本机磁盘、前端 CSP 封死外部请求(含外部 WebSocket)。
+5. **最小闭环优先**:动态判分/动态提示/第1周插槽一律可关闭模块,默认走降级口径。
 
 ## 技术栈
 
-Python + FastAPI + SQLModel（SQLite 开发 / PostgreSQL 部署），前端 React（阶段2）。ASR/LLM 本地、模型选型待机构 GPU（决策19），接口按可替换设计、不写死。
+Python 3.14 + FastAPI + SQLModel + Alembic(SQLite 开发 / PostgreSQL 部署),前端 Vite + React + TS(纯静态产物,运行期无 node)。ASR/LLM 本地、模型选型待机构 GPU(决策19),接口按可替换设计、不写死。

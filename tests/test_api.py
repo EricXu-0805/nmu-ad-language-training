@@ -196,6 +196,24 @@ def test_scale_entry_list_and_export_integration(client):
     assert ex["sheet_counts"]["scales"] == 1
 
 
+def test_live_state_roundtrip_and_session_reset(client):
+    assert client.get("/live/state").json()["seq"] == 0            # 初始为空
+    client.put("/live/state", json={"kind": "session",
+                                    "payload": {"sessionId": "S1", "weekNo": 2, "mode": "task"}})
+    client.put("/live/state", json={"kind": "cursor",
+                                    "payload": {"itemIdx": 3, "turnIdx": 1, "recording": "armed"}})
+    client.put("/live/state", json={"kind": "audioSaved",
+                                    "payload": {"rawAudioId": "a9", "turnKey": "SE_锚#1"}})
+    d = client.get("/live/state").json()
+    assert d["seq"] == 3 and d["cursor"]["itemIdx"] == 3 and d["audioSaved"]["rawAudioId"] == "a9"
+    # 新场次握手 → 旧游标/录音回报清空(防老人端串场)
+    client.put("/live/state", json={"kind": "session", "payload": {"sessionId": "S2", "weekNo": 1}})
+    d2 = client.get("/live/state").json()
+    assert d2["session"]["sessionId"] == "S2" and d2["cursor"] is None and d2["audioSaved"] is None
+    assert d2["seq"] == 4                                           # seq 只增不回卷
+    assert client.put("/live/state", json={"kind": "bogus", "payload": {}}).status_code == 422
+
+
 def test_phase_aware_cue_intervention_flagged(client):
     _mk_session(client)
     ev = client.post("/sessions/SM0/abnormal",

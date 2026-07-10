@@ -6,6 +6,7 @@ sqlmodel>=0.0.22
 pydantic>=2.7
 python-multipart>=0.0.9
 pytest>=8.0
+alembic>=1.13          # 数据库迁移(真机患者数据禁止删库重建)
 
 # 本地转录（阶段1）：ASR 模型选型待机构 GPU 配置确认（决策19），接口按可替换设计，
 # 不写死模型；候选如 FunASR / Paraformer，本地运行、音频不出机构。禁止云端转录。

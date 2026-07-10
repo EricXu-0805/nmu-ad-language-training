@@ -140,6 +140,22 @@ class AudioAssetRow(SQLModel, table=True):
     exported_at: Optional[datetime] = None
 
 
+class LiveState(SQLModel, table=True):
+    """仪器实时状态(单行,id=1)——跨设备同步的服务端真值。
+
+    此前同步只靠浏览器 BroadcastChannel(仅同机双窗可用);此表让老人端平板与
+    操作端电脑分居两台设备时仍能经内网同步:操作端写、两端轮询,seq 单调递增判新旧。
+    只存指针(索引/级别/id),不存题目文本——内容仍以版本锁定的题库为唯一源。
+    """
+    id: int = Field(default=1, primary_key=True)
+    seq: int = 0
+    session_json: Optional[str] = None       # 最新 session 握手(JSON)
+    cursor_json: Optional[str] = None        # 最新游标
+    rapport_json: Optional[str] = None       # 最新第1周步进
+    audio_json: Optional[str] = None         # 最新老人端录音回报(audioSaved)
+    updated_at: Optional[datetime] = None
+
+
 class AbnormalEvent(SQLModel, table=True):
     """异常/介入记录（phase 感知）。正式训练周的代说物品名/称呼→线索性介入、影响判分有效性。"""
     id: Optional[int] = Field(default=None, primary_key=True)
