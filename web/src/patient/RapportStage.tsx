@@ -28,7 +28,7 @@ export function RapportStage({ rapportStep, sessionId }: { rapportStep?: Rapport
   }, [script, isRobot, text]);
 
   const recording = rapportStep?.recording ?? "idle";
-  const { stopAndSave } = useVoxRecorder({
+  const { stopAndSave, saving } = useVoxRecorder({
     sessionId,
     recording: rapportStep?.recording,
     recSeq: rapportStep?.recSeq,
@@ -52,9 +52,9 @@ export function RapportStage({ rapportStep, sessionId }: { rapportStep?: Rapport
       {rapportStep?.assentGate && (
         <p className="cue" style={{ color: "var(--c-primary)" }}>（等您点头同意，我们再开始）</p>
       )}
-      {(recording === "armed" || recording === "recording") && (
-        <MicButton state={recording} onStop={stopAndSave} />
-      )}
+      {saving
+        ? <p className="cue" style={{ border: "none", boxShadow: "none", background: "transparent" }}>好的，收到了…</p>
+        : (recording === "armed" || recording === "recording") && <MicButton state={recording} onStop={stopAndSave} />}
     </div>
   );
 }

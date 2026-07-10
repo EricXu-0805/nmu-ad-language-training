@@ -72,11 +72,21 @@ def get_patient(patient_id: str, s: DBSession = Depends(get_session)):
 
 @app.post("/sessions", response_model=TrainSession)
 def create_session(sess: TrainSession, s: DBSession = Depends(get_session)):
+    if s.get(TrainSession, sess.session_id):
+        raise HTTPException(409, f"session_id {sess.session_id} 已存在(可取回续做)")
     if not s.get(Patient, sess.patient_id):
         raise HTTPException(404, "患者不存在，先建档")
     if not sess.item_bank_version_id:
         raise HTTPException(422, "场次须绑题库版本号 item_bank_version_id")
     s.add(sess); s.commit(); s.refresh(sess)
+    return sess
+
+
+@app.get("/sessions/{session_id}", response_model=TrainSession)
+def get_train_session(session_id: str, s: DBSession = Depends(get_session)):
+    sess = s.get(TrainSession, session_id)
+    if not sess:
+        raise HTTPException(404, "场次不存在")
     return sess
 
 

@@ -9,15 +9,18 @@ export interface JournalTurn {
   asrSaved: boolean; confirmed: boolean; aiJudged: boolean; locked: boolean;
   elementValue?: number; promptLevel?: number;
   asrText?: string; confirmedText?: string;   // 缓存文本,供回访环节回填(后端无按 turn 回读)
+  cueLevel?: number;                          // 已发线索级:回访环节恢复,不清老人端线索、prompt_level 建议不记错
 }
 export interface JournalAudio {
   turnKey: string; containsDirectIdentifier: boolean; isReliabilitySample: boolean; lastStatus: string;
+  durationSeconds?: number;                   // 刷新后凭 turnKey 反查恢复回放条
 }
 export interface SessionJournal {
   sessionId: string;
   itemEvents: Record<string, JournalItem>;
   turns: Record<string, JournalTurn>;
   audios: Record<string, JournalAudio>;
+  cueLevels?: Record<string, number>;  // turnKey → 已发线索级(turn 未建时也要能记,故独立于 turns)
   cursor: { itemIdx: number; turnIdx: number };
 }
 
@@ -56,9 +59,13 @@ export function useSessionJournal(sessionId: string) {
     setJournal((j) => { const n = { ...j, audios: { ...j.audios, [rawAudioId]: v } }; localStorage.setItem(key(n.sessionId), JSON.stringify(n)); return n; });
   }, []);
 
+  const recordCueLevel = useCallback((turnK: string, level: number) => {
+    setJournal((j) => { const n = { ...j, cueLevels: { ...(j.cueLevels ?? {}), [turnK]: level } }; localStorage.setItem(key(n.sessionId), JSON.stringify(n)); return n; });
+  }, []);
+
   const setCursor = useCallback((itemIdx: number, turnIdx: number) => {
     setJournal((j) => { const n = { ...j, cursor: { itemIdx, turnIdx } }; localStorage.setItem(key(n.sessionId), JSON.stringify(n)); return n; });
   }, []);
 
-  return { journal, persist, upsertItem, upsertTurn, upsertAudio, setCursor };
+  return { journal, persist, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor };
 }

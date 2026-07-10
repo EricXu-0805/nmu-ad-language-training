@@ -41,6 +41,11 @@ def test_session_needs_patient_and_version(client):
     assert client.post("/sessions", json=sess).status_code == 404  # 患者不存在
     client.post("/patients", json={"patient_id": "P404"})
     assert client.post("/sessions", json=sess).status_code == 200
+    # 重复建同 id 场次 → 干净 409(曾是主键冲突 500),前端凭它走"取回续做"
+    assert client.post("/sessions", json=sess).status_code == 409
+    got = client.get("/sessions/S1")
+    assert got.status_code == 200 and got.json()["patient_id"] == "P404"
+    assert client.get("/sessions/S404").status_code == 404
 
 
 def test_item_bank_endpoint(client):

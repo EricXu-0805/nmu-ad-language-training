@@ -94,13 +94,44 @@ input:focus, select:focus, textarea:focus {
   50% { box-shadow: 0 0 0 24px rgba(11, 92, 173, 0); }
 }
 :root[data-scale="patient"] .image-pane { max-width: min(90vw, 90vh); box-shadow: var(--shadow-md); }
+/* 线索槽恒占位:线索来了不把问句/麦克风上下顶 */
+:root[data-scale="patient"] .cue-slot { min-height: 2.6em; display: flex; align-items: center; justify-content: center; }
 
 .tts-toggle {
   position: fixed; top: 14px; right: 14px; min-width: 60px; min-height: 60px; font-size: 28px;
   border-radius: 50%; border: 1px solid var(--c-line-soft); background: var(--c-surface);
-  box-shadow: var(--shadow-sm); opacity: 0.82;
+  box-shadow: var(--shadow-sm); opacity: 0.82; z-index: 30;
 }
 .tts-toggle:hover { opacity: 1; }
+
+/* 老人端点击式启动:明确的可点落点,替代"先摸一下屏幕"的隐性要求 */
+.tap-overlay {
+  position: fixed; inset: 0; z-index: 850; border: none; cursor: pointer;
+  background: rgba(243, 236, 217, 0.94); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+}
+.tap-overlay-inner {
+  display: flex; flex-direction: column; align-items: center; gap: var(--sp-4);
+  background: var(--c-surface); border-radius: 32px; box-shadow: var(--shadow-md);
+  padding: var(--sp-7) var(--sp-8); font-size: var(--fs-xl); font-weight: 700; color: var(--c-fg);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+.tap-overlay-sub { font-size: 0.45em; font-weight: 500; color: var(--c-muted); }
+@keyframes breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.03); }
+}
+
+/* 训练屏左侧题列:固定侧栏独立滚动,主工作卡滚动时不跟着跑 */
+.item-rail {
+  width: 224px; flex-shrink: 0; position: sticky; top: 76px;
+  max-height: calc(100vh - 96px); display: flex; flex-direction: column; gap: var(--sp-2);
+}
+.item-rail-list { overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding-right: 2px; }
+
+/* 屏幕切换淡入:状态突变不再生硬 */
+@keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+.app-main main > *, .fade-in { animation: fadeIn 180ms ease; }
 
 /* ---------- 通用小工具类 ---------- */
 .card {

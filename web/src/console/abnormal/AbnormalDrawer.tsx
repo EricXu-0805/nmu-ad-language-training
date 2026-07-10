@@ -47,8 +47,8 @@ export function AbnormalDrawer({ sessionId, phaseType, currentItemEventId, open,
   }
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.35)", zIndex: 900, display: "flex", justifyContent: "flex-end" }}>
-      <div className="col" style={{ width: 460, maxWidth: "92vw", height: "100%", background: "var(--c-bg)", padding: "var(--sp-5)", overflowY: "auto" }}>
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.35)", zIndex: 900, display: "flex", justifyContent: "flex-end" }}>
+      <div className="col fade-in" onClick={(e) => e.stopPropagation()} style={{ width: 460, maxWidth: "92vw", height: "100%", background: "var(--c-bg)", padding: "var(--sp-5)", overflowY: "auto" }}>
         <div className="row" style={{ justifyContent: "space-between" }}>
           <h2>记录异常 / 介入</h2>
           <Button onClick={onClose}>关闭</Button>

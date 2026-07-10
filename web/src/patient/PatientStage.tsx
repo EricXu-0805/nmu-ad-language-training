@@ -19,7 +19,7 @@ export function PatientStage({ plan, cursor, sessionId }: { plan: SessionPlan | 
   const role = planTurn?.response_role ?? "命名";
   const tk = item && planTurn ? turnKey(item.item_id, planTurn.turn_seq) : "";
 
-  const { stopAndSave } = useVoxRecorder({ sessionId, recording: cursor?.recording, recSeq: cursor?.recSeq, turnKey: tk });
+  const { stopAndSave, saving } = useVoxRecorder({ sessionId, recording: cursor?.recording, recSeq: cursor?.recSeq, turnKey: tk });
 
   const spotlight: Spotlight = role.startsWith("左") ? "left" : role.startsWith("右") ? "right" : role === "关系识别" ? "both" : "none";
   const question = role.includes("作用") ? "它是做什么用的呢？" : role === "关系识别" ? "它们之间有什么关系呢？" : "请看这张图片，这是什么？";
@@ -38,8 +38,13 @@ export function PatientStage({ plan, cursor, sessionId }: { plan: SessionPlan | 
     <Centered>
       <ImagePane imageId={item.image_id} spotlight={spotlight} alt="题目图片" />
       <p className="question">{question}</p>
-      {cueText && <p className="cue card" style={{ maxWidth: "80vw" }}>{cueText}</p>}
-      <MicButton state={cursor?.recording ?? "idle"} onStop={stopAndSave} />
+      {/* 线索槽恒占位:线索出现/消失不再把问句和麦克风上下顶(布局零跳动) */}
+      <div className="cue-slot">
+        {cueText && <p className="cue" style={{ maxWidth: "80vw", margin: 0 }}>{cueText}</p>}
+      </div>
+      {saving
+        ? <p className="cue" style={{ border: "none", boxShadow: "none", background: "transparent" }}>好的，收到了…</p>
+        : <MicButton state={cursor?.recording ?? "idle"} onStop={stopAndSave} />}
     </Centered>
   );
 }

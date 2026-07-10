@@ -7,18 +7,25 @@ import type { AudioSavedMsg, CursorMsg, RapportMsg, SessionMsg, SyncMsg } from "
 
 const LIVE_POLL_MS = 2000;
 
+// 写序号:以启动时刻打底、每次广播递增——操作端页面刷新后计数必然大于旧值,老人端不会拒收新写者。
+let wseqCounter = Date.now();
+const nextWseq = () => ++wseqCounter;
+
 export function useCursorWriter() {
-  const postSession = useCallback((m: Omit<SessionMsg, "type">) => {
-    bus.post({ type: "session", ...m });
-    api.putLiveState("session", m).catch(() => {});
+  const postSession = useCallback((m: Omit<SessionMsg, "type" | "wseq">) => {
+    const stamped = { ...m, wseq: nextWseq() };
+    bus.post({ type: "session", ...stamped });
+    api.putLiveState("session", stamped).catch(() => {});
   }, []);
-  const postCursor = useCallback((m: Omit<CursorMsg, "type">) => {
-    bus.post({ type: "cursor", ...m });
-    api.putLiveState("cursor", m).catch(() => {});
+  const postCursor = useCallback((m: Omit<CursorMsg, "type" | "wseq">) => {
+    const stamped = { ...m, wseq: nextWseq() };
+    bus.post({ type: "cursor", ...stamped });
+    api.putLiveState("cursor", stamped).catch(() => {});
   }, []);
-  const postRapport = useCallback((m: Omit<RapportMsg, "type">) => {
-    bus.post({ type: "rapportStep", ...m });
-    api.putLiveState("rapportStep", m).catch(() => {});
+  const postRapport = useCallback((m: Omit<RapportMsg, "type" | "wseq">) => {
+    const stamped = { ...m, wseq: nextWseq() };
+    bus.post({ type: "rapportStep", ...stamped });
+    api.putLiveState("rapportStep", stamped).catch(() => {});
   }, []);
   const resetSession = useCallback(() => bus.reset(), []);
   return { postSession, postCursor, postRapport, resetSession };

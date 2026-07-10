@@ -74,12 +74,16 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
     postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "idle", recSeq: recSeq.current, containsDirectIdentifier: isSelfIntro });
   };
 
+  const [proxyBusy, setProxyBusy] = useState(false);
   async function recordProxyNaming() {
-    // 关系建立周"代说物品名"属允许(无警告),仅记介入。
+    // 关系建立周"代说物品名"属允许(无警告),仅记介入。在途锁防双击写重复记录。
+    if (proxyBusy) return;
+    setProxyBusy(true);
     try {
       await api.recordAbnormal(session.session_id, { intervention_type: "代说物品名", note: "关系建立周·允许" });
       toast("已记录介入:代说物品名(关系建立周允许)", "ok");
     } catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); }
+    finally { setProxyBusy(false); }
   }
 
   return (
@@ -121,7 +125,7 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
             ? <Button variant="primary" onClick={armRecording}>示意老人录音{isSelfIntro ? "(含标识)" : ""}</Button>
             : <Button variant="danger" onClick={stopRecording}>停止录音</Button>}
           {recState !== "idle" && <StatusPill tone="danger">录音中…</StatusPill>}
-          <Button onClick={recordProxyNaming}>记录:代说物品名(允许)</Button>
+          <Button onClick={recordProxyNaming} disabled={proxyBusy}>{proxyBusy ? "记录中…" : "记录:代说物品名(允许)"}</Button>
         </div>
       </div>
 

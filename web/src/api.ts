@@ -53,6 +53,7 @@ export const api = {
   createPatient: (p: Patient) => req<Patient>("POST", "/patients", p),
   getPatient: (id: string) => req<Patient>("GET", `/patients/${encodeURIComponent(id)}`),
   createSession: (s: Session) => req<Session>("POST", "/sessions", s),
+  getTrainSession: (sid: string) => req<Session>("GET", `/sessions/${encodeURIComponent(sid)}`),
 
   // 内容 / 计划
   itemBank: () => req<ItemBankInfo>("GET", "/content/item-bank"),

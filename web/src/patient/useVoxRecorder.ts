@@ -62,5 +62,5 @@ export function useVoxRecorder(opts: {
   stopRef.current = stopAndSave;
   useEffect(() => () => { if (recRef.current.active) void stopRef.current(); }, []);
 
-  return { stopAndSave };
+  return { stopAndSave, saving };
 }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import { blobStore } from "../audio/blobStore";
 import { Button } from "../components/Button";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { StatusPill } from "../components/StatusPill";
 import { useToast } from "../components/Toast";
 import { useSessionJournal } from "../hooks/useSessionJournal";
@@ -10,7 +11,7 @@ import { ratioPct } from "../lib/format";
 import type { AudioAsset, ExportResult, ScoreReconstruction, Session, SessionPlan } from "../types";
 
 // 场次收尾:完整度计 + 评分只读重建 + 音频删除闸门 + 去标识导出。
-export function SessionWrapupScreen({ session }: { session: Session }) {
+export function SessionWrapupScreen({ session, onBack }: { session: Session; onBack?: () => void }) {
   const toast = useToast();
   const { journal, upsertAudio } = useSessionJournal(session.session_id);
 
@@ -27,12 +28,18 @@ export function SessionWrapupScreen({ session }: { session: Session }) {
     toast(`补记迟到录音:${m.rawAudioId.slice(0, 12)}…(已列入音频闸门)`, "info");
   });
   const [scores, setScores] = useState<ScoreReconstruction | null>(null);
+  const [scoresErr, setScoresErr] = useState<string | null>(null); // 失败≠加载中:给重试,不给永远的"加载中…"
   const [plan, setPlan] = useState<SessionPlan | null>(null);
   const [exp, setExp] = useState<ExportResult | null>(null);
   const [busy, setBusy] = useState(false);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [gateEpoch, setGateEpoch] = useState(0); // 导出/批量操作后驱动闸门各行重取状态
 
-  useEffect(() => { api.sessionScores(session.session_id).then(setScores).catch((e) => toast(String(e), "danger")); }, [session, toast]);
-  useEffect(() => { api.sessionPlan(session.session_id, session.week_no, session.event_line).then(setPlan).catch(() => setPlan(null)); }, [session]);
+  useEffect(() => {
+    setScoresErr(null);
+    api.sessionScores(session.session_id).then(setScores).catch((e) => setScoresErr(e instanceof ApiError ? e.detail : String(e)));
+  }, [session, retryNonce]);
+  useEffect(() => { api.sessionPlan(session.session_id, session.week_no, session.event_line).then(setPlan).catch(() => setPlan(null)); }, [session, retryNonce]);
 
   // 完整度:excluded_items 只列"已建未锁"的题;未动过的计划题要靠 plan 对照日志才可见。
   const lockedTurns = Object.values(journal.turns).filter((t) => t.locked).length;
@@ -43,6 +50,7 @@ export function SessionWrapupScreen({ session }: { session: Session }) {
     try {
       const r = await api.exportSession(session.session_id, true); // 只暴露去标识通道
       setExp(r);
+      setGateEpoch((n) => n + 1); // 导出把 recorded→exported:闸门各行立即重取,不显示过期按钮
       toast(`已导出批次 ${r.batch_id}(去标识)`, "ok");
     } catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); }
     finally { setBusy(false); }
@@ -50,9 +58,28 @@ export function SessionWrapupScreen({ session }: { session: Session }) {
 
   const audioIds = Object.keys(journal.audios);
 
+  // 30+ 条音频逐条点"校验"太折磨:一键顺序校验全部 exported 态音频
+  const [verifyingAll, setVerifyingAll] = useState(false);
+  async function verifyAll() {
+    if (verifyingAll) return;
+    setVerifyingAll(true);
+    let ok = 0, fail = 0;
+    for (const id of audioIds) {
+      try { const a = await api.getAudio(id); if (a.status === "exported") { await api.audioChecksum(id); ok++; } }
+      catch { fail++; }
+    }
+    setGateEpoch((n) => n + 1);
+    toast(`批量校验完成:${ok} 通过${fail ? `,${fail} 失败(见各行状态)` : ""}`, fail ? "warn" : "ok");
+    setVerifyingAll(false);
+  }
+
   return (
     <div className="col" style={{ maxWidth: 820 }}>
-      <h2>场次收尾 · {session.session_id}</h2>
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <h2 style={{ margin: 0 }}>场次收尾 · {session.session_id}</h2>
+        {/* 收尾不再是单行道:看到漏锁随时回去补 */}
+        {onBack && <Button onClick={onBack}>← 回{session.week_no === 1 ? "关系建立" : "训练"}屏继续</Button>}
+      </div>
 
       {plan && plan.total_turns > 0 && (
         <div className="card col">
@@ -75,7 +102,12 @@ export function SessionWrapupScreen({ session }: { session: Session }) {
 
       <div className="card col">
         <h3>过程性评分(从已锁定环节值重建 · 单一事实源)</h3>
-        {!scores ? <p>加载中…</p> : (
+        {scoresErr ? (
+          <div className="row wrap">
+            <span style={{ color: "var(--c-danger)" }}>加载失败:{scoresErr}</span>
+            <Button onClick={() => setRetryNonce((n) => n + 1)}>重试</Button>
+          </div>
+        ) : !scores ? <p>加载中…</p> : (
           <>
             <div className="wrap">
               <ScoreCard title="单要素命名正确率" summary={scores.single} metric="naming_accuracy" fmt={ratioPct} />
@@ -94,9 +126,14 @@ export function SessionWrapupScreen({ session }: { session: Session }) {
       </div>
 
       <div className="card col">
-        <h3>音频删除闸门(护栏1 · 未过闸门不出现删除钮)</h3>
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <h3 style={{ margin: 0 }}>音频删除闸门(护栏1 · 未过闸门不出现删除钮)</h3>
+          {audioIds.length > 1 && (
+            <Button onClick={verifyAll} disabled={verifyingAll}>{verifyingAll ? "批量校验中…" : "校验全部已导出"}</Button>
+          )}
+        </div>
         {audioIds.length === 0 ? <p className="muted">本场次暂无登记音频。</p> :
-          audioIds.map((id) => <AudioGateRow key={id} rawAudioId={id} />)}
+          audioIds.map((id) => <AudioGateRow key={id} rawAudioId={id} gateEpoch={gateEpoch} />)}
       </div>
 
       <div className="card col">
@@ -129,41 +166,64 @@ function ScoreCard({ title, summary, metric, fmt }: { title: string; summary: Re
 }
 
 // 四步闸门:recorded→exported→checksum_verified→(信度)reliability_review_done→deletable→deleted
-function AudioGateRow({ rawAudioId }: { rawAudioId: string }) {
+function AudioGateRow({ rawAudioId, gateEpoch = 0 }: { rawAudioId: string; gateEpoch?: number }) {
   const toast = useToast();
   const [a, setA] = useState<AudioAsset | null>(null);
+  const [loadState, setLoadState] = useState<"loading" | "ok" | "missing" | "error">("loading");
+  const [rowBusy, setRowBusy] = useState(false);
+  const [confirmDel, setConfirmDel] = useState(false);
 
-  const refresh = useCallback(() => { api.getAudio(rawAudioId).then(setA).catch(() => setA(null)); }, [rawAudioId]);
-  useEffect(() => { refresh(); }, [refresh]);
+  const refresh = useCallback(() => {
+    setLoadState("loading");
+    api.getAudio(rawAudioId)
+      .then((x) => { setA(x); setLoadState("ok"); })
+      .catch((e) => { setA(null); setLoadState(e instanceof ApiError && e.status === 404 ? "missing" : "error"); });
+  }, [rawAudioId]);
+  useEffect(() => { refresh(); }, [refresh, gateEpoch]);
 
   async function step(fn: () => Promise<AudioAsset>) {
+    if (rowBusy) return; // 在途锁:慢网下连点不重复触发状态迁移
+    setRowBusy(true);
     try { setA(await fn()); toast("闸门状态已推进", "ok"); }
-    catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); }
+    catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); refresh(); }
+    finally { setRowBusy(false); }
   }
   async function remove() {
+    if (rowBusy) return;
+    setRowBusy(true);
     try {
       await api.deleteAudio(rawAudioId);
       await blobStore.del(rawAudioId); // 服务端放行后才镜像删本地字节
       toast("音频已删除(服务端放行 + 本地字节清除)", "ok");
       refresh();
     } catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); }
+    finally { setRowBusy(false); }
   }
 
-  if (!a) return <div className="row muted">{rawAudioId}:未在服务端登记</div>;
+  if (loadState === "loading") return <div className="row muted">{rawAudioId.slice(0, 16)}…:读取状态中…</div>;
+  if (loadState === "error") return <div className="row muted">{rawAudioId.slice(0, 16)}…:状态获取失败 <Button onClick={refresh}>重试</Button></div>;
+  if (loadState === "missing" || !a) return <div className="row muted">{rawAudioId.slice(0, 16)}…:未在服务端登记</div>;
   const tone = a.status === "deletable" ? "ok" : a.status === "deleted" ? "muted" : "primary";
   return (
-    <div className="row" style={{ justifyContent: "space-between", borderBottom: "1px solid var(--c-line)", paddingBottom: 8 }}>
+    <div className="row" style={{ justifyContent: "space-between", borderBottom: "1px solid var(--c-line-soft)", paddingBottom: 8 }}>
       <div className="col" style={{ gap: 2 }}>
         <span className="mono">{rawAudioId.slice(0, 16)}…</span>
         <span className="muted">{a.is_reliability_sample ? "信度样本" : "常规"}{a.contains_direct_identifier ? " · 含直接标识" : ""}</span>
       </div>
       <div className="row wrap">
         <StatusPill tone={tone}>{a.status}</StatusPill>
-        {a.status === "recorded" && <Button onClick={() => step(() => api.audioExport(rawAudioId))}>导出</Button>}
-        {a.status === "exported" && <Button onClick={() => step(() => api.audioChecksum(rawAudioId))}>校验</Button>}
-        {a.status === "checksum_verified" && a.is_reliability_sample && <Button onClick={() => step(() => api.audioReliabilityReview(rawAudioId))}>信度复核</Button>}
-        {a.status === "deletable" && <Button variant="danger" onClick={remove}>删除</Button>}
+        {rowBusy && <span className="muted">处理中…</span>}
+        {a.status === "recorded" && <Button disabled={rowBusy} onClick={() => step(() => api.audioExport(rawAudioId))}>导出</Button>}
+        {a.status === "exported" && <Button disabled={rowBusy} onClick={() => step(() => api.audioChecksum(rawAudioId))}>校验</Button>}
+        {a.status === "checksum_verified" && a.is_reliability_sample && <Button disabled={rowBusy} onClick={() => step(() => api.audioReliabilityReview(rawAudioId))}>信度复核</Button>}
+        {/* 删除是唯一不可恢复动作:锁分都有确认层,删录音更要 */}
+        {a.status === "deletable" && <Button variant="danger" disabled={rowBusy} onClick={() => setConfirmDel(true)}>删除</Button>}
       </div>
+      <ConfirmDialog open={confirmDel} title="删除这条研究录音?"
+        body={`${rawAudioId.slice(0, 16)}… 已过全部闸门(导出+校验${a.is_reliability_sample ? "+信度复核" : ""})。删除将同时清掉服务端与本机字节,不可恢复。`}
+        confirmLabel="确认删除"
+        onConfirm={() => { setConfirmDel(false); void remove(); }}
+        onCancel={() => setConfirmDel(false)} />
     </div>
   );
 }
