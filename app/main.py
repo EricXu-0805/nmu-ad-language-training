@@ -17,7 +17,7 @@ from datetime import datetime
 from . import audio_gate, content, export, judging, rule_judge, runtime, scoring
 from .db import engine, get_session, init_db
 from .enums import AudioStatus
-from .models import AbnormalEvent, AudioAssetRow, ItemEvent, Patient, TurnEvent
+from .models import AbnormalEvent, AudioAssetRow, ItemEvent, Patient, ScaleResult, TurnEvent
 from .models import Session as TrainSession
 
 
@@ -397,6 +397,31 @@ def record_abnormal(session_id: str, body: AbnormalIn, s: DBSession = Depends(ge
     return ev
 
 
+# ---------------- 前后测量表录入（scale_result 容器;量表选型待 PI,字段通用）----------------
+class ScaleIn(BaseModel):
+    phase_type: str                          # 前测 / 后测 / 随访
+    scale_name: str                          # 具体量表名(如 CETI / CADL,待 PI 定)
+    subscale: str | None = None
+    score: float | None = None
+    assessor_id: str | None = None
+
+
+@app.post("/patients/{patient_id}/scales", response_model=ScaleResult)
+def create_scale(patient_id: str, body: ScaleIn, s: DBSession = Depends(get_session)):
+    if not s.get(Patient, patient_id):
+        raise HTTPException(404, "患者不存在,先建档")
+    row = ScaleResult(patient_id=patient_id, assessed_at=datetime.now(), **body.model_dump())
+    s.add(row); s.commit(); s.refresh(row)
+    return row
+
+
+@app.get("/patients/{patient_id}/scales")
+def list_scales(patient_id: str, s: DBSession = Depends(get_session)):
+    if not s.get(Patient, patient_id):
+        raise HTTPException(404, "患者不存在")
+    return list(s.exec(_select(ScaleResult, ScaleResult.patient_id == patient_id)))
+
+
 # ---------------- 评分重建（只读）+ 去标识化导出 ----------------
 @app.get("/sessions/{session_id}/scores")
 def session_scores(session_id: str, s: DBSession = Depends(get_session)):
@@ -424,3 +449,31 @@ def session_export(session_id: str, deidentify: bool = True, s: DBSession = Depe
 def _select(model, where):
     from sqlmodel import select
     return select(model).where(where)
+
+
+# ---------------- 生产静态托管(离线部署)----------------
+# 前端构建为 web/dist(纯静态,无 node 运行时);存在即由本服务同源托管,医院机器只需 Python。
+# 仅当 dist 存在时挂载 → 测试/纯后端环境零影响。SPA 客户端路由(/console /patient)回退 index.html。
+def _mount_spa() -> None:
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    dist = Path(__file__).resolve().parent.parent / "web" / "dist"
+    if not dist.exists():
+        return
+    assets = dist / "assets"
+    if assets.exists():
+        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        # 显式 API 路由已在上方优先匹配;此处只兜非 API 路径 → 返回 SPA 外壳。
+        candidate = dist / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(dist / "index.html")
+
+
+_mount_spa()

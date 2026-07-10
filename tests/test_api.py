@@ -149,6 +149,24 @@ def test_ai_judge_no_deterministic_target_is_human_only(client):
     assert j["ai_answer_type"] is None and j["ai_needs_review"] is True   # 关系无确定式口径→纯人工
 
 
+def test_scale_entry_list_and_export_integration(client):
+    client.post("/patients", json={"patient_id": "PS1"})
+    r = client.post("/patients/PS1/scales",
+                    json={"phase_type": "前测", "scale_name": "CETI", "score": 42.0, "assessor_id": "A1"})
+    assert r.status_code == 200 and r.json()["scale_name"] == "CETI"
+    lst = client.get("/patients/PS1/scales").json()
+    assert len(lst) == 1 and lst[0]["score"] == 42.0
+    # 未建档患者 → 404
+    assert client.post("/patients/P404x/scales",
+                       json={"phase_type": "前测", "scale_name": "CETI"}).status_code == 404
+    # 录入的量表进导出(scales 表),且去标识通道不带 assessor_id
+    client.post("/sessions", json={"session_id": "SPS1", "patient_id": "PS1", "week_no": 2,
+                                   "phase_type": "正式训练", "event_line": "正式训练",
+                                   "item_bank_version_id": "wk2-v1-20260707"})
+    ex = client.post("/sessions/SPS1/export").json()
+    assert ex["sheet_counts"]["scales"] == 1
+
+
 def test_phase_aware_cue_intervention_flagged(client):
     _mk_session(client)
     ev = client.post("/sessions/SM0/abnormal",

@@ -1,0 +1,26 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "oxc"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+  },
+  "overrides": [
+    {
+      "files": ["src/console/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["**/patient/**", "**/patientLocalProfile", "**/RapportStage", "**/PatientStage"],
+                "message": "★画像不进判分:操作端判分链(console/**)禁止 import 老人端画像/交互源。画像仅可存在于 patient/ 与 patientLocalProfile。"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

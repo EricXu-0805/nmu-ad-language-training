@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <!-- 本地/离线优先(硬约束3):只允许同源 + data/blob;外部 CDN/字体/遥测/外部 WebSocket 被 CSP 挡死。
+         connect-src 的 ws 仅限本机(dev HMR),不放行任意外部主机 → 杜绝声纹/PII 经 WebSocket 外泄。 -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* wss://localhost:* ws://127.0.0.1:* wss://127.0.0.1:*" />
+    <title>语言沟通训练系统 · 南医大</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
