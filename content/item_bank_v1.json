@@ -1,7 +1,7 @@
 {
  "item_bank_version_id": "wk2-v1-20260707",
  "source": "第二周训练内容.docx（逐字抽取；第2–8周据会议决策重复同一批题，绑本版本号）",
- "note": "本文件由解析器从源脚本抽取，供内容组核对补全（acceptable_expressions/image_id/难度/探针集标识等）。raw_source 见 _wk2parsed.json；上线前须双人校对并冻结版本。",
+ "note": "本文件由解析器从源脚本抽取，供内容组核对补全（acceptable_expressions/image_id/难度/探针集标识等）。raw_source 见 _wk2parsed.json；上线前须双人校对并冻结版本。 image_id 已于 2026-07-11 回填:图源=同一源 docx 内嵌插图(image1–30 与题目一一对应),经 32-agent 视检(内容吻合/图上无文字/双要素左右方位与 left_word,right_word 一致)。",
  "errata_fixed": [
   {
    "item": "斧子+树",
@@ -33,7 +33,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个蔬菜叫胡萝卜。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-01",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:胡萝卜"
@@ -59,7 +59,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫熨斗。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-02",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:熨斗"
@@ -87,7 +87,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫锚。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-03",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:锚"
@@ -113,7 +113,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫树。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-04",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:树"
@@ -141,7 +141,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫狐狸。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-05",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:狐狸"
@@ -169,7 +169,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫针。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-06",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:针"
@@ -196,7 +196,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫船。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-07",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:船"
@@ -223,7 +223,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫纽扣。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-08",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:纽扣"
@@ -249,7 +249,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫烟灰缸。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-09",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:烟灰缸"
@@ -277,7 +277,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫鸡。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-10",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:鸡"
@@ -303,7 +303,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫蜜蜂。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-11",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:蜜蜂"
@@ -330,7 +330,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫螺丝钉。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-12",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:螺丝钉"
@@ -356,7 +356,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫斧子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-13",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:斧子"
@@ -382,7 +382,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫花。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-14",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:花"
@@ -411,7 +411,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫鞋。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-15",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:鞋"
@@ -439,7 +439,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫衬衫。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-16",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:衬衫"
@@ -467,7 +467,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫螺丝刀。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-17",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:螺丝刀"
@@ -495,7 +495,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫烟。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-18",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:烟"
@@ -521,7 +521,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫兔子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-19",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:兔子"
@@ -548,7 +548,7 @@
     }
    },
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫刷子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
-   "image_id": null,
+   "image_id": "wk2-20",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:刷子"
@@ -564,7 +564,7 @@
    "left_function_cue": "没关系，左边这是生活中常见的一种条状物，外面通常用纸包着，里面有烟丝和配料，是供人吸用的。",
    "right_function_cue": "没关系，右边这是一件常见的桌面容器，四周通常有几个小凹槽，专门用来收集烟灰、放烟蒂。",
    "relation_cue": "抽烟时产生的烟灰需要弹在烟灰缸里，吸完的烟头也会在里面掐灭。",
-   "image_id": null,
+   "image_id": "wk2-21",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:烟灰缸+烟"
@@ -578,7 +578,7 @@
    "left_function_cue": "没关系，左边这是一种哺乳动物，外形有点像狼，面部比较长，耳朵通常是三角形的，尾巴比较长，毛色常见的是赤黄色。它常常昼伏夜出，给人的印象是比较狡猾、多疑。",
    "right_function_cue": "没关系，右边这是一种常见的家禽，品种很多。它的嘴比较短，上嘴稍微弯曲，头部通常有红色的肉冠，翅膀比较短，一般不能高飞。",
    "relation_cue": "在自然界中，狐狸是肉食动物，经常会去农场里抓鸡、偷鸡吃。",
-   "image_id": null,
+   "image_id": "wk2-22",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:狐狸+鸡"
@@ -592,7 +592,7 @@
    "left_function_cue": "没关系，左边这是一种装卸螺钉用的工具。它的尖端有扁平、十字等形状，适合用在钉帽上有槽纹的螺钉上。",
    "right_function_cue": "没关系，右边这是一种常见的金属零件，形状像圆柱形或圆锥形的金属杆，杆上带有螺纹，一端有帽。",
    "relation_cue": "螺丝刀是专门用来拧螺丝钉的工具，我们在修理或组装东西时，需要用螺丝刀把螺丝钉拧紧或者松开。",
-   "image_id": null,
+   "image_id": "wk2-23",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:螺丝刀+螺丝钉"
@@ -606,7 +606,7 @@
    "left_function_cue": "没关系，左边这是生活中常见的一种家用小工具。它非常细小，一头很尖，另一头有个小孔用来穿线，平时缝补衣服常常会用到它。",
    "right_function_cue": "没关系，右边这是衣服上常见的小物件，可以把衣服等扣起来。它通常比较小，可以是球状的，也可以是片状的。",
    "relation_cue": "衣服上的纽扣掉了或者需要固定时，我们需要用针穿着线，把纽扣缝在衣服上。",
-   "image_id": null,
+   "image_id": "wk2-24",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:针+纽扣"
@@ -620,7 +620,7 @@
    "left_function_cue": "没关系，左边这是一种哺乳动物，头部有点像鼠，耳朵很大，上唇中间分裂，尾巴短而向上翘，前肢比后肢短，善于跳跃，跑得也很快。",
    "right_function_cue": "没关系，右边这是一种常见蔬菜。它的根通常是肉质的，形状多为圆锥形或圆柱形，颜色有紫红、橘红、黄色等多种，可以作为食物。",
    "relation_cue": "兔子喜欢吃胡萝卜。",
-   "image_id": null,
+   "image_id": "wk2-25",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:兔子+胡萝卜"
@@ -634,7 +634,7 @@
    "left_function_cue": "没关系，左边这是一种水上的主要运输工具，可以在江河湖海上行驶，用来载人或运输物品。",
    "right_function_cue": "没关系，右边这是船停泊时所用的器具，通常用铁制成。一端有两个或两个以上带倒钩的爪儿，另一端用铁链连在船上。停船时，会把带倒钩的一端抛到水底或岸边，用来稳定船舶。",
    "relation_cue": "锚是船上用来停泊固定的重要工具。当船需要停留在水面上不被冲走时，就需要把锚抛入水中。",
-   "image_id": null,
+   "image_id": "wk2-26",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:船+锚"
@@ -648,7 +648,7 @@
    "left_function_cue": "没关系，左边这是一种常见的用具，通常用毛、棕、塑料丝或金属丝等制成，可以用来清除脏物，也可以用来涂抹膏油等。它一般是长形或椭圆形，有的还带有柄。",
    "right_function_cue": "没关系，右边这是生活中常见的物品，通常穿在脚上，走路的时候会着地，可以保护我们的脚。",
    "relation_cue": "刷子是可以用来清除脏物的用具，鞋是穿在脚上、走路时着地的东西。鞋子脏了以后，可以用刷子把鞋面或鞋底上的脏东西刷干净。",
-   "image_id": null,
+   "image_id": "wk2-27",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:刷子+鞋"
@@ -662,7 +662,7 @@
    "left_function_cue": "没关系，左边这是一种昆虫，体表有很密的绒毛，前翅比后翅大。它们常常成群居住，工蜂能采花粉、酿蜜，还能帮助某些植物传粉，有些蜜蜂还有毒刺，能蜇人。",
    "right_function_cue": "没关系，右边这是种子植物的有性繁殖器官，通常由花瓣、花萼、花托、花蕊组成，有各种颜色，有的很艳丽，也有香味。",
    "relation_cue": "蜜蜂最喜欢停在花朵上，它们从花朵里采集花蜜来做蜂蜜，同时也能帮助花儿传授花粉。",
-   "image_id": null,
+   "image_id": "wk2-28",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:蜜蜂+花"
@@ -676,7 +676,7 @@
    "left_function_cue": "没关系，左边这是一种用来烫平衣物的金属器具，形状像斗。旧式熨斗中间可以烧木炭，新式熨斗一般用电发热。",
    "right_function_cue": "没关系，右边这是一种西式单上衣，可以穿在里面，也可以单独穿在外面。",
    "relation_cue": "当衬衫洗完变皱了之后，我们需要用加热后的熨斗在衬衫上推移，把上面的皱褶烫平整。",
-   "image_id": null,
+   "image_id": "wk2-29",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:熨斗+衬衫"
@@ -690,7 +690,7 @@
    "left_function_cue": "没关系，左边这是一种砍竹子、木头等用的金属工具，头部呈楔形，通常装有木柄。",
    "right_function_cue": "没关系，右边这是一种木本植物，是自然界中很常见的植物类型，通常有树干、树枝和树叶。",
    "relation_cue": "斧子是专门用来砍伐树木的工具。人们经常挥动斧子把大树砍倒，用来劈柴或者获取木材。",
-   "image_id": null,
+   "image_id": "wk2-30",
    "item_set_type": "训练集",
    "difficulty_level": null,
    "raw_source_ref": "week2:斧子+树"

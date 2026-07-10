@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session as DBSession
 
 import os
@@ -299,14 +300,27 @@ def live_put(body: LiveIn, s: DBSession = Depends(get_session)):
     slot = _LIVE_SLOT.get(body.kind)
     if not slot:
         raise HTTPException(422, f"未知 kind {body.kind!r}")
-    row = s.get(LiveState, 1) or LiveState(id=1, seq=0)
-    if body.kind == "session":
-        # 新场次握手 → 清掉旧游标/步进/录音回报,防老人端串到上一场
-        row.cursor_json = None; row.rapport_json = None; row.audio_json = None
-    setattr(row, slot, _json.dumps(body.payload, ensure_ascii=False))
-    row.seq += 1
-    row.updated_at = datetime.now()
-    s.add(row); s.commit(); s.refresh(row)
+
+    def apply(row: LiveState) -> LiveState:
+        if body.kind == "session":
+            # 新场次握手 → 清掉旧游标/步进/录音回报,防老人端串到上一场
+            row.cursor_json = None; row.rapport_json = None; row.audio_json = None
+        setattr(row, slot, _json.dumps(body.payload, ensure_ascii=False))
+        row.seq += 1
+        row.updated_at = datetime.now()
+        s.add(row)
+        return row
+
+    row = apply(s.get(LiveState, 1) or LiveState(id=1, seq=0))
+    try:
+        s.commit()
+    except IntegrityError:
+        # 空库首写竞态:两个并发 PUT 都没读到 id=1 单例行、双双 INSERT,后到者撞 UNIQUE。
+        # 回滚重取(此时行必已存在),在既有行上重放本次写。
+        s.rollback()
+        row = apply(s.get(LiveState, 1))
+        s.commit()
+    s.refresh(row)
     return {"seq": row.seq}
 
 

@@ -21,13 +21,13 @@
 | 前端 | `web/` Vite+React+TS:`/console` 操作端(建档→建场次→逐环节判分→收尾导出)+ `/patient` 老人端(大图大字/VOX录音);构建为纯静态 dist 由本服务同源托管 |
 | 同步 | 双通道:BroadcastChannel(同机秒推)+ `/live/state` 服务端轮询(**内网双设备可用**) |
 
-尚未接:真 ASR 引擎(待机构 GPU)· LLM 判分(阶段4,可关闭)· TTS · 题图(内容组回填,week≥2 真实采集的阻断项)。
+尚未接:真 ASR 引擎(待机构 GPU)· LLM 判分真引擎(阶段4,可关闭)。题图已回填(30 张,源=第二周训练内容 docx 内嵌插图,`web/public/img/wk2-*.webp`);多要素场景图两张因图内印有文字("动物园"/"公园")暂不可用,待内容组换图。
 
 ## 跑测试 / 开发
 
 ```bash
 cd platform
-./.venv/bin/python -m pytest              # 69 项(无 .venv 先: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt)
+./.venv/bin/python -m pytest              # 75 项(无 .venv 先: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt)
 cd web && npm run dev                     # 前端热更(另开 ./scripts/serve.sh 或 uvicorn 起后端)
 ```
 
