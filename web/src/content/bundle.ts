@@ -30,6 +30,15 @@ export interface ItemBankBundle {
   double_element: BankDoubleItem[];
 }
 
+export interface Week1Question { slot_field?: string; ask: string; success?: string }
+// speaker="研究者" 的节是当面话术(不进 TTS、不广播给老人端);speaker="机器人" 的节才由小语开口。
+export interface Week1Section {
+  key: string;
+  speaker: string;
+  note?: string;
+  questions?: Week1Question[];
+  line?: string;
+}
 export interface Week1Script {
   script_version_id: string;
   phase_type: string;
@@ -39,7 +48,20 @@ export interface Week1Script {
   slots: Record<string, unknown>;
   silence_seconds: number;
   generic_fallback_line: string;
-  sections: { section_key: string; title?: string; lines?: string[]; questions?: unknown[]; [k: string]: unknown }[];
+  sections: Week1Section[];
+}
+
+// fail-closed:脚本 JSON 与代码期望的字段错位曾静默把"自我介绍段打红线标记"整个绕过
+// (代码找 section_key,文件里是 key,tsc 因盲转型全绿)——加载时校验,缺字段直接拒用。
+function assertWeek1Shape(s: Week1Script): Week1Script {
+  if (!Array.isArray(s.sections) || s.sections.length === 0) throw new Error("week1 脚本无 sections");
+  for (const sec of s.sections) {
+    if (!sec.key || !sec.speaker) throw new Error(`week1 脚本节缺 key/speaker:${JSON.stringify(sec).slice(0, 80)}`);
+    if (sec.speaker === "机器人" && !sec.questions?.length && !sec.line) {
+      throw new Error(`week1 机器人节 ${sec.key} 既无 questions 也无 line`);
+    }
+  }
+  return s;
 }
 
 let bankCache: ItemBankBundle | null = null;
@@ -69,7 +91,7 @@ export function useWeek1Script(): { script: Week1Script | null; error: string | 
   useEffect(() => {
     if (scriptCache) return;
     fetchJson<Week1Script>("/content/week1_script.json")
-      .then((s) => { scriptCache = s; setScript(s); })
+      .then((s) => { const ok = assertWeek1Shape(s); scriptCache = ok; setScript(ok); })
       .catch((e) => setError(String(e)));
   }, []);
   return { script, error };
