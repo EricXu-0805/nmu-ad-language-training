@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../api";
 import { Button } from "../../components/Button";
 import { EnumSelect, Field, TextInput } from "../../components/Field";
@@ -6,7 +6,7 @@ import { StatusPill } from "../../components/StatusPill";
 import { useToast } from "../../components/Toast";
 import { assertVersionsMatch, findDouble, findSingle, lookupCue, useItemBankBundle } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
-import { useAudioSaved, useCursorWriter } from "../../sync/useCursorWriter";
+import { useAudioSaved, useCursorWriter, useSaveWatchdog } from "../../sync/useCursorWriter";
 import type { PlanItem, PlanTurn, Session, SessionPlan } from "../../types";
 import { assertPortraitFree, isRelationRole } from "./vm";
 
@@ -26,6 +26,9 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
   const [reviewerId, setReviewerId] = useState("R1");
   const [recordingAllowed, setRecordingAllowed] = useState<boolean | null>(true); // null=未评→仍允许提示录音
   const [recState, setRecState] = useState<"idle" | "armed">("idle");
+  const recSeq = useRef(0);
+  const watchdog = useSaveWatchdog(() =>
+    toast("8 秒未收到老人端录音回报——可能没录上(麦克风权限/网络)。请检查老人端后重新示意录音。", "danger"));
   const [cueLevel, setCueLevel] = useState<0 | 1 | 2 | 3>(0);      // 已发给老人端的线索等级(只升不降)
   const [savingTurn, setSavingTurn] = useState(false);
   // 当前环节工作态
@@ -72,21 +75,27 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
       turnId: jt?.turnId ?? null, asrText: jt?.asrText ?? "", confirmed: jt?.confirmedText ?? "", ai: null,
       locked: jt?.locked ?? false, savedAsr: jt?.asrSaved ?? false, savedConfirm: jt?.confirmed ?? false,
     });
+    if (recState === "armed") watchdog.start(); // 录音中直接跳题:老人端会自动收尾保存,回报也要有人等
     setRecState("idle");
     setCueLevel(0);
     setCursor(itemIdx, turnIdx);
-    postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: 0, recording: "idle" });
+    postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: 0, recording: "idle", recSeq: recSeq.current });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [itemIdx, turnIdx, plan]);
 
   // 老人端录完 → 建 turn 的音频入参在此暂存(按 turnKey)
-  useAudioSaved(useCallback((m) => {
+  useAudioSaved((m) => {
+    watchdog.clear();
     setPendingAudio((prev) => ({ ...prev, [m.turnKey]: { rawAudioId: m.rawAudioId, duration: m.durationSeconds } }));
     // 记入 journal.audios,收尾屏音频闸门才能列出并驱动导出/校验/信度/删除。
     upsertAudio(m.rawAudioId, { turnKey: m.turnKey, containsDirectIdentifier: false, isReliabilitySample: false, lastStatus: "recorded" });
+    if (recState === "armed" && planTurn) {
+      // 老人自己按"我说好了"停的:把 idle 写回镜像/服务端真值源,否则 armed 残留会让老人端刷新后自动开麦。
+      postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current });
+    }
     setRecState("idle");
     toast(`老人端录音已保存(${m.durationSeconds.toFixed(1)}s)`, "info");
-  }, [toast, upsertAudio]));
+  });
 
   const advance = () => {
     if (!plan || !item) return;
@@ -99,13 +108,15 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
   // 携带当前 cueLevel,录音启停不清老人端已显示的线索。
   const armRecording = () => {
     if (!planTurn) return;
+    recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
     setRecState("armed");
-    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "armed" });
+    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "armed", recSeq: recSeq.current });
   };
   const stopRecording = () => {
     if (!planTurn) return;
     setRecState("idle");
-    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "stopped" });
+    watchdog.start();
+    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "stopped", recSeq: recSeq.current });
   };
 
   // 发分级线索给老人端(0→3 只升不降;线索文本永远取自版本锁定题库,操作端不产话术)。
@@ -210,7 +221,8 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
             <label className="row" style={{ gap: 6 }}>
               <input type="checkbox" checked={aiEnabled} onChange={(e) => setAiEnabled(e.target.checked)} /> 动态 AI 初评
             </label>
-            <Button variant="ghost" onClick={onWrapup}>场次收尾 →</Button>
+            {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
+            <Button variant="ghost" onClick={() => { if (recState === "armed") stopRecording(); onWrapup(); }}>场次收尾 →</Button>
           </div>
         </div>
 

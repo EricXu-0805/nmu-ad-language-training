@@ -24,6 +24,24 @@ export function useCursorWriter() {
   return { postSession, postCursor, postRapport, resetSession };
 }
 
+// 停止录音后的回报看门狗:arm→真实开录之间没有回执,若超时没等到 audioSaved,
+// 说明这段可能是零字节(麦克风权限被拒/armed 消息丢失/arm-stop 间隔被轮询快照吞掉)——
+// 必须让研究者当场知道,而不是场次收尾时才发现"暂无登记音频"。
+export function useSaveWatchdog(onTimeout: () => void, ms = 8000) {
+  const timer = useRef<number | null>(null);
+  const cb = useRef(onTimeout);
+  cb.current = onTimeout;
+  const clear = useCallback(() => {
+    if (timer.current != null) { clearTimeout(timer.current); timer.current = null; }
+  }, []);
+  const start = useCallback(() => {
+    clear();
+    timer.current = window.setTimeout(() => { timer.current = null; cb.current(); }, ms);
+  }, [clear, ms]);
+  useEffect(() => clear, [clear]);
+  return { start, clear };
+}
+
 // 操作端订阅老人端录音回报:bus(同机)+ 服务端轮询(跨设备),按 rawAudioId 去重。
 export function useAudioSaved(handler: (m: AudioSavedMsg) => void): void {
   const seen = useRef<Set<string>>(new Set());

@@ -5,18 +5,38 @@ import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
 import { useToast } from "../components/Toast";
 import { useSessionJournal } from "../hooks/useSessionJournal";
+import { useAudioSaved } from "../sync/useCursorWriter";
 import { ratioPct } from "../lib/format";
-import type { AudioAsset, ExportResult, ScoreReconstruction, Session } from "../types";
+import type { AudioAsset, ExportResult, ScoreReconstruction, Session, SessionPlan } from "../types";
 
-// 场次收尾:评分只读重建 + 音频删除闸门 + 去标识导出。
+// 场次收尾:完整度计 + 评分只读重建 + 音频删除闸门 + 去标识导出。
 export function SessionWrapupScreen({ session }: { session: Session }) {
   const toast = useToast();
-  const { journal } = useSessionJournal(session.session_id);
+  const { journal, upsertAudio } = useSessionJournal(session.session_id);
+
+  // 接住迟到的录音回报:录音中点了"场次收尾",老人端保存发生在训练/关系屏卸载之后——
+  // 不接就成为音频闸门列不出的孤儿音频(DB 有行、本机有字节,却没人能走删除闸门)。
+  useAudioSaved((m) => {
+    if (journal.audios[m.rawAudioId]) return; // 轮询会重放最后一条回报:已记过的不算迟到
+    upsertAudio(m.rawAudioId, {
+      turnKey: m.turnKey,
+      containsDirectIdentifier: m.containsDirectIdentifier ?? false,
+      isReliabilitySample: false,
+      lastStatus: "recorded",
+    });
+    toast(`补记迟到录音:${m.rawAudioId.slice(0, 12)}…(已列入音频闸门)`, "info");
+  });
   const [scores, setScores] = useState<ScoreReconstruction | null>(null);
+  const [plan, setPlan] = useState<SessionPlan | null>(null);
   const [exp, setExp] = useState<ExportResult | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => { api.sessionScores(session.session_id).then(setScores).catch((e) => toast(String(e), "danger")); }, [session, toast]);
+  useEffect(() => { api.sessionPlan(session.session_id, session.week_no, session.event_line).then(setPlan).catch(() => setPlan(null)); }, [session]);
+
+  // 完整度:excluded_items 只列"已建未锁"的题;未动过的计划题要靠 plan 对照日志才可见。
+  const lockedTurns = Object.values(journal.turns).filter((t) => t.locked).length;
+  const untouched = (plan?.items ?? []).filter((it) => !journal.itemEvents[it.item_id]);
 
   async function doExport() {
     setBusy(true);
@@ -33,6 +53,25 @@ export function SessionWrapupScreen({ session }: { session: Session }) {
   return (
     <div className="col" style={{ maxWidth: 820 }}>
       <h2>场次收尾 · {session.session_id}</h2>
+
+      {plan && plan.total_turns > 0 && (
+        <div className="card col">
+          <h3>完整度</h3>
+          <div className="row wrap">
+            <StatusPill tone={lockedTurns >= plan.total_turns ? "ok" : "primary"}>
+              已锁定 {lockedTurns} / 计划 {plan.total_turns} 环节
+            </StatusPill>
+            <StatusPill tone={untouched.length === 0 ? "ok" : "danger"}>
+              未开始 {untouched.length} / {plan.total_items} 题
+            </StatusPill>
+          </div>
+          {untouched.length > 0 && (
+            <p className="muted" style={{ margin: 0 }}>
+              未开始:{untouched.map((it) => `${it.item_id}(${it.task_type})`).join("、")} —— 建议回训练屏完成后再导出。
+            </p>
+          )}
+        </div>
+      )}
 
       <div className="card col">
         <h3>过程性评分(从已锁定环节值重建 · 单一事实源)</h3>

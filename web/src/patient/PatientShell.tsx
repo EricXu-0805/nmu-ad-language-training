@@ -30,7 +30,7 @@ export function PatientShell() {
       </Centered>
     );
   } else if (session.mode === "rapport") {
-    body = <RapportStage rapportStep={rapportStep} />;
+    body = <RapportStage rapportStep={rapportStep} sessionId={session.sessionId} />;
   } else {
     body = <PatientStage plan={plan} cursor={cursor} sessionId={session.sessionId} />;
   }
