@@ -23,6 +23,40 @@ if [ ! -d web/dist ] && command -v npm >/dev/null 2>&1; then
 fi
 [ -d web/dist ] || echo "⚠️ 无 web/dist(纯 API 模式);要带界面请先在有 node 的机器上构建后拷入"
 
+# 后台起服务 → 探测真正监听后才报地址(横幅先于就绪打印会诱导过早开浏览器→连接被拒);
+# 单机模式就绪后自动开两窗(macOS;NO_OPEN=1 关闭)。Ctrl-C 正常退出并带走服务进程。
+run_server() { # $1=探测URL $2=就绪后要打印/打开的说明,其余=uvicorn 参数
+  local probe="$1" ready_msg="$2"; shift 2
+  if curl -sk -o /dev/null "$probe" 2>/dev/null; then
+    echo "✗ 端口上已有服务在跑(多半是上一个 serve.sh 没关)。"
+    echo "  先到旧窗口按 Ctrl-C,或执行: pkill -f app.main:app  再重新启动。"
+    exit 1
+  fi
+  ./.venv/bin/uvicorn "$@" &
+  local srv=$!
+  trap 'kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null; exit 0' INT TERM
+  for _ in $(seq 1 120); do
+    if ! kill -0 "$srv" 2>/dev/null; then
+      echo "✗ 服务启动失败(常见:端口被占,查 lsof -i :${probe##*:} 的端口段;或看上方报错)"
+      exit 1
+    fi
+    if curl -sk -o /dev/null "$probe" 2>/dev/null; then
+      echo "════════════════════════════════════════"
+      echo "✓ 服务已就绪"
+      printf '%b\n' "$ready_msg"
+      echo "  (停止:本窗口按 Ctrl-C)"
+      echo "════════════════════════════════════════"
+      if [ "${INTRANET:-0}" != "1" ] && [ "${NO_OPEN:-0}" != "1" ] && command -v open >/dev/null 2>&1; then
+        open "http://127.0.0.1:8000/console"
+        open "http://127.0.0.1:8000/patient"
+      fi
+      break
+    fi
+    sleep 0.5
+  done
+  wait "$srv"
+}
+
 if [ "${INTRANET:-0}" = "1" ]; then
   # 3a) 内网双设备:PIN 门(病房 WiFi 里任何设备都不得裸操作写接口)+ 自签证书 + https
   if [ -z "${CONSOLE_PIN:-}" ]; then
@@ -35,18 +69,20 @@ if [ "${INTRANET:-0}" = "1" ]; then
   echo "════════════════════════════════════════"
   CERT_DIR=data/certs
   mkdir -p "$CERT_DIR"
+  HOST_IP=$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo 127.0.0.1)
   if [ ! -f "$CERT_DIR/server.crt" ]; then
-    HOST_IP=$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo 127.0.0.1)
     echo "生成自签证书(CN=$HOST_IP,10 年,仅内网用)…"
     openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
       -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" \
       -subj "/CN=$HOST_IP" -addext "subjectAltName=IP:$HOST_IP,DNS:localhost" >/dev/null 2>&1
-    echo "平板访问: https://$HOST_IP:8443/patient  (首次需信任自签证书)"
   fi
-  exec ./.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8443 \
+  run_server "https://127.0.0.1:8443/patient" \
+    "  操作电脑: https://$HOST_IP:8443/console\n  平板:     https://$HOST_IP:8443/patient(首次需信任自签证书)" \
+    app.main:app --host 0.0.0.0 --port 8443 \
     --ssl-keyfile "$CERT_DIR/server.key" --ssl-certfile "$CERT_DIR/server.crt"
 else
   # 3b) 单机双窗:只听本机回环
-  echo "操作端: http://127.0.0.1:8000/console   老人端: http://127.0.0.1:8000/patient"
-  exec ./.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+  run_server "http://127.0.0.1:8000/patient" \
+    "  操作端: http://127.0.0.1:8000/console\n  老人端: http://127.0.0.1:8000/patient(已自动打开;NO_OPEN=1 可关)" \
+    app.main:app --host 127.0.0.1 --port 8000
 fi
