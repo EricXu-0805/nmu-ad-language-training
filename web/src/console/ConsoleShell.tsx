@@ -23,16 +23,22 @@ export function ConsoleShell() {
 
   return (
     <ToastProvider>
-      <div className="col" style={{ padding: "var(--sp-5)", gap: "var(--sp-4)" }}>
-        <header className="row" style={{ justifyContent: "space-between" }}>
-          <strong>语言沟通训练 · 操作端</strong>
-          <div className="row">
-            {patientId && <Button onClick={() => setScaleOpen(true)}>量表录入</Button>}
-            {state.session && <Button onClick={() => setAbnormalOpen(true)}>记录异常/介入</Button>}
-            <Button onClick={() => dispatch({ t: "reset" })}>新受试者</Button>
+      <header className="app-header">
+        <div className="app-brand">
+          <div className="app-brand-mark" aria-hidden>语</div>
+          <div className="col" style={{ gap: 0 }}>
+            <strong>语言沟通训练系统</strong>
+            <span className="muted" style={{ fontSize: "0.82em" }}>操作端 · 研究者专用</span>
           </div>
-        </header>
+        </div>
+        <div className="row">
+          {patientId && <Button onClick={() => setScaleOpen(true)}>量表录入</Button>}
+          {state.session && <Button onClick={() => setAbnormalOpen(true)}>记录异常/介入</Button>}
+          <Button onClick={() => dispatch({ t: "reset" })}>新受试者</Button>
+        </div>
+      </header>
 
+      <div className="app-main">
         {state.session && <SessionContextBar sessionId={state.session.session_id} patientId={state.session.patient_id}
           weekNo={state.session.week_no} phase={state.session.phase_type} eventLine={state.session.event_line} version={state.session.item_bank_version_id} />}
 

@@ -43,7 +43,8 @@ INTRANET=1 ./scripts/serve.sh             # 内网双设备:0.0.0.0:8443 + 自�
 - 启动自动 `alembic upgrade head`(幂等);schema 变更一律走 `alembic revision --autogenerate`,**真机严禁删库重建**。
 - 内网模式必须 https:平板浏览器麦克风(getUserMedia)仅在 secure context 开放。证书/私钥在 `data/certs/`(gitignored),不外发。
 - 换 PostgreSQL:改 `app/db.py` 的 URL + `alembic upgrade head`。
-- **语音 SOP**:老人端页面打开后先触摸屏幕任意处一次(浏览器要求用户激活后才放行朗读;刷新后需再触摸一次);示意录音前等小语把问句读完,减少机器人声音进研究音频(朗读时刻已记入本机审计日志 `nmu:tts:log`,分析侧可剔除)。小语只用**本机**中文语音包(无则静音,绝不落到联网语音);备份用 `./scripts/backup.sh`(可 `BACKUP_DIR=` 指到院内加密移动盘)。
+- **语音 SOP**:老人端页面打开后先触摸屏幕任意处一次(浏览器要求用户激活后才放行朗读;刷新后需再触摸一次);示意录音前等小语把问句读完,减少机器人声音进研究音频(朗读时刻已记入本机审计日志 `nmu:tts:log`,分析侧可剔除)。小语只用**本机**中文语音包(无则静音,绝不落到联网语音——云 TTS 意味着文本出机器,禁止)。
+- **音色**:自动优先婷婷(macOS)/晓晓·慧慧(Windows)等标准普通话音色,降权 Eddy/Flo 等玩具音色,排除粤语/台湾腔优先级。macOS 想更好听:系统设置→辅助功能→朗读内容→系统声音→管理声音→下载"婷婷(高级)"。点老人端 🔊 即试听当前音色(悬停显示音色名);要钉死某音色,在老人端浏览器控制台执行 `localStorage.setItem("nmu:tts:voice", "音色名")`。备份用 `./scripts/backup.sh`(可 `BACKUP_DIR=` 指到院内加密移动盘)。
 
 ## 不可触碰的硬约束(提测逐条对)
 

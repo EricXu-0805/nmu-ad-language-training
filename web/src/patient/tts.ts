@@ -7,6 +7,7 @@
 
 let enabled = localStorage.getItem("nmu:tts") !== "off";
 let pending: { text: string; tag: string } | null = null;
+let lastText: { text: string; tag: string } | null = null; // 最近一次屏显文本(试听重读用,读的仍是屏上原文)
 
 export function ttsEnabled(): boolean { return enabled; }
 export function setTtsEnabled(on: boolean): void {
@@ -26,16 +27,35 @@ function audit(ev: string, tag: string, text: string): void {
   } catch { /* 审计失败不影响朗读 */ }
 }
 
-// 普通话优先:zh-CN/cmn > 其他 zh(macOS 常见 Meijia zh-TW / Sinji zh-HK 粤语排在婷婷前,
-// 取"第一个 zh"可能给南京老人读粤语)。仍严格限 localService。
+// 选声:严格限 localService;普通话(zh-CN/cmn)优先于 zh-TW/zh-HK(防给南京老人读粤语);
+// 同为 zh-CN 再按质量排——macOS 把 Eddy/Flo/Grandma 等"玩具音色"也标成 zh-CN 本机语音,
+// 枚举序还常排在婷婷前,不降权就会选中怪声(真机已踩中,被当成"不是普通话")。
+const NOVELTY_VOICES = new Set([
+  "Albert", "Bad News", "Bahh", "Bells", "Boing", "Bubbles", "Cellos", "Eddy", "Flo", "Fred",
+  "Good News", "Grandma", "Grandpa", "Jester", "Junior", "Kathy", "Organ", "Ralph", "Reed",
+  "Rocko", "Sandy", "Shelley", "Superstar", "Trinoids", "Whisper", "Wobble", "Zarvox",
+]);
+// 已知的高质量中文音色(macOS 婷婷;Windows 晓晓/慧慧/康康/瑶瑶),命中即置顶
+const PREFERRED_VOICES = ["婷婷", "Tingting", "Ting-Ting", "晓晓", "Xiaoxiao", "慧慧", "Huihui", "瑶瑶", "Yaoyao", "康康", "Kangkang"];
+
 function pickLocalZhVoice(): SpeechSynthesisVoice | null {
   const norm = (l: string) => l.replace("_", "-").toLowerCase();
+  const pinned = localStorage.getItem("nmu:tts:voice"); // 研究者可钉死某音色(设备本地)
   const vs = window.speechSynthesis.getVoices().filter((v) => v.localService && (norm(v.lang).startsWith("zh") || norm(v.lang).startsWith("cmn")));
   const score = (v: SpeechSynthesisVoice) => {
+    if (pinned && v.name === pinned) return -1;
     const l = norm(v.lang);
-    return l.startsWith("zh-cn") || l.startsWith("cmn") ? 0 : l.startsWith("zh-tw") ? 1 : 2;
+    const langBase = l.startsWith("zh-cn") || l.startsWith("cmn") ? 0 : l.startsWith("zh-tw") ? 40 : 60;
+    const base = v.name.split(" (")[0].trim();
+    const nameAdj = PREFERRED_VOICES.some((p) => v.name.includes(p)) ? 0 : NOVELTY_VOICES.has(base) ? 20 : 10;
+    return langBase + nameAdj;
   };
-  return vs.sort((a, b) => score(a) - score(b))[0] ?? null;
+  return [...vs].sort((a, b) => score(a) - score(b))[0] ?? null;
+}
+
+export function currentVoiceName(): string | null {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return null;
+  return pickLocalZhVoice()?.name ?? null;
 }
 
 function utter(text: string, tag: string): void {
@@ -46,7 +66,7 @@ function utter(text: string, tag: string): void {
   u.lang = voice.lang;
   u.rate = 0.85;   // 老人节奏:略慢
   u.volume = 1;
-  u.onstart = () => audit("start", tag, text);
+  u.onstart = () => audit(`start@${voice.name}`, tag, text);
   u.onend = () => { audit("end", tag, text); if (pending?.text === text) pending = null; };
   u.onerror = (e) => audit(`error:${e.error}`, tag, text); // not-allowed 等留 pending,触屏后补读
   window.speechSynthesis.speak(u);
@@ -55,11 +75,22 @@ function utter(text: string, tag: string): void {
 // enqueue=false(默认):打断当前朗读换新话(换环节/换话术)。
 // enqueue=true:排在当前朗读之后(线索——恢复/跳题场景问句与线索同帧到达,不许线索掐掉问句)。
 export function speak(text: string, opts?: { tag?: string; enqueue?: boolean }): void {
-  if (!enabled || !text || typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  if (typeof window === "undefined" || !("speechSynthesis" in window) || !text) return;
+  lastText = { text, tag: opts?.tag ?? "" };
+  if (!enabled) return;
   const tag = opts?.tag ?? "";
   pending = { text, tag };
   if (!opts?.enqueue) window.speechSynthesis.cancel();
   utter(text, tag);
+}
+
+// 试听:重读当前屏显文本(开关打开那一下既给了用户激活,也当场验证音色/音量)。
+// 无屏显历史时读"您好"——老人端待机屏上的原文。
+export function speakSample(): void {
+  const t = lastText ?? { text: "您好", tag: "sample" };
+  pending = t;
+  window.speechSynthesis.cancel();
+  utter(t.text, t.tag);
 }
 
 export function stopSpeaking(): void {

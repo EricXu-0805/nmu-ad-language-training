@@ -6,7 +6,7 @@ import type { SessionPlan } from "../types";
 import { Centered } from "./Centered";
 import { PatientStage } from "./PatientStage";
 import { RapportStage } from "./RapportStage";
-import { setTtsEnabled, ttsEnabled } from "./tts";
+import { currentVoiceName, setTtsEnabled, speakSample, ttsEnabled } from "./tts";
 
 // 老人端外壳:只读订阅游标的哑显示器。从不自主推进/判分/写游标。
 // 无 session 超时、无自动黑屏、对沉默与错误宽容(永不报错、永不闪红)。
@@ -39,15 +39,21 @@ export function PatientShell() {
 }
 
 // 语音开关(设备本地设置,研究者代点):角落小钮,不进老人的视觉主线。
+// 点开即试读当前屏显文本——既给浏览器用户激活,也当场听到用的是哪个音色。
 function TtsToggle() {
   const [on, setOn] = useState(ttsEnabled());
   return (
     <button
       type="button"
+      className="tts-toggle"
       aria-label={on ? "关闭语音" : "开启语音"}
-      onClick={() => { setTtsEnabled(!on); setOn(!on); }}
-      style={{ position: "fixed", top: 12, right: 12, minWidth: 56, minHeight: 56, fontSize: 28,
-        borderRadius: "50%", border: "1px solid var(--c-line)", background: "var(--c-surface)", opacity: 0.65 }}
+      title={`语音${on ? "开" : "关"}${currentVoiceName() ? ` · 音色:${currentVoiceName()}` : " · 本机无中文语音"}`}
+      onClick={() => {
+        const next = !on;
+        setTtsEnabled(next);
+        setOn(next);
+        if (next) speakSample();
+      }}
     >
       {on ? "🔊" : "🔇"}
     </button>
