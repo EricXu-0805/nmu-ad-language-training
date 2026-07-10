@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useState } from "react";
 import { Button } from "../components/Button";
+import { PinPrompt } from "../components/PinPrompt";
 import { StatusPill } from "../components/StatusPill";
 import { ToastProvider } from "../components/Toast";
 import { AbnormalDrawer } from "./abnormal/AbnormalDrawer";
@@ -49,6 +50,7 @@ export function ConsoleShell() {
           open={abnormalOpen} onClose={() => setAbnormalOpen(false)} />
       )}
       {patientId && <ScaleDrawer patientId={patientId} open={scaleOpen} onClose={() => setScaleOpen(false)} />}
+      <PinPrompt />
     </ToastProvider>
   );
 }

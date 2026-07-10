@@ -16,15 +16,30 @@ export class ApiError extends Error {
   }
 }
 
+// 操作端 PIN(内网双设备模式,后端设 CONSOLE_PIN 才启用)。两端各输一次,存本机。
+const PIN_KEY = "nmu:pin";
+export const getPin = (): string | null => { try { return localStorage.getItem(PIN_KEY); } catch { return null; } };
+export const setPin = (p: string): void => localStorage.setItem(PIN_KEY, p);
+export const PIN_REQUIRED_EVENT = "nmu:pin-required";
+
+function pinHeader(): Record<string, string> {
+  const p = getPin();
+  return p ? { "X-Console-Pin": p } : {};
+}
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
-    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+    headers: {
+      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      ...pinHeader(),
+    },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
+    if (res.status === 401) window.dispatchEvent(new Event(PIN_REQUIRED_EVENT));
     const detail = data && typeof data === "object" && "detail" in data ? String(data.detail) : text;
     throw new ApiError(res.status, detail);
   }
@@ -89,9 +104,12 @@ export const api = {
   uploadAudioBlob: async (id: string, blob: Blob) => {
     const res = await fetch(`/audio/${encodeURIComponent(id)}/blob`, {
       method: "PUT", body: blob,
-      headers: { "Content-Type": blob.type || "audio/webm" },
+      headers: { "Content-Type": blob.type || "audio/webm", ...pinHeader() },
     });
-    if (!res.ok) throw new ApiError(res.status, await res.text());
+    if (!res.ok) {
+      if (res.status === 401) window.dispatchEvent(new Event(PIN_REQUIRED_EVENT));
+      throw new ApiError(res.status, await res.text());
+    }
     return res.json() as Promise<{ raw_audio_id: string; bytes: number; checksum: string; format: string }>;
   },
   audioBlobUrl: (id: string) => `/audio/${encodeURIComponent(id)}/blob`,

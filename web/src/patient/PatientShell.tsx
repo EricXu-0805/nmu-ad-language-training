@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { PinPrompt } from "../components/PinPrompt";
 import { useLiveCursor } from "../sync/useLiveCursor";
 import type { SessionPlan } from "../types";
 import { Centered } from "./Centered";
@@ -20,18 +21,18 @@ export function PatientShell() {
     api.sessionPlan(session.sessionId, session.weekNo, session.eventLine).then(setPlan).catch(() => setPlan(null));
   }, [session?.sessionId, session?.weekNo, session?.eventLine]);
 
+  let body: React.ReactNode;
   if (!session) {
-    return (
+    body = (
       <Centered>
         <div className="target">您好</div>
         <p className="question">准备好了我们就开始</p>
       </Centered>
     );
+  } else if (session.mode === "rapport") {
+    body = <RapportStage rapportStep={rapportStep} />;
+  } else {
+    body = <PatientStage plan={plan} cursor={cursor} sessionId={session.sessionId} />;
   }
-
-  if (session.mode === "rapport") {
-    return <RapportStage rapportStep={rapportStep} />;
-  }
-
-  return <PatientStage plan={plan} cursor={cursor} sessionId={session.sessionId} />;
+  return <>{body}<PinPrompt /></>;
 }

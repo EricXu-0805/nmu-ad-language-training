@@ -1,4 +1,7 @@
 // 展示格式化。评分只作展示,真值永远在后端锁定分/重建函数。
+// ratioPct:0–1 比率 → 百分比(naming_accuracy 等);pct:已是百分制的数(weekly_de_score_percentile)。
+export const ratioPct = (x: number | null | undefined): string =>
+  x == null ? "—" : `${(x * 100).toFixed(1)}%`;
 export const pct = (x: number | null | undefined): string =>
   x == null ? "—" : `${(x as number).toFixed(1)}%`;
 

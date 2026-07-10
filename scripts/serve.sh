@@ -24,7 +24,15 @@ fi
 [ -d web/dist ] || echo "⚠️ 无 web/dist(纯 API 模式);要带界面请先在有 node 的机器上构建后拷入"
 
 if [ "${INTRANET:-0}" = "1" ]; then
-  # 3a) 内网双设备:自签证书(仅首次生成)+ https 监听所有网卡
+  # 3a) 内网双设备:PIN 门(病房 WiFi 里任何设备都不得裸操作写接口)+ 自签证书 + https
+  if [ -z "${CONSOLE_PIN:-}" ]; then
+    CONSOLE_PIN=$(( (RANDOM % 900000) + 100000 ))
+  fi
+  export CONSOLE_PIN
+  echo "════════════════════════════════════════"
+  echo "  操作端 PIN: $CONSOLE_PIN"
+  echo "  (两端首次写操作时输入;固定 PIN 可用 CONSOLE_PIN=xxxxxx 启动)"
+  echo "════════════════════════════════════════"
   CERT_DIR=data/certs
   mkdir -p "$CERT_DIR"
   if [ ! -f "$CERT_DIR/server.crt" ]; then

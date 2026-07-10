@@ -12,12 +12,13 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session as DBSession
 
+import os
 from datetime import datetime
 
 from fastapi import Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-from . import asr, audio_gate, audio_store, content, export, judging, rule_judge, runtime, scoring
+from . import asr, audio_gate, audio_store, content, export, judging, llm_judge, rule_judge, runtime, scoring
 from .db import engine, get_session, init_db
 from .enums import AudioStatus
 from .models import AbnormalEvent, AudioAssetRow, ItemEvent, LiveState, Patient, ScaleResult, TurnEvent
@@ -31,6 +32,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="南医大 · AI 语言沟通训练系统", version="0.0.1", lifespan=lifespan)
+
+
+# ---------------- 操作端 PIN 门(内网双设备模式)----------------
+# 设 CONSOLE_PIN 环境变量即启用:一切写操作(POST/PUT/PATCH/DELETE)须带 X-Console-Pin。
+# 单机模式不设即零打扰。读操作(GET)不拦——老人端轮询 /live/state 无需先输 PIN。
+# 两端都由研究者开机配置(平板也输一次,存 localStorage),故统一拦全部写口、不留白名单。
+@app.middleware("http")
+async def console_pin_guard(request: Request, call_next):
+    pin = os.environ.get("CONSOLE_PIN")
+    if pin and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        if request.headers.get("x-console-pin") != pin:
+            return JSONResponse(status_code=401,
+                                content={"detail": "需要操作端 PIN(请求头 X-Console-Pin)"})
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -440,10 +455,19 @@ def ai_judge_turn(turn_id: int, s: DBSession = Depends(get_session)):
         upper_terms=tuple(bi.get("upper_terms", []) or []),
         dialect_synonyms=tuple(bi.get("dialect_synonyms", []) or []),
         asr_text=t.asr_text, confirmed_response_text=t.confirmed_response_text)
-    res = rule_judge.judge_rule_based(ji)
-    t.ai_answer_type = res.answer_type.value if res.answer_type else res.interaction_state
-    t.ai_score = res.ai_score
-    t.ai_needs_review = res.ai_needs_review
+    # 后端二(LLM,默认 off)优先尝试;不可用/未启用 → 回退后端一(规则确定式)。两者都只产初评。
+    lj = llm_judge.get_engine().judge(ji)
+    if lj is not None:
+        t.ai_answer_type = lj.answer_type.value
+        t.ai_score = lj.ai_score
+        t.ai_needs_review = lj.ai_needs_review
+        t.ai_judge_mode = "LLM辅助"
+    else:
+        res = rule_judge.judge_rule_based(ji)
+        t.ai_answer_type = res.answer_type.value if res.answer_type else res.interaction_state
+        t.ai_score = res.ai_score
+        t.ai_needs_review = res.ai_needs_review
+        t.ai_judge_mode = "规则确定式"
     t.judge_portrait_used = False
     s.add(t); s.commit(); s.refresh(t)
     return t

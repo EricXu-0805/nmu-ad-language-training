@@ -21,12 +21,14 @@ export function TextInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
 }
 
 // 从冻结枚举渲染下拉;禁止本地私造取值。空选项 = 未填(nullable 一等公民)。
-export function EnumSelect({ options, value, onChange, placeholder = "（未选）", disabled }: {
+// allowEmpty=false 用于必有值的场景(如提示等级默认 0),不渲染占位空选项。
+export function EnumSelect({ options, value, onChange, placeholder = "（未选）", disabled, allowEmpty = true }: {
   options: readonly string[];
   value: string | null | undefined;
   onChange: (v: string | null) => void;
   placeholder?: string;
   disabled?: boolean;
+  allowEmpty?: boolean;
 }) {
   return (
     <select
@@ -35,7 +37,7 @@ export function EnumSelect({ options, value, onChange, placeholder = "（未选�
       onChange={(e) => onChange(e.target.value === "" ? null : e.target.value)}
       style={inputStyle}
     >
-      <option value="">{placeholder}</option>
+      {allowEmpty && <option value="">{placeholder}</option>}
       {options.map((o) => <option key={o} value={o}>{o}</option>)}
     </select>
   );

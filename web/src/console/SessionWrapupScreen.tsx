@@ -5,7 +5,7 @@ import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
 import { useToast } from "../components/Toast";
 import { useSessionJournal } from "../hooks/useSessionJournal";
-import { pct } from "../lib/format";
+import { ratioPct } from "../lib/format";
 import type { AudioAsset, ExportResult, ScoreReconstruction, Session } from "../types";
 
 // 场次收尾:评分只读重建 + 音频删除闸门 + 去标识导出。
@@ -39,9 +39,9 @@ export function SessionWrapupScreen({ session }: { session: Session }) {
         {!scores ? <p>加载中…</p> : (
           <>
             <div className="wrap">
-              <ScoreCard title="单要素" summary={scores.single} metric="naming_accuracy" fmt={pct} />
-              <ScoreCard title="双要素" summary={scores.double} metric="weekly_de_score_percentile" />
-              <ScoreCard title="多要素" summary={scores.multi} metric="weekly_me_score_percentile" />
+              <ScoreCard title="单要素命名正确率" summary={scores.single} metric="naming_accuracy" fmt={ratioPct} />
+              <ScoreCard title="双要素周得分(百分制)" summary={scores.double} metric="weekly_de_score_percentile" />
+              <ScoreCard title="多要素关键要素率" summary={scores.multi} metric="weekly_me_score_percentile" />
             </div>
             {scores.excluded_items.length > 0 && (
               <div className="card" style={{ background: "var(--c-warn-bg)", border: "1px solid var(--c-warn)", color: "var(--c-warn)" }}>

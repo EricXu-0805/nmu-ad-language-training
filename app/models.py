@@ -90,6 +90,7 @@ class TurnEvent(SQLModel, table=True):
     ai_answer_type: Optional[str] = None
     ai_score: Optional[float] = None
     ai_needs_review: Optional[bool] = None
+    ai_judge_mode: Optional[str] = None          # 规则确定式 / LLM辅助（JudgingMode,审计用）
     judge_portrait_used: bool = False            # 恒 False，审计用
     # 人工锁定评分（研究数据默认取此）
     reviewer_id: Optional[str] = None

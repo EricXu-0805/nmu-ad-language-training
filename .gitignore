@@ -9,3 +9,4 @@ web/dist/
 web/.vite/
 # public/content 为构建期从 platform/content 同步的副本,不入库(由 prebuild 生成)
 web/public/content/
+.gstack/

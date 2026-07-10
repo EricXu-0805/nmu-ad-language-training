@@ -4,7 +4,7 @@ import { Button } from "../../components/Button";
 import { EnumSelect, Field, TextInput } from "../../components/Field";
 import { StatusPill } from "../../components/StatusPill";
 import { useToast } from "../../components/Toast";
-import { assertVersionsMatch, findDouble, findSingle, useItemBankBundle } from "../../content/bundle";
+import { assertVersionsMatch, findDouble, findSingle, lookupCue, useItemBankBundle } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
 import { useAudioSaved, useCursorWriter } from "../../sync/useCursorWriter";
 import type { PlanItem, PlanTurn, Session, SessionPlan } from "../../types";
@@ -26,6 +26,7 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
   const [reviewerId, setReviewerId] = useState("R1");
   const [recordingAllowed, setRecordingAllowed] = useState<boolean | null>(true); // null=未评→仍允许提示录音
   const [recState, setRecState] = useState<"idle" | "armed">("idle");
+  const [cueLevel, setCueLevel] = useState<0 | 1 | 2 | 3>(0);      // 已发给老人端的线索等级(只升不降)
   const [savingTurn, setSavingTurn] = useState(false);
   // 当前环节工作态
   const [work, setWork] = useState<WorkState>(emptyWork());
@@ -72,6 +73,7 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
       locked: jt?.locked ?? false, savedAsr: jt?.asrSaved ?? false, savedConfirm: jt?.confirmed ?? false,
     });
     setRecState("idle");
+    setCueLevel(0);
     setCursor(itemIdx, turnIdx);
     postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: 0, recording: "idle" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -94,15 +96,24 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
   };
 
   // 示意老人端录音(VOX):arm→老人端自动开始录音;stop→老人端停止并保存后回传 audioSaved。
+  // 携带当前 cueLevel,录音启停不清老人端已显示的线索。
   const armRecording = () => {
     if (!planTurn) return;
     setRecState("armed");
-    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: 0, recording: "armed" });
+    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "armed" });
   };
   const stopRecording = () => {
     if (!planTurn) return;
     setRecState("idle");
-    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: 0, recording: "stopped" });
+    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "stopped" });
+  };
+
+  // 发分级线索给老人端(0→3 只升不降;线索文本永远取自版本锁定题库,操作端不产话术)。
+  const sendCue = (level: 1 | 2 | 3) => {
+    if (!planTurn || level <= cueLevel) return;
+    setCueLevel(level);
+    postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role,
+                 cueLevel: level, recording: recState === "armed" ? "armed" : "idle" });
   };
 
   async function ensureItemEvent(): Promise<number | null> {
@@ -212,6 +223,12 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
 
             <ItemReference item={item} bundle={bundle} />
 
+            {/* 分级线索(0→3 只升不降;内容取版本锁定题库,推老人端显示) */}
+            {!work.locked && (
+              <CueButtons bundle={bundle} itemId={item.item_id} taskType={item.task_type}
+                role={planTurn.response_role} cueLevel={cueLevel} onSend={sendCue} />
+            )}
+
             {/* 录音示意(老人端 VOX) */}
             <div className="row wrap" style={{ alignItems: "center" }}>
               {recordingAllowed === false ? (
@@ -272,7 +289,8 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
 
             {/* 阶段D 人工锁分 */}
             {work.savedAsr && !work.locked && (
-              <LockControl key={turnK} taskType={item.task_type} role={planTurn.response_role} onLock={doLock} />
+              <LockControl key={turnK} taskType={item.task_type} role={planTurn.response_role}
+                suggestedPromptLevel={cueLevel} onLock={doLock} />
             )}
             {work.locked && <div className="row"><StatusPill tone="ok">✓ 本环节锁定分已写入</StatusPill><Button variant="primary" onClick={advance}>下一环节 →</Button></div>}
           </div>
@@ -342,10 +360,51 @@ function ItemReference({ item, bundle }: { item: PlanItem; bundle: ReturnType<ty
   return null;
 }
 
+// ---------------- 分级线索控件(推老人端;文本只来自题库,缺文本禁发) ----------------
+function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
+  bundle: ReturnType<typeof useItemBankBundle>["bundle"];
+  itemId: string; taskType: string; role: string;
+  cueLevel: 0 | 1 | 2 | 3; onSend: (level: 1 | 2 | 3) => void;
+}) {
+  // 单要素命名:三级;双要素 作用/关系:一级(题库仅一条角色线索);其余无预置线索。
+  const levels: { level: 1 | 2 | 3; label: string }[] =
+    taskType === "单要素"
+      ? [{ level: 1, label: "发线索1" }, { level: 2, label: "发线索2" }, { level: 3, label: "告知答案" }]
+      : taskType === "双要素" && (role.includes("作用") || role === "关系识别")
+        ? [{ level: 1, label: "发线索" }]
+        : [];
+  if (levels.length === 0) return null;
+  const current = lookupCue(bundle, itemId, taskType, role, cueLevel);
+  return (
+    <div className="card col" style={{ background: "var(--c-bg)", gap: "var(--sp-2)" }}>
+      <div className="row wrap">
+        <strong>线索(当前 {cueLevel} 级)</strong>
+        {levels.map(({ level, label }) => {
+          const text = lookupCue(bundle, itemId, taskType, role, level);
+          return (
+            <Button key={level} disabled={level <= cueLevel || text == null}
+              title={text == null ? "题库缺此级线索文本(待内容组补)" : undefined}
+              onClick={() => onSend(level)}>
+              {label}{text == null ? "(缺文本)" : ""}
+            </Button>
+          );
+        })}
+      </div>
+      {current && <p className="muted" style={{ fontSize: "0.9em" }}>老人端正显示:{current}</p>}
+    </div>
+  );
+}
+
 // ---------------- 按角色切换的锁分控件 ----------------
-function LockControl({ taskType, role, onLock }: { taskType: string; role: string; onLock: (v: number, promptLevel?: number) => void }) {
-  const [promptLevel, setPromptLevel] = useState<string | null>("0");
+function LockControl({ taskType, role, suggestedPromptLevel = 0, onLock }: {
+  taskType: string; role: string; suggestedPromptLevel?: number;
+  onLock: (v: number, promptLevel?: number) => void;
+}) {
+  const [promptLevel, setPromptLevel] = useState<string | null>(String(suggestedPromptLevel));
   const [confirmVal, setConfirmVal] = useState<{ v: number; label: string } | null>(null);
+
+  // 线索升级发生在锁分之后填的场景:跟随建议(研究者仍可改)。
+  useEffect(() => { setPromptLevel(String(suggestedPromptLevel)); }, [suggestedPromptLevel]);
 
   const relation = isRelationRole(role);
   const single = taskType === "单要素";
@@ -359,7 +418,7 @@ function LockControl({ taskType, role, onLock }: { taskType: string; role: strin
       <strong>④ 人工锁分(研究数据真值 · 一旦锁定不可改)</strong>
       {single && (
         <Field label="提示等级 prompt_level(0 自发 / 1 轻提示 / 2 明确或语音 / 3 告知答案)">
-          <EnumSelect options={["0", "1", "2", "3"]} value={promptLevel} onChange={setPromptLevel} placeholder="0" />
+          <EnumSelect options={["0", "1", "2", "3"]} value={promptLevel} onChange={setPromptLevel} allowEmpty={false} />
         </Field>
       )}
       <div className="row wrap">

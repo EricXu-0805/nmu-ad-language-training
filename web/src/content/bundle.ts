@@ -80,6 +80,30 @@ export const findSingle = (b: ItemBankBundle, itemId: string): BankSingleItem | 
 export const findDouble = (b: ItemBankBundle, itemId: string): BankDoubleItem | undefined =>
   b.double_element.find((x) => x.item_id === itemId);
 
+// 线索查表(纯,两端共用):单要素 1→cues1 / 2→cues2 / 3→tell_answer;
+// 双要素 作用→left/right_function_cue、关系→relation_cue(等级≥1 即显,双要素无多级)。
+// 只接 string|null,无任何拼接兜底——null 渲染空,交研究者决定升级。
+export function lookupCue(bundle: ItemBankBundle | null, itemId: string, taskType: string,
+                          role: string, level: number): string | null {
+  if (!bundle || level < 1) return null;
+  if (taskType === "单要素") {
+    const s = findSingle(bundle, itemId);
+    if (!s) return null;
+    if (level === 1) return s.cues["1"]?.text ?? null;
+    if (level === 2) return s.cues["2"]?.text ?? null;
+    return s.tell_answer ?? null; // level 3
+  }
+  if (taskType === "双要素") {
+    const d = findDouble(bundle, itemId);
+    if (!d) return null;
+    if (role === "左作用") return d.left_function_cue ?? null;
+    if (role === "右作用") return d.right_function_cue ?? null;
+    if (role === "关系识别") return d.relation_cue ?? null;
+    return null; // 命名环节无预置线索文本
+  }
+  return null;
+}
+
 // 三方版本断言:bundle=plan=item-bank,任一不等 → 抛错(fail-closed,拒开训练屏)。
 export function assertVersionsMatch(bundleVer: string, planVer: string, itemBankVer: string): void {
   if (bundleVer !== planVer || bundleVer !== itemBankVer) {
