@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -22,7 +23,7 @@ from typing import Optional
 from sqlmodel import Session as DBSession
 from sqlmodel import select
 
-from . import audio_gate, scoring
+from . import audio_gate, audio_store, scoring
 from .models import (
     AbnormalEvent, AudioAssetRow, ItemEvent, Patient, ScaleResult,
     Session as TrainSession, TurnEvent,
@@ -210,6 +211,17 @@ def export_session_bundle(db: DBSession, session_id: str, *, deidentify: bool = 
     if touched:
         db.commit()
 
+    # --- 音频字节真打包(有存储字节才拷,进导出包 audio/ 子目录;无字节仅出清单行)---
+    base = (write_dir or EXPORT_DIR) / batch_id
+    audio_files: list[str] = []
+    for a in audios:
+        p = audio_store.find_blob(a.raw_audio_id)
+        if p:
+            dst = base / "audio" / p.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+            audio_files.append(p.name)
+
     sheets = {"session": session_sheet, "turns": turn_sheet, "item_scores": score_sheet,
               "scales": scale_sheet, "abnormal": abn_sheet, "audio_manifest": audio_sheet}
     if not deidentify:
@@ -220,7 +232,8 @@ def export_session_bundle(db: DBSession, session_id: str, *, deidentify: bool = 
 
     files = _write_csvs(sheets, batch_id, write_dir)
     return {"batch_id": batch_id, "deidentified": deidentify, "sheets": sheets,
-            "files": files, "audio_touched": touched, "excluded_items": scores["excluded_items"]}
+            "files": files, "audio_touched": touched, "audio_files": audio_files,
+            "excluded_items": scores["excluded_items"]}
 
 
 def _assert_no_direct_identifiers(sheets: dict) -> None:

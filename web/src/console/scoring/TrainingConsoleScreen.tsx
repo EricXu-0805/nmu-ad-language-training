@@ -114,6 +114,21 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
     return ie.id;
   }
 
+  async function tryLocalAsr() {
+    const au = pendingAudio[turnK];
+    if (!au) return;
+    try {
+      const r = await api.asrTranscribe(au.rawAudioId);
+      if (r.degraded || r.asr_text == null) {
+        toast(`本地 ASR 引擎未接(${r.engine_version}),请人工转写`, "info");
+        return;
+      }
+      // 引擎产文只预填,仍走人工确认→冻结的正常链路
+      setWork((w) => (w.savedAsr ? w : { ...w, asrText: r.asr_text ?? w.asrText }));
+      toast(`ASR 预填完成(${r.engine_version},置信度 ${r.asr_confidence ?? "—"})`, "ok");
+    } catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); }
+  }
+
   async function saveTranscription() {
     if (!item || !planTurn) return;
     if (savingTurn) return;                                          // 在途锁:防双击重复建 item/turn
@@ -206,7 +221,13 @@ export function TrainingConsoleScreen({ session, onWrapup }: { session: Session;
               ) : (
                 <Button onClick={armRecording} disabled={work.locked}>● 示意老人录音</Button>
               )}
-              {pendingAudio[turnK] && <StatusPill tone="ok">已收到录音 {pendingAudio[turnK].duration.toFixed(1)}s</StatusPill>}
+              {pendingAudio[turnK] && (
+                <>
+                  <StatusPill tone="ok">已收到录音 {pendingAudio[turnK].duration.toFixed(1)}s</StatusPill>
+                  <audio controls preload="none" src={api.audioBlobUrl(pendingAudio[turnK].rawAudioId)} style={{ height: 36 }} />
+                  {!work.savedAsr && <Button onClick={tryLocalAsr}>本地 ASR 转写</Button>}
+                </>
+              )}
             </div>
 
             {/* 阶段A 转写 */}

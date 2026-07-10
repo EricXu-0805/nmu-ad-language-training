@@ -80,14 +80,43 @@ def test_judge_valid_prefers_confirmed(client):
 def test_audio_gate_blocks_premature_delete(client):
     client.post("/audio", json={"raw_audio_id": "a1"})
     assert client.delete("/audio/a1").status_code == 409          # 未导出不能删
+    client.put("/audio/a1/blob", content=b"fake-audio-bytes")     # 字节落库+登记 sha256
     client.post("/audio/a1/export")
     assert client.delete("/audio/a1").status_code == 409          # 未校验不能删
-    client.post("/audio/a1/checksum")
-    assert client.delete("/audio/a1").status_code == 200          # 导出+校验后可删
+    assert client.post("/audio/a1/checksum").status_code == 200   # 真校验通过
+    r = client.delete("/audio/a1")
+    assert r.status_code == 200 and r.json()["bytes_deleted"] is True  # 放行才物理删字节
+    assert client.get("/audio/a1/blob").status_code == 404        # 字节确已删除
+
+
+def test_audio_checksum_requires_real_bytes(client):
+    client.post("/audio", json={"raw_audio_id": "nb"})
+    client.post("/audio/nb/export")
+    assert client.post("/audio/nb/checksum").status_code == 409   # 无字节禁止盲翻状态
+
+
+def test_audio_blob_roundtrip_and_asr_degraded(client):
+    client.post("/audio", json={"raw_audio_id": "rt"})
+    up = client.put("/audio/rt/blob", content=b"\x1aEwebm-ish",
+                    headers={"content-type": "audio/webm"}).json()
+    assert up["format"] == "webm" and len(up["checksum"]) == 64
+    assert client.get("/audio/rt/blob").content == b"\x1aEwebm-ish"
+    # Null 引擎降级:asr_text=None,人工转写路径不断
+    tr = client.post("/asr/transcribe/rt").json()
+    assert tr["degraded"] is True and tr["asr_text"] is None
+    assert client.post("/asr/transcribe/none-x").status_code == 404
+
+
+def test_asr_hotwords_from_frozen_bank(client):
+    d = client.get("/asr/hotwords").json()
+    assert d["engine"] == "null-0"
+    assert "胡萝卜" in d["hotwords"] and "斧子" in d["hotwords"] and "树" in d["hotwords"]
+    assert "属牛" in d["hotwords"] or "牛" in d["hotwords"]       # 属相闭表并入
 
 
 def test_audio_reliability_needs_review_before_delete(client):
     client.post("/audio", json={"raw_audio_id": "rel", "is_reliability_sample": True})
+    client.put("/audio/rel/blob", content=b"rel-bytes")
     client.post("/audio/rel/export")
     client.post("/audio/rel/checksum")
     assert client.delete("/audio/rel").status_code == 409         # 信度样本须先人工复核

@@ -79,6 +79,20 @@ export const api = {
   audioChecksum: (id: string) => req<AudioAsset>("POST", `/audio/${encodeURIComponent(id)}/checksum`),
   audioReliabilityReview: (id: string) => req<AudioAsset>("POST", `/audio/${encodeURIComponent(id)}/reliability-review`),
   getAudio: (id: string) => req<AudioAsset>("GET", `/audio/${encodeURIComponent(id)}`),
+  // 音频字节落库(本机磁盘,不上云);老人端录完即传,checksum 闸门据此真校验。
+  uploadAudioBlob: async (id: string, blob: Blob) => {
+    const res = await fetch(`/audio/${encodeURIComponent(id)}/blob`, {
+      method: "PUT", body: blob,
+      headers: { "Content-Type": blob.type || "audio/webm" },
+    });
+    if (!res.ok) throw new ApiError(res.status, await res.text());
+    return res.json() as Promise<{ raw_audio_id: string; bytes: number; checksum: string; format: string }>;
+  },
+  audioBlobUrl: (id: string) => `/audio/${encodeURIComponent(id)}/blob`,
+  // 本地 ASR(M0=Null 引擎:degraded=true → 人工转写)
+  asrTranscribe: (id: string) =>
+    req<{ raw_audio_id: string; asr_text: string | null; asr_confidence: number | null; engine_version: string; degraded: boolean }>(
+      "POST", `/asr/transcribe/${encodeURIComponent(id)}`),
   // 操作端收尾屏的删除都是人工发起,审计口径应为 manual(非到期 auto)。
   deleteAudio: (id: string, source: "manual" | "withdrawal" = "manual") =>
     req<{ raw_audio_id: string; status: string; deleted_by: string }>("DELETE", `/audio/${encodeURIComponent(id)}?source=${source}`),

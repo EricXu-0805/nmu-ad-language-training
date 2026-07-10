@@ -14,7 +14,10 @@ from sqlmodel import Session as DBSession
 
 from datetime import datetime
 
-from . import audio_gate, content, export, judging, rule_judge, runtime, scoring
+from fastapi import Request
+from fastapi.responses import FileResponse
+
+from . import asr, audio_gate, audio_store, content, export, judging, rule_judge, runtime, scoring
 from .db import engine, get_session, init_db
 from .enums import AudioStatus
 from .models import AbnormalEvent, AudioAssetRow, ItemEvent, Patient, ScaleResult, TurnEvent
@@ -188,6 +191,13 @@ def audio_export(raw_audio_id: str, s: DBSession = Depends(get_session)):
 
 @app.post("/audio/{raw_audio_id}/checksum", response_model=AudioAssetRow)
 def audio_checksum(raw_audio_id: str, s: DBSession = Depends(get_session)):
+    """导出期校验:重算存储字节 sha256 与登记 checksum 比对,一致才推进状态(拒绝盲翻)。"""
+    r = _load_row(raw_audio_id, s)
+    p = audio_store.find_blob(raw_audio_id)
+    if not p or not r.checksum:
+        raise HTTPException(409, "无音频字节或未登记校验值,无法校验(先 PUT /audio/{id}/blob)")
+    if audio_store.sha256_hex(p.read_bytes()) != r.checksum:
+        raise HTTPException(409, "校验不一致:存储字节与登记 checksum 不符,禁止推进")
     return _transition(raw_audio_id, s, audio_gate.mark_checksum_verified)
 
 
@@ -206,13 +216,66 @@ def audio_delete(raw_audio_id: str, source: str = "auto", s: DBSession = Depends
     except audio_gate.AudioGateError as e:
         raise HTTPException(409, str(e))
     r.status = asset.status
+    r.delete_gate_passed = True                       # 审计:闸门放行标记
+    bytes_deleted = audio_store.delete_blob(raw_audio_id)  # 放行后物理删除字节
     s.add(r); s.commit()
-    return {"raw_audio_id": raw_audio_id, "status": r.status, "deleted_by": source}
+    return {"raw_audio_id": raw_audio_id, "status": r.status, "deleted_by": source,
+            "bytes_deleted": bytes_deleted}
 
 
 @app.get("/audio/{raw_audio_id}", response_model=AudioAssetRow)
 def audio_get(raw_audio_id: str, s: DBSession = Depends(get_session)):
     return _load_row(raw_audio_id, s)
+
+
+@app.put("/audio/{raw_audio_id}/blob")
+async def audio_upload_blob(raw_audio_id: str, request: Request, s: DBSession = Depends(get_session)):
+    """音频字节落库(本机磁盘 data/audio/,不上云)。登记 sha256 供导出期校验。"""
+    if not audio_store.SAFE_ID.match(raw_audio_id):
+        raise HTTPException(422, "非法音频 id")
+    r = _load_row(raw_audio_id, s)          # 须先 POST /audio 登记元数据
+    data = await request.body()
+    if not data:
+        raise HTTPException(422, "空音频字节")
+    p, digest = audio_store.save_blob(raw_audio_id, data, request.headers.get("content-type"))
+    r.checksum = digest
+    r.audio_format = p.suffix.lstrip(".")
+    s.add(r); s.commit()
+    return {"raw_audio_id": raw_audio_id, "bytes": len(data),
+            "checksum": digest, "format": r.audio_format}
+
+
+@app.get("/audio/{raw_audio_id}/blob")
+def audio_download_blob(raw_audio_id: str, s: DBSession = Depends(get_session)):
+    """回放存储字节(操作端复核用,同源本机)。"""
+    _load_row(raw_audio_id, s)
+    p = audio_store.find_blob(raw_audio_id)
+    if not p:
+        raise HTTPException(404, "无音频字节(未上传或已删除)")
+    return FileResponse(p)
+
+
+# ---------------- M3 ASR(本地、可插拔;M0=Null 引擎降级人工)----------------
+@app.get("/asr/hotwords")
+def asr_hotwords():
+    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
+    hw = asr.build_hotwords(bank, script)
+    return {"engine": asr.get_engine().version, "count": len(hw), "hotwords": hw}
+
+
+@app.post("/asr/transcribe/{raw_audio_id}")
+def asr_transcribe(raw_audio_id: str, s: DBSession = Depends(get_session)):
+    """本地转写。引擎未接(null)→ degraded=true、asr_text=null,操作端走人工转写,链路不断。"""
+    _load_row(raw_audio_id, s)
+    p = audio_store.find_blob(raw_audio_id)
+    if not p:
+        raise HTTPException(404, "无音频字节,无法转写(先 PUT /audio/{id}/blob)")
+    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    res = asr.get_engine().transcribe(p.read_bytes(), asr.build_hotwords(bank))
+    return {"raw_audio_id": raw_audio_id, "asr_text": res.asr_text,
+            "asr_confidence": res.asr_confidence, "engine_version": res.engine_version,
+            "degraded": res.asr_text is None}
 
 
 # ---------------- R 会话编排 + 逐环节录音/判分/锁分 ----------------
