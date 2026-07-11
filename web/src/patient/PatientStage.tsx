@@ -39,23 +39,25 @@ export function PatientStage({ plan, cursor, sessionId }: { plan: SessionPlan | 
   }
 
   return (
-    <Centered>
-      <ImagePane imageId={item.image_id} spotlight={spotlight} alt="题目图片" />
+    <div className="patient-stage">
+      <div className="stage-image"><ImagePane imageId={item.image_id} spotlight={spotlight} compact={!!cueText} alt="题目图片" /></div>
       <p className="question">{question}</p>
       {/* 线索槽恒占位:线索出现/消失不再把问句和麦克风上下顶(布局零跳动) */}
       <div className="cue-slot">
-        {cueText && <p className="cue" style={{ maxWidth: "80vw", margin: 0 }}>{cueText}</p>}
+        {cueText && <p className="cue" style={{ maxWidth: "84vw", margin: 0 }}>{cueText}</p>}
       </div>
-      {saving
-        ? <p className="cue" style={{ border: "none", boxShadow: "none", background: "transparent" }}>好的，收到了…</p>
-        : (
-          <>
-            <MicButton state={cursor?.recording ?? "idle"} localActive={recActive}
-              selfStart={cursor?.selfStart === true} micError={micError} starting={starting}
-              onStart={() => void startNow()} onStop={stopAndSave} />
-            {saveError && <p style={{ fontSize: "var(--fs-md)", margin: 0, opacity: 0.75 }}>刚才没有存上，请再说一遍</p>}
-          </>
-        )}
-    </Centered>
+      <div className="stage-mic">
+        {saving
+          ? <p className="cue" style={{ border: "none", boxShadow: "none", background: "transparent" }}>好的，收到了…</p>
+          : (
+            <>
+              <MicButton state={cursor?.recording ?? "idle"} localActive={recActive}
+                selfStart={cursor?.selfStart === true} micError={micError} starting={starting}
+                onStart={() => void startNow()} onStop={stopAndSave} />
+              {saveError && <p style={{ fontSize: "var(--fs-md)", margin: 0, opacity: 0.75 }}>刚才没有存上，请再说一遍</p>}
+            </>
+          )}
+      </div>
+    </div>
   );
 }

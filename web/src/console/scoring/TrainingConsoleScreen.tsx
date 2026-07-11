@@ -212,6 +212,17 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     else if (itemIdx + 1 < plan.items.length) { setItemIdx(itemIdx + 1); setTurnIdx(0); }
     else toast("已到最后一个环节,可前往场次收尾", "ok");
   };
+  const retreat = () => {
+    if (!plan) return;
+    if (turnIdx > 0) setTurnIdx(turnIdx - 1);
+    else if (itemIdx > 0) {
+      const prev = plan.items[itemIdx - 1];
+      setItemIdx(itemIdx - 1);
+      setTurnIdx(Math.max(0, prev.turns.length - 1));
+    }
+  };
+  const atFirstTurn = itemIdx === 0 && turnIdx === 0;
+  const atLastTurn = !!plan && !!item && turnIdx + 1 >= item.turns.length && itemIdx + 1 >= plan.items.length;
 
   // 示意老人端录音(VOX):arm→老人端自动开始录音;stop→老人端停止并保存后回传 audioSaved。
   // 携带当前 cueLevel,录音启停不清老人端已显示的线索。
@@ -385,7 +396,12 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
           <div className="card col">
             <div className="row" style={{ justifyContent: "space-between" }}>
               <div><StatusPill tone="primary">{item.task_type}</StatusPill> 环节 {planTurn.turn_seq}/{item.turns.length} · <strong>{planTurn.response_role}</strong></div>
-              {work.locked && <StatusPill tone="ok">已锁定</StatusPill>}
+              <div className="row" style={{ gap: 8 }}>
+                {work.locked && <StatusPill tone="ok">已锁定</StatusPill>}
+                {/* 常驻导航:每个环节都能一键前进/回退(老人端随游标同步),不必等锁分或翻左侧题列 */}
+                <Button onClick={retreat} disabled={atFirstTurn}>← 上一环节</Button>
+                <Button onClick={advance} disabled={atLastTurn}>下一环节 →</Button>
+              </div>
             </div>
 
             <ItemReference item={item} bundle={bundle} />

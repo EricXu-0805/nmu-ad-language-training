@@ -223,6 +223,32 @@ def test_live_state_roundtrip_and_session_reset(client):
     assert client.put("/live/state", json={"kind": "bogus", "payload": {}}).status_code == 422
 
 
+def test_tts_speak_degraded_and_validation(client, monkeypatch):
+    import app.tts as tts_mod
+    monkeypatch.setenv("TTS_ENGINE", "null")
+    monkeypatch.setattr(tts_mod, "_engine", None)          # 复位懒加载单例,强制吃到 env
+    assert client.get("/tts/speak", params={"text": ""}).status_code == 422
+    assert client.get("/tts/speak", params={"text": "x" * 501}).status_code == 422
+    r = client.get("/tts/speak", params={"text": "你好"})
+    assert r.status_code == 204 and r.headers["x-tts-engine"] == "null-0"  # 降级→前端回退系统语音
+    monkeypatch.setattr(tts_mod, "_engine", None)
+
+
+def test_tts_piper_synthesis_and_cache(client, tmp_path, monkeypatch):
+    import app.tts as tts_mod
+    if not tts_mod.DEFAULT_VOICE.exists():
+        pytest.skip("本机无 piper 语音模型(部署机可选)")
+    monkeypatch.delenv("TTS_ENGINE", raising=False)
+    monkeypatch.setattr(tts_mod, "_engine", None)
+    monkeypatch.setattr(tts_mod, "CACHE_DIR", tmp_path / "tts-cache")
+    r = client.get("/tts/speak", params={"text": "这是测试"})
+    assert r.status_code == 200 and r.content[:4] == b"RIFF"
+    assert r.headers["x-tts-cache"] == "miss"
+    r2 = client.get("/tts/speak", params={"text": "这是测试"})
+    assert r2.headers["x-tts-cache"] == "hit" and r2.content == r.content  # 同句只合成一次
+    monkeypatch.setattr(tts_mod, "_engine", None)
+
+
 def test_phase_aware_cue_intervention_flagged(client):
     _mk_session(client)
     ev = client.post("/sessions/SM0/abnormal",

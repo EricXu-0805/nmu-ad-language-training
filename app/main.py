@@ -19,7 +19,9 @@ from datetime import datetime
 from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import asr, audio_gate, audio_store, content, export, judging, llm_judge, rule_judge, runtime, scoring
+from fastapi.responses import Response as PlainResponse
+
+from . import asr, audio_gate, audio_store, content, export, judging, llm_judge, rule_judge, runtime, scoring, tts
 from .db import engine, get_session, init_db
 from .enums import AudioStatus
 from .models import AbnormalEvent, AudioAssetRow, ItemEvent, LiveState, Patient, ScaleResult, TurnEvent
@@ -358,6 +360,23 @@ def asr_transcribe(raw_audio_id: str, s: DBSession = Depends(get_session)):
     return {"raw_audio_id": raw_audio_id, "asr_text": res.asr_text,
             "asr_confidence": res.asr_confidence, "engine_version": res.engine_version,
             "degraded": res.asr_text is None}
+
+
+# ---------------- 本地神经 TTS(小语的声音;全本地,云端语音 API 属禁区)----------------
+@app.get("/tts/speak")
+def tts_speak(text: str):
+    """合成一句固定话术。GET(读语义,老人端免 PIN);引擎未接/模型缺失 → 204,前端回退系统语音。"""
+    text = text.strip()
+    if not text:
+        raise HTTPException(422, "text 为空")
+    if len(text) > 500:
+        raise HTTPException(422, "text 超长(>500 字),话术不应这么长")
+    data, version, cached = tts.speak(text)
+    if data is None:
+        return PlainResponse(status_code=204, headers={"X-Tts-Engine": version})
+    return PlainResponse(content=data, media_type="audio/wav",
+                         headers={"X-Tts-Engine": version, "X-Tts-Cache": "hit" if cached else "miss",
+                                  "Cache-Control": "no-store"})
 
 
 # ---------------- R 会话编排 + 逐环节录音/判分/锁分 ----------------

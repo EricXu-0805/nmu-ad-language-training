@@ -19,7 +19,7 @@ export function MicButton({ state, localActive, selfStart, micError, starting, o
     borderRadius: "var(--radius)", cursor: "pointer",
   };
   return (
-    <div className="col" style={{ alignItems: "center", gap: "var(--sp-5)" }}>
+    <div className="col" style={{ alignItems: "center", gap: "var(--sp-3)" }}>
       <div
         className={`mic${recording ? " mic--pulse" : ""}`}
         role="img"
@@ -28,7 +28,7 @@ export function MicButton({ state, localActive, selfStart, micError, starting, o
       >
         🎤
       </div>
-      <div style={{ fontSize: "var(--fs-md)", minHeight: "1.5em" }}>
+      <div style={{ fontSize: "var(--fs-md)", minHeight: "1.2em", lineHeight: 1.2 }}>
         {recording ? "请说…" : " "}
       </div>
       {recording && onStop && (

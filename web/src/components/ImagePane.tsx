@@ -1,8 +1,41 @@
+import React, { useCallback, useEffect, useState } from "react";
+
 // 题图呈现 + 可选半区聚光(左命名/左作用→左半,右命名/右作用→右半,关系识别→双亮)。
 // image_id=null(内容组未回填)→ 明确占位框,不静默;真实数据采集须先回填题图。
 export type Spotlight = "left" | "right" | "both" | "none";
 
-export function ImagePane({ imageId, spotlight = "none", alt }: { imageId: string | null; spotlight?: Spotlight; alt?: string }) {
+// 题图源是 docx 抽出的线稿,原始像素小(最小 132px)——不能按原尺寸摆,大屏上只有一角。
+// 按视口给足呈现面积:高最多 IMG_VH·视口高、宽最多 IMG_VW·视口宽,允许放大(线稿放大可接受),
+// 用 naturalWidth/Height 算显式宽高,聚光半区永远与图片边缘对齐。
+const IMG_VW = 0.9;
+
+function fit(nw: number, nh: number, vw: number, vh: number, compact: boolean): { width: number; height: number } {
+  // 竖屏(iPad 竖持)图让高给文字与麦克风;线索挂出来时(compact)图再让一档,内容永不叠
+  const imgVh = vh > vw ? (compact ? 0.26 : 0.34) : (compact ? 0.30 : 0.40);
+  const scale = Math.min((vw * IMG_VW) / nw, (vh * imgVh) / nh);
+  return { width: Math.round(nw * scale), height: Math.round(nh * scale) };
+}
+
+export function ImagePane({ imageId, spotlight = "none", compact = false, alt }: { imageId: string | null; spotlight?: Spotlight; compact?: boolean; alt?: string }) {
+  const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+
+  const onLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    if (img.naturalWidth > 0) setNatural({ w: img.naturalWidth, h: img.naturalHeight });
+  }, []);
+
+  useEffect(() => {
+    if (!natural) return;
+    const apply = () => setSize(fit(natural.w, natural.h, window.innerWidth, window.innerHeight, compact));
+    apply();
+    window.addEventListener("resize", apply);
+    return () => window.removeEventListener("resize", apply);
+  }, [natural, compact]);
+
+  // 换题时回到未测量状态,避免用上一张图的尺寸闪一帧
+  useEffect(() => { setSize(null); setNatural(null); }, [imageId]);
+
   if (!imageId) {
     return (
       <div className="image-pane card" style={{
@@ -22,8 +55,11 @@ export function ImagePane({ imageId, spotlight = "none", alt }: { imageId: strin
     transition: "background 300ms", pointerEvents: "none",
   } as React.CSSProperties);
   return (
-    <div className="image-pane" style={{ position: "relative", display: "inline-block", borderRadius: "var(--radius)", overflow: "hidden" }}>
-      <img src={`/img/${imageId}.webp`} alt={alt ?? ""} style={{ display: "block", maxWidth: "100%", height: "auto" }} />
+    <div className="image-pane" style={{ position: "relative", display: "inline-block", borderRadius: "var(--radius)", overflow: "hidden", background: "#fff" }}>
+      <img src={`/img/${imageId}.webp`} alt={alt ?? ""} onLoad={onLoad}
+        style={size
+          ? { display: "block", width: size.width, height: size.height }
+          : { display: "block", maxWidth: "90vw", maxHeight: "40vh", visibility: "hidden" }} />
       {spotlight !== "none" && spotlight !== "both" && (
         <>
           <div style={half("left")} aria-hidden />
