@@ -78,29 +78,37 @@ def get_engine() -> TtsProvider:
 _engine: TtsProvider | None = None
 _engine_lock = threading.Lock()
 
+# 缓存键里带合成参数指纹:调 length_scale 等参数后旧缓存自然失效,不会全场命中旧语速
+_SYN_PARAMS = "length_scale=1.15"
+
 
 def engine() -> TtsProvider:
+    """只缓存可用引擎;Null(未装/缺模型)不焊死——补装模型后下一次请求即生效,无须重启。"""
     global _engine
     with _engine_lock:
-        if _engine is None:
+        if _engine is None or isinstance(_engine, NullTtsEngine):
             _engine = get_engine()
         return _engine
 
 
 def speak(text: str) -> tuple[bytes | None, str, bool]:
-    """合成一句话。返回 (wav字节|None, 引擎版本, 是否缓存命中)。同句缓存复用。"""
+    """合成一句话。返回 (wav字节|None, 引擎版本, 是否缓存命中)。同句缓存复用。
+    引擎抛错一律按降级处理(None→204→前端回退系统语音),不 500——半配置状态不炸接口。"""
     eng = engine()
     if isinstance(eng, NullTtsEngine):
         return None, eng.version, False
-    key = hashlib.sha256(f"{eng.version}\n{text}".encode()).hexdigest()
+    key = hashlib.sha256(f"{eng.version}\n{_SYN_PARAMS}\n{text}".encode()).hexdigest()
     cached = CACHE_DIR / f"{key}.wav"
-    if cached.exists():
+    if cached.exists() and cached.stat().st_size > 44:      # 44=wav 头:崩溃残留的 0 字节占位不算命中
         return cached.read_bytes(), eng.version, True
-    data = eng.synthesize(text)
-    if data is None:
+    try:
+        data = eng.synthesize(text)
+    except Exception:
+        return None, eng.version, False
+    if data is None or len(data) <= 44:
         return None, eng.version, False
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = cached.with_suffix(".tmp")
+    tmp = cached.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")  # 并发写不共 tmp
     tmp.write_bytes(data)
     tmp.replace(cached)
     return data, eng.version, False

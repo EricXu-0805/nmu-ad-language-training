@@ -3,8 +3,12 @@
 // ② 回退:浏览器 speechSynthesis,只用 localService 中文语音(Chrome "Google 普通话" 是联网合成,
 //    文本会出机器——宁可静音也不用;找不到本机中文语音就什么都不读)。
 // ★只朗读屏上已显示的题库/脚本原文,不合成任何新话术(单一内容源不破)。
-// 可靠性:无用户激活时 audio.play()/speak() 都被静默拒——失败文本留 pending,
-// 等 voiceschanged / 首次触屏后补读,而不是永久丢句。
+//
+// 播放核心是显式状态机,防三类并发事故(复审确证过的真事故):
+// - busy 在取队即置位(fetch 在途也算忙)——否则同帧"问句+线索"两次 speak 并发抢同一 audio 元素;
+// - gen 世代计数,打断即递增——迟到的旧 fetch/旧 play 回调看到世代不符就自弃,
+//   绝不把已被换掉的旧句用系统语音"还魂"叠在新句上;
+// - 播放被拒(无用户激活)把句子退回队首——触屏补读按原顺序读"问句→线索",不丢主句。
 
 let enabled = localStorage.getItem("nmu:tts") !== "off";
 let pending: { text: string; tag: string } | null = null;
@@ -28,50 +32,91 @@ function audit(ev: string, tag: string, text: string): void {
   } catch { /* 审计失败不影响朗读 */ }
 }
 
-// ---------------- ① 本地神经 TTS ----------------
-// 引擎可用性一次探明(204=后端未配引擎,整个会话走回退;网络错按未知下次再试)。
-let neural: "unknown" | "on" | "off" = "unknown";
+// ---------------- 播放状态机 ----------------
+type Line = { text: string; tag: string };
+let neural: "unknown" | "on" | "off" = "unknown"; // 后端引擎可用性,204 一次探明整会话回退
 const audioEl = typeof Audio !== "undefined" ? new Audio() : null;
-let queue: { text: string; tag: string }[] = [];
-let playingTag: string | null = null;
+let queue: Line[] = [];
+let busy = false;   // 取队即置位:fetch/play 在途都算忙,同帧第二句只能排队
+let gen = 0;        // 世代:打断/停止即 +1,旧世代的一切异步续体自弃
+let curUrl: string | null = null; // 正在播的 blobURL:打断路径也要回收,不靠 onended
 
-async function playNeural(text: string, tag: string): Promise<boolean> {
-  if (!audioEl || neural === "off") return false;
-  try {
-    const res = await fetch(`/tts/speak?text=${encodeURIComponent(text)}`);
-    if (res.status === 204) { neural = "off"; return false; }
-    if (!res.ok) return false;
-    neural = "on";
-    const url = URL.createObjectURL(await res.blob());
-    audioEl.src = url;
-    playingTag = tag;
-    audioEl.onended = () => {
-      URL.revokeObjectURL(url);
-      audit("end", tag, text);
-      if (pending?.text === text) pending = null;
-      playingTag = null;
-      driveQueue();
-    };
-    audioEl.onerror = () => { URL.revokeObjectURL(url); audit("error:audio", tag, text); playingTag = null; driveQueue(); };
-    await audioEl.play(); // 无用户激活会 reject → 留 pending,触屏后补读
-    audit("start@piper", tag, text);
-    return true;
-  } catch (e) {
-    if (e instanceof DOMException && e.name === "NotAllowedError") {
-      audit("error:not-allowed", tag, text); // 已拿到音频只是不许放:算处理过,别再叠一遍系统语音
-      playingTag = null;
-      return true;
-    }
-    return false; // 网络/后端异常:这句走系统语音回退
-  }
+function interrupt(): void {
+  gen += 1;
+  busy = false;
+  if (audioEl && !audioEl.paused) audioEl.pause();
+  if (curUrl) { URL.revokeObjectURL(curUrl); curUrl = null; }
+  if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
 }
 
 function driveQueue(): void {
+  if (busy) return;
   const next = queue.shift();
   if (!next) return;
-  void playNeural(next.text, next.tag).then((handled) => {
-    if (!handled) { utter(next.text, next.tag); }
-  });
+  busy = true;
+  void playItem(next, gen);
+}
+
+async function playItem(item: Line, g: number): Promise<void> {
+  // ① 神经路径
+  if (audioEl && neural !== "off") {
+    let url: string | null = null;
+    try {
+      const res = await fetch(`/tts/speak?text=${encodeURIComponent(item.text)}`);
+      if (g !== gen) return;                       // 已被打断:新句自会驱动,旧续体退场
+      if (res.status === 204) { neural = "off"; }
+      else if (res.ok) {
+        neural = "on";
+        url = URL.createObjectURL(await res.blob());
+        if (g !== gen) { URL.revokeObjectURL(url); return; }
+        const u = url;
+        audioEl.src = u;
+        curUrl = u;
+        audioEl.onended = () => {
+          URL.revokeObjectURL(u);
+          if (curUrl === u) curUrl = null;
+          if (g !== gen) return;
+          audit("end", item.tag, item.text);
+          if (pending?.text === item.text) pending = null;
+          busy = false;
+          driveQueue();
+        };
+        audioEl.onerror = () => {
+          URL.revokeObjectURL(u);
+          if (curUrl === u) curUrl = null;
+          if (g !== gen) return;
+          audit("error:audio", item.tag, item.text);
+          busy = false;
+          driveQueue();
+        };
+        await audioEl.play();
+        audit("start@piper", item.tag, item.text);
+        return;                                     // 播放中,后续由 onended 续驱
+      }
+      // !res.ok(非 204):这一句落到 ② 回退
+    } catch (e) {
+      if (url) { URL.revokeObjectURL(url); if (curUrl === url) curUrl = null; }
+      if (g !== gen) return;
+      if (e instanceof DOMException && e.name === "NotAllowedError") {
+        // 无用户激活:句子退回队首,触屏后按原顺序补读(问句仍在线索前面)
+        audit("error:not-allowed", item.tag, item.text);
+        queue.unshift(item);
+        busy = false;
+        return;
+      }
+      if (e instanceof DOMException && e.name === "AbortError") {
+        // 被打断(pause/换 src):新句已接管,旧句静默退场,绝不回退系统语音还魂。
+        // 同世代 Abort 理论不可达,防御性放掉忙位以免队列停摆。
+        audit("error:aborted", item.tag, item.text);
+        if (g === gen) { busy = false; driveQueue(); }
+        return;
+      }
+      // 网络/后端异常:这一句落到 ② 回退
+    }
+  }
+  if (g !== gen) return;
+  // ② 系统语音回退
+  utterItem(item, g);
 }
 
 // ---------------- ② 回退:浏览器系统语音 ----------------
@@ -109,18 +154,35 @@ export function currentVoiceName(): string | null {
   return pickLocalZhVoice()?.name ?? null;
 }
 
-function utter(text: string, tag: string): void {
-  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+function utterItem(item: Line, g: number): void {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) { busy = false; return; }
   const voice = pickLocalZhVoice();
-  if (!voice) return; // 语音表未就绪或本机无中文语音:留在 pending 等补读,绝不落到联网语音
-  const u = new SpeechSynthesisUtterance(text);
+  if (!voice) {
+    // 语音表未就绪/本机无中文语音:退回队首等 voiceschanged/触屏补读,绝不落到联网语音
+    queue.unshift(item);
+    busy = false;
+    return;
+  }
+  const u = new SpeechSynthesisUtterance(item.text);
   u.voice = voice;
   u.lang = voice.lang;
   u.rate = 0.85;   // 老人节奏:略慢(神经引擎在服务端用 length_scale 达成同一意图)
   u.volume = 1;
-  u.onstart = () => audit(`start@${voice.name}`, tag, text);
-  u.onend = () => { audit("end", tag, text); if (pending?.text === text) pending = null; driveQueue(); };
-  u.onerror = (e) => audit(`error:${e.error}`, tag, text); // not-allowed 等留 pending,触屏后补读
+  u.onstart = () => audit(`start@${voice.name}`, item.tag, item.text);
+  u.onend = () => {
+    if (g !== gen) return;
+    audit("end", item.tag, item.text);
+    if (pending?.text === item.text) pending = null;
+    busy = false;
+    driveQueue();
+  };
+  u.onerror = (e) => {
+    audit(`error:${e.error}`, item.tag, item.text);
+    if (g !== gen) return;
+    if (e.error === "not-allowed") { queue.unshift(item); busy = false; return; } // 触屏后补读
+    busy = false;
+    driveQueue();                                   // 其他错误:跳过这句,队列不停摆
+  };
   window.speechSynthesis.speak(u);
 }
 
@@ -134,17 +196,12 @@ export function speak(text: string, opts?: { tag?: string; enqueue?: boolean }):
   if (!enabled) return;
   pending = { text, tag };
   if (!opts?.enqueue) {
-    queue = [];
-    if (audioEl && !audioEl.paused) audioEl.pause();
-    playingTag = null;
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    queue.push({ text, tag });
-    driveQueue();
+    interrupt();
+    queue = [{ text, tag }];
   } else {
     queue.push({ text, tag });
-    const synthBusy = "speechSynthesis" in window && (window.speechSynthesis.speaking || window.speechSynthesis.pending);
-    if (playingTag === null && !synthBusy) driveQueue();
   }
+  driveQueue(); // busy(含 fetch 在途)时这里是空操作,由在途句的终态回调续驱
 }
 
 // 试听:重读当前屏显文本(开关打开那一下既给了用户激活,也当场验证音色/音量)。
@@ -157,18 +214,18 @@ export function speakSample(): void {
 export function stopSpeaking(): void {
   pending = null;
   queue = [];
-  playingTag = null;
-  if (audioEl && !audioEl.paused) audioEl.pause();
-  if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
+  interrupt();
 }
 
-// 补读:语音表就绪(voiceschanged)或获得用户激活(首次触屏)时,把最近一句没读出去的读了。
+// 补读:语音表就绪(voiceschanged)或获得用户激活(首次触屏)时,把没读出去的接着读。
+// 队列有货(被拒句已退回队首)优先驱队列;队列空才用 pending 单槽兜底。
 function retryPending(): void {
-  if (!enabled || !pending) return;
-  if (playingTag !== null) return; // 神经在放,别重复
+  if (!enabled || busy) return;
   if ("speechSynthesis" in window && (window.speechSynthesis.speaking || window.speechSynthesis.pending)) return;
-  const p = pending;
-  queue = [{ text: p.text, tag: p.tag }];
+  if (queue.length === 0) {
+    if (!pending) return;
+    queue.push({ text: pending.text, tag: pending.tag });
+  }
   driveQueue();
 }
 

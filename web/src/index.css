@@ -98,8 +98,8 @@ input:focus, select:focus, textarea:focus {
 :root[data-scale="patient"] .cue-slot { min-height: calc(var(--fs-root) * 1.5); display: flex; align-items: center; justify-content: center; }
 
 /* 老人端任务舞台:满屏一屏放下(100dvh 不滚动),图占上部、问句居中、麦克风区贴底。
-   题图源像素小,由 ImagePane 按视口放大;这里只管纵向分区。 */
-:root[data-scale="patient"] body { overflow: hidden; }
+   题图源像素小,由 ImagePane 按视口放大;这里只管纵向分区。
+   注意:不给 body 设全局 overflow:hidden——关系建立屏等文档流布局超视口时要能滚动。 */
 .patient-stage {
   height: 100dvh; padding: 2dvh 3vw 3dvh;
   display: flex; flex-direction: column; align-items: center; justify-content: flex-start;

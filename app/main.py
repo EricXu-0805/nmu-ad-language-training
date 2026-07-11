@@ -373,7 +373,8 @@ def tts_speak(text: str):
         raise HTTPException(422, "text 超长(>500 字),话术不应这么长")
     data, version, cached = tts.speak(text)
     if data is None:
-        return PlainResponse(status_code=204, headers={"X-Tts-Engine": version})
+        # 204 显式禁缓存:补装模型后老人端刷新要立刻吃到 200,不能被启发式缓存钉死在降级态
+        return PlainResponse(status_code=204, headers={"X-Tts-Engine": version, "Cache-Control": "no-store"})
     return PlainResponse(content=data, media_type="audio/wav",
                          headers={"X-Tts-Engine": version, "X-Tts-Cache": "hit" if cached else "miss",
                                   "Cache-Control": "no-store"})
