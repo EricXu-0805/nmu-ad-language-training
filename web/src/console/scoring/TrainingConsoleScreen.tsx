@@ -7,7 +7,7 @@ import { StatusPill } from "../../components/StatusPill";
 import { useToast } from "../../components/Toast";
 import { assertVersionsMatch, findDouble, findSingle, lookupCue, useItemBankBundle } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
-import { useAudioSaved, useCursorWriter, useSaveWatchdog } from "../../sync/useCursorWriter";
+import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
 import type { PlanItem, PlanTurn, Session, SessionPlan } from "../../types";
 import { assertPortraitFree, isRelationRole } from "./vm";
 
@@ -27,10 +27,22 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   const [itemIdx, setItemIdx] = useState(journal.cursor.itemIdx);
   const [turnIdx, setTurnIdx] = useState(journal.cursor.turnIdx);
   const [aiEnabled, setAiEnabled] = useState(true);
+  // 收到老人端录音回报即自动推进下一环节——老人"点开始→说→我说好了"就能自走全场。
+  // 关掉则回到研究者逐环节手动推进(需要当场转写/锁分时用)。
+  const [autoAdvance, setAutoAdvance] = useState(() => {
+    try { return localStorage.getItem("nmu:console:autoAdvance") !== "0"; } catch { return true; }
+  });
+  const toggleAutoAdvance = () => setAutoAdvance((v) => {
+    const n = !v;
+    try { localStorage.setItem("nmu:console:autoAdvance", n ? "1" : "0"); } catch { /* 私隐模式等 */ }
+    return n;
+  });
   const [reviewerId, setReviewerId] = useState("R1");
   // 录音资格 fail-closed:确认拿到患者档案前不允许 arm(获取失败若默认放行,
   // recording_allowed=false 的受试者会被开麦——合规护栏静默失效)。
   const [recStatus, setRecStatus] = useState<"loading" | "error" | "denied" | "allowed" | "unrated">("loading");
+  // 下发老人端的自助开录资格:与"示意录音"同一判定(unrated 按允许);loading/error/denied 一律 false。
+  const selfStart = recStatus === "allowed" || recStatus === "unrated";
   const [recState, setRecState] = useState<"idle" | "armed">("idle");
   const recSeq = useRef(0);
   const watchdog = useSaveWatchdog(() =>
@@ -89,6 +101,22 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   const item: PlanItem | undefined = plan?.items[itemIdx];
   const planTurn: PlanTurn | undefined = item?.turns[turnIdx];
   const turnK = item && planTurn ? `${item.item_id}#${planTurn.turn_seq}` : "";
+  // 在途异步续体的环节身份校验:自动推进可在任何请求在途时跳环节,续体不校验会把
+  // turnId/结果写进"下一环节"的工作卡——确认/锁分随之落到错误的 turn。
+  const turnKRef = useRef(turnK);
+  turnKRef.current = turnK;
+  // 已锁环节不下发自助开录("锁定后不可再录"对自助路径同样生效)
+  const selfStartOut = selfStart && !(journal.turns[turnK]?.locked ?? false);
+  // 老人端麦克风真值(自助开录时操作端唯一感知渠道)
+  const patientRec = usePatientRec(session.session_id);
+  const patientMicOn = patientRec?.active === true;
+  // 麦克风关闭的下降沿启动看门狗:自助路径的停麦后若迟迟等不到 audioSaved(保存失败),
+  // 8 秒告警——否则自助模式保存失败对操作端零信号,老人的回答静默丢失。
+  const prevMicOn = useRef(false);
+  useEffect(() => {
+    if (prevMicOn.current && !patientMicOn) watchdog.start();
+    prevMicOn.current = patientMicOn;
+  }, [patientMicOn, watchdog]);
 
   // 光标变化 → 重置工作态(从 journal 恢复布尔/已锁/线索级)+ 广播老人端
   useEffect(() => {
@@ -107,22 +135,75 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     setCueLevel(restoredCue);
     setCursor(itemIdx, turnIdx);
     onItemEventChange?.(journal.itemEvents[item.item_id]?.itemEventId ?? null);
-    postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: restoredCue, recording: "idle", recSeq: recSeq.current });
+    postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: restoredCue, recording: "idle", recSeq: recSeq.current,
+                 selfStart: selfStart && !(jt?.locked ?? false) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [itemIdx, turnIdx, plan]);
 
+  // 录音资格判定变化即补发游标:落地(→allowed/unrated/denied)给按钮,重查(→loading)收回按钮。
+  // loading 也要发——资格重查期间老人端保留旧 selfStart=true 按钮就违反 fail-closed。
+  useEffect(() => {
+    if (!planTurn) return;
+    postCursor({ screen: recState === "armed" ? "record" : "present", itemIdx, turnIdx,
+                 responseRole: planTurn.response_role, cueLevel,
+                 recording: recState === "armed" ? "armed" : "idle", recSeq: recSeq.current, selfStart: selfStartOut });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recStatus]);
+
+  // ★收回游标:离开训练屏(收尾/新受试者/切屏)或 fail-closed 时,老人端的
+  // "开始回答"按钮必须撤下——否则残留的 selfStart=true 让过渡期里任何人都能往本场次录音。
+  // (控制台整页被强杀属残余风险:无人可发收回;README 已注明换人前先核对老人端画面。)
+  const withdrawRef = useRef<() => void>(() => {});
+  withdrawRef.current = () => {
+    if (!planTurn) return;
+    postCursor({ screen: "thanks", itemIdx, turnIdx, responseRole: planTurn.response_role,
+                 cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
+  };
+  useEffect(() => () => withdrawRef.current(), []);
+  useEffect(() => { if (err) withdrawRef.current(); }, [err]);
+
   // 老人端录完 → 建 turn 的音频入参在此暂存(按 turnKey)
   useAudioSaved((m) => {
-    watchdog.clear();
+    // ★跨场次过滤:live state 里 audioSaved 残留到下次握手才清(且 PUT 是 fire-and-forget,
+    // 失败可能永存)。别场次的回报若被记入本场 journal,会诱导跨场串绑——一律丢弃。
+    if (m.sessionId !== session.session_id) return;
+    // 重放判定:操作端刷新后轮询会把最后一条回报再送一遍(内存 seen 集刷新即空)。
+    // journal 持久化,里面已有的 rawAudioId 一律按重放处理:记录性动作照做(幂等),
+    // 但绝不触发自动推进——否则每次刷新老人端都被顶走一题。
+    const isReplay = Boolean(journal.audios[m.rawAudioId]);
+    // 迟到回报(非当前环节)只做记账:watchdog 可能正在为"当前环节"守着,清了它
+    // 会吞掉真正的超时告警;armed→idle 写回若以当前环节身份发出,会掐断刚示意的新录音。
+    const isCurrent = m.turnKey === turnK;
     setPendingAudio((prev) => ({ ...prev, [m.turnKey]: { rawAudioId: m.rawAudioId, duration: m.durationSeconds } }));
     // 记入 journal.audios,收尾屏音频闸门才能列出并驱动导出/校验/信度/删除。
-    upsertAudio(m.rawAudioId, { turnKey: m.turnKey, containsDirectIdentifier: false, isReliabilitySample: false, lastStatus: "recorded", durationSeconds: m.durationSeconds });
+    upsertAudio(m.rawAudioId, { turnKey: m.turnKey, containsDirectIdentifier: m.containsDirectIdentifier ?? false, isReliabilitySample: false, lastStatus: "recorded", durationSeconds: m.durationSeconds });
+    if (!isCurrent) return;
+    watchdog.clear();
     if (recState === "armed" && planTurn) {
       // 老人自己按"我说好了"停的:把 idle 写回镜像/服务端真值源,否则 armed 残留会让老人端刷新后自动开麦。
-      postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current });
+      postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: selfStartOut });
     }
     setRecState("idle");
+    if (isReplay) return;
     toast(`老人端录音已保存(${m.durationSeconds.toFixed(1)}s)`, "info");
+    // 自动推进:只认"当前环节"的首次回报;老人端由此获得"点开始→说→我说好了→下一题"
+    // 的自走闭环,转写/锁分可事后回访补。研究者手上有在途操作/未保存的转写或确认改动时
+    // 不跳——advance 会按 journal 重置工作卡,未存的字会被冲掉。
+    if (!autoAdvance) return;
+    const jt = journal.turns[turnK];
+    const confirmBaseline = jt?.confirmedText ?? jt?.asrText ?? "";
+    const dirty = busyOp !== null || savingTurn || locking
+      || (work.asrText.trim() !== "" && !work.savedAsr)
+      || (work.confirmed !== "" && work.confirmed !== confirmBaseline && !work.savedConfirm);
+    if (dirty) { toast("录音已收,但本环节有未保存的编辑/在途操作,未自动跳转", "warn"); return; }
+    const atEnd = plan && item && turnIdx + 1 >= item.turns.length && itemIdx + 1 >= plan.items.length;
+    if (atEnd && planTurn) {
+      // 末环节:游标不动的话老人端会停在末题、按钮常驻,可无限重复录音——转"完成"过渡屏
+      postCursor({ screen: "thanks", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
+      toast("最后一个环节已收音,老人端已转入结束画面;可前往场次收尾", "ok");
+    } else {
+      advance();
+    }
   });
 
   const advance = () => {
@@ -138,13 +219,13 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     if (!planTurn) return;
     recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
     setRecState("armed");
-    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "armed", recSeq: recSeq.current });
+    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "armed", recSeq: recSeq.current, selfStart: selfStartOut });
   };
   const stopRecording = () => {
     if (!planTurn) return;
     setRecState("idle");
     watchdog.start();
-    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "stopped", recSeq: recSeq.current });
+    postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "stopped", recSeq: recSeq.current, selfStart: selfStartOut });
   };
 
   // 发分级线索给老人端(0→3 只升不降;线索文本永远取自版本锁定题库,操作端不产话术)。
@@ -153,7 +234,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     setCueLevel(level);
     recordCueLevel(turnK, level); // 持久化:回访本环节时恢复,不清老人端线索
     postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role,
-                 cueLevel: level, recording: recState === "armed" ? "armed" : "idle", recSeq: recSeq.current });
+                 cueLevel: level, recording: recState === "armed" ? "armed" : "idle", recSeq: recSeq.current, selfStart: selfStartOut });
   };
 
   async function ensureItemEvent(): Promise<number | null> {
@@ -172,9 +253,11 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   async function tryLocalAsr() {
     const au = pendingAudio[turnK];
     if (!au || busyOp) return;
+    const opK = turnK; // 环节身份:自动推进可在请求在途时跳环节,续体只准写回发起时的环节
     setBusyOp("asr");
     try {
       const r = await api.asrTranscribe(au.rawAudioId);
+      if (turnKRef.current !== opK) return;
       if (r.degraded || r.asr_text == null) {
         toast(`本地 ASR 引擎未接(${r.engine_version}),请人工转写`, "info");
         return;
@@ -190,6 +273,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     if (!item || !planTurn) return;
     if (savingTurn) return;                                          // 在途锁:防双击重复建 item/turn
     if (work.savedAsr && work.turnId) { toast("该环节转写已冻结,不可重写", "warn"); return; }
+    const opK = turnK;
     setSavingTurn(true);
     try {
       const ieid = await ensureItemEvent();
@@ -200,6 +284,9 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
         asr_text: work.asrText, raw_audio_id: au?.rawAudioId ?? null, duration_seconds: au?.duration ?? null,
       });
       upsertTurn(item.item_id, planTurn.turn_seq, { turnId: te.id, responseRole: planTurn.response_role, asrSaved: true, asrText: work.asrText });
+      // 环节已被自动推进跳走:journal 已正确记账(键在发起时捕获),但工作卡现在属于新环节,
+      // 把旧环节的 turnId 写进去会让后续确认/锁分落到错误的 turn 上。
+      if (turnKRef.current !== opK) return;
       // 确认文本预填 ASR 原文:多数环节只需微调而非整句重打
       setWork((w) => ({ ...w, turnId: te.id, savedAsr: true, confirmed: w.confirmed.trim() ? w.confirmed : w.asrText }));
       toast("转写已保存并冻结", "ok");
@@ -211,10 +298,12 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     if (!item || !planTurn || work.turnId == null) { toast("请先保存转写", "warn"); return false; }
     if (!work.confirmed.trim()) { toast("确认文本为空,未提交(避免把已有确认覆盖成空串)", "warn"); return false; }
     if (busyOp) return false;
+    const opK = turnK;
     setBusyOp("confirm");
     try {
       await api.confirmTurn(work.turnId, work.confirmed);
       upsertTurn(item.item_id, planTurn.turn_seq, { turnId: work.turnId, responseRole: planTurn.response_role, confirmed: true, confirmedText: work.confirmed });
+      if (turnKRef.current !== opK) return true; // 已跳环节:journal 已记账,不写新环节的工作卡
       setWork((w) => ({ ...w, savedConfirm: true }));
       toast("确认文本已保存(未覆盖原文)", "ok");
       // 判分口径以 confirmed 优先:确认一落地就自动跑初评,省一次手点("动态"名副其实)
@@ -227,9 +316,11 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   async function runAiJudge(auto = false) {
     if (work.turnId == null) { toast("请先保存转写", "warn"); return; }
     if (!auto && busyOp) return;
+    const opK = turnK;
     if (!auto) setBusyOp("ai");
     try {
       const te = await api.aiJudgeTurn(work.turnId);
+      if (turnKRef.current !== opK) return;
       setWork((w) => ({ ...w, ai: { answerType: te.ai_answer_type ?? null, score: te.ai_score ?? null, needsReview: !!te.ai_needs_review } }));
     } catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); }
     finally { if (!auto) setBusyOp((b) => (b === "ai" ? null : b)); }
@@ -239,6 +330,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   async function doLock(elementValue: number, promptLevel?: number): Promise<boolean> {
     if (!item || !planTurn || work.turnId == null) { toast("请先保存转写", "warn"); return false; }
     if (locking) return false;
+    const opK = turnK;
     setLocking(true);
     const payload = { reviewer_id: reviewerId, element_value: elementValue, prompt_level: promptLevel ?? null };
     try {
@@ -246,12 +338,16 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
       if (work.confirmed.trim() && !work.savedConfirm) {
         await api.confirmTurn(work.turnId, work.confirmed);
         upsertTurn(item.item_id, planTurn.turn_seq, { turnId: work.turnId, responseRole: planTurn.response_role, confirmed: true, confirmedText: work.confirmed });
-        setWork((w) => ({ ...w, savedConfirm: true }));
+        if (turnKRef.current === opK) setWork((w) => ({ ...w, savedConfirm: true }));
       }
       assertPortraitFree(payload as unknown as Record<string, unknown>); // ★锁分载荷画像守卫(前端第4层)
       await api.lockTurn(work.turnId, payload);
       upsertTurn(item.item_id, planTurn.turn_seq, { turnId: work.turnId, responseRole: planTurn.response_role, locked: true, elementValue, promptLevel });
-      setWork((w) => ({ ...w, locked: true }));
+      if (turnKRef.current === opK) {
+        setWork((w) => ({ ...w, locked: true }));
+        // 锁定即收回老人端自助开录按钮("锁定后不可再录"对自助路径同样生效)
+        postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
+      }
       toast("已锁定评分", "ok");
       return true;
     } catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); return false; }
@@ -276,6 +372,9 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
             </label>
             <label className="row" style={{ gap: 6 }}>
               <input type="checkbox" checked={aiEnabled} onChange={(e) => setAiEnabled(e.target.checked)} /> 动态 AI 初评
+            </label>
+            <label className="row" style={{ gap: 6 }} title="老人端点'我说好了'后自动跳下一环节;关掉则手动逐环节推进">
+              <input type="checkbox" checked={autoAdvance} onChange={toggleAutoAdvance} /> 收音自动推进
             </label>
             {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
             <Button variant="ghost" onClick={() => { if (recState === "armed") stopRecording(); onWrapup(); }}>场次收尾 →</Button>
@@ -308,8 +407,13 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
                   <StatusPill tone="warn">录音资格未确认(患者档案获取失败)</StatusPill>
                   <Button onClick={() => setRetryNonce((n) => n + 1)}>重试</Button>
                 </>
-              ) : recState === "armed" ? (
-                <Button variant="danger" onClick={stopRecording}>■ 停止录音</Button>
+              ) : recState === "armed" || patientMicOn ? (
+                <>
+                  <Button variant="danger" onClick={stopRecording}>■ 停止录音</Button>
+                  {patientMicOn && recState !== "armed" && (
+                    <StatusPill tone="danger">老人端麦克风开着(自助开录)</StatusPill>
+                  )}
+                </>
               ) : (
                 <>
                   <Button onClick={armRecording} disabled={work.locked}>● 示意老人录音</Button>

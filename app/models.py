@@ -154,6 +154,7 @@ class LiveState(SQLModel, table=True):
     cursor_json: Optional[str] = None        # 最新游标
     rapport_json: Optional[str] = None       # 最新第1周步进
     audio_json: Optional[str] = None         # 最新老人端录音回报(audioSaved)
+    patient_rec_json: Optional[str] = None   # 老人端麦克风真值上报(patientRec):自助开录操作端可见、可远程停
     updated_at: Optional[datetime] = None
 
 

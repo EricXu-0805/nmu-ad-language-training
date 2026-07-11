@@ -209,13 +209,17 @@ def test_live_state_roundtrip_and_session_reset(client):
                                     "payload": {"itemIdx": 3, "turnIdx": 1, "recording": "armed"}})
     client.put("/live/state", json={"kind": "audioSaved",
                                     "payload": {"rawAudioId": "a9", "turnKey": "SE_锚#1"}})
+    client.put("/live/state", json={"kind": "patientRec",
+                                    "payload": {"active": True, "turnKey": "SE_锚#1", "sessionId": "S1"}})
     d = client.get("/live/state").json()
-    assert d["seq"] == 3 and d["cursor"]["itemIdx"] == 3 and d["audioSaved"]["rawAudioId"] == "a9"
-    # 新场次握手 → 旧游标/录音回报清空(防老人端串场)
+    assert d["seq"] == 4 and d["cursor"]["itemIdx"] == 3 and d["audioSaved"]["rawAudioId"] == "a9"
+    assert d["patientRec"]["active"] is True                        # 老人端麦克风真值上报可读
+    # 新场次握手 → 旧游标/录音回报/麦克风上报清空(防老人端串场)
     client.put("/live/state", json={"kind": "session", "payload": {"sessionId": "S2", "weekNo": 1}})
     d2 = client.get("/live/state").json()
     assert d2["session"]["sessionId"] == "S2" and d2["cursor"] is None and d2["audioSaved"] is None
-    assert d2["seq"] == 4                                           # seq 只增不回卷
+    assert d2["patientRec"] is None
+    assert d2["seq"] == 5                                           # seq 只增不回卷
     assert client.put("/live/state", json={"kind": "bogus", "payload": {}}).status_code == 422
 
 

@@ -11,22 +11,54 @@ export class Recorder {
   private stream: MediaStream | null = null;
   private chunks: Blob[] = [];
   private startedAt = 0;
+  // 单飞:getUserMedia 在途期间(权限弹窗可悬很久)再次 start 必须共用同一次,
+  // 否则并发拿到两条 MediaStream,先到的那条被覆盖成无主热麦——绝不允许。
+  private startingP: Promise<void> | null = null;
+  private disposed = false;
 
   get active(): boolean {
     return this.mr?.state === "recording";
   }
 
+  get pending(): boolean {
+    return this.startingP !== null;
+  }
+
   async start(): Promise<void> {
     if (this.active) return;
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    this.chunks = [];
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
-    this.mr = new MediaRecorder(this.stream, mimeType ? { mimeType } : undefined);
-    this.mr.ondataavailable = (e) => {
-      if (e.data.size > 0) this.chunks.push(e.data);
-    };
-    this.startedAt = performance.now();
-    this.mr.start();
+    if (this.startingP) return this.startingP;
+    this.startingP = (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (this.disposed) {
+          // 组件已卸载才拿到流:立即物理关麦,绝不留无主热麦
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        this.stream = stream;
+        this.chunks = [];
+        const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+        this.mr = new MediaRecorder(this.stream, mimeType ? { mimeType } : undefined);
+        this.mr.ondataavailable = (e) => {
+          if (e.data.size > 0) this.chunks.push(e.data);
+        };
+        this.startedAt = performance.now();
+        this.mr.start();
+      } finally {
+        this.startingP = null;
+      }
+    })();
+    return this.startingP;
+  }
+
+  // 卸载兜底:在途的 getUserMedia 一旦落地立即关闭;已录中的由调用方 stopAndSave 收尾。
+  dispose(): void {
+    this.disposed = true;
+    if (!this.active) {
+      this.stream?.getTracks().forEach((t) => t.stop());
+      this.stream = null;
+      this.mr = null;
+    }
   }
 
   async stop(): Promise<Recording> {

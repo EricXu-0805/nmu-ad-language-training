@@ -25,6 +25,9 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
   const isSelfIntro = section?.key === "自我介绍";
   const questions = section?.questions ?? [];
   const recSeq = useRef(0);
+  // ★必须在所有 early-return 之前:hook 写在条件 return 后面,脚本从"加载中"变"已加载"
+  // 那一帧 hook 数量改变,React 抛错卸载整棵树——整页按钮全部失灵。
+  const [proxyBusy, setProxyBusy] = useState(false);
   const watchdog = useSaveWatchdog(() =>
     toast("8 秒未收到老人端录音回报——可能没录上(麦克风权限/网络)。请检查老人端后重新示意录音。", "danger"));
 
@@ -35,6 +38,7 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
 
   // 老人端录音落库回报 → 记入作业日志(收尾屏音频闸门据此列出)
   useAudioSaved((m) => {
+    if (m.sessionId !== session.session_id) return; // 跨场次残留/迟到回报一律丢弃
     watchdog.clear();
     upsertAudio(m.rawAudioId, {
       turnKey: m.turnKey,
@@ -74,7 +78,6 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
     postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "idle", recSeq: recSeq.current, containsDirectIdentifier: isSelfIntro });
   };
 
-  const [proxyBusy, setProxyBusy] = useState(false);
   async function recordProxyNaming() {
     // 关系建立周"代说物品名"属允许(无警告),仅记介入。在途锁防双击写重复记录。
     if (proxyBusy) return;

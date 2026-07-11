@@ -19,7 +19,7 @@ export function PatientStage({ plan, cursor, sessionId }: { plan: SessionPlan | 
   const role = planTurn?.response_role ?? "命名";
   const tk = item && planTurn ? turnKey(item.item_id, planTurn.turn_seq) : "";
 
-  const { stopAndSave, saving } = useVoxRecorder({ sessionId, recording: cursor?.recording, recSeq: cursor?.recSeq, turnKey: tk });
+  const { stopAndSave, startNow, saving, recActive, micError, saveError, starting } = useVoxRecorder({ sessionId, recording: cursor?.recording, recSeq: cursor?.recSeq, turnKey: tk });
 
   const spotlight: Spotlight = role.startsWith("左") ? "left" : role.startsWith("右") ? "right" : role === "关系识别" ? "both" : "none";
   const question = role.includes("作用") ? "它是做什么用的呢？" : role === "关系识别" ? "它们之间有什么关系呢？" : "请看这张图片，这是什么？";
@@ -30,6 +30,10 @@ export function PatientStage({ plan, cursor, sessionId }: { plan: SessionPlan | 
   useEffect(() => { if (tk) speak(question, { tag: tk }); }, [tk, question]);
   useEffect(() => { if (cueText) speak(cueText, { tag: tk, enqueue: true }); }, [cueText, tk]);
 
+  // 收尾/结束的收回游标(screen:"thanks"):撤下作答界面,给平和的过渡屏
+  if (cursor?.screen === "thanks") {
+    return <Centered><div className="target">今天辛苦了</div><p className="question">请稍候…</p></Centered>;
+  }
   if (!item || !planTurn) {
     return <Centered><p className="question">请稍候…</p></Centered>;
   }
@@ -44,7 +48,14 @@ export function PatientStage({ plan, cursor, sessionId }: { plan: SessionPlan | 
       </div>
       {saving
         ? <p className="cue" style={{ border: "none", boxShadow: "none", background: "transparent" }}>好的，收到了…</p>
-        : <MicButton state={cursor?.recording ?? "idle"} onStop={stopAndSave} />}
+        : (
+          <>
+            <MicButton state={cursor?.recording ?? "idle"} localActive={recActive}
+              selfStart={cursor?.selfStart === true} micError={micError} starting={starting}
+              onStart={() => void startNow()} onStop={stopAndSave} />
+            {saveError && <p style={{ fontSize: "var(--fs-md)", margin: 0, opacity: 0.75 }}>刚才没有存上，请再说一遍</p>}
+          </>
+        )}
     </Centered>
   );
 }

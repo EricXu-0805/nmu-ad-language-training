@@ -78,8 +78,8 @@ export const api = {
 
   // 跨设备实时状态(内网双设备;同机双窗时 BroadcastChannel 仍是快路径)
   getLiveState: () =>
-    req<{ seq: number; session: unknown; cursor: unknown; rapportStep: unknown; audioSaved: unknown }>("GET", "/live/state"),
-  putLiveState: (kind: "session" | "cursor" | "rapportStep" | "audioSaved", payload: object) =>
+    req<{ seq: number; session: unknown; cursor: unknown; rapportStep: unknown; audioSaved: unknown; patientRec: unknown }>("GET", "/live/state"),
+  putLiveState: (kind: "session" | "cursor" | "rapportStep" | "audioSaved" | "patientRec", payload: object) =>
     req<{ seq: number }>("PUT", "/live/state", { kind, payload }),
 
   // 前后测量表(scale_result 容器)

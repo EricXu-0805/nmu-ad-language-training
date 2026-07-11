@@ -10,11 +10,18 @@ export type PatientScreen = "idle" | "present" | "record" | "thanks" | "done";
 export type SyncMsg =
   | { type: "session"; sessionId: string; weekNo: number; eventLine: string; mode: "task" | "rapport"; itemBankVersionId: string; wseq?: number }
   // recSeq:每次 arm 递增。armed→armed 重发(老人自停后再示意)靠它触发老人端 effect;无它则依赖值不变、麦克风永不重开。
-  | { type: "cursor"; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; wseq?: number }
+  // selfStart:操作端按录音资格(recording_allowed)判定后下发——老人端只有收到 true 才显示
+  // "点这里,开始回答"自助开录按钮。缺省/false 一律不显示(fail-closed:合规闸门不被老人端绕过)。
+  | { type: "cursor"; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; selfStart?: boolean; wseq?: number }
   | { type: "rapportStep"; sectionKey: string; questionIdx: number; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; wseq?: number }
-  | { type: "audioSaved"; rawAudioId: string; durationSeconds: number; turnKey: string; containsDirectIdentifier?: boolean };
+  // sessionId:操作端凭它丢弃跨场次的迟到/残留回报(live state 里 audioSaved 存到下次握手才清)。
+  | { type: "audioSaved"; rawAudioId: string; durationSeconds: number; turnKey: string; sessionId?: string; containsDirectIdentifier?: boolean }
+  // 老人端麦克风真值上报(自助开录时操作端唯一的感知渠道;也用于示意录音的开麦确认)。
+  // 这是"上报"不是"显示状态"——老人端仍只读游标,写者规则不变(audioSaved/patientRec 两类上报除外)。
+  | { type: "patientRec"; active: boolean; turnKey: string; sessionId: string };
 
 export type SessionMsg = Extract<SyncMsg, { type: "session" }>;
 export type CursorMsg = Extract<SyncMsg, { type: "cursor" }>;
 export type RapportMsg = Extract<SyncMsg, { type: "rapportStep" }>;
 export type AudioSavedMsg = Extract<SyncMsg, { type: "audioSaved" }>;
+export type PatientRecMsg = Extract<SyncMsg, { type: "patientRec" }>;

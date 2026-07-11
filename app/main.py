@@ -291,7 +291,8 @@ class LiveIn(BaseModel):
 
 
 _LIVE_SLOT = {"session": "session_json", "cursor": "cursor_json",
-              "rapportStep": "rapport_json", "audioSaved": "audio_json"}
+              "rapportStep": "rapport_json", "audioSaved": "audio_json",
+              "patientRec": "patient_rec_json"}
 
 
 @app.put("/live/state")
@@ -303,8 +304,8 @@ def live_put(body: LiveIn, s: DBSession = Depends(get_session)):
 
     def apply(row: LiveState) -> LiveState:
         if body.kind == "session":
-            # 新场次握手 → 清掉旧游标/步进/录音回报,防老人端串到上一场
-            row.cursor_json = None; row.rapport_json = None; row.audio_json = None
+            # 新场次握手 → 清掉旧游标/步进/录音回报/麦克风上报,防老人端串到上一场
+            row.cursor_json = None; row.rapport_json = None; row.audio_json = None; row.patient_rec_json = None
         setattr(row, slot, _json.dumps(body.payload, ensure_ascii=False))
         row.seq += 1
         row.updated_at = datetime.now()
@@ -329,10 +330,11 @@ def live_get(s: DBSession = Depends(get_session)):
     """读实时状态(两端轮询)。seq 不变即无新事,客户端可跳过处理。"""
     row = s.get(LiveState, 1)
     if not row:
-        return {"seq": 0, "session": None, "cursor": None, "rapportStep": None, "audioSaved": None}
+        return {"seq": 0, "session": None, "cursor": None, "rapportStep": None, "audioSaved": None, "patientRec": None}
     load = lambda t: _json.loads(t) if t else None  # noqa: E731
     return {"seq": row.seq, "session": load(row.session_json), "cursor": load(row.cursor_json),
-            "rapportStep": load(row.rapport_json), "audioSaved": load(row.audio_json)}
+            "rapportStep": load(row.rapport_json), "audioSaved": load(row.audio_json),
+            "patientRec": load(row.patient_rec_json)}
 
 
 # ---------------- M3 ASR(本地、可插拔;M0=Null 引擎降级人工)----------------

@@ -1,9 +1,9 @@
 // 操作端唯一写者 hook。双通道:BroadcastChannel(同机秒推)+ 服务端 /live/state(跨设备真值)。
 // 服务端写失败不阻塞现场(fire-and-forget)——同机模式 bus 已足够,内网模式下轮询会追上。
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { bus } from "./bus";
-import type { AudioSavedMsg, CursorMsg, RapportMsg, SessionMsg, SyncMsg } from "./messages";
+import type { AudioSavedMsg, CursorMsg, PatientRecMsg, RapportMsg, SessionMsg, SyncMsg } from "./messages";
 
 const LIVE_POLL_MS = 2000;
 
@@ -47,6 +47,30 @@ export function useSaveWatchdog(onTimeout: () => void, ms = 8000) {
   }, [clear, ms]);
   useEffect(() => clear, [clear]);
   return { start, clear };
+}
+
+// 操作端订阅老人端麦克风真值上报(patientRec):自助开录时操作端唯一的感知渠道。
+// 这是"最新状态"不是事件流:bus 秒推 + 轮询兜底,跨场次的上报一律丢弃。
+export function usePatientRec(sessionId: string): PatientRecMsg | null {
+  const [rec, setRec] = useState<PatientRecMsg | null>(null);
+  const sidRef = useRef(sessionId);
+  sidRef.current = sessionId;
+  useEffect(() => {
+    const apply = (m: PatientRecMsg) => { if (m.sessionId === sidRef.current) setRec(m); };
+    const unsub = bus.subscribe((msg: SyncMsg) => {
+      if (msg.type === "patientRec") apply(msg);
+    });
+    const timer = setInterval(() => {
+      api.getLiveState()
+        .then((d) => {
+          const m = (d as { patientRec?: PatientRecMsg | null }).patientRec;
+          if (m && typeof m.active === "boolean") apply({ ...m, type: "patientRec" });
+        })
+        .catch(() => {});
+    }, LIVE_POLL_MS);
+    return () => { unsub(); clearInterval(timer); };
+  }, []);
+  return rec;
 }
 
 // 操作端订阅老人端录音回报:bus(同机)+ 服务端轮询(跨设备),按 rawAudioId 去重。

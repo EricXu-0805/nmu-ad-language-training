@@ -48,7 +48,9 @@ function pickLocalZhVoice(): SpeechSynthesisVoice | null {
     const langBase = l.startsWith("zh-cn") || l.startsWith("cmn") ? 0 : l.startsWith("zh-tw") ? 40 : 60;
     const base = v.name.split(" (")[0].trim();
     const nameAdj = PREFERRED_VOICES.some((p) => v.name.includes(p)) ? 0 : NOVELTY_VOICES.has(base) ? 20 : 10;
-    return langBase + nameAdj;
+    // 同名高级/增强变体(研究者在系统设置下载后出现)音质远好于紧凑版:同层再压一档,自动优先
+    const qualityAdj = /高级|增强|Enhanced|Premium|Superior/i.test(v.name) ? -5 : 0;
+    return langBase + nameAdj + qualityAdj;
   };
   return [...vs].sort((a, b) => score(a) - score(b))[0] ?? null;
 }
