@@ -36,6 +36,7 @@ from .models import Session as TrainSession
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db(engine)
+    asr.cleanup_scratch()   # 清扫上次进程异常终止残留的云转写临时音频副本
     yield
 
 
@@ -1136,7 +1137,7 @@ def resume_session(session_id: str, s: DBSession = Depends(get_session)):
     return _runtime_payload(session_id, state)
 
 
-# ---------------- M3 ASR(本地、可插拔;M0=Null 引擎降级人工)----------------
+# ---------------- M3 ASR(可插拔;默认 auto:有 Key 走云端 qwen3-asr,无则降级人工)----------------
 @app.get("/asr/hotwords")
 def asr_hotwords():
     bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
@@ -1147,22 +1148,27 @@ def asr_hotwords():
 
 @app.post("/asr/transcribe/{raw_audio_id}")
 def asr_transcribe(raw_audio_id: str, s: DBSession = Depends(get_session)):
-    """本地转写。引擎未接(null)→ degraded=true、asr_text=null,操作端走人工转写,链路不断。"""
+    """转写(云端 qwen3-asr 上下文偏置/降级 null)。引擎不可用 → degraded=true、asr_text=null,操作端走人工转写,链路不断。"""
     _load_row(raw_audio_id, s)
     p = audio_store.find_blob(raw_audio_id)
     if not p:
         raise HTTPException(404, "无音频字节,无法转写(先 PUT /audio/{id}/blob)")
     bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
-    res = asr.get_engine().transcribe(p.read_bytes(), asr.build_hotwords(bank))
+    try:
+        script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
+    except Exception:
+        script = None       # 脚本文件坏只影响属相热词,转写链路不断
+    res = asr.get_engine().transcribe(p.read_bytes(), asr.build_hotwords(bank, script))
     return {"raw_audio_id": raw_audio_id, "asr_text": res.asr_text,
             "asr_confidence": res.asr_confidence, "engine_version": res.engine_version,
             "degraded": res.asr_text is None}
 
 
-# ---------------- 本地神经 TTS(小语的声音;全本地,云端语音 API 属禁区)----------------
+# ---------------- 神经 TTS(小语的声音;云端白名单闭集优先,本地 piper 降级)----------------
 @app.get("/tts/speak")
 def tts_speak(text: str):
-    """合成一句固定话术。GET(读语义,老人端免 PIN);引擎未接/模型缺失 → 204,前端回退系统语音。"""
+    """合成一句固定话术。GET(读语义,老人端免 PIN);引擎未接/模型缺失 → 204,前端回退系统语音。
+    云引擎只合成白名单文本(题库/脚本/固定话术闭集)——患者字段永不出网,见 tts.cloud_text_allowed。"""
     text = text.strip()
     if not text:
         raise HTTPException(422, "text 为空")

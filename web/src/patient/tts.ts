@@ -1,5 +1,6 @@
-// 老人端本地语音(小语开口),两级链路、零云端:
-// ① 本地神经 TTS(后端 /tts/speak,piper onnx,CPU 实时,自然人声)——同源请求,文本不出机器;
+// 老人端语音(小语开口),两级链路:
+// ① 神经 TTS(后端 /tts/speak,同源)——后端按配置走云端(白名单闭集,只合成题库/脚本/
+//    固定话术,患者字段永不出网)或本地 piper,失败自动降级;前端只看响应,不感知引擎。
 // ② 回退:浏览器 speechSynthesis,只用 localService 中文语音(Chrome "Google 普通话" 是联网合成,
 //    文本会出机器——宁可静音也不用;找不到本机中文语音就什么都不读)。
 // ★只朗读屏上已显示的题库/脚本原文,不合成任何新话术(单一内容源不破)。
@@ -34,7 +35,7 @@ function audit(ev: string, tag: string, text: string): void {
 
 // ---------------- 播放状态机 ----------------
 type Line = { text: string; tag: string };
-let neural: "unknown" | "on" | "off" = "unknown"; // 后端引擎可用性,204 一次探明整会话回退
+let neural: "unknown" | "on" | "off" = "unknown"; // 后端引擎可用性;只有"引擎未接"(X-Tts-Engine=null-0)的 204 才一次锁定整场回退
 let neuralFails = 0;           // 连续网络/后端失败计数:偶发抖动单句回退,连败才整场降级
 const NEURAL_FAIL_LATCH = 3;   // (一次瞬断就把 neural 钉死,会让无本机中文语音的设备整场静音)
 const audioEl = typeof Audio !== "undefined" ? new Audio() : null;
@@ -66,7 +67,12 @@ async function playItem(item: Line, g: number): Promise<void> {
     try {
       const res = await fetch(`/tts/speak?text=${encodeURIComponent(item.text)}`);
       if (g !== gen) return;                       // 已被打断:新句自会驱动,旧续体退场
-      if (res.status === 204) { neural = "off"; }
+      const engineTag = res.headers.get("X-Tts-Engine") ?? "";
+      if (res.status === 204) {
+        // 云接入后 204 有两种成因:引擎未接(null-0,稳定态)才一次锁死整场;
+        // 云端瞬态失败(header 带引擎名)按连败计数——云 5 秒后恢复不该整场哑掉。
+        if (engineTag === "null-0" || ++neuralFails >= NEURAL_FAIL_LATCH) { neural = "off"; }
+      }
       else if (res.ok) {
         neural = "on";
         neuralFails = 0;
@@ -96,7 +102,7 @@ async function playItem(item: Line, g: number): Promise<void> {
           utterItem(item, g);
         };
         await audioEl.play();
-        audit("start@piper", item.tag, item.text);
+        audit(`start@${engineTag || "neural"}`, item.tag, item.text);
         return;                                     // 播放中,后续由 onended 续驱
       }
       else if (++neuralFails >= NEURAL_FAIL_LATCH) { neural = "off"; }

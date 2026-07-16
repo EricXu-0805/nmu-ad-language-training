@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 部署启动脚本(医院内网/科室专机,全程离线,不上云)。
+# 部署启动脚本(医院内网/科室专机)。云语音(TTS/ASR/判分)为可选增强:
+# 配了 DASHSCOPE_API_KEY 自动启用,没配全链降级本地,照常能跑。
 #
 # 单机模式(默认):  ./scripts/serve.sh
 #   → 127.0.0.1:8000,同机开两窗 /console + /patient(localhost 即 secure context,麦克风可用)
@@ -23,11 +24,26 @@ if [ ! -d web/dist ] && command -v npm >/dev/null 2>&1; then
 fi
 [ -d web/dist ] || echo "⚠️ 无 web/dist(纯 API 模式);要带界面请先在有 node 的机器上构建后拷入"
 
+# 云语音 Key(可选):环境没带时从 macOS 钥匙串取。录入(终端里输,别贴聊天):
+#   security add-generic-password -s nmu-dashscope -a nmu -w '<你的KEY>'
+# 必须放在 npm install/build 之后:任意 npm postinstall 脚本都不该读到 Key。
+if [ -z "${DASHSCOPE_API_KEY:-}" ] && command -v security >/dev/null 2>&1; then
+  DASHSCOPE_API_KEY=$(security find-generic-password -s nmu-dashscope -w 2>/dev/null || true)
+  if [ -n "$DASHSCOPE_API_KEY" ]; then
+    export DASHSCOPE_API_KEY
+    echo "✓ 已从钥匙串加载云语音 Key(小语=云端人声,ASR/判分=云端)"
+  fi
+fi
+
 # 后台起服务 → 探测真正监听后才报地址(横幅先于就绪打印会诱导过早开浏览器→连接被拒);
 # 单机模式就绪后自动开两窗(macOS;NO_OPEN=1 关闭)。Ctrl-C 正常退出并带走服务进程。
+# 本机回环探测一律绕过代理:装了 Clash/VPN 的机器,shell 里的 http_proxy 会把
+# curl 127.0.0.1 劫持到代理、代理回 502,curl 收到响应即 exit 0,会被误判成"端口已占用"。
+probe_local() { curl -sk --noproxy '*' -o /dev/null "$1" 2>/dev/null; }
+
 run_server() { # $1=探测URL $2=就绪后要打印/打开的说明,其余=uvicorn 参数
   local probe="$1" ready_msg="$2"; shift 2
-  if curl -sk -o /dev/null "$probe" 2>/dev/null; then
+  if probe_local "$probe"; then
     echo "✗ 端口上已有服务在跑(多半是上一个 serve.sh 没关)。"
     echo "  先到旧窗口按 Ctrl-C,或执行: pkill -f app.main:app  再重新启动。"
     exit 1
@@ -40,7 +56,7 @@ run_server() { # $1=探测URL $2=就绪后要打印/打开的说明,其余=uvico
       echo "✗ 服务启动失败(常见:端口被占,查 lsof -i :${probe##*:} 的端口段;或看上方报错)"
       exit 1
     fi
-    if curl -sk -o /dev/null "$probe" 2>/dev/null; then
+    if probe_local "$probe"; then
       echo "════════════════════════════════════════"
       echo "✓ 服务已就绪"
       printf '%b\n' "$ready_msg"

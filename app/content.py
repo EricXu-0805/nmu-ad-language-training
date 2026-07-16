@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -164,6 +165,74 @@ def validate_week1_script(script: dict) -> list[str]:
     if script.get("silence_seconds") != 10:
         issues.append("沉默触发阈值应为 10 秒（与第2–8周口径一致）")
     return issues
+
+
+# 老人端前端硬编码的固定话术（PatientStage 问句 / RapportStage 兜底 / 试听句）。
+# 改前端这些字符串时必须同步这里，否则云 TTS 拒合成、自动落回本地引擎。
+FIXED_TTS_LINES: tuple[str, ...] = (
+    "您好",
+    "请看这张图片，这是什么？",
+    "它是做什么用的呢？",
+    "它们之间有什么关系呢？",
+    "我们一起聊聊天，好吗？",
+)
+
+
+_SLOT_RE = re.compile(r"【[^】]*】")
+_ZODIAC_SLOT = "【老人所说的属相】"
+
+
+def _expand_slots(line: str, zodiac: list[str]):
+    """槽位模板处理：属相是 12 生肖闭集 → 展开成具体句进白名单；
+    开放槽位（兴趣/活动/称呼…）实例化后含老人自述内容=患者数据 →
+    模板与实例一律不进白名单（云端拒合成，由本地引擎朗读）。"""
+    if "【" not in line:
+        yield line
+        return
+    if _SLOT_RE.findall(line) == [_ZODIAC_SLOT]:
+        for z in zodiac:
+            yield line.replace(_ZODIAC_SLOT, z)
+
+
+def tts_allowlist(bank: ItemBank, week1_script: dict | None = None) -> frozenset[str]:
+    """云 TTS 允许合成的全部文本（闭集）。
+
+    红线：发往云端的文本只能来自题库/脚本/固定 UI 话术，永不携带患者字段。
+    不在此集合的文本，云引擎一律拒合成（fail-closed，落回本地引擎/系统语音）。
+    """
+    lines: set[str] = set(FIXED_TTS_LINES)
+    for it in bank.single_element:
+        for t in (it.get("initial_prompt"), it.get("success_line"), it.get("tell_answer")):
+            if t:
+                lines.add(t)
+        for cue in (it.get("cues") or {}).values():
+            t = (cue or {}).get("text")
+            if t:
+                lines.add(t)
+    for it in bank.double_element:
+        for k in ("left_function_cue", "right_function_cue", "relation_cue"):
+            t = it.get(k)
+            if t:
+                lines.add(t)
+    if week1_script:
+        zodiac = list(week1_script.get("zodiac_closed_list") or [])
+        t = week1_script.get("generic_fallback_line")
+        if t:
+            lines.add(t)
+        for sec in week1_script.get("sections") or []:
+            if sec.get("speaker") != "机器人":
+                continue
+            if sec.get("line"):
+                lines.update(_expand_slots(sec["line"], zodiac))
+            for q in sec.get("questions") or []:
+                for t in (q.get("ask"), q.get("success")):
+                    if t:
+                        lines.update(_expand_slots(t, zodiac))
+        for slot in (week1_script.get("slots") or {}).values():
+            t = (slot or {}).get("fallback_line")
+            if t:
+                lines.add(t)
+    return frozenset(s.strip() for s in lines if s and s.strip())
 
 
 # 内容目录默认位置

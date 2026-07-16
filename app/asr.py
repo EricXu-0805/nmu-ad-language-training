@@ -1,16 +1,34 @@
-"""M3 ASR 接口(本地、可插拔、可关闭)——决策19:本地转录,待机构 GPU。
+"""ASR 接口(可插拔、可关闭)——云端优先,恒可降级人工转写。
 
-M0 用 NullAsrEngine:恒返回 None → 操作端人工转写降级,判分链不断。
-真实引擎(whisper.cpp / FunASR 等)接入时实现 AsrProvider 并注册即可,调用面不变。
-热词表从 M5 冻结题库生成(目标词/可接受表达/左右词 + 第1周属相闭表),供真实引擎偏置识别。
+口径(2026-07-16 更新,Eric 确认备案已完成):患者音频可发云端转写。
+- DashScopeAsrEngine:阿里百炼 qwen3-asr-flash(ASR_CLOUD_MODEL),**上下文偏置**——
+  题库目标词/可接受表达/左右词整包喂进 system 文本,识别自动向这些词倾斜
+  (老人方言/含糊回答的命中率靠它)。单段限 3 分钟/10MB,回答通常几十秒,够用。
+- NullAsrEngine:恒返回 None → 操作端人工转写降级,判分链不断。
+ASR_ENGINE 选择(默认 auto:有 DASHSCOPE_API_KEY → dashscope,无 → null)。
+云端失败(断网/欠费/超格式)一律降级 null 口径,不 fail-hard。
 """
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, Sequence
 
 from .content import ItemBank
+
+# 云转写的临时文件放 data/ 自有 scratch 目录(不进系统 /tmp):患者音频副本必须
+# 留在音频治理边界内;进程被杀的残留由 cleanup_scratch()(lifespan 启动时)清扫。
+SCRATCH_DIR = Path(__file__).resolve().parent.parent / "data" / "asr-scratch"
+
+
+def cleanup_scratch() -> None:
+    try:
+        for p in SCRATCH_DIR.glob("asr-*"):
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -35,12 +53,90 @@ class NullAsrEngine:
         return AsrResult(asr_text=None, asr_confidence=None, engine_version=self.version)
 
 
+def _sniff_ext(audio_bytes: bytes) -> str:
+    """按魔数猜容器扩展名(百炼按扩展名识别格式)。MediaRecorder 默认 webm/opus。"""
+    if audio_bytes[:4] == b"\x1aE\xdf\xa3":
+        return ".webm"
+    if audio_bytes[:4] == b"OggS":
+        return ".ogg"
+    if audio_bytes[:4] == b"RIFF":
+        return ".wav"
+    return ".webm"
+
+
+class DashScopeAsrEngine:
+    """qwen3-asr-flash 录音文件识别。context=热词整包(任意背景文本即可偏置)。"""
+
+    def __init__(self, model: str):
+        self._model = model
+        self.version = f"dashscope/{model}"
+
+    def available(self) -> bool:
+        return bool(os.environ.get("DASHSCOPE_API_KEY"))
+
+    def transcribe(self, audio_bytes: bytes, hotwords: Sequence[str]) -> AsrResult:
+        if not audio_bytes or not self.available():
+            return AsrResult(None, None, self.version)
+        context = "、".join(dict.fromkeys(w for w in hotwords if w))
+        try:
+            text = self._call(audio_bytes, context)
+        except Exception:
+            text = None
+        if not text:
+            return AsrResult(None, None, self.version)
+        hit = any(w and w in text for w in hotwords)
+        return AsrResult(asr_text=text, asr_confidence=None,
+                         engine_version=self.version, hotword_hit=hit)
+
+    def _call(self, audio_bytes: bytes, context: str) -> str | None:
+        from dashscope import MultiModalConversation
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+        f = tempfile.NamedTemporaryFile(dir=SCRATCH_DIR, prefix="asr-",
+                                        suffix=_sniff_ext(audio_bytes), delete=False)
+        tmp = Path(f.name)
+        try:                                # write 也在 try 内:写半截失败同样要删副本
+            with f:
+                f.write(audio_bytes)
+            messages = []
+            if context:
+                messages.append({"role": "system", "content": [{"text": context}]})
+            messages.append({"role": "user", "content": [{"audio": tmp.as_uri()}]})
+            resp = MultiModalConversation.call(
+                model=self._model, messages=messages, result_format="message",
+                request_timeout=30,
+                # itn 关:数字保持汉字口语形态,与题库可接受表达的匹配口径一致
+                asr_options={"enable_lid": False, "enable_itn": False})
+            out = getattr(resp, "output", None)
+            choices = getattr(out, "choices", None) if out is not None else None
+            if not choices:
+                return None
+            content = choices[0].message.content
+            if isinstance(content, list):
+                parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+                text = "".join(parts)
+            else:
+                text = str(content or "")
+            return text.strip() or None
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
 _ENGINES: dict[str, AsrProvider] = {"null": NullAsrEngine()}
 
 
 def get_engine() -> AsrProvider:
-    """按 ASR_ENGINE 环境变量选引擎,未配置/未注册一律降级 null(fail-degraded,不 fail-hard)。"""
-    return _ENGINES.get(os.environ.get("ASR_ENGINE", "null"), _ENGINES["null"])
+    """按 ASR_ENGINE 选引擎(默认 auto:有 Key 走云,无 Key 降级 null)。
+    未注册/不可用一律降级 null(fail-degraded,不 fail-hard)。"""
+    kind = os.environ.get("ASR_ENGINE", "auto")
+    if kind == "auto":
+        kind = "dashscope" if os.environ.get("DASHSCOPE_API_KEY") else "null"
+    if kind == "dashscope" and "dashscope" not in _ENGINES:
+        _ENGINES["dashscope"] = DashScopeAsrEngine(
+            os.environ.get("ASR_CLOUD_MODEL", "qwen3-asr-flash"))
+    eng = _ENGINES.get(kind, _ENGINES["null"])
+    if isinstance(eng, DashScopeAsrEngine) and not eng.available():
+        return _ENGINES["null"]
+    return eng
 
 
 def build_hotwords(bank: ItemBank, week1_script: dict | None = None) -> list[str]:

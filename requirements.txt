@@ -1,4 +1,4 @@
-# 后端依赖（本地部署，不上云）。阶段0 核心逻辑仅用标准库即可跑测试；
+# 后端依赖。阶段0 核心逻辑仅用标准库即可跑测试；
 # 下列依赖在接 API/DB（阶段0 收尾→阶段1）时安装。
 fastapi>=0.115
 uvicorn[standard]>=0.30
@@ -8,10 +8,13 @@ python-multipart>=0.0.9
 pytest>=8.0
 alembic>=1.13          # 数据库迁移(真机患者数据禁止删库重建)
 
-# 本地转录（阶段1）：ASR 模型选型待机构 GPU 配置确认（决策19），接口按可替换设计，
-# 不写死模型；候选如 FunASR / Paraformer，本地运行、音频不出机构。禁止云端转录。
+# 云语音/转写/判分 SDK(2026-07-16 备案完成后口径:云端为可选增强)。
+# 未装或未配 DASHSCOPE_API_KEY 时 TTS/ASR/判分全链自动降级本地,平台照常可用。
+# Key 走 macOS 钥匙串(serve.sh 自动加载),永不写进 .env/配置文件。
+# 红线:发往云 TTS 的文本只能是白名单闭集(app/content.py tts_allowlist),永不携带患者字段。
+dashscope>=1.26
 
-# 本地神经 TTS(小语的声音,CPU 实时;云端语音 API 属禁区——话术是未申报专利的研究 IP)。
+# 本地神经 TTS(小语的兜底声音,CPU 实时;云端不可用/文本不在白名单时顶上)。
 # 装后下载音色: python -m piper.download_voices --data-dir data/tts zh_CN-huayan-medium
 # 未装/无模型自动降级浏览器系统语音,部署机可选。
 piper-tts>=1.4
