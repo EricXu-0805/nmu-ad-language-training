@@ -35,6 +35,8 @@ function audit(ev: string, tag: string, text: string): void {
 // ---------------- 播放状态机 ----------------
 type Line = { text: string; tag: string };
 let neural: "unknown" | "on" | "off" = "unknown"; // 后端引擎可用性,204 一次探明整会话回退
+let neuralFails = 0;           // 连续网络/后端失败计数:偶发抖动单句回退,连败才整场降级
+const NEURAL_FAIL_LATCH = 3;   // (一次瞬断就把 neural 钉死,会让无本机中文语音的设备整场静音)
 const audioEl = typeof Audio !== "undefined" ? new Audio() : null;
 let queue: Line[] = [];
 let busy = false;   // 取队即置位:fetch/play 在途都算忙,同帧第二句只能排队
@@ -67,6 +69,7 @@ async function playItem(item: Line, g: number): Promise<void> {
       if (res.status === 204) { neural = "off"; }
       else if (res.ok) {
         neural = "on";
+        neuralFails = 0;
         url = URL.createObjectURL(await res.blob());
         if (g !== gen) { URL.revokeObjectURL(url); return; }
         const u = url;
@@ -86,13 +89,17 @@ async function playItem(item: Line, g: number): Promise<void> {
           if (curUrl === u) curUrl = null;
           if (g !== gen) return;
           audit("error:audio", item.tag, item.text);
-          busy = false;
-          driveQueue();
+          // 浏览器无法解码/播放本地 WAV 时，本会话直接降级到系统语音。
+          // 若仍保留 neural=on，voiceschanged/pointerdown 的补读会不断重取同一句，
+          // 造成老人端无声且后端被 /tts/speak 高频请求淹没。
+          neural = "off";
+          utterItem(item, g);
         };
         await audioEl.play();
         audit("start@piper", item.tag, item.text);
         return;                                     // 播放中,后续由 onended 续驱
       }
+      else if (++neuralFails >= NEURAL_FAIL_LATCH) { neural = "off"; }
       // !res.ok(非 204):这一句落到 ② 回退
     } catch (e) {
       if (url) { URL.revokeObjectURL(url); if (curUrl === url) curUrl = null; }
@@ -111,7 +118,10 @@ async function playItem(item: Line, g: number): Promise<void> {
         if (g === gen) { busy = false; driveQueue(); }
         return;
       }
-      // 网络/后端异常:这一句落到 ② 回退
+      // 网络/后端异常:单句回退系统语音;只有连续多次失败才整场停用神经路径
+      // (防补读风暴),一次瞬断不钉死——成功一次即清零复活。
+      if (++neuralFails >= NEURAL_FAIL_LATCH) neural = "off";
+      // 这一句落到 ② 回退
     }
   }
   if (g !== gen) return;
@@ -194,6 +204,13 @@ export function speak(text: string, opts?: { tag?: string; enqueue?: boolean }):
   const tag = opts?.tag ?? "";
   lastText = { text, tag };
   if (!enabled) return;
+  // 轮询、StrictMode 或同状态重挂载都不应把同一句重复塞进播放队列。
+  // tag 绑定具体题目/环节，因此只去重“同内容且同环节”的在途请求。
+  if (
+    pending?.text === text
+    && pending.tag === tag
+    && (busy || queue.some((line) => line.text === text && line.tag === tag))
+  ) return;
   pending = { text, tag };
   if (!opts?.enqueue) {
     interrupt();

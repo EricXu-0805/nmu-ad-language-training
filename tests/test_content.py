@@ -2,7 +2,7 @@ import copy
 
 from app.content import (
     CONTENT_DIR, load_item_bank, load_week1_script,
-    validate_item_bank, validate_week1_script, ItemBank,
+    content_readiness, validate_item_bank, validate_week1_script, ItemBank,
 )
 
 
@@ -12,10 +12,21 @@ def test_shipped_item_bank_no_errors():
     assert bank.version_id == "wk2-v1-20260707"
     assert len(bank.single_element) == 20
     assert len(bank.double_element) == 10
+    assert len(bank.multi_element) == 0
+    assert bank.supported_training_weeks == (2,)
+    assert bank.qc_status == "draft"
     result = validate_item_bank(bank)
     assert result["errors"] == [], f"题库不应有勘误级错误：{result['errors']}"
     # 已知待补全：源脚本“花”的第1级线索缺右引号，机器无法抽取，留待内容组补
     assert any("SE_花" in w and "第1级线索" in w for w in result["warnings"])
+
+
+def test_shipped_bank_is_explicitly_demo_only_until_qc_and_multi_complete():
+    ready = content_readiness(load_item_bank(CONTENT_DIR / "item_bank_v1.json"))
+    assert ready["qc_status"] == "draft"
+    assert ready["supported_training_weeks"] == [2]
+    assert ready["ready_for_research"] is False
+    assert any("多要素" in w for w in ready["warnings"])
 
 
 def test_errata_was_recorded():

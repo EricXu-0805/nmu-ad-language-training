@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app import export
+from app import audio_store, export
 from app.export import DIRECT_IDENTIFIER_COLUMNS, mask_text, pseudonymize
 from app.models import (
     AudioAssetRow, ItemEvent, Patient, ScaleResult, Session as TrainSession, TurnEvent,
@@ -32,10 +32,16 @@ def _seed(s):
     s.add(de); s.commit(); s.refresh(de)
     for seq, role in enumerate(["左命名", "左作用", "右命名", "右作用", "关系识别"], start=1):
         s.add(TurnEvent(item_event_id=de.id, turn_seq=seq, response_role=role,
+                        confirmed_response_text="已人工确认", prompt_level=0,
                         element_value=1, reviewed_score=1, score_locked=True, reviewer_id="R1"))
-    # 含直接标识符的音频（第1周自我介绍类）——转写须被红线
-    s.add(AudioAssetRow(raw_audio_id="a_id", session_id="S9", contains_direct_identifier=True))
-    s.add(AudioAssetRow(raw_audio_id="a_plain", session_id="S9"))
+    # 含直接标识符的音频（第1周自我介绍类）——转写须被红线。
+    # 音频须有实际采集字节 + 采集期 checksum，导出才有资格推进闸门。
+    p_id, checksum_id = audio_store.save_blob("a_id", b"identifier-voice", "audio/wav")
+    p_plain, checksum_plain = audio_store.save_blob("a_plain", b"plain-voice", "audio/wav")
+    s.add(AudioAssetRow(raw_audio_id="a_id", session_id="S9", contains_direct_identifier=True,
+                        audio_format=p_id.suffix.lstrip("."), checksum=checksum_id))
+    s.add(AudioAssetRow(raw_audio_id="a_plain", session_id="S9",
+                        audio_format=p_plain.suffix.lstrip("."), checksum=checksum_plain))
     s.add(ScaleResult(patient_id="P77", phase_type="前测", scale_name="CETI", score=42.0, assessor_id="A1"))
     s.commit()
 
@@ -86,6 +92,51 @@ def test_export_masks_identifier_transcript_and_triggers_audio_gate(db, tmp_path
     a = db.get(AudioAssetRow, "a_id")
     assert a.status.value == "exported" and a.export_batch_id == res["batch_id"]
     assert set(res["audio_touched"]) == {"a_id", "a_plain"}
+    analysis_batch = tmp_path / res["batch_id"]
+    controlled_batch = tmp_path / "_controlled_audio" / res["batch_id"]
+    assert not (analysis_batch / "audio").exists()                  # 去标识分析包无原始声纹
+    assert (controlled_batch / "audio" / "a_id.wav").exists()     # 原音只在受控目录
+
+
+def test_audio_copy_failure_does_not_commit_exported(db, tmp_path, monkeypatch):
+    _seed(db)
+
+    def fail_copy(*_args, **_kwargs):
+        raise OSError("模拟存储故障")
+
+    monkeypatch.setattr(export.shutil, "copy2", fail_copy)
+    with pytest.raises(OSError, match="存储故障"):
+        export.export_session_bundle(db, "S9", deidentify=True, write_dir=tmp_path)
+    assert db.get(AudioAssetRow, "a_id").status.value == "recorded"
+    assert db.get(AudioAssetRow, "a_plain").status.value == "recorded"
+
+
+def test_missing_prompt_is_excluded_not_counted_spontaneous(db):
+    _seed(db)
+    se = next(db.exec(export.select(ItemEvent).where(ItemEvent.item_id == "SE_锚")))
+    turn = next(db.exec(export.select(TurnEvent).where(TurnEvent.item_event_id == se.id)))
+    turn.prompt_level = None
+    db.add(turn); db.commit()
+    items = list(db.exec(export.select(ItemEvent).where(ItemEvent.session_id == "S9")))
+    turns = {item.id: list(db.exec(export.select(TurnEvent)
+                                   .where(TurnEvent.item_event_id == item.id))) for item in items}
+    scores = export._reconstruct_scores(items, turns)
+    assert scores["single"] is None
+    assert any("prompt_level 缺失" in reason for reason in scores["excluded_items"])
+
+
+def test_legacy_locked_turn_without_confirmation_is_excluded(db):
+    _seed(db)
+    se = next(db.exec(export.select(ItemEvent).where(ItemEvent.item_id == "SE_锚")))
+    turn = next(db.exec(export.select(TurnEvent).where(TurnEvent.item_event_id == se.id)))
+    turn.confirmed_response_text = None
+    db.add(turn); db.commit()
+    items = list(db.exec(export.select(ItemEvent).where(ItemEvent.session_id == "S9")))
+    turns = {item.id: list(db.exec(export.select(TurnEvent)
+                                   .where(TurnEvent.item_event_id == item.id))) for item in items}
+    scores = export._reconstruct_scores(items, turns)
+    assert scores["single"] is None
+    assert any("未确认" in reason for reason in scores["excluded_items"])
 
 
 def test_unlocked_turns_excluded_from_scoring(db, tmp_path):

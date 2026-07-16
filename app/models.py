@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional
 
+from sqlalchemy import BigInteger, Column
 from sqlmodel import Field, SQLModel  # type: ignore
 
 from .enums import (
@@ -129,6 +130,8 @@ class AudioAssetRow(SQLModel, table=True):
     """音频资产（护栏1）。状态机逻辑见 audio_gate.py。"""
     raw_audio_id: str = Field(primary_key=True)
     session_id: Optional[str] = Field(default=None, foreign_key="session.session_id")
+    # 录音落库时即绑定运行环节；即使尚未生成 TurnEvent/转写，重启后仍可恢复映射。
+    turn_key: Optional[str] = None
     audio_format: str = "mp3"                     # 信度/争议子集用 wav（无损/高码率）
     status: AudioStatus = AudioStatus.recorded
     is_reliability_sample: bool = False
@@ -150,11 +153,35 @@ class LiveState(SQLModel, table=True):
     """
     id: int = Field(default=1, primary_key=True)
     seq: int = 0
+    command_wseq: int = Field(
+        default=0, sa_column=Column(BigInteger, nullable=False, default=0))
     session_json: Optional[str] = None       # 最新 session 握手(JSON)
     cursor_json: Optional[str] = None        # 最新游标
     rapport_json: Optional[str] = None       # 最新第1周步进
     audio_json: Optional[str] = None         # 最新老人端录音回报(audioSaved)
     patient_rec_json: Optional[str] = None   # 老人端麦克风真值上报(patientRec):自助开录操作端可见、可远程停
+    # 老人端在线/画面确认只保存设备运行指针，不保存患者信息、题目文本或回答内容。
+    patient_ack_session_id: Optional[str] = None
+    patient_current_screen: Optional[str] = None
+    patient_last_seen_at: Optional[datetime] = None
+    patient_ack_seq: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True))
+    updated_at: Optional[datetime] = None
+
+
+class SessionRuntimeState(SQLModel, table=True):
+    """每场次可恢复的运行游标。
+
+    与 LiveState 的“当前广播快照”分开保存，防止切换受试者/场次时覆盖上一场的续做位置。
+    这里只存冻结计划中的位置和暂停状态；录音字节、回答、判分仍各走原有表和门禁。
+    """
+    session_id: str = Field(primary_key=True, foreign_key="session.session_id")
+    status: str = "active"                   # active / paused
+    cursor_json: Optional[str] = None          # 正式训练安全恢复游标（录音恒 idle）
+    rapport_json: Optional[str] = None         # 关系建立安全恢复游标（录音恒 idle）
+    revision: int = 0
+    paused_at: Optional[datetime] = None
+    resumed_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
 

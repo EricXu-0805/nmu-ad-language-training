@@ -2,7 +2,7 @@ import { useState } from "react";
 import { api, ApiError } from "../../api";
 import { Button } from "../../components/Button";
 import { EnumSelect, Field, TextInput } from "../../components/Field";
-import { useToast } from "../../components/Toast";
+import { useToast } from "../../components/ToastContext";
 import { ABNORMAL_TYPES, CUE_INTERVENTIONS, INTERVENTION_TYPES } from "../../types";
 import type { PhaseType } from "../../types";
 
@@ -47,33 +47,33 @@ export function AbnormalDrawer({ sessionId, phaseType, currentItemEventId, open,
   }
 
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.35)", zIndex: 900, display: "flex", justifyContent: "flex-end" }}>
-      <div className="col fade-in" onClick={(e) => e.stopPropagation()} style={{ width: 460, maxWidth: "92vw", height: "100%", background: "var(--c-bg)", padding: "var(--sp-5)", overflowY: "auto" }}>
-        <div className="row" style={{ justifyContent: "space-between" }}>
-          <h2>记录异常 / 介入</h2>
+    <div className="drawer-backdrop" onClick={onClose}>
+      <section className="drawer-panel fade-in" role="dialog" aria-modal="true" aria-labelledby="abnormal-drawer-title" onClick={(e) => e.stopPropagation()}>
+        <div className="drawer-header">
+          <div><div className="page-kicker">现场记录</div><h2 id="abnormal-drawer-title">异常与研究者介入</h2></div>
           <Button onClick={onClose}>关闭</Button>
         </div>
-        <p className="muted">当前相位:{phaseType ?? "—"}{currentItemEventId ? ` · 关联题事件 #${currentItemEventId}` : " · 未关联具体题"}</p>
+        <p className="muted">当前阶段：{phaseType ?? "—"}{currentItemEventId ? ` · 当前题记录 #${currentItemEventId}` : " · 整个场次"}</p>
 
-        <Field label="介入类型(研究者对训练过程的介入)">
+        <Field label="研究者介入类型">
           <EnumSelect options={INTERVENTION_TYPES} value={intervention} onChange={setIntervention} />
         </Field>
-        <Field label="异常类型(受试者/环境异常)">
+        <Field label="受试者或环境异常">
           <EnumSelect options={ABNORMAL_TYPES} value={abnormal} onChange={setAbnormal} />
         </Field>
 
         {cueBreach && (
-          <div className="card" style={{ background: "var(--c-danger-bg)", border: "2px solid var(--c-danger)", color: "var(--c-danger)" }}>
-            正式训练周「{intervention}」属线索性越界介入 → 将标记<strong>影响该题判分有效性</strong>(后端强制,不可撤销)。
+          <div className="alert alert--danger" role="alert">
+            正式训练中“{intervention}”属于线索性越界介入。本题会被标记为<strong>可能影响判分有效性</strong>，保存后不可撤销。
           </div>
         )}
 
-        <Field label="备注(可选)">
+        <Field label="现场说明（可选）">
           <TextInput value={note} onChange={(e) => setNote(e.target.value)} placeholder="现场情况说明" />
         </Field>
 
-        <Button variant="primary" disabled={busy} onClick={submit}>{busy ? "记录中…" : "记录"}</Button>
-      </div>
+        <div className="drawer-actions"><Button variant="primary" disabled={busy} onClick={submit}>{busy ? "正在记录…" : "保存记录"}</Button></div>
+      </section>
     </div>
   );
 }

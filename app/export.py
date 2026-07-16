@@ -19,11 +19,13 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from sqlmodel import Session as DBSession
 from sqlmodel import select
 
 from . import audio_gate, audio_store, scoring
+from .enums import AudioStatus
 from .models import (
     AbnormalEvent, AudioAssetRow, ItemEvent, Patient, ScaleResult,
     Session as TrainSession, TurnEvent,
@@ -31,8 +33,10 @@ from .models import (
 from .runtime import DOUBLE_ROLE_TO_FIELD
 
 EXPORT_DIR = Path(__file__).resolve().parent.parent / "data" / "exports"
+CONTROLLED_AUDIO_DIR = Path(__file__).resolve().parent.parent / "data" / "controlled-audio-exports"
 _REDACTION = "〔含直接标识·已去标识〕"
 _DIGIT_RUN = re.compile(r"\d{2,}")               # 掩掉 2 位以上连续数字（年龄/电话/证件片段）
+_SAFE_BATCH_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # 默认去标识导出中【绝对禁止出现】的直接标识列名——用于导出后自检。
 DIRECT_IDENTIFIER_COLUMNS = frozenset({
@@ -48,6 +52,27 @@ def pseudonymize(patient_id: str) -> str:
     return "SUBJ-" + hashlib.sha256(patient_id.encode("utf-8")).hexdigest()[:8]
 
 
+def controlled_audio_root(write_dir: Optional[Path] = None) -> Path:
+    """受控音频导出根目录。
+
+    生产环境与去标识分析包 ``data/exports`` 物理分开；测试传入
+    ``write_dir`` 时仍放在分析批次目录之外，防止调用方把声纹误当去标识附件。
+    """
+    return CONTROLLED_AUDIO_DIR if write_dir is None else write_dir / "_controlled_audio"
+
+
+def find_exported_audio_blob(raw_audio_id: str, batch_id: str,
+                             *, root: Optional[Path] = None) -> Path | None:
+    """查找已完成批次中的受控音频副本；checksum 闸门只允许校验它。"""
+    if (not audio_store.SAFE_ID.match(raw_audio_id)
+            or not _SAFE_BATCH_ID.match(batch_id)):
+        return None
+    base = (root or CONTROLLED_AUDIO_DIR) / batch_id / "audio"
+    if not base.exists():
+        return None
+    return next(base.glob(f"{raw_audio_id}.*"), None)
+
+
 def mask_text(text: Optional[str], contains_direct_identifier: bool) -> Optional[str]:
     """转写去标识：含直接标识符整段红线；其余文本对连续数字做保守掩码。"""
     if text is None:
@@ -59,7 +84,11 @@ def mask_text(text: Optional[str], contains_direct_identifier: bool) -> Optional
 
 # ============ 评分重建（从已锁定分环节值）============
 def _locked(turn: TurnEvent) -> bool:
-    return bool(turn.score_locked) and turn.element_value is not None
+    # 兼容旧库时也要重验新门禁：历史行即使 score_locked=True，缺人工确认或
+    # 提示等级仍不能进入正式研究统计。
+    return (bool(turn.score_locked)
+            and turn.element_value is not None
+            and turn.confirmed_response_text is not None)
 
 
 def _reconstruct_scores(items: list[ItemEvent], turns_by_item: dict[int, list[TurnEvent]]) -> dict:
@@ -72,13 +101,21 @@ def _reconstruct_scores(items: list[ItemEvent], turns_by_item: dict[int, list[Tu
     for it in items:
         turns = turns_by_item.get(it.id, [])
         if not turns or not all(_locked(t) for t in turns):
-            excluded.append(f"{it.item_id}（{it.task_type}）：有未锁定环节，暂不计入正式评分")
+            excluded.append(
+                f"{it.item_id}（{it.task_type}）：有未确认或未锁定环节，暂不计入正式评分"
+            )
+            continue
+        if any(t.prompt_level is None for t in turns):
+            excluded.append(f"{it.item_id}（{it.task_type}）：prompt_level 缺失，暂不计入正式评分")
             continue
         tt = str(it.task_type.value if hasattr(it.task_type, "value") else it.task_type)
         if tt == "单要素":
             t = turns[0]
             fc = int(t.element_value)
-            pl = int(t.prompt_level or 0)
+            if t.prompt_level is None:
+                excluded.append(f"{it.item_id}（单要素）：prompt_level 缺失，不得按自发正确统计")
+                continue
+            pl = int(t.prompt_level)
             singles.append(scoring.SingleElementItem(
                 item_id=it.item_id, final_correct=fc,
                 spontaneous_correct=1 if (fc == 1 and pl == 0) else 0,
@@ -119,7 +156,9 @@ def export_session_bundle(db: DBSession, session_id: str, *, deidentify: bool = 
         raise ValueError(f"场次 {session_id} 不存在")
     patient = db.get(Patient, sess.patient_id)
     now = now or datetime.now()
-    batch_id = batch_id or ("EXP-" + now.strftime("%Y%m%d-%H%M%S"))
+    batch_id = batch_id or ("EXP-" + now.strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:12])
+    if not _SAFE_BATCH_ID.match(batch_id):
+        raise ValueError("导出批次号含非法字符")
     subj = pseudonymize(sess.patient_id)
 
     items = list(db.exec(select(ItemEvent).where(ItemEvent.session_id == session_id)))
@@ -189,38 +228,26 @@ def export_session_bundle(db: DBSession, session_id: str, *, deidentify: bool = 
                   "note": (mask_text(a.note, True) if deidentify and a.note else a.note)}
                  for a in abn_rows]
 
-    # --- 音频清单（mp3 打包引用）+ 触发导出闸门 ---
+    # --- 音频清单 + 导出候选 ---
+    # 去标识分析包只放元数据清单，原始声纹始终另存受控目录。
+    # 只有在源字节存在、已登记 checksum 且受控副本成功后，才会推进 recorded→exported。
     audio_sheet, touched = [], []
+    export_candidates: list[tuple[AudioAssetRow, Path]] = []
     for a in audios:
-        if a.status == a.status.recorded:      # recorded→exported，绝不在此删
-            try:
-                asset = audio_gate.AudioAsset(a.raw_audio_id, a.status,
-                                              a.is_reliability_sample, a.withdrawn)
-                audio_gate.mark_exported(asset)
-                a.status = asset.status
-                a.export_batch_id = batch_id
-                a.exported_at = now
-                db.add(a); touched.append(a.raw_audio_id)
-            except audio_gate.AudioGateError:
-                pass
+        source_blob = audio_store.find_blob(a.raw_audio_id)
+        will_export = a.status == AudioStatus.recorded and source_blob is not None
+        if will_export:
+            if not a.checksum:
+                raise ValueError(f"音频 {a.raw_audio_id} 缺采集期 checksum，拒绝标记导出")
+            export_candidates.append((a, source_blob))
         audio_sheet.append({"raw_audio_id": a.raw_audio_id, "session_id": session_id,
-                            "audio_format": a.audio_format, "status": _v(a.status),
+                            "turn_key": a.turn_key,
+                            "audio_format": a.audio_format,
+                            "status": _v(AudioStatus.exported if will_export else a.status),
                             "is_reliability_sample": a.is_reliability_sample,
                             "contains_direct_identifier": a.contains_direct_identifier,
-                            "export_batch_id": a.export_batch_id})
-    if touched:
-        db.commit()
-
-    # --- 音频字节真打包(有存储字节才拷,进导出包 audio/ 子目录;无字节仅出清单行)---
-    base = (write_dir or EXPORT_DIR) / batch_id
-    audio_files: list[str] = []
-    for a in audios:
-        p = audio_store.find_blob(a.raw_audio_id)
-        if p:
-            dst = base / "audio" / p.name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p, dst)
-            audio_files.append(p.name)
+                            "export_batch_id": (batch_id if will_export else a.export_batch_id),
+                            "controlled_audio_exported": will_export})
 
     sheets = {"session": session_sheet, "turns": turn_sheet, "item_scores": score_sheet,
               "scales": scale_sheet, "abnormal": abn_sheet, "audio_manifest": audio_sheet}
@@ -230,9 +257,47 @@ def export_session_bundle(db: DBSession, session_id: str, *, deidentify: bool = 
     if deidentify:
         _assert_no_direct_identifiers(sheets)
 
-    files = _write_csvs(sheets, batch_id, write_dir)
+    # 顺序是数据保护边界：先完整写分析 CSV，再复制并校验受控音频副本，
+    # 最后才在 DB 提交 exported。任一 IO 步失败都不得推进删除闸门。
+    csv_base = (write_dir or EXPORT_DIR) / batch_id
+    controlled_base = controlled_audio_root(write_dir) / batch_id / "audio"
+    audio_files: list[str] = []
+    try:
+        files = _write_csvs(sheets, batch_id, write_dir)
+        for a, source in export_candidates:
+            dst = controlled_base / source.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dst)
+            copied_digest = audio_store.sha256_hex(dst.read_bytes())
+            if copied_digest != a.checksum:
+                raise RuntimeError(f"音频 {a.raw_audio_id} 导出副本 checksum 不一致，拒绝推进状态")
+            audio_files.append(source.name)
+    except Exception:
+        # 中途失败不能留下"看似完整"的批次目录:manifest 里已预标 exported、受控声纹
+        # 只有半套——分析侧会当真、backup.sh 会把孤儿副本永久收编。两个目录都以本次
+        # batch_id 独占命名,整目录移除;DB 状态未提交,音频删除闸门不受任何影响。
+        shutil.rmtree(csv_base, ignore_errors=True)
+        shutil.rmtree(controlled_base.parent, ignore_errors=True)
+        raise
+
+    for a, _source in export_candidates:
+        asset = audio_gate.AudioAsset(a.raw_audio_id, a.status,
+                                      a.is_reliability_sample, a.withdrawn)
+        audio_gate.mark_exported(asset)
+        a.status = asset.status
+        a.export_batch_id = batch_id
+        a.exported_at = now
+        db.add(a)
+        touched.append(a.raw_audio_id)
+    if touched:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
     return {"batch_id": batch_id, "deidentified": deidentify, "sheets": sheets,
             "files": files, "audio_touched": touched, "audio_files": audio_files,
+            "controlled_audio_dir": str(controlled_base.parent) if audio_files else None,
             "excluded_items": scores["excluded_items"]}
 
 

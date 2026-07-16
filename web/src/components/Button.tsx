@@ -1,18 +1,24 @@
 import type { ButtonHTMLAttributes } from "react";
 
-type Variant = "primary" | "ghost" | "danger";
+export type ButtonVariant = "primary" | "secondary" | "ghost" | "quiet" | "danger";
+export type ButtonSize = "sm" | "md" | "lg";
 
-const styles: Record<Variant, React.CSSProperties> = {
-  primary: { background: "var(--c-primary)", color: "var(--c-on-primary)", border: "1px solid var(--c-primary)" },
-  ghost: { background: "var(--c-surface)", color: "var(--c-fg)", border: "1px solid var(--c-line)" },
-  danger: { background: "var(--c-danger)", color: "#fff", border: "1px solid var(--c-danger)" },
-};
+export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  /** ghost 保留为旧版 outline 按钮别名；新代码优先写 secondary。 */
+  variant?: ButtonVariant;
+  size?: ButtonSize;
+  fullWidth?: boolean;
+}
 
-export function Button({ variant = "ghost", style, ...rest }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant }) {
+export function Button({ variant = "ghost", size = "md", fullWidth = false, className, ...rest }: ButtonProps) {
+  const classes = [
+    "button",
+    `button--${variant}`,
+    `button--${size}`,
+    fullWidth ? "button--full" : "",
+    className ?? "",
+  ].filter(Boolean).join(" ");
   return (
-    <button
-      {...rest}
-      style={{ padding: "var(--sp-2) var(--sp-4)", borderRadius: "var(--radius)", fontWeight: 600, ...styles[variant], ...style }}
-    />
+    <button {...rest} className={classes} />
   );
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 本机数据备份:数据库 + 音频字节 + 导出批次 → data/backups/<时间戳>/,附 sha256 清单。
+# 本机数据备份:数据库 + 采集音频 + 分析导出 + 受控声纹导出 → data/backups/<时间戳>/,附 sha256 清单。
 # 患者数据不出机构:备份目的地默认仍在本机;要落到院内加密移动盘/内网共享盘,用 BACKUP_DIR=/Volumes/xxx ./scripts/backup.sh。
 # 恢复:停服(Ctrl-C serve.sh)→ 用备份目录里的 app.db / audio/ 覆盖 data/ 下同名 → 重启 serve.sh(会自动 alembic upgrade)。
 # 注:PostgreSQL 部署时数据库不在 data/app.db,需另用 pg_dump;本脚本只覆盖 SQLite 形态。
@@ -28,7 +28,7 @@ else
   echo "数据库:$DATA_DIR/app.db 不存在,跳过"
 fi
 
-for sub in audio exports; do
+for sub in audio exports controlled-audio-exports; do
   if [ -d "$DATA_DIR/$sub" ] && [ -n "$(ls -A "$DATA_DIR/$sub" 2>/dev/null)" ]; then
     cp -R "$DATA_DIR/$sub" "$DEST/$sub"
     echo "$sub/:$(find "$DEST/$sub" -type f | wc -l | tr -d ' ') 个文件 ✓"

@@ -7,6 +7,7 @@ import { Button } from "./Button";
 export function PinPrompt() {
   const [open, setOpen] = useState(false);
   const [val, setVal] = useState("");
+  const patientDevice = window.location.pathname.startsWith("/patient");
 
   useEffect(() => {
     const show = () => { setVal(getPin() ?? ""); setOpen(true); };
@@ -17,19 +18,20 @@ export function PinPrompt() {
   if (!open) return null;
   const save = () => { const v = val.trim(); if (!v) return; setPin(v); setOpen(false); };
   return (
-    <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.5)", zIndex: 1100,
-                  display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <form className="card col fade-in" onClick={(e) => e.stopPropagation()}
-        onSubmit={(e) => { e.preventDefault(); save(); }} style={{ maxWidth: 380 }}>
-        <h3>需要操作端 PIN</h3>
-        <p className="muted">内网模式下写操作须验证。PIN 显示在服务器启动终端;输入一次即存本机。</p>
+    <div className="dialog-backdrop dialog-backdrop-elevated" onClick={() => setOpen(false)}>
+      <form className="dialog-panel fade-in" role="dialog" aria-modal="true" aria-labelledby="pin-dialog-title" onClick={(e) => e.stopPropagation()}
+        onSubmit={(e) => { e.preventDefault(); save(); }}>
+        <div className="dialog-header"><h3 id="pin-dialog-title">需要设备 PIN</h3></div>
+        <p className="muted">
+          {patientDevice ? "请由研究者输入服务器启动终端显示的 PIN。验证后本设备才能安全上传心跳与录音。"
+            : "内网模式下，研究数据读写需要验证。PIN 显示在服务器启动终端，输入一次后保存在本设备。"}
+        </p>
         <input autoFocus inputMode="numeric" value={val} onChange={(e) => setVal(e.target.value)}
-          style={{ padding: "var(--sp-3)", fontSize: "1.4em", textAlign: "center", letterSpacing: 4,
-                   border: "1px solid var(--c-line)", borderRadius: "var(--radius)" }} />
-        <div className="row">
+          className="pin-input" aria-label="操作端 PIN" />
+        <div className="dialog-actions">
           <Button type="button" onClick={() => setOpen(false)}>稍后</Button>
-          <Button type="submit" variant="primary" disabled={!val.trim()} style={{ flex: 1 }}>
-            保存(之后重试刚才的操作)
+          <Button type="submit" variant="primary" disabled={!val.trim()}>
+            保存并返回
           </Button>
         </div>
       </form>

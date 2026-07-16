@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { api, ApiError } from "../api";
+import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { EnumSelect, Field, TextInput, TriStateField } from "../components/Field";
-import { useToast } from "../components/Toast";
+import { StatusPill } from "../components/StatusPill";
+import { useToast } from "../components/ToastContext";
 import { CONSENT_TYPES } from "../types";
 import type { Patient } from "../types";
 
@@ -14,16 +16,16 @@ export function PatientIntakeScreen({ onReady }: { onReady: (patientId: string) 
   const set = <K extends keyof Patient>(k: K, v: Patient[K]) => setP((prev) => ({ ...prev, [k]: v }));
 
   async function submit() {
-    if (!p.patient_id.trim()) { toast("请填写受试者编号 patient_id", "warn"); return; }
+    if (!p.patient_id.trim()) { toast("请填写受试者研究编号", "warn"); return; }
     setBusy(true);
     try {
       await api.createPatient(p);
-      toast("建档成功", "ok");
+      toast("受试者档案已保存", "ok");
       onReady(p.patient_id);
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         // 已存在不是错误,取回既有档案后继续。
-        toast(`编号 ${p.patient_id} 已建档,直接进入建场次`, "info");
+        toast(`研究编号 ${p.patient_id} 已存在，已进入场次设置`, "info");
         onReady(p.patient_id);
       } else {
         toast(e instanceof ApiError ? e.detail : String(e), "danger");
@@ -34,39 +36,66 @@ export function PatientIntakeScreen({ onReady }: { onReady: (patientId: string) 
   }
 
   return (
-    <div className="col" style={{ maxWidth: 720 }}>
-      <h2>建档 · 受试者档案</h2>
-      <p className="muted">合规字段可留空(SOP 未回时"未评"是一等公民,不等于"否")。此屏只用编号,绝不录姓名。</p>
+    <div className="page-shell page-shell--medium">
+      <header className="page-header-block">
+        <div>
+          <p className="page-kicker">步骤 1 / 4 · 受试者建档</p>
+          <h2 className="page-title">建立受试者档案</h2>
+          <p className="page-description">
+            只填写研究编号和本次训练需要的信息，不录入姓名、身份证号等直接身份信息。
+          </p>
+        </div>
+      </header>
 
-      <div className="card col">
-        <h3>入组资格</h3>
-        <Field label="受试者编号 patient_id" hint="研究内部编号,勿用姓名/身份证">
-          <TextInput value={p.patient_id} onChange={(e) => set("patient_id", e.target.value)} placeholder="如 P001" />
-        </Field>
-        <Field label="痴呆严重程度">
-          <TextInput value={p.dementia_severity ?? ""} onChange={(e) => set("dementia_severity", e.target.value || null)} placeholder="轻度 / 中度" />
-        </Field>
-        <TriStateField label="普通话资格(mandarin_eligible)" value={p.mandarin_eligible} onChange={(v) => set("mandarin_eligible", v)} />
-      </div>
-
-      <div className="card col">
-        <h3>合规(护栏2,可全留空预留)</h3>
-        <Field label="知情同意类型">
-          <EnumSelect options={CONSENT_TYPES} value={p.consent_type ?? null} onChange={(v) => set("consent_type", v as Patient["consent_type"])} />
-        </Field>
-        <Field label="同意签署人(consent_person)">
-          <TextInput value={p.consent_person ?? ""} onChange={(e) => set("consent_person", e.target.value || null)} placeholder="本人 / 监护人角色(勿写真名)" />
-        </Field>
-        <TriStateField label="代理同意(proxy_consent)" value={p.proxy_consent} onChange={(v) => set("proxy_consent", v)} />
-        <TriStateField label="允许录音(recording_allowed)" value={p.recording_allowed} onChange={(v) => set("recording_allowed", v)} />
-        {p.recording_allowed === false && (
-          <div className="card" style={{ background: "var(--c-danger-bg)", border: "1px solid var(--c-danger)", color: "var(--c-danger)" }}>
-            该受试者不允许录音 → 训练屏将禁用录音,由研究者现场听记。
+      <div className="form-layout">
+        <section className="form-section">
+          <div className="form-section-header">
+            <div>
+              <h3>基本信息与入组资格</h3>
+              <p className="muted">“未评”表示尚未完成核对，不会被系统自动当作“否”。</p>
+            </div>
+            <StatusPill tone={p.patient_id.trim() ? "ok" : "muted"}>{p.patient_id.trim() ? "编号已填写" : "等待填写"}</StatusPill>
           </div>
-        )}
+          <div className="form-grid">
+            <Field label="受试者研究编号" hint="使用课题内部编号；请勿填写姓名、手机号或身份证号" required>
+              <TextInput value={p.patient_id} onChange={(e) => set("patient_id", e.target.value)} placeholder="例如 P001" autoComplete="off" required />
+            </Field>
+            <Field label="认知障碍程度（如已评估）" hint="按当前研究记录填写，可暂时留空">
+              <TextInput value={p.dementia_severity ?? ""} onChange={(e) => set("dementia_severity", e.target.value || null)} placeholder="例如：轻度 / 中度" />
+            </Field>
+            <TriStateField label="是否符合普通话训练要求" value={p.mandarin_eligible} onChange={(v) => set("mandarin_eligible", v)} />
+          </div>
+        </section>
+
+        <section className="form-section">
+          <div className="form-section-header">
+            <div>
+              <h3>知情同意与录音授权</h3>
+              <p className="muted">请以伦理批件和现场签署文件为准；尚未核对的项目可保留为“未评”。</p>
+            </div>
+          </div>
+          <div className="form-grid">
+            <Field label="知情同意方式">
+              <EnumSelect options={CONSENT_TYPES} value={p.consent_type ?? null} onChange={(v) => set("consent_type", v as Patient["consent_type"])} placeholder="请选择（可稍后补录）" />
+            </Field>
+            <Field label="签署人角色" hint="只填写“本人”“配偶”“监护人”等角色，不填写真实姓名">
+              <TextInput value={p.consent_person ?? ""} onChange={(e) => set("consent_person", e.target.value || null)} placeholder="例如：本人 / 监护人" />
+            </Field>
+            <TriStateField label="是否使用代理同意" value={p.proxy_consent} onChange={(v) => set("proxy_consent", v)} />
+            <TriStateField label="是否允许研究录音" value={p.recording_allowed} onChange={(v) => set("recording_allowed", v)} />
+          </div>
+          {p.recording_allowed === false && (
+            <Alert tone="danger" title="录音已明确禁止">
+              训练流程会关闭所有录音入口，请由研究者现场听记，不得绕过该设置。
+            </Alert>
+          )}
+        </section>
       </div>
 
-      <Button variant="primary" disabled={busy} onClick={submit}>{busy ? "提交中…" : "建档并继续"}</Button>
+      <div className="form-actions">
+        <p className="muted grow">保存后将进入本次场次设置，档案不会记录受试者姓名。</p>
+        <Button variant="primary" disabled={busy} onClick={submit}>{busy ? "正在保存…" : "保存档案，进入下一步"}</Button>
+      </div>
     </div>
   );
 }

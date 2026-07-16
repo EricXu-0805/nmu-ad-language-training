@@ -1,17 +1,18 @@
-type Tone = "ok" | "warn" | "danger" | "muted" | "primary";
+import type { HTMLAttributes } from "react";
 
-const bg: Record<Tone, string> = {
-  ok: "var(--c-ok)", warn: "var(--c-warn)", danger: "var(--c-danger)",
-  muted: "var(--c-muted)", primary: "var(--c-primary)",
-};
+export type StatusTone = "ok" | "warn" | "danger" | "muted" | "primary";
+export type StatusSize = "sm" | "md";
 
-export function StatusPill({ tone = "muted", children }: { tone?: Tone; children: React.ReactNode }) {
+export interface StatusPillProps extends HTMLAttributes<HTMLSpanElement> {
+  tone?: StatusTone;
+  size?: StatusSize;
+}
+
+export function StatusPill({ tone = "muted", size = "md", className, ...rest }: StatusPillProps) {
   return (
-    <span style={{
-      display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 10px",
-      borderRadius: 999, background: bg[tone], color: "#fff", fontSize: "0.85em", fontWeight: 600, whiteSpace: "nowrap",
-    }}>
-      {children}
-    </span>
+    <span
+      {...rest}
+      className={["status-pill", `status-pill--${tone}`, `status-pill--${size}`, className ?? ""].filter(Boolean).join(" ")}
+    />
   );
 }

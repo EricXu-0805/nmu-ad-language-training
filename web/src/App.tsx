@@ -27,28 +27,31 @@ class Boundary extends Component<{ variant: "console" | "patient"; children: Rea
     if (this.state.error === null) return this.props.children;
     if (this.props.variant === "patient") {
       return (
-        <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 24, textAlign: "center", padding: 24 }}>
-          <div style={{ fontSize: "2em", fontWeight: 700 }}>请稍等一下</div>
-          <div style={{ opacity: 0.7 }}>请研究者过来看一眼</div>
-          <button type="button" onClick={() => location.reload()}
-            style={{ minHeight: 72, minWidth: 220, fontSize: "1.1em", borderRadius: 12, border: "1px solid var(--c-border)", cursor: "pointer" }}>
+        <main className="patient-message-screen" aria-live="polite">
+          <div className="target">请稍等一下</div>
+          <p className="question muted">请研究者过来看一眼</p>
+          <button className="patient-primary-action" type="button" onClick={() => location.reload()}>
             重新载入
           </button>
-        </div>
+        </main>
       );
     }
     return (
-      <div style={{ maxWidth: 640, margin: "10vh auto", padding: 24 }}>
-        <h2>界面遇到问题,已停住</h2>
+      <main className="page-shell narrow error-page">
+        <div className="page-header-block">
+          <div className="page-kicker">安全暂停</div>
+          <h2 className="page-title">界面遇到问题，操作已停止</h2>
+          <p className="page-description">已保存到服务器的研究数据不受影响。</p>
+        </div>
         <p className="muted" style={{ wordBreak: "break-all" }}>{this.state.error}</p>
-        <div className="row" style={{ marginTop: 16, gap: 12 }}>
+        <div className="form-actions">
           <button type="button" onClick={() => location.reload()} style={btn}>重新载入</button>
           {/* 只清屏幕位置状态;判分作业日志(journal)是研究记录,绝不在这里清 */}
           <button type="button" onClick={() => { try { localStorage.removeItem("nmu:console:state"); } catch { /* noop */ } location.reload(); }} style={btn}>
             重置屏幕状态并重载
           </button>
         </div>
-      </div>
+      </main>
     );
   }
 }
@@ -75,10 +78,7 @@ function StaleBuildBanner() {
   }, []);
   if (!pathname.startsWith("/console") || !stale) return null;
   return (
-    <button type="button" onClick={() => location.reload()}
-      style={{ position: "fixed", top: 10, left: "50%", transform: "translateX(-50%)", zIndex: 1200,
-        padding: "10px 20px", borderRadius: 999, border: "none", cursor: "pointer", fontWeight: 700,
-        background: "var(--c-primary)", color: "#fff", boxShadow: "0 4px 12px rgba(0,0,0,.25)" }}>
+    <button className="stale-build-banner" type="button" onClick={() => location.reload()}>
       界面已更新 · 点击刷新
     </button>
   );
@@ -86,26 +86,31 @@ function StaleBuildBanner() {
 
 function Landing() {
   return (
-    <div style={{ maxWidth: 640, margin: "0 auto", padding: "var(--sp-8) var(--sp-5)", textAlign: "center" }}>
+    <main className="landing-shell">
+      <div className="landing-brand" aria-hidden>语</div>
+      <div className="page-kicker">南京医科大学 · 本地研究工具</div>
       <h1>语言沟通训练系统</h1>
-      <p className="muted">南京医科大学 · 轻中度阿尔茨海默病 · 本地仪器 M0</p>
-      <div className="row" style={{ justifyContent: "center", marginTop: "var(--sp-6)" }}>
-        <Link to="/console" style={link}>操作端(研究者)</Link>
-        <Link to="/patient" style={link}>老人端(受试者)</Link>
+      <p className="landing-lead">为轻中度阿尔茨海默病语言沟通训练提供双端协同、过程记录与人工判分。</p>
+      <div className="landing-grid">
+        <Link to="/console" className="landing-card">
+          <span className="landing-card-label">研究者操作端</span>
+          <strong>建档、训练与判分</strong>
+          <span>用于研究者控制场次、记录回答和完成正式锁分。</span>
+        </Link>
+        <Link to="/patient" className="landing-card patient">
+          <span className="landing-card-label">受试者呈现端</span>
+          <strong>题目呈现与回答</strong>
+          <span>建议在外接触摸屏或另一窗口打开，由研究者协助开始。</span>
+        </Link>
       </div>
-      <p className="muted" style={{ marginTop: "var(--sp-6)", fontSize: "0.9em" }}>
-        建议同机双窗:操作端一窗、老人端一窗(外接触摸屏),两窗经本地广播同步,全程离线。
+      <p className="landing-note">
+        同机双窗运行：操作端一窗，受试者端一窗；两端通过本地连接同步，全程离线。
       </p>
-    </div>
+    </main>
   );
 }
 
 const btn: React.CSSProperties = {
-  minHeight: 44, padding: "8px 18px", borderRadius: 10, border: "1px solid var(--c-border)",
+  minHeight: 44, padding: "8px 18px", borderRadius: 10, border: "1px solid var(--c-line)",
   background: "var(--c-surface)", cursor: "pointer", fontWeight: 600,
-};
-
-const link: React.CSSProperties = {
-  display: "inline-block", padding: "var(--sp-4) var(--sp-6)", borderRadius: "var(--radius)",
-  background: "var(--c-primary)", color: "var(--c-on-primary)", textDecoration: "none", fontWeight: 700, fontSize: "1.2em",
 };

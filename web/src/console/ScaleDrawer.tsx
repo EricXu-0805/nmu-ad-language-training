@@ -3,7 +3,7 @@ import { api, ApiError } from "../api";
 import { Button } from "../components/Button";
 import { EnumSelect, Field, TextInput } from "../components/Field";
 import { StatusPill } from "../components/StatusPill";
-import { useToast } from "../components/Toast";
+import { useToast } from "../components/ToastContext";
 import { SCALE_PHASES } from "../types";
 import type { ScaleResult } from "../types";
 
@@ -51,28 +51,28 @@ export function ScaleDrawer({ patientId, open, onClose }: {
   }
 
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.35)", zIndex: 900, display: "flex", justifyContent: "flex-end" }}>
-      <div className="col fade-in" onClick={(e) => e.stopPropagation()} style={{ width: 460, maxWidth: "92vw", height: "100%", background: "var(--c-bg)", padding: "var(--sp-5)", overflowY: "auto" }}>
-        <div className="row" style={{ justifyContent: "space-between" }}>
-          <h2>量表录入 · {patientId}</h2>
+    <div className="drawer-backdrop" onClick={onClose}>
+      <section className="drawer-panel fade-in" role="dialog" aria-modal="true" aria-labelledby="scale-drawer-title" onClick={(e) => e.stopPropagation()}>
+        <div className="drawer-header">
+          <div><div className="page-kicker">受试者 {patientId}</div><h2 id="scale-drawer-title">量表结果录入</h2></div>
           <Button onClick={onClose}>关闭</Button>
         </div>
-        <p className="muted">前/后测/随访结果写入 scale_result 容器;量表选型待 PI,名称先自由填(如 CETI、CADL)。</p>
+        <p className="muted">记录前测、后测或随访结果。量表选型尚待 PI 确认，当前名称可按研究记录填写。</p>
 
         <div className="card col">
           <Field label="相位">
             <EnumSelect options={SCALE_PHASES} value={phase} onChange={setPhase} />
           </Field>
-          <Field label="量表名 scale_name">
+          <Field label="量表名称">
             <TextInput value={scaleName} onChange={(e) => setScaleName(e.target.value)} placeholder="如 CETI / CADL / 未训练词命名" />
           </Field>
-          <Field label="分量表 subscale(可选)">
+          <Field label="分量表（可选）">
             <TextInput value={subscale} onChange={(e) => setSubscale(e.target.value)} />
           </Field>
-          <Field label="分数 score(可留空)">
+          <Field label="分数（可留空）">
             <TextInput inputMode="decimal" value={score} onChange={(e) => setScore(e.target.value)} placeholder="如 42" />
           </Field>
-          <Field label="评估者 assessor_id(可选)">
+          <Field label="评估者编号（可选）">
             <TextInput value={assessor} onChange={(e) => setAssessor(e.target.value)} placeholder="如 A1(勿写真名)" />
           </Field>
           <Button variant="primary" disabled={busy} onClick={submit}>{busy ? "录入中…" : "录入"}</Button>
@@ -88,7 +88,7 @@ export function ScaleDrawer({ patientId, open, onClose }: {
             </div>
           ))}
         </div>
-      </div>
+      </section>
     </div>
   );
 }

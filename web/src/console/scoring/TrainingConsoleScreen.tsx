@@ -4,11 +4,13 @@ import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { EnumSelect, Field, TextInput } from "../../components/Field";
 import { StatusPill } from "../../components/StatusPill";
-import { useToast } from "../../components/Toast";
+import { useToast } from "../../components/ToastContext";
 import { assertVersionsMatch, findDouble, findSingle, lookupCue, useItemBankBundle } from "../../content/bundle";
-import { useSessionJournal } from "../../hooks/useSessionJournal";
-import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
+import { isBoundJournalTurnKey, useSessionJournal } from "../../hooks/useSessionJournal";
+import { useSessionRuntime } from "../../hooks/useSessionRuntime";
+import { flushLiveWrites, useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
 import type { PlanItem, PlanTurn, Session, SessionPlan } from "../../types";
+import { SessionControlBar } from "../SessionControlBar";
 import { assertPortraitFree, isRelationRole } from "./vm";
 
 // week≥2 判分主屏:左题目游标列 + 右环节工作卡(转写→确认→AI初评→锁分)。
@@ -18,12 +20,23 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
 }) {
   const toast = useToast();
   const { bundle } = useItemBankBundle();
-  const { journal, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor } = useSessionJournal(session.session_id);
-  const { postSession, postCursor, resetSession } = useCursorWriter();
+  const { journal, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer } = useSessionJournal(session.session_id);
+  const { postSession, postCursor, resetSession, syncError, retrySync } = useCursorWriter(session.session_id);
+  const runtimeControl = useSessionRuntime(session.session_id);
+  const paused = runtimeControl.paused;
+  const [pausePending, setPausePending] = useState(false);
+  const [recoveredLabel, setRecoveredLabel] = useState<string | null>(null);
+  const recoveredOnce = useRef(false);
+  const restoreTarget = useRef<{ itemIdx: number; turnIdx: number } | null>(null);
+  const lastAppliedTurnK = useRef<string | null>(null);
+  const handshakeSent = useRef(false);
 
   const [plan, setPlan] = useState<SessionPlan | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [retryNonce, setRetryNonce] = useState(0);
+  const [journalLoading, setJournalLoading] = useState(true);
+  const [journalRecoveryError, setJournalRecoveryError] = useState<string | null>(null);
+  const [recoveryApplied, setRecoveryApplied] = useState(false);
   const [itemIdx, setItemIdx] = useState(journal.cursor.itemIdx);
   const [turnIdx, setTurnIdx] = useState(journal.cursor.turnIdx);
   const [aiEnabled, setAiEnabled] = useState(true);
@@ -47,6 +60,11 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   const recSeq = useRef(0);
   const watchdog = useSaveWatchdog(() =>
     toast("8 秒未收到老人端录音回报——可能没录上(麦克风权限/网络)。请检查老人端后重新示意录音。", "danger"));
+  // 看门狗守的是"哪个环节的回报":录音中跳题/暂停时守的是旧环节,回报到达时若按
+  // "是否当前环节"判清,旧环节的成功回报清不掉它——保存明明成功还弹假警报。
+  const watchdogFor = useRef<string | null>(null);
+  const lastArmedTurnK = useRef<string | null>(null);
+  const armWatchdog = (tk: string | null) => { watchdogFor.current = tk; watchdog.start(); };
   const [cueLevel, setCueLevel] = useState<0 | 1 | 2 | 3>(0);      // 已发给老人端的线索等级(只升不降)
   const [savingTurn, setSavingTurn] = useState(false);
   // 当前环节工作态
@@ -55,33 +73,103 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
 
   // 刷新恢复:journal.audios 持久有 turnKey→音频映射,重挂载时重建回放条,
   // 否则补录转写建 turn 时 raw_audio_id 静默断链。
+  // ★同环节重录取"最后一遍"(与实时路径一致——audioSaved 处理器就是后到覆盖):
+  // 先到先占会在刷新后把旧一遍录音绑回转写/回放。journal.audios 按登记序迭代,末=最新。
   useEffect(() => {
     setPendingAudio((prev) => {
       const next = { ...prev };
       for (const [rid, a] of Object.entries(journal.audios)) {
-        if (a.turnKey && !next[a.turnKey]) next[a.turnKey] = { rawAudioId: rid, duration: a.durationSeconds ?? 0 };
+        if (isBoundJournalTurnKey(a.turnKey) && /#\d+$/.test(a.turnKey)) {
+          next[a.turnKey] = { rawAudioId: rid, duration: a.durationSeconds ?? 0 };
+        }
       }
       return next;
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [journal.audios]);
 
-  // 拉取计划 + 版本三方断言(retryNonce:失败不再是死胡同,可点"重试"重跑)
+  // 计划与 journal 分开恢复：计划错误走整屏 fail-closed；journal 错误仍保留页面骨架，
+  // 但由 SessionControlBar 关闭一切现场推进并提供统一重试。
   useEffect(() => {
     setErr(null);
+    setPlan(null);
     resetSession();
-    api.sessionPlan(session.session_id, session.week_no, session.event_line)
-      .then(async (p) => {
-        const bank = await api.itemBank();
+    recoveredOnce.current = false;
+    restoreTarget.current = null;
+    lastAppliedTurnK.current = null; // 换场/重载:同名 turnKey 也必须重建工作卡
+    handshakeSent.current = false;
+    setRecoveryApplied(false);
+    setRecoveredLabel(null);
+    Promise.all([
+      api.sessionPlan(session.session_id, session.week_no, session.event_line),
+      api.itemBank(),
+    ])
+      .then(([p, bank]) => {
         // bundle 可能还没到,尽力断言 plan==后端;bundle 到位后再断言一次
         if (p.item_bank_version_id !== bank.version_id) {
           throw new Error(`题库版本不一致:计划=${p.item_bank_version_id} 后端=${bank.version_id}`);
         }
         setPlan(p);
-        postSession({ sessionId: session.session_id, weekNo: session.week_no, eventLine: session.event_line, mode: "task", itemBankVersionId: p.item_bank_version_id });
       })
       .catch((e) => setErr(String(e)));
-  }, [session, postSession, resetSession, retryNonce]);
+  }, [session, resetSession, retryNonce]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setJournalLoading(true);
+    setJournalRecoveryError(null);
+    api.sessionJournal(session.session_id)
+      .then((remoteJournal) => {
+        if (cancelled) return;
+        if (remoteJournal.session.session_id !== session.session_id) {
+          throw new Error("服务器返回了其他场次的记录，已拒绝恢复");
+        }
+        hydrateFromServer(remoteJournal);
+        setJournalLoading(false);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setJournalRecoveryError(e instanceof ApiError ? e.detail : String(e));
+        setJournalLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [hydrateFromServer, retryNonce, session.session_id]);
+
+  const recoveryLoading = runtimeControl.loading || journalLoading;
+  const recoveryError = runtimeControl.error ?? journalRecoveryError ?? syncError;
+  const runtimeReady = runtimeControl.runtime?.sessionId === session.session_id;
+  const recoveryPending = recoveryLoading || (!recoveryError && (!runtimeReady || !recoveryApplied));
+  const interactionBlocked = paused || pausePending || recoveryPending || Boolean(recoveryError);
+  const retryRecovery = () => {
+    setRetryNonce((n) => n + 1);
+    void runtimeControl.refresh();
+    retrySync();
+  };
+
+  // 服务端运行时位置优先于浏览器缓存。只在首次恢复时应用，避免轮询或本地推进被旧值拉回。
+  useEffect(() => {
+    if (!plan || !runtimeReady || recoveryLoading || recoveryError || recoveredOnce.current) return;
+    const saved = runtimeControl.runtime?.cursor;
+    const nextItem = saved?.itemIdx ?? journal.cursor.itemIdx;
+    const nextTurn = saved?.turnIdx ?? journal.cursor.turnIdx;
+    const safeItem = Math.min(Math.max(0, nextItem), Math.max(0, plan.items.length - 1));
+    const turns = plan.items[safeItem]?.turns ?? [];
+    const safeTurn = Math.min(Math.max(0, nextTurn), Math.max(0, turns.length - 1));
+    setItemIdx(safeItem);
+    setTurnIdx(safeTurn);
+    restoreTarget.current = { itemIdx: safeItem, turnIdx: safeTurn };
+    if (safeItem > 0 || safeTurn > 0 || runtimeControl.runtime?.status === "paused") {
+      setRecoveredLabel(`第 ${safeItem + 1} 题 · 第 ${safeTurn + 1} 环节`);
+    }
+    recoveredOnce.current = true;
+    setRecoveryApplied(true);
+  }, [journal.cursor.itemIdx, journal.cursor.turnIdx, plan, recoveryError, recoveryLoading, runtimeControl.runtime, runtimeReady]);
+
+  // HTTP 写入由 useCursorWriter 串行排队：先完成 session 握手，再落首个 cursor。
+  useEffect(() => {
+    if (!plan || interactionBlocked || handshakeSent.current) return;
+    postSession({ sessionId: session.session_id, weekNo: session.week_no, eventLine: session.event_line, mode: "task", itemBankVersionId: plan.item_bank_version_id });
+    handshakeSent.current = true;
+  }, [interactionBlocked, plan, postSession, session]);
 
   useEffect(() => {
     if (plan && bundle) {
@@ -106,7 +194,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   const turnKRef = useRef(turnK);
   turnKRef.current = turnK;
   // 已锁环节不下发自助开录("锁定后不可再录"对自助路径同样生效)
-  const selfStartOut = selfStart && !(journal.turns[turnK]?.locked ?? false);
+  const selfStartOut = selfStart && !interactionBlocked && !(journal.turns[turnK]?.locked ?? false);
   // 老人端麦克风真值(自助开录时操作端唯一感知渠道)
   const patientRec = usePatientRec(session.session_id);
   const patientMicOn = patientRec?.active === true;
@@ -114,13 +202,26 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   // 8 秒告警——否则自助模式保存失败对操作端零信号,老人的回答静默丢失。
   const prevMicOn = useRef(false);
   useEffect(() => {
-    if (prevMicOn.current && !patientMicOn) watchdog.start();
+    if (prevMicOn.current && !patientMicOn) armWatchdog(patientRec?.turnKey ?? turnK);
     prevMicOn.current = patientMicOn;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [patientMicOn, watchdog]);
 
   // 光标变化 → 重置工作态(从 journal 恢复布尔/已锁/线索级)+ 广播老人端
+  // ★interactionBlocked 在依赖里只为"解锁边沿补发游标";位置没变时绝不重建工作卡——
+  // 暂停/继续、重试同步成功都会翻转它,若重建会用 journal 已存值冲掉未保存的转写/确认草稿。
   useEffect(() => {
-    if (!item || !planTurn) return;
+    if (!item || !planTurn || interactionBlocked) return;
+    const target = restoreTarget.current;
+    if (target && (target.itemIdx !== itemIdx || target.turnIdx !== turnIdx)) return;
+    restoreTarget.current = null;
+    if (lastAppliedTurnK.current === turnK) {
+      // 暂停/恢复解除,位置未变:只补发游标恢复老人端按钮(恢复投影 selfStart=false),工作卡不动
+      postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel,
+                   recording: "idle", recSeq: recSeq.current, selfStart: selfStartOut });
+      return;
+    }
+    lastAppliedTurnK.current = turnK;
     const jt = journal.turns[turnK];
     setWork({
       turnId: jt?.turnId ?? null, asrText: jt?.asrText ?? "",
@@ -128,27 +229,37 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
       confirmed: jt?.confirmedText ?? jt?.asrText ?? "", ai: null,
       locked: jt?.locked ?? false, savedAsr: jt?.asrSaved ?? false, savedConfirm: jt?.confirmed ?? false,
     });
-    if (recState === "armed") watchdog.start(); // 录音中直接跳题:老人端会自动收尾保存,回报也要有人等
+    if (recState === "armed") armWatchdog(lastArmedTurnK.current); // 录音中直接跳题:老人端会自动收尾保存,回报也要有人等
     setRecState("idle");
     // 回访已发过线索的环节:恢复级别而非归零——老人端线索不被清屏,prompt_level 建议不记错
-    const restoredCue = Math.min(3, Math.max(0, journal.cueLevels?.[turnK] ?? 0)) as 0 | 1 | 2 | 3;
+    const savedCursor = runtimeControl.runtime?.cursor;
+    const runtimeCue = savedCursor?.itemIdx === itemIdx && savedCursor.turnIdx === turnIdx
+      ? savedCursor.cueLevel ?? 0
+      : 0;
+    const restoredCue = Math.min(3, Math.max(
+      0,
+      journal.cueLevels?.[turnK] ?? 0,
+      jt?.cueLevel ?? 0,
+      jt?.promptLevel ?? 0,
+      runtimeCue,
+    )) as 0 | 1 | 2 | 3;
     setCueLevel(restoredCue);
     setCursor(itemIdx, turnIdx);
     onItemEventChange?.(journal.itemEvents[item.item_id]?.itemEventId ?? null);
     postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: restoredCue, recording: "idle", recSeq: recSeq.current,
                  selfStart: selfStart && !(jt?.locked ?? false) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [itemIdx, turnIdx, plan]);
+  }, [itemIdx, turnIdx, plan, interactionBlocked]);
 
   // 录音资格判定变化即补发游标:落地(→allowed/unrated/denied)给按钮,重查(→loading)收回按钮。
   // loading 也要发——资格重查期间老人端保留旧 selfStart=true 按钮就违反 fail-closed。
   useEffect(() => {
-    if (!planTurn) return;
+    if (!planTurn || interactionBlocked) return;
     postCursor({ screen: recState === "armed" ? "record" : "present", itemIdx, turnIdx,
                  responseRole: planTurn.response_role, cueLevel,
                  recording: recState === "armed" ? "armed" : "idle", recSeq: recSeq.current, selfStart: selfStartOut });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recStatus]);
+  }, [recStatus, interactionBlocked]);
 
   // ★收回游标:离开训练屏(收尾/新受试者/切屏)或 fail-closed 时,老人端的
   // "开始回答"按钮必须撤下——否则残留的 selfStart=true 让过渡期里任何人都能往本场次录音。
@@ -160,7 +271,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
                  cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
   };
   useEffect(() => () => withdrawRef.current(), []);
-  useEffect(() => { if (err) withdrawRef.current(); }, [err]);
+  useEffect(() => { if (err || recoveryError) withdrawRef.current(); }, [err, recoveryError]);
 
   // 老人端录完 → 建 turn 的音频入参在此暂存(按 turnKey)
   useAudioSaved((m) => {
@@ -177,19 +288,24 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     setPendingAudio((prev) => ({ ...prev, [m.turnKey]: { rawAudioId: m.rawAudioId, duration: m.durationSeconds } }));
     // 记入 journal.audios,收尾屏音频闸门才能列出并驱动导出/校验/信度/删除。
     upsertAudio(m.rawAudioId, { turnKey: m.turnKey, containsDirectIdentifier: m.containsDirectIdentifier ?? false, isReliabilitySample: false, lastStatus: "recorded", durationSeconds: m.durationSeconds });
-    if (!isCurrent) return;
-    watchdog.clear();
-    if (recState === "armed" && planTurn) {
-      // 老人自己按"我说好了"停的:把 idle 写回镜像/服务端真值源,否则 armed 残留会让老人端刷新后自动开麦。
+    // 看门狗按"守的环节"清:录音中跳题/暂停时守的是旧环节,旧环节回报到达即达成,
+    // 不能因"非当前环节"漏清而弹保存成功的假警报;守当前环节时迟到旧报也清不掉它。
+    if (!isReplay && m.turnKey === watchdogFor.current) {
+      watchdog.clear();
+      watchdogFor.current = null;
+    }
+    if (!isCurrent || isReplay) return;
+    if (planTurn && !interactionBlocked) {
+      // 无论自停("我说好了",cursor 仍 armed)还是远端停(cursor 停在 stopped):都把 idle
+      // 写回真值源——armed 残留会让老人端刷新后自动开麦;stopped 残留会让自助按钮永久失效。
       postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: selfStartOut });
     }
     setRecState("idle");
-    if (isReplay) return;
     toast(`老人端录音已保存(${m.durationSeconds.toFixed(1)}s)`, "info");
     // 自动推进:只认"当前环节"的首次回报;老人端由此获得"点开始→说→我说好了→下一题"
     // 的自走闭环,转写/锁分可事后回访补。研究者手上有在途操作/未保存的转写或确认改动时
     // 不跳——advance 会按 journal 重置工作卡,未存的字会被冲掉。
-    if (!autoAdvance) return;
+    if (!autoAdvance || interactionBlocked) return;
     const jt = journal.turns[turnK];
     const confirmBaseline = jt?.confirmedText ?? jt?.asrText ?? "";
     const dirty = busyOp !== null || savingTurn || locking
@@ -207,13 +323,13 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   });
 
   const advance = () => {
-    if (!plan || !item) return;
+    if (!plan || !item || interactionBlocked) return;
     if (turnIdx + 1 < item.turns.length) setTurnIdx(turnIdx + 1);
     else if (itemIdx + 1 < plan.items.length) { setItemIdx(itemIdx + 1); setTurnIdx(0); }
     else toast("已到最后一个环节,可前往场次收尾", "ok");
   };
   const retreat = () => {
-    if (!plan) return;
+    if (!plan || interactionBlocked) return;
     if (turnIdx > 0) setTurnIdx(turnIdx - 1);
     else if (itemIdx > 0) {
       const prev = plan.items[itemIdx - 1];
@@ -223,25 +339,27 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   };
   const atFirstTurn = itemIdx === 0 && turnIdx === 0;
   const atLastTurn = !!plan && !!item && turnIdx + 1 >= item.turns.length && itemIdx + 1 >= plan.items.length;
+  const workflowStage = work.locked ? 4 : !work.savedAsr ? 1 : !work.savedConfirm ? 2 : aiEnabled && !work.ai ? 3 : 4;
 
   // 示意老人端录音(VOX):arm→老人端自动开始录音;stop→老人端停止并保存后回传 audioSaved。
   // 携带当前 cueLevel,录音启停不清老人端已显示的线索。
   const armRecording = () => {
-    if (!planTurn) return;
+    if (!planTurn || interactionBlocked) return;
     recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
+    lastArmedTurnK.current = turnK;
     setRecState("armed");
     postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "armed", recSeq: recSeq.current, selfStart: selfStartOut });
   };
   const stopRecording = () => {
     if (!planTurn) return;
     setRecState("idle");
-    watchdog.start();
+    armWatchdog(lastArmedTurnK.current ?? turnK);
     postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "stopped", recSeq: recSeq.current, selfStart: selfStartOut });
   };
 
   // 发分级线索给老人端(0→3 只升不降;线索文本永远取自版本锁定题库,操作端不产话术)。
   const sendCue = (level: 1 | 2 | 3) => {
-    if (!planTurn || level <= cueLevel) return;
+    if (!planTurn || interactionBlocked || level <= cueLevel) return;
     setCueLevel(level);
     recordCueLevel(turnK, level); // 持久化:回访本环节时恢复,不清老人端线索
     postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role,
@@ -249,7 +367,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   };
 
   async function ensureItemEvent(): Promise<number | null> {
-    if (!item) return null;
+    if (!item || interactionBlocked) return null;
     const existing = journal.itemEvents[item.item_id];
     if (existing) return existing.itemEventId;
     const ie = await api.createItem(session.session_id, { item_id: item.item_id, task_type: item.task_type, image_id: item.image_id });
@@ -263,7 +381,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
 
   async function tryLocalAsr() {
     const au = pendingAudio[turnK];
-    if (!au || busyOp) return;
+    if (!au || busyOp || interactionBlocked) return;
     const opK = turnK; // 环节身份:自动推进可在请求在途时跳环节,续体只准写回发起时的环节
     setBusyOp("asr");
     try {
@@ -281,7 +399,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   }
 
   async function saveTranscription() {
-    if (!item || !planTurn) return;
+    if (!item || !planTurn || interactionBlocked) return;
     if (savingTurn) return;                                          // 在途锁:防双击重复建 item/turn
     if (work.savedAsr && work.turnId) { toast("该环节转写已冻结,不可重写", "warn"); return; }
     const opK = turnK;
@@ -306,6 +424,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   }
 
   async function saveConfirm(): Promise<boolean> {
+    if (interactionBlocked) return false;
     if (!item || !planTurn || work.turnId == null) { toast("请先保存转写", "warn"); return false; }
     if (!work.confirmed.trim()) { toast("确认文本为空,未提交(避免把已有确认覆盖成空串)", "warn"); return false; }
     if (busyOp) return false;
@@ -325,6 +444,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   }
 
   async function runAiJudge(auto = false) {
+    if (interactionBlocked) return;
     if (work.turnId == null) { toast("请先保存转写", "warn"); return; }
     if (!auto && busyOp) return;
     const opK = turnK;
@@ -339,6 +459,7 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
 
   const [locking, setLocking] = useState(false);
   async function doLock(elementValue: number, promptLevel?: number): Promise<boolean> {
+    if (interactionBlocked) return false;
     if (!item || !planTurn || work.turnId == null) { toast("请先保存转写", "warn"); return false; }
     if (locking) return false;
     const opK = turnK;
@@ -357,7 +478,9 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
       if (turnKRef.current === opK) {
         setWork((w) => ({ ...w, locked: true }));
         // 锁定即收回老人端自助开录按钮("锁定后不可再录"对自助路径同样生效)
-        postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
+        if (!interactionBlocked) {
+          postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
+        }
       }
       toast("已锁定评分", "ok");
       return true;
@@ -365,56 +488,111 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     finally { setLocking(false); }
   }
 
+  async function pauseTraining() {
+    if (pausePending || paused) return;
+    setPausePending(true);
+    if (recState === "armed" || patientMicOn) {
+      armWatchdog(patientRec?.turnKey ?? lastArmedTurnK.current ?? turnK);
+    }
+    if (planTurn) {
+      // bus 先行收麦，不等 pause HTTP 往返；后端的场次暂停仍是最终真值。
+      postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role,
+                   cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
+    }
+    setRecState("idle");
+    try {
+      // 先排空已入队的 live 写再发 pause:pause 直连 HTTP,若先落地会把排队中的
+      // 收麦游标 409 掉,控制条随即锁死在"重新同步"循环里(复审确证的死锁)。
+      await flushLiveWrites();
+      const next = await runtimeControl.pause();
+      if (next) toast("本场训练已暂停，患者端麦克风保持关闭", "ok");
+    } finally {
+      setPausePending(false);
+    }
+  }
+
+  async function resumeTraining() {
+    const next = await runtimeControl.resume();
+    if (next) toast("已恢复到暂停前的位置", "ok");
+  }
+
   if (err) return <FailClosed msg={err} onRetry={() => setRetryNonce((n) => n + 1)} onExit={onExit} />;
   if (!plan) return <p>加载会话计划…</p>;
   if (plan.items.length === 0) return <p>本场次无评分题(第 1 周应走关系建立控制台)。</p>;
 
   return (
-    <div className="row" style={{ alignItems: "flex-start", gap: "var(--sp-5)" }}>
+    <div className="training-layout">
       <ItemRail plan={plan} itemIdx={itemIdx} lockedCount={countLocked(journal, plan)}
-        onPick={(i) => { setItemIdx(i); setTurnIdx(0); }} journalTurns={journal.turns} />
+        onPick={(i) => { if (!interactionBlocked) { setItemIdx(i); setTurnIdx(0); } }} journalTurns={journal.turns} disabled={interactionBlocked} />
 
-      <div className="col grow" style={{ maxWidth: 720 }}>
-        <div className="row" style={{ justifyContent: "space-between" }}>
-          <h2>训练判分 · {item?.item_id}</h2>
-          <div className="row">
-            <label className="row" style={{ gap: 6 }}>评分人
-              <TextInput value={reviewerId} onChange={(e) => setReviewerId(e.target.value)} style={{ width: 90 }} />
-            </label>
-            <label className="row" style={{ gap: 6 }}>
-              <input type="checkbox" checked={aiEnabled} onChange={(e) => setAiEnabled(e.target.checked)} /> 动态 AI 初评
-            </label>
-            <label className="row" style={{ gap: 6 }} title="老人端点'我说好了'后自动跳下一环节;关掉则手动逐环节推进">
-              <input type="checkbox" checked={autoAdvance} onChange={toggleAutoAdvance} /> 收音自动推进
-            </label>
-            {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
-            <Button variant="ghost" onClick={() => { if (recState === "armed") stopRecording(); onWrapup(); }}>场次收尾 →</Button>
+      <div className="training-main">
+        <div className="training-page-header">
+          <div>
+            <div className="page-kicker">当前训练任务</div>
+            <h2 className="page-title">{item?.item_id.replace(/^(SE|DE)_/, "") ?? "训练判分"}</h2>
+            <p className="page-description">按“转写、确认、辅助初评、人工锁分”顺序完成本环节。</p>
           </div>
+          {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
+          <Button variant="ghost" disabled={interactionBlocked} onClick={() => {
+            if (interactionBlocked) return;
+            if (recState === "armed") stopRecording();
+            onWrapup();
+          }}>进入场次收尾</Button>
+        </div>
+
+        <SessionControlBar paused={paused} loading={recoveryPending} busy={runtimeControl.busy || pausePending} recoveredLabel={recoveredLabel}
+          error={recoveryError} onRetry={retryRecovery}
+          onPause={() => void pauseTraining()} onResume={() => void resumeTraining()} />
+
+        <div className="toolbar training-toolbar" aria-label="训练设置">
+          <label className="toolbar-field">评分人
+            <TextInput value={reviewerId} disabled={interactionBlocked} onChange={(e) => setReviewerId(e.target.value)} style={{ width: 96 }} />
+          </label>
+          <label className="toggle-field">
+            <input type="checkbox" checked={aiEnabled} disabled={interactionBlocked} onChange={(e) => setAiEnabled(e.target.checked)} />
+            <span>启用辅助初评</span>
+          </label>
+          <label className="toggle-field" title="老人端点'我说好了'后自动跳下一环节;关掉则手动逐环节推进">
+            <input type="checkbox" checked={autoAdvance} disabled={interactionBlocked} onChange={toggleAutoAdvance} />
+            <span>收音后自动推进</span>
+          </label>
         </div>
 
         {item && planTurn && (
-          <div className="card col">
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <div><StatusPill tone="primary">{item.task_type}</StatusPill> 环节 {planTurn.turn_seq}/{item.turns.length} · <strong>{planTurn.response_role}</strong></div>
-              <div className="row" style={{ gap: 8 }}>
+          <div className={`card col training-work-card${interactionBlocked ? " session-paused-surface" : ""}`}>
+            <div className="training-work-header">
+              <div className="row wrap">
+                <StatusPill tone="primary">{item.task_type}</StatusPill>
+                <span>环节 {planTurn.turn_seq}/{item.turns.length}</span>
+                <strong>{planTurn.response_role}</strong>
+              </div>
+              <div className="row wrap" style={{ gap: 8 }}>
                 {work.locked && <StatusPill tone="ok">已锁定</StatusPill>}
                 {/* 常驻导航:每个环节都能一键前进/回退(老人端随游标同步),不必等锁分或翻左侧题列 */}
-                <Button onClick={retreat} disabled={atFirstTurn}>← 上一环节</Button>
-                <Button onClick={advance} disabled={atLastTurn}>下一环节 →</Button>
+                <Button onClick={retreat} disabled={interactionBlocked || atFirstTurn}>上一环节</Button>
+                <Button onClick={advance} disabled={interactionBlocked || atLastTurn}>下一环节</Button>
               </div>
             </div>
+
+            <WorkflowStepper current={workflowStage} />
 
             <ItemReference item={item} bundle={bundle} />
 
             {/* 分级线索(0→3 只升不降;内容取版本锁定题库,推老人端显示) */}
-            {!work.locked && (
+            {!interactionBlocked && !work.locked && (
               <CueButtons bundle={bundle} itemId={item.item_id} taskType={item.task_type}
                 role={planTurn.response_role} cueLevel={cueLevel} onSend={sendCue} />
             )}
 
             {/* 录音示意(老人端 VOX)——fail-closed:资格未确认不放行 */}
-            <div className="row wrap" style={{ alignItems: "center" }}>
-              {recStatus === "denied" ? (
+            <div className="recording-panel">
+              {recoveryPending ? (
+                <StatusPill tone="muted">正在恢复场次，录音入口保持关闭</StatusPill>
+              ) : recoveryError ? (
+                <StatusPill tone="danger">场次恢复失败，录音入口保持关闭</StatusPill>
+              ) : paused ? (
+                <StatusPill tone="warn">场次暂停中，患者端麦克风保持关闭</StatusPill>
+              ) : recStatus === "denied" ? (
                 <StatusPill tone="danger">该受试者不允许录音 · 由研究者现场听记</StatusPill>
               ) : recStatus === "loading" ? (
                 <Button disabled>录音资格确认中…</Button>
@@ -425,62 +603,71 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
                 </>
               ) : recState === "armed" || patientMicOn ? (
                 <>
-                  <Button variant="danger" onClick={stopRecording}>■ 停止录音</Button>
+                  <Button variant="danger" onClick={stopRecording}>停止老人端录音</Button>
                   {patientMicOn && recState !== "armed" && (
                     <StatusPill tone="danger">老人端麦克风开着(自助开录)</StatusPill>
                   )}
                 </>
               ) : (
                 <>
-                  <Button onClick={armRecording} disabled={work.locked}>● 示意老人录音</Button>
+                  <Button onClick={armRecording} disabled={work.locked}>开始老人端录音</Button>
                   {recStatus === "unrated" && <span className="muted">录音资格未评(按允许处理)</span>}
                 </>
               )}
               {pendingAudio[turnK] && (
                 <>
                   <StatusPill tone="ok">已收到录音 {pendingAudio[turnK].duration.toFixed(1)}s</StatusPill>
-                  <audio controls preload="none" src={api.audioBlobUrl(pendingAudio[turnK].rawAudioId)} style={{ height: 36 }} />
-                  {!work.savedAsr && <Button onClick={tryLocalAsr} disabled={busyOp !== null}>{busyOp === "asr" ? "转写中…" : "本地 ASR 转写"}</Button>}
+                  <AuthenticatedAudio rawAudioId={pendingAudio[turnK].rawAudioId} />
+                  {!work.savedAsr && <Button onClick={tryLocalAsr} disabled={interactionBlocked || busyOp !== null}>{busyOp === "asr" ? "转写中…" : "本地 ASR 转写"}</Button>}
                 </>
               )}
             </div>
 
             {/* 阶段A 转写 */}
-            <Field label="① ASR 转写(asr_text,保存即冻结,不覆盖)">
-              <TextInput value={work.asrText} disabled={work.savedAsr}
-                onChange={(e) => setWork((w) => ({ ...w, asrText: e.target.value }))}
-                placeholder={pendingAudio[turnK] ? "老人端已录音,可回放后键入识别文本" : "键入听到/识别的回答"} />
-            </Field>
-            {!work.savedAsr && <Button onClick={saveTranscription} disabled={savingTurn}>{savingTurn ? "保存中…" : "保存转写"}</Button>}
+            <section className={`workflow-panel${workflowStage === 1 ? " is-active" : ""}`}>
+              <div className="workflow-panel-header">
+                <div><span className="workflow-panel-number">1</span><strong>记录与转写</strong></div>
+                {work.savedAsr && <StatusPill tone="ok">已冻结</StatusPill>}
+              </div>
+              <Field label="受试者回答" hint="保存后保留原始转写，不会被后续人工确认覆盖。">
+                <TextInput value={work.asrText} disabled={interactionBlocked || work.savedAsr}
+                  onChange={(e) => setWork((w) => ({ ...w, asrText: e.target.value }))}
+                  placeholder={pendingAudio[turnK] ? "回放录音后输入听到的回答" : "输入现场听到的回答"} />
+              </Field>
+              {!work.savedAsr && <Button variant="primary" onClick={saveTranscription} disabled={interactionBlocked || savingTurn}>{savingTurn ? "正在保存…" : "保存原始转写"}</Button>}
+            </section>
 
             {/* 阶段B 确认 */}
             {work.savedAsr && (
-              <>
-                <div className="row">
-                  <div className="grow"><div className="muted">asr_text(原文只读)</div><div className="card mono" style={{ background: "var(--c-diff)" }}>{work.asrText || "（空）"}</div></div>
+              <section className={`workflow-panel${workflowStage === 2 ? " is-active" : ""}`}>
+                <div className="workflow-panel-header">
+                  <div><span className="workflow-panel-number">2</span><strong>人工确认</strong></div>
+                  {work.savedConfirm && <StatusPill tone="ok">已确认</StatusPill>}
                 </div>
-                <Field label="② 确认文本 confirmed(可改写,不动原文;已预填 ASR 原文)">
-                  <TextInput value={work.confirmed} disabled={work.locked}
+                <div className="source-transcript"><span>原始转写</span><strong className="mono">{work.asrText || "（空）"}</strong></div>
+                <Field label="确认后的回答" hint="可校正识别错误；原始转写会继续保留。">
+                  <TextInput value={work.confirmed} disabled={interactionBlocked || work.locked}
                     onChange={(e) => setWork((w) => ({ ...w, confirmed: e.target.value, savedConfirm: false }))} placeholder="人工校正后的规范文本" />
                 </Field>
                 {!work.locked && (
                   <div className="row">
-                    <Button onClick={() => void saveConfirm()} disabled={busyOp !== null || work.savedConfirm}>
-                      {busyOp === "confirm" ? "保存中…" : work.savedConfirm ? "✓ 已确认" : "保存确认"}
+                    <Button onClick={() => void saveConfirm()} disabled={interactionBlocked || busyOp !== null || work.savedConfirm}>
+                      {busyOp === "confirm" ? "保存中…" : work.savedConfirm ? "已确认" : "保存人工确认"}
                     </Button>
                     {!work.savedConfirm && work.turnId != null && <span className="muted">有未保存修改</span>}
                   </div>
                 )}
-              </>
+              </section>
             )}
 
             {/* 阶段C AI 初评 */}
             {work.savedAsr && aiEnabled && (
-              <div className="card" style={{ background: "var(--c-bg)" }}>
-                <div className="row" style={{ justifyContent: "space-between" }}>
-                  <strong>③ AI 初评(仅辅助,永不锁分;保存确认后自动运行)</strong>
-                  <Button onClick={() => void runAiJudge()} disabled={work.locked || busyOp !== null}>{busyOp === "ai" ? "评估中…" : "重新初评"}</Button>
+              <section className={`workflow-panel${workflowStage === 3 ? " is-active" : ""}`}>
+                <div className="workflow-panel-header">
+                  <div><span className="workflow-panel-number">3</span><strong>辅助初评</strong></div>
+                  <Button onClick={() => void runAiJudge()} disabled={interactionBlocked || work.locked || busyOp !== null}>{busyOp === "ai" ? "评估中…" : "重新初评"}</Button>
                 </div>
+                <p className="muted">只作为人工判断参考，不会写入正式分。</p>
                 {work.ai && (
                   <div className="row wrap">
                     <StatusPill tone="muted">{work.ai.answerType ?? "纯人工(无确定式口径)"}</StatusPill>
@@ -488,19 +675,20 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
                     {work.ai.needsReview && <StatusPill tone="warn">需人工复核</StatusPill>}
                   </div>
                 )}
-              </div>
+              </section>
             )}
-            {work.savedAsr && !aiEnabled && <p className="muted">③ 动态 AI 初评已关闭 → 纯人工从零打分。</p>}
+            {work.savedAsr && !aiEnabled && <p className="muted">辅助初评已关闭，本环节完全由人工判分。</p>}
 
             {/* 阶段D 人工锁分 */}
             {work.savedAsr && !work.locked && (
               <LockControl key={turnK} taskType={item.task_type} role={planTurn.response_role}
-                suggestedPromptLevel={cueLevel} onLock={doLock} locking={locking}
+                suggestedPromptLevel={cueLevel} onLock={doLock} locking={locking || interactionBlocked}
                 basis={<ItemReference item={item} bundle={bundle} />}
                 confirmedText={work.confirmed}
-                unsavedConfirm={Boolean(work.confirmed.trim()) && !work.savedConfirm} />
+                unsavedConfirm={Boolean(work.confirmed.trim()) && !work.savedConfirm}
+                active={workflowStage === 4} />
             )}
-            {work.locked && <div className="row"><StatusPill tone="ok">✓ 本环节锁定分已写入</StatusPill><Button variant="primary" onClick={advance}>下一环节 →</Button></div>}
+            {work.locked && <div className="row wrap"><StatusPill tone="ok">本环节正式分已锁定</StatusPill><Button variant="primary" disabled={interactionBlocked} onClick={advance}>进入下一环节</Button></div>}
           </div>
         )}
       </div>
@@ -520,31 +708,59 @@ function countLocked(journal: ReturnType<typeof useSessionJournal>["journal"], p
   return plan.items.filter((it) => it.turns.every((t) => journal.turns[`${it.item_id}#${t.turn_seq}`]?.locked)).length;
 }
 
-// ---------------- 左：题目游标列 ----------------
-function ItemRail({ plan, itemIdx, lockedCount, onPick, journalTurns }: {
-  plan: SessionPlan; itemIdx: number; lockedCount: number;
-  onPick: (i: number) => void; journalTurns: Record<string, { locked: boolean }>;
-}) {
+function WorkflowStepper({ current }: { current: number }) {
+  const steps = ["记录转写", "人工确认", "辅助初评", "人工锁分"];
   return (
-    <div className="item-rail">
-      <div className="muted">进度 {lockedCount}/{plan.items.length} 题全锁</div>
+    <div className="workflow-stepper" aria-label="当前环节工作进度">
+      {steps.map((label, index) => {
+        const step = index + 1;
+        return (
+          <div key={label} className={`workflow-step${step === current ? " is-active" : ""}${step < current ? " is-complete" : ""}`}>
+            <span>{step}</span>
+            <strong>{label}</strong>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------- 左：题目游标列 ----------------
+function ItemRail({ plan, itemIdx, lockedCount, onPick, journalTurns, disabled = false }: {
+  plan: SessionPlan; itemIdx: number; lockedCount: number;
+  onPick: (i: number) => void; journalTurns: Record<string, { locked: boolean }>; disabled?: boolean;
+}) {
+  const progress = plan.items.length ? Math.round((lockedCount / plan.items.length) * 100) : 0;
+  return (
+    <aside className="item-rail" aria-label="题目进度">
+      <div className="item-rail-header">
+        <div>
+          <span className="page-kicker">题目进度</span>
+          <strong>{lockedCount}/{plan.items.length} 已完成</strong>
+        </div>
+        <span className="mono muted">{progress}%</span>
+      </div>
+      <div className="progress-track" aria-hidden><span style={{ width: `${progress}%` }} /></div>
       <div className="item-rail-list">
         {plan.items.map((it, i) => {
           const total = it.turns.length;
           const locked = it.turns.filter((t) => journalTurns[`${it.item_id}#${t.turn_seq}`]?.locked).length;
           const allLocked = locked === total;
+          const displayName = it.item_id.replace(/^(SE|DE)_/, "");
           return (
-            <button key={it.item_id} onClick={() => onPick(i)}
-              style={{ textAlign: "left", padding: "6px 10px", borderRadius: 8,
-                border: i === itemIdx ? "2px solid var(--c-primary)" : "1px solid var(--c-line)",
-                background: i === itemIdx ? "var(--c-warn-bg)" : "var(--c-surface)" }}>
-              <span style={{ marginRight: 6 }}>{allLocked ? "📌" : "📍"}</span>
-              {it.item_id} {total > 1 && <span className="muted">({locked}/{total})</span>}
+            <button key={it.item_id} onClick={() => onPick(i)} disabled={disabled}
+              aria-current={i === itemIdx ? "step" : undefined}
+              className={`item-rail-button${i === itemIdx ? " is-active" : ""}${allLocked ? " is-complete" : ""}`}>
+              <span className="item-rail-index">{i + 1}</span>
+              <span className="item-rail-copy">
+                <strong>{displayName}</strong>
+                <span>{it.task_type}{total > 1 ? ` · ${locked}/${total} 环节` : allLocked ? " · 已锁定" : " · 待完成"}</span>
+              </span>
             </button>
           );
         })}
       </div>
-    </div>
+    </aside>
   );
 }
 
@@ -554,14 +770,14 @@ function ItemReference({ item, bundle }: { item: PlanItem; bundle: ReturnType<ty
   if (item.task_type === "单要素") {
     const s = findSingle(bundle, item.item_id);
     if (!s) return null;
-    return <div className="muted" style={{ fontSize: "0.9em" }}>目标词:<strong>{s.target_word}</strong> · 可接受:{s.acceptable_expressions.join("、") || "—"}</div>;
+    return <div className="item-reference"><span>判分目标</span><strong>{s.target_word}</strong><span>可接受表达：{s.acceptable_expressions.join("、") || "暂无补充"}</span></div>;
   }
   if (item.task_type === "双要素") {
     const d = findDouble(bundle, item.item_id);
     if (!d) return null;
     return (
-      <div className="muted" style={{ fontSize: "0.9em" }}>
-        左:<strong>{d.left_word}</strong> · 右:<strong>{d.right_word}</strong> · 关系线索:{d.relation_cue}
+      <div className="item-reference">
+        <span>左侧</span><strong>{d.left_word}</strong><span>右侧</span><strong>{d.right_word}</strong><span>关系线索：{d.relation_cue}</span>
       </div>
     );
   }
@@ -579,17 +795,18 @@ function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
   // 单要素命名:三级;双要素 作用/关系:一级(题库仅一条角色线索);其余无预置线索。
   const levels: { level: 1 | 2 | 3; label: string }[] =
     taskType === "单要素"
-      ? [{ level: 1, label: "发线索1" }, { level: 2, label: "发线索2" }, { level: 3, label: "告知答案" }]
+      ? [{ level: 1, label: "发送轻提示" }, { level: 2, label: "发送明确提示" }, { level: 3, label: "告知答案" }]
       : taskType === "双要素" && (role.includes("作用") || role === "关系识别")
-        ? [{ level: 1, label: "发线索" }]
+        ? [{ level: 1, label: "发送提示" }]
         : [];
   if (levels.length === 0) return null;
   const current = lookupCue(bundle, itemId, taskType, role, cueLevel);
   const tellText = lookupCue(bundle, itemId, taskType, role, 3);
   return (
-    <div className="card col" style={{ background: "var(--c-bg)", gap: "var(--sp-2)" }}>
+    <div className="cue-panel">
       <div className="row wrap">
-        <strong>线索(当前 {cueLevel} 级)</strong>
+        <strong>分级线索</strong>
+        <StatusPill tone={cueLevel === 0 ? "muted" : "warn"}>当前 {cueLevel} 级</StatusPill>
         {levels.map(({ level, label }) => {
           const text = lookupCue(bundle, itemId, taskType, role, level);
           const isTell = taskType === "单要素" && level === 3;
@@ -603,7 +820,7 @@ function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
           );
         })}
       </div>
-      {current && <p className="muted" style={{ fontSize: "0.9em" }}>老人端正显示:{current}</p>}
+      {current && <p className="muted">老人端正在显示：{current}</p>}
       <ConfirmDialog open={confirmTell} title="告知答案?"
         body={`老人端将显示并朗读:「${tellText ?? ""}」。这是最高提示级,发出后本环节提示等级不可再降。`}
         confirmLabel="告知答案"
@@ -613,11 +830,48 @@ function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
   );
 }
 
+function AuthenticatedAudio({ rawAudioId }: { rawAudioId: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    setSrc(null);
+    setError(null);
+    api.getAudioBlob(rawAudioId)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setSrc(objectUrl);
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [rawAudioId, retry]);
+
+  if (error) {
+    return (
+      <span className="row wrap">
+        <StatusPill tone="warn">回放未载入</StatusPill>
+        <Button onClick={() => setRetry((value) => value + 1)}>重试回放</Button>
+      </span>
+    );
+  }
+  if (!src) return <StatusPill tone="muted">正在准备回放…</StatusPill>;
+  return <audio controls preload="metadata" src={src} style={{ height: 36 }} />;
+}
+
 // ---------------- 按角色切换的锁分控件 ----------------
-function LockControl({ taskType, role, suggestedPromptLevel = 0, onLock, locking = false, basis, confirmedText, unsavedConfirm }: {
+function LockControl({ taskType, role, suggestedPromptLevel = 0, onLock, locking = false, basis, confirmedText, unsavedConfirm, active = false }: {
   taskType: string; role: string; suggestedPromptLevel?: number;
   onLock: (v: number, promptLevel?: number) => Promise<boolean>;
-  locking?: boolean; basis?: React.ReactNode; confirmedText?: string; unsavedConfirm?: boolean;
+  locking?: boolean; basis?: React.ReactNode; confirmedText?: string; unsavedConfirm?: boolean; active?: boolean;
 }) {
   const [promptLevel, setPromptLevel] = useState<string | null>(String(suggestedPromptLevel));
   const [confirmVal, setConfirmVal] = useState<{ v: number; label: string } | null>(null);
@@ -633,10 +887,14 @@ function LockControl({ taskType, role, suggestedPromptLevel = 0, onLock, locking
     : [{ v: 1, label: single ? "命名正确(1)" : "正确(1)", tone: "ok" }, { v: 0, label: single ? "未正确(0)" : "错误(0)", tone: "danger" }];
 
   return (
-    <div className="card col" style={{ background: "var(--c-bg)" }}>
-      <strong>④ 人工锁分(研究数据真值 · 一旦锁定不可改)</strong>
+    <section className={`workflow-panel${active ? " is-active" : ""}`}>
+      <div className="workflow-panel-header">
+        <div><span className="workflow-panel-number">4</span><strong>人工锁分</strong></div>
+        <StatusPill tone="warn">锁定后不可修改</StatusPill>
+      </div>
+      <p className="muted">请以人工确认文本和题目判分依据为准；辅助初评不会自动锁分。</p>
       {single && (
-        <Field label="提示等级 prompt_level(0 自发 / 1 轻提示 / 2 明确或语音 / 3 告知答案)">
+        <Field label="本环节最高提示等级" hint="0 自发回答 · 1 轻提示 · 2 明确或语音提示 · 3 已告知答案">
           <EnumSelect options={["0", "1", "2", "3"]} value={promptLevel} onChange={setPromptLevel} allowEmpty={false} />
         </Field>
       )}
@@ -659,7 +917,7 @@ function LockControl({ taskType, role, suggestedPromptLevel = 0, onLock, locking
             if (ok) setConfirmVal(null);
           }} />
       )}
-    </div>
+    </section>
   );
 }
 
@@ -671,16 +929,16 @@ function LockConfirm({ label, role, promptLevel, basis, confirmedText, unsavedCo
   const [armed, setArmed] = useState(false);
   useEffect(() => { const t = setTimeout(() => setArmed(true), 400); return () => clearTimeout(t); }, []);
   return (
-    <div onClick={onCancel} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 950 }}>
-      <div className="card col fade-in" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 500 }}>
-        <h3>确认锁定</h3>
-        <p>环节「{role}」→ 锁定为 <strong>{label}</strong>{promptLevel != null ? ` · 提示等级 ${promptLevel}` : ""}。</p>
+    <div className="dialog-backdrop" onClick={onCancel}>
+      <div className="dialog-panel fade-in" role="dialog" aria-modal="true" aria-labelledby="lock-confirm-title" onClick={(e) => e.stopPropagation()}>
+        <div className="dialog-header"><h3 id="lock-confirm-title">确认正式锁分</h3></div>
+        <p>环节「{role}」将锁定为 <strong>{label}</strong>{promptLevel != null ? ` · 提示等级 ${promptLevel}` : ""}。</p>
         {/* 判分依据摆在眼前,不用取消弹窗滚回去翻 */}
-        {basis && <div className="card" style={{ background: "var(--c-bg)", padding: "var(--sp-3)" }}>{basis}</div>}
+        {basis && <div className="item-reference">{basis}</div>}
         {confirmedText?.trim() && <p className="muted">确认文本:「{confirmedText}」</p>}
         {unsavedConfirm && <p style={{ color: "var(--c-warn)" }}>确认文本有未保存修改:锁定时将自动保存这一版。</p>}
-        <p className="muted">锁定后本环节不可再改 confirmed / 不可重复锁。</p>
-        <div className="row" style={{ justifyContent: "flex-end" }}>
+        <p className="muted">锁定后，本环节的确认文本和评分均不可再次修改。</p>
+        <div className="dialog-actions">
           <Button onClick={onCancel} disabled={locking}>取消</Button>
           <Button variant="primary" disabled={!armed || locking} onClick={onConfirm}>
             {locking ? "锁定中…" : armed ? "确认锁定" : "请稍候…"}
@@ -693,13 +951,15 @@ function LockConfirm({ label, role, promptLevel, basis, confirmedText, unsavedCo
 
 function FailClosed({ msg, onRetry, onExit }: { msg: string; onRetry?: () => void; onExit?: () => void }) {
   return (
-    <div className="card col" style={{ background: "var(--c-danger-bg)", border: "2px solid var(--c-danger)", color: "var(--c-danger)", maxWidth: 720 }}>
-      <h3>训练屏 fail-closed</h3>
+    <div className="alert alert--danger" role="alert" style={{ maxWidth: 760 }}>
+      <div className="col">
+      <h3>本场训练已安全暂停</h3>
       <p>{msg}</p>
-      <p className="muted">题库版本不一致或计划加载失败时,拒开训练以保护数据完整性。后端恢复后点重试即可,不必换受试者。</p>
-      <div className="row">
+      <p>题库版本不一致或计划加载失败时，系统不会继续呈现题目，以保护研究数据。恢复后可直接重试，无需更换受试者。</p>
+      <div className="row wrap">
         {onRetry && <Button variant="primary" onClick={onRetry}>重试</Button>}
-        {onExit && <Button onClick={onExit}>← 返回建场次</Button>}
+        {onExit && <Button onClick={onExit}>返回场次设置</Button>}
+      </div>
       </div>
     </div>
   );

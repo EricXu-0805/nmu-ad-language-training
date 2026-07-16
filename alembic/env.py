@@ -1,4 +1,5 @@
 from logging.config import fileConfig
+import os
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
@@ -13,9 +14,11 @@ from app.db import DEFAULT_URL
 # access to the values within the .ini file in use.
 config = context.config
 
-# URL 与应用同源:未在 alembic.ini 配置时用 app.db 的默认(dev SQLite;部署 PG 时改 DATABASE_URL)
+# URL 与应用同源：显式 Config URL 优先（测试/运维定向迁移），否则与
+# app.db.make_engine 一样先读 DATABASE_URL，最后才落到本地 SQLite。
+# 若此处忽略环境变量，serve.sh 会升级 data/app.db，而应用却连到未迁移的部署库。
 if not config.get_main_option("sqlalchemy.url"):
-    config.set_main_option("sqlalchemy.url", DEFAULT_URL)
+    config.set_main_option("sqlalchemy.url", os.environ.get("DATABASE_URL") or DEFAULT_URL)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

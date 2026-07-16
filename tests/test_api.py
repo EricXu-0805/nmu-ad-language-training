@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app import models  # noqa: F401  register tables
+from app import audio_store, models  # noqa: F401  register tables
 from app.db import get_session
 from app.main import app
 
@@ -46,11 +46,18 @@ def test_session_needs_patient_and_version(client):
     got = client.get("/sessions/S1")
     assert got.status_code == 200 and got.json()["patient_id"] == "P404"
     assert client.get("/sessions/S404").status_code == 404
+    bad_context = {**sess, "session_id": "SCTX", "phase_type": "关系建立",
+                   "event_line": "关系建立环节"}
+    assert client.post("/sessions", json=bad_context).status_code == 422
+    bad_version = {**sess, "session_id": "SVER", "item_bank_version_id": "unknown"}
+    assert client.post("/sessions", json=bad_version).status_code == 409
 
 
 def test_item_bank_endpoint(client):
     d = client.get("/content/item-bank").json()
     assert d["single_count"] == 20 and d["double_count"] == 10
+    assert d["multi_count"] == 0 and d["supported_training_weeks"] == [2]
+    assert d["qc_status"] == "draft" and d["ready_for_research"] is False
     assert d["errors"] == []
     assert any("SE_花" in w for w in d["warnings"])
 
@@ -82,21 +89,38 @@ def test_judge_valid_prefers_confirmed(client):
     assert r.json()["resolved_text"] == "红萝卜"
 
 
-def test_audio_gate_blocks_premature_delete(client):
-    client.post("/audio", json={"raw_audio_id": "a1"})
-    assert client.delete("/audio/a1").status_code == 409          # 未导出不能删
+def test_audio_gate_blocks_premature_delete(client, monkeypatch):
+    _mk_session(client, sid="SA1", pid="PA1")
+    client.post("/audio", json={"raw_audio_id": "a1", "session_id": "SA1"})
+    # ★环境开关先放行:端点把 ENABLE_AUDIO_DELETE 检查放在闸门之前,若开关关着,
+    # 下面每个 409 都来自"物理删除默认禁用"而非闸门——闸门断言全部变成空断言,
+    # 端点绕过 request_delete 的回归将测不出来。
+    monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
+    r = client.delete("/audio/a1")
+    assert r.status_code == 409 and "导出" in r.json()["detail"]  # 未导出不能删(真闸门拒绝)
     client.put("/audio/a1/blob", content=b"fake-audio-bytes")     # 字节落库+登记 sha256
-    client.post("/audio/a1/export")
-    assert client.delete("/audio/a1").status_code == 409          # 未校验不能删
+    assert client.post("/audio/a1/export").status_code == 409      # 禁止脱离场次盲翻状态
+    ex = client.post("/sessions/SA1/export").json()
+    assert ex["audio_touched"] == ["a1"]
+    assert client.put("/audio/a1/blob", content=b"overwrite").status_code == 409
+    r = client.delete("/audio/a1")
+    assert r.status_code == 409 and "校验" in r.json()["detail"]  # 未校验不能删(真闸门拒绝)
+    audio_store.find_blob("a1").write_bytes(b"source-was-changed") # 校验不得回头拿采集源文件冒充
     assert client.post("/audio/a1/checksum").status_code == 200   # 真校验通过
+    # 闸门全绿但环境开关关闭:仍默认禁删——独立于闸门的第二道保险
+    monkeypatch.delenv("ENABLE_AUDIO_DELETE")
+    r = client.delete("/audio/a1")
+    assert r.status_code == 409 and "默认禁用" in r.json()["detail"]
+    monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     r = client.delete("/audio/a1")
     assert r.status_code == 200 and r.json()["bytes_deleted"] is True  # 放行才物理删字节
     assert client.get("/audio/a1/blob").status_code == 404        # 字节确已删除
 
 
 def test_audio_checksum_requires_real_bytes(client):
-    client.post("/audio", json={"raw_audio_id": "nb"})
-    client.post("/audio/nb/export")
+    _mk_session(client, sid="SNB", pid="PNB")
+    client.post("/audio", json={"raw_audio_id": "nb", "session_id": "SNB"})
+    client.post("/sessions/SNB/export")
     assert client.post("/audio/nb/checksum").status_code == 409   # 无字节禁止盲翻状态
 
 
@@ -112,6 +136,16 @@ def test_audio_blob_roundtrip_and_asr_degraded(client):
     assert client.post("/asr/transcribe/none-x").status_code == 404
 
 
+def test_recording_explicitly_denied_blocks_audio_registration(client):
+    client.post("/patients", json={"patient_id": "PNOREC", "recording_allowed": False})
+    client.post("/sessions", json={"session_id": "SNOREC", "patient_id": "PNOREC", "week_no": 2,
+                                   "phase_type": "正式训练", "event_line": "正式训练",
+                                   "item_bank_version_id": "wk2-v1-20260707"})
+    denied = client.post("/audio", json={"raw_audio_id": "no-rec", "session_id": "SNOREC"})
+    assert denied.status_code == 409
+    assert "recording_allowed=false" in denied.json()["detail"]
+
+
 def test_asr_hotwords_from_frozen_bank(client):
     d = client.get("/asr/hotwords").json()
     assert d["engine"] == "null-0"
@@ -119,12 +153,16 @@ def test_asr_hotwords_from_frozen_bank(client):
     assert "属牛" in d["hotwords"] or "牛" in d["hotwords"]       # 属相闭表并入
 
 
-def test_audio_reliability_needs_review_before_delete(client):
-    client.post("/audio", json={"raw_audio_id": "rel", "is_reliability_sample": True})
+def test_audio_reliability_needs_review_before_delete(client, monkeypatch):
+    _mk_session(client, sid="SREL", pid="PREL")
+    client.post("/audio", json={"raw_audio_id": "rel", "session_id": "SREL",
+                                "is_reliability_sample": True})
     client.put("/audio/rel/blob", content=b"rel-bytes")
-    client.post("/audio/rel/export")
+    client.post("/sessions/SREL/export")
     client.post("/audio/rel/checksum")
-    assert client.delete("/audio/rel").status_code == 409         # 信度样本须先人工复核
+    monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")  # 先放行开关,让 409 真正来自信度闸门
+    r = client.delete("/audio/rel")
+    assert r.status_code == 409 and "信度" in r.json()["detail"]  # 信度样本须先人工复核
     client.post("/audio/rel/reliability-review")
     assert client.delete("/audio/rel").status_code == 200
 
@@ -140,6 +178,24 @@ def test_session_plan_expands_turns(client):
     _mk_session(client)
     d = client.get("/sessions/SM0/plan", params={"week_no": 2, "event_line": "正式训练"}).json()
     assert d["total_items"] == 30 and d["total_turns"] == 20 + 10 * 5
+
+
+def test_session_plan_uses_persisted_context_and_fails_closed(client):
+    _mk_session(client, sid="SP2", pid="PP2")
+    assert client.get("/sessions/SP2/plan").status_code == 200
+    assert client.get("/sessions/SP2/plan", params={"week_no": 3}).status_code == 409
+    assert client.get("/sessions/SP2/plan", params={"event_line": "基线测评窗"}).status_code == 409
+
+    blocked = client.post("/sessions", json={"session_id": "SP3", "patient_id": "PP2", "week_no": 3,
+                                             "phase_type": "正式训练", "event_line": "正式训练",
+                                             "item_bank_version_id": "wk2-v1-20260707"})
+    assert blocked.status_code == 409
+
+    client.post("/sessions", json={"session_id": "SP1", "patient_id": "PP2", "week_no": 1,
+                                   "phase_type": "关系建立", "event_line": "关系建立环节",
+                                   "item_bank_version_id": "wk2-v1-20260707"})
+    p1 = client.get("/sessions/SP1/plan").json()
+    assert p1["total_items"] == 0 and p1["total_turns"] == 0
 
 
 def test_m0_end_to_end_single_item(client):
@@ -173,6 +229,56 @@ def test_m0_end_to_end_single_item(client):
     assert ex["deidentified"] is True and ex["sheet_counts"]["turns"] == 1
 
 
+def test_lock_requires_confirmed_formal_valid_context(client):
+    _mk_session(client, sid="SLK", pid="PLK")
+    ie = client.post("/sessions/SLK/items",
+                     json={"item_id": "SE_锚", "task_type": "单要素"}).json()
+    te = client.post(f"/items/{ie['id']}/turns",
+                     json={"turn_seq": 1, "response_role": "命名", "prompt_level": 0}).json()
+    endpoint = f"/turns/{te['id']}/lock"
+    assert client.patch(endpoint, json={"reviewer_id": "R1", "element_value": 1}).status_code == 409
+    client.patch(f"/turns/{te['id']}/confirm", json={"confirmed_response_text": "锚"})
+    assert client.patch(endpoint, json={"reviewer_id": " ", "element_value": 1}).status_code == 422
+    assert client.patch(endpoint, json={"reviewer_id": "R1", "element_value": 2}).status_code == 422
+    assert client.patch(endpoint, json={"reviewer_id": "R1", "element_value": 1,
+                                        "prompt_level": 4}).status_code == 422
+
+    bad_role = client.post(f"/items/{ie['id']}/turns",
+                           json={"turn_seq": 2, "response_role": "命名", "prompt_level": 0}).json()
+    client.patch(f"/turns/{bad_role['id']}/confirm", json={"confirmed_response_text": "锚"})
+    assert client.patch(f"/turns/{bad_role['id']}/lock",
+                        json={"reviewer_id": "R1", "element_value": 1}).status_code == 422
+
+    client.post("/sessions", json={"session_id": "SLK1", "patient_id": "PLK", "week_no": 1,
+                                   "phase_type": "关系建立", "event_line": "关系建立环节",
+                                   "item_bank_version_id": "wk2-v1-20260707"})
+    w1_item = client.post("/sessions/SLK1/items",
+                          json={"item_id": "SE_锚", "task_type": "单要素"}).json()
+    w1_turn = client.post(f"/items/{w1_item['id']}/turns",
+                          json={"turn_seq": 1, "response_role": "命名", "prompt_level": 0}).json()
+    client.patch(f"/turns/{w1_turn['id']}/confirm", json={"confirmed_response_text": "锚"})
+    assert client.patch(f"/turns/{w1_turn['id']}/lock",
+                        json={"reviewer_id": "R1", "element_value": 1}).status_code == 409
+
+
+def test_read_only_session_recovery_endpoints(client):
+    _mk_session(client, sid="SREC", pid="PREC")
+    ie = client.post("/sessions/SREC/items",
+                     json={"item_id": "SE_锚", "task_type": "单要素"}).json()
+    client.post(f"/items/{ie['id']}/turns",
+                json={"turn_seq": 1, "response_role": "命名", "prompt_level": 0})
+    client.post("/audio", json={"raw_audio_id": "arec", "session_id": "SREC"})
+    client.post("/sessions/SREC/abnormal", json={"abnormal_type": "环境噪声"})
+
+    sessions = client.get("/patients/PREC/sessions").json()
+    assert [row["session_id"] for row in sessions] == ["SREC"]
+    journal = client.get("/sessions/SREC/journal").json()
+    assert journal["session"]["session_id"] == "SREC"
+    assert len(journal["items"]) == len(journal["turns"]) == 1
+    assert journal["audios"][0]["raw_audio_id"] == "arec"
+    assert journal["abnormal"][0]["abnormal_type"] == "环境噪声"
+
+
 def test_ai_judge_no_deterministic_target_is_human_only(client):
     _mk_session(client)
     ie = client.post("/sessions/SM0/items",
@@ -203,22 +309,41 @@ def test_scale_entry_list_and_export_integration(client):
 
 def test_live_state_roundtrip_and_session_reset(client):
     assert client.get("/live/state").json()["seq"] == 0            # 初始为空
-    client.put("/live/state", json={"kind": "session",
-                                    "payload": {"sessionId": "S1", "weekNo": 2, "mode": "task"}})
-    client.put("/live/state", json={"kind": "cursor",
-                                    "payload": {"itemIdx": 3, "turnIdx": 1, "recording": "armed"}})
+    _mk_session(client, sid="S1", pid="P-LIVE")
+    assert client.post("/sessions", json={
+        "session_id": "S2", "patient_id": "P-LIVE", "week_no": 2,
+        "phase_type": "正式训练", "event_line": "正式训练",
+        "item_bank_version_id": "wk2-v1-20260707",
+    }).status_code == 200
+    hs1 = client.put("/live/state", json={"kind": "session",
+                          "payload": {"sessionId": "S1", "weekNo": 2, "mode": "task", "wseq": 1}})
+    cur = client.put("/live/state", json={"kind": "cursor",
+                          "payload": {"sessionId": "S1", "screen": "record", "itemIdx": 3,
+                                      "turnIdx": 0, "responseRole": "命名", "cueLevel": 0,
+                                      "recording": "armed", "wseq": 0}})
+    assert client.post("/audio", json={"raw_audio_id": "a9", "session_id": "S1",
+                                       "turn_key": "SE_树#1"}).status_code == 200
+    assert client.put("/audio/a9/blob", content=b"live-audio").status_code == 200
     client.put("/live/state", json={"kind": "audioSaved",
-                                    "payload": {"rawAudioId": "a9", "turnKey": "SE_锚#1"}})
+                                    "payload": {"rawAudioId": "a9", "durationSeconds": 1.2,
+                                                "turnKey": "SE_树#1",
+                                                "sessionId": "S1"}})
     client.put("/live/state", json={"kind": "patientRec",
-                                    "payload": {"active": True, "turnKey": "SE_锚#1", "sessionId": "S1"}})
+                                    "payload": {"active": True, "turnKey": "SE_树#1", "sessionId": "S1"}})
     d = client.get("/live/state").json()
-    assert d["seq"] == 4 and d["cursor"]["itemIdx"] == 3 and d["audioSaved"]["rawAudioId"] == "a9"
-    assert d["patientRec"]["active"] is True                        # 老人端麦克风真值上报可读
+    assert d["seq"] == 4 and d["cursor"]["itemIdx"] == 3
+    assert d["session"]["wseq"] == hs1.json()["wseq"] < cur.json()["wseq"] == d["cursor"]["wseq"]
+    assert "audioSaved" not in d and "patientRec" not in d          # 患者最小读口不泄露研究回报
+    console = client.get("/live/console-state").json()
+    assert console["audioSaved"]["rawAudioId"] == "a9"
+    assert console["patientRec"]["active"] is True
     # 新场次握手 → 旧游标/录音回报/麦克风上报清空(防老人端串场)
-    client.put("/live/state", json={"kind": "session", "payload": {"sessionId": "S2", "weekNo": 1}})
+    client.put("/live/state", json={"kind": "session",
+                                    "payload": {"sessionId": "S2", "weekNo": 2, "mode": "task"}})
     d2 = client.get("/live/state").json()
-    assert d2["session"]["sessionId"] == "S2" and d2["cursor"] is None and d2["audioSaved"] is None
-    assert d2["patientRec"] is None
+    assert d2["session"]["sessionId"] == "S2" and d2["cursor"] is None
+    console2 = client.get("/live/console-state").json()
+    assert console2["audioSaved"] is None and console2["patientRec"] is None
     assert d2["seq"] == 5                                           # seq 只增不回卷
     assert client.put("/live/state", json={"kind": "bogus", "payload": {}}).status_code == 422
 

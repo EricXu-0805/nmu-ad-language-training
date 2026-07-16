@@ -11,7 +11,13 @@ const IMG_VW = 0.9;
 
 function fit(nw: number, nh: number, vw: number, vh: number, compact: boolean): { width: number; height: number } {
   // 竖屏(iPad 竖持)图让高给文字与麦克风;线索挂出来时(compact)图再让一档,内容永不叠
-  const imgVh = vh > vw ? (compact ? 0.26 : 0.34) : (compact ? 0.30 : 0.40);
+  // 矮屏优先给线索和“我说好了”留空间；主操作不能被题图挤出视口。
+  const short = vh <= 760;
+  const imgVh = short
+    ? (compact ? 0.23 : 0.31)
+    : vh > vw
+      ? (compact ? 0.26 : 0.34)
+      : (compact ? 0.30 : 0.40);
   const scale = Math.min((vw * IMG_VW) / nw, (vh * imgVh) / nh);
   return { width: Math.round(nw * scale), height: Math.round(nh * scale) };
 }
@@ -40,13 +46,14 @@ export function ImagePane({ imageId, spotlight = "none", compact = false, alt }:
 
   if (!imageId) {
     return (
-      <div className="image-pane card" style={{
+      <div className="image-pane card patient-status" role="status" aria-live="polite" style={{
         display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center",
-        minHeight: 240, background: "var(--c-warn-bg)", color: "var(--c-warn)", border: "2px dashed var(--c-warn)",
+        width: "min(84vw, 640px)", minHeight: "min(28vh, 240px)",
+        background: "var(--c-warn-bg)", color: "var(--c-warn)", border: "2px dashed var(--c-warn)",
       }}>
         <div>
-          <div style={{ fontSize: "1.4em", fontWeight: 700 }}>（此题暂无图片）</div>
-          <div className="muted">内容组待回填题图 · 不可用于真实数据采集</div>
+          <div style={{ fontWeight: 700 }}>图片正在准备</div>
+          <div className="muted">请稍候，研究者会来处理</div>
         </div>
       </div>
     );
@@ -60,11 +67,13 @@ export function ImagePane({ imageId, spotlight = "none", compact = false, alt }:
     // 图片字节加载失败(文件缺/损坏):给一个平和的空白画框,不永久隐形也不报错闪红;
     // 研究者从操作端能看到当前题号,QA 时据此排查。
     return (
-      <div className="image-pane" style={{
+      <div className="image-pane patient-status" role="status" aria-live="polite" style={{
         width: "min(60vw, 640px)", height: "28vh", borderRadius: "var(--radius)",
         background: "var(--c-surface)", boxShadow: "var(--shadow-md)",
-        display: "flex", alignItems: "center", justifyContent: "center", fontSize: "3em", opacity: 0.35,
-      }} aria-label="图片未能显示">🖼</div>
+        display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center",
+      }}>
+        <span>图片暂未显示<br /><span className="muted">请稍候，研究者会来处理</span></span>
+      </div>
     );
   }
   return (

@@ -16,8 +16,19 @@ class ItemBank:
     version_id: str
     single_element: list[dict]
     double_element: list[dict]
+    multi_element: list[dict] = field(default_factory=list)
     errata_fixed: list[dict] = field(default_factory=list)
     meta: dict = field(default_factory=dict)
+
+    @property
+    def supported_training_weeks(self) -> tuple[int, ...]:
+        """当前结构化内容真正覆盖的训练周；不得由 UI/运行时自行外推。"""
+        raw = self.meta.get("supported_training_weeks", [])
+        return tuple(int(w) for w in raw if isinstance(w, int) and 2 <= w <= 8)
+
+    @property
+    def qc_status(self) -> str:
+        return str(self.meta.get("qc_status") or "draft")
 
 
 def load_item_bank(path: str | Path) -> ItemBank:
@@ -29,9 +40,10 @@ def load_item_bank(path: str | Path) -> ItemBank:
         version_id=vid,
         single_element=data.get("single_element", []),
         double_element=data.get("double_element", []),
+        multi_element=data.get("multi_element", []),
         errata_fixed=data.get("errata_fixed", []),
         meta={k: v for k, v in data.items()
-              if k not in ("single_element", "double_element", "errata_fixed")},
+              if k not in ("single_element", "double_element", "multi_element", "errata_fixed")},
     )
 
 
@@ -52,6 +64,13 @@ def validate_item_bank(bank: ItemBank) -> dict[str, list[str]]:
     warnings: list[str] = []
     seen_ids: set[str] = set()
 
+    if bank.qc_status not in {"draft", "reviewed", "frozen"}:
+        errors.append(f"题库 qc_status 非法：{bank.qc_status!r}")
+    if not bank.supported_training_weeks:
+        errors.append("题库缺 supported_training_weeks，运行时不得猜测覆盖周次")
+    if bank.qc_status != "frozen":
+        warnings.append(f"题库尚未冻结（qc_status={bank.qc_status}），仅可用于开发/演示")
+
     for it in bank.single_element:
         iid = it.get("item_id", "?")
         if iid in seen_ids:
@@ -69,6 +88,15 @@ def validate_item_bank(bank: ItemBank) -> dict[str, list[str]]:
             warnings.append(f"{iid}: 缺 tell_answer")
         if not it.get("success_line"):
             warnings.append(f"{iid}: 缺 success_line")
+        if not it.get("image_id"):
+            warnings.append(f"{iid}: 缺 image_id")
+        if not it.get("acceptable_expressions"):
+            warnings.append(f"{iid}: acceptable_expressions 尚未由内容组确认")
+        if not it.get("difficulty_level"):
+            warnings.append(f"{iid}: difficulty_level 尚未标注")
+        malformed = " ".join(str(x) for x in (it.get("related_but_inaccurate") or []))
+        if "”“" in malformed or "\u201c\u201d" in malformed:
+            warnings.append(f"{iid}: related_but_inaccurate 疑含解析引号残片")
         cues = it.get("cues", {})
         for lv in ("1", "2"):
             if not (cues.get(lv) or {}).get("text"):
@@ -87,8 +115,43 @@ def validate_item_bank(bank: ItemBank) -> dict[str, list[str]]:
                 warnings.append(f"{iid}: 缺 {side}")
             elif w not in parts:
                 errors.append(f"{iid}: {side}“{w}”不在标题“{title}”中（勘误）")
+        if not it.get("image_id"):
+            warnings.append(f"{iid}: 缺 image_id")
+        for cue in ("left_function_cue", "right_function_cue", "relation_cue"):
+            if not it.get(cue):
+                warnings.append(f"{iid}: 缺 {cue}")
+
+    for it in bank.multi_element:
+        iid = it.get("item_id", "?")
+        if iid in seen_ids:
+            errors.append(f"{iid}: item_id 重复")
+        seen_ids.add(iid)
+        if not it.get("image_id"):
+            warnings.append(f"{iid}: 缺 image_id")
+        if not it.get("key_elements"):
+            errors.append(f"{iid}: 多要素题缺 key_elements")
+
+    if not bank.multi_element:
+        warnings.append("当前结构化题库未包含多要素任务，尚未达到蓝图 M0 的完整题型闭环")
 
     return {"errors": errors, "warnings": warnings}
+
+
+def content_readiness(bank: ItemBank) -> dict[str, object]:
+    """面向 API/UI 的明确能力声明，避免把“能加载”误写成“可入组”。"""
+    validation = validate_item_bank(bank)
+    return {
+        "qc_status": bank.qc_status,
+        "supported_training_weeks": list(bank.supported_training_weeks),
+        "ready_for_research": (
+            bank.qc_status == "frozen"
+            and not validation["errors"]
+            and not validation["warnings"]
+            and bool(bank.multi_element)
+        ),
+        "errors": validation["errors"],
+        "warnings": validation["warnings"],
+    }
 
 
 def validate_week1_script(script: dict) -> list[str]:

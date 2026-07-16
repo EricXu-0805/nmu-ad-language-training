@@ -75,7 +75,31 @@ def _double_plan_item(it: dict, order: int) -> PlanItem:
         presentation_order=order,
         display={"pair_title": it.get("pair_title"),
                  "left_word": it.get("left_word"), "right_word": it.get("right_word"),
+                 "left_function_cue": it.get("left_function_cue"),
+                 "right_function_cue": it.get("right_function_cue"),
                  "relation_cue": it.get("relation_cue")},
+        turns=turns,
+    )
+
+
+def _multi_plan_item(it: dict, order: int) -> PlanItem:
+    raw_elements = it.get("key_elements") or []
+    elements = []
+    for idx, raw in enumerate(raw_elements, start=1):
+        if isinstance(raw, str):
+            elements.append((raw, raw))
+        else:
+            key = raw.get("key") or raw.get("id") or f"key_{idx}"
+            label = raw.get("label") or raw.get("target") or key
+            elements.append((key, label))
+    turns = tuple(PlanTurn(turn_seq=i, response_role=label, scoring_key=key)
+                  for i, (key, label) in enumerate(elements, start=1))
+    return PlanItem(
+        item_id=it.get("item_id", f"ME_{order}"),
+        task_type="多要素",
+        image_id=it.get("image_id"),
+        presentation_order=order,
+        display={"scene_title": it.get("scene_title"), "prompt": it.get("initial_prompt")},
         turns=turns,
     )
 
@@ -84,12 +108,20 @@ def build_session_plan(bank: ItemBank, week_no: int, event_line: str,
                        max_items: Optional[int] = None) -> SessionPlan:
     """从冻结题库组装一次会话的可跑序列。
 
-    第2–8周（正式训练）：单要素各 1 环节、双要素各 5 环节（逐环节判分/锁分）。
+    已结构化且由题库 manifest 明确支持的训练周：单要素各 1 环节、双要素各 5 环节，
+    多要素按 key_elements 展开（逐环节判分/锁分）；未声明周次必须 fail-closed。
     第1周（关系建立）：judging 旁路——不在此展开评分题，交由 week1 脚本驱动（走通用降级）。
     """
+    if not 1 <= week_no <= 8:
+        raise ValueError("week_no 必须在 1..8")
     if week_no == 1:
         # 关系建立周不产评分题目；返回空评分计划，交互侧走 week1_script。
         return SessionPlan(bank.version_id, week_no, event_line, items=())
+    if week_no not in bank.supported_training_weeks:
+        supported = "、".join(str(w) for w in bank.supported_training_weeks) or "无"
+        raise ValueError(
+            f"第{week_no}周材料尚未结构化并双人校对；当前题库仅声明支持训练周：{supported}"
+        )
 
     items: list[PlanItem] = []
     order = 0
@@ -99,6 +131,9 @@ def build_session_plan(bank: ItemBank, week_no: int, event_line: str,
     for raw in bank.double_element:
         order += 1
         items.append(_double_plan_item(raw, order))
+    for raw in bank.multi_element:
+        order += 1
+        items.append(_multi_plan_item(raw, order))
     if max_items is not None:
         items = items[:max_items]
     return SessionPlan(bank.version_id, week_no, event_line, tuple(items))

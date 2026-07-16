@@ -1,13 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../api";
+import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { StatusPill } from "../../components/StatusPill";
-import { useToast } from "../../components/Toast";
+import { useToast } from "../../components/ToastContext";
 import { useWeek1Script } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
-import { useAudioSaved, useCursorWriter, useSaveWatchdog } from "../../sync/useCursorWriter";
+import { useSessionRuntime } from "../../hooks/useSessionRuntime";
+import { flushLiveWrites, useAudioSaved, useCursorWriter, useSaveWatchdog } from "../../sync/useCursorWriter";
 import type { RecState } from "../../sync/messages";
 import type { Session } from "../../types";
+import { SessionControlBar } from "../SessionControlBar";
+
+function defaultRapportFlags(sectionKey: string): { assentGate: boolean; containsDirectIdentifier: boolean } {
+  return {
+    assentGate: sectionKey === "认识机器人",
+    containsDirectIdentifier: sectionKey === "自我介绍",
+  };
+}
 
 // week1 关系建立驱动屏:plan 无评分题,本就无判分 UI(与 scoring 零 import)。
 // 逐节/逐问广播 rapportStep 推进老人端;录音同训练屏 arm/stop 模式(老人端 VOX 实采字节)。
@@ -16,11 +26,25 @@ import type { Session } from "../../types";
 export function RelationshipConsoleScreen({ session, onWrapup }: { session: Session; onWrapup: () => void }) {
   const toast = useToast();
   const { script, error: scriptError } = useWeek1Script();
-  const { postSession, postRapport, resetSession } = useCursorWriter();
-  const { upsertAudio } = useSessionJournal(session.session_id);
+  const { postSession, postRapport, resetSession, syncError, retrySync } = useCursorWriter(session.session_id);
+  const { journal, upsertAudio, hydrateFromServer } = useSessionJournal(session.session_id);
+  const runtimeControl = useSessionRuntime(session.session_id);
+  const paused = runtimeControl.paused;
+  const [pausePending, setPausePending] = useState(false);
   const [sectionIdx, setSectionIdx] = useState(0);
   const [qIdx, setQIdx] = useState(0);
+  const [recoveredLabel, setRecoveredLabel] = useState<string | null>(null);
+  const [journalRecoveryError, setJournalRecoveryError] = useState<string | null>(null);
+  const [journalLoading, setJournalLoading] = useState(true);
+  const [journalRetry, setJournalRetry] = useState(0);
+  const [recoveryApplied, setRecoveryApplied] = useState(false);
+  const [rapportFlags, setRapportFlags] = useState(() => defaultRapportFlags("认识机器人"));
+  const recoveredOnce = useRef(false);
+  const handshakeSent = useRef(false);
   const [recState, setRecState] = useState<RecState>("idle");
+  // 与正式训练共用录音资格护栏：明确 false 永不下发 arm；未评沿用当前“提示但不拦截”口径。
+  const [recStatus, setRecStatus] = useState<"loading" | "error" | "denied" | "allowed" | "unrated">("loading");
+  const [recRetry, setRecRetry] = useState(0);
   const section = script?.sections[sectionIdx];
   const isSelfIntro = section?.key === "自我介绍";
   const questions = section?.questions ?? [];
@@ -30,57 +54,174 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
   const [proxyBusy, setProxyBusy] = useState(false);
   const watchdog = useSaveWatchdog(() =>
     toast("8 秒未收到老人端录音回报——可能没录上(麦克风权限/网络)。请检查老人端后重新示意录音。", "danger"));
+  // 看门狗守"哪一节的回报":录音中换节/暂停守的是旧节,旧节回报到达即达成——
+  // 若按"是否当前节"判清,保存成功也弹假警报。
+  const watchdogFor = useRef<string | null>(null);
+  const lastArmedKey = useRef<string | null>(null);
+  const armWatchdog = (k: string | null) => { watchdogFor.current = k; watchdog.start(); };
+
+  useEffect(() => {
+    setRecStatus("loading");
+    api.getPatient(session.patient_id)
+      .then((pt) => setRecStatus(pt.recording_allowed === false ? "denied" : pt.recording_allowed === true ? "allowed" : "unrated"))
+      .catch(() => setRecStatus("error"));
+  }, [session.patient_id, recRetry]);
+
+  const recoveryLoading = runtimeControl.loading || journalLoading;
+  const recoveryError = runtimeControl.error ?? journalRecoveryError ?? syncError;
+  const runtimeReady = runtimeControl.runtime?.sessionId === session.session_id;
+  const recoveryPending = recoveryLoading || (!recoveryError && (!runtimeReady || !recoveryApplied));
+  const interactionBlocked = paused || pausePending || recoveryPending || Boolean(recoveryError);
+  const retryRecovery = () => {
+    setJournalRetry((n) => n + 1);
+    void runtimeControl.refresh();
+    retrySync();
+  };
 
   useEffect(() => {
     resetSession();
+    recoveredOnce.current = false;
+    handshakeSent.current = false;
+    setRecoveryApplied(false);
+    setRecoveredLabel(null);
+    setSectionIdx(0);
+    setQIdx(0);
+    setRapportFlags(defaultRapportFlags("认识机器人"));
+  }, [resetSession, session.session_id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setJournalLoading(true);
+    setJournalRecoveryError(null);
+    api.sessionJournal(session.session_id)
+      .then((remote) => {
+        if (cancelled) return;
+        if (remote.session.session_id !== session.session_id) {
+          throw new Error("服务器返回了其他场次的记录，已拒绝恢复");
+        }
+        hydrateFromServer(remote);
+        setJournalLoading(false);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setJournalRecoveryError(e instanceof ApiError ? e.detail : String(e));
+        setJournalLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [hydrateFromServer, journalRetry, session.session_id]);
+
+  useEffect(() => {
+    if (!script || !runtimeReady || recoveryLoading || recoveryError || recoveredOnce.current) return;
+    const saved = runtimeControl.runtime?.rapportStep;
+    const nextSection = saved ? script.sections.findIndex((candidate) => candidate.key === saved.sectionKey) : 0;
+    const safeSection = nextSection >= 0 ? nextSection : 0;
+    const maxQuestion = Math.max(0, (script.sections[safeSection]?.questions?.length ?? 1) - 1);
+    const safeQuestion = Math.min(Math.max(0, saved?.questionIdx ?? 0), maxQuestion);
+    setSectionIdx(safeSection);
+    setQIdx(safeQuestion);
+    const restoredFlags = defaultRapportFlags(script.sections[safeSection]?.key ?? "");
+    setRapportFlags({
+      assentGate: saved?.assentGate ?? restoredFlags.assentGate,
+      containsDirectIdentifier: saved?.containsDirectIdentifier ?? restoredFlags.containsDirectIdentifier,
+    });
+    if (safeSection > 0 || safeQuestion > 0 || runtimeControl.runtime?.status === "paused") {
+      setRecoveredLabel(`「${script.sections[safeSection]?.key ?? "关系建立"}」第 ${safeQuestion + 1} 问`);
+    }
+    recoveredOnce.current = true;
+    setRecoveryApplied(true);
+  }, [recoveryError, recoveryLoading, runtimeControl.runtime, runtimeReady, script]);
+
+  useEffect(() => {
+    if (!script || interactionBlocked || handshakeSent.current) return;
     postSession({ sessionId: session.session_id, weekNo: session.week_no, eventLine: session.event_line, mode: "rapport", itemBankVersionId: session.item_bank_version_id });
-  }, [session, postSession, resetSession]);
+    postRapport({
+      sectionKey: script.sections[sectionIdx]?.key ?? "",
+      questionIdx: qIdx,
+      recording: "idle",
+      recSeq: recSeq.current,
+      ...rapportFlags,
+    });
+    handshakeSent.current = true;
+  }, [interactionBlocked, postRapport, postSession, qIdx, rapportFlags, script, sectionIdx, session]);
+
+  // 卸载/换场次无条件收回 rapport 录音指令；即使本地 state 已不同步，也不留下 armed 热麦。
+  const withdrawRef = useRef<() => void>(() => {});
+  withdrawRef.current = () => {
+    watchdog.clear();
+    postRapport({
+      sectionKey: section?.key ?? "",
+      questionIdx: qIdx,
+      recording: "idle",
+      recSeq: recSeq.current,
+      ...rapportFlags,
+    });
+  };
+  useEffect(() => () => withdrawRef.current(), []);
+  useEffect(() => { if (recoveryError) withdrawRef.current(); }, [recoveryError]);
 
   // 老人端录音落库回报 → 记入作业日志(收尾屏音频闸门据此列出)
   useAudioSaved((m) => {
     if (m.sessionId !== session.session_id) return; // 跨场次残留/迟到回报一律丢弃
-    watchdog.clear();
+    const expectedTurnKey = `关系建立·${section?.key ?? ""}`;
+    const isReplay = Boolean(journal.audios[m.rawAudioId]);
     upsertAudio(m.rawAudioId, {
       turnKey: m.turnKey,
       containsDirectIdentifier: m.containsDirectIdentifier ?? false,
       isReliabilitySample: false,
       lastStatus: "recorded",
+      durationSeconds: m.durationSeconds,
     });
-    if (recState !== "idle") {
+    // 看门狗按"守的节"清:录音中换节/暂停守的是旧节,旧节的成功回报必须能清掉它。
+    if (!isReplay && m.turnKey === watchdogFor.current) {
+      watchdog.clear();
+      watchdogFor.current = null;
+    }
+    // 上一问迟到或刷新重放的回报只记账；不收当前麦克风。
+    if (m.turnKey !== expectedTurnKey || isReplay) return;
+    if (recState !== "idle" && !interactionBlocked) {
       // 老人自己按"我说好了"停的:把 idle 写回镜像/服务端真值源,否则 armed 残留会让老人端刷新后自动开麦。
-      postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "idle", recSeq: recSeq.current });
+      postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
     }
     setRecState("idle");
     toast(`录音已保存${m.containsDirectIdentifier ? "(含直接标识,导出将红线)" : ""}:${m.rawAudioId.slice(0, 12)}… · ${m.durationSeconds.toFixed(1)}s`, "ok");
   });
 
-  if (scriptError) return <p style={{ color: "var(--c-danger)" }}>第 1 周脚本校验失败,拒绝开场:{scriptError}</p>;
+  if (scriptError) return <Alert tone="danger" title="第 1 周脚本校验失败">系统已安全暂停，不能使用未经校验的话术开场：{scriptError}</Alert>;
   if (!script) return <p>加载第 1 周脚本…</p>;
 
   // 统一推进:换节/换问都先停录(老人端收到 idle 自动收尾保存),再广播新指针。
   const go = (sIdx: number, q: number) => {
+    if (interactionBlocked) return;
     const s = script.sections[sIdx];
-    if (recState !== "idle") watchdog.start();
+    const nextFlags = defaultRapportFlags(s?.key ?? "");
+    if (recState !== "idle") armWatchdog(lastArmedKey.current);
     setRecState("idle");
     setSectionIdx(sIdx);
     setQIdx(q);
-    postRapport({ sectionKey: s?.key ?? "", questionIdx: q, recording: "idle", recSeq: recSeq.current });
+    setRapportFlags(nextFlags);
+    postRapport({ sectionKey: s?.key ?? "", questionIdx: q, recording: "idle", recSeq: recSeq.current, ...nextFlags });
   };
 
   const armRecording = () => {
+    if (interactionBlocked) return;
+    if (recStatus !== "allowed" && recStatus !== "unrated") {
+      toast(recStatus === "denied" ? "该受试者档案明确不允许录音" : "录音资格尚未确认，请稍候或重试", "warn");
+      return;
+    }
     recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
+    lastArmedKey.current = `关系建立·${section?.key ?? ""}`;
     setRecState("armed");
-    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "armed", recSeq: recSeq.current, containsDirectIdentifier: isSelfIntro });
+    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "armed", recSeq: recSeq.current, ...rapportFlags });
   };
   const stopRecording = () => {
     setRecState("idle");
-    watchdog.start();
-    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "idle", recSeq: recSeq.current, containsDirectIdentifier: isSelfIntro });
+    armWatchdog(lastArmedKey.current ?? `关系建立·${section?.key ?? ""}`);
+    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
   };
 
   async function recordProxyNaming() {
     // 关系建立周"代说物品名"属允许(无警告),仅记介入。在途锁防双击写重复记录。
-    if (proxyBusy) return;
+    if (proxyBusy || interactionBlocked) return;
     setProxyBusy(true);
     try {
       await api.recordAbnormal(session.session_id, { intervention_type: "代说物品名", note: "关系建立周·允许" });
@@ -89,53 +230,103 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
     finally { setProxyBusy(false); }
   }
 
-  return (
-    <div className="col" style={{ maxWidth: 720 }}>
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <h2>关系建立 · 第 1 周</h2>
-        {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
-        <Button onClick={() => { if (recState !== "idle") stopRecording(); onWrapup(); }}>场次收尾 →</Button>
-      </div>
-      <p className="muted">驱动固定话术分节推进老人端;本屏无判分、不采集评分。画像仅落老人端本地。</p>
+  async function pauseRapport() {
+    if (pausePending || paused) return;
+    setPausePending(true);
+    if (recState !== "idle") armWatchdog(lastArmedKey.current);
+    if (section?.key) {
+      // 同机 bus 先收麦，不让患者端等待 pause HTTP 往返。
+      postRapport({ sectionKey: section.key, questionIdx: qIdx, recording: "idle",
+                    recSeq: recSeq.current, ...rapportFlags });
+    }
+    setRecState("idle");
+    try {
+      // 先排空已入队的 live 写再发 pause,否则 pause 先落地会把排队中的收麦
+      // rapport 写 409 掉,控制条锁死在"重新同步"循环(与训练屏同根)。
+      await flushLiveWrites();
+      const next = await runtimeControl.pause();
+      if (next) toast("关系建立已暂停，患者端麦克风保持关闭", "ok");
+    } finally {
+      setPausePending(false);
+    }
+  }
 
-      <div className="card col">
-        <div className="row" style={{ justifyContent: "space-between" }}>
-          <StatusPill tone="primary">节 {sectionIdx + 1}/{script.sections.length} · {section?.key}</StatusPill>
-          <StatusPill tone={section?.speaker === "机器人" ? "ok" : "muted"}>{section?.speaker === "机器人" ? "小语朗读" : "研究者当面话术(老人端不朗读)"}</StatusPill>
+  async function resumeRapport() {
+    const next = await runtimeControl.resume();
+    if (next) toast("已恢复到暂停前的对话位置", "ok");
+  }
+
+  return (
+    <div className="page-shell page-shell--medium">
+      <header className="page-header-block">
+        <div>
+          <p className="page-kicker">步骤 3 / 4 · 第 1 周</p>
+          <h2 className="page-title">关系建立</h2>
+          <p className="page-description">按固定脚本与受试者进行轻松对话。本流程不判分，研究者只控制话术推进与合规录音。</p>
+        </div>
+        {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
+        <Button disabled={interactionBlocked} onClick={() => { if (recState !== "idle") stopRecording(); onWrapup(); }}>进入场次收尾</Button>
+      </header>
+
+      <SessionControlBar paused={paused} loading={recoveryPending} busy={runtimeControl.busy || pausePending}
+        recoveredLabel={recoveredLabel} error={recoveryError} onRetry={retryRecovery}
+        onPause={() => void pauseRapport()} onResume={() => void resumeRapport()} />
+
+      <section className={`form-section rapport-console-card${interactionBlocked ? " session-paused-surface" : ""}`}>
+        <div className="form-section-header">
+          <div>
+            <p className="page-kicker">当前对话段落</p>
+            <h3>{section?.key}</h3>
+          </div>
+          <div className="row wrap">
+            <StatusPill tone="primary">第 {sectionIdx + 1} / {script.sections.length} 节</StatusPill>
+            <StatusPill tone={section?.speaker === "机器人" ? "ok" : "muted"}>{section?.speaker === "机器人" ? "受试者端朗读" : "研究者当面说"}</StatusPill>
+          </div>
         </div>
         {section?.note && <p className="muted">{section.note}</p>}
-        {section?.line && <p>{section.line}</p>}
+        {section?.line && <div className="rapport-script-line">{section.line}</div>}
         {questions.length > 0 && (
           <>
-            <ul>
+            <ol className="rapport-question-list">
               {questions.map((q, i) => (
-                <li key={i} style={i === qIdx ? { fontWeight: 700 } : { opacity: 0.6 }}>
-                  {q.ask}{q.success ? ` →(答后)${q.success}` : ""}
+                <li key={i} className={i === qIdx ? "is-active" : ""}>
+                  <strong>{q.ask}</strong>
+                  {q.success && <span>回答后说：{q.success}</span>}
                 </li>
               ))}
-            </ul>
-            <div className="row">
-              <Button disabled={qIdx === 0} onClick={() => go(sectionIdx, qIdx - 1)}>← 上一问</Button>
-              <Button disabled={qIdx >= questions.length - 1} onClick={() => go(sectionIdx, qIdx + 1)}>下一问 →</Button>
-              <span className="muted">问 {qIdx + 1}/{questions.length}</span>
+            </ol>
+            <div className="toolbar rapport-question-actions">
+              <div className="row"><Button disabled={interactionBlocked || qIdx === 0} onClick={() => go(sectionIdx, qIdx - 1)}>上一问</Button><Button disabled={interactionBlocked || qIdx >= questions.length - 1} onClick={() => go(sectionIdx, qIdx + 1)}>下一问</Button></div>
+              <span className="muted">第 {qIdx + 1} / {questions.length} 问</span>
             </div>
           </>
         )}
-        {isSelfIntro && <p className="muted">本节为自我介绍:录音将标"含直接标识",导出时整段红线。</p>}
+        {isSelfIntro && <Alert tone="warn" title="本段录音可能包含直接身份信息">如启动录音，整段会被标记为含直接标识，并在导出时进入受控处理。</Alert>}
 
-        <div className="row wrap">
-          {recState === "idle"
-            ? <Button variant="primary" onClick={armRecording}>示意老人录音{isSelfIntro ? "(含标识)" : ""}</Button>
-            : <Button variant="danger" onClick={stopRecording}>停止录音</Button>}
-          {recState !== "idle" && <StatusPill tone="danger">录音中…</StatusPill>}
-          <Button onClick={recordProxyNaming} disabled={proxyBusy}>{proxyBusy ? "记录中…" : "记录:代说物品名(允许)"}</Button>
+        {recStatus === "denied" && (
+          <Alert tone="danger" title="本场录音已禁用">受试者档案明确拒绝录音。本次关系建立只能进行现场对话和听记。</Alert>
+        )}
+        {recStatus === "loading" && <StatusPill tone="muted">正在核对录音资格…</StatusPill>}
+        {recStatus === "error" && (
+          <Alert tone="danger" title="无法确认录音资格" actions={<Button onClick={() => setRecRetry((n) => n + 1)}>重新核对</Button>}>系统已保持麦克风关闭。</Alert>
+        )}
+
+        <div className="recording-panel">
+          {paused && <StatusPill tone="warn">场次暂停中，患者端麦克风保持关闭</StatusPill>}
+          {recoveryPending && <StatusPill tone="muted">正在恢复已保存记录</StatusPill>}
+          {recoveryError && <StatusPill tone="danger">等待重新同步场次</StatusPill>}
+          {!interactionBlocked && (recStatus === "allowed" || recStatus === "unrated") && (recState === "idle"
+            ? <Button variant="primary" onClick={armRecording}>开始受试者端录音{isSelfIntro ? "（含标识）" : ""}</Button>
+            : <Button variant="danger" onClick={stopRecording}>停止受试者端录音</Button>)}
+          {recState !== "idle" && <StatusPill tone="danger">正在等待受试者端保存</StatusPill>}
+          <Button onClick={recordProxyNaming} disabled={interactionBlocked || proxyBusy}>{proxyBusy ? "正在记录…" : "记录研究者代说物品名"}</Button>
         </div>
-      </div>
+      </section>
 
-      <div className="row">
-        <Button disabled={sectionIdx === 0} onClick={() => go(sectionIdx - 1, 0)}>← 上一节</Button>
-        <Button variant="primary" disabled={sectionIdx >= script.sections.length - 1}
-          onClick={() => go(sectionIdx + 1, 0)}>下一节 →</Button>
+      <div className="form-actions rapport-section-actions">
+        <Button disabled={interactionBlocked || sectionIdx === 0} onClick={() => go(sectionIdx - 1, 0)}>上一节</Button>
+        <Button variant="primary" disabled={interactionBlocked || sectionIdx >= script.sections.length - 1}
+          onClick={() => go(sectionIdx + 1, 0)}>下一节</Button>
       </div>
     </div>
   );

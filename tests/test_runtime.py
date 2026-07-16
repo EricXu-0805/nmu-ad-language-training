@@ -1,3 +1,5 @@
+import pytest
+
 from app.content import CONTENT_DIR, load_item_bank
 from app.runtime import DOUBLE_ROLES, PlanCursor, build_session_plan
 
@@ -20,8 +22,15 @@ def test_week2_expands_single_and_double_turns():
     assert all(len(it.turns) == 5 for it in doubles)
     # 双要素5环节 = 固定角色序，含关系识别在末
     assert tuple(t.response_role for t in doubles[0].turns) == DOUBLE_ROLES
+    assert doubles[0].display["left_function_cue"]
+    assert doubles[0].display["right_function_cue"]
     # 20单 + 10双×5 = 70 环节
     assert plan.total_turns() == 20 + 10 * 5
+
+
+def test_unstructured_weeks_fail_closed_instead_of_reusing_week2():
+    with pytest.raises(ValueError, match="第3周材料尚未结构化"):
+        build_session_plan(_bank(), week_no=3, event_line="正式训练")
 
 
 def test_cursor_walks_every_turn_in_order():

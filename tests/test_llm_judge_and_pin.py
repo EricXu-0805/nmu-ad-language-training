@@ -55,7 +55,10 @@ def test_llm_engine_used_when_enabled(client, monkeypatch):
     assert j["ai_judge_mode"] == "LLM辅助" and j["ai_answer_type"] == "部分正确"
     assert j["ai_score"] == 0.5 and j["ai_needs_review"] is True
     # LLM 只产初评——锁定分仍须人工,且锁后 ai-judge 409(与规则后端同一约束)
-    client.patch(f"/turns/{tid}/lock", json={"reviewer_id": "R1", "element_value": 1})
+    client.patch(f"/turns/{tid}/confirm", json={"confirmed_response_text": "锚"})
+    locked = client.patch(f"/turns/{tid}/lock",
+                          json={"reviewer_id": "R1", "element_value": 1, "prompt_level": 0})
+    assert locked.status_code == 200
     assert client.post(f"/turns/{tid}/ai-judge").status_code == 409
 
 
@@ -78,15 +81,42 @@ def test_prompt_is_portrait_free_by_construction():
 # ---------------- 操作端 PIN 门 ----------------
 def test_pin_gate_blocks_writes_allows_reads(client, monkeypatch):
     monkeypatch.setenv("CONSOLE_PIN", "246810")
-    # 读不拦(老人端轮询无需先输 PIN)
+    pin = {"X-Console-Pin": "246810"}
+    # 老人端所需的最小读口不拦
     assert client.get("/health").status_code == 200
     assert client.get("/live/state").status_code == 200
+    assert client.get("/live/console-state").status_code == 401
+    assert client.get("/live/console-state", headers=pin).status_code == 200
     # 写没带 PIN → 401;带对 → 放行;带错 → 401
     assert client.post("/patients", json={"patient_id": "PP"}).status_code == 401
     assert client.post("/patients", json={"patient_id": "PP"},
-                       headers={"X-Console-Pin": "246810"}).status_code == 200
+                       headers=pin).status_code == 200
     assert client.put("/live/state", json={"kind": "cursor", "payload": {}},
                       headers={"X-Console-Pin": "000000"}).status_code == 401
+    # 含敏感研究数据的 GET 同样须 PIN；plan 保留给老人端。
+    assert client.get("/patients/PP").status_code == 401
+    assert client.get("/patients/PP", headers=pin).status_code == 200
+    sess = {"session_id": "SPIN", "patient_id": "PP", "week_no": 2,
+            "phase_type": "正式训练", "event_line": "正式训练",
+            "item_bank_version_id": "wk2-v1-20260707"}
+    assert client.post("/sessions", json=sess, headers=pin).status_code == 200
+    assert client.get("/sessions/SPIN/plan").status_code == 200
+    handshake = client.put("/live/state", json={"kind": "session", "payload": {
+        "sessionId": "SPIN", "weekNo": 2, "mode": "task",
+    }}, headers=pin)
+    assert handshake.status_code == 200
+    heartbeat = {"session_id": "SPIN", "screen": "waiting",
+                 "cursor_wseq": handshake.json()["wseq"]}
+    assert client.post("/live/patient-heartbeat", json=heartbeat).status_code == 401
+    assert client.post("/live/patient-heartbeat", json=heartbeat, headers=pin).status_code == 200
+    for path in ("/sessions/SPIN", "/sessions/SPIN/scores", "/sessions/SPIN/journal",
+                 "/patients/PP/sessions", "/patients/PP/scales"):
+        assert client.get(path).status_code == 401
+    assert client.post("/audio", json={"raw_audio_id": "apin", "session_id": "SPIN"},
+                       headers=pin).status_code == 200
+    assert client.put("/audio/apin/blob", content=b"voice", headers=pin).status_code == 200
+    assert client.get("/audio/apin").status_code == 401
+    assert client.get("/audio/apin/blob").status_code == 401
 
 
 def test_no_pin_configured_means_open(client, monkeypatch):

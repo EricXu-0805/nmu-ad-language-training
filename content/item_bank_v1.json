@@ -1,7 +1,11 @@
 {
  "item_bank_version_id": "wk2-v1-20260707",
- "source": "第二周训练内容.docx（逐字抽取；第2–8周据会议决策重复同一批题，绑本版本号）",
- "note": "本文件由解析器从源脚本抽取，供内容组核对补全（acceptable_expressions/image_id/难度/探针集标识等）。raw_source 见 _wk2parsed.json；上线前须双人校对并冻结版本。 image_id 已于 2026-07-11 回填:图源=同一源 docx 内嵌插图(image1–30 与题目一一对应),经 32-agent 视检(内容吻合/图上无文字/双要素左右方位与 left_word,right_word 一致)。",
+ "content_schema_version": "1.1",
+ "training_week_no": 2,
+ "supported_training_weeks": [2],
+ "qc_status": "draft",
+ "source": "20260629/第二周训练内容.docx（逐字抽取，仅代表第2周；第3–8周各有独立且部分复现的训练材料）",
+ "note": "本文件由解析器从第2周源脚本抽取，供内容组核对补全（acceptable_expressions/image_id/难度/探针集标识等）。上线前须完成临床内容双人校对并将 qc_status 冻结；当前不得作为第3–8周题库复用。image_id 已于 2026-07-11 回填：图源为同一 DOCX 内嵌插图（30个单/双要素题图）；两张多要素场景图因图中文字泄题尚未纳入。",
  "errata_fixed": [
   {
    "item": "斧子+树",

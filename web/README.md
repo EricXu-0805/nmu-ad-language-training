@@ -1,32 +1,53 @@
-# React + TypeScript + Vite
+# platform/web
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+南医大语言沟通训练系统的双端 React 前端：
 
-Currently, two official plugins are available:
+- `/console`：研究员/护理员操作端；
+- `/patient`：老人端，仅显示大图、固定话术与录音控件，不显示 ASR/AI 判定。
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+双端运行时由服务端保存当前场次的任务/关系建立游标和暂停状态，命令序号也只由服务端签发。老人端每 5 秒发送不含研究内容的最小心跳；研究者端从受 PIN 保护的独立快照读取在线状态、当前屏幕和录音回报。暂停或断线会关闭老人端麦克风和朗读，继续或重连不会自动重新开麦。
 
-## React Compiler
+当前仅用于本地开发和模拟预演。第 2 周题库仍为 `draft`，第 3–8 周尚未结构化接入，多要素题尚未接入；在项目根目录“真实预演绿灯清单”全部通过前，不得采集真实受试者数据。
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 本地开发
 
-## Expanding the Oxlint configuration
+先在 `platform/` 启动后端：
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+./scripts/serve.sh
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+需要前端热更新时另开终端：
+
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+Vite 会把 API 请求代理到本机后端。医院内网双设备模式请从 `platform/` 使用 `INTRANET=1 ./scripts/serve.sh`，不要单独暴露 Vite 开发服务器。
+
+## 提交前验证
+
+```bash
+npm run lint
+npm run build
+```
+
+构建产物写入 `web/dist/`，由 FastAPI 同源托管。运行期不依赖 Node.js。
+
+## 数据与隐私边界
+
+- 所有请求使用相对路径，禁止加入云 ASR、云 TTS、外部字体、CDN 或遥测。
+- 浏览器 IndexedDB/localStorage 只作设备侧暂存或缓存，不能作为研究事件的唯一事实源。
+- 录音必须收到服务端字节上传成功回执后，才可标记“已保存”并推进环节。
+- `recording_allowed=false` 时任何端都不得启动录音。
+- 原始声纹不是“去标识数据”，必须与分析表分开治理。
+- 不要清空 `platform/data/`、浏览器录音暂存或现有数据库来“修复”问题。
+
+## 常见问题
+
+- 麦克风不可用：单机使用 `localhost`；平板通过内网使用 HTTPS，并先信任本机自签证书。
+- 两端不同步：先看研究者端的老人端在线状态、当前屏幕和最后心跳，再确认场次编号与 PIN；不要重复创建题目/环节。
+- 刷新或换设备后续做：以后端 runtime 与 journal 恢复结果为准；系统只恢复已提交记录与安全游标，不自动恢复录音。若服务端没有对应题目/环节，先停止，不要凭浏览器缓存补造研究记录。
+- API 返回题库未冻结或周次不支持：这是安全门，不要在前端绕过。

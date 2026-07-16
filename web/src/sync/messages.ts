@@ -3,17 +3,17 @@
 
 export type RecState = "idle" | "armed" | "recording" | "stopped";
 export type CueLevel = 0 | 1 | 2 | 3;
-export type PatientScreen = "idle" | "present" | "record" | "thanks" | "done";
+export type PatientScreen = "idle" | "present" | "record" | "thanks" | "paused" | "done";
 
 // wseq:写者(操作端)单调写序号。老人端双源(bus 秒推 + 轮询快照)竞态时,
 // 凭它丢弃迟到的旧快照,防止画面被顶回上一题/上一级线索(对认知障碍老人是最糟的跳变)。
 export type SyncMsg =
-  | { type: "session"; sessionId: string; weekNo: number; eventLine: string; mode: "task" | "rapport"; itemBankVersionId: string; wseq?: number }
+  | { type: "session"; sessionId: string; weekNo: number; eventLine: string; mode: "task" | "rapport"; itemBankVersionId: string; paused?: boolean; wseq?: number }
   // recSeq:每次 arm 递增。armed→armed 重发(老人自停后再示意)靠它触发老人端 effect;无它则依赖值不变、麦克风永不重开。
   // selfStart:操作端按录音资格(recording_allowed)判定后下发——老人端只有收到 true 才显示
   // "点这里,开始回答"自助开录按钮。缺省/false 一律不显示(fail-closed:合规闸门不被老人端绕过)。
-  | { type: "cursor"; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; selfStart?: boolean; wseq?: number }
-  | { type: "rapportStep"; sectionKey: string; questionIdx: number; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; wseq?: number }
+  | { type: "cursor"; sessionId: string; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; selfStart?: boolean; wseq?: number }
+  | { type: "rapportStep"; sessionId: string; sectionKey: string; questionIdx: number; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; paused?: boolean; wseq?: number }
   // sessionId:操作端凭它丢弃跨场次的迟到/残留回报(live state 里 audioSaved 存到下次握手才清)。
   | { type: "audioSaved"; rawAudioId: string; durationSeconds: number; turnKey: string; sessionId?: string; containsDirectIdentifier?: boolean }
   // 老人端麦克风真值上报(自助开录时操作端唯一的感知渠道;也用于示意录音的开麦确认)。

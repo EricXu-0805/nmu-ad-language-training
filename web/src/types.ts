@@ -45,6 +45,42 @@ export interface Session {
   item_bank_version_id: string;
 }
 
+export interface SessionRuntimeCursor {
+  sessionId?: string;
+  itemIdx: number;
+  turnIdx: number;
+  screen?: string;
+  cueLevel?: number;
+  recording?: string;
+  responseRole?: string;
+  recSeq?: number;
+  selfStart?: boolean;
+  wseq?: number;
+}
+
+export interface SessionRuntimeRapportStep {
+  sessionId?: string;
+  sectionKey: string;
+  questionIdx: number;
+  recording?: string;
+  recSeq?: number;
+  paused?: boolean;
+  assentGate?: boolean;
+  containsDirectIdentifier?: boolean;
+  wseq?: number;
+}
+
+export interface SessionRuntimeState {
+  sessionId: string;
+  status: "active" | "paused";
+  revision: number;
+  cursor: SessionRuntimeCursor | null;
+  rapportStep: SessionRuntimeRapportStep | null;
+  pausedAt?: string | null;
+  resumedAt?: string | null;
+  updatedAt?: string | null;
+}
+
 // GET /sessions/{sid}/plan
 export interface PlanTurn {
   turn_seq: number;
@@ -66,6 +102,44 @@ export interface SessionPlan {
   total_items: number;
   total_turns: number;
   items: PlanItem[];
+}
+
+// 老人端在场确认：只上报场次、当前屏幕和已看到的操作端写序号，
+// 不携带题目文本、回答内容或任何画像字段。服务端时间才是在线真值。
+export type PatientPresenceScreen =
+  | "waiting" | "loading" | "rapport" | "present" | "record"
+  | "thanks" | "paused" | "complete" | "error";
+
+export interface PatientHeartbeatRequest {
+  session_id: string;
+  screen: PatientPresenceScreen;
+  cursor_wseq?: number;
+  client_ts?: string;
+}
+
+export interface PatientPresence {
+  session_id: string | null;
+  screen: PatientPresenceScreen | null;
+  last_seen_at: string | null;
+  online: boolean;
+  cursor_wseq?: number | null;
+}
+
+export interface PatientHeartbeatResponse {
+  ok: boolean;
+  server_time: string;
+  patientPresence: PatientPresence;
+}
+
+// 老后端没有 patientPresence；保持可选即可让新版前端继续读取旧响应。
+export interface LiveStateResponse {
+  seq: number;
+  session: unknown;
+  cursor: unknown;
+  rapportStep: unknown;
+  audioSaved: unknown;
+  patientRec: unknown;
+  patientPresence?: PatientPresence | null;
 }
 
 export interface ItemEvent {
@@ -118,6 +192,8 @@ export interface AbnormalEvent {
 
 export interface AudioAsset {
   raw_audio_id: string;
+  // 新版 journal 可直接携带采集时的稳定 turn key；旧版后端缺省。
+  turn_key?: string | null;
   session_id?: string | null;
   audio_format: string;
   status: AudioStatus;
@@ -169,6 +245,12 @@ export const SCALE_PHASES: PhaseType[] = ["前测", "后测", "随访"];
 // GET /content/item-bank
 export interface ItemBankInfo {
   version_id: string;
+  qc_status?: "draft" | "reviewed" | "frozen" | string;
+  ready_for_research?: boolean;
+  multi_count?: number;
+  // 新后端会显式声明已完成结构化、可用于开发运行的正式训练周；是否可入组另看质控状态。
+  // 老后端缺此字段时，前端仅兼容既有第 2 周能力，绝不猜测 3–8 周可用。
+  supported_training_weeks?: number[];
   single_count: number;
   double_count: number;
   errata_fixed: { item: string; corrected_to: string }[];
