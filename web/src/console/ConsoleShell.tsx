@@ -34,6 +34,7 @@ export function ConsoleShell() {
   const [abnormalOpen, setAbnormalOpen] = useState(false);
   const [scaleOpen, setScaleOpen] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState<ConsoleArea | null>(null);
+  const [confirmTrainPid, setConfirmTrainPid] = useState<string | null>(null);
   const [currentItemEventId, setCurrentItemEventId] = useState<number | null>(null);
   const auth = useConsoleAuth();
   const runPatientId = state.session?.patient_id ?? state.patientId ?? null;
@@ -117,6 +118,16 @@ export function ConsoleShell() {
     else dispatch({ t: "setArea", area });
   };
 
+  // 准备区一键开训(建档直通/表内既有人)。注意不能用 inLiveSession 判残留场次——
+  // 它要求 area==="run",而人在准备区时恰恰不满足;真正的判据是 state.session 还被持有。
+  // 同一受试者=回到进行中的场次(放下重建会造出同人同周平行双场次,割裂数据);
+  // 不同受试者才走「放下当前场次」确认。
+  const startTrainingFor = (pid: string) => {
+    if (state.session?.patient_id === pid) dispatch({ t: "setArea", area: "run" });
+    else if (state.session) setConfirmTrainPid(pid);
+    else dispatch({ t: "runPickSubject", patientId: pid });
+  };
+
   // 账号登录门(公网部署):检查中先占位,未登录挡在登录页——工作台整棵树不挂载,
   // 任何研究数据请求都发不出去(比逐接口 401 更早、更彻底)。
   if (auth.mode === "loading") {
@@ -164,7 +175,7 @@ export function ConsoleShell() {
         )}
 
         <main>
-          {state.area === "prep" && <SubjectRegistryScreen />}
+          {state.area === "prep" && <SubjectRegistryScreen onStartTraining={startTrainingFor} />}
           {state.area === "analyze" && <AnalysisScreen />}
           {state.area === "run" && state.screen === "picker" && (
             <RunPickerScreen
@@ -198,6 +209,17 @@ export function ConsoleShell() {
         confirmLabel="仍在本机打开"
         onConfirm={openPatientView}
         onCancel={() => setConfirmPatientView(false)} />
+
+      <ConfirmDialog open={confirmTrainPid !== null}
+        title="放下当前场次，为新受试者开训？"
+        body="手头还有一个未收尾的场次。开训会先放下它(已保存到服务器的数据不丢，训练台「继续未完成」可随时恢复)，再进入新受试者的场次设置。"
+        confirmLabel="放下并开训"
+        onConfirm={() => {
+          const pid = confirmTrainPid!;
+          setConfirmTrainPid(null);
+          dispatch({ t: "runPickSubject", patientId: pid });
+        }}
+        onCancel={() => setConfirmTrainPid(null)} />
 
       <ConfirmDialog open={confirmLeave !== null}
         title={confirmLeave === "run" ? "结束当前训练？" : "离开正在进行的训练？"}

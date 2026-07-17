@@ -132,23 +132,46 @@ qwen-plus；如切龙媛还需 cosyvoice-v2——`cosyvoice-v3-plus` 需单独�
 
 ## 8. 备份(重要——真机数据无第二份就没有回滚)
 
-所有数据在 `appdata` 卷（SQLite `app.db` + 录音 + TTS 缓存）。定期备份：
+**当前 89.208.253.119 裸机部署已配好全自动两级备份(2026-07-17 起):**
+
+- **VPS 端**:systemd `nmu-backup.timer` 每日 03:30(上海)调 `scripts/vps-backup-daily.sh`
+  → 复用 `scripts/backup.sh` 做 SQLite 在线快照 + 录音副本 + sha256 清单,另附
+  `config/`(.env、Caddyfile、systemd 单元——整机重建照单恢复),落
+  `/opt/nmu/backups/daily/<时间戳>/`,只留最近 14 份,磁盘 <200MB 时拒绝写入。
+  **运维真相看 `/opt/nmu/backups/backup.log` 审计行**,不要只看 systemd 状态。
+- **异地副本**:Eric Mac 端 launchd `com.nmu.vps-backup-pull`(每日 12:30,睡过点醒来补跑)
+  调 `scripts/vps-backup-pull.sh` rsync 拉回 `platform/data/vps-backups/`(gitignore 内),
+  深历史由 Time Machine 接管。患者数据只在自有机器间流动,不经第三方云。
+- 恢复:挑一份快照 `sha256sum -c MANIFEST.sha256` 校验通过后,停服 → 覆盖
+  `data/app.db` / `data/audio/` → 起服(自动 alembic 迁移)。
+
+Docker 形态部署时的等价手动命令:
 
 ```bash
-# 冷备(停一下最稳,SQLite 一致)；或用 sqlite3 .backup 热备
 docker compose exec app sh -c 'sqlite3 /app/data/app.db ".backup /app/data/backup-$(date +%F).db"'
 docker compose cp app:/app/data/backup-"$(date +%F)".db ./backup-"$(date +%F)".db
-# 录音目录一并拉走
 docker compose cp app:/app/data/audio ./audio-backup-"$(date +%F)"
 ```
-
-建议挂个 cron 每日备份并异地留存一份。恢复：把备份文件放回卷、`docker compose restart app`。
 
 ## 9. 升级 / 改配置
 
 ```bash
 git pull
 docker compose up -d --build     # 自动跑 alembic 迁移(只向前),不动既有数据
+```
+
+**裸机部署(当前 89.208.253.119)的代码同步命令——必须带这几个 exclude:**
+
+```bash
+# 本机构建前端后同步。--delete 会清掉服务器上不在本地的文件,
+# 所以 .env / data / venv 必须显式排除——⚠️ 2026-07-17 曾因漏排 .env 把服务器上的
+# 环境文件(含密钥)删掉,服务靠内存中的旧环境苟活,一重启就会起不来。
+cd platform && (cd web && npm run build)
+rsync -a --delete \
+  --exclude=.venv --exclude=node_modules --exclude=.git \
+  --exclude=data --exclude=.env --exclude='web/node_modules' \
+  ./ root@89.208.253.119:/opt/nmu/app/
+# 纯前端改动无需重启(静态文件每请求即读);后端改动才 systemctl restart nmu
 ```
 
 ## 10. 数据库选型

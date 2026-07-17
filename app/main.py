@@ -282,8 +282,13 @@ def list_patient_sessions(patient_id: str, s: DBSession = Depends(get_session)):
 def create_session(sess: TrainSession, s: DBSession = Depends(get_session)):
     if s.get(TrainSession, sess.session_id):
         raise HTTPException(409, f"session_id {sess.session_id} 已存在(可取回续做)")
-    if not s.get(Patient, sess.patient_id):
+    patient = s.get(Patient, sess.patient_id)
+    if not patient:
         raise HTTPException(404, "患者不存在，先建档")
+    # 撤回门禁收口在服务端:任何非空撤回状态(withdrawal_requested/isolated/withdrawn)一律禁建,
+    # 前端按钮 disabled 只是提示层——绕过路径(建档 409 直通、API 直调)都在这里被拦。
+    if patient.withdrawal_status:
+        raise HTTPException(403, f"受试者撤回状态为 {patient.withdrawal_status}，不可建立新场次")
     if not sess.item_bank_version_id:
         raise HTTPException(422, "场次须绑题库版本号 item_bank_version_id")
     if not 1 <= sess.week_no <= 8:

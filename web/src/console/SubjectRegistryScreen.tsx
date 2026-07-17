@@ -9,7 +9,10 @@ import { ScaleDrawer } from "./ScaleDrawer";
 
 // 准备区:测试前由审核员把受试者编号/认知障碍程度/同意/录音授权登记好,并可提前录量表。
 // 训练台只从这张登记表选人,不再现场建档——把"老人在旁边等着填表"这一步挪到测试前。
-export function SubjectRegistryScreen() {
+// onStartTraining:从这里一键跳训练台为某受试者开训(新建档后直通,或表内既有人直开)。
+export function SubjectRegistryScreen({ onStartTraining }: {
+  onStartTraining?: (patientId: string) => void;
+}) {
   const [rows, setRows] = useState<PatientSummary[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
@@ -27,8 +30,9 @@ export function SubjectRegistryScreen() {
       <div className="page-shell page-shell--medium">
         <PatientIntakeScreen context="registry" onReady={() => {
           setMode("list"); setNonce((n) => n + 1);
-        }} />
-        <div className="form-actions"><Button onClick={() => setMode("list")}>返回登记表</Button></div>
+        }} onTrain={onStartTraining} />
+        {/* 返回也刷新列表:走「保存并直接开训」后被确认弹窗取消/409 拦下时,档案可能已建成 */}
+        <div className="form-actions"><Button onClick={() => { setMode("list"); setNonce((n) => n + 1); }}>返回登记表</Button></div>
       </div>
     );
   }
@@ -66,7 +70,14 @@ export function SubjectRegistryScreen() {
               <span role="cell">{triLabel(r.mandarin_eligible)}</span>
               <span role="cell">{recordingLabel(r.recording_allowed)}</span>
               <span role="cell">{r.session_count}{r.last_training_date ? ` · 最近 ${r.last_training_date}` : ""}</span>
-              <span role="cell"><Button onClick={() => setScaleFor(r.patient_id)}>录量表</Button></span>
+              <span role="cell" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <Button onClick={() => setScaleFor(r.patient_id)}>录量表</Button>
+                {onStartTraining && (
+                  <Button variant="primary" disabled={r.withdrawal_status === "withdrawn"}
+                    title={r.withdrawal_status === "withdrawn" ? "已撤回,不可开训" : undefined}
+                    onClick={() => onStartTraining(r.patient_id)}>开训</Button>
+                )}
+              </span>
             </div>
           ))}
         </div>

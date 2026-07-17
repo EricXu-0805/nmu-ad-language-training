@@ -53,6 +53,19 @@ def test_session_needs_patient_and_version(client):
     assert client.post("/sessions", json=bad_version).status_code == 409
 
 
+def test_session_blocked_for_withdrawn_patient(client):
+    # 撤回门禁收口在服务端:前端按钮 disabled 只是提示层,409 建档直通/API 直调都必须被拦
+    client.post("/patients", json={"patient_id": "PW", "withdrawal_status": "withdrawn"})
+    sess = {"session_id": "SW", "patient_id": "PW", "week_no": 2,
+            "phase_type": "正式训练", "event_line": "正式训练", "item_bank_version_id": "wk2-v1-20260707"}
+    r = client.post("/sessions", json=sess)
+    assert r.status_code == 403 and "撤回" in r.json()["detail"]
+    # 任何非空撤回状态(不只 withdrawn)一律 fail-closed
+    client.post("/patients", json={"patient_id": "PW2", "withdrawal_status": "withdrawal_requested"})
+    r2 = client.post("/sessions", json={**sess, "session_id": "SW2", "patient_id": "PW2"})
+    assert r2.status_code == 403
+
+
 def test_item_bank_endpoint(client):
     d = client.get("/content/item-bank").json()
     assert d["single_count"] == 20 and d["double_count"] == 10
