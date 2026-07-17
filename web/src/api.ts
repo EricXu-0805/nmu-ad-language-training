@@ -99,6 +99,10 @@ export const api = {
   confirmTurn: (turnId: number, confirmed_response_text: string) =>
     req<TurnEvent>("PATCH", `/turns/${turnId}/confirm`, { confirmed_response_text }),
   aiJudgeTurn: (turnId: number) => req<TurnEvent>("POST", `/turns/${turnId}/ai-judge`),
+  // 自动驾驶逐轮判类:只读,不建 turn、不写库、永不锁分
+  judgeClassify: (item_id: string, response_role: string, text: string | null) =>
+    req<{ answer_type: string | null; ai_score: number | null; needs_review: boolean; judge_mode: string; contains_target: boolean }>(
+      "POST", "/judge/classify", { item_id, response_role, text }, 30_000),
   lockTurn: (turnId: number, body: { reviewer_id: string; element_value: number; reviewed_score?: number | null; prompt_level?: number | null }) =>
     req<TurnEvent>("PATCH", `/turns/${turnId}/lock`, body),
 

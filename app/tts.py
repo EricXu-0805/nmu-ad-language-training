@@ -226,16 +226,18 @@ def cloud_text_allowed(text: str) -> bool:
     """红线守卫:白名单加载失败/文本不在集合 → False(fail-closed,云端一个字都不发)。"""
     global _allow_cache
     from . import content
-    bank_path = content.CONTENT_DIR / "item_bank_v1.json"
-    wk_path = content.CONTENT_DIR / "week1_script.json"
+    paths = [content.CONTENT_DIR / "item_bank_v1.json",
+             content.CONTENT_DIR / "week1_script.json",
+             content.CONTENT_DIR / "autopilot_protocol_v1.json"]
     try:
         with _allow_lock:
-            b, w = bank_path.stat(), wk_path.stat()
-            key = (b.st_mtime_ns, b.st_size, w.st_mtime_ns, w.st_size)
+            stats = [p.stat() for p in paths]
+            key = tuple(x for st in stats for x in (st.st_mtime_ns, st.st_size))
             if _allow_cache is None or _allow_cache[0] != key:
-                bank = content.load_item_bank(bank_path)
-                wk = json.loads(wk_path.read_text(encoding="utf-8"))
-                _allow_cache = (key, content.tts_allowlist(bank, wk))
+                bank = content.load_item_bank(paths[0])
+                wk = json.loads(paths[1].read_text(encoding="utf-8"))
+                proto = json.loads(paths[2].read_text(encoding="utf-8"))
+                _allow_cache = (key, content.tts_allowlist(bank, wk, proto))
             return text.strip() in _allow_cache[1]
     except Exception:
         return False

@@ -387,7 +387,8 @@ class PatientHeartbeatIn(BaseModel):
 
 
 class RuntimeCursorIn(BaseModel):
-    """受 PIN 保护的正式训练游标写入契约，不接受内容文本或回答。"""
+    """受 PIN 保护的正式训练游标写入契约，不接受内容文本或回答。
+    自动驾驶反馈同样不载文本:fbKey 只指向题库/协议里的固定话术,老人端本地查表回填。"""
     model_config = ConfigDict(extra="forbid")
 
     screen: Literal["idle", "present", "record", "thanks", "done"]
@@ -399,6 +400,10 @@ class RuntimeCursorIn(BaseModel):
     recSeq: int | None = PydanticField(default=None, ge=0)
     rawAudioId: str | None = PydanticField(default=None, max_length=160)
     selfStart: bool | None = None
+    fbKey: Literal["self", "cued1_unknown", "cued1_close", "cued1_silence",
+                   "cued2", "namefix_l", "namefix_r"] | None = None
+    fbItemId: str | None = PydanticField(default=None, max_length=160)
+    fbSeq: int | None = PydanticField(default=None, ge=0)
     wseq: int | None = PydanticField(default=None, ge=0)
     sessionId: str | None = PydanticField(default=None, min_length=1, max_length=128)
     session_id: str | None = PydanticField(default=None, min_length=1, max_length=128)
@@ -511,7 +516,8 @@ _PUBLIC_LIVE_FIELDS = {
     "session": {"sessionId", "weekNo", "eventLine", "mode", "itemBankVersionId",
                 "paused", "wseq"},
     "cursor": {"sessionId", "screen", "itemIdx", "turnIdx", "responseRole",
-               "cueLevel", "recording", "recSeq", "selfStart", "wseq"},
+               "cueLevel", "recording", "recSeq", "selfStart",
+               "fbKey", "fbItemId", "fbSeq", "wseq"},
     "rapportStep": {"sessionId", "sectionKey", "questionIdx", "recording", "recSeq",
                     "assentGate", "containsDirectIdentifier", "paused", "wseq"},
 }
@@ -1277,6 +1283,50 @@ def _load_turn(turn_id: int, s: DBSession) -> TurnEvent:
     if not t:
         raise HTTPException(404, "环节不存在")
     return t
+
+
+class ClassifyIn(BaseModel):
+    """自动驾驶逐轮判类输入:题号+环节角色+该轮 ASR 文本,无画像、无患者字段。"""
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str = PydanticField(min_length=1, max_length=160)
+    response_role: str = PydanticField(default="命名", max_length=64)
+    text: str | None = PydanticField(default=None, max_length=2000)
+
+
+@app.post("/judge/classify")
+def judge_classify(body: ClassifyIn):
+    """自动驾驶逐轮判类(只读):同一环节可听多轮,每轮判一次;**不建 turn、不写库、永不锁分**。
+    turn 行只在环节了结时由操作端建一次(带最后一轮音频/转写/prompt_level);
+    中间轮音频已按 turnKey 落库,中间轮转写文本 v1 暂不入库(分析可离线重转写)。"""
+    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    found = _task_type_for_bank_item(bank, body.item_id)
+    if not found:
+        raise HTTPException(404, f"题库无此题:{body.item_id}")
+    task_type, bi = found
+    target = _role_target(bi, body.response_role or "命名")
+    if not target:
+        # 作用/关系/关键要素:无确定式判分口径,自动驾驶按"能答即继续"处理,对错人工事后
+        return {"answer_type": None, "ai_score": None, "needs_review": True,
+                "judge_mode": "无确定式口径", "contains_target": False}
+    # 是否说全了目标词(自动驾驶据此区分:"是胡萝卜"含目标词=说对了→表扬;
+    # "萝卜"只是目标词子串→部分正确、不含全词→按不准确升级提示)。含可接受表达也算说对。
+    text = body.text or ""
+    contains = target in text or any(a and a in text for a in (bi.get("acceptable_expressions") or []))
+    ji = judging.build_judge_input(                       # 过画像守卫(混入画像→PortraitLeakError)
+        item_id=body.item_id, task_type=task_type, target_word=target,
+        acceptable_expressions=tuple(bi.get("acceptable_expressions", []) or []),
+        upper_terms=tuple(bi.get("upper_terms", []) or []),
+        dialect_synonyms=tuple(bi.get("dialect_synonyms", []) or []),
+        asr_text=body.text)
+    lj = llm_judge.get_engine().judge(ji)
+    if lj is not None:
+        return {"answer_type": lj.answer_type.value, "ai_score": lj.ai_score,
+                "needs_review": lj.ai_needs_review, "judge_mode": "LLM辅助", "contains_target": contains}
+    res = rule_judge.judge_rule_based(ji)
+    return {"answer_type": res.answer_type.value if res.answer_type else res.interaction_state,
+            "ai_score": res.ai_score, "needs_review": res.ai_needs_review,
+            "judge_mode": "规则确定式", "contains_target": contains}
 
 
 class ConfirmIn(BaseModel):

@@ -24,7 +24,8 @@ from app import content, tts  # noqa: E402
 def collect_lines() -> list[str]:
     bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
-    return sorted(content.tts_allowlist(bank, script))
+    proto = content.load_autopilot_protocol(content.CONTENT_DIR / "autopilot_protocol_v1.json")
+    return sorted(content.tts_allowlist(bank, script, proto))
 
 
 def _billing_chars(text: str) -> int:

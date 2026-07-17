@@ -5,7 +5,7 @@ import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { EnumSelect, Field, TextInput } from "../../components/Field";
 import { StatusPill } from "../../components/StatusPill";
 import { useToast } from "../../components/ToastContext";
-import { assertVersionsMatch, findDouble, findSingle, lookupCue, useItemBankBundle } from "../../content/bundle";
+import { assertVersionsMatch, findDouble, findSingle, lookupCue, resolveFeedbackLine, useAutopilotProtocol, useItemBankBundle, type FbKey } from "../../content/bundle";
 import { isBoundJournalTurnKey, useSessionJournal } from "../../hooks/useSessionJournal";
 import { useSessionRuntime } from "../../hooks/useSessionRuntime";
 import { flushLiveWrites, useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
@@ -45,6 +45,27 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
   const [autoAdvance, setAutoAdvance] = useState(() => {
     try { return localStorage.getItem("nmu:console:autoAdvance") !== "0"; } catch { return true; }
   });
+  // 自动驾驶:AI 听→判→固定话术反馈→提示升级→推进;人工随时可关(接管)。默认关。
+  const [autoPilot, setAutoPilot] = useState(() => {
+    try { return localStorage.getItem("nmu:console:autopilot") === "1"; } catch { return false; }
+  });
+  const toggleAutoPilot = () => setAutoPilot((v) => {
+    const n = !v;
+    try { localStorage.setItem("nmu:console:autopilot", n ? "1" : "0"); } catch { /* 私隐模式等 */ }
+    return n;
+  });
+  const autoPilotRef = useRef(autoPilot);
+  autoPilotRef.current = autoPilot;
+  const { protocol } = useAutopilotProtocol();
+  const apTimers = useRef<{ arm?: ReturnType<typeof setTimeout>; answer?: ReturnType<typeof setTimeout>; act?: ReturnType<typeof setTimeout> }>({});
+  const apCue1Path = useRef<"unknown" | "close" | "silence" | null>(null); // 第1次提示的进入路径(成功反馈按来路选变体,文档口径)
+  const apBusy = useRef(false);
+  const apLastRound = useRef<{ rawAudioId: string; duration: number; asrText: string | null } | null>(null);
+  // 本轮是否仍在等回答:arm 后置真,收到本轮 audioSaved 或答窗到点即置假。
+  // ★没有 VAD——"麦克风开了"(patientMicOn)不等于"老人在说话",故绝不用它当作答信号;
+  // 用它做去重闸:自动收麦后迟到的旧录音回报(apAwaitingAnswer 已假)不再驱动状态机。
+  const apAwaitingAnswer = useRef(false);
+  const fbSeqCounter = useRef(0);
   const toggleAutoAdvance = () => setAutoAdvance((v) => {
     const n = !v;
     try { localStorage.setItem("nmu:console:autoAdvance", n ? "1" : "0"); } catch { /* 私隐模式等 */ }
@@ -246,6 +267,8 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     setCueLevel(restoredCue);
     setCursor(itemIdx, turnIdx);
     onItemEventChange?.(journal.itemEvents[item.item_id]?.itemEventId ?? null);
+    // 自动驾驶的反馈不在此下发:它是"上一题图片还在屏上"时先读的独立一拍(apAdvance beat-1),
+    // 推进到新题的这条游标绝不带 fbKey——否则老人看着新图听到上一题的"这就是胡萝卜"。
     postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel: restoredCue, recording: "idle", recSeq: recSeq.current,
                  selfStart: selfStart && !(jt?.locked ?? false) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -302,6 +325,11 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     }
     setRecState("idle");
     toast(`老人端录音已保存(${m.durationSeconds.toFixed(1)}s)`, "info");
+    // 自动驾驶接管:转写→判类→分支(反馈/提示升级/推进)全自动,人工只看卡住
+    if (autoPilot) {
+      if (!interactionBlocked) void runAutoPilotOnAudio(m);
+      return;
+    }
     // 自动推进:只认"当前环节"的首次回报;老人端由此获得"点开始→说→我说好了→下一题"
     // 的自走闭环,转写/锁分可事后回访补。研究者手上有在途操作/未保存的转写或确认改动时
     // 不跳——advance 会按 journal 重置工作卡,未存的字会被冲掉。
@@ -488,6 +516,195 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
     finally { setLocking(false); }
   }
 
+  // ---------------- 自动驾驶状态机(文档协议:四分支→两级提示→告知答案,永不卡题) ----------------
+  // 分工:处理器(收音回报/沉默)只判类和改状态;所有定时(开麦/沉默/终局播报后推进)统一由
+  // 下面的 [turnK, cueLevel] 效应安排——避免"改状态的定时器被状态变化触发的 cleanup 清掉"。
+  // AI 只判类驱动流程,永不锁分;反馈话术全部指向题库/协议固定文案(fbKey 查表,不产文本)。
+  const apActive = autoPilot && !interactionBlocked && !!item && !!planTurn
+    && (recStatus === "allowed" || recStatus === "unrated");
+  const clearApTimers = () => {
+    for (const k of ["arm", "answer", "act"] as const) {
+      const t = apTimers.current[k];
+      if (t) clearTimeout(t);
+      apTimers.current[k] = undefined;
+    }
+  };
+  // 朗读时长估计:无老人端"读完"回执,按字数估(云端语速 0.9)+固定余量;宁可多等不早开麦
+  // (早开麦会把小语自己的声音录进去)。答窗宽限也用它:反馈/线索长句要多给作答时间。
+  const speakMs = (t: string | null | undefined) => (t ? 2500 + t.length * 260 : 0);
+
+  // 收麦并把老人端 idle 写回真值(armed/stopped 残留会自动重开麦/锁死自助按钮)。
+  function apDisarm() {
+    apAwaitingAnswer.current = false;
+    setRecState("idle");
+    if (planTurn) {
+      postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role,
+                   cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: selfStartOut });
+    }
+  }
+
+  // 环节了结:建正式 turn(最后一轮音频/转写冻结;confirmed 留人工事后),持久化 AI 初评,推进
+  async function apResolve(fbKey: FbKey | null, promptLevel: number) {
+    if (!item || !planTurn) return;
+    const opK = turnK;
+    try {
+      const ieid = await ensureItemEvent();
+      if (ieid == null || turnKRef.current !== opK) return;
+      const round = apLastRound.current;
+      const te = await api.createTurn(ieid, {
+        turn_seq: planTurn.turn_seq, response_role: planTurn.response_role,
+        asr_text: round?.asrText ?? null, raw_audio_id: round?.rawAudioId ?? null,
+        duration_seconds: round?.duration ?? null, prompt_level: promptLevel,
+      });
+      upsertTurn(item.item_id, planTurn.turn_seq, { turnId: te.id, responseRole: planTurn.response_role,
+        asrSaved: true, asrText: round?.asrText ?? "", cueLevel: promptLevel as 0 | 1 | 2 | 3 });
+      void api.aiJudgeTurn(te.id).catch(() => undefined);   // 初评持久化失败不阻推进(人工可回访重跑)
+      if (turnKRef.current !== opK) return;
+      setWork((w) => ({ ...w, turnId: te.id, asrText: round?.asrText ?? "", savedAsr: true }));
+      apAdvance(fbKey);
+    } catch (e) {
+      toast(`自动驾驶建档失败,请人工接管本环节:${e instanceof ApiError ? e.detail : String(e)}`, "danger");
+    }
+  }
+
+  // 推进两拍:beat-1 反馈话术在"当前题图片还在屏上"时先读(引用的是本题目标词,如"这就是胡萝卜");
+  // 待反馈读完 beat-2 才换到下一题——否则老人看着新图听到上一题的答案。无反馈则直接推进。
+  function apAdvance(fbKey: FbKey | null) {
+    if (!plan || !item || !planTurn || interactionBlocked) return;
+    clearApTimers();
+    apLastRound.current = null;
+    const atEnd = turnIdx + 1 >= item.turns.length && itemIdx + 1 >= plan.items.length;
+    const step = () => {
+      if (atEnd) {
+        postCursor({ screen: "thanks", itemIdx, turnIdx, responseRole: planTurn.response_role,
+                     cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
+        toast("最后一题完成,老人端已转入结束画面;可前往场次收尾", "ok");
+      } else {
+        advance();
+      }
+    };
+    if (fbKey) {
+      const line = resolveFeedbackLine(bundle, protocol, fbKey, item.item_id);
+      postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role,
+                   cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false,
+                   fbKey, fbItemId: item.item_id, fbSeq: ++fbSeqCounter.current });
+      apTimers.current.act = setTimeout(step, speakMs(line) + 600);
+    } else {
+      step();
+    }
+  }
+
+  // 提示升级:单条 idle 游标原子下发(不走 apDisarm+sendCue 两次 post——后者读到未提交的
+  // 陈旧 recState='armed',会让老人端在读线索时误显"正在准备麦克风")。arm 由效应随后重排。
+  function apEscalate(path: "unknown" | "close" | "silence") {
+    apAwaitingAnswer.current = false;
+    setRecState("idle");
+    if (cueLevel === 0) apCue1Path.current = path;
+    const next = Math.min(3, cueLevel + 1) as 1 | 2 | 3;
+    setCueLevel(next);
+    recordCueLevel(turnK, next);
+    if (planTurn) {
+      postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role,
+                   cueLevel: next, recording: "idle", recSeq: recSeq.current, selfStart: selfStartOut });
+    }
+  }
+
+  // 答窗到点:老人在作答窗内没点"我说好了"(痴呆人群常见:困惑/不理解按钮)。没有 VAD,
+  // 只能按"作答窗超时=沉默"处理——先物理收麦(绝不留热麦),再按文档沉默分支走。
+  function apOnSilence() {
+    if (!apActive || !item || !planTurn) return;
+    apAwaitingAnswer.current = false;
+    apDisarm();                                            // 收回老人端麦克风(热麦红线)
+    if (item.task_type === "单要素") { apEscalate("silence"); return; }
+    // 双要素:文档未定义沉默——v1 按"不能回答"处理(已在协议 notes 报备待课题组拍板)
+    if (planTurn.response_role.includes("命名")) {
+      void apResolve(planTurn.response_role.startsWith("左") ? "namefix_l" : "namefix_r", cueLevel);
+    } else if (cueLevel < 1) {
+      apEscalate("silence");   // 作用/关系:给功能/关系讲解;读完推进由效应终局分支接管
+    } else {
+      void apResolve(null, cueLevel);
+    }
+  }
+
+  // 收音回报 → 转写 → 判类 → 分支(成功反馈按进入路径选变体;失败升级;终局推进)
+  async function runAutoPilotOnAudio(m: { rawAudioId: string; durationSeconds: number }) {
+    // apAwaitingAnswer 闸:只处理"正在等的这一轮"回报;自动收麦后迟到的旧录音回报一律忽略
+    // (它 turnKey 仍等于当前环节,靠 turnKRef 挡不住,只能靠这个每轮独占标记)。
+    if (!apAwaitingAnswer.current || apBusy.current || !item || !planTurn) return;
+    apAwaitingAnswer.current = false;
+    clearApTimers();
+    apBusy.current = true;
+    const opK = turnK;
+    try {
+      const tr = await api.asrTranscribe(m.rawAudioId);
+      if (turnKRef.current !== opK || !autoPilotRef.current) return;
+      if (tr.degraded || tr.asr_text == null) {
+        toast(`ASR 引擎不可用(${tr.engine_version}),自动驾驶让位:请人工转写/推进本环节`, "warn");
+        return;
+      }
+      apLastRound.current = { rawAudioId: m.rawAudioId, duration: m.durationSeconds, asrText: tr.asr_text };
+      if (cueLevel >= 3) { void apResolve(null, 3); return; }   // 告知答案后不再判类,总是推进
+      const cls = await api.judgeClassify(item.item_id, planTurn.response_role, tr.asr_text);
+      if (turnKRef.current !== opK || !autoPilotRef.current) return;
+      setWork((w) => ({ ...w, asrText: w.savedAsr ? w.asrText : (tr.asr_text ?? ""),
+        ai: { answerType: cls.answer_type, score: cls.ai_score, needsReview: cls.needs_review } }));
+      // 成功=判"正确",或回答里包含了完整目标词(含目标词=说对了,如"是胡萝卜";
+      // 而"萝卜"这种目标词的子串只判"部分正确"、contains_target 为假 → 按不准确升级提示)。
+      const ok = cls.answer_type === "正确" || cls.contains_target === true;
+      if (item.task_type === "单要素") {
+        if (ok) {
+          void apResolve(cueLevel === 0 ? "self"
+            : cueLevel === 1 ? (`cued1_${apCue1Path.current ?? "close"}` as FbKey) : "cued2", cueLevel);
+        } else {
+          apEscalate(cls.answer_type === "上位词或相关词" || cls.answer_type === "部分正确" ? "close" : "unknown");
+        }
+      } else if (planTurn.response_role.includes("命名")) {
+        // 双要素命名:答错一次性纠正("这个我们刚刚见过,它叫X。"),不升级,直接下一环节
+        void apResolve(ok ? null : planTurn.response_role.startsWith("左") ? "namefix_l" : "namefix_r", cueLevel);
+      } else {
+        void apResolve(null, cueLevel);   // 作用/关系:开放式,能答即继续(文档口径),对错人工事后
+      }
+    } catch (e) {
+      toast(`自动驾驶处理失败,请人工接管本环节:${e instanceof ApiError ? e.detail : String(e)}`, "danger");
+    } finally {
+      apBusy.current = false;
+    }
+  }
+
+  // 唯一的定时安排点:换环节/线索升级时,算好"读完再动"的等待
+  useEffect(() => {
+    if (!apActive || !item || !planTurn) return;
+    if (work.locked || journal.turns[turnK]?.asrSaved) return;   // 已办环节(含回访)不自动化
+    const role = planTurn.response_role;
+    const isDoubleAux = item.task_type === "双要素" && !role.includes("命名");
+    if (cueLevel >= 3 || (isDoubleAux && cueLevel >= 1)) {
+      // 终局播报(告知答案/双要素讲解):读完即建档推进,不再收音
+      const text = lookupCue(bundle, item.item_id, item.task_type, role, cueLevel);
+      apTimers.current.act = setTimeout(() => { void apResolve(null, cueLevel); }, speakMs(text) + 800);
+      return clearApTimers;
+    }
+    const qText = role.includes("作用") ? "它是做什么用的呢？" : role === "关系识别" ? "它们之间有什么关系呢？" : "请看这张图片，这是什么？";
+    const cueText = cueLevel > 0 ? lookupCue(bundle, item.item_id, item.task_type, role, cueLevel) : null;
+    const spoken = cueLevel > 0 ? cueText : qText;
+    apTimers.current.arm = setTimeout(() => {
+      armRecording();
+      apAwaitingAnswer.current = true;
+      // 作答窗=文档沉默阈值(默认10s)+宽限;到点没等到"我说好了"即按沉默处理(收麦+升级)。
+      // ★不随 patientMicOn 撤销——没有 VAD,"麦克风开着"不代表老人在说话;这条计时是唯一
+      // 能在活麦沉默场景停麦、推进状态机的机制(真机麦克风验收的关键)。
+      apTimers.current.answer = setTimeout(apOnSilence, ((protocol?.silence_seconds ?? 10) + 5) * 1000);
+    }, speakMs(spoken));
+    return clearApTimers;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turnK, cueLevel, apActive, work.locked]);
+
+  // 换环节复位来路;关自动驾驶清干净(人工接管即刻生效)
+  useEffect(() => { apCue1Path.current = null; }, [turnK]);
+  useEffect(() => {
+    if (!autoPilot) { clearApTimers(); apAwaitingAnswer.current = false; apLastRound.current = null; }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPilot]);
+
   async function pauseTraining() {
     if (pausePending || paused) return;
     setPausePending(true);
@@ -556,6 +773,11 @@ export function TrainingConsoleScreen({ session, onWrapup, onExit, onItemEventCh
             <input type="checkbox" checked={autoAdvance} disabled={interactionBlocked} onChange={toggleAutoAdvance} />
             <span>收音后自动推进</span>
           </label>
+          <label className="toggle-field" title="AI 全自动:自动开麦收音→云转写→判类→固定话术反馈→提示逐级升级→推进;随时可关(人工接管)。需已配云语音 Key">
+            <input type="checkbox" checked={autoPilot} disabled={interactionBlocked} onChange={toggleAutoPilot} />
+            <span>自动驾驶</span>
+          </label>
+          {autoPilot && <StatusPill tone="primary">自动驾驶中 · AI 判类仅驱动流程,锁分仍需人工</StatusPill>}
         </div>
 
         {item && planTurn && (

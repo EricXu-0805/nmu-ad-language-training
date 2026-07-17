@@ -8,7 +8,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const src = resolve(here, "../../content");
 const dst = resolve(here, "../public/content");
 mkdirSync(dst, { recursive: true });
-for (const f of ["item_bank_v1.json", "week1_script.json"]) {
+for (const f of ["item_bank_v1.json", "week1_script.json", "autopilot_protocol_v1.json"]) {
   cpSync(resolve(src, f), resolve(dst, f));
   console.log(`synced ${f}`);
 }

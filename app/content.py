@@ -55,6 +55,35 @@ def load_week1_script(path: str | Path) -> dict:
     return data
 
 
+def load_autopilot_protocol(path: str | Path) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not data.get("protocol_version_id"):
+        raise ValueError("自动驾驶协议缺少 protocol_version_id")
+    return data
+
+
+def validate_autopilot_protocol(p: dict) -> list[str]:
+    """协议话术完整性闸:缺任何一条固定反馈,自动驾驶就会在该分支哑掉(留空不兜底)。"""
+    issues: list[str] = []
+    if p.get("silence_seconds") != 10:
+        issues.append("沉默阈值应为 10 秒(与源文档口径一致;改动须课题组拍板)")
+    naming = p.get("naming") or {}
+    cue1 = naming.get("success_after_cue1") or {}
+    for k in ("unknown", "close", "silence"):
+        if not cue1.get(k):
+            issues.append(f"缺 naming.success_after_cue1.{k}")
+    if not naming.get("success_after_cue2"):
+        issues.append("缺 naming.success_after_cue2")
+    for k in ("namefix_left", "namefix_right"):
+        if not (p.get("double") or {}).get(k):
+            issues.append(f"缺 double.{k}")
+    for key, tpl in (("close", cue1.get("close")), ("silence", cue1.get("silence")),
+                     ("cue2", naming.get("success_after_cue2"))):
+        if tpl and "【物品名】" not in tpl:
+            issues.append(f"success_after_cue1.{key} 模板缺【物品名】槽位")
+    return issues
+
+
 def validate_item_bank(bank: ItemBank) -> dict[str, list[str]]:
     """两档校验，冻结前的自动校对闸：
       errors   = 缺陷/勘误（目标词↔告知话术↔标题 对不上、重复 id）——冻结前必须清零；
@@ -194,11 +223,13 @@ def _expand_slots(line: str, zodiac: list[str]):
             yield line.replace(_ZODIAC_SLOT, z)
 
 
-def tts_allowlist(bank: ItemBank, week1_script: dict | None = None) -> frozenset[str]:
+def tts_allowlist(bank: ItemBank, week1_script: dict | None = None,
+                  autopilot_protocol: dict | None = None) -> frozenset[str]:
     """云 TTS 允许合成的全部文本（闭集）。
 
     红线：发往云端的文本只能来自题库/脚本/固定 UI 话术，永不携带患者字段。
     不在此集合的文本，云引擎一律拒合成（fail-closed，落回本地引擎/系统语音）。
+    自动驾驶协议的【物品名】模板用题库词表（闭集）展开成具体句。
     """
     lines: set[str] = set(FIXED_TTS_LINES)
     for it in bank.single_element:
@@ -232,6 +263,23 @@ def tts_allowlist(bank: ItemBank, week1_script: dict | None = None) -> frozenset
             t = (slot or {}).get("fallback_line")
             if t:
                 lines.add(t)
+    if autopilot_protocol:
+        words = [it.get("target_word") for it in bank.single_element]
+        words += [it.get(k) for it in bank.double_element for k in ("left_word", "right_word")]
+        words = [w for w in words if w]
+        naming = autopilot_protocol.get("naming") or {}
+        cue1 = naming.get("success_after_cue1") or {}
+        templates = [cue1.get("unknown"), cue1.get("close"), cue1.get("silence"),
+                     naming.get("success_after_cue2"),
+                     (autopilot_protocol.get("double") or {}).get("namefix_left"),
+                     (autopilot_protocol.get("double") or {}).get("namefix_right")]
+        for tpl in templates:
+            if not tpl:
+                continue
+            if "【物品名】" in tpl:
+                lines.update(tpl.replace("【物品名】", w) for w in words)
+            else:
+                lines.add(tpl)
     return frozenset(s.strip() for s in lines if s and s.strip())
 
 

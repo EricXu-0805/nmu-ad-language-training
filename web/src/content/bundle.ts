@@ -64,8 +64,23 @@ function assertWeek1Shape(s: Week1Script): Week1Script {
   return s;
 }
 
+// 自动驾驶协议(通用固定话术,逐字来自源文档;【物品名】槽位由题库目标词回填)
+export interface AutopilotProtocol {
+  protocol_version_id: string;
+  silence_seconds: number;
+  naming: {
+    success_after_cue1: { unknown: string; close: string; silence: string };
+    success_after_cue2: string;
+  };
+  double: { namefix_left: string; namefix_right: string };
+}
+export type FbKey =
+  | "self" | "cued1_unknown" | "cued1_close" | "cued1_silence"
+  | "cued2" | "namefix_l" | "namefix_r";
+
 let bankCache: ItemBankBundle | null = null;
 let scriptCache: Week1Script | null = null;
+let protocolCache: AutopilotProtocol | null = null;
 
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
@@ -97,10 +112,43 @@ export function useWeek1Script(): { script: Week1Script | null; error: string | 
   return { script, error };
 }
 
+export function useAutopilotProtocol(): { protocol: AutopilotProtocol | null; error: string | null } {
+  const [protocol, setProtocol] = useState<AutopilotProtocol | null>(protocolCache);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (protocolCache) return;
+    fetchJson<AutopilotProtocol>("/content/autopilot_protocol_v1.json")
+      .then((p) => { protocolCache = p; setProtocol(p); })
+      .catch((e) => setError(String(e)));
+  }, []);
+  return { protocol, error };
+}
+
 export const findSingle = (b: ItemBankBundle, itemId: string): BankSingleItem | undefined =>
   b.single_element.find((x) => x.item_id === itemId);
 export const findDouble = (b: ItemBankBundle, itemId: string): BankDoubleItem | undefined =>
   b.double_element.find((x) => x.item_id === itemId);
+
+// 自动驾驶反馈话术查表(纯,两端共用):fbKey→协议模板/题库 success_line,
+// 【物品名】只用题库目标词回填;任何缺字段返回 null——留空,绝不拼接兜底(单一内容源)。
+export function resolveFeedbackLine(bundle: ItemBankBundle | null, protocol: AutopilotProtocol | null,
+                                    fbKey: string, fbItemId: string): string | null {
+  if (!bundle || !protocol) return null;
+  const fill = (tpl: string | undefined, word: string | undefined): string | null =>
+    tpl && word ? tpl.replaceAll("【物品名】", word) : null;
+  const single = () => findSingle(bundle, fbItemId);
+  const double = () => findDouble(bundle, fbItemId);
+  switch (fbKey) {
+    case "self": return single()?.success_line ?? null;
+    case "cued1_unknown": return protocol.naming?.success_after_cue1?.unknown ?? null;
+    case "cued1_close": return fill(protocol.naming?.success_after_cue1?.close, single()?.target_word);
+    case "cued1_silence": return fill(protocol.naming?.success_after_cue1?.silence, single()?.target_word);
+    case "cued2": return fill(protocol.naming?.success_after_cue2, single()?.target_word);
+    case "namefix_l": return fill(protocol.double?.namefix_left, double()?.left_word);
+    case "namefix_r": return fill(protocol.double?.namefix_right, double()?.right_word);
+    default: return null;
+  }
+}
 
 // 线索查表(纯,两端共用):单要素 1→cues1 / 2→cues2 / 3→tell_answer;
 // 双要素 作用→left/right_function_cue、关系→relation_cue(等级≥1 即显,双要素无多级)。

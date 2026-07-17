@@ -12,7 +12,8 @@ export type SyncMsg =
   // recSeq:每次 arm 递增。armed→armed 重发(老人自停后再示意)靠它触发老人端 effect;无它则依赖值不变、麦克风永不重开。
   // selfStart:操作端按录音资格(recording_allowed)判定后下发——老人端只有收到 true 才显示
   // "点这里,开始回答"自助开录按钮。缺省/false 一律不显示(fail-closed:合规闸门不被老人端绕过)。
-  | { type: "cursor"; sessionId: string; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; selfStart?: boolean; wseq?: number }
+  // fbKey/fbItemId/fbSeq:自动驾驶反馈——不载文本,只指向题库/协议固定话术,老人端本地查表回填(fbSeq 变化才重读)。
+  | { type: "cursor"; sessionId: string; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; selfStart?: boolean; fbKey?: string; fbItemId?: string; fbSeq?: number; wseq?: number }
   | { type: "rapportStep"; sessionId: string; sectionKey: string; questionIdx: number; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; paused?: boolean; wseq?: number }
   // sessionId:操作端凭它丢弃跨场次的迟到/残留回报(live state 里 audioSaved 存到下次握手才清)。
   | { type: "audioSaved"; rawAudioId: string; durationSeconds: number; turnKey: string; sessionId?: string; containsDirectIdentifier?: boolean }

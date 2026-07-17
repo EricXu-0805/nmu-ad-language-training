@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { MicButton } from "../components/MicButton";
 import { ImagePane, type Spotlight } from "../components/ImagePane";
-import { lookupCue, useItemBankBundle } from "../content/bundle";
+import { lookupCue, resolveFeedbackLine, useAutopilotProtocol, useItemBankBundle } from "../content/bundle";
 import { turnKey } from "../lib/ids";
 import type { CursorMsg } from "../sync/messages";
 import type { SessionPlan } from "../types";
@@ -19,6 +19,7 @@ export function PatientStage({ plan, cursor, sessionId, connectionReady = true, 
   sessionPaused?: boolean;
 }) {
   const { bundle } = useItemBankBundle();
+  const { protocol } = useAutopilotProtocol();
 
   const item = plan && cursor ? plan.items[cursor.itemIdx] : undefined;
   const planTurn = item && cursor ? item.turns[cursor.turnIdx] : undefined;
@@ -35,6 +36,11 @@ export function PatientStage({ plan, cursor, sessionId, connectionReady = true, 
   const spotlight: Spotlight = role.startsWith("左") ? "left" : role.startsWith("右") ? "right" : role === "关系识别" ? "both" : "none";
   const question = role.includes("作用") ? "它是做什么用的呢？" : role === "关系识别" ? "它们之间有什么关系呢？" : "请看这张图片，这是什么？";
   const cueText = item ? lookupCue(bundle, item.item_id, item.task_type, role, cursor?.cueLevel ?? 0) : null;
+  // 自动驾驶反馈:游标只带键,文本本地查表(协议模板+题库目标词);缺内容返回 null,留空不兜底。
+  const fbLine = cursor?.fbKey && cursor.fbItemId
+    ? resolveFeedbackLine(bundle, protocol, cursor.fbKey, cursor.fbItemId)
+    : null;
+  const lastFbSeq = useRef<number | null>(null);   // null=未播种;挂载后首个 fbSeq 视为已消费,不重读
 
   // 小语开口:换环节读问句;线索到达/升级读线索(读的都是屏上原文)。
   // 线索用 enqueue:恢复/跳题时问句与线索同帧到达,排队读而不是让线索的 cancel 掐掉问句。
@@ -50,6 +56,17 @@ export function PatientStage({ plan, cursor, sessionId, connectionReady = true, 
     if (!suspended && cursor?.screen !== "thanks" && tk) speak(question, { tag: tk });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tk, question, resumeEpoch]);
+  // 自动驾驶反馈:独立一拍(位置还停在当前题、图片未换),fbSeq 变化才读。
+  // ★挂载时用首个 fbSeq 播种(不朗读)——刷新恢复出的旧反馈游标绝不重读(它属于已过去的一拍)。
+  useEffect(() => {
+    const seq = cursor?.fbSeq;
+    if (seq == null) return;
+    if (lastFbSeq.current === null) { lastFbSeq.current = seq; return; }  // 播种:视为已消费
+    if (seq === lastFbSeq.current) return;
+    lastFbSeq.current = seq;
+    if (!suspended && cursor?.screen !== "thanks" && fbLine) speak(fbLine, { tag: `fb:${cursor?.fbItemId ?? ""}:${seq}` });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cursor?.fbSeq]);
   useEffect(() => {
     if (!suspended && cursor?.screen !== "thanks" && cueText) speak(cueText, { tag: tk, enqueue: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
