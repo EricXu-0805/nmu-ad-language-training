@@ -1038,3 +1038,39 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   .session-control-bar > .button { width: 100%; }
   .session-presence { width: 100%; }
 }
+
+/* ===== 单机一条流:受试者画面叠层(操作端在下层继续驱动) ===== */
+.patient-embed-overlay {
+  position: fixed; inset: 0; z-index: calc(var(--z-critical) + 100);
+  background: var(--c-bg); overflow-y: auto;
+  display: flex; flex-direction: column;
+}
+.patient-exit-hold {
+  position: fixed; top: var(--sp-3); left: var(--sp-3);
+  z-index: calc(var(--z-critical) + 110);
+  padding: 8px 14px; border-radius: 999px; border: 1px solid var(--c-line);
+  background: var(--c-surface); color: var(--c-text-soft);
+  font-size: 13px; line-height: 1; cursor: pointer;
+  opacity: 0.3; transition: opacity 0.15s ease;
+  overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none;
+}
+.patient-exit-hold:hover, .patient-exit-hold:focus-visible { opacity: 0.85; }
+.patient-exit-hold.is-holding { opacity: 1; }
+.patient-exit-hold__bar {
+  position: absolute; left: 0; bottom: 0; height: 3px; width: 0;
+  background: var(--c-accent, #2563eb);
+}
+.patient-exit-hold.is-holding .patient-exit-hold__bar {
+  width: 100%; transition: width 2.5s linear;
+}
+/* 确认钮异位出现(顶部居中):按住的手指所在位置随手再点碰不到它 */
+.patient-exit-hold.is-armed {
+  left: 50%; transform: translateX(-50%);
+  opacity: 1; background: var(--c-accent, #2563eb); color: #fff;
+  border-color: transparent; font-weight: 600;
+}
+/* 叠层期间暂存提示的中性小点(不红不闪,只给研究者) */
+.patient-exit-hold__note {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-left: 6px; background: var(--c-accent, #2563eb); vertical-align: middle;
+}

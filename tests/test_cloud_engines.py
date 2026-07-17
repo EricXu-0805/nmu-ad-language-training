@@ -135,6 +135,7 @@ def test_cloud_text_allowed_fail_closed(monkeypatch):
 
 
 def test_bad_rate_env_never_crashes_chain(monkeypatch, tmp_path):
+    monkeypatch.setattr(tts, "CACHE_DIR", tmp_path / "tts-cache")  # 隔离:别打真预合成缓存
     monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
     monkeypatch.setenv("TTS_ENGINE", "auto")
     monkeypatch.setenv("TTS_CLOUD_RATE", "0,9")           # 配置坏值(逗号小数)

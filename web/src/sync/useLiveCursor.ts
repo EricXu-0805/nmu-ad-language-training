@@ -112,6 +112,16 @@ export function useLiveCursor(): LiveState {
       cursor: snap.cursor?.sessionId === snap.session?.sessionId ? snap.cursor?.wseq ?? 0 : 0,
       rapportStep: snap.rapportStep?.sessionId === snap.session?.sessionId ? snap.rapportStep?.wseq ?? 0 : 0,
     };
+    // 这份快照必须同步补发到 state:render→effect 间隙落进镜像的消息(单机叠层挂载时
+    // 常态出现)已被 applied 记账,若只记账不发布,后续同 wseq 重达会被 fresh() 判旧丢弃,
+    // 画面停在旧游标直到轮询兜底(约一个轮询周期)。
+    const sid0 = snap.session?.sessionId;
+    setState((prev) => ({
+      ...prev,
+      session: snap.session,
+      cursor: snap.cursor?.sessionId === sid0 ? snap.cursor : undefined,
+      rapportStep: snap.rapportStep?.sessionId === sid0 ? snap.rapportStep : undefined,
+    }));
 
     const unsub = bus.subscribe((msg: SyncMsg) => {
       // bus 只送内容,不当连接信号:BroadcastChannel 是浏览器层通道,后端进程死了它照样通,

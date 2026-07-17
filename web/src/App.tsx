@@ -1,7 +1,8 @@
-import { Component, useEffect, useState, type ReactNode } from "react";
+import { Component, useEffect, useRef, useState, type ReactNode } from "react";
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ConsoleShell } from "./console/ConsoleShell";
 import { PatientShell } from "./patient/PatientShell";
+import { CONSOLE_NOTE_EVENT, PATIENT_VIEW_EVENT, PATIENT_VIEW_EXIT_EVENT, PATIENT_VIEW_REC_EVENT } from "./sync/messages";
 
 // 两路由:/console 操作端 · /patient 老人端。零外链(硬约束3)。SPA fallback 由 main.py 提供,clean URL 可刷新。
 export default function App() {
@@ -10,7 +11,12 @@ export default function App() {
       <StaleBuildBanner />
       <Routes>
         <Route path="/" element={<Landing />} />
-        <Route path="/console" element={<Boundary variant="console"><ConsoleShell /></Boundary>} />
+        {/* 操作端与叠层宿主各自独立 Boundary:操作端崩溃时叠层不塌——受试者继续看平和画面,
+            绝不被突然切到红色报错屏;研究者经宿主的按住返回离开后才见错误页。 */}
+        <Route path="/console" element={<>
+          <Boundary variant="console"><ConsoleShell /></Boundary>
+          <Boundary variant="patient"><PatientViewHost /></Boundary>
+        </>} />
         <Route path="/patient" element={<Boundary variant="patient"><PatientShell /></Boundary>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
@@ -23,6 +29,10 @@ export default function App() {
 class Boundary extends Component<{ variant: "console" | "patient"; children: ReactNode }, { error: string | null }> {
   state = { error: null as string | null };
   static getDerivedStateFromError(e: unknown) { return { error: String(e) }; }
+  componentDidCatch() {
+    // 老人端崩溃时其卸载清理会删掉适老字号尺度,平和屏会缩成 16px 小字——补回来。
+    if (this.props.variant === "patient") document.documentElement.dataset.scale = "patient";
+  }
   render() {
     if (this.state.error === null) return this.props.children;
     if (this.props.variant === "patient") {
@@ -30,7 +40,8 @@ class Boundary extends Component<{ variant: "console" | "patient"; children: Rea
         <main className="patient-message-screen" aria-live="polite">
           <div className="target">请稍等一下</div>
           <p className="question muted">请研究者过来看一眼</p>
-          <button className="patient-primary-action" type="button" onClick={() => location.reload()}>
+          {/* 原地重试而非整页 reload:叠层场景下 reload 会把受试者载进研究者操作端。 */}
+          <button className="patient-primary-action" type="button" onClick={() => this.setState({ error: null })}>
             重新载入
           </button>
         </main>
@@ -62,6 +73,13 @@ class Boundary extends Component<{ variant: "console" | "patient"; children: Rea
 function StaleBuildBanner() {
   const { pathname } = useLocation();
   const [stale, setStale] = useState(false);
+  // 叠层打开时藏起来:横幅在 inert 包装之外,Tab+Enter 会整页 reload,销毁进行中的录音。
+  const [overlayOpen, setOverlayOpen] = useState(false);
+  useEffect(() => {
+    const onToggle = (e: Event) => setOverlayOpen((e as CustomEvent<{ open: boolean }>).detail?.open === true);
+    window.addEventListener(PATIENT_VIEW_EVENT, onToggle);
+    return () => window.removeEventListener(PATIENT_VIEW_EVENT, onToggle);
+  }, []);
   useEffect(() => {
     if (!import.meta.env.PROD) return;
     let stop = false;
@@ -76,10 +94,114 @@ function StaleBuildBanner() {
     const timer = setInterval(check, 30000);
     return () => { stop = true; clearInterval(timer); };
   }, []);
-  if (!pathname.startsWith("/console") || !stale) return null;
+  if (!pathname.startsWith("/console") || !stale || overlayOpen) return null;
   return (
     <button className="stale-build-banner" type="button" onClick={() => location.reload()}>
       界面已更新 · 点击刷新
+    </button>
+  );
+}
+
+// 单机一条流:受试者画面叠层宿主。挂在 /console 路由(与 ConsoleShell 并列),
+// ConsoleShell 保持挂载在下层继续写游标/跑自动驾驶;开关状态源在 ConsoleShell,
+// 经窗内事件到这——红线守卫禁止 console/** import 老人端源码,叠层只能在这层长出来。
+function PatientViewHost() {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const onToggle = (e: Event) => setOpen((e as CustomEvent<{ open: boolean }>).detail?.open === true);
+    window.addEventListener(PATIENT_VIEW_EVENT, onToggle);
+    return () => window.removeEventListener(PATIENT_VIEW_EVENT, onToggle);
+  }, []);
+  const exit = () => {
+    // 宿主本地也收拢:操作端若已崩溃(独立 Boundary 接管),退出事件没了接收者,
+    // 研究者必须仍能离开叠层去看错误页。
+    setOpen(false);
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => { /* 已不在全屏 */ });
+    window.dispatchEvent(new Event(PATIENT_VIEW_EXIT_EVENT));
+  };
+  if (!open) return null;
+  return (
+    <div className="patient-embed-overlay">
+      <Boundary variant="patient"><PatientShell /></Boundary>
+      <HoldToExit onExit={exit} />
+    </div>
+  );
+}
+
+// 研究者退出叠层:按住 2.5 秒 → 屏幕上方另一位置出现确认钮,4 秒内点它才真正返回。
+// 两步且异位:受试者"点了没反应就按住"够不成整套动作;多点触控/滑出均有护栏。
+function HoldToExit({ onExit }: { onExit: () => void }) {
+  const [holding, setHolding] = useState(false);
+  const [armed, setArmed] = useState(false);
+  const [recActive, setRecActive] = useState(false);
+  const [noteCount, setNoteCount] = useState(0);
+  const timer = useRef<number | null>(null);
+  const disarmTimer = useRef<number | null>(null);
+  const pointerId = useRef<number | null>(null);
+
+  useEffect(() => {
+    const onRec = (e: Event) => setRecActive((e as CustomEvent<{ active: boolean }>).detail?.active === true);
+    const onNote = (e: Event) => setNoteCount((e as CustomEvent<{ count: number }>).detail?.count ?? 0);
+    window.addEventListener(PATIENT_VIEW_REC_EVENT, onRec);
+    window.addEventListener(CONSOLE_NOTE_EVENT, onNote);
+    return () => {
+      window.removeEventListener(PATIENT_VIEW_REC_EVENT, onRec);
+      window.removeEventListener(CONSOLE_NOTE_EVENT, onNote);
+    };
+  }, []);
+  useEffect(() => () => {
+    if (timer.current !== null) clearTimeout(timer.current);
+    if (disarmTimer.current !== null) clearTimeout(disarmTimer.current);
+  }, []);
+
+  const start = (e: React.PointerEvent<HTMLButtonElement>) => {
+    // 只认主指针且不可重入:手掌/第二指的 pointerdown 若覆盖计时器,会留下孤儿计时器
+    // 在手抬起后照样触发退出——恰好击穿防误触门槛。
+    if (!e.isPrimary || timer.current !== null || armed) return;
+    pointerId.current = e.pointerId;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setHolding(true);
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      pointerId.current = null;
+      setHolding(false);
+      setArmed(true);
+      disarmTimer.current = window.setTimeout(() => { disarmTimer.current = null; setArmed(false); }, 4000);
+    }, 2500);
+  };
+  const cancel = (e: React.PointerEvent) => {
+    if (pointerId.current !== null && e.pointerId !== pointerId.current) return;
+    pointerId.current = null;
+    setHolding(false);
+    if (timer.current !== null) { clearTimeout(timer.current); timer.current = null; }
+  };
+  const move = (e: React.PointerEvent<HTMLButtonElement>) => {
+    // 触屏隐式 pointer capture 会吃掉 pointerleave:滑出按钮范围就地取消按住。
+    if (pointerId.current === null || e.pointerId !== pointerId.current) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) cancel(e);
+  };
+
+  if (armed) {
+    return (
+      <button type="button" className="patient-exit-hold is-armed" aria-label="确认返回操作端"
+        onClick={() => {
+          setArmed(false);
+          if (disarmTimer.current !== null) { clearTimeout(disarmTimer.current); disarmTimer.current = null; }
+          onExit();
+        }}>
+        点此返回操作端
+      </button>
+    );
+  }
+  return (
+    <button type="button" className={`patient-exit-hold${holding ? " is-holding" : ""}`}
+      aria-label={`研究者按住 2.5 秒后确认返回操作端${noteCount > 0 ? ";有待处理提示" : ""}`}
+      onPointerDown={start} onPointerUp={cancel} onPointerCancel={cancel} onPointerMove={move}
+      onContextMenu={(e) => e.preventDefault()}>
+      <span aria-hidden="true">{holding && recActive ? "录音中 · " : ""}研究者 · 按住返回</span>
+      {noteCount > 0 && <span className="patient-exit-hold__note" aria-hidden="true" />}
+      <span className="patient-exit-hold__bar" aria-hidden="true" />
     </button>
   );
 }
@@ -104,7 +226,8 @@ function Landing() {
         </Link>
       </div>
       <p className="landing-note">
-        同机双窗运行：操作端一窗，受试者端一窗；两端通过本地连接同步，全程离线。
+        一台设备即可完成全程：进入操作端建好场次，点「受试者画面」全屏切给受试者，研究者按住角落按钮返回。
+        也支持双窗/双设备同步运行。
       </p>
     </main>
   );

@@ -26,6 +26,9 @@ function readMirror<T>(key: string): T | undefined {
 class SessionBus {
   private ch: BroadcastChannel | null =
     typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(CHANNEL) : null;
+  // BroadcastChannel 不把消息回投给发出它的同一个实例,而单机一条流(受试者画面
+  // 与操作端同页叠层)靠这条总线双向即时送达 cursor/patientRec——故本页订阅者另行直投。
+  private local = new Set<(msg: SyncMsg) => void>();
 
   post(msg: SyncMsg): void {
     // 持久状态镜像到 localStorage(session/cursor/rapportStep);audioSaved 是瞬时事件不镜像。
@@ -33,13 +36,18 @@ class SessionBus {
     else if (msg.type === "cursor") localStorage.setItem(K_CURSOR, JSON.stringify(msg));
     else if (msg.type === "rapportStep") localStorage.setItem(K_RAPPORT, JSON.stringify(msg));
     this.ch?.postMessage(msg);
+    // 微任务投递:订阅方 setState 不在发送方调用栈里重入。
+    queueMicrotask(() => this.local.forEach((h) => h(msg)));
   }
 
   subscribe(handler: (msg: SyncMsg) => void): () => void {
-    if (!this.ch) return () => {};
+    this.local.add(handler);
     const listener = (e: MessageEvent) => handler(e.data as SyncMsg);
-    this.ch.addEventListener("message", listener);
-    return () => this.ch?.removeEventListener("message", listener);
+    this.ch?.addEventListener("message", listener);
+    return () => {
+      this.local.delete(handler);
+      this.ch?.removeEventListener("message", listener);
+    };
   }
 
   snapshot(): BusSnapshot {

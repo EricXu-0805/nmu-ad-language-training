@@ -1,4 +1,5 @@
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
+import { PATIENT_VIEW_EVENT, PATIENT_VIEW_EXIT_EVENT } from "../sync/messages";
 import { Button } from "../components/Button";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { PinPrompt } from "../components/PinPrompt";
@@ -17,6 +18,8 @@ import { SubjectRegistryScreen } from "./SubjectRegistryScreen";
 import { TrainingConsoleScreen } from "./scoring/TrainingConsoleScreen";
 import { useConsoleAuth } from "./useConsoleAuth";
 import { usePatientPresence, type PatientPresenceView } from "../sync/usePatientPresence";
+import { usePatientRec } from "../sync/useCursorWriter";
+import { PATIENT_VIEW_REC_EVENT } from "../sync/messages";
 
 // 操作端顶层外壳。设 data-scale=console;三区标签(准备/训练/分析)+ run 区 reducer 驱动
 // 选人→建/续场次→训练/关系建立→收尾。场次编号是后台概念,前端流程不呈现。
@@ -37,12 +40,73 @@ export function ConsoleShell() {
   const patientPresence = usePatientPresence(state.session?.session_id);
   const inLiveSession = state.area === "run" && !!state.session
     && (state.screen === "training" || state.screen === "relationship");
+  // 单机一条流:训练中把受试者画面全屏叠在操作端之上;操作端保持挂载,
+  // 游标写者/自动驾驶在底下继续驱动(它是唯一驾驶员,同窗跳路由会把它卸载)。
+  // 叠层本体挂在 App 路由层(红线守卫禁止 console/** import 老人端源码),
+  // 这里只持有开关状态,经 window 事件与宿主同步。
+  const [patientView, setPatientView] = useState(false);
+  const [confirmPatientView, setConfirmPatientView] = useState(false);
+  const patientRec = usePatientRec(state.session?.session_id ?? "");
+  // 本机叠层自己的心跳也会把在场打成 online;刚关掉自己的叠层又重进不该被当成"另一台设备"。
+  const overlayClosedAt = useRef(0);
 
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.scale = "console";
     return () => { if (root.dataset.scale === "console") delete root.dataset.scale; };
   }, []);
+  // 开关状态广播给 App 层宿主。不做卸载时兜底关闭:同路由内操作端只在崩溃(Boundary
+  // 接管)时卸载,那一刻恰恰要让叠层留着——受试者继续看平和画面,而不是红色报错屏。
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent(PATIENT_VIEW_EVENT, { detail: { open: patientView } }));
+  }, [patientView]);
+  // 场次结束/离开训练即收起叠层;叠层收起后把 PatientShell 清理掉的字号尺度接回来。
+  useEffect(() => { if (!inLiveSession && patientView) closePatientView(); }, [inLiveSession]); // eslint-disable-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => {
+    if (!patientView) document.documentElement.dataset.scale = "console";
+  }, [patientView]);
+  // 退出通道:仅宿主的「按住→确认」。不接 Escape——单键瞬时退出会绕过防误触门槛。
+  useEffect(() => {
+    if (!patientView) return;
+    const exit = () => closePatientView();
+    window.addEventListener(PATIENT_VIEW_EXIT_EVENT, exit);
+    return () => window.removeEventListener(PATIENT_VIEW_EXIT_EVENT, exit);
+  }, [patientView]); // eslint-disable-line react-hooks/exhaustive-deps
+  // 历史栈守卫:平板边缘回滑(popstate)不得一步退出训练直达落地页——压回哨兵原地不动。
+  useEffect(() => {
+    if (!patientView) return;
+    history.pushState({ nmuPatientView: true }, "");
+    const onPop = () => { history.pushState({ nmuPatientView: true }, ""); };
+    window.addEventListener("popstate", onPop);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      if ((history.state as { nmuPatientView?: boolean } | null)?.nmuPatientView) history.back();
+    };
+  }, [patientView]);
+  // 录音真值转发给宿主退出钮:按住返回时若受试者正在作答,给研究者一个"录音中"提示。
+  useEffect(() => {
+    if (!patientView) return;
+    window.dispatchEvent(new CustomEvent(PATIENT_VIEW_REC_EVENT, { detail: { active: patientRec?.active === true } }));
+  }, [patientView, patientRec?.active]);
+
+  const openPatientView = () => {
+    setConfirmPatientView(false);
+    setPatientView(true);
+    // 平板上尽力全屏(去浏览器栏);拒绝(如 iOS Safari)不影响叠层本身。
+    document.documentElement.requestFullscreen?.().catch(() => { /* 平台不支持即忽略 */ });
+  };
+  const enterPatientView = () => {
+    // 已有受试者端在线(遗留窗口/另一设备)时再叠一个 = 双开麦、同一环节两份录音——先确认。
+    // 15 秒宽限抵消本机叠层自己的心跳残留(退出→马上重进是常规操作,不该弹)。
+    if (patientPresence.state === "online" && Date.now() - overlayClosedAt.current > 15000) {
+      setConfirmPatientView(true);
+    } else openPatientView();
+  };
+  const closePatientView = () => {
+    overlayClosedAt.current = Date.now();
+    setPatientView(false);
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => { /* 已不在全屏 */ });
+  };
   useEffect(() => { persistConsoleState(state); }, [state]);
   useEffect(() => { window.scrollTo({ top: 0, behavior: "auto" }); }, [state.screen, state.area]);
 
@@ -64,7 +128,7 @@ export function ConsoleShell() {
 
   return (
     <ToastProvider>
-      <header className="app-header">
+      <header className="app-header" inert={patientView || undefined}>
         <div className="app-brand">
           <div className="app-brand-mark" aria-hidden>语</div>
           <div className="col" style={{ gap: 0 }}>
@@ -91,12 +155,12 @@ export function ConsoleShell() {
         </div>
       </header>
 
-      <div className="app-main">
+      <div className="app-main" inert={patientView || undefined}>
         {inLiveSession && state.session && (
           <SessionContextBar patientId={state.session.patient_id}
             weekNo={state.session.week_no} phase={state.session.phase_type} eventLine={state.session.event_line}
             version={state.session.item_bank_version_id} presence={patientPresence}
-            onEnd={() => setConfirmLeave("run")} />
+            onEnd={() => setConfirmLeave("run")} onPatientView={enterPatientView} />
         )}
 
         <main>
@@ -128,6 +192,13 @@ export function ConsoleShell() {
         </main>
       </div>
 
+      <ConfirmDialog open={confirmPatientView}
+        title="另一个受试者端似乎在线"
+        body="检测到已有受试者端连着本场次(另一窗口或另一台设备)。同时再开本机受试者画面会双开麦克风、同一环节产生两份录音。确认要在本机打开吗?"
+        confirmLabel="仍在本机打开"
+        onConfirm={openPatientView}
+        onCancel={() => setConfirmPatientView(false)} />
+
       <ConfirmDialog open={confirmLeave !== null}
         title={confirmLeave === "run" ? "结束当前训练？" : "离开正在进行的训练？"}
         body="已保存到服务器的数据和本机作业日志不会删除。训练台会保留该场次,可随时切回继续。"
@@ -153,8 +224,9 @@ export function ConsoleShell() {
 }
 
 // SessionContextBar:★绝不显示姓名/称呼;场次编号是后台概念,前端不呈现——只出研究编号与本次安排。
-function SessionContextBar({ patientId, weekNo, phase, eventLine, version, presence, onEnd }: {
-  patientId: string; weekNo: number; phase: string; eventLine: string; version: string; presence: PatientPresenceView; onEnd: () => void;
+function SessionContextBar({ patientId, weekNo, phase, eventLine, version, presence, onEnd, onPatientView }: {
+  patientId: string; weekNo: number; phase: string; eventLine: string; version: string; presence: PatientPresenceView;
+  onEnd: () => void; onPatientView: () => void;
 }) {
   const eventLabel = eventLine === phase ? null : eventLine;
   const presenceTone = presence.state === "online" ? "ok"
@@ -183,6 +255,9 @@ function SessionContextBar({ patientId, weekNo, phase, eventLine, version, prese
           {presence.lastSeenLabel && <span>{presence.lastSeenLabel}</span>}
         </div>
       </div>
+      <Button variant="primary" onClick={onPatientView} title="本机全屏切到受试者画面;研究者按住画面角落的按钮即可返回">
+        受试者画面
+      </Button>
       <Button onClick={onEnd}>结束/切换受试者</Button>
     </section>
   );

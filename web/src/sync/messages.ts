@@ -26,3 +26,10 @@ export type CursorMsg = Extract<SyncMsg, { type: "cursor" }>;
 export type RapportMsg = Extract<SyncMsg, { type: "rapportStep" }>;
 export type AudioSavedMsg = Extract<SyncMsg, { type: "audioSaved" }>;
 export type PatientRecMsg = Extract<SyncMsg, { type: "patientRec" }>;
+
+// 单机一条流的窗内事件(非跨窗总线):操作端 ⇄ App 路由层叠层宿主。
+// 状态源在 ConsoleShell;红线守卫禁止 console/** import 老人端源码,故经事件解耦。
+export const PATIENT_VIEW_EVENT = "nmu:patient-view";           // detail: { open: boolean }
+export const PATIENT_VIEW_EXIT_EVENT = "nmu:patient-view-exit"; // 宿主按住返回 → 操作端收
+export const PATIENT_VIEW_REC_EVENT = "nmu:patient-view-rec";   // detail: { active } 录音真值→宿主退出钮
+export const CONSOLE_NOTE_EVENT = "nmu:console-note";           // detail: { count } 叠层期间暂存的提示数
