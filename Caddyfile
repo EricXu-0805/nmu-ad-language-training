@@ -1,0 +1,18 @@
+# 反向代理 + TLS 终止。app 只在 compose 内网监听 8000,不对外。
+# SITE_ADDRESS 由 .env 提供,两种模式:
+#   有域名(推荐): SITE_ADDRESS=training.example.com     → 自动 Let's Encrypt 证书,保持 tls internal 注释
+#   仅 IP(暂无域名): SITE_ADDRESS=https://203.0.113.10   → 取消下方 tls internal,用 Caddy 内部 CA 自签
+# 老人端麦克风(getUserMedia)只在 https 安全上下文可用,故两种模式都必须走 TLS。
+{$SITE_ADDRESS} {
+	encode gzip
+	reverse_proxy app:8000 {
+		# 用真实直连 IP 覆写 X-Forwarded-For,阻止客户端伪造 XFF 绕过后端失败限速。
+		# 与 app 侧 FORWARDED_ALLOW_IPS=只信任本 Caddy 双重保证:后端拿到的来访 IP 不可伪造。
+		# (注:若日后本机再前置 CDN/别的反代,这里要改成信任那一层,否则会记成上游 IP。)
+		header_up X-Forwarded-For {remote_host}
+	}
+
+	# 仅 IP 部署(无域名)时取消下一行注释:Caddy 用内部 CA 自签,浏览器首次访问需人工信任一次。
+	# 有域名时保持注释——让 Caddy 走自动公共证书,无需任何手动信任。
+	# tls internal
+}

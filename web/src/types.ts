@@ -45,6 +45,19 @@ export interface PatientSummary {
   last_training_date?: string | null;
 }
 
+// 账号认证(M1-D 公网部署)。绝不携带任何凭据,只表明该显示哪种门。
+export interface AuthConfig {
+  auth_required: boolean;     // 认证是否生效(回环开发可为 false → 全开)
+  accounts_enabled: boolean;  // 库里已有研究者账号 → console 走登录门
+  pin_enabled: boolean;       // 设了 CONSOLE_PIN → 老人端/保底走 PIN
+}
+
+export interface AuthIdentity {
+  display_id: string;         // 落到锁分/量表的审计身份
+  role: string;               // researcher / admin
+  username: string;
+}
+
 export interface Session {
   session_id: string;
   patient_id: string;

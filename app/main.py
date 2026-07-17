@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import math
+import re
 import secrets
 import threading
 from typing import Literal
@@ -25,48 +26,159 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from fastapi.responses import Response as PlainResponse
 
-from . import asr, audio_gate, audio_store, content, export, judging, llm_judge, rule_judge, runtime, scoring, tts
-from .db import engine, get_session, init_db
+from . import asr, audio_gate, audio_store, auth, content, db, export, judging, llm_judge, rule_judge, runtime, scoring, tts
+from .auth import COOKIE_NAME
+from .db import get_session, init_db
 from .enums import AudioStatus
 from .models import (AbnormalEvent, AudioAssetRow, ItemEvent, LiveState, Patient, ScaleResult,
                      SessionRuntimeState, TurnEvent)
 from .models import Session as TrainSession
 
+from fastapi import Response
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db(engine)
+    init_db(db.engine)
     asr.cleanup_scratch()   # 清扫上次进程异常终止残留的云转写临时音频副本
+    with DBSession(db.engine) as _s:
+        auth.cleanup_expired_sessions(_s)          # 清掉过期会话
+        _has_users = auth.has_any_user(_s)
+        auth.mark_users_present(_has_users)        # 库里已有账号 → 认证生效(即便忘设 REQUIRE_AUTH)
+        auth.assert_deploy_credentials(_s)         # 公网 fail-closed：声明 REQUIRE_AUTH 却无任何凭据 → 拒绝启动
+    # 账号-only(有账号、无 PIN)且独立老人端平板:平板无研究者 cookie,写操作(心跳/录音)会一直 401,
+    # PinPrompt 弹出也无 PIN 可放行。独立平板部署务必设 CONSOLE_PIN。
+    if auth.auth_active() and _has_users and not auth.pin_configured():
+        print("⚠️ 已启用账号认证但未设 CONSOLE_PIN:若老人端是独立平板,其心跳/录音上传将无法认证。"
+              "独立双设备部署请设 CONSOLE_PIN(见 DEPLOY.md)。", flush=True)
     yield
 
 
 app = FastAPI(title="南医大 · AI 语言沟通训练系统", version="0.0.1", lifespan=lifespan)
 
 
-# ---------------- 操作端 PIN 门(内网双设备模式)----------------
-# 设 CONSOLE_PIN 环境变量即启用：写操作与含研究数据的读口须带 X-Console-Pin。
+# ---------------- 操作端认证门(账号会话 + PIN 保底)----------------
+# 认证生效条件见 auth.auth_active()。生效时：写操作与含研究数据的读口须满足其一——
+#   带有效会话 cookie(真实账号,携带审计身份) 或 带正确 X-Console-Pin(共享保底,无身份)。
 # 老人端必需的 live/plan/TTS 与健康、静态内容保持可读。
 def _sensitive_get(path: str) -> bool:
-    if path == "/live/console-state":
+    if path in ("/live/console-state", "/patients"):   # /patients 列表(无斜杠)此前漏网 → 补上
         return True
     if path.startswith("/patients/") or path.startswith("/audio/"):
         return True
     if path.startswith("/sessions/"):
-        return not path.endswith("/plan")
+        # 只豁免真正的老人端只读计划口 /sessions/{id}/plan;endswith('/plan') 太宽——
+        # /sessions/plan 会被误判豁免,让未认证者读到 session 详情(含 patient_id)。
+        return re.fullmatch(r"/sessions/[^/]+/plan", path) is None
     return False
 
 
+def _client_ip(request: Request) -> str:
+    # 依赖 uvicorn --proxy-headers 把可信代理的 XFF 改写进 request.client.host；
+    # 不自行解析 XFF(裸解析可被伪造绕过限速)。
+    return request.client.host if request.client else "?"
+
+
+def _actor(request: Request) -> str | None:
+    """当前请求的审计身份：账号登录 → display_id；PIN/开放模式 → None。"""
+    return getattr(request.state, "actor", None)
+
+
 @app.middleware("http")
-async def console_pin_guard(request: Request, call_next):
+async def console_auth_guard(request: Request, call_next):
+    path = request.url.path
+    # /auth/* 自管认证(登录必须可达、/auth/me 自行返回 401),不经此门。
+    if path.startswith("/auth/"):
+        return await call_next(request)
+
+    needs = request.method in ("POST", "PUT", "PATCH", "DELETE") \
+        or (request.method == "GET" and _sensitive_get(path))
+    if not (needs and auth.auth_active()):
+        return await call_next(request)
+
+    ip = _client_ip(request)
+    if auth.is_locked(ip):
+        return JSONResponse(status_code=429, content={"detail": "尝试过多，暂时锁定，请稍后再试"})
+
+    cookie = request.cookies.get(COOKIE_NAME)
+    supplied_pin = request.headers.get("x-console-pin")
+
+    # 1) 会话 cookie(真实账号,携带审计身份)。display_id/role 必须在 session 打开时就取出:
+    #    resolve_session 内部节流写 last_seen 会 commit,默认 expire_on_commit 令 user 过期,
+    #    出了 with 块再读属性会 DetachedInstanceError → 500(每约5分钟一次)。
+    actor = actor_role = None
+    if cookie:
+        with DBSession(db.engine) as s:
+            user = auth.resolve_session(s, cookie)
+            if user:
+                actor, actor_role = user.display_id, user.role
+    if actor:
+        request.state.actor = actor
+        request.state.actor_role = actor_role
+        auth.record_success(ip)
+        return await call_next(request)
+
+    # 2) 共享 PIN 保底(无身份)。bytes 比较:非 ASCII 的 PIN 头不会让 compare_digest 抛 TypeError(→500)。
     pin = os.environ.get("CONSOLE_PIN")
-    needs_pin = request.method in ("POST", "PUT", "PATCH", "DELETE") \
-        or (request.method == "GET" and _sensitive_get(request.url.path))
-    if pin and needs_pin:
-        supplied = request.headers.get("x-console-pin", "")
-        if not secrets.compare_digest(supplied, pin):
-            return JSONResponse(status_code=401,
-                                content={"detail": "需要操作端 PIN(请求头 X-Console-Pin)"})
-    return await call_next(request)
+    if pin and supplied_pin is not None \
+            and secrets.compare_digest(supplied_pin.encode("utf-8"), pin.encode("utf-8")):
+        auth.record_success(ip)
+        return await call_next(request)
+
+    # 只有"错 PIN"才计入限速。会话 cookie 是 256 位随机 token,在线爆破无意义,不计——否则
+    # 会话过期/被吊销后浏览器仍带旧 cookie 每3秒轮询,会把研究者/整院共享出口 IP 误锁在门外。
+    if supplied_pin is not None:
+        auth.record_failure(ip)
+    return JSONResponse(status_code=401, content={"detail": "需要登录或操作端 PIN"})
+
+
+# ---------------- 账号认证接口 ----------------
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/login")
+def auth_login(body: LoginIn, request: Request, response: Response, s: DBSession = Depends(get_session)):
+    ip = _client_ip(request)
+    if auth.is_locked(ip):
+        raise HTTPException(429, "尝试过多，暂时锁定，请稍后再试")
+    user = auth.authenticate(s, body.username.strip(), body.password)
+    if not user:
+        auth.record_failure(ip)
+        raise HTTPException(401, "用户名或密码错误")
+    auth.record_success(ip)
+    token = auth.create_session(s, user.username)
+    secure = request.url.scheme == "https" \
+        or os.environ.get("SESSION_COOKIE_SECURE", "").strip() in ("1", "true", "yes")
+    response.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax",
+                        secure=secure, path="/", max_age=12 * 3600)
+    return {"display_id": user.display_id, "role": user.role, "username": user.username}
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request, response: Response, s: DBSession = Depends(get_session)):
+    auth.revoke_session(s, request.cookies.get(COOKIE_NAME))
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/auth/me")
+def auth_me(request: Request, s: DBSession = Depends(get_session)):
+    user = auth.resolve_session(s, request.cookies.get(COOKIE_NAME))
+    if not user:
+        raise HTTPException(401, "未登录")
+    return {"display_id": user.display_id, "role": user.role, "username": user.username}
+
+
+@app.get("/auth/config")
+def auth_config(s: DBSession = Depends(get_session)):
+    """开放读口：告诉前端该显示哪种门(账号登录 / PIN / 全开),不泄任何凭据。"""
+    return {
+        "auth_required": auth.auth_active(),
+        "accounts_enabled": auth.has_any_user(s),
+        "pin_enabled": auth.pin_configured(),
+    }
 
 
 @app.get("/health")
@@ -1434,7 +1546,7 @@ def _allowed_lock_values(task_type: str, response_role: str) -> set[float]:
 
 
 @app.patch("/turns/{turn_id}/lock", response_model=TurnEvent)
-def lock_turn(turn_id: int, body: LockIn, s: DBSession = Depends(get_session)):
+def lock_turn(turn_id: int, body: LockIn, request: Request, s: DBSession = Depends(get_session)):
     """人工锁定评分（研究数据真值）。一旦锁定不得重复锁。"""
     t = _load_turn(turn_id, s)
     if t.score_locked:
@@ -1442,7 +1554,8 @@ def lock_turn(turn_id: int, body: LockIn, s: DBSession = Depends(get_session)):
 
     if t.confirmed_response_text is None:
         raise HTTPException(409, "须先人工确认 confirmed_response_text 才能锁分")
-    reviewer_id = body.reviewer_id.strip()
+    # 已登录 → 锁分人就是登录账号(权威身份,不信任请求体自报);PIN/开放模式 → 用请求体自报。
+    reviewer_id = (_actor(request) or body.reviewer_id or "").strip()
     if not reviewer_id:
         raise HTTPException(422, "reviewer_id 不得为空")
 
@@ -1542,10 +1655,14 @@ class ScaleIn(BaseModel):
 
 
 @app.post("/patients/{patient_id}/scales", response_model=ScaleResult)
-def create_scale(patient_id: str, body: ScaleIn, s: DBSession = Depends(get_session)):
+def create_scale(patient_id: str, body: ScaleIn, request: Request, s: DBSession = Depends(get_session)):
     if not s.get(Patient, patient_id):
         raise HTTPException(404, "患者不存在,先建档")
-    row = ScaleResult(patient_id=patient_id, assessed_at=datetime.now(), **body.model_dump())
+    data = body.model_dump()
+    actor = _actor(request)
+    if actor:                    # 已登录 → 评估人 = 登录账号(权威身份)
+        data["assessor_id"] = actor
+    row = ScaleResult(patient_id=patient_id, assessed_at=datetime.now(), **data)
     s.add(row); s.commit(); s.refresh(row)
     return row
 

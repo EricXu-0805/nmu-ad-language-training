@@ -1,0 +1,12 @@
+# 生产运行期依赖(容器用),钉精确版本以保证可复现构建 + 可审计(跑真实受试者数据的机器)。
+# 版本 = 本仓库开发/测试所用版本。升级时改这里并重跑测试,勿在部署机静默漂移。
+# (去掉了 requirements.txt 里的 pytest;python-multipart 未被使用[无 Form/File/UploadFile]故不装。)
+fastapi==0.139.0
+uvicorn[standard]==0.50.2
+sqlmodel==0.0.39
+pydantic==2.13.4
+alembic==1.18.5
+dashscope==1.26.3
+
+# 本地神经兜底音色(可选;体积较大)。要在容器里也有 piper 兜底,取消注释重建:
+# piper-tts>=1.4

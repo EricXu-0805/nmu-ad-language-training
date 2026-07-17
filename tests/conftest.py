@@ -1,6 +1,6 @@
 import pytest
 
-from app import audio_store, export
+from app import audio_store, auth, export
 
 
 @pytest.fixture(autouse=True)
@@ -16,3 +16,14 @@ def _no_cloud_key(monkeypatch):
     # auto 引擎(TTS/ASR/判分)见 DASHSCOPE_API_KEY 会真出网;测试一律摘 Key,
     # 云端行为全部用替身注入,保证套件在配了 Key 的机器上照样零网络。
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_state(monkeypatch):
+    # 认证靠环境变量 + 进程内粘滞位(限速器/已有账号标记)。逐测试清干净,
+    # 避免"上一测试建了账号/触发锁定"渗到下一测试(否则 no-pin-open 会误判为需认证)。
+    monkeypatch.delenv("REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("CONSOLE_PIN", raising=False)
+    auth.reset_for_tests()
+    yield
+    auth.reset_for_tests()

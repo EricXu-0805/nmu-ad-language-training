@@ -1,0 +1,53 @@
+# 自有 VPS 部署(课题组已同意承载)。两容器:app(FastAPI+前端静态) + caddy(TLS 反代)。
+# app 只在 compose 内网监听 8000,绝不 publish 到宿主;对外只有 caddy 的 80/443。
+# 详细步骤见 DEPLOY.md。
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 兜底:即便 .env 漏了,也强制认证生效(公网 fail-closed)。
+      REQUIRE_AUTH: "1"
+      SESSION_COOKIE_SECURE: "1"     # 经 TLS 反代 → 会话 cookie 打 Secure
+      # 只信任 Caddy 这一跳的 X-Forwarded-For(caddy 的固定内网 IP,见下 networks)。
+      # 不用 '*':否则客户端可伪造 XFF,失败限速按可控 IP 计 → 形同虚设、可爆破 PIN。
+      FORWARDED_ALLOW_IPS: "172.28.0.10"
+    volumes:
+      - appdata:/app/data            # SQLite + 录音 + TTS 缓存(唯一持久化目录)
+    expose:
+      - "8000"                       # 仅 compose 内网可见;不写 ports,不对宿主/公网开放
+    networks:
+      - nmunet
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # 只给反代它需要的 SITE_ADDRESS(compose 从 .env 插值),不灌整份 .env——
+    # 反代是唯一对公网直暴的容器,不该拿到 DASHSCOPE_API_KEY / CONSOLE_PIN 等应用密钥。
+    environment:
+      SITE_ADDRESS: "${SITE_ADDRESS}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data              # 证书(自动 Let's Encrypt 或内部自签 CA)
+      - caddyconfig:/config
+    depends_on:
+      - app
+    networks:
+      nmunet:
+        ipv4_address: 172.28.0.10    # 固定 IP,供 app 的 FORWARDED_ALLOW_IPS 精确信任
+
+networks:
+  nmunet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  appdata:
+  caddydata:
+  caddyconfig:

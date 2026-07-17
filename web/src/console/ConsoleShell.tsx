@@ -7,6 +7,7 @@ import { ToastProvider } from "../components/Toast";
 import { AbnormalDrawer } from "./abnormal/AbnormalDrawer";
 import { AnalysisScreen } from "./AnalysisScreen";
 import { consoleReducer, initialConsole, loadConsoleState, persistConsoleState, type ConsoleArea } from "./consoleReducer";
+import { LoginScreen } from "./LoginScreen";
 import { RelationshipConsoleScreen } from "./relationship/RelationshipConsoleScreen";
 import { RunPickerScreen } from "./RunPickerScreen";
 import { ScaleDrawer } from "./ScaleDrawer";
@@ -14,6 +15,7 @@ import { SessionCreateScreen } from "./SessionCreateScreen";
 import { SessionWrapupScreen } from "./SessionWrapupScreen";
 import { SubjectRegistryScreen } from "./SubjectRegistryScreen";
 import { TrainingConsoleScreen } from "./scoring/TrainingConsoleScreen";
+import { useConsoleAuth } from "./useConsoleAuth";
 import { usePatientPresence, type PatientPresenceView } from "../sync/usePatientPresence";
 
 // 操作端顶层外壳。设 data-scale=console;三区标签(准备/训练/分析)+ run 区 reducer 驱动
@@ -30,6 +32,7 @@ export function ConsoleShell() {
   const [scaleOpen, setScaleOpen] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState<ConsoleArea | null>(null);
   const [currentItemEventId, setCurrentItemEventId] = useState<number | null>(null);
+  const auth = useConsoleAuth();
   const runPatientId = state.session?.patient_id ?? state.patientId ?? null;
   const patientPresence = usePatientPresence(state.session?.session_id);
   const inLiveSession = state.area === "run" && !!state.session
@@ -49,6 +52,15 @@ export function ConsoleShell() {
     if (inLiveSession && area !== "run") setConfirmLeave(area);
     else dispatch({ t: "setArea", area });
   };
+
+  // 账号登录门(公网部署):检查中先占位,未登录挡在登录页——工作台整棵树不挂载,
+  // 任何研究数据请求都发不出去(比逐接口 401 更早、更彻底)。
+  if (auth.mode === "loading") {
+    return <main className="login-shell"><div className="login-card"><p className="muted">正在检查登录…</p></div></main>;
+  }
+  if (auth.mode === "login") {
+    return <LoginScreen onLoggedIn={auth.refresh} />;
+  }
 
   return (
     <ToastProvider>
@@ -70,6 +82,12 @@ export function ConsoleShell() {
         <div className="toolbar">
           {state.area === "run" && runPatientId && <Button onClick={() => setScaleOpen(true)}>录入量表</Button>}
           {state.area === "run" && state.session && <Button onClick={() => setAbnormalOpen(true)}>记录现场情况</Button>}
+          {auth.identity && (
+            <div className="toolbar-account">
+              <span className="muted" title={`账号 ${auth.identity.username}`}>👤 {auth.identity.display_id}</span>
+              <Button onClick={() => { void auth.logout(); }}>退出</Button>
+            </div>
+          )}
         </div>
       </header>
 
@@ -128,7 +146,8 @@ export function ConsoleShell() {
           open={abnormalOpen} onClose={() => setAbnormalOpen(false)} />
       )}
       {state.area === "run" && runPatientId && <ScaleDrawer patientId={runPatientId} open={scaleOpen} onClose={() => setScaleOpen(false)} />}
-      <PinPrompt />
+      {/* 账号模式由登录门兜底,不再弹 PIN;仅 PIN/开放模式(无账号)保留 PinPrompt。 */}
+      {!auth.accountsEnabled && <PinPrompt />}
     </ToastProvider>
   );
 }

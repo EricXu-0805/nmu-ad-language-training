@@ -1,7 +1,7 @@
 // 强类型 API 客户端——逐个后端路由一个函数。相对路径:dev 走 Vite 代理、生产由 FastAPI 同源托管。
 // 全本地、无外部请求。任何非 2xx 抛 ApiError,带后端 detail,供 UI 明确报错(不静默失败)。
 import type {
-  AbnormalEvent, AudioAsset, ExportResult, ItemBankInfo, ItemEvent,
+  AbnormalEvent, AudioAsset, AuthConfig, AuthIdentity, ExportResult, ItemBankInfo, ItemEvent,
   LiveStateResponse, Patient, PatientHeartbeatRequest, PatientHeartbeatResponse,
   PatientSummary, ScaleResult, ScoreReconstruction, Session, SessionPlan, SessionRuntimeState, TurnEvent,
 } from "./types";
@@ -34,13 +34,16 @@ function pinHeader(): Record<string, string> {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 12_000;
 
-async function req<T>(method: string, path: string, body?: unknown, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<T> {
+// silent401:登录/自查这类"401 是预期结果"的调用不广播重认证事件,免得触发 PinPrompt / 无限刷新。
+async function req<T>(method: string, path: string, body?: unknown,
+                     timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, opts?: { silent401?: boolean }): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(path, {
       method,
       signal: controller.signal,
+      credentials: "same-origin",   // 携带账号会话 cookie(同源 SPA;账号登录后授权即靠它)
       headers: {
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
         ...pinHeader(),
@@ -50,7 +53,7 @@ async function req<T>(method: string, path: string, body?: unknown, timeoutMs = 
     const text = await res.text();
     const data = text ? JSON.parse(text) : null;
     if (!res.ok) {
-      if (res.status === 401) window.dispatchEvent(new Event(PIN_REQUIRED_EVENT));
+      if (res.status === 401 && !opts?.silent401) window.dispatchEvent(new Event(PIN_REQUIRED_EVENT));
       const detail = data && typeof data === "object" && "detail" in data ? String(data.detail) : text;
       throw new ApiError(res.status, detail);
     }
@@ -65,6 +68,14 @@ async function req<T>(method: string, path: string, body?: unknown, timeoutMs = 
 
 export const api = {
   health: () => req<{ status: string; service: string }>("GET", "/health"),
+
+  // 账号认证(公网部署)。cookie 走同源自动携带;登录/登出/自查/配置。
+  // authMe/authLogin 的 401 是预期结果(未登录/密码错),silent401 免触发重认证事件。
+  authConfig: () => req<AuthConfig>("GET", "/auth/config"),
+  authMe: () => req<AuthIdentity>("GET", "/auth/me", undefined, DEFAULT_REQUEST_TIMEOUT_MS, { silent401: true }),
+  authLogin: (username: string, password: string) =>
+    req<AuthIdentity>("POST", "/auth/login", { username, password }, DEFAULT_REQUEST_TIMEOUT_MS, { silent401: true }),
+  authLogout: () => req<{ ok: boolean }>("POST", "/auth/logout"),
 
   // 患者 / 场次
   createPatient: (p: Patient) => req<Patient>("POST", "/patients", p),

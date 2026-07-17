@@ -12,7 +12,7 @@ const backend = 'http://127.0.0.1:8000'
 // 注意:只代理 /content/item-bank(后端路由),不代理整个 /content——
 // 否则会劫持 Vite 从 public/ 提供的静态 /content/*.json(题库/脚本冻结副本)。
 const proxy = Object.fromEntries(
-  ['/health', '/patients', '/sessions', '/content/item-bank', '/score', '/judge', '/audio', '/items', '/turns', '/asr', '/live', '/tts']
+  ['/health', '/auth', '/patients', '/sessions', '/content/item-bank', '/score', '/judge', '/audio', '/items', '/turns', '/asr', '/live', '/tts']
     .map((p) => [p, { target: backend, changeOrigin: true }]),
 )
 

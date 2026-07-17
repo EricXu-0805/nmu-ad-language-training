@@ -1,0 +1,16 @@
+# 只把源码 + 冻结内容 + 迁移送进构建上下文;产物/依赖/数据/密钥全部排除。
+.venv/
+web/node_modules/
+web/dist/
+web/.vite/
+web/public/content/
+data/
+**/__pycache__/
+.pytest_cache/
+.gstack/
+.git/
+.env
+*.env
+!.env.example
+tests/
+*.md

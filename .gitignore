@@ -10,3 +10,10 @@ web/.vite/
 # public/content 为构建期从 platform/content 同步的副本,不入库(由 prebuild 生成)
 web/public/content/
 .gstack/
+
+# 部署密钥/证书绝不入库(.env.example 是模板,入库)
+.env
+*.env
+!.env.example
+caddy_data/
+

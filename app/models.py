@@ -196,3 +196,32 @@ class AbnormalEvent(SQLModel, table=True):
     affects_scoring_validity: bool = False        # 是否影响该环节/题判分有效性
     note: Optional[str] = None                    # caregiver_note / session_note
     created_at: Optional[datetime] = None
+
+
+class ResearchUser(SQLModel, table=True):
+    """研究者账号（公网部署的真实身份层，替代裸共享 PIN）。
+
+    display_id 才是落到 TurnEvent.reviewer_id / ScaleResult.assessor_id 的审计标识，
+    与登录名 username 解耦：登录名可改，历史锁分归属仍稳定指向 display_id。
+    绝不存明文密码——password_hash 是 pbkdf2_sha256$iters$salt$hash（见 app/auth.py）。
+    """
+    username: str = Field(primary_key=True)
+    display_id: str                               # 审计身份（谁锁的分/谁评的量表）
+    password_hash: str
+    role: str = "researcher"                       # researcher / admin（admin 可管账号）
+    disabled: bool = False                          # 停用即时生效（会话校验时否决）
+    created_at: Optional[datetime] = None
+    last_login_at: Optional[datetime] = None
+
+
+class AuthSession(SQLModel, table=True):
+    """服务端会话（可撤销：登出/停用立即失效，优于无状态 JWT）。
+
+    表里只存 token 的 sha256（token_hash），明文 token 只在浏览器 httponly cookie 里——
+    数据库即便泄露也无法据此伪造有效会话。
+    """
+    token_hash: str = Field(primary_key=True)
+    username: str = Field(foreign_key="researchuser.username", index=True)
+    created_at: datetime
+    expires_at: datetime
+    last_seen_at: Optional[datetime] = None
