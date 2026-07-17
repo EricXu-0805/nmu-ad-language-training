@@ -122,6 +122,14 @@ sudo ss -tlnp | grep 8000 || echo "OK: 8000 未对外"
 
 无论哪种：`.env` 已在 `.gitignore`，**绝不提交到仓库**；仓库须私有。
 
+**换 Key(轮换到医院/课题组自己的百炼账号)**：新账号在百炼控制台创建 API Key 后，
+改 `.env` 里的 `DASHSCOPE_API_KEY=` 并 `docker compose restart app` 即可，代码零改动。
+注意三点：① 新账号的工作空间须开通所用模型（qwen3-tts-flash / qwen3-asr-flash /
+qwen-plus；如切龙媛还需 cosyvoice-v2——`cosyvoice-v3-plus` 需单独开通，未开通一律
+418）；② TTS 缓存(`data/tts-cache/`)按引擎+参数+文本作键、与 Key 无关，换 Key 后
+已合成话术不重新计费；③ 换 Key 后建议先跑 `scripts/presynthesize_tts.py --dry-run`
+再实跑一遍，确认新空间模型可用、增量话术打满。
+
 ## 8. 备份(重要——真机数据无第二份就没有回滚)
 
 所有数据在 `appdata` 卷（SQLite `app.db` + 录音 + TTS 缓存）。定期备份：
