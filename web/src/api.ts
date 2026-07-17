@@ -1,7 +1,7 @@
 // 强类型 API 客户端——逐个后端路由一个函数。相对路径:dev 走 Vite 代理、生产由 FastAPI 同源托管。
 // 全本地、无外部请求。任何非 2xx 抛 ApiError,带后端 detail,供 UI 明确报错(不静默失败)。
 import type {
-  AbnormalEvent, AudioAsset, AuthConfig, AuthIdentity, ExportResult, ItemBankInfo, ItemEvent,
+  AbnormalEvent, AudioAsset, AuditEntry, AuditVerify, AuthConfig, AuthIdentity, ExportResult, ItemBankInfo, ItemEvent,
   LiveStateResponse, Patient, PatientHeartbeatRequest, PatientHeartbeatResponse,
   PatientSummary, ScaleResult, ScoreReconstruction, Session, SessionPlan, SessionRuntimeState, TurnEvent,
 } from "./types";
@@ -82,6 +82,17 @@ export const api = {
   getPatient: (id: string) => req<Patient>("GET", `/patients/${encodeURIComponent(id)}`),
   listPatients: () => req<PatientSummary[]>("GET", "/patients"),
   patientSessions: (id: string) => req<Session[]>("GET", `/patients/${encodeURIComponent(id)}/sessions`),
+
+  // 研究审计账本(只读)。按受试者/场次过滤;verify 校验哈希链是否被篡改。
+  listAudit: (params: { patientId?: string; sessionId?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.patientId) q.set("patient_id", params.patientId);
+    if (params.sessionId) q.set("session_id", params.sessionId);
+    if (params.limit) q.set("limit", String(params.limit));
+    const qs = q.toString();
+    return req<AuditEntry[]>("GET", `/audit${qs ? `?${qs}` : ""}`);
+  },
+  auditVerify: () => req<AuditVerify>("GET", "/audit/verify"),
   createSession: (s: Session) => req<Session>("POST", "/sessions", s),
   getTrainSession: (sid: string) => req<Session>("GET", `/sessions/${encodeURIComponent(sid)}`),
   sessionJournal: (sid: string) => req<{

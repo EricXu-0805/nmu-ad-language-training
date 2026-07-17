@@ -519,6 +519,13 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .analysis-turn-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; }
 .analysis-turn-body { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; font-size: var(--text-sm); }
 
+/* 审计追踪列表 */
+.audit-list { display: flex; flex-direction: column; gap: var(--sp-1); }
+.audit-row { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--c-line-soft); border-radius: var(--radius-sm); background: var(--c-surface); font-size: var(--text-sm); }
+.audit-ts { color: var(--c-muted); font-size: var(--text-xs); white-space: nowrap; }
+.audit-actor { color: var(--c-muted); white-space: nowrap; }
+.audit-summary { flex: 1; min-width: 200px; }
+
 @media (max-width: 720px) {
   .registry-row { grid-template-columns: 1fr 1fr; }
   .registry-row.registry-head { display: none; }

@@ -26,11 +26,11 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from fastapi.responses import Response as PlainResponse
 
-from . import asr, audio_gate, audio_store, auth, content, db, export, judging, llm_judge, rule_judge, runtime, scoring, tts
+from . import asr, audio_gate, audio_store, audit, auth, content, db, export, judging, llm_judge, rule_judge, runtime, scoring, tts
 from .auth import COOKIE_NAME
 from .db import get_session, init_db
 from .enums import AudioStatus
-from .models import (AbnormalEvent, AudioAssetRow, ItemEvent, LiveState, Patient, ScaleResult,
+from .models import (AbnormalEvent, AuditLog, AudioAssetRow, ItemEvent, LiveState, Patient, ScaleResult,
                      SessionRuntimeState, TurnEvent)
 from .models import Session as TrainSession
 
@@ -64,7 +64,7 @@ app = FastAPI(title="南医大 · AI 语言沟通训练系统", version="0.0.1",
 def _sensitive_get(path: str) -> bool:
     if path in ("/live/console-state", "/patients"):   # /patients 列表(无斜杠)此前漏网 → 补上
         return True
-    if path.startswith("/patients/") or path.startswith("/audio/"):
+    if path.startswith("/patients/") or path.startswith("/audio/") or path.startswith("/audit"):
         return True
     if path.startswith("/sessions/"):
         # 只豁免真正的老人端只读计划口 /sessions/{id}/plan;endswith('/plan') 太宽——
@@ -82,6 +82,17 @@ def _client_ip(request: Request) -> str:
 def _actor(request: Request) -> str | None:
     """当前请求的审计身份：账号登录 → display_id；PIN/开放模式 → None。"""
     return getattr(request.state, "actor", None)
+
+
+def _audit(s: DBSession, request: Request, action: str, summary: str, *,
+           patient_id: str | None = None, session_id: str | None = None, turn_id: int | None = None) -> None:
+    """best-effort 审计追加:记账失败绝不拖垮临床写(锁分不能因审计库抖动而失败),但也不静默——打日志。
+    summary 只传元数据,绝不含患者回答文本/姓名。"""
+    try:
+        audit.record(s, actor=_actor(request) or "PIN/本地", action=action, summary=summary,
+                     patient_id=patient_id, session_id=session_id, turn_id=turn_id)
+    except Exception as e:  # noqa: BLE001 —— 审计是补充记录,临床写已成功,不回滚
+        print(f"[audit] 记账失败({action}):{e}", flush=True)
 
 
 @app.middleware("http")
@@ -153,6 +164,10 @@ def auth_login(body: LoginIn, request: Request, response: Response, s: DBSession
         or os.environ.get("SESSION_COOKIE_SECURE", "").strip() in ("1", "true", "yes")
     response.set_cookie(COOKIE_NAME, token, httponly=True, samesite="lax",
                         secure=secure, path="/", max_age=12 * 3600)
+    try:                       # 登录事件:此时 request.state 尚无 actor,直接署名登录账号
+        audit.record(s, actor=user.display_id, action="login", summary=f"登录成功 role={user.role}")
+    except Exception as e:     # noqa: BLE001 —— 审计失败不拦登录
+        print(f"[audit] 记账失败(login):{e}", flush=True)
     return {"display_id": user.display_id, "role": user.role, "username": user.username}
 
 
@@ -179,6 +194,29 @@ def auth_config(s: DBSession = Depends(get_session)):
         "accounts_enabled": auth.has_any_user(s),
         "pin_enabled": auth.pin_configured(),
     }
+
+
+# ---------------- 研究审计账本(只读;哈希链防篡改)----------------
+@app.get("/audit")
+def list_audit(patient_id: str | None = None, session_id: str | None = None,
+               limit: int = 200, s: DBSession = Depends(get_session)):
+    """按受试者/场次过滤审计条目(最新在前)。只出元数据,永不含患者作答文本/姓名。"""
+    q = select(AuditLog)
+    if patient_id:
+        q = q.where(AuditLog.patient_id == patient_id)
+    if session_id:
+        q = q.where(AuditLog.session_id == session_id)
+    q = q.order_by(AuditLog.id.desc()).limit(min(max(limit, 1), 1000))
+    rows = list(s.exec(q))
+    return [{"id": r.id, "ts": r.ts, "actor": r.actor, "action": r.action,
+             "patient_id": r.patient_id, "session_id": r.session_id, "turn_id": r.turn_id,
+             "summary": r.summary, "entry_hash": r.entry_hash} for r in rows]
+
+
+@app.get("/audit/verify")
+def audit_verify(s: DBSession = Depends(get_session)):
+    """从头重算哈希链,报告是否被篡改(ok / 断裂位置)。"""
+    return audit.verify_chain(s)
 
 
 @app.get("/health")
@@ -442,7 +480,7 @@ def audio_reliability_review(raw_audio_id: str, s: DBSession = Depends(get_sessi
 
 
 @app.delete("/audio/{raw_audio_id}")
-def audio_delete(raw_audio_id: str, source: str = "auto", s: DBSession = Depends(get_session)):
+def audio_delete(raw_audio_id: str, request: Request, source: str = "auto", s: DBSession = Depends(get_session)):
     """删除音频。未达闸门条件（导出+校验[+信度复核]）→ 409，杜绝到期盲删。"""
     r = _load_row(raw_audio_id, s)
     if os.environ.get("ENABLE_AUDIO_DELETE") != "1":
@@ -456,6 +494,8 @@ def audio_delete(raw_audio_id: str, source: str = "auto", s: DBSession = Depends
     r.delete_gate_passed = True                       # 审计:闸门放行标记
     bytes_deleted = audio_store.delete_blob(raw_audio_id)  # 放行后物理删除字节
     s.add(r); s.commit()
+    _audit(s, request, "audio_delete", f"删除录音 {raw_audio_id}(source={source},字节={bytes_deleted})",
+           session_id=r.session_id)
     return {"raw_audio_id": raw_audio_id, "status": r.status, "deleted_by": source,
             "bytes_deleted": bytes_deleted}
 
@@ -1613,6 +1653,9 @@ def lock_turn(turn_id: int, body: LockIn, request: Request, s: DBSession = Depen
     t.prompt_level = prompt_level
     t.score_locked = True
     s.add(t); s.commit(); s.refresh(t)
+    _audit(s, request, "score_lock",
+           f"锁分 第{sess.week_no}周 {ie.item_id} {response_role or ''} = {t.element_value}(提示级{prompt_level})",
+           patient_id=sess.patient_id, session_id=sess.session_id, turn_id=t.id)
     return t
 
 
@@ -1629,7 +1672,7 @@ _CUE_INTERVENTIONS = {"代说物品名", "代说称呼"}
 
 
 @app.post("/sessions/{session_id}/abnormal", response_model=AbnormalEvent)
-def record_abnormal(session_id: str, body: AbnormalIn, s: DBSession = Depends(get_session)):
+def record_abnormal(session_id: str, body: AbnormalIn, request: Request, s: DBSession = Depends(get_session)):
     """记异常/介入。正式训练周的代说物品名/称呼 → 自动判为线索性介入且影响判分有效性。"""
     sess = s.get(TrainSession, session_id)
     if not sess:
@@ -1642,6 +1685,10 @@ def record_abnormal(session_id: str, body: AbnormalIn, s: DBSession = Depends(ge
     ev = AbnormalEvent(session_id=session_id, phase_type=sess.phase_type,
                        created_at=datetime.now(), **data)
     s.add(ev); s.commit(); s.refresh(ev)
+    # 只记类型/是否影响判分有效性,不写 note 自由文本(可能含识别信息)。
+    _audit(s, request, "abnormal",
+           f"异常/介入 {ev.abnormal_type or '?'}/{ev.intervention_type or '?'} 影响判分有效性={ev.affects_scoring_validity}",
+           patient_id=sess.patient_id, session_id=session_id)
     return ev
 
 
@@ -1664,6 +1711,9 @@ def create_scale(patient_id: str, body: ScaleIn, request: Request, s: DBSession 
         data["assessor_id"] = actor
     row = ScaleResult(patient_id=patient_id, assessed_at=datetime.now(), **data)
     s.add(row); s.commit(); s.refresh(row)
+    _audit(s, request, "scale_record",
+           f"录量表 {row.phase_type} {row.scale_name}{('/' + row.subscale) if row.subscale else ''} = {row.score}",
+           patient_id=patient_id)
     return row
 
 
@@ -1711,14 +1761,18 @@ def session_scores(session_id: str, s: DBSession = Depends(get_session)):
 
 
 @app.post("/sessions/{session_id}/export")
-def session_export(session_id: str, deidentify: bool = True, s: DBSession = Depends(get_session)):
+def session_export(session_id: str, request: Request, deidentify: bool = True, s: DBSession = Depends(get_session)):
     """场次收尾去标识化导出（默认走去标识通道，不带直接标识符）。触发音频导出闸门第一关。"""
-    if not s.get(TrainSession, session_id):
+    sess = s.get(TrainSession, session_id)
+    if not sess:
         raise HTTPException(404, "场次不存在")
     try:
         res = export.export_session_bundle(s, session_id, deidentify=deidentify)
     except (ValueError, RuntimeError) as e:
         raise HTTPException(409, str(e))
+    _audit(s, request, "data_export",
+           f"导出场次 batch={res['batch_id']} 去标识={res['deidentified']} 触及音频={res['audio_touched']}",
+           patient_id=sess.patient_id, session_id=session_id)
     return {"batch_id": res["batch_id"], "deidentified": res["deidentified"],
             "files": res["files"], "audio_touched": res["audio_touched"],
             "excluded_items": res["excluded_items"],

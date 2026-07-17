@@ -58,6 +58,27 @@ export interface AuthIdentity {
   username: string;
 }
 
+// 研究审计账本条目(只读;只含元数据,永不含患者作答文本/姓名)。
+export interface AuditEntry {
+  id: number;
+  ts: string;
+  actor: string;              // 登录账号 display_id / "PIN/本地" / "system"
+  action: string;             // score_lock / scale_record / abnormal / audio_delete / data_export / login
+  patient_id?: string | null;
+  session_id?: string | null;
+  turn_id?: number | null;
+  summary: string;
+  entry_hash: string;
+}
+
+export interface AuditVerify {
+  ok: boolean;
+  count: number;
+  broken_at: number | null;
+  problem?: "chain_broken" | "truncated" | "anchor_behind" | null;
+  expected_count?: number;
+}
+
 export interface Session {
   session_id: string;
   patient_id: string;

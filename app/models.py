@@ -198,6 +198,41 @@ class AbnormalEvent(SQLModel, table=True):
     created_at: Optional[datetime] = None
 
 
+class AuditLog(SQLModel, table=True):
+    """只追加的研究审计账本(防篡改 tamper-evident)。记录"谁在何时对研究真值做了什么",供论文溯源与核查。
+
+    红线:summary 只记元数据(研究编号 + 动作 + 分值/类型),【绝不写入患者回答文本或姓名】——
+    审计不能变成第二个泄露患者作答的地方。
+
+    完整性保证的边界(诚实标注,勿夸大):
+      * 哈希链:entry_hash=sha256(prev_hash|各字段)。改动/中间删除任一历史行 → 从该行起断链,verify 检出。
+      * 高水位锚点(AuditAnchor):记录条数与链尾 hash,verify 比对 → 尾部截断/整表清空可检出(这是裸哈希链单靠自身检不出的)。
+      * prev_hash 唯一约束:并发追加撞链(多 worker)在 DB 层被挡,不会静默分叉。
+      * 【已知残余】裸 sha256 无密钥、锚点与账本同库:掌握 DB 写权且懂方案者可同时重算链+改锚点伪造。
+        强保证需外部密钥 HMAC/逐条签名/把链尾定期锚定到外部不可变存储(WORM/公共时间戳)——留待后续。
+        威胁模型:本工具服务可信研究者小组,审计用于诚实溯源、检出意外损坏与阻吓随手篡改。
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ts: datetime
+    actor: str                                    # 登录账号 display_id / "PIN/本地" / "system"
+    action: str                                   # score_lock/response_confirm/scale_record/abnormal/audio_delete/data_export/login…
+    patient_id: Optional[str] = Field(default=None, index=True)
+    session_id: Optional[str] = Field(default=None, index=True)
+    turn_id: Optional[int] = None
+    summary: str                                  # 短元数据(无回答文本/姓名)
+    prev_hash: str = Field(unique=True)           # 唯一 → 并发追加撞链在 DB 层被挡(防多 worker 静默分叉)
+    entry_hash: str
+
+
+class AuditAnchor(SQLModel, table=True):
+    """审计高水位锚点(单行,id=1)。每次追加同事务更新条数与链尾 hash;
+    verify 比对之 → 检出裸哈希链单靠自身检不出的"尾部截断/整表清空"。"""
+    id: int = Field(default=1, primary_key=True)
+    count: int = 0
+    tip_hash: str = "0" * 64
+    updated_at: Optional[datetime] = None
+
+
 class ResearchUser(SQLModel, table=True):
     """研究者账号（公网部署的真实身份层，替代裸共享 PIN）。
 

@@ -3,8 +3,60 @@ import { api, ApiError } from "../api";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
-import type { AudioAsset, ItemEvent, PatientSummary, ScaleResult, Session, TurnEvent } from "../types";
+import type { AuditEntry, AuditVerify, AudioAsset, ItemEvent, PatientSummary, ScaleResult, Session, TurnEvent } from "../types";
 import { AuthenticatedAudio } from "./AuthenticatedAudio";
+
+// 审计动作码 → 中文标签
+const AUDIT_ACTION_LABELS: Record<string, string> = {
+  score_lock: "锁分", scale_record: "录量表", abnormal: "异常/介入",
+  audio_delete: "删录音", data_export: "导出", login: "登录",
+};
+const auditActionLabel = (a: string) => AUDIT_ACTION_LABELS[a] ?? a;
+
+// 全局审计链完整性徽标:重算哈希链 + 比对高水位锚点,报告改动/删除。
+function IntegrityBadge() {
+  const [v, setV] = useState<AuditVerify | null>(null);
+  const [err, setErr] = useState(false);
+  useEffect(() => { api.auditVerify().then(setV).catch(() => setErr(true)); }, []);
+  if (err) return <StatusPill tone="muted" size="sm">审计链状态未知</StatusPill>;
+  if (!v) return <StatusPill tone="muted" size="sm">校验审计链…</StatusPill>;
+  if (v.ok) return <StatusPill tone="ok" size="sm">审计链完整 · {v.count} 条</StatusPill>;
+  if (v.problem === "chain_broken") return <StatusPill tone="danger" size="sm">⚠ 审计链在 #{v.broken_at} 处被改</StatusPill>;
+  if (v.problem === "truncated") return <StatusPill tone="danger" size="sm">⚠ 审计疑似被删({v.count}/{v.expected_count} 条)</StatusPill>;
+  return <StatusPill tone="warn" size="sm">⚠ 审计链异常({v.problem})</StatusPill>;
+}
+
+// 某场次的操作审计(只读元数据:谁/何时/做了什么,无患者作答文本)。
+function AuditPanel({ sessionId }: { sessionId: string }) {
+  const [rows, setRows] = useState<AuditEntry[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    api.listAudit({ sessionId }).then(setRows).catch((e) => setErr(e instanceof ApiError ? e.detail : String(e)));
+  }, [sessionId]);
+  return (
+    <section className="form-section">
+      <div className="form-section-header"><div>
+        <h3>操作审计(本场)</h3>
+        <p className="muted">只追加、哈希链防篡改;仅记元数据,不含患者作答文本。</p>
+      </div></div>
+      {err && <Alert tone="danger" title="审计读取失败">{err}</Alert>}
+      {rows && rows.length === 0 && <p className="muted">本场暂无审计记录。</p>}
+      {rows && rows.length > 0 && (
+        <div className="audit-list">
+          {rows.map((r) => (
+            <div className="audit-row" key={r.id}>
+              <span className="audit-ts mono">{r.ts.replace("T", " ").slice(0, 19)}</span>
+              <StatusPill tone="primary" size="sm">{auditActionLabel(r.action)}</StatusPill>
+              <span className="audit-actor">👤 {r.actor}</span>
+              <span className="audit-summary">{r.summary}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {!rows && !err && <StatusPill tone="muted" size="sm">正在加载审计…</StatusPill>}
+    </section>
+  );
+}
 
 // 分析后台:按受试者 → 场次 → 逐环节,回看 AI 判定/提示级/人工锁分/录音,供后期核查
 // "AI 判得对不对、指引对不对"。只读;绝不显示画像(judge_portrait_used 恒 false)。
@@ -32,6 +84,7 @@ export function AnalysisScreen() {
           <h2 className="page-title">数据回看与核查</h2>
           <p className="page-description">按受试者编号进入,回看每场次逐环节的 AI 判定、提示层级、人工锁分和录音,用于核查 AI 判得准不准、指引对不对。</p>
         </div>
+        <IntegrityBadge />
       </header>
       {err && <Alert tone="danger" title="受试者列表加载失败">{err}</Alert>}
       {rows && rows.length === 0 && !err && <Alert tone="info" title="暂无数据">还没有登记受试者或采集数据。</Alert>}
@@ -202,6 +255,8 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
           </section>
         );
       })()}
+
+      <AuditPanel sessionId={sessionId} />
       {!data && !err && <StatusPill tone="muted">正在加载场次逐环节…</StatusPill>}
     </div>
   );
