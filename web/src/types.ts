@@ -33,6 +33,18 @@ export interface Patient {
   registration_no?: string | null;
 }
 
+// 受试者登记表摘要(准备区/训练台/分析后台选择列表;无姓名、无场次编号)。
+export interface PatientSummary {
+  patient_id: string;
+  dementia_severity?: string | null;
+  mandarin_eligible?: boolean | null;
+  consent_type?: ConsentType | null;
+  recording_allowed?: boolean | null;
+  withdrawal_status?: string | null;
+  session_count: number;
+  last_training_date?: string | null;
+}
+
 export interface Session {
   session_id: string;
   patient_id: string;

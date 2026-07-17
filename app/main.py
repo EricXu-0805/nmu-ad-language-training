@@ -83,6 +83,32 @@ def create_patient(p: Patient, s: DBSession = Depends(get_session)):
     return p
 
 
+@app.get("/patients")
+def list_patients(s: DBSession = Depends(get_session)):
+    """受试者登记表(准备区/训练台/分析后台的选择列表)。只出研究编号与合规摘要,无姓名。
+    附场次数与最近训练日,供研究者按编号选人——绝不显示场次编号(那是后台概念)。"""
+    patients = list(s.exec(select(Patient).order_by(Patient.patient_id)))
+    sessions = list(s.exec(select(TrainSession)))
+    by_patient: dict[str, list] = {}
+    for sess in sessions:
+        by_patient.setdefault(sess.patient_id, []).append(sess)
+    out = []
+    for p in patients:
+        rows = by_patient.get(p.patient_id, [])
+        dates = [r.training_date for r in rows if r.training_date]
+        out.append({
+            "patient_id": p.patient_id,
+            "dementia_severity": p.dementia_severity,
+            "mandarin_eligible": p.mandarin_eligible,
+            "consent_type": p.consent_type.value if hasattr(p.consent_type, "value") else p.consent_type,
+            "recording_allowed": p.recording_allowed,
+            "withdrawal_status": p.withdrawal_status,
+            "session_count": len(rows),
+            "last_training_date": max(dates).isoformat() if dates else None,
+        })
+    return out
+
+
 @app.get("/patients/{patient_id}", response_model=Patient)
 def get_patient(patient_id: str, s: DBSession = Depends(get_session)):
     p = s.get(Patient, patient_id)

@@ -10,9 +10,12 @@ import { EVENT_LINES, PHASE_TYPES } from "../types";
 import type { EventLine, PhaseType, Session } from "../types";
 
 // 显式绑定四元组建场次(绝不由 week 推导);绑冻结题库版本;建前做版本一致性断言。
-export function SessionCreateScreen({ patientId, onStarted }: {
+// run 区从登记表选人进来:patientId 锁定、场次编号后台自动生成不呈现(hideSessionId)。
+export function SessionCreateScreen({ patientId, onStarted, onBack, hideSessionId = false }: {
   patientId: string | null;
   onStarted: (s: Session) => void;
+  onBack?: () => void;
+  hideSessionId?: boolean;
 }) {
   const toast = useToast();
   const [pid, setPid] = useState(patientId ?? "");
@@ -68,14 +71,15 @@ export function SessionCreateScreen({ patientId, onStarted }: {
         phase_type: phase, event_line: eventLine, item_bank_version_id: bankVersion,
       };
       const created = await api.createSession(s);
-      toast(`场次 ${created.session_id} 已建立`, "ok");
+      // 红线①:run 区场次编号是后台概念,不呈现——toast 不带 id(否则建场瞬间闪现真实场次号)
+      toast(hideSessionId ? "已开始本次训练" : `场次 ${created.session_id} 已建立`, "ok");
       onStarted(created);
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         // 场次已存在(如误清屏后想续做):直接取回进入,不再是撞墙
         try {
           const existing = await api.getTrainSession(sid);
-          toast(`场次 ${sid} 已存在，已进入继续操作`, "ok");
+          toast(hideSessionId ? "已进入既有场次，继续操作" : `场次 ${sid} 已存在，已进入继续操作`, "ok");
           onStarted(existing);
         } catch { toast("场次已存在，但读取失败，请重试", "danger"); }
       }
@@ -90,9 +94,9 @@ export function SessionCreateScreen({ patientId, onStarted }: {
     <div className="page-shell page-shell--medium">
       <header className="page-header-block">
         <div>
-          <p className="page-kicker">步骤 2 / 4 · 建立场次</p>
-          <h2 className="page-title">设置本次训练安排</h2>
-          <p className="page-description">确认受试者、周次和任务类型。系统会把本场次与当前题库版本固定绑定，避免后续内容混用。</p>
+          <p className="page-kicker">训练台 · 开始本次训练</p>
+          <h2 className="page-title">受试者 {pid || "—"} · 本次安排</h2>
+          <p className="page-description">确认周次和任务类型即可开始。系统会把本场次与当前题库版本固定绑定，避免后续内容混用。</p>
         </div>
         <StatusPill tone={researchReady ? "ok" : bankVersion ? "warn" : "muted"}>
           {researchReady ? "研究可用" : bankVersion ? "仅限模拟" : "正在核对内容"}
@@ -100,22 +104,24 @@ export function SessionCreateScreen({ patientId, onStarted }: {
       </header>
 
       <div className="form-layout">
-        <section className="form-section">
-          <div className="form-section-header">
-            <div>
-              <h3>受试者与场次</h3>
-              <p className="muted">场次编号已自动生成；仅在恢复既有场次时修改。</p>
+        {!hideSessionId && (
+          <section className="form-section">
+            <div className="form-section-header">
+              <div>
+                <h3>受试者与场次</h3>
+                <p className="muted">场次编号已自动生成；仅在恢复既有场次时修改。</p>
+              </div>
             </div>
-          </div>
-          <div className="form-grid">
-            <Field label="受试者研究编号" required>
-              <TextInput value={pid} onChange={(e) => setPid(e.target.value)} required />
-            </Field>
-            <Field label="场次编号" hint="输入已存在的场次编号，可继续该场次" required>
-              <TextInput value={sid} onChange={(e) => setSid(e.target.value)} required />
-            </Field>
-          </div>
-        </section>
+            <div className="form-grid">
+              <Field label="受试者研究编号" required>
+                <TextInput value={pid} onChange={(e) => setPid(e.target.value)} required />
+              </Field>
+              <Field label="场次编号" hint="输入已存在的场次编号，可继续该场次" required>
+                <TextInput value={sid} onChange={(e) => setSid(e.target.value)} required />
+              </Field>
+            </div>
+          </section>
+        )}
 
         <section className="form-section">
           <div className="form-section-header">
@@ -194,9 +200,10 @@ export function SessionCreateScreen({ patientId, onStarted }: {
       </div>
 
       <div className="form-actions">
-        <p className="muted grow">建立后将进入{weekNo === 1 ? "关系建立" : "训练"}工作台。</p>
+        {onBack && <Button onClick={onBack}>返回选人</Button>}
+        <p className="muted grow">开始后将进入{weekNo === 1 ? "关系建立" : "训练"}工作台。</p>
         <Button variant="primary" disabled={busy || !bankVersion || !weekSupported} onClick={submit}>
-          {busy ? "正在建立场次…" : !bankVersion ? "等待内容检查…" : weekSupported ? (researchReady ? "建立场次并开始" : "建立模拟场次") : "当前周次不可开场"}
+          {busy ? "正在开始…" : !bankVersion ? "等待内容检查…" : weekSupported ? (researchReady ? "开始训练" : "开始模拟训练") : "当前周次不可开场"}
         </Button>
       </div>
     </div>

@@ -9,7 +9,11 @@ import { CONSENT_TYPES } from "../types";
 import type { Patient } from "../types";
 
 // 建档 + 合规字段(护栏2 全 nullable,"未评/待SOP"为一等公民)。绝不显示姓名,只用 patient_id。
-export function PatientIntakeScreen({ onReady }: { onReady: (patientId: string) => void }) {
+// context="registry":准备区登记(测试前),文案不提"进入场次";"intake" 保留旧线性流文案。
+export function PatientIntakeScreen({ onReady, context = "intake" }: {
+  onReady: (patientId: string) => void; context?: "intake" | "registry";
+}) {
+  const registry = context === "registry";
   const toast = useToast();
   const [p, setP] = useState<Patient>({ patient_id: "" });
   const [busy, setBusy] = useState(false);
@@ -20,12 +24,12 @@ export function PatientIntakeScreen({ onReady }: { onReady: (patientId: string) 
     setBusy(true);
     try {
       await api.createPatient(p);
-      toast("受试者档案已保存", "ok");
+      toast(registry ? "受试者已登记" : "受试者档案已保存", "ok");
       onReady(p.patient_id);
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         // 已存在不是错误,取回既有档案后继续。
-        toast(`研究编号 ${p.patient_id} 已存在，已进入场次设置`, "info");
+        toast(registry ? `研究编号 ${p.patient_id} 已在登记表中` : `研究编号 ${p.patient_id} 已存在，已进入场次设置`, "info");
         onReady(p.patient_id);
       } else {
         toast(e instanceof ApiError ? e.detail : String(e), "danger");
@@ -39,8 +43,8 @@ export function PatientIntakeScreen({ onReady }: { onReady: (patientId: string) 
     <div className="page-shell page-shell--medium">
       <header className="page-header-block">
         <div>
-          <p className="page-kicker">步骤 1 / 4 · 受试者建档</p>
-          <h2 className="page-title">建立受试者档案</h2>
+          <p className="page-kicker">{registry ? "准备区 · 登记受试者" : "步骤 1 / 4 · 受试者建档"}</p>
+          <h2 className="page-title">{registry ? "登记受试者档案" : "建立受试者档案"}</h2>
           <p className="page-description">
             只填写研究编号和本次训练需要的信息，不录入姓名、身份证号等直接身份信息。
           </p>
@@ -93,8 +97,8 @@ export function PatientIntakeScreen({ onReady }: { onReady: (patientId: string) 
       </div>
 
       <div className="form-actions">
-        <p className="muted grow">保存后将进入本次场次设置，档案不会记录受试者姓名。</p>
-        <Button variant="primary" disabled={busy} onClick={submit}>{busy ? "正在保存…" : "保存档案，进入下一步"}</Button>
+        <p className="muted grow">{registry ? "保存后返回登记表，可继续登记或去训练台选人；档案不记录姓名。" : "保存后将进入本次场次设置，档案不会记录受试者姓名。"}</p>
+        <Button variant="primary" disabled={busy} onClick={submit}>{busy ? "正在保存…" : registry ? "保存登记" : "保存档案，进入下一步"}</Button>
       </div>
     </div>
   );

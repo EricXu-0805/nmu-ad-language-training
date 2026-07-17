@@ -479,6 +479,51 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .workflow-step.is-active,
 .workflow-step[aria-current="step"] { border-color: var(--c-primary); background: var(--c-primary-soft); color: var(--c-primary); font-weight: var(--weight-semibold); }
 .workflow-step.is-complete { border-color: var(--c-ok-line); background: var(--c-ok-bg); color: var(--c-ok-text); }
+
+/* ---------- 工作台三区标签(准备/训练/分析) ---------- */
+.area-tabs { display: inline-flex; gap: 4px; padding: 4px; border-radius: var(--radius); background: var(--c-surface-subtle); border: 1px solid var(--c-line-soft); }
+.area-tab {
+  appearance: none; border: 0; cursor: pointer; white-space: nowrap;
+  padding: var(--sp-2) var(--sp-4); border-radius: var(--radius-sm);
+  background: transparent; color: var(--c-muted); font-size: var(--text-sm); font-weight: var(--weight-semibold);
+}
+.area-tab:hover { color: var(--c-fg); }
+.area-tab.is-active { background: var(--c-primary); color: #fff; box-shadow: var(--shadow-sm); }
+
+/* ---------- 登记表 / 分析表(通用行列) ---------- */
+.registry-table { display: flex; flex-direction: column; gap: 6px; }
+.registry-row {
+  display: grid; grid-template-columns: 1.2fr 1.4fr 0.8fr 0.9fr 1.6fr 0.9fr;
+  align-items: center; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4); border: 1px solid var(--c-line-soft); border-radius: var(--radius-sm);
+  background: var(--c-surface); font-size: var(--text-sm);
+}
+.registry-row.registry-head { background: var(--c-surface-subtle); color: var(--c-muted); font-weight: var(--weight-semibold); }
+
+/* ---------- 训练台选人卡 ---------- */
+.run-picker-card { border: 1px solid var(--c-line-soft); border-radius: var(--radius); background: var(--c-surface); padding: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-3); }
+.run-picker-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; }
+.resume-list { display: flex; flex-direction: column; gap: 6px; border-top: 1px dashed var(--c-line-soft); padding-top: var(--sp-3); }
+.resume-row { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); font-size: var(--text-sm); }
+
+/* ---------- 分析后台 ---------- */
+.analysis-subject-row {
+  appearance: none; text-align: left; cursor: pointer; width: 100%;
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4); border: 1px solid var(--c-line-soft); border-radius: var(--radius-sm);
+  background: var(--c-surface); font-size: var(--text-sm); color: var(--c-fg);
+}
+.analysis-subject-row:hover { border-color: var(--c-primary-line); background: var(--c-primary-soft); }
+.analysis-subject-row > .muted { margin-left: auto; }
+.analysis-turn-card { border: 1px solid var(--c-line-soft); border-radius: var(--radius-sm); background: var(--c-surface); padding: var(--sp-3) var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-2); }
+.analysis-turn-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap; }
+.analysis-turn-body { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; font-size: var(--text-sm); }
+
+@media (max-width: 720px) {
+  .registry-row { grid-template-columns: 1fr 1fr; }
+  .registry-row.registry-head { display: none; }
+  .area-tabs { width: 100%; justify-content: space-between; }
+}
 .workflow-step > :first-child {
   display: inline-grid;
   flex: 0 0 auto;

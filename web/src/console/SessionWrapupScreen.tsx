@@ -12,7 +12,7 @@ import { ratioPct } from "../lib/format";
 import type { AudioAsset, ExportResult, ScoreReconstruction, Session, SessionPlan } from "../types";
 
 // 场次收尾:完整度计 + 评分只读重建 + 音频删除闸门 + 去标识导出。
-export function SessionWrapupScreen({ session, onBack }: { session: Session; onBack?: () => void }) {
+export function SessionWrapupScreen({ session, onBack, onDone }: { session: Session; onBack?: () => void; onDone?: () => void }) {
   const toast = useToast();
   const { journal, upsertAudio, hydrateFromServer } = useSessionJournal(session.session_id);
   const [journalRecovery, setJournalRecovery] = useState<"loading" | "ready" | "error">("loading");
@@ -136,6 +136,7 @@ export function SessionWrapupScreen({ session, onBack }: { session: Session; onB
           </StatusPill>
           {/* 收尾不再是单行道:看到漏锁随时回去补 */}
           {onBack && <Button onClick={onBack}>返回{session.week_no === 1 ? "关系建立" : "训练"}</Button>}
+          {onDone && <Button variant="primary" onClick={onDone}>完成收尾,切换下一位</Button>}
         </div>
       </header>
 

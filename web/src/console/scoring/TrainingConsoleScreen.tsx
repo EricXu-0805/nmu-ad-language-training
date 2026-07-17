@@ -10,6 +10,7 @@ import { isBoundJournalTurnKey, useSessionJournal } from "../../hooks/useSession
 import { useSessionRuntime } from "../../hooks/useSessionRuntime";
 import { flushLiveWrites, useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
 import type { PlanItem, PlanTurn, Session, SessionPlan } from "../../types";
+import { AuthenticatedAudio } from "../AuthenticatedAudio";
 import { SessionControlBar } from "../SessionControlBar";
 import { assertPortraitFree, isRelationRole } from "./vm";
 
@@ -1052,43 +1053,6 @@ function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
   );
 }
 
-function AuthenticatedAudio({ rawAudioId }: { rawAudioId: string }) {
-  const [src, setSrc] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [retry, setRetry] = useState(0);
-
-  useEffect(() => {
-    let cancelled = false;
-    let objectUrl: string | null = null;
-    setSrc(null);
-    setError(null);
-    api.getAudioBlob(rawAudioId)
-      .then((blob) => {
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setSrc(objectUrl);
-      })
-      .catch((cause: unknown) => {
-        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
-      });
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [rawAudioId, retry]);
-
-  if (error) {
-    return (
-      <span className="row wrap">
-        <StatusPill tone="warn">回放未载入</StatusPill>
-        <Button onClick={() => setRetry((value) => value + 1)}>重试回放</Button>
-      </span>
-    );
-  }
-  if (!src) return <StatusPill tone="muted">正在准备回放…</StatusPill>;
-  return <audio controls preload="metadata" src={src} style={{ height: 36 }} />;
-}
-
 // ---------------- 按角色切换的锁分控件 ----------------
 function LockControl({ taskType, role, suggestedPromptLevel = 0, onLock, locking = false, basis, confirmedText, unsavedConfirm, active = false }: {
   taskType: string; role: string; suggestedPromptLevel?: number;
@@ -1180,7 +1144,7 @@ function FailClosed({ msg, onRetry, onExit }: { msg: string; onRetry?: () => voi
       <p>题库版本不一致或计划加载失败时，系统不会继续呈现题目，以保护研究数据。恢复后可直接重试，无需更换受试者。</p>
       <div className="row wrap">
         {onRetry && <Button variant="primary" onClick={onRetry}>重试</Button>}
-        {onExit && <Button onClick={onExit}>返回场次设置</Button>}
+        {onExit && <Button onClick={onExit}>返回选人</Button>}
       </div>
       </div>
     </div>

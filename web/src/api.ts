@@ -3,7 +3,7 @@
 import type {
   AbnormalEvent, AudioAsset, ExportResult, ItemBankInfo, ItemEvent,
   LiveStateResponse, Patient, PatientHeartbeatRequest, PatientHeartbeatResponse,
-  ScaleResult, ScoreReconstruction, Session, SessionPlan, SessionRuntimeState, TurnEvent,
+  PatientSummary, ScaleResult, ScoreReconstruction, Session, SessionPlan, SessionRuntimeState, TurnEvent,
 } from "./types";
 
 export class ApiError extends Error {
@@ -69,6 +69,8 @@ export const api = {
   // 患者 / 场次
   createPatient: (p: Patient) => req<Patient>("POST", "/patients", p),
   getPatient: (id: string) => req<Patient>("GET", `/patients/${encodeURIComponent(id)}`),
+  listPatients: () => req<PatientSummary[]>("GET", "/patients"),
+  patientSessions: (id: string) => req<Session[]>("GET", `/patients/${encodeURIComponent(id)}/sessions`),
   createSession: (s: Session) => req<Session>("POST", "/sessions", s),
   getTrainSession: (sid: string) => req<Session>("GET", `/sessions/${encodeURIComponent(sid)}`),
   sessionJournal: (sid: string) => req<{
