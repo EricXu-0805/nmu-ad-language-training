@@ -117,9 +117,9 @@ def test_tts_engine_selection(monkeypatch):
     monkeypatch.setenv("TTS_ENGINE", "auto")
     assert not getattr(tts.get_engine(), "cloud", False)  # 无 Key:auto 落本地
     monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    assert isinstance(tts.get_engine(), tts.DashScopeQwenTtsEngine)   # auto=小语主音色苏瑶
+    monkeypatch.setenv("TTS_ENGINE", "cosyvoice")
     assert isinstance(tts.get_engine(), tts.DashScopeCosyVoiceEngine)
-    monkeypatch.setenv("TTS_ENGINE", "qwen-tts")
-    assert isinstance(tts.get_engine(), tts.DashScopeQwenTtsEngine)
     monkeypatch.setenv("TTS_ENGINE", "null")
     assert isinstance(tts.get_engine(), tts.NullTtsEngine)
 
@@ -139,13 +139,36 @@ def test_bad_rate_env_never_crashes_chain(monkeypatch, tmp_path):
     monkeypatch.setenv("TTS_ENGINE", "auto")
     monkeypatch.setenv("TTS_CLOUD_RATE", "0,9")           # 配置坏值(逗号小数)
     eng = tts.get_engine()                                # 不许抛:回退默认语速
-    assert isinstance(eng, tts.DashScopeCosyVoiceEngine) and eng._rate == 0.9
+    assert isinstance(eng, tts.DashScopeQwenTtsEngine) and eng._rate == 0.9
     monkeypatch.setattr(tts, "_engine", None)
     monkeypatch.setenv("TTS_VOICE_PATH", str(tmp_path / "missing.onnx"))
-    monkeypatch.setattr(tts.DashScopeCosyVoiceEngine, "_call", lambda self, t: None)
+    monkeypatch.setattr(tts.DashScopeQwenTtsEngine, "_call", lambda self, t: None)
     data, _, _ = tts.speak("您好")                        # 全链不 500,只降级
     assert data is None
     monkeypatch.setattr(tts, "_engine", None)
+
+
+def test_qwen_tts_rate_in_cache_key_and_call(monkeypatch):
+    # 语速必须进缓存键:调 TTS_CLOUD_RATE 后旧速缓存自然失效,不会全场命中旧语速
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    a = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena", speech_rate=0.9)
+    b = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena", speech_rate=0.8)
+    assert a.cache_params != b.cache_params
+    seen = {}
+
+    class FakeMMC:
+        @staticmethod
+        def call(**kw):
+            seen.update(kw)
+
+            class R:
+                output = None
+            return R()
+
+    import dashscope
+    monkeypatch.setattr(dashscope, "MultiModalConversation", FakeMMC)
+    a.synthesize("您好")
+    assert seen.get("speech_rate") == 0.9                 # 语速真传到了 API
 
 
 def test_cosyvoice_partial_audio_not_cached(monkeypatch, tmp_path):

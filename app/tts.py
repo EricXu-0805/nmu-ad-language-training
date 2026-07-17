@@ -7,12 +7,14 @@
      同句只出一次网;预合成脚本 scripts/presynthesize_tts.py 可离线打满缓存。
 
 引擎(TTS_ENGINE 选择,默认 auto):
-- auto:有 DASHSCOPE_API_KEY → cosyvoice;无 → piper;piper 模型也缺 → null。
-- cosyvoice:阿里百炼 cosyvoice-v2(TTS_COSY_MODEL),音色 longyuan_v2 龙媛
-  (TTS_COSY_VOICE),显式语速 TTS_CLOUD_RATE(默认 0.9,老人节奏)。
-  (v3-plus 需工作空间单独开通;当前 Key 的空间未开,默认落 v2——同款龙媛音色。)
+- auto:有 DASHSCOPE_API_KEY → qwen-tts(Eric 2026-07-17 耳测拍板:苏瑶,龙媛偏闷);
+  无 → piper;piper 模型也缺 → null。
 - qwen-tts:阿里百炼 qwen3-tts-flash(TTS_QWEN_MODEL),音色 Serena 苏瑶
-  (TTS_QWEN_VOICE,温柔女声);无语速参数,供与 cosyvoice 耳测对比。
+  (TTS_QWEN_VOICE,温柔女声),语速 TTS_CLOUD_RATE(默认 0.9,老人节奏——
+  speech_rate 参数官方文档未列但真机实测有效:0.7 时音频时长 +39%≈1/0.7)。
+- cosyvoice:阿里百炼 cosyvoice-v2(TTS_COSY_MODEL),音色 longyuan_v2 龙媛
+  (TTS_COSY_VOICE),同用 TTS_CLOUD_RATE;耳测备选。
+  (v3-plus 需工作空间单独开通;当前 Key 的空间未开,默认落 v2——同款龙媛音色。)
   (模型/音色环境变量按引擎分家——共用一个变量做 A/B 耳测会互相污染。)
 - piper:本地 onnx(TTS_VOICE_PATH,默认 data/tts/zh_CN-huayan-medium.onnx),
   云端不可用/文本不在白名单时的降级层;文本不出机器,无白名单限制。
@@ -118,15 +120,18 @@ class DashScopeCosyVoiceEngine:
 
 
 class DashScopeQwenTtsEngine:
-    """阿里百炼 qwen3-tts-flash 云合成。无显式语速参数;与 cosyvoice 耳测对比用。"""
+    """阿里百炼 qwen3-tts-flash 云合成(小语主音色:苏瑶)。
+    speech_rate 官方文档未列但真机实测有效(0.7→时长+39%≈1/0.7);万一后端哪天
+    静默丢弃该参数,只是回到常速,不炸链路。"""
 
     cloud = True
-    cache_params = ""
 
-    def __init__(self, model: str, voice: str):
+    def __init__(self, model: str, voice: str, speech_rate: float = 1.0):
         self._model = model
         self._voice = voice
+        self._rate = speech_rate
         self.version = f"dashscope/{model}/{voice}"
+        self.cache_params = f"speech_rate={speech_rate}"
 
     def available(self) -> bool:
         return bool(os.environ.get("DASHSCOPE_API_KEY"))
@@ -158,6 +163,7 @@ class DashScopeQwenTtsEngine:
         from dashscope import MultiModalConversation
         resp = MultiModalConversation.call(model=self._model, text=text, voice=self._voice,
                                            language_type="Chinese", stream=False,
+                                           speech_rate=self._rate,
                                            request_timeout=15)
         out = getattr(resp, "output", None)
         audio = getattr(out, "audio", None) if out is not None else None
@@ -176,7 +182,8 @@ def _cloud_engine(kind: str) -> TtsProvider:
     if kind == "qwen-tts":
         return DashScopeQwenTtsEngine(
             model=os.environ.get("TTS_QWEN_MODEL", "qwen3-tts-flash"),
-            voice=os.environ.get("TTS_QWEN_VOICE", "Serena"))
+            voice=os.environ.get("TTS_QWEN_VOICE", "Serena"),
+            speech_rate=_env_float("TTS_CLOUD_RATE", 0.9))
     return DashScopeCosyVoiceEngine(
         model=os.environ.get("TTS_COSY_MODEL", "cosyvoice-v2"),
         voice=os.environ.get("TTS_COSY_VOICE", "longyuan_v2"),
@@ -193,7 +200,7 @@ def get_engine() -> TtsProvider:
     if kind == "null":
         return NullTtsEngine()
     if kind == "auto":
-        kind = "cosyvoice" if os.environ.get("DASHSCOPE_API_KEY") else "piper"
+        kind = "qwen-tts" if os.environ.get("DASHSCOPE_API_KEY") else "piper"
     if kind in ("cosyvoice", "qwen-tts"):
         eng = _cloud_engine(kind)
         if eng.available():
