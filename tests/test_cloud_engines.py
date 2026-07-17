@@ -66,7 +66,7 @@ def cloud_tts(monkeypatch, tmp_path):
         return _wav()
 
     monkeypatch.setattr(tts.DashScopeCosyVoiceEngine, "_call", fake_call)
-    eng = tts.DashScopeCosyVoiceEngine("cosyvoice-v3-plus", "longyuan_v3", 0.9)
+    eng = tts.DashScopeCosyVoiceEngine("cosyvoice-v2", "longyuan_v2", 0.9)
     monkeypatch.setattr(tts, "_engine", eng)
     yield eng, calls
     monkeypatch.setattr(tts, "_engine", None)
@@ -107,7 +107,7 @@ def test_cloud_tts_failure_falls_back_to_piper(monkeypatch, tmp_path):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(tts.DashScopeCosyVoiceEngine, "_call", boom)
-    monkeypatch.setattr(tts, "_engine", tts.DashScopeCosyVoiceEngine("cosyvoice-v3-plus", "longyuan_v3", 0.9))
+    monkeypatch.setattr(tts, "_engine", tts.DashScopeCosyVoiceEngine("cosyvoice-v2", "longyuan_v2", 0.9))
     data, ver, _ = tts.speak("您好")
     monkeypatch.setattr(tts, "_engine", None)
     assert data and ver.startswith("piper/")             # 云挂了,本地引擎顶上
@@ -161,7 +161,7 @@ def test_cosyvoice_partial_audio_not_cached(monkeypatch, tmp_path):
 
     import dashscope.audio.tts_v2 as tts_v2
     monkeypatch.setattr(tts_v2, "SpeechSynthesizer", FakeSynth)
-    eng = tts.DashScopeCosyVoiceEngine("cosyvoice-v3-plus", "longyuan_v3", 0.9)
+    eng = tts.DashScopeCosyVoiceEngine("cosyvoice-v2", "longyuan_v2", 0.9)
     assert eng.synthesize("您好") is None
 
     class FakeSynthOk(FakeSynth):
@@ -170,6 +170,43 @@ def test_cosyvoice_partial_audio_not_cached(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tts_v2, "SpeechSynthesizer", FakeSynthOk)
     assert eng.synthesize("您好") is not None
+
+
+def test_qwen_tts_downloads_http_oss_url_over_https(monkeypatch):
+    # 回归:qwen3-tts-flash 常只回 http:// 的 OSS 临时地址,旧代码只认 https:// → 把成功结果丢了。
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    eng = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena")
+    monkeypatch.setattr(eng, "_call",
+                        lambda text: {"data": "", "url": "http://oss-cn-beijing.example.com/a.wav?sig=x"})
+    got = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"RIFF" + b"\x00" * 2000
+
+    def fake_urlopen(url, timeout=15):
+        got["url"] = url
+        return FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    out = eng.synthesize("您好")
+    assert out and out.startswith(b"RIFF")
+    assert got["url"].startswith("https://")              # http→https 升级,签名不变,不走明文
+
+
+def test_qwen_tts_uses_inline_base64_when_present(monkeypatch):
+    import base64
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    eng = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena")
+    raw = b"RIFF" + b"\x00" * 100
+    monkeypatch.setattr(eng, "_call", lambda text: {"data": base64.b64encode(raw).decode(), "url": ""})
+
+    def no_net(*a, **k):
+        raise AssertionError("有内联 base64 就不该再下载 URL")
+
+    monkeypatch.setattr("urllib.request.urlopen", no_net)
+    assert eng.synthesize("您好") == raw
 
 
 def test_fallback_piper_singleton_reused(monkeypatch, tmp_path):

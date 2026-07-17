@@ -8,8 +8,9 @@
 
 引擎(TTS_ENGINE 选择,默认 auto):
 - auto:有 DASHSCOPE_API_KEY → cosyvoice;无 → piper;piper 模型也缺 → null。
-- cosyvoice:阿里百炼 cosyvoice-v3-plus(TTS_COSY_MODEL),音色 longyuan_v3 龙媛
+- cosyvoice:阿里百炼 cosyvoice-v2(TTS_COSY_MODEL),音色 longyuan_v2 龙媛
   (TTS_COSY_VOICE),显式语速 TTS_CLOUD_RATE(默认 0.9,老人节奏)。
+  (v3-plus 需工作空间单独开通;当前 Key 的空间未开,默认落 v2——同款龙媛音色。)
 - qwen-tts:阿里百炼 qwen3-tts-flash(TTS_QWEN_MODEL),音色 Serena 苏瑶
   (TTS_QWEN_VOICE,温柔女声);无语速参数,供与 cosyvoice 耳测对比。
   (模型/音色环境变量按引擎分家——共用一个变量做 A/B 耳测会互相污染。)
@@ -144,9 +145,12 @@ class DashScopeQwenTtsEngine:
             except Exception:
                 return None
         url = audio.get("url")
-        if url and url.startswith("https://"):
+        if url and url.startswith(("http://", "https://")):
+            # 百炼 qwen3-tts 常只回 http:// 的 OSS 临时地址;OSS 查询串签名与 scheme 无关,
+            # 强制升 https 下载(不走明文),旧代码只认 https:// 会把成功结果整个丢弃。
             import urllib.request
-            with urllib.request.urlopen(url, timeout=15) as r:  # noqa: S310 —— 百炼返回的音频临时下载地址
+            secure = "https://" + url.split("://", 1)[1]
+            with urllib.request.urlopen(secure, timeout=15) as r:  # noqa: S310 —— 百炼签名临时下载地址
                 return r.read()
         return None
 
@@ -174,8 +178,8 @@ def _cloud_engine(kind: str) -> TtsProvider:
             model=os.environ.get("TTS_QWEN_MODEL", "qwen3-tts-flash"),
             voice=os.environ.get("TTS_QWEN_VOICE", "Serena"))
     return DashScopeCosyVoiceEngine(
-        model=os.environ.get("TTS_COSY_MODEL", "cosyvoice-v3-plus"),
-        voice=os.environ.get("TTS_COSY_VOICE", "longyuan_v3"),
+        model=os.environ.get("TTS_COSY_MODEL", "cosyvoice-v2"),
+        voice=os.environ.get("TTS_COSY_VOICE", "longyuan_v2"),
         speech_rate=_env_float("TTS_CLOUD_RATE", 0.9))
 
 

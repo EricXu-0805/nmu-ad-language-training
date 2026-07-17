@@ -48,7 +48,7 @@ def main() -> int:
     lines = collect_lines()
     bill = sum(_billing_chars(t) for t in lines)
     print(f"白名单话术 {len(lines)} 句,计费 {bill} 字符(汉字按2计)"
-          f"(cosyvoice-v3-plus 约 {bill * 2.0 / 10000:.2f} 元,qwen3-tts-flash 约 {bill * 0.8 / 10000:.2f} 元;"
+          f"(cosyvoice-v2 约 {bill * 2.0 / 10000:.2f} 元,qwen3-tts-flash 约 {bill * 0.8 / 10000:.2f} 元;"
           f"各模型另有免费额度)")
     if args.dry_run:
         for t in lines:
