@@ -3,7 +3,9 @@ import { api, ApiError } from "../api";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
-import type { PatientSummary, PatientWithdrawalReceipt } from "../types";
+import { useToast } from "../components/ToastContext";
+import type { PatientSummary, PatientWithdrawalReceipt, Session } from "../types";
+import { QUICK_DRILL_CONTEXT_LABEL, runQuickDrill } from "./quickDrill";
 import { DataBoundaryBadge, DataBoundaryFilter } from "./DataBoundaryFilter";
 import { PatientIntakeScreen } from "./PatientIntakeScreen";
 import {
@@ -23,12 +25,24 @@ import { VisitPlanCreateScreen } from "./VisitPlanCreateScreen";
 import { WithdrawnAudioGovernancePanel } from "./WithdrawnAudioGovernancePanel";
 import { WITHDRAWAL_REASON_LABELS } from "./subjectWithdrawal";
 
+// 准备区流程模式:研究规范(默认多步)vs 快速演练(仅模拟档案一键 create→审核→开场)。
+// 只存本机偏好,不影响任何服务端门禁;换账号/设备各自独立。
+type PrepFlowMode = "research" | "quickDrill";
+const FLOW_MODE_KEY = "nmu:prep:flowMode";
+function loadPrepFlowMode(): PrepFlowMode {
+  try { return localStorage.getItem(FLOW_MODE_KEY) === "quickDrill" ? "quickDrill" : "research"; }
+  catch { return "research"; }
+}
+
 // 准备区把建档、量表与训练安排合成一条测试前工作流。床旁训练台只消费已审核安排，
 // 不再让研究人员临场填写周次、阶段、任务线或场次编号。
-export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null }: {
+// onSessionStarted(可选):快速演练一键开场后,把服务端权威场次交回外壳直挂床旁。
+export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null, onSessionStarted }: {
   canManagePlans?: boolean;
   actorRole?: string | null;
+  onSessionStarted?: (session: Session) => void;
 }) {
+  const toast = useToast();
   const [rows, setRows] = useState<PatientSummary[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
@@ -39,7 +53,30 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null 
   const [withdrawalFor, setWithdrawalFor] = useState<PatientSummary | null>(null);
   const [withdrawalReceipt, setWithdrawalReceipt] = useState<PatientWithdrawalReceipt | null>(null);
   const [refreshGate] = useState(() => createSubjectRegistryRefreshGate());
+  const [flowMode, setFlowMode] = useState<PrepFlowMode>(loadPrepFlowMode);
+  const [quickDrillBusy, setQuickDrillBusy] = useState<string | null>(null);
   const canRegisterWithdrawal = actorRole === "admin";
+  const quickDrillEnabled = Boolean(onSessionStarted) && canManagePlans;
+
+  const selectFlowMode = (next: PrepFlowMode) => {
+    setFlowMode(next);
+    try { localStorage.setItem(FLOW_MODE_KEY, next); } catch { /* 存储不可用不阻塞流程 */ }
+  };
+
+  // 一键演练:仅对模拟档案,原子走服务端 create→approve→start,成功即把场次交回外壳。
+  // 失败(如同槽位已有安排/内容未冻结)平静提示,绝不静默;不改任何服务端门禁。
+  const startQuickDrill = useCallback(async (patientId: string) => {
+    if (!onSessionStarted || quickDrillBusy) return;
+    setQuickDrillBusy(patientId);
+    try {
+      const session = await runQuickDrill(api, patientId);
+      onSessionStarted(session); // 成功即切走本屏,不再回写本组件状态
+    } catch (e) {
+      const detail = e instanceof ApiError ? e.detail : e instanceof Error ? e.message : String(e);
+      toast(`一键演练开训未成功：${detail}`, "danger");
+      setQuickDrillBusy(null);
+    }
+  }, [onSessionStarted, quickDrillBusy, toast]);
 
   // `mode` is an in-page route. Without resetting the viewport, a long intake form
   // leaves the following plan screen half way down the page and hides its title.
@@ -81,7 +118,9 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null 
           setPlanPatientId(patientId);
           setMode("plan");
           setNonce((n) => n + 1);
-        }} />
+        }} onQuickDrill={flowMode === "quickDrill" && quickDrillEnabled
+          ? (patientId) => { void startQuickDrill(patientId); }
+          : undefined} />
         {/* 返回也刷新列表：建档请求可能已完成，不能因后续网络失败把新档案隐藏。 */}
         <div className="form-actions"><Button onClick={() => { setMode("list"); setNonce((n) => n + 1); }}>返回登记表</Button></div>
       </div>
@@ -110,6 +149,29 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null 
           title={!canManagePlans ? "当前账号为只读角色" : undefined}
           onClick={() => setMode("new")}>登记新受试者</Button>
       </header>
+
+      {quickDrillEnabled && (
+        <section className="form-section" role="group" aria-label="准备区流程模式">
+          <div className="form-section-header">
+            <div>
+              <h3>流程模式</h3>
+              <p className="muted">
+                {flowMode === "quickDrill"
+                  ? `快速演练:对模拟档案一键 建档→创建安排→审核→开场（${QUICK_DRILL_CONTEXT_LABEL}）。全程仍逐步走服务端计划账本、不绕过任何门禁；真实受试者永远走规范多步流程。`
+                  : "研究规范（默认）：建档 → 创建训练安排 → 审核 → 训练台开场的多步流程。"}
+              </p>
+            </div>
+            <div className="toolbar" role="radiogroup" aria-label="选择准备区流程模式">
+              <Button variant={flowMode === "research" ? "primary" : undefined}
+                aria-pressed={flowMode === "research"}
+                onClick={() => selectFlowMode("research")}>研究规范流程</Button>
+              <Button variant={flowMode === "quickDrill" ? "primary" : undefined}
+                aria-pressed={flowMode === "quickDrill"}
+                onClick={() => selectFlowMode("quickDrill")}>快速演练（仅模拟）</Button>
+            </div>
+          </div>
+        </section>
+      )}
 
       {err && <Alert tone="danger" title="登记表加载失败" actions={<Button onClick={reload}>重试</Button>}>{err}</Alert>}
       {withdrawalReceipt && (
@@ -218,6 +280,14 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null 
                     onClick={() => { setPlanPatientId(r.patient_id); setMode("plan"); }}>
                     {classification === "simulation" ? "安排模拟演练" : "安排训练"}
                   </Button>
+                  {flowMode === "quickDrill" && quickDrillEnabled
+                    && classification === "simulation" && !r.withdrawal_status && (
+                    <Button variant="primary" disabled={quickDrillBusy !== null}
+                      title={`一键 建档已完成 → 审核 → 开场（${QUICK_DRILL_CONTEXT_LABEL}）；不绕过服务端计划账本`}
+                      onClick={() => { void startQuickDrill(r.patient_id); }}>
+                      {quickDrillBusy === r.patient_id ? "正在开场…" : "一键演练开训"}
+                    </Button>
+                  )}
               </span>
             </div>
             );

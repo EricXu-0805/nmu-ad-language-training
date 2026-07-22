@@ -297,7 +297,8 @@ function ConsoleWorkspace({ identity, onLogout }: {
             </Alert>
           )}
           {state.area === "prep" && <SubjectRegistryScreen
-            canManagePlans={canOperateTraining} actorRole={identity?.role ?? null} />}
+            canManagePlans={canOperateTraining} actorRole={identity?.role ?? null}
+            onSessionStarted={(s) => dispatch({ t: "sessionStarted", session: s })} />}
           {state.area === "analyze" && <AnalysisScreen />}
           {state.area === "run" && state.screen === "picker" && (
             <RunPickerScreen

@@ -29,8 +29,11 @@ interface DuplicateReview {
 // 建档 + 合规字段(护栏2 全 nullable,"未评/待SOP"为一等公民)。绝不显示姓名,只用 patient_id。
 // context="registry":准备区登记(测试前),文案不提"进入场次";"intake" 仅保留兼容文案。
 // onCreatePlan(仅 registry):保存档案后继续填写并审核测试前训练安排，不直接开训。
-export function PatientIntakeScreen({ onReady, onCreatePlan, context = "intake" }: {
-  onReady: (patientId: string) => void; onCreatePlan?: (patientId: string) => void; context?: "intake" | "registry";
+// onQuickDrill(仅 registry 快速演练模式,且仅对模拟档案生效):保存后一键原子演练开训,
+//   不绕过服务端计划账本;真实受试者永远走 onCreatePlan 的规范多步流程。
+export function PatientIntakeScreen({ onReady, onCreatePlan, onQuickDrill, context = "intake" }: {
+  onReady: (patientId: string) => void; onCreatePlan?: (patientId: string) => void;
+  onQuickDrill?: (patientId: string) => void; context?: "intake" | "registry";
 }) {
   const registry = context === "registry";
   const toast = useToast();
@@ -442,12 +445,17 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, context = "intake" 
           <Button disabled={busy} onClick={() => submit(onReady)}>仅保存登记</Button>
         )}
         <Button variant="primary" disabled={busy}
-          onClick={() => submit(registry && onCreatePlan ? onCreatePlan : onReady)}>
+          onClick={() => submit(
+            onQuickDrill && p.is_simulation_subject && purposeConfirmed === "simulation"
+              ? onQuickDrill
+              : registry && onCreatePlan ? onCreatePlan : onReady)}>
           {busy
             ? "正在保存…"
-            : p.is_simulation_subject && purposeConfirmed === "simulation"
-              ? onCreatePlan ? "保存专用模拟档案并安排演练" : "保存专用模拟档案"
-              : registry ? (onCreatePlan ? "保存并创建训练安排" : "保存登记") : "保存档案，进入下一步"}
+            : onQuickDrill && p.is_simulation_subject && purposeConfirmed === "simulation"
+              ? "保存模拟档案并一键演练开训"
+              : p.is_simulation_subject && purposeConfirmed === "simulation"
+                ? onCreatePlan ? "保存专用模拟档案并安排演练" : "保存专用模拟档案"
+                : registry ? (onCreatePlan ? "保存并创建训练安排" : "保存登记") : "保存档案，进入下一步"}
         </Button>
       </div>
 
