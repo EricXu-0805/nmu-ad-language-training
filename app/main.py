@@ -1654,6 +1654,20 @@ def _visit_plan_write_conflict(s: DBSession, exc: IntegrityError) -> NoReturn:
     }) from exc
 
 
+def _visit_plan_audit_summary(
+        result: visit_plan_contract.VisitPlanReceipt) -> str:
+    """训练安排审计只保留研究者可理解的受控元数据。
+
+    plan_id 是后台并发/幂等绑定键，不是业务语义；将它写入可视审计
+    摘要会让分析界面泄露内部编号。关联性由 AuditLog.patient_id/session_id
+    的结构化列保留，摘要不再重复 opaque id。
+    """
+    return (
+        f"status={result.status} revision={result.revision} "
+        f"date={result.scheduled_date.isoformat()} week={result.week_no}"
+    )
+
+
 @app.post(
     "/visit-plans",
     response_model=visit_plan_contract.VisitPlanReceipt,
@@ -1680,8 +1694,7 @@ def create_visit_plan(
             _visit_plan_write_conflict(s, exc)
     _audit(
         s, request, "visit_plan_create",
-        f"plan={result.plan_id} status={result.status} revision={result.revision} "
-        f"date={result.scheduled_date.isoformat()} week={result.week_no}",
+        _visit_plan_audit_summary(result),
         patient_id=result.patient_id,
     )
     return result
@@ -1778,8 +1791,7 @@ def _mutate_visit_plan(
             _visit_plan_write_conflict(s, exc)
     _audit(
         s, request, f"visit_plan_{action}",
-        f"plan={result.plan_id} status={result.status} revision={result.revision} "
-        f"date={result.scheduled_date.isoformat()} week={result.week_no}",
+        _visit_plan_audit_summary(result),
         patient_id=result.patient_id,
         session_id=result.session_id,
     )
@@ -1837,8 +1849,7 @@ def cancel_visit_plan(
             _visit_plan_write_conflict(s, exc)
     _audit(
         s, request, "visit_plan_cancel",
-        f"plan={result.plan_id} status={result.status} revision={result.revision} "
-        f"date={result.scheduled_date.isoformat()} week={result.week_no}",
+        _visit_plan_audit_summary(result),
         patient_id=result.patient_id,
     )
     return result

@@ -833,6 +833,27 @@ def test_approve_today_queue_and_start_form_one_atomic_idempotent_vertical(
         assert runtime.session_id == started["session_id"]
         assert (runtime.status, runtime.revision) == ("active", 0)
 
+        visit_audits = list(session.exec(select(AuditLog).where(
+            AuditLog.action.in_({
+                "visit_plan_create",
+                "visit_plan_approve",
+                "visit_plan_start",
+            }),
+            AuditLog.patient_id == "P-VISIT-03",
+        )))
+        # Exact command replays are themselves visible audit reads of the
+        # authoritative receipt, so this flow records create + two approve +
+        # two start entries.  Every projection must still omit the opaque key.
+        assert len(visit_audits) == 5
+        assert all(created["plan_id"] not in row.summary
+                   for row in visit_audits)
+        assert all("plan=" not in row.summary for row in visit_audits)
+        assert {row.action for row in visit_audits} == {
+            "visit_plan_create",
+            "visit_plan_approve",
+            "visit_plan_start",
+        }
+
     after_start = visit_clients.researcher.get("/visit-plans/today")
     assert after_start.status_code == 200, after_start.text
     assert after_start.json()["plans"] == []

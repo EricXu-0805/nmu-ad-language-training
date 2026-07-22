@@ -19,13 +19,7 @@ import {
   sessionDataClassification,
   type DataClassification,
 } from "./dataClassification";
-
-// 审计动作码 → 中文标签
-const AUDIT_ACTION_LABELS: Record<string, string> = {
-  score_lock: "锁分", scale_record: "录量表", abnormal: "异常/介入",
-  audio_delete: "删录音", data_export: "导出", login: "登录",
-};
-const auditActionLabel = (a: string) => AUDIT_ACTION_LABELS[a] ?? a;
+import { auditActionLabel, auditDisplaySummary } from "./auditPresentation";
 
 // 全局审计链完整性徽标:重算哈希链 + 比对高水位锚点,报告改动/删除。
 function IntegrityBadge() {
@@ -83,7 +77,7 @@ function AuditPanel({ sessionId }: { sessionId: string }) {
               <span className="audit-ts mono">{r.ts.replace("T", " ").slice(0, 19)}</span>
               <StatusPill tone="primary" size="sm">{auditActionLabel(r.action)}</StatusPill>
               <span className="audit-actor">操作者 {r.actor}</span>
-              <span className="audit-summary">{r.summary}</span>
+              <span className="audit-summary">{auditDisplaySummary(r)}</span>
             </div>
           ))}
         </div>
