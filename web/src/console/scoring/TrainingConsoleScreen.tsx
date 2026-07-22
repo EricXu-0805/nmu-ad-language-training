@@ -30,6 +30,7 @@ import { SessionControlBar } from "../SessionControlBar";
 import { SessionAbortControl } from "../SessionAbortControl";
 import { autopilotFailureKindForErrorCode, cueTypeForPrompt, decideAttemptProcessResult } from "./attemptEvidence";
 import { answerTimeoutAction, canReleaseAutopilotFailure, makeAutopilotFailure, type AutopilotFailure, type AutopilotFailureKind } from "./autopilotSafety";
+import { decideAudioSavedAutomation, retireLegacyAudioSavedAutoAdvancePreference } from "./audioSavedProgressSafety";
 import { bedsideOperationIsCurrent, captureBedsideOperation, type BedsideOperationFence } from "./bedsideOperationFence";
 import { ServerAutopilotControl } from "./ServerAutopilotControl";
 import type { AutopilotConsoleState } from "../../autopilot/startControl";
@@ -114,11 +115,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   const [recoveryApplied, setRecoveryApplied] = useState(false);
   const [itemIdx, setItemIdx] = useState(journal.cursor.itemIdx);
   const [turnIdx, setTurnIdx] = useState(journal.cursor.turnIdx);
-  // 收到老人端录音回报即自动推进下一环节——老人"点开始→说→我说好了"就能自走全场。
-  // 关掉则回到研究者逐环节手动推进(需要当场转写/锁分时用)。
-  const [autoAdvance, setAutoAdvance] = useState(() => {
-    try { return localStorage.getItem("nmu:console:autoAdvance") !== "0"; } catch { return true; }
-  });
+  useEffect(() => retireLegacyAudioSavedAutoAdvancePreference(localStorage), []);
   // 自动驾驶:AI 听→判→固定话术反馈→提示升级→推进;人工随时可关(接管)。默认关。
   // 旧的浏览器本地自动驾驶不再从持久化开关恢复。服务器 P0a 必须由研究者
   // 在当前模拟场次显式启动；否则刷新会在无人确认时重新成为第二驾驶员。
@@ -176,11 +173,6 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   // 用它做去重闸:自动收麦后迟到的旧录音回报(apAwaitingAnswer 已假)不再驱动状态机。
   const apAwaitingAnswer = useRef(false);
   const apMicSeenActive = useRef(false);
-  const toggleAutoAdvance = () => setAutoAdvance((v) => {
-    const n = !v;
-    try { localStorage.setItem("nmu:console:autoAdvance", n ? "1" : "0"); } catch { /* 私隐模式等 */ }
-    return n;
-  });
   // 录音资格 fail-closed:确认拿到患者档案前不允许 arm(获取失败若默认放行,
   // recording_allowed=false 的受试者会被开麦——合规护栏静默失效)。
   const [recStatus, setRecStatus] = useState<"loading" | "error" | "denied" | "allowed">("loading");
@@ -545,9 +537,6 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
 
   // 老人端录完 → 建 turn 的音频入参在此暂存(按 turnKey)
   useAudioSaved((m) => {
-    // ★跨场次过滤:live state 会保留最近一条 audioSaved；别场次的回报若被记入本场
-    // journal,会诱导跨场串绑——一律丢弃。
-    if (m.sessionId !== session.session_id) return;
     // 重放判定:操作端刷新后轮询会把最后一条回报再送一遍(内存 seen 集刷新即空)。
     // journal 持久化,里面已有的 rawAudioId 一律按重放处理:记录性动作照做(幂等),
     // 但绝不触发自动推进——否则每次刷新老人端都被顶走一题。
@@ -555,6 +544,18 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     // 迟到回报(非当前环节)只做记账:watchdog 可能正在为"当前环节"守着,清了它
     // 会吞掉真正的超时告警;armed→idle 写回若以当前环节身份发出,会掐断刚示意的新录音。
     const isCurrent = m.turnKey === turnK;
+    const automationAction = decideAudioSavedAutomation({
+      sameSession: m.sessionId === session.session_id,
+      sameTurn: isCurrent,
+      alreadyRecorded: isReplay,
+      safetyFailureLatched: apFailureLatched.current,
+      manualTakeoverForTurn: apManualTakeoverTurn.current === turnK,
+      adjudicationEnabled: autoPilot,
+      interactionBlocked: manualInteractionBlocked,
+    });
+    // ★跨场次过滤:live state 会保留最近一条 audioSaved；别场次的回报若被记入本场
+    // journal,会诱导跨场串绑——一律丢弃。
+    if (automationAction === "ignore") return;
     setPendingAudio((prev) => ({ ...prev, [m.turnKey]: { rawAudioId: m.rawAudioId, duration: m.durationSeconds } }));
     // 记入 journal.audios,收尾屏音频闸门才能列出并驱动导出/校验/信度/删除。
     upsertAudio(m.rawAudioId, { turnKey: m.turnKey, containsDirectIdentifier: m.containsDirectIdentifier ?? false, isReliabilitySample: false, lastStatus: "recorded", durationSeconds: m.durationSeconds });
@@ -572,31 +573,8 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     }
     setRecState("idle");
     toast(`老人端录音已保存(${m.durationSeconds.toFixed(1)}s)`, "info");
-    // 技术暂停后的迟到上传、或关闭自动驾驶时正在收尾的旧录音，只记账不驱动任何流程。
-    if (apFailureLatched.current || apManualTakeoverTurn.current === turnK) return;
-    // 自动驾驶接管:转写→判类→分支(反馈/提示升级/推进)全自动,人工只看卡住
-    if (autoPilot) {
-      if (!manualInteractionBlocked) void runAutoPilotOnAudio(m);
-      return;
-    }
-    // 自动推进:只认"当前环节"的首次回报;老人端由此获得"点开始→说→我说好了→下一题"
-    // 的自走闭环,转写/锁分可事后回访补。研究者手上有在途操作/未保存的转写或确认改动时
-    // 不跳——advance 会按 journal 重置工作卡,未存的字会被冲掉。
-    if (!autoAdvance || manualInteractionBlocked) return;
-    const jt = journal.turns[turnK];
-    const confirmBaseline = jt?.confirmedText ?? jt?.asrText ?? "";
-    const dirty = busyOp !== null || savingTurn || locking
-      || (work.asrText.trim() !== "" && !work.savedAsr)
-      || (work.confirmed !== "" && work.confirmed !== confirmBaseline && !work.savedConfirm);
-    if (dirty) { toast("录音已收,但本环节有未保存的编辑/在途操作,未自动跳转", "warn"); return; }
-    const atEnd = plan && item && turnIdx + 1 >= item.turns.length && itemIdx + 1 >= plan.items.length;
-    if (atEnd && planTurn) {
-      // 末环节:游标不动的话老人端会停在末题、按钮常驻,可无限重复录音——转"完成"过渡屏
-      postCursor({ screen: "thanks", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
-      toast("最后一个环节已收音,老人端已转入结束画面;可前往场次收尾", "ok");
-    } else {
-      advance();
-    }
+    // audioSaved 只证明录音已持久化。它最多启动判定链；不能直接改变题位、提示或结束状态。
+    if (automationAction === "adjudicate") void runAutoPilotOnAudio(m);
   });
 
   const advance = () => {
@@ -1036,10 +1014,8 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     // but do not let this old tab emit a cursor write into the server-owned plane.
     disarmAutopilot(false, false);
     persistAutoPilot(false);
-    setAutoAdvance(false);
     try {
       localStorage.setItem("nmu:console:autopilot", "0");
-      localStorage.setItem("nmu:console:autoAdvance", "0");
     } catch { /* 私隐模式等 */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverOwned]);
@@ -1053,7 +1029,6 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     // second fire-and-forget write from disarmAutopilot.
     disarmAutopilot(false, false);
     persistAutoPilot(false);
-    setAutoAdvance(false);
     const accepted = await postCursor({
       screen: "present",
       itemIdx,
@@ -1687,10 +1662,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
 
         <div className="toolbar training-toolbar" aria-label="训练设置">
           <StatusPill tone="muted">复核身份由服务器签发</StatusPill>
-          <label className="toggle-field" title="老人端点'我说好了'后自动跳下一环节;关掉则手动逐环节推进">
-            <input type="checkbox" checked={autoAdvance} disabled={manualInteractionBlocked} onChange={toggleAutoAdvance} />
-            <span>收音后自动推进</span>
-          </label>
+          <StatusPill tone="muted">收音仅保存记录，不会直接跳题</StatusPill>
           <StatusPill tone="muted">浏览器本地自动驾驶已停用</StatusPill>
         </div>
 
