@@ -128,6 +128,8 @@ _ROUTE_RULES = (
            label="读取自动驾驶所有权状态"),
     _route({"GET", "HEAD"}, r"/ai/provider-readiness", AccessKind.ACCOUNT,
            label="读取 AI 服务合成检查状态"),
+    _route({"GET", "HEAD"}, r"/quality/ai-metrics", AccessKind.ACCOUNT,
+           roles=KNOWN_ACCOUNT_ROLES, label="读取去标识 AI 质量汇总"),
     _route({"POST"}, r"/ai/provider-readiness/probe", AccessKind.ACCOUNT,
            roles=ADMIN_ROLES, label="执行 AI 服务合成检查"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/start", AccessKind.ACCOUNT,
@@ -242,7 +244,7 @@ _API_ROOTS = frozenset({
     "audit", "patients", "sessions", "content", "score", "judge", "audio",
     "live", "asr", "items", "turns", "cloud-processing", "auth", "tts", "device",
     "visit-plans",
-    "ai", "exports", "governance", "assessment-events",
+    "ai", "quality", "exports", "governance", "assessment-events",
     "assessment-instances",
 })
 

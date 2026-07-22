@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 import os
+from pathlib import Path
 import re
 import threading
 from typing import Iterator
@@ -186,13 +187,21 @@ def _reject_terminal_or_withdrawn(row: AudioAssetRow) -> None:
             "音频已删除或撤回，禁止创建或恢复采集收据")
 
 
-def verify_persisted_audio(row: AudioAssetRow) -> audio_store.AudioBlobFacts:
+def verify_persisted_audio(
+        row: AudioAssetRow, *, max_bytes: int | None = None,
+        indexed_path: Path | None = None,
+) -> audio_store.AudioBlobFacts:
     """live 回报前逐次核对 DB 完整收据与磁盘真实 size/hash。"""
     checksum = _normalized_checksum(row.checksum)
     if checksum is None or row.byte_count is None or row.byte_count <= 0 or row.uploaded_at is None:
         raise AudioCaptureIntegrityError("音频尚无完整的服务端上传收据")
     try:
-        facts = audio_store.blob_facts(row.raw_audio_id)
+        facts = (
+            audio_store.blob_facts_for_path(
+                row.raw_audio_id, indexed_path, max_bytes=max_bytes)
+            if indexed_path is not None
+            else audio_store.blob_facts(row.raw_audio_id, max_bytes=max_bytes)
+        )
     except (ValueError, audio_store.AudioStoreIntegrityError) as exc:
         raise AudioCaptureIntegrityError(str(exc)) from exc
     if facts is None:

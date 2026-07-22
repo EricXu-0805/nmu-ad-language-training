@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
-import hashlib
 import re
 import threading
 from typing import Callable, Literal
@@ -68,10 +67,8 @@ def _fail(code: str, message: str) -> None:
 
 
 def _event_key(session_id: str, command_id: int, error_code: str) -> str:
-    digest = hashlib.sha256(
-        f"{session_id}\x00{command_id}\x00{error_code}".encode("utf-8")
-    ).hexdigest()
-    return f"attempt-failure-{digest}"
+    return autopilot_ledger.attempt_failure_event_key(
+        session_id, command_id, error_code)
 
 
 def _next_control_event_seq(db: Session, session_id: str) -> int:

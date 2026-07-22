@@ -2634,8 +2634,12 @@ def test_completed_attempt_requires_operational_only_and_rechecks_capture_proof(
         payload = evidence_ledger.validate_stored_payload(
             judgement.event_type, judgement.payload_json)
         payload["truth_scope"] = "operational_only"
-        judgement.payload_json = evidence_ledger.encode_event_payload(
-            judgement.event_type, payload)
+        # Simulate a privileged out-of-band ledger tamper. Ordinary ORM writes
+        # are rejected because InteractionEvent is append-only.
+        db.execute(update(InteractionEvent).where(
+            InteractionEvent.id == judgement.id,
+        ).values(payload_json=evidence_ledger.encode_event_payload(
+            judgement.event_type, payload)))
         asset = db.get(AudioAssetRow, attempt.raw_audio_id)
         assert asset is not None
         asset.checksum = "f" * 64

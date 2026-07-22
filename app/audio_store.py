@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 import asyncio
@@ -30,6 +30,7 @@ _EXT_BY_MIME = {
     "audio/webm": ".webm", "audio/mpeg": ".mp3", "audio/wav": ".wav",
     "audio/x-wav": ".wav", "audio/mp4": ".m4a", "audio/ogg": ".ogg",
 }
+_SUPPORTED_EXTENSIONS = frozenset(_EXT_BY_MIME.values())
 
 
 class AudioBlobConflict(RuntimeError):
@@ -125,16 +126,25 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
+def sha256_file(
+        path: Path, *, chunk_size: int = 1024 * 1024,
+        max_bytes: int | None = None,
+) -> tuple[str, int]:
     """常量内存计算普通文件的 SHA-256 与长度。"""
     if path.is_symlink() or not path.is_file():
         raise AudioStoreIntegrityError("音频路径不是可信普通文件")
+    if (max_bytes is not None
+            and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
+                 or max_bytes < 0)):
+        raise ValueError("max_bytes must be a nonnegative integer")
     digest = hashlib.sha256()
     total = 0
     with path.open("rb") as handle:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
             total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise AudioBlobTooLarge("音频原件超过本次完整性校验字节上限")
     return digest.hexdigest(), total
 
 
@@ -157,7 +167,9 @@ def _existing_blobs(raw_audio_id: str) -> list[Path]:
     return rows
 
 
-def blob_facts(raw_audio_id: str) -> AudioBlobFacts | None:
+def blob_facts(
+        raw_audio_id: str, *, max_bytes: int | None = None,
+) -> AudioBlobFacts | None:
     """读取权威物理原件事实；完整性异常不降级成“文件不存在”。"""
     if not SAFE_ID.fullmatch(raw_audio_id):
         raise ValueError("非法音频 id")
@@ -168,8 +180,62 @@ def blob_facts(raw_audio_id: str) -> AudioBlobFacts | None:
     rows = _existing_blobs(raw_audio_id)
     if not rows:
         return None
-    digest, byte_count = sha256_file(rows[0])
+    digest, byte_count = sha256_file(rows[0], max_bytes=max_bytes)
     return AudioBlobFacts(rows[0], digest, byte_count)
+
+
+def index_blobs(raw_audio_ids: Iterable[str]) -> dict[str, Path]:
+    """Index requested immutable blobs with one storage-directory scan.
+
+    This is intended for bounded batch verification. It preserves the same
+    duplicate/symlink/non-file rejection as per-id lookup without turning N
+    requested audio ids into N full directory scans.
+    """
+    requested = set(raw_audio_ids)
+    if any(not isinstance(value, str) or SAFE_ID.fullmatch(value) is None
+           for value in requested):
+        raise ValueError("非法音频 id")
+    if not requested or not AUDIO_DIR.exists():
+        return {}
+    if AUDIO_DIR.is_symlink() or not AUDIO_DIR.is_dir():
+        raise AudioStoreIntegrityError("音频存储根目录不是可信目录")
+    indexed: dict[str, Path] = {}
+    with os.scandir(AUDIO_DIR) as entries:
+        for entry in entries:
+            suffix = Path(entry.name).suffix
+            matching_ids = {
+                entry.name[:index]
+                for index, character in enumerate(entry.name)
+                if character == "." and entry.name[:index] in requested
+            }
+            if not matching_ids:
+                continue
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                raise AudioStoreIntegrityError("音频路径不是可信普通文件")
+            for raw_audio_id in matching_ids:
+                if (suffix not in _SUPPORTED_EXTENSIONS
+                        or entry.name != f"{raw_audio_id}{suffix}"):
+                    raise AudioStoreIntegrityError(
+                        "音频路径使用了未批准的文件类型")
+                if raw_audio_id in indexed:
+                    raise AudioStoreIntegrityError("同一音频 id 出现多个物理文件")
+                indexed[raw_audio_id] = Path(entry.path)
+    return indexed
+
+
+def blob_facts_for_path(
+        raw_audio_id: str, path: Path, *, max_bytes: int | None = None,
+) -> AudioBlobFacts:
+    """Hash one path previously returned by :func:`index_blobs`."""
+    if SAFE_ID.fullmatch(raw_audio_id) is None:
+        raise ValueError("非法音频 id")
+    candidate = Path(path)
+    if (candidate.absolute().parent != AUDIO_DIR.absolute()
+            or candidate.suffix not in _SUPPORTED_EXTENSIONS
+            or candidate.name != f"{raw_audio_id}{candidate.suffix}"):
+        raise AudioStoreIntegrityError("音频索引路径与 id 不一致")
+    checksum, byte_count = sha256_file(candidate, max_bytes=max_bytes)
+    return AudioBlobFacts(candidate, checksum, byte_count)
 
 
 def _lock_path(raw_audio_id: str) -> Path:

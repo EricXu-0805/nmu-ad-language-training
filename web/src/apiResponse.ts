@@ -3,12 +3,14 @@ export class ApiError extends Error {
   detail: string;
   detailData: unknown;
   detailEnvelope: "direct" | "nested-detail" | "noncanonical-json" | "non-json";
+  retryAfterSeconds: number | null;
 
   constructor(
     status: number,
     detail: string,
     detailData?: unknown,
     detailEnvelope: ApiError["detailEnvelope"] = "direct",
+    retryAfterSeconds: number | null = null,
   ) {
     super(`[${status}] ${detail}`);
     this.name = "ApiError";
@@ -16,6 +18,7 @@ export class ApiError extends Error {
     this.detail = detail;
     this.detailData = detailData ?? detail;
     this.detailEnvelope = detailEnvelope;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -48,11 +51,25 @@ export interface ApiResponsePayload {
   ok: boolean;
   statusText?: string;
   text: string;
+  retryAfter?: string | null;
+}
+
+function parseRetryAfterSeconds(value: string | null | undefined): number | null {
+  const normalized = value?.trim() ?? "";
+  if (!/^(0|[1-9][0-9]{0,5})$/.test(normalized)) return null;
+  const seconds = Number(normalized);
+  return Number.isSafeInteger(seconds) && seconds <= 86_400 ? seconds : null;
 }
 
 // fetch Response 先读成文本再交这里处理。错误页可能来自 Caddy/代理，不能让
 // JSON.parse 的 SyntaxError 越过 ApiError 边界，也不能把整页 HTML 塞进界面。
-export function decodeJsonApiResponse({ status, ok, statusText = "", text }: ApiResponsePayload): unknown {
+export function decodeJsonApiResponse({
+  status,
+  ok,
+  statusText = "",
+  text,
+  retryAfter,
+}: ApiResponsePayload): unknown {
   let data: unknown = null;
   if (text) {
     try {
@@ -60,7 +77,13 @@ export function decodeJsonApiResponse({ status, ok, statusText = "", text }: Api
     } catch {
       if (!ok) {
         const fallback = statusText.trim() || `请求失败（HTTP ${status}）`;
-        throw new ApiError(status, readableApiDetail(text, fallback), text, "non-json");
+        throw new ApiError(
+          status,
+          readableApiDetail(text, fallback),
+          text,
+          "non-json",
+          parseRetryAfterSeconds(retryAfter),
+        );
       }
       throw new ApiError(status, "服务器返回格式错误，请重试或联系管理员", text, "non-json");
     }
@@ -80,6 +103,7 @@ export function decodeJsonApiResponse({ status, ok, statusText = "", text }: Api
       readableApiDetail(detailData, fallback),
       detailData,
       canonicalNestedDetail ? "nested-detail" : "noncanonical-json",
+      parseRetryAfterSeconds(retryAfter),
     );
   }
   return data;

@@ -7,6 +7,7 @@ fences then prevent a late worker or ACK from mutating a newer control epoch.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import secrets
@@ -33,6 +34,18 @@ from .models import (
 
 
 AUTOPILOT_LEASE_SECONDS = 30
+
+
+def attempt_failure_event_key(
+    session_id: str,
+    command_id: int,
+    error_code: str,
+) -> str:
+    """Derive the immutable idempotency key for one attempt failure boundary."""
+    digest = hashlib.sha256(
+        f"{session_id}\x00{command_id}\x00{error_code}".encode("utf-8")
+    ).hexdigest()
+    return f"attempt-failure-{digest}"
 COMMAND_LEASE_SECONDS = 30
 CLAIMABLE_AUTOPILOT_STATUSES = frozenset({
     "idle", "running",

@@ -5,8 +5,10 @@ AttemptEvent.asr_text，画像字段在这个边界被递归拒绝。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -22,6 +24,17 @@ from .models import AttemptEvent
 RECOVERABLE_ATTEMPT_STATUSES = frozenset({"received", "asr_completed"})
 TERMINAL_ATTEMPT_STATUSES = frozenset({"completed", "technical_failure"})
 ATTEMPT_LEASE_SECONDS = 90
+PATIENT_REC_FAILURE_ID_PATTERN = (
+    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-8][0-9A-Fa-f]{3}-"
+    r"[89AaBb][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$")
+PATIENT_REC_FAILURE_CODES = frozenset({
+    "microphone_start_timeout",
+    "microphone_permission_denied",
+    "microphone_not_found",
+    "microphone_start_failed",
+    "recording_authorization_failed",
+})
+_PATIENT_REC_FAILURE_ID_RE = re.compile(PATIENT_REC_FAILURE_ID_PATTERN)
 
 
 @dataclass(frozen=True)
@@ -216,6 +229,45 @@ MANUAL_EVENT_TYPES = frozenset({
 })
 
 _MAX_STRING_VALUE = 256
+
+
+def technical_pause_request_hash(
+    session_id: str,
+    request_fields: dict[str, Any],
+) -> str:
+    """Hash the exact atomic technical-pause command contract.
+
+    Both the write path and read-only quality projection use this helper.  Keeping
+    the canonicalization here prevents a dashboard-side approximation from
+    accepting a receipt that the command endpoint could never have produced.
+    Callers remain responsible for validating the request field types before
+    invoking the helper.
+    """
+    canonical = {
+        "schema_version": 1,
+        "session_id": session_id,
+        **{key: value for key, value in request_fields.items() if value is not None},
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def valid_patient_rec_failure_fact(
+    error_code: object,
+    failure_id: object,
+) -> bool:
+    """Validate the closed patient-device microphone failure identity."""
+    return bool(
+        isinstance(error_code, str)
+        and error_code in PATIENT_REC_FAILURE_CODES
+        and isinstance(failure_id, str)
+        and _PATIENT_REC_FAILURE_ID_RE.fullmatch(failure_id) is not None
+    )
 
 
 def _assert_no_portrait_keys(value: Any) -> None:

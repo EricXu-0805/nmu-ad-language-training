@@ -12,6 +12,16 @@ import {
   type TurnEvidence,
 } from "./analysisEvidence";
 import { DataBoundaryBadge, DataBoundaryFilter } from "./DataBoundaryFilter";
+import { AIQualityDashboard } from "./quality/AIQualityDashboard";
+import { qualityDashboardRequestClassification } from "./quality/qualityDashboardRequestPolicy";
+import {
+  qualityRetryDeadlineMs,
+  qualityRetryRemainingSeconds,
+} from "./quality/qualityDashboardRetryPolicy";
+import {
+  buildAIQualityDashboardViewModel,
+  type AIQualityDashboardViewModel,
+} from "./quality/qualityDashboardViewModel";
 import {
   DATA_CLASSIFICATION_META,
   partitionByDataClassification,
@@ -20,6 +30,19 @@ import {
   type DataClassification,
 } from "./dataClassification";
 import { auditActionLabel, auditDisplaySummary } from "./auditPresentation";
+
+type QualityRequestState = {
+  classification: "research" | "simulation";
+  status: "loading" | "forbidden";
+} | {
+  classification: "research" | "simulation";
+  status: "error";
+  retryAtMs: number | null;
+} | {
+  classification: "research" | "simulation";
+  status: "ready";
+  model: AIQualityDashboardViewModel;
+};
 
 // 全局审计链完整性徽标:重算哈希链 + 比对高水位锚点,报告改动/删除。
 function IntegrityBadge() {
@@ -95,10 +118,51 @@ export function AnalysisScreen() {
   const [patientId, setPatientId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [classificationFilter, setClassificationFilter] = useState<DataClassification>("research");
+  const [qualityState, setQualityState] = useState<QualityRequestState | null>(null);
+  const [qualityReloadToken, setQualityReloadToken] = useState(0);
+  const [qualityNowMs, setQualityNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     api.listPatients().then(setRows).catch((e) => setErr(e instanceof ApiError ? e.detail : String(e)));
   }, []);
+
+  useEffect(() => {
+    const classification = qualityDashboardRequestClassification(classificationFilter);
+    if (classification === null) {
+      setQualityState(null);
+      return;
+    }
+    let current = true;
+    const controller = new AbortController();
+    setQualityState({ classification, status: "loading" });
+    api.getAIQualityMetrics(classification, controller.signal)
+      .then((contract) => {
+        if (!current) return;
+        setQualityState({
+          classification,
+          status: "ready",
+          model: buildAIQualityDashboardViewModel(contract),
+        });
+      })
+      .catch((error: unknown) => {
+        if (!current || (error instanceof DOMException && error.name === "AbortError")) return;
+        const nowMs = Date.now();
+        setQualityNowMs(nowMs);
+        if (error instanceof ApiError && error.status === 403) {
+          setQualityState({ classification, status: "forbidden" });
+        } else {
+          setQualityState({
+            classification,
+            status: "error",
+            retryAtMs: qualityRetryDeadlineMs(error, nowMs),
+          });
+        }
+      });
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [classificationFilter, qualityReloadToken]);
 
   const sections = partitionByDataClassification(rows ?? [], patientDataClassification);
   const classificationCounts = {
@@ -111,6 +175,27 @@ export function AnalysisScreen() {
   const selectedPatientClassification = selectedPatient
     ? patientDataClassification(selectedPatient)
     : "legacy_unknown";
+  const qualityClassification = qualityDashboardRequestClassification(classificationFilter);
+  const currentQualityState = qualityClassification !== null
+    && qualityState?.classification === qualityClassification
+    ? qualityState
+    : null;
+  const qualityRetryAtMs = currentQualityState?.status === "error"
+    ? currentQualityState.retryAtMs
+    : null;
+  const qualityRetrySeconds = qualityRetryRemainingSeconds(qualityRetryAtMs, qualityNowMs);
+
+  useEffect(() => {
+    if (qualityRetryAtMs === null) return;
+    const updateClock = () => {
+      const nowMs = Date.now();
+      setQualityNowMs(nowMs);
+      if (nowMs >= qualityRetryAtMs) window.clearInterval(timer);
+    };
+    const timer = window.setInterval(updateClock, 250);
+    updateClock();
+    return () => window.clearInterval(timer);
+  }, [qualityRetryAtMs]);
 
   if (sessionId && patientId) {
     return <SessionAnalysis patientId={patientId} sessionId={sessionId} onBack={() => setSessionId(null)} />;
@@ -159,6 +244,46 @@ export function AnalysisScreen() {
         <Alert tone="info" title={`${DATA_CLASSIFICATION_META[classificationFilter].label}分区暂无数据`}>
           其他数据分区不会混入当前列表。
         </Alert>
+      )}
+      {qualityClassification === null && (
+        <Alert tone="info" title="历史/未知分区不请求 AI 质量汇总">
+          该分区缺少可信分类，前端不会调用质量接口，也不会把历史数据混入真实或模拟 overall。
+        </Alert>
+      )}
+      {qualityClassification !== null
+        && (currentQualityState === null || currentQualityState.status === "loading") && (
+        <section className="form-section" aria-label="AI 质量汇总加载状态">
+          <StatusPill role="status" tone="muted">正在加载当前分区 AI 质量 overall…</StatusPill>
+        </section>
+      )}
+      {currentQualityState?.status === "forbidden" && (
+        <Alert tone="warn" title="当前账号无权查看 AI 质量汇总">
+          质量 overall 只向获授权研究账号开放；本页不会回退到患者、场次或录音明细拼接统计。
+        </Alert>
+      )}
+      {currentQualityState?.status === "error" && (
+        <Alert
+          tone="danger"
+          title="AI 质量汇总读取失败"
+          actions={(
+            <Button
+              disabled={qualityRetrySeconds > 0}
+              onClick={() => setQualityReloadToken((token) => token + 1)}
+            >
+              {qualityRetrySeconds > 0 ? `${qualityRetrySeconds} 秒后可重试` : "重试质量汇总"}
+            </Button>
+          )}
+        >
+          {qualityRetrySeconds > 0
+            ? "服务器已要求暂缓质量查询；倒计时结束前不会重复请求，也不会沿用上一分区数据。"
+            : "服务器不可用或返回结果未通过 v2 聚合隐私契约；已拒绝显示，不会沿用上一分区数据。"}
+        </Alert>
+      )}
+      {currentQualityState?.status === "ready" && (
+        <AIQualityDashboard
+          headingId={`ai-quality-dashboard-${currentQualityState.classification}`}
+          model={currentQualityState.model}
+        />
       )}
       {rows && visibleRows.map((r) => {
         const classification = patientDataClassification(r);

@@ -37,7 +37,8 @@ from . import (access_policy, assessment_contract, assessment_service, asr,
                autopilot_service,
                cloud_processing, content, db, export_security, governance_lock,
                device_capability, evidence_ledger, export, http_security, judging,
-               llm_judge, rule_judge, runtime, scoring, session_completion,
+               ai_quality_service, llm_judge, rule_judge, runtime, scoring,
+               session_completion,
                resource_limits, patient_asset, patient_presentation,
                provider_readiness, scale_protocol,
                session_admission, session_closeout, tts,
@@ -331,14 +332,21 @@ def _require_session_read_operator_if_admitted(
     return admitted
 
 
-def _expensive_rate_limit(request: Request, principal: str) -> JSONResponse | None:
-    retry = resource_limits.consume(request.method, request.url.path, principal)
+def _expensive_rate_limit(
+        request: Request, principal: str, *, resource_path: str | None = None,
+) -> JSONResponse | None:
+    retry = resource_limits.consume(
+        request.method, resource_path or request.url.path, principal)
     if retry is None:
         return None
     return JSONResponse(
         status_code=429,
         content={"detail": "该设备或账号请求过于频繁，请稍后重试", "code": "resource_rate_limited"},
-        headers={"Retry-After": str(max(1, math.ceil(retry)))},
+        headers={
+            "Retry-After": str(max(1, math.ceil(retry))),
+            "Cache-Control": "private, no-store",
+            "Pragma": "no-cache",
+        },
     )
 
 
@@ -4063,8 +4071,7 @@ class LivePatientRecPayload(BaseModel):
     ] | None = None
     failureId: str | None = PydanticField(
         default=None,
-        pattern=(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-8][0-9A-Fa-f]{3}-"
-                 r"[89AaBb][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$"),
+        pattern=evidence_ledger.PATIENT_REC_FAILURE_ID_PATTERN,
     )
 
     @model_validator(mode="after")
@@ -4076,6 +4083,9 @@ class LivePatientRecPayload(BaseModel):
         if code_supplied:
             if self.failureCode is None or self.failureId is None:
                 raise ValueError("patientRec failureCode/failureId 不得为 null")
+            if not evidence_ledger.valid_patient_rec_failure_fact(
+                    self.failureCode, self.failureId):
+                raise ValueError("patientRec failureCode/failureId 格式非法")
             if self.active:
                 raise ValueError("patientRec active=true 不得携带设备失败")
         return self
@@ -6252,6 +6262,75 @@ def asr_hotwords():
 
 
 # ---------------- AI provider synthetic readiness (no participant data) ----------------
+@app.get("/quality/ai-metrics")
+def get_ai_quality_metrics(
+        data_classification: Literal["research", "simulation"],
+        request: Request, response: Response,
+        s: DBSession = Depends(get_session)):
+    """Return one deidentified, account-scoped overall quality partition."""
+    actor_id = _require_account_identity(
+        request, "查看 AI 质量汇总",
+        roles={"researcher", "data_steward", "admin"})
+    # Reject duplicate and future/ad-hoc dimensions rather than silently
+    # accepting a query the privacy contract does not implement.
+    if (len(request.query_params.multi_items()) != 1
+            or request.query_params.multi_items()[0][0] != "data_classification"):
+        raise HTTPException(status_code=422, detail={
+            "code": "quality_query_invalid",
+            "message": "AI 质量汇总只允许一个 data_classification 查询参数",
+        }, headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"})
+    if data_classification == "simulation":
+        limited = _expensive_rate_limit(
+            request,
+            f"account:{actor_id}:{_client_ip(request)}",
+            resource_path="/quality/ai-metrics/simulation",
+        )
+        if limited is not None:
+            return limited
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    try:
+        return ai_quality_service.build_ai_quality_dashboard(
+            s,
+            actor_id=actor_id,
+            actor_role=getattr(request.state, "actor_role", ""),
+            data_classification=data_classification,
+        )
+    except ai_quality_service.QualityScopeTooLarge as exc:
+        raise HTTPException(status_code=413, detail={
+            "code": "quality_scope_too_large",
+            "message": "当前权限范围超过单次质量汇总上限，未返回部分结果",
+        }, headers={
+            "Cache-Control": "private, no-store", "Pragma": "no-cache",
+        }) from exc
+    except ai_quality_service.QualityEvidenceLimitExceeded as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "quality_evidence_limit_exceeded",
+            "message": "质量证据量超过单次安全处理上限，未返回部分结果",
+            "resource": exc.resource,
+        }, headers={
+            "Cache-Control": "private, no-store", "Pragma": "no-cache",
+        }) from exc
+    except ai_quality_service.QualitySnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail={
+            "code": "quality_snapshot_unavailable",
+            "message": "当前无法建立一致的只读质量快照，未返回部分结果",
+        }, headers={
+            "Cache-Control": "private, no-store", "Pragma": "no-cache",
+        }) from exc
+    except content.FrozenContentUnavailable:
+        # Preserve the app-wide fixed, path-free 503 response for missing or
+        # damaged packaged definitions; this subtype also inherits ValueError.
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "quality_projection_unavailable",
+            "message": "质量证据无法按当前聚合合同安全投影",
+        }, headers={
+            "Cache-Control": "private, no-store", "Pragma": "no-cache",
+        }) from exc
+
+
 @app.get(
     "/ai/provider-readiness",
     response_model=provider_readiness.ReadinessProjection,
@@ -8028,16 +8107,10 @@ class TechnicalPauseIn(BaseModel):
 
 def _technical_pause_request_hash(
         session_id: str, body: TechnicalPauseIn) -> str:
-    canonical = {
-        "schema_version": 1,
-        "session_id": session_id,
-        **body.model_dump(exclude_none=True, mode="json"),
-    }
-    encoded = _json.dumps(
-        canonical, ensure_ascii=False, sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return evidence_ledger.technical_pause_request_hash(
+        session_id,
+        body.model_dump(exclude_none=True, mode="json"),
+    )
 
 
 def _technical_pause_active_position(

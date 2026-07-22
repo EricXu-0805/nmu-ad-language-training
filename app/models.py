@@ -494,6 +494,12 @@ class InteractionEvent(SQLModel, table=True):
     is_simulation: bool = False
 
 
+@sa_event.listens_for(InteractionEvent, "before_update")
+@sa_event.listens_for(InteractionEvent, "before_delete")
+def _reject_interaction_event_mutation(*_args) -> None:
+    raise RuntimeError("InteractionEvent 是只追加运行证据，禁止更新或删除")
+
+
 class InteractionPresentationReceipt(SQLModel, table=True):
     """Durable receipt for one atomic bedside interaction presentation.
 

@@ -54,3 +54,33 @@ test("empty and valid JSON success bodies decode without throwing SyntaxError", 
   assert.equal(decodeJsonApiResponse({ status: 204, ok: true, text: "" }), null);
   assert.deepEqual(decodeJsonApiResponse({ status: 200, ok: true, text: '{"ok":true}' }), { ok: true });
 });
+
+test("Retry-After is preserved only as a bounded integer on ApiError", () => {
+  for (const [raw, expected] of [["7", 7], [" 12 ", 12], ["bad", null], ["999999", null]] as const) {
+    assert.throws(
+      () => decodeJsonApiResponse({
+        status: 429,
+        ok: false,
+        text: JSON.stringify({ detail: "slow down" }),
+        retryAfter: raw,
+      }),
+      (error: unknown) => error instanceof ApiError
+        && error.retryAfterSeconds === expected,
+    );
+  }
+});
+
+test("non-JSON proxy throttling preserves bounded Retry-After", () => {
+  assert.throws(
+    () => decodeJsonApiResponse({
+      status: 429,
+      ok: false,
+      statusText: "Too Many Requests",
+      text: "<html><body>rate limited by proxy</body></html>",
+      retryAfter: "9",
+    }),
+    (error: unknown) => error instanceof ApiError
+      && error.detailEnvelope === "non-json"
+      && error.retryAfterSeconds === 9,
+  );
+});

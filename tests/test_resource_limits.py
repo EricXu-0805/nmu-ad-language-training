@@ -18,3 +18,17 @@ def test_tts_token_bucket_limits_and_refills():
 def test_ordinary_routes_are_not_bucketed():
     for _ in range(100):
         assert resource_limits.consume("GET", "/patients", "account:a", now=1.0) is None
+
+
+def test_quality_read_has_low_burst_and_thirty_second_refill():
+    resource_limits.reset_for_tests()
+    path = "/quality/ai-metrics/simulation"
+    assert resource_limits.consume("GET", path, "account:a", now=10.0) is None
+    assert resource_limits.consume("GET", path, "account:a", now=10.0) is None
+    assert resource_limits.consume("GET", path, "account:a", now=10.0) == 30.0
+    assert resource_limits.consume("GET", path, "account:b", now=10.0) is None
+    assert resource_limits.consume("GET", path, "account:a", now=40.0) is None
+    # Research suppression performs no cohort/evidence read and intentionally
+    # does not consume the expensive simulation projection budget.
+    assert resource_limits.consume(
+        "GET", "/quality/ai-metrics", "account:a", now=40.0) is None

@@ -57,6 +57,12 @@ import {
   parsePatientWithdrawalReceipt,
   parseWithdrawnAudioGovernanceRows,
 } from "./console/subjectWithdrawal";
+import {
+  parseAIQualityDashboard,
+  type AIQualityDashboardContract,
+  type QualityDataClassification,
+} from "./console/quality/qualityDashboardContract";
+import { qualityDashboardRequestPath } from "./console/quality/qualityDashboardRequestPolicy";
 import type { CursorMsg } from "./sync/messages";
 
 export { ApiError } from "./apiResponse";
@@ -336,6 +342,7 @@ async function req<T>(method: string, path: string, body?: unknown,
       ok: res.ok,
       statusText: res.statusText,
       text,
+      retryAfter: res.headers.get("Retry-After"),
     }) as T;
   } catch (error) {
     if (timedOut) throw new ApiError(408, "请求超时，请检查本机服务连接后重试");
@@ -425,6 +432,13 @@ export const api = {
   listPatients: () => req<PatientSummary[]>(
     "GET", "/patients", undefined, DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
   ),
+  getAIQualityMetrics: async (
+    classification: QualityDataClassification,
+    signal?: AbortSignal,
+  ): Promise<AIQualityDashboardContract> => parseAIQualityDashboard(await req<unknown>(
+    "GET", qualityDashboardRequestPath(classification), undefined,
+    DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
+  ), classification),
   patientSessions: async (id: string): Promise<Session[]> =>
     parsePatientSessionList(await req<unknown>(
       "GET", `/patients/${encodeURIComponent(id)}/sessions`, undefined,

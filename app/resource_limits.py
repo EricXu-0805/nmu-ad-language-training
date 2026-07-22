@@ -20,6 +20,11 @@ _BUCKETS: dict[tuple[str, str], _Bucket] = {}
 _POLICIES = (
     ("provider-readiness", "POST", re.compile(r"/ai/provider-readiness/probe"),
      1.0, 1.0 / 60.0),
+    # The quality projection may verify a bounded set of physical audio blobs.
+    # Keep refreshes deliberately sparse per named account/IP; the database and
+    # byte preflight remain the primary, fail-closed resource boundary.
+    ("quality-read", "GET", re.compile(r"/quality/ai-metrics/simulation"),
+     2.0, 1.0 / 30.0),
     ("tts", "POST", re.compile(
         r"(?:/tts/speak|/sessions/[^/]+/autopilot/commands/[^/]+/tts)"),
      12.0, 1.0),
