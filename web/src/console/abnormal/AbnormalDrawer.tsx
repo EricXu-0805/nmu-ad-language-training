@@ -3,6 +3,7 @@ import { api, ApiError } from "../../api";
 import { Button } from "../../components/Button";
 import { EnumSelect, Field, TextInput } from "../../components/Field";
 import { useToast } from "../../components/ToastContext";
+import { useDialogFocusTrap } from "../../components/useDialogFocusTrap";
 import { ABNORMAL_TYPES, CUE_INTERVENTIONS, INTERVENTION_TYPES } from "../../types";
 import type { PhaseType } from "../../types";
 
@@ -19,6 +20,12 @@ export function AbnormalDrawer({ sessionId, phaseType, currentItemEventId, open,
   const [abnormal, setAbnormal] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+  const cancelSafely = () => { if (!busy) onClose(); };
+  const panelRef = useDialogFocusTrap<HTMLElement>({
+    open,
+    onCancel: cancelSafely,
+    initialFocus: "first-button",
+  });
 
   const cueBreach = phaseType === "正式训练" && intervention != null &&
     (CUE_INTERVENTIONS as readonly string[]).includes(intervention);
@@ -47,19 +54,21 @@ export function AbnormalDrawer({ sessionId, phaseType, currentItemEventId, open,
   }
 
   return (
-    <div className="drawer-backdrop" onClick={onClose}>
-      <section className="drawer-panel fade-in" role="dialog" aria-modal="true" aria-labelledby="abnormal-drawer-title" onClick={(e) => e.stopPropagation()}>
+    <div className="drawer-backdrop" onClick={cancelSafely}>
+      <section ref={panelRef} className="drawer-panel fade-in" role="dialog" aria-modal="true"
+        aria-busy={busy || undefined} tabIndex={-1}
+        aria-labelledby="abnormal-drawer-title" onClick={(e) => e.stopPropagation()}>
         <div className="drawer-header">
           <div><div className="page-kicker">现场记录</div><h2 id="abnormal-drawer-title">异常与研究者介入</h2></div>
-          <Button onClick={onClose}>关闭</Button>
+          <Button disabled={busy} onClick={cancelSafely}>关闭</Button>
         </div>
         <p className="muted">当前阶段：{phaseType ?? "—"}{currentItemEventId ? ` · 当前题记录 #${currentItemEventId}` : " · 整个场次"}</p>
 
         <Field label="研究者介入类型">
-          <EnumSelect options={INTERVENTION_TYPES} value={intervention} onChange={setIntervention} />
+          <EnumSelect options={INTERVENTION_TYPES} value={intervention} disabled={busy} onChange={setIntervention} />
         </Field>
         <Field label="受试者或环境异常">
-          <EnumSelect options={ABNORMAL_TYPES} value={abnormal} onChange={setAbnormal} />
+          <EnumSelect options={ABNORMAL_TYPES} value={abnormal} disabled={busy} onChange={setAbnormal} />
         </Field>
 
         {cueBreach && (
@@ -69,7 +78,7 @@ export function AbnormalDrawer({ sessionId, phaseType, currentItemEventId, open,
         )}
 
         <Field label="现场说明（可选）">
-          <TextInput value={note} onChange={(e) => setNote(e.target.value)} placeholder="现场情况说明" />
+          <TextInput value={note} disabled={busy} onChange={(e) => setNote(e.target.value)} placeholder="现场情况说明" />
         </Field>
 
         <div className="drawer-actions"><Button variant="primary" disabled={busy} onClick={submit}>{busy ? "正在记录…" : "保存记录"}</Button></div>

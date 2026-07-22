@@ -30,6 +30,8 @@ class LlmJudgement:
 
 class LlmJudgeProvider(Protocol):
     version: str
+    data_boundary: str
+    provider_id: str | None
 
     def judge(self, ji: JudgeInput) -> Optional[LlmJudgement]: ...
 
@@ -52,6 +54,8 @@ def build_judge_prompt(ji: JudgeInput) -> str:
 class OffLlmJudge:
     """默认引擎:恒不可用 → 调用方回退规则确定式。"""
     version = "off"
+    data_boundary = "local"
+    provider_id = None
 
     def judge(self, ji: JudgeInput) -> Optional[LlmJudgement]:
         return None
@@ -62,6 +66,9 @@ _VALID_SCORES = (0.0, 0.5, 1.0)
 
 class QwenJudge:
     """阿里百炼 qwen 判分:产 AI 初评,永不锁分。任何异常/格式可疑 → None 回退规则。"""
+
+    data_boundary = "cloud"
+    provider_id = "aliyun-dashscope"
 
     def __init__(self, model: str):
         self._model = model
@@ -121,16 +128,24 @@ class QwenJudge:
 _ENGINES: dict[str, LlmJudgeProvider] = {"off": OffLlmJudge()}
 
 
+class UnknownLlmJudge(OffLlmJudge):
+    """未知 provider 不得被当成安全的本地 off 引擎。"""
+    data_boundary = "unknown"
+
+    def __init__(self, kind: str):
+        self.version = f"unknown/{kind}"
+
+
 def register_engine(name: str, engine: LlmJudgeProvider) -> None:
     """真实引擎接入点;测试亦经此注入替身。"""
     _ENGINES[name] = engine
 
 
 def get_engine() -> LlmJudgeProvider:
-    """按 LLM_JUDGE 选引擎(默认 auto:有 Key → qwen,无 → off);未注册一律 off(fail-degraded)。"""
+    """按 LLM_JUDGE 选引擎；未知配置保留 unknown 边界供调用链 fail-closed。"""
     kind = os.environ.get("LLM_JUDGE", "auto")
     if kind == "auto":
         kind = "qwen" if os.environ.get("DASHSCOPE_API_KEY") else "off"
     if kind == "qwen" and "qwen" not in _ENGINES:
         _ENGINES["qwen"] = QwenJudge(os.environ.get("LLM_JUDGE_MODEL", "qwen-plus"))
-    return _ENGINES.get(kind, _ENGINES["off"])
+    return _ENGINES.get(kind) or UnknownLlmJudge(kind)

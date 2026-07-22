@@ -41,6 +41,8 @@ class AsrResult:
 
 class AsrProvider(Protocol):
     version: str
+    data_boundary: str
+    provider_id: str | None
 
     def transcribe(self, audio_bytes: bytes, hotwords: Sequence[str]) -> AsrResult: ...
 
@@ -48,6 +50,8 @@ class AsrProvider(Protocol):
 class NullAsrEngine:
     """占位引擎:恒降级。保证『动态能力关闭即走降级口径』这条铁律从第一天就可跑。"""
     version = "null-0"
+    data_boundary = "local"
+    provider_id = None
 
     def transcribe(self, audio_bytes: bytes, hotwords: Sequence[str]) -> AsrResult:
         return AsrResult(asr_text=None, asr_confidence=None, engine_version=self.version)
@@ -66,6 +70,9 @@ def _sniff_ext(audio_bytes: bytes) -> str:
 
 class DashScopeAsrEngine:
     """qwen3-asr-flash 录音文件识别。context=热词整包(任意背景文本即可偏置)。"""
+
+    data_boundary = "cloud"
+    provider_id = "aliyun-dashscope"
 
     def __init__(self, model: str):
         self._model = model
@@ -124,16 +131,26 @@ class DashScopeAsrEngine:
 _ENGINES: dict[str, AsrProvider] = {"null": NullAsrEngine()}
 
 
+class UnknownAsrEngine(NullAsrEngine):
+    """未知配置不能伪装成本地降级；调用链会按 unknown fail-closed。"""
+    data_boundary = "unknown"
+
+    def __init__(self, kind: str):
+        self.version = f"unknown/{kind}"
+
+
 def get_engine() -> AsrProvider:
     """按 ASR_ENGINE 选引擎(默认 auto:有 Key 走云,无 Key 降级 null)。
-    未注册/不可用一律降级 null(fail-degraded,不 fail-hard)。"""
+    已知但不可用的云引擎降级 null；未知配置保留 unknown 边界供调用链 fail-closed。"""
     kind = os.environ.get("ASR_ENGINE", "auto")
     if kind == "auto":
         kind = "dashscope" if os.environ.get("DASHSCOPE_API_KEY") else "null"
     if kind == "dashscope" and "dashscope" not in _ENGINES:
         _ENGINES["dashscope"] = DashScopeAsrEngine(
             os.environ.get("ASR_CLOUD_MODEL", "qwen3-asr-flash"))
-    eng = _ENGINES.get(kind, _ENGINES["null"])
+    eng = _ENGINES.get(kind)
+    if eng is None:
+        return UnknownAsrEngine(kind)
     if isinstance(eng, DashScopeAsrEngine) and not eng.available():
         return _ENGINES["null"]
     return eng

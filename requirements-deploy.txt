@@ -6,6 +6,7 @@ uvicorn[standard]==0.50.2
 sqlmodel==0.0.39
 pydantic==2.13.4
 alembic==1.18.5
+psycopg[binary]==3.3.4
 dashscope==1.26.3
 
 # 本地神经兜底音色(可选;体积较大)。要在容器里也有 piper 兜底,取消注释重建:

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
 import { blobStore } from "../audio/blobStore";
 import { Alert } from "../components/Alert";
@@ -7,41 +7,141 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { StatusPill } from "../components/StatusPill";
 import { useToast } from "../components/ToastContext";
 import { useSessionJournal } from "../hooks/useSessionJournal";
-import { useAudioSaved } from "../sync/useCursorWriter";
+import { useSessionRuntime } from "../hooks/useSessionRuntime";
 import { ratioPct } from "../lib/format";
-import type { AudioAsset, ExportResult, ScoreReconstruction, Session, SessionPlan } from "../types";
+import { sessionAbortReasonLabel } from "../sessionAbort";
+import {
+  canExportCompletedSession,
+  wrapupMode,
+  type WrapupMode,
+} from "../sessionLifecycle";
+import { useAudioSaved } from "../sync/useCursorWriter";
+import type {
+  AudioAsset,
+  ExportResult,
+  ScoreReconstruction,
+  Session,
+  SessionPlan,
+  SessionRuntimeState,
+  SessionRuntimeStatus,
+} from "../types";
+import { ResearchReviewPanel } from "./ResearchReviewPanel";
+import { SessionCloseoutPanel } from "./SessionCloseoutPanel";
+import { ensureExportIntent, type ExportIntent } from "./exportIntent";
+import type {
+  SessionCloseoutOutcomeSummary,
+  SessionCloseoutRecord,
+  SessionCloseoutSaveRequest,
+} from "./sessionCloseout";
+import {
+  completionIssueLabel,
+  localCompletionGate,
+  localInterventionCompletionGate,
+  parseCompletionFailure,
+  type CompletionFailureView,
+} from "./sessionCompletion";
 
-// 场次收尾:完整度计 + 评分只读重建 + 音频删除闸门 + 去标识导出。
-export function SessionWrapupScreen({ session, onBack, onDone }: { session: Session; onBack?: () => void; onDone?: () => void }) {
+// 双终态收尾：现场只结束床旁干预；研究者事后复核/锁分后才最终完成；导出只属于最终完成态。
+export function SessionWrapupScreen({
+  session,
+  reviewerId,
+  canExport = false,
+  canDeleteAudio = false,
+  onBack,
+  onDone,
+  onRuntimeStatusChange,
+  onCompletionBusyChange,
+  onCloseoutGateChange,
+}: {
+  session: Session;
+  reviewerId: string;
+  canExport?: boolean;
+  canDeleteAudio?: boolean;
+  onBack?: () => void;
+  onDone?: () => void;
+  onRuntimeStatusChange?: (status: SessionRuntimeStatus) => void;
+  onCompletionBusyChange?: (busy: boolean) => void;
+  onCloseoutGateChange?: (blocked: boolean) => void;
+}) {
   const toast = useToast();
-  const { journal, upsertAudio, hydrateFromServer } = useSessionJournal(session.session_id);
+  const runtimeControl = useSessionRuntime(session.session_id);
+  const [runtimeOverride, setRuntimeOverride] = useState<SessionRuntimeState | null>(null);
+  const { journal, upsertAudio, upsertTurn, hydrateFromServer } = useSessionJournal(session.session_id);
   const [journalRecovery, setJournalRecovery] = useState<"loading" | "ready" | "error">("loading");
   const [journalRecoveryError, setJournalRecoveryError] = useState<string | null>(null);
   const [journalRetry, setJournalRetry] = useState(0);
-
-  // 接住迟到的录音回报:录音中点了"场次收尾",老人端保存发生在训练/关系屏卸载之后——
-  // 不接就成为音频闸门列不出的孤儿音频(DB 有行、本机有字节,却没人能走删除闸门)。
-  useAudioSaved((m) => {
-    // live state 会保留最近一条回报；别场次/旧协议缺 sessionId 的回报绝不能混入本场 journal。
-    if (m.sessionId !== session.session_id) return;
-    if (journal.audios[m.rawAudioId]) return; // 轮询会重放最后一条回报:已记过的不算迟到
-    upsertAudio(m.rawAudioId, {
-      turnKey: m.turnKey,
-      containsDirectIdentifier: m.containsDirectIdentifier ?? false,
-      isReliabilitySample: false,
-      lastStatus: "recorded",
-    });
-    toast(`补记迟到录音:${m.rawAudioId.slice(0, 12)}…(已列入音频闸门)`, "info");
-  });
   const [scores, setScores] = useState<ScoreReconstruction | null>(null);
-  const [scoresErr, setScoresErr] = useState<string | null>(null); // 失败≠加载中:给重试,不给永远的"加载中…"
+  const [scoresErr, setScoresErr] = useState<string | null>(null);
   const [plan, setPlan] = useState<SessionPlan | null>(null);
   const [planErr, setPlanErr] = useState<string | null>(null);
   const [exp, setExp] = useState<ExportResult | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [confirmIncompleteExport, setConfirmIncompleteExport] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [transitionBusy, setTransitionBusy] = useState(false);
+  const [transitionFailure, setTransitionFailure] = useState<CompletionFailureView | null>(null);
+  const [outcomeSummary, setOutcomeSummary] = useState<SessionCloseoutOutcomeSummary | null>(null);
+  const [closeout, setCloseout] = useState<SessionCloseoutRecord | null>(null);
+  const [closeoutLoadState, setCloseoutLoadState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [closeoutLoadError, setCloseoutLoadError] = useState<string | null>(null);
+  const [closeoutRetryNonce, setCloseoutRetryNonce] = useState(0);
+  const [closeoutEditorGate, setCloseoutEditorGate] = useState({
+    dirty: false,
+    submitting: false,
+    reconciliation_required: false,
+  });
   const [retryNonce, setRetryNonce] = useState(0);
-  const [gateEpoch, setGateEpoch] = useState(0); // 导出/批量操作后驱动闸门各行重取状态
+  const [scoresRetryNonce, setScoresRetryNonce] = useState(0);
+  const [gateEpoch, setGateEpoch] = useState(0);
+  const [verifyingAll, setVerifyingAll] = useState(false);
+  const mountedRef = useRef(true);
+  const exportIntentRef = useRef<ExportIntent | null>(null);
+  const transitionInFlight = useRef(false);
+  const transitionRequest = useRef(0);
+
+  const polledRuntime = runtimeControl.runtime?.sessionId === session.session_id
+    ? runtimeControl.runtime
+    : null;
+  const currentRuntime = runtimeOverride
+    && (!polledRuntime || runtimeOverride.revision >= polledRuntime.revision)
+    ? runtimeOverride
+    : polledRuntime;
+  const runtimeStatus = currentRuntime?.status ?? session.runtime_status ?? null;
+  const runtimeConfirmed = currentRuntime != null && !runtimeControl.error;
+  const mode: WrapupMode | null = runtimeStatus == null ? null : wrapupMode(runtimeStatus);
+  const closeoutReadyForLeave = closeout !== null
+    && !closeoutEditorGate.dirty
+    && !closeoutEditorGate.submitting
+    && !closeoutEditorGate.reconciliation_required;
+  const reviewAnalysisUnlocked = mode !== "review" || closeoutReadyForLeave;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      transitionRequest.current += 1;
+      transitionInFlight.current = false;
+      onCompletionBusyChange?.(false);
+    };
+  }, [onCompletionBusyChange, session.session_id]);
+
+  useEffect(() => {
+    onCloseoutGateChange?.(
+      runtimeStatus === "intervention_completed" && !closeoutReadyForLeave,
+    );
+  }, [closeoutReadyForLeave, onCloseoutGateChange, runtimeStatus]);
+
+  useEffect(() => () => onCloseoutGateChange?.(false), [onCloseoutGateChange]);
+
+  // 现场结束时仍可能有最后一条 stop-and-save 回报在路上；只收同场次，绝不跨受试者混入。
+  useAudioSaved((message) => {
+    if (message.sessionId !== session.session_id || journal.audios[message.rawAudioId]) return;
+    upsertAudio(message.rawAudioId, {
+      turnKey: message.turnKey,
+      containsDirectIdentifier: message.containsDirectIdentifier ?? false,
+      isReliabilitySample: false,
+      lastStatus: "recorded",
+    });
+    toast(`已补记最后一条录音：${message.rawAudioId.slice(0, 12)}…`, "info");
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -56,249 +156,632 @@ export function SessionWrapupScreen({ session, onBack, onDone }: { session: Sess
         hydrateFromServer(remote);
         setJournalRecovery("ready");
       })
-      .catch((e) => {
+      .catch((error) => {
         if (cancelled) return;
-        setJournalRecoveryError(e instanceof ApiError ? e.detail : String(e));
+        setJournalRecoveryError(error instanceof ApiError ? error.detail : String(error));
         setJournalRecovery("error");
       });
     return () => { cancelled = true; };
   }, [hydrateFromServer, journalRetry, session.session_id]);
 
   useEffect(() => {
+    setScores(null);
     setScoresErr(null);
-    api.sessionScores(session.session_id).then(setScores).catch((e) => setScoresErr(e instanceof ApiError ? e.detail : String(e)));
-  }, [session, retryNonce]);
+    api.sessionScores(session.session_id)
+      .then(setScores)
+      .catch((error) => setScoresErr(error instanceof ApiError ? error.detail : String(error)));
+  }, [scoresRetryNonce, session.session_id]);
+
   useEffect(() => {
     setPlan(null);
     setPlanErr(null);
     api.sessionPlan(session.session_id, session.week_no, session.event_line)
       .then(setPlan)
-      .catch((e) => setPlanErr(e instanceof ApiError ? e.detail : String(e)));
-  }, [session, retryNonce]);
+      .catch((error) => setPlanErr(error instanceof ApiError ? error.detail : String(error)));
+  }, [retryNonce, session.event_line, session.session_id, session.week_no]);
 
-  // 完整度:excluded_items 只列"已建未锁"的题;未动过的计划题要靠 plan 对照日志才可见。
-  const lockedTurns = Object.values(journal.turns).filter((t) => t.locked).length;
-  const untouched = (plan?.items ?? []).filter((it) => !journal.itemEvents[it.item_id]);
-
-  async function doExport() {
-    if (journalRecovery !== "ready") {
-      toast("服务器记录尚未完整恢复，导出保持关闭", "danger");
+  useEffect(() => {
+    if (mode !== "review" && mode !== "completed") {
+      setOutcomeSummary(null);
+      setCloseout(null);
+      setCloseoutLoadState("idle");
+      setCloseoutLoadError(null);
       return;
     }
-    setBusy(true);
-    try {
-      const r = await api.exportSession(session.session_id, true); // 只暴露去标识通道
-      setExp(r);
-      setGateEpoch((n) => n + 1); // 导出把 recorded→exported:闸门各行立即重取,不显示过期按钮
-      toast(`已导出批次 ${r.batch_id}(去标识)`, "ok");
-    } catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); }
-    finally { setBusy(false); }
-  }
+    let cancelled = false;
+    setOutcomeSummary(null);
+    setCloseout(null);
+    setCloseoutLoadState("loading");
+    setCloseoutLoadError(null);
+    void (async () => {
+      try {
+        const summary = await api.getSessionOutcomeSummary(session.session_id);
+        if (cancelled) return;
+        setOutcomeSummary(summary);
+        try {
+          const report = await api.getSessionCloseout(session.session_id);
+          if (!cancelled) setCloseout(report);
+        } catch (error) {
+          if (!(error instanceof ApiError && error.status === 404)) throw error;
+          if (!cancelled) setCloseout(null);
+        }
+        if (!cancelled) setCloseoutLoadState("ready");
+      } catch (error) {
+        if (cancelled) return;
+        setCloseoutLoadError(error instanceof ApiError ? error.detail : String(error));
+        setCloseoutLoadState("error");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [closeoutRetryNonce, mode, session.session_id]);
 
-  const audioIds = Object.keys(journal.audios);
   const journalReady = journalRecovery === "ready";
   const planReady = plan !== null;
   const totalTurns = plan?.total_turns ?? 0;
-  const completionPct = planReady ? (totalTurns > 0 ? Math.round((lockedTurns / totalTurns) * 100) : 100) : null;
-  const incomplete = planReady && totalTurns > 0 && lockedTurns < totalTurns;
-  const untouchedGroups = ["单要素", "双要素", "多要素"].map((taskType) => ({
-    taskType,
-    items: untouched.filter((item) => item.task_type === taskType),
-  })).filter((group) => group.items.length > 0);
+  const lockedTurns = Object.values(journal.turns).filter((turn) => turn.locked).length;
+  const audioIds = Object.keys(journal.audios);
+  const untouched = (plan?.items ?? []).filter((item) => !journal.itemEvents[item.item_id]);
+  const completionPct = totalTurns > 0 ? Math.round((lockedTurns / totalTurns) * 100) : null;
+  const interventionGate = localInterventionCompletionGate({
+    journalReady,
+    planReady,
+    weekNo: session.week_no,
+    totalTurns,
+  });
+  const completionGate = localCompletionGate({
+    journalReady,
+    planReady,
+    weekNo: session.week_no,
+    lockedTurns,
+    totalTurns,
+  });
+  const exportAllowed = currentRuntime != null && !runtimeControl.error && canExportCompletedSession({
+    status: currentRuntime.status,
+    strictCompletionGatePassed: completionGate.canRequest,
+    roleAllowsExport: canExport,
+  });
   const planHas = (taskType: string) => plan == null || plan.items.some((item) => item.task_type === taskType);
+  const rawAudioIdsByTurnKey = Object.fromEntries(
+    Object.entries(journal.turns).flatMap(([key, turn]) =>
+      turn.rawAudioId ? [[key, turn.rawAudioId] as const] : []),
+  );
 
-  // 30+ 条音频逐条点"校验"太折磨:一键顺序校验全部 exported 态音频
-  const [verifyingAll, setVerifyingAll] = useState(false);
-  async function verifyAll() {
-    if (verifyingAll || !journalReady) return;
-    setVerifyingAll(true);
-    let ok = 0, fail = 0;
-    for (const id of audioIds) {
-      try { const a = await api.getAudio(id); if (a.status === "exported") { await api.audioChecksum(id); ok++; } }
-      catch { fail++; }
+  function beginTransition(): number | null {
+    if (transitionInFlight.current) return null;
+    const requestId = ++transitionRequest.current;
+    transitionInFlight.current = true;
+    setTransitionBusy(true);
+    setTransitionFailure(null);
+    onCompletionBusyChange?.(true);
+    return requestId;
+  }
+
+  function endTransition(requestId: number) {
+    if (!mountedRef.current || requestId !== transitionRequest.current) return;
+    transitionInFlight.current = false;
+    setTransitionBusy(false);
+    onCompletionBusyChange?.(false);
+  }
+
+  async function finishIntervention() {
+    if (!runtimeConfirmed || mode !== "bedside" || !interventionGate.canRequest) return;
+    const requestId = beginTransition();
+    if (requestId == null) return;
+    try {
+      const runtime = await api.finishIntervention(session.session_id);
+      if (!mountedRef.current || requestId !== transitionRequest.current) return;
+      if (runtime.status !== "intervention_completed") {
+        setTransitionFailure({ message: "服务器未返回床旁干预已结束终态，本场仍保留在当前页。" });
+        return;
+      }
+      setRuntimeOverride(runtime);
+      onRuntimeStatusChange?.(runtime.status);
+      toast("床旁干预已结束；老人端已停麦，请完成独立现场收尾后再切换下一位", "ok");
+    } catch (error) {
+      if (mountedRef.current && requestId === transitionRequest.current) {
+        setTransitionFailure(parseCompletionFailure(error));
+      }
+    } finally {
+      endTransition(requestId);
     }
-    setGateEpoch((n) => n + 1);
-    toast(`批量校验完成:${ok} 通过${fail ? `,${fail} 失败(见各行状态)` : ""}`, fail ? "warn" : "ok");
+  }
+
+  async function saveCloseout(
+    request: SessionCloseoutSaveRequest,
+  ): Promise<SessionCloseoutRecord> {
+    const saved = await api.saveSessionCloseout(session.session_id, request);
+    setCloseout(saved);
+    setCloseoutLoadError(null);
+    setCloseoutLoadState("ready");
+    toast(saved.idempotent ? "现场收尾已确认，无需重复保存" : "现场收尾已保存，可以切换下一位", "ok");
+    return saved;
+  }
+
+  async function reconcileCloseout(): Promise<SessionCloseoutRecord | null> {
+    try {
+      const authoritative = await api.getSessionCloseout(session.session_id);
+      setCloseout(authoritative);
+      setCloseoutLoadError(null);
+      setCloseoutLoadState("ready");
+      return authoritative;
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        setCloseout(null);
+        setCloseoutLoadError(null);
+        setCloseoutLoadState("ready");
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async function completeResearchReview() {
+    if (!runtimeConfirmed || mode !== "review" || !completionGate.canRequest
+        || !closeoutReadyForLeave) return;
+    const requestId = beginTransition();
+    if (requestId == null) return;
+    try {
+      const runtime = await api.completeSession(session.session_id);
+      if (!mountedRef.current || requestId !== transitionRequest.current) return;
+      if (runtime.status !== "completed") {
+        setTransitionFailure({ message: "服务器未返回最终完成态，本场仍保留在研究复核页。" });
+        return;
+      }
+      setRuntimeOverride(runtime);
+      onRuntimeStatusChange?.(runtime.status);
+      toast("服务器已核对全部锁定研究真值；场次已最终完成", "ok");
+    } catch (error) {
+      if (mountedRef.current && requestId === transitionRequest.current) {
+        setTransitionFailure(parseCompletionFailure(error));
+      }
+    } finally {
+      endTransition(requestId);
+    }
+  }
+
+  async function doExport() {
+    if (!exportAllowed || exportBusy) {
+      toast("只有最终完成、严格门禁通过的场次才允许由数据管理员导出", "danger");
+      return;
+    }
+    setExportBusy(true);
+    try {
+      exportIntentRef.current = ensureExportIntent(
+        exportIntentRef.current, session.session_id,
+      );
+      // Keep this key across timeouts/ambiguous responses.  A retry is the same
+      // export intent, never an accidental second batch.
+      const result = await api.exportSession(
+        session.session_id, exportIntentRef.current.idempotencyKey, true,
+      );
+      setExp(result);
+      setGateEpoch((value) => value + 1);
+      toast(`已生成去标识导出批次 ${result.batch_id}`, "ok");
+    } catch (error) {
+      toast(error instanceof ApiError ? error.detail : String(error), "danger");
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
+  async function verifyAll() {
+    if (verifyingAll || !exportAllowed) return;
+    setVerifyingAll(true);
+    let ok = 0;
+    let fail = 0;
+    for (const id of audioIds) {
+      try {
+        const audio = await api.getAudio(id);
+        if (audio.status === "exported") {
+          await api.audioChecksum(id);
+          ok += 1;
+        }
+      } catch {
+        fail += 1;
+      }
+    }
+    setGateEpoch((value) => value + 1);
+    toast(`批量校验完成：${ok} 通过${fail ? `，${fail} 失败` : ""}`, fail ? "warn" : "ok");
     setVerifyingAll(false);
   }
+
+  const header = headerForMode(mode, closeoutReadyForLeave);
+  const primaryGate = mode === "bedside" ? interventionGate : completionGate;
+  const statusTone = journalRecovery === "error" || planErr || runtimeControl.error
+    ? "danger"
+    : mode === "completed" ? "ok"
+      : mode === "closed" ? "danger"
+        : mode === "review" && !closeoutReadyForLeave ? "warn"
+        : !runtimeConfirmed || !mode || !journalReady || !planReady ? "muted"
+          : primaryGate.canRequest ? "ok" : "warn";
 
   return (
     <div className="page-shell page-shell--medium">
       <header className="page-header-block">
         <div>
-          <p className="page-kicker">步骤 4 / 4 · 场次收尾</p>
-          <h2 className="page-title">核对并导出本场次</h2>
-          <p className="page-description">先核对训练完整度与评分，再统一导出本场数据。研究录音只有通过导出、校验和信度复核后才可能删除。</p>
+          <p className="page-kicker">{header.kicker}</p>
+          <h2 className="page-title">{header.title}</h2>
+          <p className="page-description">{header.description}</p>
         </div>
         <div className="toolbar">
-          <StatusPill tone={journalRecovery === "error" ? "danger" : !journalReady || !planReady ? "muted" : incomplete ? "warn" : "ok"}>
-            {journalRecovery === "error" ? "记录恢复失败" : !journalReady || !planReady ? "正在核对记录" : incomplete ? "仍有项目待完成" : "训练记录完整"}
+          <StatusPill tone={statusTone}>
+            {!runtimeConfirmed ? "正在核对服务器场次状态" : mode === "completed" ? "最终完成 · 只读"
+              : mode === "closed" ? terminalStatusLabel(runtimeStatus)
+                : mode === "review" && !closeoutReadyForLeave ? "现场收尾待保存"
+                : primaryGate.label}
           </StatusPill>
-          {/* 收尾不再是单行道:看到漏锁随时回去补 */}
-          {onBack && <Button onClick={onBack}>返回{session.week_no === 1 ? "关系建立" : "训练"}</Button>}
-          {onDone && <Button variant="primary" onClick={onDone}>完成收尾,切换下一位</Button>}
+          {mode === "bedside" && onBack && (
+            <Button disabled={transitionBusy} onClick={onBack}>返回{session.week_no === 1 ? "关系建立" : "训练"}</Button>
+          )}
+          {mode === "bedside" && (
+            <Button variant="primary" disabled={transitionBusy || !runtimeConfirmed || !interventionGate.canRequest}
+              onClick={() => { void finishIntervention(); }}>
+              {transitionBusy ? "正在核对 AI 与录音证据…" : "结束床旁干预"}
+            </Button>
+          )}
+          {mode === "review" && onDone && (
+            <Button disabled={transitionBusy || !closeoutReadyForLeave}
+              title={!closeoutReadyForLeave ? "请先保存当前现场收尾，并完成服务器核对" : undefined}
+              onClick={onDone}>{closeoutReadyForLeave ? "切换下一位 · 研究复核稍后进行" : "先完成现场收尾"}</Button>
+          )}
+          {mode === "review" && (
+            <Button variant="primary"
+              disabled={transitionBusy || !runtimeConfirmed || !completionGate.canRequest || !closeoutReadyForLeave}
+              onClick={() => { void completeResearchReview(); }}>
+              {transitionBusy ? "正在请求最终核验…" : "锁定复核并最终完成"}
+            </Button>
+          )}
+          {(mode === "completed" || mode === "closed") && onDone && (
+            <Button onClick={onDone}>返回受试者列表</Button>
+          )}
         </div>
       </header>
 
+      {runtimeControl.error && (
+        <Alert tone="danger" title="无法核对服务器场次状态"
+          actions={<Button onClick={() => { void runtimeControl.refresh(); }}>重新同步</Button>}>
+          {runtimeControl.error}。状态未恢复前不会开放结束、锁分、完成或导出操作。
+        </Alert>
+      )}
+
+      {mode === "bedside" && (
+        <Alert tone="info" title="现场结束不等待人工锁分">
+          系统只核对每个计划环节是否已有权威 AI attempt、绑定的终值 Turn 和可追溯录音。通过后立即让老人端停麦并生成不可变自动汇总；保存独立现场收尾后即可切换，人工确认与锁分留到事后研究复核。
+        </Alert>
+      )}
+      {mode === "review" && (
+        <Alert tone="warn" title="床旁干预已经结束 · 禁止返回训练">
+          老人端、题目推进、提示、录音、暂停与恢复均已关闭。先完成独立现场收尾；保存成功后再核对 AI 原文、确认并锁定研究真值。
+        </Alert>
+      )}
+      {mode === "completed" && (
+        <Alert tone="ok" title="场次已最终完成">
+          训练记录与研究真值均为只读。只有数据管理员可在严格完成门禁再次核对通过后执行去标识导出。
+        </Alert>
+      )}
+      {mode === "closed" && (
+        <Alert tone="danger" title={`${terminalStatusLabel(runtimeStatus)} · 只读`}>
+          {runtimeStatus === "aborted" ? (
+            <>
+              <p>受控中止原因：{sessionAbortReasonLabel(currentRuntime?.endReason)}。已保存证据保持只读，不开放物理删除。</p>
+              <p>本次访问位已保留，不会自动释放或重排；是否补做由协议负责人决定。</p>
+            </>
+          ) : (
+            "该场次不能继续训练、研究锁分或导出，请由研究负责人核查异常终态。"
+          )}
+        </Alert>
+      )}
+
+      {session.week_no === 1 && (
+        <Alert tone="warn" title="第 1 周关系建立完成口径尚未实现">
+          关系建立须独立核对脚本步骤、录音与退出条件；当前不会用空训练计划宣布床旁结束或最终完成。
+        </Alert>
+      )}
+
+      {transitionFailure && (
+        <CompletionFailureAlert failure={transitionFailure} bedside={mode === "bedside"} />
+      )}
+
       {journalRecovery === "error" && (
         <Alert tone="danger" title="无法恢复服务器中的完整场次记录"
-          actions={<Button onClick={() => setJournalRetry((n) => n + 1)}>重新加载记录</Button>}>
-          {journalRecoveryError}。恢复完成前系统不会开放导出，也不会显示可能不完整的录音闸门清单。
+          actions={<Button onClick={() => setJournalRetry((value) => value + 1)}>重新加载记录</Button>}>
+          {journalRecoveryError}。恢复前所有终态转换与导出保持关闭。
         </Alert>
       )}
       {journalRecovery === "loading" && (
         <Alert tone="info" title="正在恢复服务器记录">
-          正在合并已提交的环节、评分与音频；完成前导出保持关闭。
+          正在合并已提交环节、研究真值与录音证据；完成前所有门禁保持关闭。
         </Alert>
       )}
 
-      <section className="form-section">
-        <div className="form-section-header">
-          <div>
-            <h3>训练完成情况</h3>
-            <p className="muted">完成度按已人工锁定的训练环节计算。</p>
-          </div>
-          <StatusPill tone={!journalReady || !planReady ? "muted" : incomplete ? "warn" : "ok"}>
-            {!journalReady || completionPct == null ? "正在计算" : `${completionPct}% 完成`}
-          </StatusPill>
-        </div>
-        <div className="metric-grid">
-          <div className="metric-card">
-            <span className="metric-card__label">已锁定环节</span>
-            <strong className="metric-card__value">{lockedTurns}<small> / {totalTurns || "—"}</small></strong>
-          </div>
-          <div className="metric-card">
-            <span className="metric-card__label">未开始题目</span>
-            <strong className="metric-card__value">{untouched.length}<small> / {plan?.total_items ?? "—"}</small></strong>
-          </div>
-          <div className="metric-card">
-            <span className="metric-card__label">已登记录音</span>
-            <strong className="metric-card__value">{audioIds.length}<small> 条</small></strong>
-          </div>
-        </div>
+      {mode === "review" && !closeoutReadyForLeave && (
+        <Alert tone="warn" title="离开本场前，请先完成现场收尾">
+          明确选择“无额外观察”或记录可观察事实并保存。服务器确认后，切换下一位、退出账号和切换工作区才会开放；研究分析与锁分也会显示在下方。
+        </Alert>
+      )}
 
-        {planErr && (
-          <Alert tone="danger" title="无法核对场次计划"
-            actions={<Button onClick={() => setRetryNonce((n) => n + 1)}>重新加载</Button>}>
-            {planErr}。完整度未知时系统不会开放导出，请先恢复本机服务连接。
-          </Alert>
-        )}
+      {(mode === "review" || mode === "completed") && closeoutLoadState === "loading" && (
+        <Alert tone="info" title="正在恢复自动汇总与现场收尾">
+          服务器记录确认前不会开放切换受试者或最终完成。
+        </Alert>
+      )}
+      {(mode === "review" || mode === "completed") && closeoutLoadState === "error" && (
+        <Alert tone="danger" title="无法恢复自动汇总或现场收尾"
+          actions={<Button onClick={() => setCloseoutRetryNonce((value) => value + 1)}>重新加载收尾</Button>}>
+          {closeoutLoadError}。系统不会用浏览器本地计数代替服务器权威汇总。
+        </Alert>
+      )}
+      {(mode === "review" || mode === "completed") && outcomeSummary && closeoutLoadState === "ready" && (
+        <SessionCloseoutPanel
+          outcomeSummary={outcomeSummary}
+          closeout={closeout}
+          busy={transitionBusy || mode === "completed"}
+          onSave={saveCloseout}
+          onReconcile={reconcileCloseout}
+          onGateChange={setCloseoutEditorGate}
+        />
+      )}
 
-        {journalReady && untouched.length > 0 && (
-          <Alert tone="warn" title={`有 ${untouched.length} 题尚未开始`}
-            actions={onBack ? <Button onClick={onBack}>返回训练补齐</Button> : undefined}>
-            建议返回训练工作台补齐；如仍需导出，导出文件会明确标记未计入的内容。
-            <details style={{ marginTop: 12 }}>
-              <summary style={{ cursor: "pointer", fontWeight: 600 }}>查看未开始题目清单</summary>
-              {untouchedGroups.map((group) => (
-                <div key={group.taskType} style={{ marginTop: 10 }}>
-                  <strong>{group.taskType} · {group.items.length} 题</strong>
-                  <ul>{group.items.map((item) => <li key={item.item_id} className="mono">{item.item_id}</li>)}</ul>
-                </div>
-              ))}
-            </details>
-          </Alert>
-        )}
-      </section>
-
-      <section className="form-section">
-        <div className="form-section-header">
-          <div>
-            <h3>本场评分结果</h3>
-            <p className="muted">只汇总已由研究者人工确认并锁定的环节。</p>
-          </div>
-        </div>
-        {scoresErr ? (
-          <div className="row wrap">
-            <span style={{ color: "var(--c-danger)" }}>评分结果加载失败：{scoresErr}</span>
-            <Button onClick={() => setRetryNonce((n) => n + 1)}>重新加载</Button>
-          </div>
-        ) : !scores ? <p className="muted">正在加载评分结果…</p> : (
-          <>
-            <div className="metric-grid">
-              {planHas("单要素") && <ScoreCard title="单要素命名正确率" summary={scores.single} metric="naming_accuracy" fmt={ratioPct} />}
-              {planHas("双要素") && <ScoreCard title="双要素周得分" summary={scores.double} metric="weekly_de_score_percentile" />}
-              {planHas("多要素") && <ScoreCard title="多要素关键要素率" summary={scores.multi} metric="weekly_me_score_percentile" />}
+      {reviewAnalysisUnlocked && (
+        <section className="form-section">
+          <div className="form-section-header">
+            <div>
+              <h3>{mode === "bedside" ? "床旁证据概览" : "研究复核完整度"}</h3>
+              <p className="muted">
+                {mode === "bedside"
+                  ? "最终是否可结束由服务器逐环节核对 AI attempt 与录音字节，前端不会用人工锁分冒充现场完成。"
+                  : "最终完成要求冻结计划的每个环节都有唯一人工确认与锁定研究真值。"}
+              </p>
             </div>
-            {scores.excluded_items.length > 0 && (
-              <Alert tone="warn" title={`${scores.excluded_items.length} 项未计入评分`}>
-                这些项目仍有环节未锁定。导出不会被阻断，但文件会保留该缺失标记。
-                <details style={{ marginTop: 8 }}>
-                  <summary style={{ cursor: "pointer", fontWeight: 600 }}>查看未计入项目</summary>
-                  <ul>{scores.excluded_items.map((x, i) => <li key={i}>{x}</li>)}</ul>
-                </details>
-              </Alert>
-            )}
-          </>
-        )}
-      </section>
-
-      <section className="form-section">
-        <div className="form-section-header">
-          <div>
-            <h3>数据导出与录音保护</h3>
-            <p className="muted">必须按顺序推进；未通过全部闸门的录音不会显示删除操作。</p>
+            <StatusPill tone={!journalReady || !planReady ? "muted" : primaryGate.canRequest ? "ok" : "warn"}>
+              {!journalReady || !planReady ? "正在计算" : mode === "bedside" ? interventionGate.label
+                : completionPct == null ? completionGate.label : `${completionPct}% 已锁定`}
+            </StatusPill>
           </div>
-        </div>
-        <div className="workflow-stepper" aria-label="数据导出与录音处理顺序">
-          <div className={`workflow-step${!journalReady || !planReady ? " is-active" : !incomplete ? " is-complete" : ""}`}><span>1</span><span>核对完整度</span></div>
-          <div className={`workflow-step${exp ? " is-complete" : journalReady && planReady ? " is-active" : ""}`}><span>2</span><span>整场去标识导出</span></div>
-          <div className={`workflow-step${exp ? " is-active" : ""}`}><span>3</span><span>校验录音副本</span></div>
-          <div className="workflow-step"><span>4</span><span>信度复核后删除</span></div>
-        </div>
-
-        {journalReady && incomplete && (
-          <Alert tone="warn" title="当前导出将是不完整场次">
-            仍有未锁定环节。请优先返回训练补齐；如研究流程要求此刻导出，缺失项会写入导出结果。
-          </Alert>
-        )}
-
-        <div className="form-actions">
-          <p className="muted grow">系统只提供去标识导出，不包含直接身份信息；整场音频会进入同一受控批次。</p>
-          <Button variant="primary" disabled={busy || !planReady || !journalReady}
-            onClick={() => incomplete ? setConfirmIncompleteExport(true) : void doExport()}>
-            {busy ? "正在生成导出批次…" : !journalReady ? "等待服务器记录恢复…" : !planReady ? "等待完成度检查…" : incomplete ? "导出当前已完成数据" : "导出本场次（去标识）"}
-          </Button>
-        </div>
-        {exp && (
-          <div className="card" style={{ background: "var(--c-bg)" }}>
-            <div className="row wrap"><StatusPill tone="ok">导出批次 {exp.batch_id}</StatusPill><StatusPill tone={exp.deidentified ? "ok" : "danger"}>{exp.deidentified ? "已去标识" : "包含标识信息"}</StatusPill></div>
-            <p>已生成：{Object.entries(exp.sheet_counts).map(([k, v]) => `${k}（${v}）`).join("、")}</p>
-            <p className="muted">共 {exp.files.length} 个文件 · 纳入 {exp.audio_touched.length} 条研究录音</p>
-            {exp.excluded_items.length > 0 && <p style={{ color: "var(--c-warn)" }}>{exp.excluded_items.length} 项因未锁定而未计入评分</p>}
+          <div className="metric-grid">
+            <div className="metric-card">
+              <span className="metric-card__label">终值环节记录</span>
+              <strong className="metric-card__value">{Object.keys(journal.turns).length}<small> / {totalTurns || "—"}</small></strong>
+            </div>
+            <div className="metric-card">
+              <span className="metric-card__label">人工已锁定</span>
+              <strong className="metric-card__value">{lockedTurns}<small> / {totalTurns || "—"}</small></strong>
+            </div>
+            <div className="metric-card">
+              <span className="metric-card__label">已登记录音</span>
+              <strong className="metric-card__value">{audioIds.length}<small> 条</small></strong>
+            </div>
           </div>
-        )}
 
-        <div className="form-section-header" style={{ marginTop: 8 }}>
-          <div>
-            <h3>研究录音状态</h3>
-            <p className="muted">校验针对本次导出的受控副本；原始录音不能逐条绕过整场导出。</p>
-          </div>
-          {journalReady && audioIds.length > 1 && (
-            <Button onClick={verifyAll} disabled={verifyingAll || !journalReady}>{verifyingAll ? "正在批量校验…" : "校验全部已导出录音"}</Button>
+          {planErr && (
+            <Alert tone="danger" title="无法核对冻结计划"
+              actions={<Button onClick={() => setRetryNonce((value) => value + 1)}>重新加载</Button>}>
+              {planErr}。计划未知时不会开放终态转换或导出。
+            </Alert>
           )}
-        </div>
-        {!journalReady ? <p className="muted">完整录音清单恢复后才会显示。</p> : audioIds.length === 0 ? <p className="muted">本场次没有登记研究录音，无需执行录音闸门。</p> :
-          audioIds.map((id) => <AudioGateRow key={id} rawAudioId={id} gateEpoch={gateEpoch} />)}
-      </section>
+          {journalReady && untouched.length > 0 && (
+            <Alert tone="warn" title={`有 ${untouched.length} 题没有终值记录`}>
+              服务器证据门禁会逐项核对并拒绝缺失位置；本页不会提供不完整导出绕过。
+              <details style={{ marginTop: 8 }}>
+                <summary>查看缺失题目</summary>
+                <ul>{untouched.map((item) => <li key={item.item_id}>{item.item_id} · {item.task_type}</li>)}</ul>
+              </details>
+            </Alert>
+          )}
+        </section>
+      )}
 
-      <ConfirmDialog open={confirmIncompleteExport} title="导出不完整场次？"
-        body={`当前仅锁定 ${lockedTurns}/${totalTurns} 个环节。导出文件会保留缺失标记，建议先返回训练补齐；只有研究流程确需中途留档时才继续。`}
-        confirmLabel="仍要导出"
-        onConfirm={() => { setConfirmIncompleteExport(false); void doExport(); }}
-        onCancel={() => setConfirmIncompleteExport(false)} />
+      {(mode === "review" || mode === "completed") && reviewAnalysisUnlocked && plan && journalReady && (
+        <ResearchReviewPanel
+          plan={plan}
+          turns={journal.turns}
+          reviewerId={reviewerId}
+          readOnly={mode === "completed"}
+          rawAudioIdsByTurnKey={rawAudioIdsByTurnKey}
+          onUpsertTurn={upsertTurn}
+          onChanged={() => setScoresRetryNonce((value) => value + 1)}
+        />
+      )}
+
+      {(mode === "review" || mode === "completed") && reviewAnalysisUnlocked && (
+        <section className="form-section">
+          <div className="form-section-header">
+            <div>
+              <h3>研究评分结果</h3>
+              <p className="muted">只汇总已由研究者人工确认并锁定的环节；AI operational 判类不作为研究真值。</p>
+            </div>
+          </div>
+          {scoresErr ? (
+            <div className="row wrap">
+              <span style={{ color: "var(--c-danger)" }}>评分结果加载失败：{scoresErr}</span>
+              <Button onClick={() => setScoresRetryNonce((value) => value + 1)}>重新加载</Button>
+            </div>
+          ) : !scores ? <p className="muted">正在加载评分结果…</p> : (
+            <>
+              <div className="metric-grid">
+                {planHas("单要素") && <ScoreCard title="单要素命名正确率" summary={scores.single} metric="naming_accuracy" fmt={ratioPct} />}
+                {planHas("双要素") && <ScoreCard title="双要素周得分" summary={scores.double} metric="weekly_de_score_percentile" />}
+                {planHas("多要素") && <ScoreCard title="多要素关键要素率" summary={scores.multi} metric="weekly_me_score_percentile" />}
+              </div>
+              {scores.excluded_items.length > 0 && (
+                <Alert tone="warn" title={`${scores.excluded_items.length} 项尚未计入研究评分`}>
+                  这些项目仍缺人工锁定，严格完成门禁与导出均保持关闭。
+                </Alert>
+              )}
+            </>
+          )}
+        </section>
+      )}
+
+      {mode === "completed" && (
+        <section className="form-section">
+          <div className="form-section-header">
+            <div>
+              <h3>数据管理员导出、保全与治理</h3>
+              <p className="muted">这里只处理 completed 后的数据治理生命周期，不会重新编辑床旁训练或评分真值；角色、最终终态和严格完成门禁缺一不可。</p>
+            </div>
+          </div>
+
+          {!completionGate.canRequest && (
+            <Alert tone="danger" title="最终终态与本地严格门禁不一致 · 导出已关闭">
+              {completionGate.detail}。请先由研究负责人核查服务器记录，不能用不完整导出绕过。
+            </Alert>
+          )}
+          {!canExport && (
+            <Alert tone="info" title="当前账号不能执行数据导出">
+              研究者可以只读查看最终记录；去标识导出、录音副本校验与后续保全操作由 admin 或 data_steward 执行。
+            </Alert>
+          )}
+
+          {exportAllowed && (
+            <>
+              <div className="form-actions">
+                <p className="muted grow">服务器会再次核对最终完成态与完整性，并记录数据导出审计事件。</p>
+                <Button variant="primary" disabled={exportBusy} onClick={() => { void doExport(); }}>
+                  {exportBusy ? "正在生成导出批次…" : "导出本场次（去标识）"}
+                </Button>
+              </div>
+              {exp && (
+                <div className="card" style={{ background: "var(--c-bg)" }}>
+                  <div className="row wrap">
+                    <StatusPill tone="ok">导出批次 {exp.batch_id}</StatusPill>
+                    <StatusPill tone={exp.deidentified ? "ok" : "danger"}>{exp.deidentified ? "已去标识" : "包含标识信息"}</StatusPill>
+                  </div>
+                  <p>已生成：{Object.entries(exp.sheet_counts).map(([key, value]) => `${key}（${value}）`).join("、")}</p>
+                  <p className="muted">共 {exp.files.length} 个文件 · 纳入 {exp.audio_touched.length} 条研究录音</p>
+                </div>
+              )}
+
+              <div className="form-section-header" style={{ marginTop: 16 }}>
+                <div>
+                  <h3>研究录音状态</h3>
+                  <p className="muted">整场导出后才可校验受控副本；原始录音不能绕过完整场次单独处理。</p>
+                </div>
+                {audioIds.length > 1 && (
+                  <Button onClick={() => { void verifyAll(); }} disabled={verifyingAll}>
+                    {verifyingAll ? "正在批量校验…" : "校验全部已导出录音"}
+                  </Button>
+                )}
+              </div>
+              {audioIds.length === 0
+                ? <p className="muted">本场没有登记研究录音。</p>
+                : audioIds.map((id) => <AudioGateRow key={id} rawAudioId={id}
+                  sessionId={session.session_id} gateEpoch={gateEpoch}
+                  canDelete={canDeleteAudio} />)}
+            </>
+          )}
+        </section>
+      )}
     </div>
   );
 }
 
-function ScoreCard({ title, summary, metric, fmt }: { title: string; summary: Record<string, unknown> | null; metric: string; fmt?: (n: number) => string }) {
-  const v = summary ? (summary[metric] as number | undefined) : undefined;
+function headerForMode(
+  mode: WrapupMode | null,
+  closeoutReadyForLeave: boolean,
+): { kicker: string; title: string; description: string } {
+  if (mode === "bedside") {
+    return {
+      kicker: "现场流程 · 结束床旁干预",
+      title: "核对 AI 与录音证据后结束老人端",
+      description: "不要求老人等待人工转写、确认或锁分；结束后工作人员独立补现场收尾。",
+    };
+  }
+  if (mode === "review") {
+    if (!closeoutReadyForLeave) {
+      return {
+        kicker: "现场流程 · 必填收尾",
+        title: "先保存现场收尾，再切换下一位",
+        description: "老人端已经结束；这一步只记录可直接观察到的事实，保存后才进入事后研究复核。",
+      };
+    }
+    return {
+      kicker: "事后流程 · 研究复核",
+      title: "人工确认研究真值并锁分",
+      description: "老人端已经结束；研究者在后台逐环节复核 AI 证据，全部锁定后才最终完成。",
+    };
+  }
+  if (mode === "completed") {
+    return {
+      kicker: "数据后台 · 最终完成",
+      title: "只读查看与受控导出",
+      description: "训练与研究真值均已冻结；只有数据管理员可执行去标识导出。",
+    };
+  }
+  if (mode === "closed") {
+    return {
+      kicker: "异常终态 · 只读",
+      title: "本场次已关闭",
+      description: "系统不会恢复题目推进、录音或锁分。",
+    };
+  }
+  return {
+    kicker: "场次状态核对",
+    title: "正在确认服务器终态",
+    description: "状态确认完成前不开放任何终态转换或导出操作。",
+  };
+}
+
+function terminalStatusLabel(status: SessionRuntimeStatus | null): string {
+  if (status === "aborted") return "场次已中止";
+  if (status === "failed") return "场次已异常结束";
+  if (status === "intervention_completed") return "干预已结束 · 待研究复核";
+  if (status === "completed") return "场次已最终完成";
+  return "场次状态未知";
+}
+
+function CompletionFailureAlert({ failure, bedside }: { failure: CompletionFailureView; bedside: boolean }) {
+  return (
+    <Alert tone="danger" title={bedside ? "服务器拒绝结束床旁干预" : "服务器拒绝最终完成"}>
+      <p>{failure.message}</p>
+      {failure.assessment && (
+        <>
+          <p>
+            服务器核对：计划 {failure.assessment.expectedTurns ?? "—"} 个环节，
+            匹配 {failure.assessment.matchedTurns ?? "—"} 个，
+            AI 完成 {failure.assessment.completedAttemptTurns ?? "—"} 个，
+            录音证据 {failure.assessment.audioEvidencedTurns ?? "—"} 个，
+            人工锁定 {failure.assessment.lockedTurns ?? "—"} 个。
+          </p>
+          {failure.assessment.issues.length > 0 && (
+            <details>
+              <summary style={{ cursor: "pointer", fontWeight: 600 }}>
+                查看 {failure.assessment.issues.length} 条阻断原因
+              </summary>
+              <ul>
+                {failure.assessment.issues.map((issue, index) => (
+                  <li key={`${issue.code ?? "issue"}-${issue.itemId ?? "session"}-${issue.turnSeq ?? "none"}-${index}`}>
+                    {completionIssueLabel(issue)}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </>
+      )}
+      本场仍保留在当前页面，不会误切换受试者或宣布完成。
+    </Alert>
+  );
+}
+
+function ScoreCard({
+  title,
+  summary,
+  metric,
+  fmt,
+}: {
+  title: string;
+  summary: Record<string, unknown> | null;
+  metric: string;
+  fmt?: (value: number) => string;
+}) {
+  const value = summary ? (summary[metric] as number | undefined) : undefined;
   return (
     <div className="metric-card">
       <span className="metric-card__label">{title}</span>
-      {summary ? (
-        <strong className="metric-card__value">{v == null ? "—" : fmt ? fmt(v) : `${v.toFixed(1)}%`}</strong>
-      ) : <span className="muted">暂无已锁定题</span>}
+      {summary
+        ? <strong className="metric-card__value">{value == null ? "—" : fmt ? fmt(value) : `${value.toFixed(1)}%`}</strong>
+        : <span className="muted">暂无已锁定题</span>}
     </div>
   );
 }
@@ -308,69 +791,103 @@ const audioStatusLabel: Record<AudioAsset["status"], string> = {
   exported: "已导出，待校验",
   checksum_verified: "校验通过，待信度复核",
   reliability_review_done: "信度复核完成",
-  deletable: "全部闸门通过",
-  deleted: "已删除",
+  deletable: "全部保全闸门通过",
+  deleted: "采集原件已删（受控副本按策略保留）",
 };
 
-// 四步闸门:recorded 只能经完整 session export → exported→checksum_verified→(信度)reliability_review_done→deletable→deleted
-function AudioGateRow({ rawAudioId, gateEpoch = 0 }: { rawAudioId: string; gateEpoch?: number }) {
+function AudioGateRow({ rawAudioId, sessionId, gateEpoch = 0, canDelete = false }: {
+  rawAudioId: string;
+  sessionId: string;
+  gateEpoch?: number;
+  canDelete?: boolean;
+}) {
   const toast = useToast();
-  const [a, setA] = useState<AudioAsset | null>(null);
+  const [audio, setAudio] = useState<AudioAsset | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ok" | "missing" | "error">("loading");
   const [rowBusy, setRowBusy] = useState(false);
-  const [confirmDel, setConfirmDel] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const refresh = useCallback(() => {
     setLoadState("loading");
     api.getAudio(rawAudioId)
-      .then((x) => { setA(x); setLoadState("ok"); })
-      .catch((e) => { setA(null); setLoadState(e instanceof ApiError && e.status === 404 ? "missing" : "error"); });
+      .then((next) => { setAudio(next); setLoadState("ok"); })
+      .catch((error) => {
+        setAudio(null);
+        setLoadState(error instanceof ApiError && error.status === 404 ? "missing" : "error");
+      });
   }, [rawAudioId]);
-  useEffect(() => { refresh(); }, [refresh, gateEpoch]);
+  useEffect(() => { refresh(); }, [gateEpoch, refresh]);
 
-  async function step(fn: () => Promise<AudioAsset>) {
-    if (rowBusy) return; // 在途锁:慢网下连点不重复触发状态迁移
+  async function step(operation: () => Promise<AudioAsset>) {
+    if (rowBusy) return;
     setRowBusy(true);
-    try { setA(await fn()); toast("闸门状态已推进", "ok"); }
-    catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); refresh(); }
-    finally { setRowBusy(false); }
+    try {
+      setAudio(await operation());
+      toast("录音保全闸门已推进", "ok");
+    } catch (error) {
+      toast(error instanceof ApiError ? error.detail : String(error), "danger");
+      refresh();
+    } finally {
+      setRowBusy(false);
+    }
   }
+
   async function remove() {
     if (rowBusy) return;
     setRowBusy(true);
     try {
-      await api.deleteAudio(rawAudioId);
-      await blobStore.del(rawAudioId); // 服务端放行后才镜像删本地字节
-      toast("音频已删除(服务端放行 + 本地字节清除)", "ok");
+      await api.deleteAudio(rawAudioId, sessionId);
+      let localCacheCleared = true;
+      try {
+        const outcome = await blobStore.del(rawAudioId);
+        localCacheCleared = outcome === "deleted" || outcome === "missing";
+      } catch { localCacheCleared = false; }
+      toast(
+        localCacheCleared
+          ? "服务器采集原件与当前浏览器同 ID 缓存已清理"
+          : "服务器采集原件已删除，但当前浏览器缓存清理失败",
+        localCacheCleared ? "ok" : "warn",
+      );
       refresh();
-    } catch (e) { toast(e instanceof ApiError ? e.detail : String(e), "danger"); }
-    finally { setRowBusy(false); }
+    } catch (error) {
+      toast(error instanceof ApiError ? error.detail : String(error), "danger");
+    } finally {
+      setRowBusy(false);
+    }
   }
 
-  if (loadState === "loading") return <div className="row muted">{rawAudioId.slice(0, 16)}…:读取状态中…</div>;
-  if (loadState === "error") return <div className="row muted">{rawAudioId.slice(0, 16)}…:状态获取失败 <Button onClick={refresh}>重试</Button></div>;
-  if (loadState === "missing" || !a) return <div className="row muted">{rawAudioId.slice(0, 16)}…:未在服务端登记</div>;
-  const tone = a.status === "deletable" ? "ok" : a.status === "deleted" ? "muted" : "primary";
+  if (loadState === "loading") return <div className="row muted">{rawAudioId.slice(0, 16)}…：读取状态中…</div>;
+  if (loadState === "error") return <div className="row muted">{rawAudioId.slice(0, 16)}…：状态获取失败 <Button onClick={refresh}>重试</Button></div>;
+  if (loadState === "missing" || !audio) return <div className="row muted">{rawAudioId.slice(0, 16)}…：服务端未登记</div>;
+  const tone = audio.status === "deletable" ? "ok" : audio.status === "deleted" ? "muted" : "primary";
   return (
     <div className="row" style={{ justifyContent: "space-between", borderBottom: "1px solid var(--c-line-soft)", paddingBottom: 8 }}>
       <div className="col" style={{ gap: 2 }}>
         <span className="mono">{rawAudioId.slice(0, 16)}…</span>
-        <span className="muted">{a.is_reliability_sample ? "信度样本" : "常规"}{a.contains_direct_identifier ? " · 含直接标识" : ""}</span>
+        <span className="muted">{audio.is_reliability_sample ? "信度样本" : "常规"}{audio.contains_direct_identifier ? " · 含直接标识" : ""}</span>
       </div>
       <div className="row wrap">
-        <StatusPill tone={tone}>{audioStatusLabel[a.status]}</StatusPill>
+        <StatusPill tone={tone}>{audioStatusLabel[audio.status]}</StatusPill>
         {rowBusy && <span className="muted">处理中…</span>}
-        {a.status === "recorded" && <span className="muted">请先执行整场去标识导出</span>}
-        {a.status === "exported" && <Button disabled={rowBusy} onClick={() => step(() => api.audioChecksum(rawAudioId))}>校验导出副本</Button>}
-        {a.status === "checksum_verified" && a.is_reliability_sample && <Button disabled={rowBusy} onClick={() => step(() => api.audioReliabilityReview(rawAudioId))}>完成人工信度复核</Button>}
-        {/* 删除是唯一不可恢复动作:锁分都有确认层,删录音更要 */}
-        {a.status === "deletable" && <Button variant="danger" disabled={rowBusy} onClick={() => setConfirmDel(true)}>删除</Button>}
+        {audio.status === "recorded" && <span className="muted">请先执行整场去标识导出</span>}
+        {audio.status === "exported" && (
+          <Button disabled={rowBusy} onClick={() => { void step(() => api.audioChecksum(rawAudioId)); }}>校验导出副本</Button>
+        )}
+        {audio.status === "checksum_verified" && audio.is_reliability_sample && (
+          <Button disabled={rowBusy} onClick={() => { void step(() => api.audioReliabilityReview(rawAudioId)); }}>完成人工信度复核</Button>
+        )}
+        {audio.status === "deletable" && canDelete && (
+          <Button variant="danger" disabled={rowBusy} onClick={() => setConfirmDelete(true)}>删除采集原件</Button>
+        )}
+        {audio.status === "deletable" && !canDelete && (
+          <span className="muted">已满足闸门；物理删除需由系统管理员执行</span>
+        )}
       </div>
-      <ConfirmDialog open={confirmDel} title="删除这条研究录音?"
-        body={`${rawAudioId.slice(0, 16)}… 已过全部闸门(导出+校验${a.is_reliability_sample ? "+信度复核" : ""})。删除将同时清掉服务端与本机字节,不可恢复。`}
-        confirmLabel="确认删除"
-        onConfirm={() => { setConfirmDel(false); void remove(); }}
-        onCancel={() => setConfirmDel(false)} />
+      <ConfirmDialog open={canDelete && confirmDelete} title="删除这条研究录音采集原件？"
+        body={`${rawAudioId.slice(0, 16)}… 已通过整场导出、校验${audio.is_reliability_sample ? "与信度复核" : ""}。此操作不可恢复；受控导出副本仍按研究保留策略保存。`}
+        confirmLabel="确认删除采集原件"
+        onConfirm={() => { setConfirmDelete(false); void remove(); }}
+        onCancel={() => setConfirmDelete(false)} />
     </div>
   );
 }

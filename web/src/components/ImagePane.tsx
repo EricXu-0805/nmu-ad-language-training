@@ -1,7 +1,13 @@
-import React, { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  loadCurrentPatientAsset,
+  type LoadedPatientAsset,
+  type PatientAssetReadinessEvent,
+} from "../patient/currentPatientAsset.ts";
+import { browserCurrentPatientAssetDependencies } from "../patient/browserCurrentPatientAsset.ts";
 
 // 题图呈现 + 可选半区聚光(左命名/左作用→左半,右命名/右作用→右半,关系识别→双亮)。
-// image_id=null(内容组未回填)→ 明确占位框,不静默;真实数据采集须先回填题图。
+// 只取服务器当前游标授权的字节；不接收/拼接 image_id，DOM 仅出现临时 blob URL。
 export type Spotlight = "left" | "right" | "both" | "none";
 
 // 题图源是 docx 抽出的线稿,原始像素小(最小 132px)——不能按原尺寸摆,大屏上只有一角。
@@ -22,66 +28,131 @@ function fit(nw: number, nh: number, vw: number, vh: number, compact: boolean): 
   return { width: Math.round(nw * scale), height: Math.round(nh * scale) };
 }
 
-export function ImagePane({ imageId, spotlight = "none", compact = false, alt }: { imageId: string | null; spotlight?: Spotlight; compact?: boolean; alt?: string }) {
+export function ImagePane({
+  sessionId,
+  requestKey,
+  required = true,
+  spotlight = "none",
+  compact = false,
+  alt,
+  onReadinessChange,
+}: {
+  sessionId: string;
+  /** Local race key only. It is never sent to the server or written into DOM. */
+  requestKey: string;
+  required?: boolean;
+  spotlight?: Spotlight;
+  compact?: boolean;
+  alt?: string;
+  onReadinessChange?(event: PatientAssetReadinessEvent): void;
+}) {
   const [size, setSize] = useState<{ width: number; height: number } | null>(null);
-  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
-  const [failed, setFailed] = useState(false);
+  const [loaded, setLoaded] = useState<{
+    requestKey: string;
+    asset: LoadedPatientAsset;
+  } | null>(null);
+  const [failedKey, setFailedKey] = useState<string | null>(null);
+  // Prop changes render before effects clean up. Bind both success and failure
+  // to the exact key so the previous item's pixels cannot flash for one frame.
+  const asset = loaded?.requestKey === requestKey ? loaded.asset : null;
+  const failed = failedKey === requestKey;
+  const readinessCallback = useRef(onReadinessChange);
+  readinessCallback.current = onReadinessChange;
 
-  const onLoad = useCallback((e: React.SyntheticEvent<HTMLImageElement>) => {
-    const img = e.currentTarget;
-    if (img.naturalWidth > 0) setNatural({ w: img.naturalWidth, h: img.naturalHeight });
-  }, []);
-
-  // useLayoutEffect:naturalWH 一到就在 paint 前定好尺寸,不闪未适配帧
+  // 解码通过后在 paint 前定好尺寸,不闪未适配帧。
   useLayoutEffect(() => {
-    if (!natural) return;
-    const apply = () => setSize(fit(natural.w, natural.h, window.innerWidth, window.innerHeight, compact));
+    if (!asset) return;
+    const apply = () => setSize(fit(
+      asset.naturalWidth,
+      asset.naturalHeight,
+      window.innerWidth,
+      window.innerHeight,
+      compact,
+    ));
     apply();
     window.addEventListener("resize", apply);
     return () => window.removeEventListener("resize", apply);
-  }, [natural, compact]);
+  }, [asset, compact]);
 
-  // 换题时回到未测量状态,避免用上一张图的尺寸闪一帧
-  useEffect(() => { setSize(null); setNatural(null); setFailed(false); }, [imageId]);
+  useEffect(() => {
+    setSize(null);
+    setLoaded(null);
+    setFailedKey(null);
+    if (!required) {
+      readinessCallback.current?.({ requestKey, readiness: "ready" });
+      return;
+    }
+    const controller = new AbortController();
+    let ownedAsset: LoadedPatientAsset | null = null;
+    readinessCallback.current?.({ requestKey, readiness: "loading" });
+    void loadCurrentPatientAsset(
+      sessionId,
+      controller.signal,
+      browserCurrentPatientAssetDependencies,
+    ).then((loaded) => {
+      if (controller.signal.aborted) {
+        loaded.dispose();
+        return;
+      }
+      ownedAsset = loaded;
+      setLoaded({ requestKey, asset: loaded });
+      readinessCallback.current?.({ requestKey, readiness: "ready" });
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted
+          || (error instanceof DOMException && error.name === "AbortError")) return;
+      setFailedKey(requestKey);
+      readinessCallback.current?.({ requestKey, readiness: "failed" });
+    });
+    return () => {
+      controller.abort(new DOMException("题目已切换", "AbortError"));
+      ownedAsset?.dispose();
+    };
+  }, [required, requestKey, sessionId]);
 
-  if (!imageId) {
-    return (
-      <div className="image-pane card patient-status" role="status" aria-live="polite" style={{
-        display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center",
-        width: "min(84vw, 640px)", minHeight: "min(28vh, 240px)",
-        background: "var(--c-warn-bg)", color: "var(--c-warn)", border: "2px dashed var(--c-warn)",
-      }}>
-        <div>
-          <div style={{ fontWeight: 700 }}>图片正在准备</div>
-          <div className="muted">请稍候，研究者会来处理</div>
-        </div>
-      </div>
-    );
-  }
+  if (!required) return null;
   const half = (side: "left" | "right"): React.CSSProperties => ({
     position: "absolute", top: 0, bottom: 0, width: "50%", [side]: 0,
     background: spotlight === side ? "transparent" : "rgba(0,0,0,0.55)",
     transition: "background 300ms", pointerEvents: "none",
   } as React.CSSProperties);
   if (failed) {
-    // 图片字节加载失败(文件缺/损坏):给一个平和的空白画框,不永久隐形也不报错闪红;
-    // 研究者从操作端能看到当前题号,QA 时据此排查。
+    // 安全取图或解码失败即关闭媒体门禁；不给老人暴露技术细节。
     return (
-      <div className="image-pane patient-status" role="status" aria-live="polite" style={{
+      <div className="image-pane patient-status" role="alert" aria-live="assertive" style={{
         width: "min(60vw, 640px)", height: "28vh", borderRadius: "var(--radius)",
         background: "var(--c-surface)", boxShadow: "var(--shadow-md)",
         display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center",
       }}>
-        <span>图片暂未显示<br /><span className="muted">请稍候，研究者会来处理</span></span>
+        <span>我们先等一下<br /><span className="muted">请研究者查看题目图片</span></span>
+      </div>
+    );
+  }
+  if (!asset) {
+    return (
+      <div className="image-pane card patient-status" role="status" aria-live="polite" aria-busy="true" style={{
+        display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center",
+        width: "min(84vw, 640px)", minHeight: "min(28vh, 240px)",
+        background: "var(--c-surface)", color: "var(--c-ink)",
+      }}>
+        <div>
+          <div style={{ fontWeight: 700 }}>图片正在准备</div>
+          <div className="muted">请稍候</div>
+        </div>
       </div>
     );
   }
   return (
     <div className="image-pane" style={{ position: "relative", display: "inline-block", borderRadius: "var(--radius)", overflow: "hidden", background: "#fff" }}>
-      <img src={`/img/${imageId}.webp`} alt={alt ?? ""} onLoad={onLoad} onError={() => setFailed(true)}
+      <img src={asset.objectUrl} alt={alt ?? ""}
+        onError={() => {
+          asset.dispose();
+          setLoaded(null);
+          setFailedKey(requestKey);
+          readinessCallback.current?.({ requestKey, readiness: "failed" });
+        }}
         style={size
           ? { display: "block", width: size.width, height: size.height }
-          : { display: "block", maxWidth: "90vw", maxHeight: "40vh", visibility: "hidden" }} />
+          : { display: "block", width: 1, height: 1, visibility: "hidden" }} />
       {spotlight !== "none" && spotlight !== "both" && (
         <>
           <div style={half("left")} aria-hidden />

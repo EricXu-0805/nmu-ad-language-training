@@ -23,18 +23,156 @@
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import io
+import ipaddress
 import json
 import os
+import socket
+import stat
 import threading
 import wave
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CACHE_DIR = DATA_DIR / "tts-cache"
 DEFAULT_VOICE = DATA_DIR / "tts" / "zh_CN-huayan-medium.onnx"
+_MAX_CLOUD_TTS_BYTES = 16 * 1024 * 1024
+_DASHSCOPE_DOWNLOAD_SUFFIXES = ("aliyuncs.com",)
+
+
+def _max_cloud_tts_base64_chars() -> int:
+    """Largest canonical base64 envelope that can contain the byte budget."""
+    return 4 * ((_MAX_CLOUD_TTS_BYTES + 2) // 3)
+
+
+def _validated_wav_bytes(data: object) -> bytes:
+    """Return bounded RIFF/WAVE bytes or reject the provider/cache payload.
+
+    All cloud result shapes and the persistent cache share this exact boundary;
+    otherwise a provider can bypass the URL-download checks by choosing inline
+    bytes/base64, and a bad response can become a permanent cache hit.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError("TTS 音频不是字节串")
+    size = len(data)
+    if size <= 44:
+        raise ValueError("TTS 音频没有有效载荷")
+    if size > _MAX_CLOUD_TTS_BYTES:
+        raise ValueError("TTS 音频超过大小上限")
+    payload = bytes(data)
+    if not payload.startswith(b"RIFF") or payload[8:12] != b"WAVE":
+        raise ValueError("TTS 音频容器签名无效")
+    return payload
+
+
+def _validated_inline_wav_base64(value: object) -> bytes:
+    """Strictly decode a bounded base64 envelope, then validate decoded WAV."""
+    if not isinstance(value, (str, bytes, bytearray)):
+        raise ValueError("云 TTS base64 类型无效")
+    if len(value) > _max_cloud_tts_base64_chars():
+        raise ValueError("云 TTS base64 超过解码前上限")
+    if isinstance(value, str):
+        try:
+            encoded = value.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("云 TTS base64 不是 ASCII") from exc
+    else:
+        encoded = bytes(value)
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("云 TTS base64 非法") from exc
+    return _validated_wav_bytes(decoded)
+
+
+def _read_validated_wav_cache(path: Path) -> bytes:
+    """Read at most the TTS budget from one regular, non-symlink cache file."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("TTS 缓存不是普通文件")
+        if metadata.st_size <= 44 or metadata.st_size > _MAX_CLOUD_TTS_BYTES:
+            raise ValueError("TTS 缓存大小无效")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(_MAX_CLOUD_TTS_BYTES + 1)
+        return _validated_wav_bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def _discard_invalid_cache(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _validated_dashscope_download_url(url: str) -> str:
+    """只接受阿里云公开 HTTPS OSS 地址；拒绝内网、特殊 IP、凭据和非 443 端口。"""
+    raw = "https://" + url.split("://", 1)[1] if url.startswith("http://") else url
+    parsed = urlsplit(raw)
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if (parsed.scheme != "https" or not host or parsed.username or parsed.password
+            or parsed.port not in (None, 443)
+            or not any(host == suffix or host.endswith("." + suffix)
+                       for suffix in _DASHSCOPE_DOWNLOAD_SUFFIXES)):
+        raise ValueError("云 TTS 下载地址不在允许的阿里云 HTTPS 域")
+    try:
+        addresses = {
+            item[4][0].split("%", 1)[0]
+            for item in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        }
+    except OSError as exc:
+        raise ValueError("云 TTS 下载域名无法解析") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("云 TTS 下载地址解析到非公网 IP")
+    return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
+
+
+def _open_tts_download(url: str, timeout: int = 15):
+    """禁用自动重定向；3xx 必须失败，不能先访问未校验的跳转目标。"""
+    import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    return opener.open(urllib.request.Request(url, headers={"Accept": "audio/*"}), timeout=timeout)
+
+
+def _download_dashscope_audio(url: str) -> bytes:
+    secure = _validated_dashscope_download_url(url)
+    with _open_tts_download(secure, timeout=15) as response:
+        # 防御性复核最终 URL；自定义/测试 transport 也不得把重定向结果偷偷喂回来。
+        final_url = response.geturl() if hasattr(response, "geturl") else secure
+        _validated_dashscope_download_url(final_url)
+        headers = getattr(response, "headers", {})
+        content_type = (headers.get("Content-Type", "") if headers else "").split(";", 1)[0].lower()
+        if content_type and not (content_type.startswith("audio/")
+                                 or content_type == "application/octet-stream"):
+            raise ValueError("云 TTS 下载响应不是音频")
+        declared = headers.get("Content-Length") if headers else None
+        if declared:
+            try:
+                declared_size = int(declared)
+                if declared_size < 0:
+                    raise ValueError("云 TTS Content-Length 非法")
+                if declared_size > _MAX_CLOUD_TTS_BYTES:
+                    raise ValueError("云 TTS 音频超过下载上限")
+            except ValueError as exc:
+                if str(exc) in {"云 TTS Content-Length 非法", "云 TTS 音频超过下载上限"}:
+                    raise
+                raise ValueError("云 TTS Content-Length 非法") from exc
+        data = response.read(_MAX_CLOUD_TTS_BYTES + 1)
+        return _validated_wav_bytes(data)
 
 
 class TtsProvider(Protocol):
@@ -103,7 +241,10 @@ class DashScopeCosyVoiceEngine:
         if not self.available():
             return None
         data = self._call(text)
-        return bytes(data) if isinstance(data, (bytes, bytearray)) else None
+        try:
+            return _validated_wav_bytes(data)
+        except ValueError:
+            return None
 
     def _call(self, text: str):
         from dashscope.audio.tts_v2 import AudioFormat, SpeechSynthesizer
@@ -144,19 +285,18 @@ class DashScopeQwenTtsEngine:
             return None
         b64 = audio.get("data")
         if b64:
-            import base64
             try:
-                return base64.b64decode(b64)
-            except Exception:
+                return _validated_inline_wav_base64(b64)
+            except ValueError:
                 return None
         url = audio.get("url")
         if url and url.startswith(("http://", "https://")):
             # 百炼 qwen3-tts 常只回 http:// 的 OSS 临时地址;OSS 查询串签名与 scheme 无关,
             # 强制升 https 下载(不走明文),旧代码只认 https:// 会把成功结果整个丢弃。
-            import urllib.request
-            secure = "https://" + url.split("://", 1)[1]
-            with urllib.request.urlopen(secure, timeout=15) as r:  # noqa: S310 —— 百炼签名临时下载地址
-                return r.read()
+            try:
+                return _download_dashscope_audio(url)
+            except (OSError, ValueError):
+                return None
         return None
 
     def _call(self, text: str):
@@ -299,15 +439,19 @@ def speak(text: str) -> tuple[bytes | None, str, bool]:
         key = hashlib.sha256(f"{eng.version}\n{eng.cache_params}\n{text}".encode()).hexdigest()
         cached = CACHE_DIR / f"{key}.wav"
         try:
-            if cached.exists() and cached.stat().st_size > 44:  # 44=wav 头:0 字节残留不算命中
-                return cached.read_bytes(), eng.version, True
-        except OSError:
-            pass                                            # 缓存读不了按未命中,现场合成
+            return _read_validated_wav_cache(cached), eng.version, True
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            # 损坏、越界或软链接缓存不能成为永久命中；只移除这个摘要路径。
+            _discard_invalid_cache(cached)
         try:
             data = eng.synthesize(text)
+            if data is not None:
+                data = _validated_wav_bytes(data)
         except Exception:
             data = None
-        if data is None or len(data) <= 44:
+        if data is None:
             continue
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)

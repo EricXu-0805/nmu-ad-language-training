@@ -1,43 +1,77 @@
-import { useEffect } from "react";
-import { useWeek1Script } from "../content/bundle";
+import { useEffect, useLayoutEffect } from "react";
 import { MicButton } from "../components/MicButton";
 import type { RapportMsg } from "../sync/messages";
 import { Centered } from "./Centered";
-import { speak } from "./tts";
+import { audioRecorderBlockCopy } from "./audioRecorderBlock";
+import type { RapportPresentationExpectation } from "./presentationContent";
+import { speak, stopSpeaking } from "./tts";
+import { usePatientPresentation } from "./usePatientPresentation";
 import { useVoxRecorder } from "./useVoxRecorder";
+import type { TtsPlaybackContextKey } from "./ttsContext";
 
 // 第1周关系建立屏:对话模式(米色暖调、机器人头像、无图无线索梯无评分光环),刻意区别于任务模式防串屏。
 // 显示操作端广播的固定话术;画像采集仅落本地(patientLocalProfile),此屏不 POST。
 // 录音同任务屏 VOX:操作端 arm 才录;自我介绍段 containsDirectIdentifier 随消息带入登记(导出侧整段红线)。
 // TTS 只给 speaker="机器人" 的节开口;"研究者"节是当面话术,屏上只显欢迎语、不朗读。
-export function RapportStage({ rapportStep, sessionId, connectionReady = true, sessionPaused = false }: {
+export function RapportStage({
+  rapportStep,
+  sessionId,
+  ttsContextKey,
+  connectionReady = true,
+  sessionPaused = false,
+  sessionTerminal = false,
+}: {
   rapportStep?: RapportMsg;
   sessionId: string;
+  ttsContextKey: TtsPlaybackContextKey | null;
   connectionReady?: boolean;
   sessionPaused?: boolean;
+  sessionTerminal?: boolean;
 }) {
-  const { script, error } = useWeek1Script();
-  const section = script?.sections.find((s) => s.key === rapportStep?.sectionKey);
-  const isRobot = section?.speaker === "机器人";
+  const presentationExpected: RapportPresentationExpectation | null =
+    rapportStep && !sessionTerminal
+      ? {
+          mode: "rapport",
+          sessionId,
+          sectionKey: rapportStep.sectionKey,
+          questionIdx: rapportStep.questionIdx,
+          wseq: rapportStep.wseq,
+        }
+      : null;
+  const { presentation, error } = usePatientPresentation(presentationExpected);
+  const rapportPresentation = presentation?.mode === "rapport" ? presentation : null;
+  const contentReady = rapportPresentation !== null;
+  const isRobot = rapportPresentation?.speaker === "机器人";
   const qIdx = rapportStep?.questionIdx ?? 0;
   const text = isRobot
-    ? section?.questions?.[Math.min(qIdx, Math.max(0, (section.questions?.length ?? 1) - 1))]?.ask
-      ?? section?.line
-      ?? script?.generic_fallback_line
-      ?? ""
+    ? rapportPresentation?.text ?? ""
     : "我们一起聊聊天，好吗？";
 
-  const isPaused = sessionPaused || rapportStep?.paused === true;
+  const isPaused = sessionPaused || sessionTerminal || rapportStep?.paused === true;
   // 小语开口:机器人节话术变了就读;研究者节/脚本未就绪/校验失败一律不读。
+  useLayoutEffect(() => {
+    if (!(connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey)) {
+      // A robot line may still be fetching when the next step belongs to the
+      // researcher.  Invalidate it before paint so it cannot speak over the
+      // human-led step.
+      stopSpeaking();
+    }
+  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey]);
   useEffect(() => {
-    if (connectionReady && !isPaused && script && isRobot && text) {
-      speak(text, { tag: `rapport:${section?.key ?? ""}:${qIdx}` });
+    if (connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey) {
+      speak(text, {
+        contextKey: ttsContextKey,
+        tag: `rapport:${rapportPresentation?.section_key ?? ""}:${qIdx}`,
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionReady, isPaused, script, isRobot, text]);
+  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey]);
 
   const recording = rapportStep?.recording ?? "idle";
-  const { stopAndSave, retrySave, saving, canRetry, recActive, micError, saveError, starting, remoteCommandBlocked } = useVoxRecorder({
+  const {
+    stopAndSave, retrySave, saving, canRetry, recActive, micError, saveError,
+    starting, remoteCommandBlocked, blockReason,
+  } = useVoxRecorder({
     sessionId,
     recording: rapportStep?.recording,
     recSeq: rapportStep?.recSeq,
@@ -45,8 +79,14 @@ export function RapportStage({ rapportStep, sessionId, connectionReady = true, s
     turnKey: `关系建立·${rapportStep?.sectionKey ?? ""}`,
     containsDirectIdentifier: rapportStep?.containsDirectIdentifier ?? false,
     connectionReady,
-    suspended: sessionPaused,
+    suspended: sessionPaused || sessionTerminal || !contentReady,
+    stopRequested: isPaused || sessionTerminal || !contentReady,
   });
+  const blockCopy = blockReason ? audioRecorderBlockCopy(blockReason) : null;
+
+  if (sessionTerminal) {
+    return <Centered className="patient-rapport"><div className="target">今天辛苦了</div><p className="question">今天的交流已经结束</p></Centered>;
+  }
 
   if (isPaused) {
     return (
@@ -57,8 +97,8 @@ export function RapportStage({ rapportStep, sessionId, connectionReady = true, s
     );
   }
 
-  if (error) {
-    // fail-closed:脚本 schema 校验失败,拒绝凭错误内容开场(对老人仍显平静文案)
+  if (error || !contentReady) {
+    // fail-closed:最小投影未就绪/校验失败，拒绝凭本地整包脚本或旧问句开场。
     return (
       <Centered className="patient-rapport">
         <p className="question">请稍等一下，马上就好。</p>
@@ -68,7 +108,7 @@ export function RapportStage({ rapportStep, sessionId, connectionReady = true, s
 
   const effectiveRecording = remoteCommandBlocked ? "idle" : recording;
   const recordingRequested = effectiveRecording === "armed" || effectiveRecording === "recording";
-  const showRecorder = recordingRequested || recActive || saving || saveError;
+  const showRecorder = recordingRequested || recActive || saving || saveError || micError || blockCopy !== null;
 
   return (
     <div className="patient-stage patient-rapport" style={{ background: "#F3ECD9" }}>
@@ -84,9 +124,18 @@ export function RapportStage({ rapportStep, sessionId, connectionReady = true, s
         <div className="stage-mic" aria-busy={saving}>
           {saving
             ? <p className="patient-status" role="status" aria-live="polite">正在保存，请稍候</p>
+            : blockCopy
+              ? (
+                <div className="col" style={{ alignItems: "center", gap: "var(--sp-3)" }} role="alert">
+                  <p className="patient-status">{blockCopy.patient}</p>
+                  <p className="muted" style={{ maxWidth: "72ch", textAlign: "center" }}>
+                    研究者处置：{blockCopy.researcher}
+                  </p>
+                </div>
+              )
             : (
               <>
-                {!saveError && (recordingRequested || recActive) && (
+                {!saveError && (recordingRequested || recActive || micError) && (
                   <MicButton state={effectiveRecording} localActive={recActive} micError={micError} starting={starting} onStop={stopAndSave} />
                 )}
                 {saveError && (

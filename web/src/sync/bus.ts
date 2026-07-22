@@ -1,7 +1,13 @@
 // SessionBus = BroadcastChannel('nmu-session') + localStorage 镜像。
 // 实时靠 channel;老人窗刷新/迟到订阅靠镜像立即恢复到当前 session/cursor/rapportStep。
-// 全本地、同源、无网络往返、无轮询(v1 同机双窗)。
-import type { CursorMsg, RapportMsg, SessionMsg, SyncMsg } from "./messages";
+// 这是同机双窗的低延迟快路径；跨设备与可恢复真值另由同源后端同步。
+import {
+  parseSyncMsg,
+  type CursorMsg,
+  type RapportMsg,
+  type SessionMsg,
+  type SyncMsg,
+} from "./messages";
 
 const CHANNEL = "nmu-session";
 const K_SESSION = "nmu:session";
@@ -14,10 +20,15 @@ export interface BusSnapshot {
   rapportStep?: RapportMsg;
 }
 
-function readMirror<T>(key: string): T | undefined {
+function readMirror(key: string, type: "session"): SessionMsg | undefined;
+function readMirror(key: string, type: "cursor"): CursorMsg | undefined;
+function readMirror(key: string, type: "rapportStep"): RapportMsg | undefined;
+function readMirror(key: string, type: SyncMsg["type"]): SyncMsg | undefined {
   try {
     const raw = localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : undefined;
+    if (!raw) return undefined;
+    const parsed = parseSyncMsg(JSON.parse(raw) as unknown);
+    return parsed?.type === type ? parsed : undefined;
   } catch {
     return undefined;
   }
@@ -31,18 +42,25 @@ class SessionBus {
   private local = new Set<(msg: SyncMsg) => void>();
 
   post(msg: SyncMsg): void {
-    // 持久状态镜像到 localStorage(session/cursor/rapportStep);audioSaved 是瞬时事件不镜像。
-    if (msg.type === "session") localStorage.setItem(K_SESSION, JSON.stringify(msg));
-    else if (msg.type === "cursor") localStorage.setItem(K_CURSOR, JSON.stringify(msg));
-    else if (msg.type === "rapportStep") localStorage.setItem(K_RAPPORT, JSON.stringify(msg));
-    this.ch?.postMessage(msg);
+    // 即使发件方是本地 TypeScript，也在跨窗边界再做一次 runtime 校验。
+    // any/旧缓存/被注入页面不能把额外字段或非有限数送进状态机。
+    const safe = parseSyncMsg(msg);
+    if (!safe) return;
+    // 仅持久化权威可恢复投影；audioSaved 与减权 safetyStop 都是瞬时事件，不进镜像。
+    if (safe.type === "session") localStorage.setItem(K_SESSION, JSON.stringify(safe));
+    else if (safe.type === "cursor") localStorage.setItem(K_CURSOR, JSON.stringify(safe));
+    else if (safe.type === "rapportStep") localStorage.setItem(K_RAPPORT, JSON.stringify(safe));
+    this.ch?.postMessage(safe);
     // 微任务投递:订阅方 setState 不在发送方调用栈里重入。
-    queueMicrotask(() => this.local.forEach((h) => h(msg)));
+    queueMicrotask(() => this.local.forEach((h) => h(safe)));
   }
 
   subscribe(handler: (msg: SyncMsg) => void): () => void {
     this.local.add(handler);
-    const listener = (e: MessageEvent) => handler(e.data as SyncMsg);
+    const listener = (e: MessageEvent) => {
+      const parsed = parseSyncMsg(e.data);
+      if (parsed) handler(parsed);
+    };
     this.ch?.addEventListener("message", listener);
     return () => {
       this.local.delete(handler);
@@ -52,17 +70,32 @@ class SessionBus {
 
   snapshot(): BusSnapshot {
     return {
-      session: readMirror<SessionMsg>(K_SESSION),
-      cursor: readMirror<CursorMsg>(K_CURSOR),
-      rapportStep: readMirror<RapportMsg>(K_RAPPORT),
+      session: readMirror(K_SESSION, "session"),
+      cursor: readMirror(K_CURSOR, "cursor"),
+      rapportStep: readMirror(K_RAPPORT, "rapportStep"),
     };
+  }
+
+  // Mirror a server-authoritative patient projection without broadcasting it as
+  // a new console command.  Missing fields are removed, so refresh cannot revive
+  // an old session/cursor after auth loss, server reset, or a session switch.
+  replaceSnapshot(snapshot: BusSnapshot): void {
+    const session = snapshot.session;
+    const cursor = session && snapshot.cursor?.sessionId === session.sessionId
+      ? snapshot.cursor : undefined;
+    const rapport = session && snapshot.rapportStep?.sessionId === session.sessionId
+      ? snapshot.rapportStep : undefined;
+    if (session) localStorage.setItem(K_SESSION, JSON.stringify(session));
+    else localStorage.removeItem(K_SESSION);
+    if (cursor) localStorage.setItem(K_CURSOR, JSON.stringify(cursor));
+    else localStorage.removeItem(K_CURSOR);
+    if (rapport) localStorage.setItem(K_RAPPORT, JSON.stringify(rapport));
+    else localStorage.removeItem(K_RAPPORT);
   }
 
   // 新场次开始前清掉旧镜像,避免老人端串到上一场。
   reset(): void {
-    localStorage.removeItem(K_SESSION);
-    localStorage.removeItem(K_CURSOR);
-    localStorage.removeItem(K_RAPPORT);
+    this.replaceSnapshot({});
   }
 }
 

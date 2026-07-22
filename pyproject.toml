@@ -1,7 +1,7 @@
 [project]
 name = "nmu-language-training-platform"
 version = "0.0.1"
-description = "南医大 · 轻中度痴呆 AI 语言沟通训练系统（本地部署，不上云）"
+description = "南医大 · 自有服务器持久化、可选云端 AI 增强的轻中度痴呆语言沟通训练研究平台"
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]

@@ -10,7 +10,7 @@ from sqlmodel.pool import StaticPool
 
 from app import content
 from app.db import get_session
-from app.main import app
+from app.main import _classify_with_operational_rubric, app
 
 BANK = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
 WK = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
@@ -81,13 +81,49 @@ def test_judge_classify_correct_answer(client):
     assert subword["answer_type"] == "部分正确" and subword["contains_target"] is False
 
 
-def test_judge_classify_open_role_has_no_deterministic_rubric(client):
+def test_contextless_judge_route_never_initializes_cloud_engine(client, monkeypatch):
+    def forbidden_engine():
+        raise AssertionError("/judge/classify 不得触发 LLM engine")
+
+    monkeypatch.setattr("app.main.llm_judge.get_engine", forbidden_engine)
+    response = client.post("/judge/classify", json={
+        "item_id": "SE_胡萝卜", "response_role": "命名", "text": "胡萝卜",
+    })
+    assert response.status_code == 200
+    assert response.json()["judge_mode"] == "规则确定式"
+
+
+def test_judge_classify_open_role_fails_closed_without_frozen_rubric(client):
     d = BANK.double_element[0]
     r = client.post("/judge/classify", json={"item_id": d["item_id"], "response_role": "关系识别",
                                              "text": "随便说说"})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["answer_type"] is None and body["needs_review"] is True
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "operational_rubric_unavailable"
+
+    silent = client.post("/judge/classify", json={
+        "item_id": d["item_id"], "response_role": "关系识别", "text": "  ",
+    })
+    assert silent.status_code == 409
+
+
+def test_versioned_open_answer_rubric_requires_actual_content_match():
+    rubric = {
+        "rubric_version": "clinical-v1",
+        "decision_policy": "all_required_concepts",
+        "required_concepts": ["杯子", "喝水"],
+        "cues": {"1": "轻提示", "2": "明确提示"},
+        "tell_answer": "用杯子喝水",
+    }
+    correct = _classify_with_operational_rubric(rubric, "这个杯子是拿来喝水的")
+    partial = _classify_with_operational_rubric(rubric, "杯子")
+    wrong = _classify_with_operational_rubric(rubric, "随便说说")
+    silent = _classify_with_operational_rubric(rubric, " ")
+    assert correct["answer_type"] == "正确" and correct["ai_score"] == 1.0
+    assert partial["answer_type"] == "部分正确" and partial["ai_score"] == 0.5
+    assert wrong["answer_type"] == "未识别" and wrong["ai_score"] == 0.0
+    assert silent["answer_type"] == "沉默" and silent["matched_on"] == "silence"
+    assert all(row["truth_scope"] == "operational_only"
+               for row in (correct, partial, wrong, silent))
 
 
 def test_judge_classify_unknown_item_404_and_extra_field_422(client):
@@ -107,11 +143,16 @@ def test_judge_classify_writes_nothing(client):
 # ---------------- 游标反馈键(不载文本,老人端免 PIN 读口可见) ----------------
 
 def _seed(client):
-    assert client.post("/patients", json={"patient_id": "P-AP", "recording_allowed": True}).status_code == 200
+    assert client.post("/patients", json={
+        "patient_id": "P-AP", "consent_status": "已同意", "consent_type": "本人同意",
+        "mandarin_eligible": True, "recording_allowed": True,
+        "is_simulation_subject": True,
+    }).status_code == 200
     assert client.post("/sessions", json={
         "session_id": "S-AP-1", "patient_id": "P-AP", "week_no": 2,
         "phase_type": "正式训练", "event_line": "正式训练",
         "item_bank_version_id": BANK_VERSION,
+        "is_simulation": True,
     }).status_code == 200
     assert client.put("/live/state", json={"kind": "session", "payload": {
         "sessionId": "S-AP-1", "weekNo": 2, "eventLine": "正式训练",
@@ -128,7 +169,9 @@ def test_cursor_fb_fields_roundtrip_to_patient(client):
     }})
     assert r.status_code == 200, r.text
     cur = client.get("/live/state").json()["cursor"]
-    assert cur["fbKey"] == "cued2" and cur["fbItemId"] == "SE_胡萝卜" and cur["fbSeq"] == 3
+    assert cur["fbKey"] == "cued2" and "fbItemId" not in cur and cur["fbSeq"] == 3
+    # canonical 反馈题指针只对账号端投影，不进入受试设备快照。
+    assert client.get("/live/console-state").json()["cursor"]["fbItemId"] == "SE_胡萝卜"
 
 
 def test_cursor_rejects_unknown_fb_key_and_free_text(client):

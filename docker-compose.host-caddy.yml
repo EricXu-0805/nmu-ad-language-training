@@ -1,0 +1,18 @@
+# 已有宿主 Caddy 的 VPS 专用覆盖文件。
+# 必须与 docker-compose.yml 同时使用；它让应用只发布到宿主 loopback，
+# 并把 Compose Caddy 放进默认不启用的 profile，避免误抢 80/443。
+services:
+  app:
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:?set APP_HOST_PORT}:8000"
+    environment:
+      # 宿主 Caddy 经 Docker NAT 连接应用时，容器看到的是本网络的精确
+      # bridge source IP。现场测得后填写；禁止使用 * 或整个网段。
+      FORWARDED_ALLOW_IPS: "${HOST_CADDY_BRIDGE_IP:?set exact Docker bridge source IP}"
+    # 现网 VPS 只有 1 GiB；蓝绿重叠期使用更窄的候选上限。切换前必须
+    # 真实压测 TTS、录音上传与导出，不能靠提高上限挤掉 SSH/回滚通道。
+    mem_limit: 384m
+    memswap_limit: 512m
+
+  caddy:
+    profiles: ["embedded-proxy-disabled-in-host-mode"]

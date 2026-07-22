@@ -44,7 +44,7 @@ export function MicButton({ state, localActive, selfStart, micError, starting, o
           我说好了
         </button>
       )}
-      {!recording && !preparing && selfStart && onStart && (
+      {!recording && !preparing && !micError && selfStart && onStart && (
         <button type="button" className="patient-primary-action" aria-describedby={statusId} onClick={onStart}>
           点这里，开始回答
         </button>

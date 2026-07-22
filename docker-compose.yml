@@ -1,15 +1,39 @@
-# 自有 VPS 部署(课题组已同意承载)。两容器:app(FastAPI+前端静态) + caddy(TLS 反代)。
+# 自有 VPS 生产部署合同。项目名固定，不依赖检出目录；生产流程
+# 禁止用 `-p` 或 COMPOSE_PROJECT_NAME 覆盖这个身份。
+# app 只运行按 digest 锁定的已审查镜像，不在生产 Compose 中从工作树构建。
 # app 只在 compose 内网监听 8000,绝不 publish 到宿主;对外只有 caddy 的 80/443。
 # 详细步骤见 DEPLOY.md。
+name: nmu-platform
+
 services:
   app:
-    build: .
+    image: "${APP_IMAGE:?set immutable APP_IMAGE with @sha256 digest}"
     restart: unless-stopped
-    env_file: .env
+    stop_grace_period: 30s
+    # 运行进程只需写 /app/data；根文件系统保持只读，第三方库若确需临时
+    # 文件只能落独立、不可执行的内存盘。与镜像内 root-owned 源码形成双层边界。
+    read_only: true
+    user: "10001:10001"
+    init: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    # 当前生产 VPS 只有 1 GiB 内存。给应用设置硬上限并允许少量受控 swap，
+    # 防止 TTS/导出或异常请求把宿主 SSH、反代和回滚通道一起挤死。
+    mem_limit: 512m
+    memswap_limit: 640m
+    env_file: "${APP_ENV_FILE:-.env}"
     environment:
+      # 镜像引用传入容器后由入口脚本二次校验；只有
+      # name@sha256:<64 hex> 可以启动，浮动 tag 会在服务监听前 fail-closed。
+      NMU_RELEASE_IMAGE: "${APP_IMAGE:?set immutable APP_IMAGE with @sha256 digest}"
       # 兜底:即便 .env 漏了,也强制认证生效(公网 fail-closed)。
       REQUIRE_AUTH: "1"
       SESSION_COOKIE_SECURE: "1"     # 经 TLS 反代 → 会话 cookie 打 Secure
+      # 公网容器不允许退回“未配置即接受任意 Host”的开发兼容路径。
+      TRUSTED_HOSTS: "${TRUSTED_HOSTS:?set TRUSTED_HOSTS in .env}"
       # 只信任 Caddy 这一跳的 X-Forwarded-For(caddy 的固定内网 IP,见下 networks)。
       # 不用 '*':否则客户端可伪造 XFF,失败限速按可控 IP 计 → 形同虚设、可爆破 PIN。
       FORWARDED_ALLOW_IPS: "172.28.0.10"
@@ -17,16 +41,36 @@ services:
       - appdata:/app/data            # SQLite + 录音 + TTS 缓存(唯一持久化目录)
     expose:
       - "8000"                       # 仅 compose 内网可见;不写 ports,不对宿主/公网开放
+    healthcheck:
+      # 不经代理、不依赖 curl；只有不可变镜像合同和 DB=head
+      # 启动检查通过后 Uvicorn 才会监听。常规启动绝不执行迁移。
+      # TCP 仍连容器回环，但 Host 必须取已强制配置的第一个公开域名；
+      # 不把 127.0.0.1 加进公网白名单，也不为健康口绕过 Host 校验。
+      test: ["CMD", "python", "-c", "import http.client; from app.http_security import configured_hosts; h=configured_hosts()[0]; c=http.client.HTTPConnection('127.0.0.1',8000,timeout=3); c.request('GET','/health',headers={'Host':h}); r=c.getresponse(); raise SystemExit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     networks:
       - nmunet
 
   caddy:
-    image: caddy:2-alpine
+    # 固定到已含 2026 安全修复且支持 request_body 的版本；升级时先在预演环境
+    # `caddy validate`，再显式改版本，避免浮动 tag 无审查改变代理行为。
+    image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     restart: unless-stopped
+    stop_grace_period: 30s
     # 只给反代它需要的 SITE_ADDRESS(compose 从 .env 插值),不灌整份 .env——
     # 反代是唯一对公网直暴的容器,不该拿到 DASHSCOPE_API_KEY / CONSOLE_PIN 等应用密钥。
     environment:
-      SITE_ADDRESS: "${SITE_ADDRESS}"
+      SITE_ADDRESS: "${SITE_ADDRESS:?set SITE_ADDRESS in .env}"
     ports:
       - "80:80"
       - "443:443"
@@ -35,10 +79,47 @@ services:
       - caddydata:/data              # 证书(自动 Let's Encrypt 或内部自签 CA)
       - caddyconfig:/config
     depends_on:
-      - app
+      app:
+        condition: service_healthy
+    mem_limit: 128m
+    memswap_limit: 160m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     networks:
       nmunet:
         ipv4_address: 172.28.0.10    # 固定 IP,供 app 的 FORWARDED_ALLOW_IPS 精确信任
+
+  # 只有具名运维员在停写、已验证备份和候选卷的维护窗口内才能
+  # 显式调用。profile 保证常规 `up` 不会启动它；脚本在 upgrade 后
+  # 再校验 DB=head，但不代替恢复演练和迁移前后数据核对。
+  migrate:
+    image: "${APP_IMAGE:?set immutable APP_IMAGE with @sha256 digest}"
+    profiles: ["maintenance"]
+    restart: "no"
+    read_only: true
+    user: "10001:10001"
+    init: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 512m
+    memswap_limit: 640m
+    env_file: "${APP_ENV_FILE:-.env}"
+    environment:
+      NMU_RELEASE_IMAGE: "${APP_IMAGE:?set immutable APP_IMAGE with @sha256 digest}"
+    entrypoint: ["bash", "scripts/docker-migrate.sh"]
+    command: []
+    volumes:
+      - appdata:/app/data
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - nmunet
 
 networks:
   nmunet:
@@ -49,5 +130,13 @@ networks:
 
 volumes:
   appdata:
+    # 必须是运维员预先创建并明确验收的卷。升级时指向从已验证
+    # 快照恢复的候选卷；原 live 卷保留不动，供镜像+数据一起回退。
+    name: "${APPDATA_VOLUME:?set explicit existing APPDATA_VOLUME}"
+    external: true
   caddydata:
+    name: "${CADDY_DATA_VOLUME:?set explicit existing CADDY_DATA_VOLUME}"
+    external: true
   caddyconfig:
+    name: "${CADDY_CONFIG_VOLUME:?set explicit existing CADDY_CONFIG_VOLUME}"
+    external: true

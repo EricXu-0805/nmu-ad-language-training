@@ -2,18 +2,29 @@
 data/
 __pycache__/
 .pytest_cache/
+.ruff_cache/
+.DS_Store
 
 # 前端构建产物与依赖(源码入库,产物/依赖不入库)
 web/node_modules/
 web/dist/
 web/.vite/
-# public/content 为构建期从 platform/content 同步的副本,不入库(由 prebuild 生成)
-web/public/content/
 .gstack/
+.playwright-cli/
+# 真实浏览器点对点验收的临时 trace/snapshot；结论写入版本化审计文档，
+# 浏览器运行态与可能含合成受试者编号的原始制品不进入发布源码。
+output/playwright/
 
-# 部署密钥/证书绝不入库(.env.example 是模板,入库)
+# 部署/构建密钥绝不入库。Vite 会自动读取 .env.production
+# 等变体并把 VITE_* 编进浏览器包，所以根目录与任意子目录都要拒绝。
 .env
+.env.*
 *.env
+*.env.*
+**/.env*
 !.env.example
+!**/.env.example
+# npm registry token 只能用受控 secret mount，不得随源码/构建上下文流转。
+.npmrc
+**/.npmrc
 caddy_data/
-

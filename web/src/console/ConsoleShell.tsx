@@ -1,43 +1,103 @@
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { PATIENT_VIEW_EVENT, PATIENT_VIEW_EXIT_EVENT } from "../sync/messages";
+import { api, ApiError } from "../api";
+import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { PinPrompt } from "../components/PinPrompt";
 import { StatusPill } from "../components/StatusPill";
 import { ToastProvider } from "../components/Toast";
 import { AbnormalDrawer } from "./abnormal/AbnormalDrawer";
 import { AnalysisScreen } from "./AnalysisScreen";
-import { consoleReducer, initialConsole, loadConsoleState, persistConsoleState, type ConsoleArea } from "./consoleReducer";
+import {
+  clearConsoleState,
+  consoleReducer,
+  loadConsoleState,
+  persistConsoleState,
+  type ConsoleArea,
+} from "./consoleReducer";
 import { LoginScreen } from "./LoginScreen";
 import { RelationshipConsoleScreen } from "./relationship/RelationshipConsoleScreen";
 import { RunPickerScreen } from "./RunPickerScreen";
-import { ScaleDrawer } from "./ScaleDrawer";
-import { SessionCreateScreen } from "./SessionCreateScreen";
 import { SessionWrapupScreen } from "./SessionWrapupScreen";
+import { SessionAbortControl } from "./SessionAbortControl";
 import { SubjectRegistryScreen } from "./SubjectRegistryScreen";
 import { TrainingConsoleScreen } from "./scoring/TrainingConsoleScreen";
 import { useConsoleAuth } from "./useConsoleAuth";
 import { usePatientPresence, type PatientPresenceView } from "../sync/usePatientPresence";
 import { usePatientRec } from "../sync/useCursorWriter";
 import { PATIENT_VIEW_REC_EVENT } from "../sync/messages";
+import type { AuthIdentity } from "../types";
+import {
+  identityCanExportResearchData,
+  identityCanOperateTraining,
+  identityCanPhysicallyDeleteAudio,
+  shouldMountConsoleWorkspace,
+} from "./authPolicy";
+import { makeSessionSafeToExit } from "./sessionExitSafety";
+import { bedsideProtocolRoute } from "./protocolAdmission";
+import type { Session } from "../types";
+import { useSessionRuntime } from "../hooks/useSessionRuntime";
 
 // 操作端顶层外壳。设 data-scale=console;三区标签(准备/训练/分析)+ run 区 reducer 驱动
-// 选人→建/续场次→训练/关系建立→收尾。场次编号是后台概念,前端流程不呈现。
+// 今日已审核安排→服务器原子开场/异常恢复→训练/关系建立→收尾。场次编号是后台概念,前端流程不呈现。
 const AREA_TABS: { key: ConsoleArea; label: string; hint: string }[] = [
-  { key: "prep", label: "准备区", hint: "登记受试者、录量表" },
-  { key: "run", label: "训练台", hint: "选人一键开训" },
+  { key: "prep", label: "准备区", hint: "建档、协议核对与训练安排" },
+  { key: "run", label: "训练台", hint: "今日已审核安排一键开训" },
   { key: "analyze", label: "分析后台", hint: "回看 AI 判定与录音" },
 ];
 
 export function ConsoleShell() {
-  const [state, dispatch] = useReducer(consoleReducer, initialConsole, loadConsoleState);
-  const [abnormalOpen, setAbnormalOpen] = useState(false);
-  const [scaleOpen, setScaleOpen] = useState(false);
-  const [confirmLeave, setConfirmLeave] = useState<ConsoleArea | null>(null);
-  const [confirmTrainPid, setConfirmTrainPid] = useState<string | null>(null);
-  const [currentItemEventId, setCurrentItemEventId] = useState<number | null>(null);
   const auth = useConsoleAuth();
-  const runPatientId = state.session?.patient_id ?? state.patientId ?? null;
+  if (auth.mode === "loading") {
+    return <main className="login-shell"><div className="login-card"><p className="muted">正在检查登录…</p></div></main>;
+  }
+  if (auth.mode === "error") {
+    return (
+      <main className="login-shell">
+        <section className="login-card" aria-labelledby="auth-check-failure-title">
+          <div className="login-brand" aria-hidden>语</div>
+          <div className="page-kicker">安全暂停</div>
+          <h1 className="login-title" id="auth-check-failure-title">认证检查失败</h1>
+          <Alert tone="danger" title="研究者工作台未打开">
+            {auth.failure ?? "无法确认当前登录状态。为保护研究数据，系统已保持关闭。"}
+          </Alert>
+          <p className="muted">请检查服务器或网络连接后重试。认证成功前不会读取本机工作台缓存，也不会发起研究数据请求。</p>
+          <Button type="button" variant="primary" onClick={() => { void auth.refresh(); }}>重试认证检查</Button>
+        </section>
+      </main>
+    );
+  }
+  if (auth.mode === "login") {
+    return <LoginScreen onLoggedIn={auth.refresh} />;
+  }
+  if (!shouldMountConsoleWorkspace(auth.mode)) return null;
+  return (
+    <ConsoleWorkspace
+      key={auth.identity?.username ?? "LOCAL-M0"}
+      identity={auth.identity}
+      onLogout={auth.logout}
+    />
+  );
+}
+
+function ConsoleWorkspace({ identity, onLogout }: {
+  identity: AuthIdentity | null;
+  onLogout: () => Promise<void>;
+}) {
+  const [state, dispatch] = useReducer(consoleReducer, loadConsoleState(identity));
+  const [abnormalOpen, setAbnormalOpen] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState<ConsoleArea | null>(null);
+  const [currentItemEventId, setCurrentItemEventId] = useState<number | null>(null);
+  const [wrapupCompletionBusy, setWrapupCompletionBusy] = useState(false);
+  const [runPickerBusy, setRunPickerBusy] = useState(false);
+  const [closeoutGateBlocked, setCloseoutGateBlocked] = useState(false);
+  const [logoutBusy, setLogoutBusy] = useState(false);
+  const [logoutSafetyError, setLogoutSafetyError] = useState<string | null>(null);
+  const [leaveBusy, setLeaveBusy] = useState(false);
+  const [leaveError, setLeaveError] = useState<string | null>(null);
+  const leaveBusyRef = useRef(false);
+  // 本地显式关闭账号认证的 M0 环境没有 identity；生产具名账号则严格按角色收口。
+  const canOperateTraining = identityCanOperateTraining(identity);
   const patientPresence = usePatientPresence(state.session?.session_id);
   const inLiveSession = state.area === "run" && !!state.session
     && (state.screen === "training" || state.screen === "relationship");
@@ -108,34 +168,82 @@ export function ConsoleShell() {
     setPatientView(false);
     if (document.fullscreenElement) document.exitFullscreen().catch(() => { /* 已不在全屏 */ });
   };
-  useEffect(() => { persistConsoleState(state); }, [state]);
+  useEffect(() => { persistConsoleState(state, identity); }, [identity, state]);
   useEffect(() => { window.scrollTo({ top: 0, behavior: "auto" }); }, [state.screen, state.area]);
 
   // 切区:训练中(training/relationship)切走要确认——防误触离开正在进行的现场。
   const requestArea = (area: ConsoleArea) => {
+    if (wrapupCompletionBusy || runPickerBusy) return;
     if (area === state.area) return;
-    if (inLiveSession && area !== "run") setConfirmLeave(area);
+    if (closeoutGateBlocked && area !== "run") {
+      setLogoutSafetyError("床旁干预已结束，请先在当前页保存并核对现场收尾，再切换工作区。");
+      return;
+    }
+    if (inLiveSession && area !== "run") {
+      setLeaveError(null);
+      setConfirmLeave(area);
+    }
     else dispatch({ t: "setArea", area });
   };
 
-  // 准备区一键开训(建档直通/表内既有人)。注意不能用 inLiveSession 判残留场次——
-  // 它要求 area==="run",而人在准备区时恰恰不满足;真正的判据是 state.session 还被持有。
-  // 同一受试者=回到进行中的场次(放下重建会造出同人同周平行双场次,割裂数据);
-  // 不同受试者才走「放下当前场次」确认。
-  const startTrainingFor = (pid: string) => {
-    if (state.session?.patient_id === pid) dispatch({ t: "setArea", area: "run" });
-    else if (state.session) setConfirmTrainPid(pid);
-    else dispatch({ t: "runPickSubject", patientId: pid });
+  const requestLogout = async () => {
+    if (logoutBusy || wrapupCompletionBusy || runPickerBusy) return;
+    if (closeoutGateBlocked) {
+      setLogoutSafetyError("本场现场收尾尚未完成；为避免跳过现场记录切换受试者，当前不能退出。");
+      return;
+    }
+    setLogoutBusy(true);
+    setLogoutSafetyError(null);
+    try {
+      if (state.session) {
+        const runtime = await makeSessionSafeToExit(api, state.session.session_id);
+        dispatch({ t: "sessionRuntimeUpdated", status: runtime.status });
+      }
+      clearConsoleState(identity);
+      await onLogout();
+    } catch (error) {
+      const detail = error instanceof ApiError ? error.detail
+        : error instanceof Error && error.message.trim() ? error.message
+          : "服务器未确认场次已安全暂停";
+      setLogoutSafetyError(`${detail}。工作台与本地场次状态已保留，不会强制退出。`);
+    } finally {
+      setLogoutBusy(false);
+    }
   };
 
-  // 账号登录门(公网部署):检查中先占位,未登录挡在登录页——工作台整棵树不挂载,
-  // 任何研究数据请求都发不出去(比逐接口 401 更早、更彻底)。
-  if (auth.mode === "loading") {
-    return <main className="login-shell"><div className="login-card"><p className="muted">正在检查登录…</p></div></main>;
-  }
-  if (auth.mode === "login") {
-    return <LoginScreen onLoggedIn={auth.refresh} />;
-  }
+  const requestSessionExit = () => {
+    setLeaveError(null);
+    setConfirmLeave("run");
+  };
+
+  const leaveSessionAfterServerSafe = async () => {
+    if (leaveBusyRef.current || !confirmLeave) return;
+    const target = confirmLeave;
+    if (!state.session) {
+      setConfirmLeave(null);
+      if (target === "run") dispatch({ t: "resetRun" });
+      else dispatch({ t: "setArea", area: target });
+      return;
+    }
+    leaveBusyRef.current = true;
+    setLeaveBusy(true);
+    setLeaveError(null);
+    try {
+      const runtime = await makeSessionSafeToExit(api, state.session.session_id);
+      dispatch({ t: "sessionRuntimeUpdated", status: runtime.status });
+      setConfirmLeave(null);
+      if (target === "run") dispatch({ t: "resetRun" });
+      else dispatch({ t: "setArea", area: target });
+    } catch (error) {
+      const detail = error instanceof ApiError ? error.detail
+        : error instanceof Error && error.message.trim() ? error.message
+          : "服务器未确认场次已安全暂停";
+      setLeaveError(detail);
+    } finally {
+      leaveBusyRef.current = false;
+      setLeaveBusy(false);
+    }
+  };
 
   return (
     <ToastProvider>
@@ -144,23 +252,30 @@ export function ConsoleShell() {
           <div className="app-brand-mark" aria-hidden>语</div>
           <div className="col" style={{ gap: 0 }}>
             <strong>语言沟通训练系统</strong>
-            <span className="muted" style={{ fontSize: "0.82em" }}>研究者工作台 · 本地运行</span>
+            <span className="muted" style={{ fontSize: "0.82em" }}>研究者工作台 · 受控研究环境</span>
           </div>
         </div>
         <nav className="area-tabs" aria-label="工作台切换">
           {AREA_TABS.map((t) => (
             <button key={t.key} className={`area-tab${state.area === t.key ? " is-active" : ""}`}
               aria-current={state.area === t.key ? "page" : undefined} title={t.hint}
+              disabled={wrapupCompletionBusy || runPickerBusy
+                || (closeoutGateBlocked && t.key !== "run")}
               onClick={() => requestArea(t.key)}>{t.label}</button>
           ))}
         </nav>
         <div className="toolbar">
-          {state.area === "run" && runPatientId && <Button onClick={() => setScaleOpen(true)}>录入量表</Button>}
-          {state.area === "run" && state.session && <Button onClick={() => setAbnormalOpen(true)}>记录现场情况</Button>}
-          {auth.identity && (
+          {canOperateTraining && state.area === "run" && state.session
+            && (state.screen === "training" || state.screen === "relationship")
+            && <Button onClick={() => setAbnormalOpen(true)}>记录现场异常或介入</Button>}
+          {identity && (
             <div className="toolbar-account">
-              <span className="muted" title={`账号 ${auth.identity.username}`}>👤 {auth.identity.display_id}</span>
-              <Button onClick={() => { void auth.logout(); }}>退出</Button>
+              <span className="muted" title={`账号 ${identity.username}`}>账号 {identity.display_id}</span>
+              <Button disabled={runPickerBusy || wrapupCompletionBusy || logoutBusy}
+                title={runPickerBusy ? "正在确认开训结果，完成前不能退出"
+                  : wrapupCompletionBusy ? "正在确认场次终态，完成前不能退出"
+                    : closeoutGateBlocked ? "请先完成现场收尾" : undefined}
+                onClick={() => { void requestLogout(); }}>{logoutBusy ? "正在安全退出…" : "退出"}</Button>
             </div>
           )}
         </div>
@@ -170,35 +285,53 @@ export function ConsoleShell() {
         {inLiveSession && state.session && (
           <SessionContextBar patientId={state.session.patient_id}
             weekNo={state.session.week_no} phase={state.session.phase_type} eventLine={state.session.event_line}
-            version={state.session.item_bank_version_id} presence={patientPresence}
-            onEnd={() => setConfirmLeave("run")} onPatientView={enterPatientView} />
+            presence={patientPresence}
+            onEnd={requestSessionExit} onPatientView={enterPatientView} />
         )}
 
         <main>
-          {state.area === "prep" && <SubjectRegistryScreen onStartTraining={startTrainingFor} />}
+          {logoutSafetyError && (
+            <Alert tone="danger" title="已阻止不安全的离开"
+              actions={<Button onClick={() => setLogoutSafetyError(null)}>知道了</Button>}>
+              {logoutSafetyError}
+            </Alert>
+          )}
+          {state.area === "prep" && <SubjectRegistryScreen
+            canManagePlans={canOperateTraining} actorRole={identity?.role ?? null} />}
           {state.area === "analyze" && <AnalysisScreen />}
           {state.area === "run" && state.screen === "picker" && (
             <RunPickerScreen
-              onPickSubject={(pid) => dispatch({ t: "runPickSubject", patientId: pid })}
+              canStart={canOperateTraining}
+              canReview={canOperateTraining}
+              canViewCompleted={true}
+              onStartingChange={setRunPickerBusy}
               onResume={(s) => dispatch({ t: "sessionStarted", session: s })}
               onGoPrep={() => dispatch({ t: "setArea", area: "prep" })} />
           )}
-          {state.area === "run" && state.screen === "sessionNew" && (
-            <SessionCreateScreen patientId={state.patientId} hideSessionId
-              onBack={() => dispatch({ t: "goRunPicker" })}
-              onStarted={(s) => dispatch({ t: "sessionStarted", session: s })} />
-          )}
           {state.area === "run" && state.screen === "training" && state.session && (
-            <TrainingConsoleScreen session={state.session}
-              onWrapup={() => dispatch({ t: "goWrapup" })} onExit={() => dispatch({ t: "goRunPicker" })}
+            <TrainingConsoleScreen key={state.session.session_id} session={state.session}
+              hasNamedAccount={identity !== null}
+              onWrapup={() => dispatch({ t: "goWrapup" })} onExit={requestSessionExit}
               onItemEventChange={setCurrentItemEventId} />
           )}
           {state.area === "run" && state.screen === "relationship" && state.session && (
-            <RelationshipConsoleScreen key={state.session.session_id} session={state.session} onWrapup={() => dispatch({ t: "goWrapup" })} />
+            <RelationshipConsoleScreen key={state.session.session_id} session={state.session}
+              onWrapup={() => dispatch({ t: "goWrapup" })} onExit={requestSessionExit} />
+          )}
+          {state.area === "run" && state.screen === "unsupported" && state.session && (
+            <UnsupportedProtocolScreen session={state.session} onExit={requestSessionExit}
+              onWrapup={() => dispatch({ t: "goWrapup" })} />
           )}
           {state.area === "run" && state.screen === "wrapup" && state.session && (
-            <SessionWrapupScreen session={state.session} onBack={() => dispatch({ t: "backToSession" })}
-              onDone={() => dispatch({ t: "resetRun" })} />
+            <SessionWrapupScreen session={state.session}
+              reviewerId={identity?.display_id ?? state.session.trainer_id ?? "PIN/本地"}
+              canExport={identityCanExportResearchData(identity)}
+              canDeleteAudio={identityCanPhysicallyDeleteAudio(identity)}
+              onBack={() => dispatch({ t: "backToSession" })}
+              onRuntimeStatusChange={(status) => dispatch({ t: "sessionRuntimeUpdated", status })}
+              onDone={() => dispatch({ t: "resetRun" })}
+              onCompletionBusyChange={setWrapupCompletionBusy}
+              onCloseoutGateChange={setCloseoutGateBlocked} />
           )}
         </main>
       </div>
@@ -210,44 +343,63 @@ export function ConsoleShell() {
         onConfirm={openPatientView}
         onCancel={() => setConfirmPatientView(false)} />
 
-      <ConfirmDialog open={confirmTrainPid !== null}
-        title="放下当前场次，为新受试者开训？"
-        body="手头还有一个未收尾的场次。开训会先放下它(已保存到服务器的数据不丢，训练台「继续未完成」可随时恢复)，再进入新受试者的场次设置。"
-        confirmLabel="放下并开训"
-        onConfirm={() => {
-          const pid = confirmTrainPid!;
-          setConfirmTrainPid(null);
-          dispatch({ t: "runPickSubject", patientId: pid });
-        }}
-        onCancel={() => setConfirmTrainPid(null)} />
-
       <ConfirmDialog open={confirmLeave !== null}
-        title={confirmLeave === "run" ? "结束当前训练？" : "离开正在进行的训练？"}
-        body="已保存到服务器的数据和本机作业日志不会删除。训练台会保留该场次,可随时切回继续。"
-        confirmLabel={confirmLeave === "run" ? "结束并回到选人" : "离开"}
-        onConfirm={() => {
-          const target = confirmLeave!;
-          setConfirmLeave(null);
-          if (target === "run") dispatch({ t: "resetRun" });
-          else dispatch({ t: "setArea", area: target });
-        }}
-        onCancel={() => setConfirmLeave(null)} />
+        title={confirmLeave === "run" ? "暂停当前训练并返回待办？" : "暂停当前训练并离开？"}
+        body={`${leaveError ? `上次未能安全离开：${leaveError}。` : ""}系统会先读取服务器真值；若场次仍在进行，会安全暂停自动推进和录音后再离开。已保存的数据不会删除，可从异常恢复入口继续。`}
+        confirmLabel={leaveBusy ? "正在确认安全状态…" : confirmLeave === "run" ? "安全暂停并返回" : "安全暂停并离开"}
+        busy={leaveBusy}
+        onConfirm={() => { void leaveSessionAfterServerSafe(); }}
+        onCancel={() => { if (!leaveBusy) { setLeaveError(null); setConfirmLeave(null); } }} />
 
       {state.area === "run" && state.session && (
         <AbnormalDrawer sessionId={state.session.session_id} phaseType={state.session.phase_type}
           currentItemEventId={state.screen === "training" ? currentItemEventId : null}
           open={abnormalOpen} onClose={() => setAbnormalOpen(false)} />
       )}
-      {state.area === "run" && runPatientId && <ScaleDrawer patientId={runPatientId} open={scaleOpen} onClose={() => setScaleOpen(false)} />}
-      {/* 账号模式由登录门兜底,不再弹 PIN;仅 PIN/开放模式(无账号)保留 PinPrompt。 */}
-      {!auth.accountsEnabled && <PinPrompt />}
     </ToastProvider>
   );
 }
 
+function UnsupportedProtocolScreen({ session, onExit, onWrapup }: {
+  session: Session;
+  onExit: () => void;
+  onWrapup: () => void;
+}) {
+  const runtime = useSessionRuntime(session.session_id);
+  const route = bedsideProtocolRoute(session);
+  const reason = route.screen === "unsupported"
+    ? route.reason
+    : "当前场次没有可执行的床旁协议合同。";
+  return (
+    <div className="page-shell page-shell--medium">
+      <header className="page-header-block">
+        <div>
+          <p className="page-kicker">安全阻断</p>
+          <h2 className="page-title">本场不能进入床旁操作</h2>
+          <p className="page-description">系统已根据周次、阶段和任务线的完整组合停止自动推进。</p>
+        </div>
+      </header>
+      <Alert tone="danger" title="协议尚未开放">
+        {reason}当前不会打开关系建立页或训练页，也不会开启受试者端录音。
+      </Alert>
+      <div className="form-section">
+        <h3>已锁定的安排事实</h3>
+        <p className="muted">第 {session.week_no} 周 · {session.phase_type} · {session.event_line}</p>
+        <div className="form-actions">
+          <Button variant="primary" onClick={onExit}>安全暂停并返回待办</Button>
+          <SessionAbortControl sessionId={session.session_id}
+            expectedRevision={runtime.runtime?.revision ?? null}
+            disabled={runtime.loading || runtime.busy || runtime.terminal}
+            onAborted={() => onWrapup()} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // SessionContextBar:★绝不显示姓名/称呼;场次编号是后台概念,前端不呈现——只出研究编号与本次安排。
-function SessionContextBar({ patientId, weekNo, phase, eventLine, version, presence, onEnd, onPatientView }: {
-  patientId: string; weekNo: number; phase: string; eventLine: string; version: string; presence: PatientPresenceView;
+function SessionContextBar({ patientId, weekNo, phase, eventLine, presence, onEnd, onPatientView }: {
+  patientId: string; weekNo: number; phase: string; eventLine: string; presence: PatientPresenceView;
   onEnd: () => void; onPatientView: () => void;
 }) {
   const eventLabel = eventLine === phase ? null : eventLine;
@@ -269,7 +421,6 @@ function SessionContextBar({ patientId, weekNo, phase, eventLine, version, prese
         <span className="muted">本次安排</span>
         <strong>第 {weekNo} 周 · {phase}{eventLabel ? ` · ${eventLabel}` : ""}</strong>
       </div>
-      <StatusPill tone="muted">题库 {version}</StatusPill>
       <div className="session-presence" role="status" aria-live="polite">
         <StatusPill tone={presenceTone}>{presenceLabel}</StatusPill>
         <div className="session-presence__copy">
@@ -280,7 +431,7 @@ function SessionContextBar({ patientId, weekNo, phase, eventLine, version, prese
       <Button variant="primary" onClick={onPatientView} title="本机全屏切到受试者画面;研究者按住画面角落的按钮即可返回">
         受试者画面
       </Button>
-      <Button onClick={onEnd}>结束/切换受试者</Button>
+      <Button onClick={onEnd}>安全暂停并返回待办</Button>
     </section>
   );
 }

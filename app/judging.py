@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 
 # 画像字段命名空间（与共享数据契约 H 组一致）。判分输入出现其中任一键即违规。
 PORTRAIT_FIELDS = frozenset({

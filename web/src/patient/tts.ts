@@ -11,9 +11,24 @@
 //   绝不把已被换掉的旧句用系统语音"还魂"叠在新句上;
 // - 播放被拒(无用户激活)把句子退回队首——触屏补读按原顺序读"问句→线索",不丢主句。
 
+import { handleDeviceAuthorizationFailure, selectDeviceCredential } from "../api";
+import { csrfHeader } from "../security/csrf";
+import { ttsEngineLabel } from "./ttsEngineLabel";
+import {
+  EMPTY_TTS_CONTEXT_STATE,
+  rememberTtsLine,
+  replayLineForContext,
+  transitionTtsContext,
+  type TtsContextState,
+  type TtsPlaybackContextKey,
+  type TtsReplayLine,
+} from "./ttsContext";
+import { mustDiscardSynthesizedSpeech } from "./ttsResponsePolicy";
+
 let enabled = localStorage.getItem("nmu:tts") !== "off";
-let pending: { text: string; tag: string } | null = null;
-let lastText: { text: string; tag: string } | null = null; // 最近一次屏显文本(试听重读用,读的仍是屏上原文)
+let pending: TtsReplayLine | null = null;
+// 试听重读不是全局历史；它只属于当前场次+控制面+题位上下文。
+let contextState: TtsContextState = EMPTY_TTS_CONTEXT_STATE;
 
 export function ttsEnabled(): boolean { return enabled; }
 export function setTtsEnabled(on: boolean): void {
@@ -34,8 +49,9 @@ function audit(ev: string, tag: string, text: string): void {
 }
 
 // ---------------- 播放状态机 ----------------
-type Line = { text: string; tag: string };
+type Line = TtsReplayLine;
 let neural: "unknown" | "on" | "off" = "unknown"; // 后端引擎可用性;只有"引擎未接"(X-Tts-Engine=null-0)的 204 才一次锁定整场回退
+let activeEngineTag: string | null = null; // 只记录实际返回可播放字节的服务器签发音源
 let neuralFails = 0;           // 连续网络/后端失败计数:偶发抖动单句回退,连败才整场降级
 const NEURAL_FAIL_LATCH = 3;   // (一次瞬断就把 neural 钉死,会让无本机中文语音的设备整场静音)
 const audioEl = typeof Audio !== "undefined" ? new Audio() : null;
@@ -61,55 +77,93 @@ function driveQueue(): void {
 }
 
 async function playItem(item: Line, g: number): Promise<void> {
+  if (item.contextKey !== contextState.activeContextKey) return;
   // ① 神经路径
   if (audioEl && neural !== "off") {
     let url: string | null = null;
     try {
-      const res = await fetch(`/tts/speak?text=${encodeURIComponent(item.text)}`);
-      if (g !== gen) return;                       // 已被打断:新句自会驱动,旧续体退场
+      const credential = selectDeviceCredential();
+      const res = await fetch("/tts/speak", {
+        method: "POST",
+        credentials: "omit",
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/json",
+          ...credential.headers,
+          ...csrfHeader("POST"),
+        },
+        body: JSON.stringify({ text: item.text }),
+      });
+      if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
+      // 已被打断/撤销上下文:新句自会驱动,旧续体退场
       const engineTag = res.headers.get("X-Tts-Engine") ?? "";
+      if (!res.ok) {
+        const errorText = await res.text();
+        if (mustDiscardSynthesizedSpeech(res.status, errorText)) {
+          // The request was authorized when synthesis began but lost its exact
+          // bedside authority before bytes returned.  Neither those bytes nor
+          // browser speech synthesis may resurrect the old sentence.
+          stopSpeaking();
+          return;
+        }
+        if (handleDeviceAuthorizationFailure(res.status, errorText, credential)) {
+          // Auth/session loss is not an engine outage: never resurrect an old-session
+          // sentence through system-speech fallback while re-pairing.
+          stopSpeaking();
+          return;
+        }
+      }
       if (res.status === 204) {
         // 云接入后 204 有两种成因:引擎未接(null-0,稳定态)才一次锁死整场;
         // 云端瞬态失败(header 带引擎名)按连败计数——云 5 秒后恢复不该整场哑掉。
-        if (engineTag === "null-0" || ++neuralFails >= NEURAL_FAIL_LATCH) { neural = "off"; }
+        if (engineTag === "null-0" || ++neuralFails >= NEURAL_FAIL_LATCH) {
+          neural = "off";
+          activeEngineTag = null;
+        }
       }
       else if (res.ok) {
+        const blob = await res.blob();
+        if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
+        url = URL.createObjectURL(blob);
         neural = "on";
         neuralFails = 0;
-        url = URL.createObjectURL(await res.blob());
-        if (g !== gen) { URL.revokeObjectURL(url); return; }
+        activeEngineTag = engineTag || null;
         const u = url;
         audioEl.src = u;
         curUrl = u;
         audioEl.onended = () => {
           URL.revokeObjectURL(u);
           if (curUrl === u) curUrl = null;
-          if (g !== gen) return;
+          if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
           audit("end", item.tag, item.text);
-          if (pending?.text === item.text) pending = null;
+          if (pending?.text === item.text && pending.contextKey === item.contextKey) pending = null;
           busy = false;
           driveQueue();
         };
         audioEl.onerror = () => {
           URL.revokeObjectURL(u);
           if (curUrl === u) curUrl = null;
-          if (g !== gen) return;
+          if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
           audit("error:audio", item.tag, item.text);
           // 浏览器无法解码/播放本地 WAV 时，本会话直接降级到系统语音。
           // 若仍保留 neural=on，voiceschanged/pointerdown 的补读会不断重取同一句，
           // 造成老人端无声且后端被 /tts/speak 高频请求淹没。
           neural = "off";
+          activeEngineTag = null;
           utterItem(item, g);
         };
         await audioEl.play();
         audit(`start@${engineTag || "neural"}`, item.tag, item.text);
         return;                                     // 播放中,后续由 onended 续驱
       }
-      else if (++neuralFails >= NEURAL_FAIL_LATCH) { neural = "off"; }
+      else if (++neuralFails >= NEURAL_FAIL_LATCH) {
+        neural = "off";
+        activeEngineTag = null;
+      }
       // !res.ok(非 204):这一句落到 ② 回退
     } catch (e) {
       if (url) { URL.revokeObjectURL(url); if (curUrl === url) curUrl = null; }
-      if (g !== gen) return;
+      if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
       if (e instanceof DOMException && e.name === "NotAllowedError") {
         // 无用户激活:句子退回队首,触屏后按原顺序补读(问句仍在线索前面)
         audit("error:not-allowed", item.tag, item.text);
@@ -126,11 +180,14 @@ async function playItem(item: Line, g: number): Promise<void> {
       }
       // 网络/后端异常:单句回退系统语音;只有连续多次失败才整场停用神经路径
       // (防补读风暴),一次瞬断不钉死——成功一次即清零复活。
-      if (++neuralFails >= NEURAL_FAIL_LATCH) neural = "off";
+      if (++neuralFails >= NEURAL_FAIL_LATCH) {
+        neural = "off";
+        activeEngineTag = null;
+      }
       // 这一句落到 ② 回退
     }
   }
-  if (g !== gen) return;
+  if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
   // ② 系统语音回退
   utterItem(item, g);
 }
@@ -165,12 +222,13 @@ function pickLocalZhVoice(): SpeechSynthesisVoice | null {
 }
 
 export function currentVoiceName(): string | null {
-  if (neural === "on") return "小语·本地神经(华言)";
+  if (neural === "on") return ttsEngineLabel(activeEngineTag) ?? "小语·服务端语音";
   if (typeof window === "undefined" || !("speechSynthesis" in window)) return null;
   return pickLocalZhVoice()?.name ?? null;
 }
 
 function utterItem(item: Line, g: number): void {
+  if (item.contextKey !== contextState.activeContextKey) { busy = false; return; }
   if (typeof window === "undefined" || !("speechSynthesis" in window)) { busy = false; return; }
   const voice = pickLocalZhVoice();
   if (!voice) {
@@ -186,15 +244,15 @@ function utterItem(item: Line, g: number): void {
   u.volume = 1;
   u.onstart = () => audit(`start@${voice.name}`, item.tag, item.text);
   u.onend = () => {
-    if (g !== gen) return;
+    if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
     audit("end", item.tag, item.text);
-    if (pending?.text === item.text) pending = null;
+    if (pending?.text === item.text && pending.contextKey === item.contextKey) pending = null;
     busy = false;
     driveQueue();
   };
   u.onerror = (e) => {
     audit(`error:${e.error}`, item.tag, item.text);
-    if (g !== gen) return;
+    if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
     if (e.error === "not-allowed") { queue.unshift(item); busy = false; return; } // 触屏后补读
     busy = false;
     driveQueue();                                   // 其他错误:跳过这句,队列不停摆
@@ -205,33 +263,61 @@ function utterItem(item: Line, g: number): void {
 // ---------------- 对外 API ----------------
 // enqueue=false(默认):打断当前朗读换新话(换环节/换话术)。
 // enqueue=true:排在当前朗读之后(线索——恢复/跳题场景问句与线索同帧到达,不许线索掐掉问句)。
-export function speak(text: string, opts?: { tag?: string; enqueue?: boolean }): void {
+export function speak(text: string, opts: {
+  contextKey: TtsPlaybackContextKey;
+  tag?: string;
+  enqueue?: boolean;
+}): void {
   if (typeof window === "undefined" || !text) return;
   const tag = opts?.tag ?? "";
-  lastText = { text, tag };
+  const contextKey = opts.contextKey;
+  if (!contextKey || contextState.activeContextKey !== contextKey) return;
+  const line = { text, tag, contextKey };
+  contextState = rememberTtsLine(contextState, line);
   if (!enabled) return;
   // 轮询、StrictMode 或同状态重挂载都不应把同一句重复塞进播放队列。
   // tag 绑定具体题目/环节，因此只去重“同内容且同环节”的在途请求。
   if (
     pending?.text === text
     && pending.tag === tag
-    && (busy || queue.some((line) => line.text === text && line.tag === tag))
+    && pending.contextKey === contextKey
+    && (busy || queue.some((queued) => queued.text === text
+      && queued.tag === tag && queued.contextKey === contextKey))
   ) return;
-  pending = { text, tag };
+  pending = line;
   if (!opts?.enqueue) {
     interrupt();
-    queue = [{ text, tag }];
+    queue = [line];
   } else {
-    queue.push({ text, tag });
+    queue.push(line);
   }
   driveQueue(); // busy(含 fetch 在途)时这里是空操作,由在途句的终态回调续驱
 }
 
-// 试听:重读当前屏显文本(开关打开那一下既给了用户激活,也当场验证音色/音量)。
-// 无屏显历史时读"您好"——老人端待机屏上的原文。
-export function speakSample(): void {
-  const t = lastText ?? { text: "您好", tag: "sample" };
-  speak(t.text, { tag: t.tag });
+// 试听:只重读这一个床旁上下文已屏显的原文。新受试者/新题未就绪时
+// 保持静音，不用上一位话术，也不用无来源的通用句替代。
+export function speakSample(contextKey: TtsPlaybackContextKey | null): void {
+  const line = replayLineForContext(contextState, contextKey);
+  if (!line) return;
+  speak(line.text, { contextKey: line.contextKey, tag: line.tag });
+}
+
+/**
+ * Bind the only legacy TTS context allowed to speak.  Any transition (including
+ * active -> null -> same key across pause/resume) revokes queued bytes and replay
+ * memory before the next paint.
+ */
+export function setTtsContext(contextKey: TtsPlaybackContextKey | null): void {
+  const transition = transitionTtsContext(contextState, contextKey);
+  contextState = transition.state;
+  if (!transition.changed) return;
+  pending = null;
+  queue = [];
+  interrupt();
+}
+
+export function clearTtsContext(): void {
+  setTtsContext(null);
 }
 
 export function stopSpeaking(): void {
@@ -247,7 +333,11 @@ function retryPending(): void {
   if ("speechSynthesis" in window && (window.speechSynthesis.speaking || window.speechSynthesis.pending)) return;
   if (queue.length === 0) {
     if (!pending) return;
-    queue.push({ text: pending.text, tag: pending.tag });
+    if (pending.contextKey !== contextState.activeContextKey) {
+      pending = null;
+      return;
+    }
+    queue.push(pending);
   }
   driveQueue();
 }

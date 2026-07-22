@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 部署启动脚本(医院内网/科室专机)。云语音(TTS/ASR/判分)为可选增强:
-# 配了 DASHSCOPE_API_KEY 自动启用,没配全链降级本地,照常能跑。
+# 配了 DASHSCOPE_API_KEY 自动启用；没配时 TTS 降级本地/浏览器、ASR 转人工，
+# 判分仅在有确定规则时本地处理，不把降级状态伪装成云处理成功。
 #
 # 单机模式(默认):  ./scripts/serve.sh
 #   → 127.0.0.1:8000,同机开两窗 /console + /patient(localhost 即 secure context,麦克风可用)
@@ -10,17 +11,26 @@
 #     故内网模式必须带证书;首次访问浏览器会警告自签证书,人工信任一次即可。
 #     证书只签给本机内网 IP/主机名,私钥留在本机 data/certs/(gitignored),不外发。
 set -euo pipefail
+umask 077
 cd "$(dirname "$0")/.."
 
 PY=./.venv/bin/python
 [ -x "$PY" ] || { echo "缺 .venv,先: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt"; exit 1; }
+
+# 回环开发脚本本身就是显式的模拟环境入口；公网/内网双设备模式仍默认关闭，
+# 必须由部署者在环境中主动设置，避免浏览器请求自行把真实数据降格为模拟。
+if [ "${INTRANET:-0}" != "1" ] && [ -z "${ALLOW_SIMULATION_DATA:-}" ]; then
+  export ALLOW_SIMULATION_DATA=1
+  echo "✓ 回环开发模式：已启用显式模拟数据路径（真实研究门禁仍保持关闭）"
+fi
 
 # 1) 数据库迁移到最新(幂等;真机患者数据靠它升级,禁止删库重建)
 ./.venv/bin/alembic upgrade head
 
 # 2) 前端产物:web/dist 缺失且有 npm 时现场构建(纯静态,构建后运行期不需要 node)
 if [ ! -d web/dist ] && command -v npm >/dev/null 2>&1; then
-  (cd web && npm install --no-audit --no-fund && npm run build)
+  # 部署构建必须与已审查 lockfile 完全一致；不允许 npm install 在现场改锁。
+  (cd web && npm ci --no-audit --no-fund && npm run build)
 fi
 [ -d web/dist ] || echo "⚠️ 无 web/dist(纯 API 模式);要带界面请先在有 node 的机器上构建后拷入"
 
@@ -48,7 +58,9 @@ run_server() { # $1=探测URL $2=就绪后要打印/打开的说明,其余=uvico
     echo "  先到旧窗口按 Ctrl-C,或执行: pkill -f app.main:app  再重新启动。"
     exit 1
   fi
-  ./.venv/bin/uvicorn "$@" &
+  # 路径中含研究、场次和录音标识，不应进入终端/systemd 访问日志。
+  # 保留 Uvicorn 启动/错误日志；研究动作由应用内审计账本记录。
+  ./.venv/bin/uvicorn --no-access-log "$@" &
   local srv=$!
   trap 'kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null; exit 0' INT TERM
   for _ in $(seq 1 120); do
@@ -74,15 +86,22 @@ run_server() { # $1=探测URL $2=就绪后要打印/打开的说明,其余=uvico
 }
 
 if [ "${INTRANET:-0}" = "1" ]; then
-  # 3a) 内网双设备:PIN 门(病房 WiFi 里任何设备都不得裸操作写接口)+ 自签证书 + https
+  # 3a) 内网双设备:研究者账号 + 床旁配对 PIN + 自签证书 + https。
+  # PIN 只签发短时场次 capability，不是 console 管理员凭据。
   if [ -z "${CONSOLE_PIN:-}" ]; then
-    CONSOLE_PIN=$(( (RANDOM % 900000) + 100000 ))
+    CONSOLE_PIN=$("$PY" -c 'import secrets; print(secrets.randbelow(90_000_000) + 10_000_000)')
   fi
   export CONSOLE_PIN
-  echo "════════════════════════════════════════"
-  echo "  操作端 PIN: $CONSOLE_PIN"
-  echo "  (两端首次写操作时输入;固定 PIN 可用 CONSOLE_PIN=xxxxxx 启动)"
-  echo "════════════════════════════════════════"
+  # 不靠服务启动后的 401 推测坏配置；内网暴露前即检查账号+PIN。
+  "$PY" scripts/manage_users.py check-ready
+  if [ -t 1 ]; then
+    echo "════════════════════════════════════════"
+    echo "  老人端配对 PIN: $CONSOLE_PIN"
+    echo "  (老人端首次连接时输入;固定 PIN 请用受控环境变量配置)"
+    echo "════════════════════════════════════════"
+  else
+    echo "✓ 老人端配对 PIN 已就绪（非交互日志不显示凭据）"
+  fi
   CERT_DIR=data/certs
   mkdir -p "$CERT_DIR"
   HOST_IP=$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo 127.0.0.1)
@@ -92,6 +111,8 @@ if [ "${INTRANET:-0}" = "1" ]; then
       -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" \
       -subj "/CN=$HOST_IP" -addext "subjectAltName=IP:$HOST_IP,DNS:localhost" >/dev/null 2>&1
   fi
+  chmod 700 "$CERT_DIR"
+  chmod 600 "$CERT_DIR/server.key" "$CERT_DIR/server.crt"
   run_server "https://127.0.0.1:8443/patient" \
     "  操作电脑: https://$HOST_IP:8443/console\n  平板:     https://$HOST_IP:8443/patient(首次需信任自签证书)" \
     app.main:app --host 0.0.0.0 --port 8443 \

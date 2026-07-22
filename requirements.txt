@@ -7,10 +7,14 @@ pydantic>=2.7
 python-multipart>=0.0.9
 pytest>=8.0
 alembic>=1.13          # 数据库迁移(真机患者数据禁止删库重建)
+# PostgreSQL 生产连接。binary extra 自带 libpq，支持当前 Python 3.14 部署镜像；
+# 没有它，DATABASE_URL=postgresql+psycopg://... 会在启动时直接 ModuleNotFoundError。
+psycopg[binary]>=3.3,<4
 
 # 云语音/转写/判分 SDK(2026-07-16 备案完成后口径:云端为可选增强)。
-# 未装或未配 DASHSCOPE_API_KEY 时 TTS/ASR/判分全链自动降级本地,平台照常可用。
-# Key 走 macOS 钥匙串(serve.sh 自动加载),永不写进 .env/配置文件。
+# 未装或未配 DASHSCOPE_API_KEY 时：TTS 降级到本地/浏览器，ASR 明确转人工，
+# 判分仅在有确定规则时本地降级；不得把降级状态伪装成云处理成功。
+# Key 优先走部署系统 secret / macOS 钥匙串；VPS 最低限度可放 chmod 600 的 gitignored .env。
 # 红线:发往云 TTS 的文本只能是白名单闭集(app/content.py tts_allowlist),永不携带患者字段。
 dashscope>=1.26
 

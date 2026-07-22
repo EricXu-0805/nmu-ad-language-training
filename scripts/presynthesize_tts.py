@@ -2,7 +2,7 @@
 
 用法(在 platform/ 下,需先配 DASHSCOPE_API_KEY 环境变量):
   ./.venv/bin/python scripts/presynthesize_tts.py --dry-run          # 只列清单和字符量,不出网
-  ./.venv/bin/python scripts/presynthesize_tts.py                    # 用当前 TTS_ENGINE(默认 auto→cosyvoice)打满缓存
+  ./.venv/bin/python scripts/presynthesize_tts.py                    # 用当前 TTS_ENGINE(有 Key 时默认 auto→qwen-tts)打满缓存
   ./.venv/bin/python scripts/presynthesize_tts.py --engine cosyvoice --engine qwen-tts --samples 5
       # 两个云引擎各合成一遍;每个引擎另存 5 句样音到 data/tts-preview/<engine>/ 供耳测选型
 

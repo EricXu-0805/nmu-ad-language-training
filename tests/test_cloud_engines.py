@@ -2,6 +2,7 @@
 
 红线覆盖:白名单外文本永不出网;引擎失败恒降级;判分格式可疑一律回退规则。
 """
+import base64
 import json
 
 import pytest
@@ -17,7 +18,7 @@ WEBM = b"\x1aE\xdf\xa3" + b"\x00" * 64
 
 
 def _wav(n: int = 2000) -> bytes:
-    return b"RIFF" + b"\x00" * n
+    return b"RIFF" + (n + 4).to_bytes(4, "little") + b"WAVE" + b"\x00" * n
 
 
 # ---------------- 白名单闭集 ----------------
@@ -85,6 +86,38 @@ def test_cloud_tts_synthesizes_allowlisted_and_caches(cloud_tts):
     assert data and not cached and ver == eng.version and calls == [line]
     data2, _, cached2 = tts.speak(line)
     assert data2 == data and cached2 and calls == [line]  # 第二次纯缓存,不再出网
+
+
+def test_cloud_tts_discards_corrupt_or_oversized_cache(cloud_tts):
+    eng, calls = cloud_tts
+    line = BANK.single_element[0]["initial_prompt"]
+    expected, _, _ = tts.speak(line)
+    cache_path = next(tts.CACHE_DIR.glob("*.wav"))
+
+    cache_path.write_bytes(b"not-a-wave" * 10)
+    recovered, version, cached = tts.speak(line)
+    assert recovered == expected and version == eng.version and not cached
+    assert cache_path.read_bytes() == expected
+
+    with cache_path.open("wb") as handle:
+        handle.truncate(tts._MAX_CLOUD_TTS_BYTES + 1)
+    recovered, version, cached = tts.speak(line)
+    assert recovered == expected and version == eng.version and not cached
+    assert cache_path.read_bytes() == expected
+    assert calls == [line, line, line]
+
+
+def test_cloud_wav_validator_enforces_16_mib_boundary(monkeypatch):
+    assert tts._MAX_CLOUD_TTS_BYTES == 16 * 1024 * 1024
+    monkeypatch.setattr(tts, "_MAX_CLOUD_TTS_BYTES", 64)
+    exact = _wav(52)
+    assert len(exact) == 64
+    assert tts._validated_wav_bytes(exact) == exact
+
+    with pytest.raises(ValueError, match="大小上限"):
+        tts._validated_wav_bytes(_wav(53))
+    with pytest.raises(ValueError, match="容器签名"):
+        tts._validated_wav_bytes(b"not-a-wave" * 6)
 
 
 def test_cloud_tts_error_degrades_not_500(cloud_tts, monkeypatch):
@@ -196,34 +229,103 @@ def test_cosyvoice_partial_audio_not_cached(monkeypatch, tmp_path):
     assert eng.synthesize("您好") is not None
 
 
+def test_cosyvoice_rejects_non_wav_or_oversized_sdk_bytes(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    monkeypatch.setattr(tts, "_MAX_CLOUD_TTS_BYTES", 64)
+    eng = tts.DashScopeCosyVoiceEngine("cosyvoice-v2", "longyuan_v2", 0.9)
+
+    for invalid in (b"not-a-wave" * 6, _wav(53)):
+        monkeypatch.setattr(eng, "_call", lambda _text, value=invalid: value)
+        assert eng.synthesize("您好") is None
+
+
 def test_qwen_tts_downloads_http_oss_url_over_https(monkeypatch):
     # 回归:qwen3-tts-flash 常只回 http:// 的 OSS 临时地址,旧代码只认 https:// → 把成功结果丢了。
     monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
     eng = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena")
     monkeypatch.setattr(eng, "_call",
-                        lambda text: {"data": "", "url": "http://oss-cn-beijing.example.com/a.wav?sig=x"})
+                        lambda text: {"data": "", "url": "http://dashscope-result.oss-cn-beijing.aliyuncs.com/a.wav?sig=x"})
     got = {}
 
     class FakeResp:
+        headers = {"Content-Type": "audio/wav", "Content-Length": "2012"}
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def read(self): return b"RIFF" + b"\x00" * 2000
+        def geturl(self): return got["url"]
+        def read(self, _size=-1): return _wav()
 
-    def fake_urlopen(url, timeout=15):
+    def fake_open(url, timeout=15):
         got["url"] = url
         return FakeResp()
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(tts, "_validated_dashscope_download_url",
+                        lambda url: "https://" + url.split("://", 1)[-1])
+    monkeypatch.setattr(tts, "_open_tts_download", fake_open)
     out = eng.synthesize("您好")
     assert out and out.startswith(b"RIFF")
     assert got["url"].startswith("https://")              # http→https 升级,签名不变,不走明文
 
 
-def test_qwen_tts_uses_inline_base64_when_present(monkeypatch):
-    import base64
+def test_qwen_tts_rejects_untrusted_or_oversized_download(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
     eng = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena")
-    raw = b"RIFF" + b"\x00" * 100
+    monkeypatch.setattr(eng, "_call",
+                        lambda text: {"data": "", "url": "https://127.0.0.1/internal.wav"})
+    assert eng.synthesize("您好") is None
+
+    monkeypatch.setattr(eng, "_call", lambda text: {
+        "data": "", "url": "https://dashscope-result.oss-cn-beijing.aliyuncs.com/a.wav",
+    })
+    monkeypatch.setattr(tts, "_validated_dashscope_download_url", lambda url: url)
+
+    class TooLarge:
+        headers = {"Content-Type": "audio/wav", "Content-Length": str(17 * 1024 * 1024)}
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def geturl(self): return "https://dashscope-result.oss-cn-beijing.aliyuncs.com/a.wav"
+        def read(self, _size=-1): raise AssertionError("声明超限时不应读取响应体")
+
+    monkeypatch.setattr(tts, "_open_tts_download", lambda *_a, **_k: TooLarge())
+    assert eng.synthesize("您好") is None
+
+
+def test_qwen_tts_rejects_bad_download_metadata_or_non_wav(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    eng = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena")
+    monkeypatch.setattr(eng, "_call", lambda text: {
+        "data": "", "url": "https://dashscope-result.oss-cn-beijing.aliyuncs.com/a.wav",
+    })
+    monkeypatch.setattr(tts, "_validated_dashscope_download_url", lambda url: url)
+
+    class Response:
+        headers = {}
+        payload = _wav()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def geturl(self): return "https://dashscope-result.oss-cn-beijing.aliyuncs.com/a.wav"
+        def read(self, _size=-1): return self.payload
+
+    wrong_type = Response()
+    wrong_type.headers = {"Content-Type": "text/html", "Content-Length": str(len(_wav()))}
+    monkeypatch.setattr(tts, "_open_tts_download", lambda *_a, **_k: wrong_type)
+    assert eng.synthesize("您好") is None
+
+    negative_length = Response()
+    negative_length.headers = {"Content-Type": "audio/wav", "Content-Length": "-1"}
+    monkeypatch.setattr(tts, "_open_tts_download", lambda *_a, **_k: negative_length)
+    assert eng.synthesize("您好") is None
+
+    non_wav = Response()
+    non_wav.payload = b"not-a-wave" * 10
+    non_wav.headers = {"Content-Type": "audio/wav", "Content-Length": str(len(non_wav.payload))}
+    monkeypatch.setattr(tts, "_open_tts_download", lambda *_a, **_k: non_wav)
+    assert eng.synthesize("您好") is None
+
+
+def test_qwen_tts_uses_inline_base64_when_present(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    eng = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena")
+    raw = _wav(92)
     monkeypatch.setattr(eng, "_call", lambda text: {"data": base64.b64encode(raw).decode(), "url": ""})
 
     def no_net(*a, **k):
@@ -231,6 +333,30 @@ def test_qwen_tts_uses_inline_base64_when_present(monkeypatch):
 
     monkeypatch.setattr("urllib.request.urlopen", no_net)
     assert eng.synthesize("您好") == raw
+
+
+def test_qwen_inline_base64_is_strict_and_bounded_before_and_after_decode(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    monkeypatch.setattr(tts, "_MAX_CLOUD_TTS_BYTES", 64)
+    eng = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena")
+
+    exact = _wav(52)
+    monkeypatch.setattr(eng, "_call", lambda text: {
+        "data": base64.b64encode(exact).decode("ascii"), "url": "",
+    })
+    assert eng.synthesize("您好") == exact
+
+    invalid_envelopes = (
+        "!!!!",
+        base64.b64encode(b"not-a-wave" * 6).decode("ascii"),
+        "A" * (tts._max_cloud_tts_base64_chars() + 1),
+        base64.b64encode(_wav(53)).decode("ascii"),
+    )
+    for envelope in invalid_envelopes:
+        monkeypatch.setattr(eng, "_call", lambda text, value=envelope: {
+            "data": value, "url": "",
+        })
+        assert eng.synthesize("您好") is None
 
 
 def test_fallback_piper_singleton_reused(monkeypatch, tmp_path):

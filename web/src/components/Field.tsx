@@ -1,3 +1,4 @@
+import { useId } from "react";
 import type { InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from "react";
 
 // 表单字段外壳
@@ -55,21 +56,24 @@ export function TriStateField({ label, value, onChange }: {
   value: boolean | null | undefined;
   onChange: (v: boolean | null) => void;
 }) {
+  const labelId = useId();
   const opts: { k: string; v: boolean | null }[] = [
     { k: "是", v: true }, { k: "否", v: false }, { k: "未评", v: null },
   ];
   const cur = value === true ? "是" : value === false ? "否" : "未评";
   return (
-    <Field label={label}>
-      <div className="segmented-control" role="group" aria-label={label}>
+    <div className="field">
+      <span className="field__label" id={labelId}>{label}</span>
+      <div className="segmented-control" role="group" aria-labelledby={labelId}>
         {opts.map((o) => (
           <button key={o.k} type="button" onClick={() => onChange(o.v)}
+            aria-label={o.k}
             aria-pressed={cur === o.k}
             className="segmented-control__button">
             {o.k}
           </button>
         ))}
       </div>
-    </Field>
+    </div>
   );
 }

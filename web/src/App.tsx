@@ -1,8 +1,14 @@
-import { Component, useEffect, useRef, useState, type ReactNode } from "react";
+import { Component, lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
-import { ConsoleShell } from "./console/ConsoleShell";
-import { PatientShell } from "./patient/PatientShell";
+import { clearConsoleWorkspaceState } from "./security/localSensitiveState";
 import { CONSOLE_NOTE_EVENT, PATIENT_VIEW_EVENT, PATIENT_VIEW_EXIT_EVENT, PATIENT_VIEW_REC_EVENT } from "./sync/messages";
+
+const ConsoleShell = lazy(async () => ({
+  default: (await import("./console/ConsoleShell")).ConsoleShell,
+}));
+const PatientShell = lazy(async () => ({
+  default: (await import("./patient/PatientShell")).PatientShell,
+}));
 
 // 两路由:/console 操作端 · /patient 老人端。零外链(硬约束3)。SPA fallback 由 main.py 提供,clean URL 可刷新。
 export default function App() {
@@ -14,13 +20,32 @@ export default function App() {
         {/* 操作端与叠层宿主各自独立 Boundary:操作端崩溃时叠层不塌——受试者继续看平和画面,
             绝不被突然切到红色报错屏;研究者经宿主的按住返回离开后才见错误页。 */}
         <Route path="/console" element={<>
-          <Boundary variant="console"><ConsoleShell /></Boundary>
+          <Boundary variant="console">
+            <Suspense fallback={<ConsoleLoading />}><ConsoleShell /></Suspense>
+          </Boundary>
           <Boundary variant="patient"><PatientViewHost /></Boundary>
         </>} />
-        <Route path="/patient" element={<Boundary variant="patient"><PatientShell /></Boundary>} />
+        <Route path="/patient" element={
+          <Boundary variant="patient">
+            <Suspense fallback={<PatientLoading />}><PatientShell /></Suspense>
+          </Boundary>
+        } />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
+  );
+}
+
+function ConsoleLoading() {
+  return <main className="login-shell"><div className="login-card"><p className="muted">正在打开研究者工作台…</p></div></main>;
+}
+
+function PatientLoading() {
+  return (
+    <main className="patient-message-screen" aria-live="polite">
+      <div className="target">请稍等一下</div>
+      <p className="question muted">训练画面正在准备</p>
+    </main>
   );
 }
 
@@ -58,7 +83,7 @@ class Boundary extends Component<{ variant: "console" | "patient"; children: Rea
         <div className="form-actions">
           <button type="button" onClick={() => location.reload()} style={btn}>重新载入</button>
           {/* 只清屏幕位置状态;判分作业日志(journal)是研究记录,绝不在这里清 */}
-          <button type="button" onClick={() => { try { localStorage.removeItem("nmu:console:state"); } catch { /* noop */ } location.reload(); }} style={btn}>
+          <button type="button" onClick={() => { clearConsoleWorkspaceState(); location.reload(); }} style={btn}>
             重置屏幕状态并重载
           </button>
         </div>
@@ -122,7 +147,9 @@ function PatientViewHost() {
   if (!open) return null;
   return (
     <div className="patient-embed-overlay">
-      <Boundary variant="patient"><PatientShell /></Boundary>
+      <Boundary variant="patient">
+        <Suspense fallback={<PatientLoading />}><PatientShell /></Suspense>
+      </Boundary>
       <HoldToExit onExit={exit} />
     </div>
   );
@@ -210,14 +237,14 @@ function Landing() {
   return (
     <main className="landing-shell">
       <div className="landing-brand" aria-hidden>语</div>
-      <div className="page-kicker">南京医科大学 · 本地研究工具</div>
+      <div className="page-kicker">南京医科大学 · 研究开发版</div>
       <h1>语言沟通训练系统</h1>
-      <p className="landing-lead">为轻中度阿尔茨海默病语言沟通训练提供双端协同、过程记录与人工判分。</p>
+      <p className="landing-lead">AI 可辅助收音、转写、判类、提示和推进；研究者随时接管，并对正式研究分异步复核锁定。</p>
       <div className="landing-grid">
         <Link to="/console" className="landing-card">
           <span className="landing-card-label">研究者操作端</span>
-          <strong>建档、训练与判分</strong>
-          <span>用于研究者控制场次、记录回答和完成正式锁分。</span>
+          <strong>准备、AI 训练与研究复核</strong>
+          <span>用于测试前建档、监看或接管训练、回看录音，并完成人工研究真值锁定。</span>
         </Link>
         <Link to="/patient" className="landing-card patient">
           <span className="landing-card-label">受试者呈现端</span>
@@ -228,6 +255,9 @@ function Landing() {
       <p className="landing-note">
         一台设备即可完成全程：进入操作端建好场次，点「受试者画面」全屏切给受试者，研究者按住角落按钮返回。
         也支持双窗/双设备同步运行。
+      </p>
+      <p className="landing-note">
+        当前仅限模拟预演和受控技术验证，不得用于正式受试者采集。启用云服务后，固定话术、回答音频或回答文本会按所用能力发送至第三方云端；AI 实时判断不是正式研究评分。
       </p>
     </main>
   );

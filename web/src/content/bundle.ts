@@ -1,5 +1,6 @@
-// 冻结题库/脚本随包副本(构建期从 platform/content 同步到 public/content)。
-// 是前端唯一可得的双要素功能线索源(后端 /plan.display 不暴露它)。
+// 具名研究者工作台使用的冻结题库/脚本由服务器固定账号路由返回。
+// 答案整包不再进入 public/dist；受试者设备只读服务端当前游标绑定的
+// /patient-presentation 最小投影。
 // boot 断言 bundle 版本 = plan 版本 = /content/item-bank 版本,不等则 fail-closed 拒开训练屏。
 import { useEffect, useState } from "react";
 
@@ -83,7 +84,11 @@ let scriptCache: Week1Script | null = null;
 let protocolCache: AutopilotProtocol | null = null;
 
 async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+  });
   if (!res.ok) throw new Error(`加载 ${url} 失败(${res.status})`);
   return (await res.json()) as T;
 }
@@ -93,7 +98,7 @@ export function useItemBankBundle(): { bundle: ItemBankBundle | null; error: str
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     if (bankCache) return;
-    fetchJson<ItemBankBundle>("/content/item_bank_v1.json")
+    fetchJson<ItemBankBundle>("/content/item-bank-bundle")
       .then((b) => { bankCache = b; setBundle(b); })
       .catch((e) => setError(String(e)));
   }, []);
@@ -105,7 +110,7 @@ export function useWeek1Script(): { script: Week1Script | null; error: string | 
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     if (scriptCache) return;
-    fetchJson<Week1Script>("/content/week1_script.json")
+    fetchJson<Week1Script>("/content/week1-script")
       .then((s) => { const ok = assertWeek1Shape(s); scriptCache = ok; setScript(ok); })
       .catch((e) => setError(String(e)));
   }, []);
@@ -117,7 +122,7 @@ export function useAutopilotProtocol(): { protocol: AutopilotProtocol | null; er
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     if (protocolCache) return;
-    fetchJson<AutopilotProtocol>("/content/autopilot_protocol_v1.json")
+    fetchJson<AutopilotProtocol>("/content/autopilot-protocol")
       .then((p) => { protocolCache = p; setProtocol(p); })
       .catch((e) => setError(String(e)));
   }, []);

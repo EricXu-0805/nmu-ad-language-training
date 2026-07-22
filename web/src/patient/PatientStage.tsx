@@ -1,46 +1,104 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MicButton } from "../components/MicButton";
 import { ImagePane, type Spotlight } from "../components/ImagePane";
-import { lookupCue, resolveFeedbackLine, useAutopilotProtocol, useItemBankBundle } from "../content/bundle";
 import { turnKey } from "../lib/ids";
 import type { CursorMsg } from "../sync/messages";
-import type { SessionPlan } from "../types";
 import { Centered } from "./Centered";
+import { advanceFeedbackPlayback, initialFeedbackPlaybackState } from "./feedbackState";
+import type { TaskPresentationExpectation } from "./presentationContent";
 import { speak, stopSpeaking } from "./tts";
+import { usePatientPresentation } from "./usePatientPresentation";
 import { useVoxRecorder } from "./useVoxRecorder";
+import { audioRecorderBlockCopy } from "./audioRecorderBlock";
+import type { PatientSessionPlan } from "./patientPlan";
+import type { TtsPlaybackContextKey } from "./ttsContext";
+import {
+  patientAssetRequirementReady,
+  type PatientAssetReadinessEvent,
+} from "./currentPatientAsset.ts";
 
 // 一屏一图一环节:呈现→录音→沉默后逐级线索。超大/高对比/无倒计时/无对错。
 // ★组件树无任何画像来源;线索文本只从版本锁定的 bundle 查表,null 就留空,绝不拼接兜底。
-export function PatientStage({ plan, cursor, sessionId, connectionReady = true, sessionPaused = false }: {
-  plan: SessionPlan | null;
+export function PatientStage({
+  plan,
+  cursor,
+  sessionId,
+  ttsContextKey,
+  connectionReady = true,
+  sessionPaused = false,
+  sessionTerminal = false,
+}: {
+  plan: PatientSessionPlan | null;
   cursor?: CursorMsg;
   sessionId: string;
+  ttsContextKey: TtsPlaybackContextKey | null;
   connectionReady?: boolean;
   sessionPaused?: boolean;
+  sessionTerminal?: boolean;
 }) {
-  const { bundle } = useItemBankBundle();
-  const { protocol } = useAutopilotProtocol();
-
   const item = plan && cursor ? plan.items[cursor.itemIdx] : undefined;
   const planTurn = item && cursor ? item.turns[cursor.turnIdx] : undefined;
   const role = planTurn?.response_role ?? "命名";
-  const tk = item && planTurn ? turnKey(item.item_id, planTurn.turn_seq) : "";
+  const tk = item && planTurn ? turnKey(item.item_ref, planTurn.turn_seq) : "";
+  const presentationExpected: TaskPresentationExpectation | null =
+    plan && item && planTurn && cursor && !sessionTerminal
+      ? {
+          mode: "task",
+          sessionId,
+          itemBankVersionId: plan.item_bank_version_id,
+          itemIdx: cursor.itemIdx,
+          turnIdx: cursor.turnIdx,
+          itemRef: item.item_ref,
+          turnSeq: planTurn.turn_seq,
+          responseRole: planTurn.response_role,
+          cueLevel: cursor.cueLevel,
+          feedbackKey: cursor.fbKey,
+          feedbackItemRef: cursor.fbKey ? item.item_ref : undefined,
+          feedbackSeq: cursor.fbSeq,
+          wseq: cursor.wseq,
+        }
+      : null;
+  const { presentation } = usePatientPresentation(presentationExpected);
+  const taskPresentation = presentation?.mode === "task" ? presentation : null;
+  const contentReady = taskPresentation !== null;
+  const assetRequired = cursor?.screen === "present" || cursor?.screen === "record";
+  const assetRequestKey = item?.item_ref ?? "no-current-item";
+  const [assetState, setAssetState] = useState<PatientAssetReadinessEvent | null>(null);
+  const onAssetReadinessChange = useCallback((event: PatientAssetReadinessEvent) => {
+    setAssetState(event);
+  }, []);
+  const assetReady = patientAssetRequirementReady(
+    assetRequired,
+    assetState,
+    assetRequestKey,
+  );
+  const mediaReady = contentReady && assetReady;
   const isPaused = sessionPaused || cursor?.screen === "paused";
-  const suspended = !connectionReady || isPaused;
+  const suspended = !connectionReady || isPaused || sessionTerminal || !mediaReady;
 
-  const { stopAndSave, startNow, retrySave, saving, canRetry, recActive, micError, saveError, starting, remoteCommandBlocked } = useVoxRecorder({
+  const {
+    stopAndSave, startNow, retrySave, saving, canRetry, recActive, micError,
+    saveError, starting, remoteCommandBlocked, blockReason,
+  } = useVoxRecorder({
     sessionId, recording: cursor?.recording, recSeq: cursor?.recSeq, commandSeq: cursor?.wseq,
-    turnKey: tk, connectionReady, suspended: sessionPaused,
+    turnKey: tk, connectionReady, suspended: sessionPaused || !mediaReady,
+    selfStartAllowed: mediaReady && cursor?.selfStart === true && !isPaused && !sessionTerminal && cursor?.screen !== "thanks" && cursor?.screen !== "done",
+    stopRequested: sessionTerminal || isPaused || !mediaReady || cursor?.screen === "thanks" || cursor?.screen === "done",
   });
+  const blockCopy = blockReason ? audioRecorderBlockCopy(blockReason) : null;
 
   const spotlight: Spotlight = role.startsWith("左") ? "left" : role.startsWith("右") ? "right" : role === "关系识别" ? "both" : "none";
   const question = role.includes("作用") ? "它是做什么用的呢？" : role === "关系识别" ? "它们之间有什么关系呢？" : "请看这张图片，这是什么？";
-  const cueText = item ? lookupCue(bundle, item.item_id, item.task_type, role, cursor?.cueLevel ?? 0) : null;
-  // 自动驾驶反馈:游标只带键,文本本地查表(协议模板+题库目标词);缺内容返回 null,留空不兜底。
-  const fbLine = cursor?.fbKey && cursor.fbItemId
-    ? resolveFeedbackLine(bundle, protocol, cursor.fbKey, cursor.fbItemId)
-    : null;
-  const lastFbSeq = useRef<number | null>(null);   // null=未播种;挂载后首个 fbSeq 视为已消费,不重读
+  // 线索/反馈不再从浏览器整包题库查找；只接受服务端当前游标的最小投影。
+  const cueText = taskPresentation?.cue_text ?? null;
+  const fbLine = taskPresentation?.feedback_text ?? null;
+  const feedbackPlayback = useRef(initialFeedbackPlaybackState());
+
+  // 换题时图片门禁会在同一 render 立即失效；paint 前停止上一题语音，
+  // 绝不让旧题朗读跨进新图的加载窗口。
+  useLayoutEffect(() => {
+    if (!assetReady) stopSpeaking();
+  }, [assetReady, assetRequestKey]);
 
   // 小语开口:换环节读问句;线索到达/升级读线索(读的都是屏上原文)。
   // 线索用 enqueue:恢复/跳题时问句与线索同帧到达,排队读而不是让线索的 cancel 掐掉问句。
@@ -53,28 +111,40 @@ export function PatientStage({ plan, cursor, sessionId, connectionReady = true, 
     prevSuspended.current = suspended;
   }, [suspended]);
   useEffect(() => {
-    if (!suspended && cursor?.screen !== "thanks" && tk) speak(question, { tag: tk });
+    if (!suspended && cursor?.screen !== "thanks" && tk && ttsContextKey) {
+      speak(question, { contextKey: ttsContextKey, tag: tk });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tk, question, resumeEpoch]);
+  }, [tk, question, resumeEpoch, contentReady, ttsContextKey]);
   // 自动驾驶反馈:独立一拍(位置还停在当前题、图片未换),fbSeq 变化才读。
-  // ★挂载时用首个 fbSeq 播种(不朗读)——刷新恢复出的旧反馈游标绝不重读(它属于已过去的一拍)。
+  // 首次连接成功时的游标是历史基线,不重读；基线之后到达的第一个新 fbSeq 必须朗读。
   useEffect(() => {
-    const seq = cursor?.fbSeq;
-    if (seq == null) return;
-    if (lastFbSeq.current === null) { lastFbSeq.current = seq; return; }  // 播种:视为已消费
-    if (seq === lastFbSeq.current) return;
-    lastFbSeq.current = seq;
-    if (!suspended && cursor?.screen !== "thanks" && fbLine) speak(fbLine, { tag: `fb:${cursor?.fbItemId ?? ""}:${seq}` });
+    if (!contentReady) return;
+    const transition = advanceFeedbackPlayback(feedbackPlayback.current, connectionReady, cursor?.fbSeq);
+    feedbackPlayback.current = transition.state;
+    if (transition.shouldSpeak && !suspended && cursor?.screen !== "thanks"
+        && fbLine && ttsContextKey) {
+      speak(fbLine, {
+        contextKey: ttsContextKey,
+        tag: `fb:${item?.item_ref ?? ""}:${cursor?.fbSeq ?? ""}`,
+      });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor?.fbSeq]);
+  }, [connectionReady, cursor?.fbSeq, suspended, contentReady, ttsContextKey]);
   useEffect(() => {
-    if (!suspended && cursor?.screen !== "thanks" && cueText) speak(cueText, { tag: tk, enqueue: true });
+    if (!suspended && cursor?.screen !== "thanks" && cueText && ttsContextKey) {
+      speak(cueText, { contextKey: ttsContextKey, tag: tk, enqueue: true });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cueText, tk, resumeEpoch]);
+  }, [cueText, tk, resumeEpoch, ttsContextKey]);
   // 收尾过渡屏:屏上是"今天辛苦了",小语不能同时还在念题(屏幕与语音互相矛盾的跳变)
   useEffect(() => {
     if (cursor?.screen === "thanks") stopSpeaking();
   }, [cursor?.screen]);
+
+  if (sessionTerminal) {
+    return <Centered><div className="target">今天辛苦了</div><p className="question">今天的练习已经结束</p></Centered>;
+  }
 
   if (isPaused) {
     return (
@@ -92,12 +162,23 @@ export function PatientStage({ plan, cursor, sessionId, connectionReady = true, 
   if (!item || !planTurn) {
     return <Centered><p className="question">请稍候…</p></Centered>;
   }
+  if (!contentReady) {
+    return <Centered><p className="question">请稍等一下，马上就好。</p></Centered>;
+  }
 
   return (
     <div className="patient-stage">
       <div className="patient-stage-body">
         <div className="stage-image" data-compact={cueText ? "true" : "false"}>
-          <ImagePane imageId={item.image_id} spotlight={spotlight} compact={!!cueText} alt="题目图片" />
+          <ImagePane
+            sessionId={sessionId}
+            requestKey={assetRequestKey}
+            required={assetRequired}
+            spotlight={spotlight}
+            compact={!!cueText}
+            alt="题目图片"
+            onReadinessChange={onAssetReadinessChange}
+          />
         </div>
         <p className="question" aria-live="polite" aria-atomic="true">{question}</p>
         {/* 线索槽恒占位:线索出现/消失不再把问句和麦克风上下顶(布局零跳动) */}
@@ -108,11 +189,20 @@ export function PatientStage({ plan, cursor, sessionId, connectionReady = true, 
       <div className="stage-mic" aria-busy={saving}>
         {saving
           ? <p className="patient-status" role="status" aria-live="polite">正在保存，请稍候</p>
+          : blockCopy
+            ? (
+              <div className="col" style={{ alignItems: "center", gap: "var(--sp-3)" }} role="alert">
+                <p className="patient-status">{blockCopy.patient}</p>
+                <p className="muted" style={{ maxWidth: "72ch", textAlign: "center" }}>
+                  研究者处置：{blockCopy.researcher}
+                </p>
+              </div>
+            )
           : (
             <>
               {!saveError && (
-                <MicButton state={remoteCommandBlocked ? "idle" : (cursor?.recording ?? "idle")} localActive={recActive}
-                  selfStart={!remoteCommandBlocked && cursor?.selfStart === true} micError={micError} starting={starting}
+                <MicButton state={!mediaReady || remoteCommandBlocked ? "idle" : (cursor?.recording ?? "idle")} localActive={recActive}
+                  selfStart={mediaReady && !remoteCommandBlocked && cursor?.selfStart === true} micError={micError} starting={mediaReady && starting}
                   onStart={() => void startNow()} onStop={stopAndSave} />
               )}
               {saveError && (

@@ -1,37 +1,74 @@
-import { useEffect, useState } from "react";
-import { PIN_REQUIRED_EVENT, getPin, setPin } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { api, ApiError, DEVICE_PAIR_REQUIRED_EVENT } from "../api";
 import { Button } from "./Button";
+import { useDialogFocusTrap } from "./useDialogFocusTrap";
 
-// 内网模式的 PIN 输入(后端 401 时弹出;单机模式后端不设 PIN,永不出现)。
-// 两端各输一次存本机;输错下次写操作会再次弹出。
+// PIN 只用于这一次当面配对：不写 localStorage/sessionStorage，不成为后续 API bearer。
 export function PinPrompt() {
   const [open, setOpen] = useState(false);
   const [val, setVal] = useState("");
-  const patientDevice = window.location.pathname.startsWith("/patient");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const openRef = useRef(false);
+
+  const close = () => {
+    openRef.current = false;
+    setOpen(false);
+  };
+  const cancelSafely = () => { if (!busy) close(); };
+  const panelRef = useDialogFocusTrap<HTMLFormElement>({
+    open,
+    onCancel: cancelSafely,
+  });
 
   useEffect(() => {
-    const show = () => { setVal(getPin() ?? ""); setOpen(true); };
-    window.addEventListener(PIN_REQUIRED_EVENT, show);
-    return () => window.removeEventListener(PIN_REQUIRED_EVENT, show);
+    const show = () => {
+      // Concurrent device routes can repeat the pairing-required hint. Do not
+      // erase a PIN that the researcher is in the middle of typing.
+      if (openRef.current) return;
+      openRef.current = true;
+      setVal("");
+      setError(null);
+      setOpen(true);
+    };
+    window.addEventListener(DEVICE_PAIR_REQUIRED_EVENT, show);
+    return () => window.removeEventListener(DEVICE_PAIR_REQUIRED_EVENT, show);
   }, []);
 
   if (!open) return null;
-  const save = () => { const v = val.trim(); if (!v) return; setPin(v); setOpen(false); };
+  const pair = async () => {
+    const pin = val.trim();
+    if (!pin || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.pairDevice(pin);
+      setVal("");
+      close();
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.status === 401) setError("PIN 不正确，请重新输入");
+      else setError(caught instanceof ApiError ? caught.detail : "配对失败，请检查连接后重试");
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
-    <div className="dialog-backdrop dialog-backdrop-elevated" onClick={() => setOpen(false)}>
-      <form className="dialog-panel fade-in" role="dialog" aria-modal="true" aria-labelledby="pin-dialog-title" onClick={(e) => e.stopPropagation()}
-        onSubmit={(e) => { e.preventDefault(); save(); }}>
-        <div className="dialog-header"><h3 id="pin-dialog-title">需要设备 PIN</h3></div>
+    <div className="dialog-backdrop dialog-backdrop-elevated" onClick={cancelSafely}>
+      <form ref={panelRef} className="dialog-panel fade-in" role="dialog" aria-modal="true"
+        aria-labelledby="pin-dialog-title" aria-busy={busy || undefined} tabIndex={-1} onClick={(e) => e.stopPropagation()}
+        onSubmit={(e) => { e.preventDefault(); void pair(); }}>
+        <div className="dialog-header"><h3 id="pin-dialog-title">配对受试者端</h3></div>
         <p className="muted">
-          {patientDevice ? "请由研究者输入服务器启动终端显示的 PIN。验证后本设备才能安全上传心跳与录音。"
-            : "内网模式下，研究数据读写需要验证。PIN 显示在服务器启动终端，输入一次后保存在本设备。"}
+          请由研究者在现场输入设备 PIN。配对只对当前训练场次有效，关闭此标签页后自动消失。
         </p>
-        <input autoFocus inputMode="numeric" value={val} onChange={(e) => setVal(e.target.value)}
-          className="pin-input" aria-label="操作端 PIN" />
+        <input inputMode="numeric" type="password" autoComplete="one-time-code"
+          value={val} onChange={(e) => { setVal(e.target.value); setError(null); }}
+          className="pin-input" aria-label="设备 PIN" disabled={busy} />
+        {error && <p role="alert" className="danger-text">{error}</p>}
         <div className="dialog-actions">
-          <Button type="button" onClick={() => setOpen(false)}>稍后</Button>
-          <Button type="submit" variant="primary" disabled={!val.trim()}>
-            保存并返回
+          <Button type="button" onClick={cancelSafely} disabled={busy}>稍后</Button>
+          <Button type="submit" variant="primary" disabled={!val.trim() || busy}>
+            {busy ? "正在配对…" : "完成配对"}
           </Button>
         </div>
       </form>

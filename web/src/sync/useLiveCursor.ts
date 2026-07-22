@@ -2,35 +2,58 @@
 // 三源合一:localStorage 镜像(刷新恢复)→ BroadcastChannel(同机秒推)→ 服务端轮询(跨设备兜底)。
 // seq 单调判新:轮询只在服务端 seq 前进时应用快照,避免旧快照覆盖 bus 刚推的新状态。
 import { useEffect, useRef, useState } from "react";
-import { ApiError, getPin, PIN_REQUIRED_EVENT } from "../api";
+import {
+  ApiError,
+  DEVICE_CAPABILITY_UPDATED_EVENT,
+  DEVICE_PAIR_REQUIRED_EVENT,
+  getDeviceCapability,
+  handleDeviceAuthorizationFailure,
+  selectDeviceCredential,
+} from "../api";
 import type { LiveStateResponse } from "../types";
 import { bus } from "./bus";
-import type { CursorMsg, RapportMsg, SessionMsg, SyncMsg } from "./messages";
+import { LiveAuthorizationFence } from "./liveAuthorizationFence";
+import { livePollingHasActiveCapability } from "./livePollPolicy";
+import {
+  parseSyncPayload,
+  type CursorMsg,
+  type RapportMsg,
+  type SessionMsg,
+  type SyncMsg,
+} from "./messages";
 
 const LIVE_POLL_MS = 1500;
 const RECONNECT_GRACE_MS = 4500;
 const LIVE_FETCH_TIMEOUT_MS = 4000;
 
-// api.getLiveState 目前不接 AbortSignal；老人端在这里保留同样的相对路径、PIN 与 401 行为，
+class DeviceAuthorizationFailure extends Error {}
+
+// api.getLiveState 目前不接 AbortSignal；老人端在这里保留同样的相对路径、capability 与失效行为，
 // 但给真实 fetch 加物理 abort，避免悬挂请求让页面永远误判“仍连接”。
-async function fetchLiveState(signal: AbortSignal): Promise<LiveStateResponse> {
-  const pin = getPin();
+async function fetchLiveState(
+  signal: AbortSignal,
+  credential: ReturnType<typeof selectDeviceCredential>,
+): Promise<LiveStateResponse> {
   const res = await fetch("/live/state", {
     method: "GET",
-    headers: pin ? { "X-Console-Pin": pin } : undefined,
+    credentials: "omit",
+    headers: credential.headers,
+    cache: "no-store",
     signal,
   });
   const text = await res.text();
-  let data: unknown = null;
-  if (text) data = JSON.parse(text) as unknown;
   if (!res.ok) {
-    if (res.status === 401) window.dispatchEvent(new Event(PIN_REQUIRED_EVENT));
+    const deviceAuthFailed = handleDeviceAuthorizationFailure(res.status, text, credential);
+    let data: unknown = null;
+    try { if (text) data = JSON.parse(text) as unknown; } catch { /* proxy body */ }
     const detail = data && typeof data === "object" && "detail" in data
-      ? String((data as { detail: unknown }).detail)
+      ? JSON.stringify((data as { detail: unknown }).detail)
       : text;
+    if (deviceAuthFailed) throw new DeviceAuthorizationFailure(detail);
     throw new ApiError(res.status, detail);
   }
-  return data as LiveStateResponse;
+  try { return (text ? JSON.parse(text) : null) as LiveStateResponse; }
+  catch { throw new ApiError(res.status, "服务器返回的实时状态格式错误"); }
 }
 
 export type LiveConnectionState = "connecting" | "connected" | "reconnecting";
@@ -43,16 +66,9 @@ export interface LiveState {
 }
 
 export function useLiveCursor(): LiveState {
-  const [state, setState] = useState<LiveState>(() => {
-    const snap = bus.snapshot();
-    const sessionId = snap.session?.sessionId;
-    return {
-      session: snap.session,
-      cursor: snap.cursor?.sessionId === sessionId ? snap.cursor : undefined,
-      rapportStep: snap.rapportStep?.sessionId === sessionId ? snap.rapportStep : undefined,
-      connection: "connecting",
-    };
-  });
+  // localStorage/BroadcastChannel is an untrusted speed path.  Never render its
+  // contents until this mount has obtained a successful server projection.
+  const [state, setState] = useState<LiveState>({ connection: "connecting" });
   const lastSeq = useRef(0);
   const serverSnapshotSeen = useRef(false);
   // 消息合并依赖“已应用 wseq”。这些 ref 变更不能放在 React state updater 中：
@@ -73,6 +89,14 @@ export function useLiveCursor(): LiveState {
     let reconnectTimer: number | undefined;
     let activePoll: AbortController | null = null;
     let contactVersion = 0;
+    // Keep "not yet server-verified" separate from an explicit auth rejection.
+    // Network failure while unverified must keep retrying; only a stable device
+    // auth response pauses periodic probes until a capability update.
+    let serverProjectionAuthorized = false;
+    let deviceAuthBlocked = false;
+    let authorizedSessionId: string | null = null;
+    let pendingCapabilityProbe = false;
+    const authorizationFence = new LiveAuthorizationFence();
 
     const publish = (next: LiveState) => {
       if (cancelled || next === stateRef.current) return;
@@ -105,25 +129,11 @@ export function useLiveCursor(): LiveState {
       }, RECONNECT_GRACE_MS);
     };
 
-    // 初始镜像也计入已应用序号,防轮询用更旧的服务端快照覆盖它
-    const snap = bus.snapshot();
-    applied.current = {
-      session: snap.session?.wseq ?? 0,
-      cursor: snap.cursor?.sessionId === snap.session?.sessionId ? snap.cursor?.wseq ?? 0 : 0,
-      rapportStep: snap.rapportStep?.sessionId === snap.session?.sessionId ? snap.rapportStep?.wseq ?? 0 : 0,
-    };
-    // 这份快照必须同步补发到 state:render→effect 间隙落进镜像的消息(单机叠层挂载时
-    // 常态出现)已被 applied 记账,若只记账不发布,后续同 wseq 重达会被 fresh() 判旧丢弃,
-    // 画面停在旧游标直到轮询兜底(约一个轮询周期)。
-    const sid0 = snap.session?.sessionId;
-    setState((prev) => ({
-      ...prev,
-      session: snap.session,
-      cursor: snap.cursor?.sessionId === sid0 ? snap.cursor : undefined,
-      rapportStep: snap.rapportStep?.sessionId === sid0 ? snap.rapportStep : undefined,
-    }));
-
     const unsub = bus.subscribe((msg: SyncMsg) => {
+      if (!serverProjectionAuthorized) return;
+      // A successful /live/state authorizes exactly its returned session.  A
+      // console BroadcastChannel switch is ignored until the server confirms it.
+      if (!authorizedSessionId || msg.sessionId !== authorizedSessionId) return;
       // bus 只送内容,不当连接信号:BroadcastChannel 是浏览器层通道,后端进程死了它照样通,
       // 若据此 markConnected 会压制断线判定——录音保存必失败却不显示"正在重新连接"。
       const prev = stateRef.current;
@@ -146,19 +156,48 @@ export function useLiveCursor(): LiveState {
       // audioSaved 不改老人端可视状态
     });
 
-    const poll = () => {
-      if (cancelled || activePoll) return;
+    const poll = (allowWhileBlocked = false) => {
+      if (cancelled || activePoll || (deviceAuthBlocked && !allowWhileBlocked)) return;
+      const credential = selectDeviceCredential();
+      if (!livePollingHasActiveCapability(credential)) {
+        deviceAuthBlocked = true;
+        serverProjectionAuthorized = false;
+        authorizedSessionId = null;
+        publish({ connection: "reconnecting" });
+        if (allowWhileBlocked) {
+          queueMicrotask(() => {
+            if (!cancelled && !getDeviceCapability()) {
+              window.dispatchEvent(new Event(DEVICE_PAIR_REQUIRED_EVENT));
+            }
+          });
+        }
+        return;
+      }
       const controller = new AbortController();
       activePoll = controller;
       const contactAtStart = contactVersion;
+      const authorizationProbe = authorizationFence.capture(
+        credential.record?.capability ?? null);
+      const credentialStillSelected = () => authorizationFence.accepts(
+        authorizationProbe,
+        selectDeviceCredential().record?.capability ?? null,
+      );
       let timedOut = false;
       const timeout = window.setTimeout(() => {
         timedOut = true;
         controller.abort();
       }, LIVE_FETCH_TIMEOUT_MS);
 
-      fetchLiveState(controller.signal)
+      fetchLiveState(controller.signal, credential)
         .then((d) => {
+          // Abort is not sufficient once a response promise has already resolved.
+          // Any active-token event invalidates all earlier probes, including a
+          // queued old-token 200 that would otherwise repaint a blanked session.
+          if (!credentialStillSelected()) return;
+          // Authorization is established only by this successful response, never
+          // merely by storing a capability or receiving a browser-local message.
+          deviceAuthBlocked = false;
+          serverProjectionAuthorized = true;
           markConnected();
           const seq = typeof d.seq === "number" ? d.seq : 0;
           const firstServerSnapshot = !serverSnapshotSeen.current;
@@ -168,19 +207,23 @@ export function useLiveCursor(): LiveState {
           const epochReset = firstServerSnapshot || seq < lastSeq.current;
           serverSnapshotSeen.current = true;
           lastSeq.current = seq;
-          const s = (d.session as SessionMsg | null) ?? undefined;
-          const c = (d.cursor as CursorMsg | null) ?? undefined;
-          const r = (d.rapportStep as RapportMsg | null) ?? undefined;
+          const s = parseSyncPayload("session", d.session) ?? undefined;
+          const c = parseSyncPayload("cursor", d.cursor) ?? undefined;
+          const r = parseSyncPayload("rapportStep", d.rapportStep) ?? undefined;
           const prev = stateRef.current;
           // 首次成功轮询是跨设备真值。服务端已空时必须撤下 localStorage
           // 的旧场次镜像，否则服务重启/换库后老人端会一直显示上一位受试者的题目。
           if (!s) {
+            authorizedSessionId = null;
             applied.current = { session: 0, cursor: 0, rapportStep: 0 };
+            bus.reset();
             publish({ connection: prev.connection });
             return;
           }
           const serverCursor = c?.sessionId === s.sessionId ? c : undefined;
           const serverRapport = r?.sessionId === s.sessionId ? r : undefined;
+          authorizedSessionId = s.sessionId;
+          bus.replaceSnapshot({ session: s, cursor: serverCursor, rapportStep: serverRapport });
           // 只有"新纪元"(首次快照/服务重启换库/换场次)才整体重置三类序号与画面。
           if (epochReset || prev.session?.sessionId !== s.sessionId) {
             applied.current = {
@@ -202,8 +245,21 @@ export function useLiveCursor(): LiveState {
           if (serverRapport && fresh("rapportStep", serverRapport.wseq)) next = { ...next, rapportStep: serverRapport };
           if (next !== prev) publish(next);
         })
-        .catch(() => {
+        .catch((error: unknown) => {
+          if (!credentialStillSelected()) return;
           if (cancelled || contactVersion !== contactAtStart) return;
+          if (error instanceof DeviceAuthorizationFailure) {
+            deviceAuthBlocked = true;
+            serverProjectionAuthorized = false;
+            authorizedSessionId = null;
+            pendingCapabilityProbe = false;
+            serverSnapshotSeen.current = false;
+            lastSeq.current = 0;
+            applied.current = { session: 0, cursor: 0, rapportStep: 0 };
+            bus.reset();
+            publish({ connection: "reconnecting" });
+            return;
+          }
           // 悬挂到超时是明确失联，立即进入重连并让 PatientShell 触发停麦；
           // 普通瞬时失败仍保留缓冲，避免单个丢包令适老界面闪烁。
           markFailed(timedOut);
@@ -211,9 +267,15 @@ export function useLiveCursor(): LiveState {
         .finally(() => {
           clearTimeout(timeout);
           if (activePoll === controller) activePoll = null;
+          if (!cancelled && pendingCapabilityProbe && getDeviceCapability()) {
+            pendingCapabilityProbe = false;
+            poll(true);
+          }
         });
     };
-    poll();
+    // No authority request is sent before pairing.  The capability update event
+    // below starts exactly one first probe after the PIN exchange succeeds.
+    poll(true);
     const timer = setInterval(poll, LIVE_POLL_MS);
     const onOffline = () => {
       activePoll?.abort();
@@ -222,6 +284,38 @@ export function useLiveCursor(): LiveState {
     const onOnline = () => poll();
     window.addEventListener("offline", onOffline);
     window.addEventListener("online", onOnline);
+    const onCapabilityUpdated = () => {
+      const active = getDeviceCapability();
+      // Active token install/removal is not authority by itself.  Blank in the
+      // same tick (so a TTS/upload-discovered expiry also stops the microphone),
+      // close BC, then prove the new state with exactly one server request.
+      serverProjectionAuthorized = false;
+      authorizationFence.invalidate();
+      authorizedSessionId = null;
+      serverSnapshotSeen.current = false;
+      lastSeq.current = 0;
+      applied.current = { session: 0, cursor: 0, rapportStep: 0 };
+      bus.reset();
+      publish({ connection: "reconnecting" });
+      if (active) {
+        pendingCapabilityProbe = true;
+        if (activePoll) activePoll.abort();
+        else {
+          pendingCapabilityProbe = false;
+          poll(true);
+        }
+      } else {
+        pendingCapabilityProbe = false;
+        activePoll?.abort();
+        deviceAuthBlocked = true;
+        queueMicrotask(() => {
+          if (!cancelled && !getDeviceCapability()) {
+            window.dispatchEvent(new Event(DEVICE_PAIR_REQUIRED_EVENT));
+          }
+        });
+      }
+    };
+    window.addEventListener(DEVICE_CAPABILITY_UPDATED_EVENT, onCapabilityUpdated);
     if (!navigator.onLine) markFailed(true);
 
     return () => {
@@ -232,6 +326,7 @@ export function useLiveCursor(): LiveState {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       window.removeEventListener("offline", onOffline);
       window.removeEventListener("online", onOnline);
+      window.removeEventListener(DEVICE_CAPABILITY_UPDATED_EVENT, onCapabilityUpdated);
     };
   }, []);
 

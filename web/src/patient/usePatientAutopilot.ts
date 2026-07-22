@@ -1,0 +1,554 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  DEVICE_CAPABILITY_UPDATED_EVENT,
+  DEVICE_PAIR_REQUIRED_EVENT,
+  selectDeviceCredential,
+} from "../api.ts";
+import { DurableAutopilotAckDelivery } from "./autopilotAckDelivery.ts";
+import {
+  PatientAutopilotController,
+  deviceCapabilityAllowsAutopilot,
+} from "./autopilotController.ts";
+import { autopilotHttpTransport } from "./autopilotHttpTransport.ts";
+import { recoverAutopilotRecording, BrowserAutopilotRecordingExecutor } from "./autopilotRecordingExecutor.ts";
+import { restoreAutopilotRuntime, type AutopilotRuntimeState } from "./autopilotRuntime.ts";
+import { BrowserAutopilotSpeechExecutor } from "./autopilotSpeechExecutor.ts";
+import {
+  acknowledgeExactAutopilotDrain,
+  fetchExactAutopilotDrainTarget,
+} from "./autopilotMediaTransport.ts";
+import { browserAutopilotMediaDependencies } from "./autopilotBrowserMediaDependencies.ts";
+import type { NextCommandProjection } from "./autopilotProtocol.ts";
+import { stopSpeaking } from "./tts.ts";
+import {
+  canProbePatientAutopilot,
+  canRunPatientAutopilotMedia,
+  resolvePatientAutopilotVisibleMode,
+  type PatientAutopilotMode,
+} from "./autopilotAdmission.ts";
+import {
+  acquireAutopilotOwnerLease,
+  type AutopilotOwnerLease,
+} from "./autopilotOwnerLease.ts";
+import { AutopilotExecutionFence } from "./autopilotExecutionFence.ts";
+import {
+  acknowledgeDrainAfterShutdown,
+  assertExactDrainTransition,
+} from "./autopilotDrainCoordinator.ts";
+import {
+  classifyAutopilotDrainFailure,
+  drainRetryDelayMs,
+} from "./autopilotDrainRetryPolicy.ts";
+import { settleAutopilotServerExit } from "./autopilotServerExitCoordinator.ts";
+import {
+  exactAutopilotApiCode,
+  planAutopilotProbeFailure,
+} from "./autopilotProbePolicy.ts";
+import type { PatientAssetReadinessEvent } from "./currentPatientAsset.ts";
+import { PatientAssetMediaGate } from "./patientAssetMediaGate.ts";
+
+export type { PatientAutopilotMode } from "./autopilotAdmission.ts";
+
+interface ServerContext {
+  delivery: DurableAutopilotAckDelivery;
+  current: NextCommandProjection | null;
+  runtime: AutopilotRuntimeState;
+  ownerLease: AutopilotOwnerLease;
+  controller: PatientAutopilotController | null;
+  fence: AutopilotExecutionFence;
+  drainedCommandKey: string | null;
+  exitPromise: Promise<void> | null;
+}
+
+export interface PatientAutopilotView {
+  mode: PatientAutopilotMode;
+  runtime: AutopilotRuntimeState | null;
+  current: NextCommandProjection | null;
+  reason: string | null;
+  assetReadiness: PatientAssetReadinessEvent | null;
+  reportAssetReadiness(event: PatientAssetReadinessEvent): void;
+  stopMediaNow(): void;
+  stopRecordingNow(): void;
+}
+
+function blockedReason(error: unknown): string {
+  const code = exactAutopilotApiCode(error);
+  if (code === "autopilot_command_device_mismatch"
+      || code === "autopilot_command_device_rotated") {
+    return "自动流程已绑定其他设备，请研究者处置";
+  }
+  if (code === "autopilot_state_invalid" || code === "autopilot_command_invalid") {
+    return "自动流程状态不一致，已安全停止";
+  }
+  return "自动流程暂时无法确认，请研究者查看";
+}
+
+async function loadServerRuntime(
+  sessionId: string,
+  delivery: DurableAutopilotAckDelivery,
+): Promise<{ current: NextCommandProjection | null; runtime: AutopilotRuntimeState }> {
+  let current = await autopilotHttpTransport.next(sessionId);
+  let runtime = restoreAutopilotRuntime(current, delivery.initialDeviceEventSeq);
+  if (runtime.command?.kind === "record" && runtime.command.state === "started") {
+    const recovered = await recoverAutopilotRecording(sessionId, runtime.command);
+    if (recovered) {
+      await delivery.send(runtime.command, delivery.initialDeviceEventSeq, {
+        ack_type: "record_stopped",
+        ...recovered,
+      });
+      current = await autopilotHttpTransport.next(sessionId);
+      runtime = restoreAutopilotRuntime(current, delivery.initialDeviceEventSeq);
+    }
+  }
+  return { current: runtime.command, runtime };
+}
+
+export function usePatientAutopilot(input: {
+  sessionId: string | null;
+  activated: boolean;
+  ttsOn: boolean;
+  connectionReady: boolean;
+  sessionPaused: boolean;
+  sessionTerminal: boolean;
+}): PatientAutopilotView {
+  const [capabilityRevision, setCapabilityRevision] = useState(0);
+  const [mode, setMode] = useState<PatientAutopilotMode>("legacy");
+  const [probeEpoch, setProbeEpoch] = useState(0);
+  const [resolvedProbeKey, setResolvedProbeKey] = useState("");
+  const [server, setServer] = useState<ServerContext | null>(null);
+  const [reason, setReason] = useState<string | null>(null);
+  const [assetReadiness, setAssetReadiness] = useState<PatientAssetReadinessEvent | null>(null);
+  const assetGateRef = useRef<PatientAssetMediaGate | null>(null);
+  if (assetGateRef.current === null) assetGateRef.current = new PatientAssetMediaGate();
+  const controllerRef = useRef<PatientAutopilotController | null>(null);
+  const serverContextRef = useRef<ServerContext | null>(null);
+  const probeRetryAttempt = useRef(0);
+  const probeRetryKey = useRef("");
+  serverContextRef.current = server;
+
+  const reportAssetReadiness = useCallback((event: PatientAssetReadinessEvent) => {
+    // A stale image callback can arrive after React has projected a newer
+    // command. It must neither satisfy nor fail that newer command's gate.
+    if (serverContextRef.current?.current?.command_key !== event.requestKey) return;
+    assetGateRef.current?.report(event.requestKey, event.readiness);
+    setAssetReadiness(event);
+    if (event.readiness !== "failed") return;
+    stopSpeaking();
+    controllerRef.current?.stop();
+    setMode("blocked");
+    setReason("题目图片未能安全显示，已停止语音和录音，请研究者处置");
+  }, []);
+
+  const releaseServerToLegacy = useCallback((
+    context: ServerContext,
+    resolvedKey: string,
+  ): Promise<void> => {
+    if (context.exitPromise) return context.exitPromise;
+    stopSpeaking();
+    setMode("probing");
+    setReason("正在安全释放服务器控制");
+    const active = context.controller;
+    context.controller = null;
+    if (controllerRef.current === active) controllerRef.current = null;
+    const shutdown = active?.stopAndWait() ?? null;
+    context.exitPromise = settleAutopilotServerExit({
+      fence: context.fence,
+      shutdown,
+      ownerLease: context.ownerLease,
+    }).then(() => {
+      if (serverContextRef.current !== context) return;
+      setServer(null);
+      setResolvedProbeKey(resolvedKey);
+      setReason(null);
+      setMode("legacy");
+    });
+    return context.exitPromise;
+  }, []);
+
+  useEffect(() => {
+    const update = () => setCapabilityRevision((value) => value + 1);
+    window.addEventListener(DEVICE_CAPABILITY_UPDATED_EVENT, update);
+    return () => window.removeEventListener(DEVICE_CAPABILITY_UPDATED_EVENT, update);
+  }, []);
+
+  useEffect(() => {
+    assetGateRef.current?.reset("场次已切换");
+    setAssetReadiness(null);
+  }, [input.sessionId]);
+
+  const credential = input.sessionId ? selectDeviceCredential(input.sessionId) : null;
+  const capability = credential?.source === "active" ? credential.record : null;
+  // Never copy the bearer capability into React state/dependency keys. Rotation
+  // is represented by the in-memory update revision instead.
+  const capabilityKey = capability
+    ? `${capability.sessionId}\u0000${capability.expiresAt}\u0000${capabilityRevision}` : "";
+  const probeKey = input.sessionId && capabilityKey
+    ? `${input.sessionId}\u0000${capabilityKey}` : "";
+  const probeAllowed = canProbePatientAutopilot({
+    hasSession: input.sessionId !== null,
+    hasExactCapability: capability !== null,
+    sessionTerminal: input.sessionTerminal,
+  });
+  // Suppress the legacy subtree on the very first render that sees an exact
+  // capability. Waiting for a passive effect would let legacy TTS/recorder
+  // effects fire once before the P0a ownership probe finishes.
+  const visibleMode = resolvePatientAutopilotVisibleMode({
+    hasSession: input.sessionId !== null,
+    hasExactCapability: capability !== null,
+    probeKey,
+    resolvedProbeKey,
+    resolvedMode: mode,
+  });
+
+  useEffect(() => {
+    const sessionId = input.sessionId;
+    const selected = sessionId ? selectDeviceCredential(sessionId) : null;
+    const activeCapability = selected?.source === "active" ? selected.record : null;
+    if (!sessionId || input.sessionTerminal) {
+      stopSpeaking();
+      setMode("legacy");
+      setResolvedProbeKey("");
+      setServer(null);
+      setReason(null);
+      return;
+    }
+    if (!deviceCapabilityAllowsAutopilot(activeCapability, sessionId)) {
+      stopSpeaking();
+      setServer(null);
+      setResolvedProbeKey("");
+      setMode("probing");
+      setReason("请研究者完成本场次设备配对");
+      queueMicrotask(() => {
+        const current = selectDeviceCredential(sessionId);
+        if (current.source !== "active" || current.record?.sessionId !== sessionId) {
+          window.dispatchEvent(new Event(DEVICE_PAIR_REQUIRED_EVENT));
+        }
+      });
+      return;
+    }
+    if (probeRetryKey.current !== probeKey) {
+      probeRetryKey.current = probeKey;
+      probeRetryAttempt.current = 0;
+    }
+    let cancelled = false;
+    let retryTimer: number | null = null;
+    const ownerAbort = new AbortController();
+    let ownerLease: AutopilotOwnerLease | null = null;
+    let retainedContext: ServerContext | null = null;
+    const releaseOwner = () => {
+      const lease = ownerLease;
+      if (!lease) return;
+      ownerLease = null;
+      lease.release();
+      void lease.released;
+    };
+    setMode("probing");
+    setResolvedProbeKey("");
+    setServer(null);
+    setReason(null);
+    void (async () => {
+      try {
+        ownerLease = await acquireAutopilotOwnerLease(
+          sessionId, undefined, ownerAbort.signal);
+        if (cancelled) return;
+        const delivery = await DurableAutopilotAckDelivery.create({
+          capability: activeCapability,
+          transport: autopilotHttpTransport,
+        });
+        await delivery.drainPending();
+        const restored = await loadServerRuntime(sessionId, delivery);
+        if (cancelled) return;
+        stopSpeaking();
+        const context: ServerContext = {
+          delivery,
+          current: restored.current,
+          runtime: restored.runtime,
+          ownerLease,
+          controller: null,
+          fence: new AutopilotExecutionFence(),
+          drainedCommandKey: null,
+          exitPromise: null,
+        };
+        retainedContext = context;
+        probeRetryAttempt.current = 0;
+        setServer(context);
+        setMode("server");
+        setResolvedProbeKey(probeKey);
+      } catch (error) {
+        if (cancelled) return;
+        setServer(null);
+        const failurePlan = planAutopilotProbeFailure(
+          error, probeRetryAttempt.current);
+        if (failurePlan.action === "stop-legacy") {
+          probeRetryAttempt.current = 0;
+          setMode("legacy");
+          setReason(null);
+          setResolvedProbeKey(probeKey);
+        } else if (failurePlan.action === "retry") {
+          stopSpeaking();
+          setMode("probing");
+          setResolvedProbeKey("");
+          setReason("服务器状态暂时无法确认，人工流程继续锁定并自动重试");
+          probeRetryAttempt.current += 1;
+          retryTimer = window.setTimeout(
+            () => setProbeEpoch((value) => value + 1), failurePlan.delayMs);
+        } else {
+          probeRetryAttempt.current = 0;
+          stopSpeaking();
+          setMode("blocked");
+          setReason(failurePlan.retryExhausted
+            ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
+            : blockedReason(error));
+          setResolvedProbeKey(probeKey);
+        }
+      } finally {
+        if (retainedContext === null) releaseOwner();
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      ownerAbort.abort(new DOMException("自动流程页面已离开", "AbortError"));
+      const context = retainedContext;
+      const controller = context?.controller ?? null;
+      if (context && controller) {
+        context.controller = null;
+        context.fence.registerControllerShutdown(controller.stopAndWait());
+      }
+      const idle = context?.fence.waitForActiveStart() ?? Promise.resolve();
+      void idle.finally(releaseOwner);
+    };
+  }, [input.sessionId, input.sessionTerminal, capabilityKey, probeKey, probeEpoch]);
+
+  const mediaAllowed = canRunPatientAutopilotMedia({
+    serverOwned: visibleMode === "server",
+    hasDurableDelivery: server !== null,
+    activated: input.activated,
+    ttsOn: input.ttsOn,
+    connectionReady: input.connectionReady,
+    sessionPaused: input.sessionPaused,
+    sessionTerminal: input.sessionTerminal,
+  });
+
+  // Before user activation (or while explicitly gated), polling may update the
+  // visible command but can never enter either media executor or emit an ACK.
+  useEffect(() => {
+    if (visibleMode !== "server" || !server || mediaAllowed || !probeAllowed) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    let retryAttempt = 0;
+    const poll = async () => {
+      try {
+        await server.fence.runPassive(async () => {
+          if (cancelled) return;
+          const restored = await loadServerRuntime(input.sessionId as string, server.delivery);
+          if (!cancelled) setServer((before) => before?.delivery === server.delivery
+            ? { ...before, current: restored.current, runtime: restored.runtime } : before);
+        });
+        retryAttempt = 0;
+        if (!cancelled) setReason(null);
+      } catch (error) {
+        if (!cancelled) {
+          const failurePlan = planAutopilotProbeFailure(error, retryAttempt);
+          if (failurePlan.action === "stop-legacy") {
+            await releaseServerToLegacy(server, probeKey);
+          } else if (failurePlan.action === "retry") {
+            stopSpeaking();
+            setReason("服务器状态暂时无法确认，已停止媒体并自动重试");
+            retryAttempt += 1;
+            timer = window.setTimeout(poll, failurePlan.delayMs);
+          } else {
+            stopSpeaking();
+            setMode("blocked");
+            setReason(failurePlan.retryExhausted
+              ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
+              : blockedReason(error));
+          }
+        }
+        return;
+      }
+      if (!cancelled) timer = window.setTimeout(poll, 1_500);
+    };
+    timer = window.setTimeout(poll, 1_500);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [visibleMode, server, mediaAllowed, input.sessionId, probeAllowed, probeKey,
+    releaseServerToLegacy]);
+
+  useEffect(() => {
+    const context = serverContextRef.current;
+    if (!mediaAllowed || !context || !input.sessionId) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    let controller: PatientAutopilotController | null = null;
+    void (async () => {
+      // Bootstrap itself is fenced as a passive delivery operation. If the
+      // gate flips again while /next or capture recovery is in flight, owner
+      // release and the next controller both wait for this exact operation.
+      const restored = await context.fence.runPassive(async () => {
+        if (cancelled) return null;
+        return loadServerRuntime(input.sessionId as string, context.delivery);
+      });
+      if (cancelled || restored === null) return;
+      setServer((before) => before?.delivery === context.delivery
+        ? { ...before, current: restored.current, runtime: restored.runtime } : before);
+      controller = new PatientAutopilotController({
+        sessionId: input.sessionId as string,
+        transport: autopilotHttpTransport,
+        speech: new BrowserAutopilotSpeechExecutor(input.sessionId as string),
+        recording: new BrowserAutopilotRecordingExecutor(input.sessionId as string),
+        ackDelivery: context.delivery,
+        initialCommand: restored.current,
+        waitForPresentation: (command, signal) => (
+          assetGateRef.current as PatientAssetMediaGate
+        ).waitFor(command, signal),
+        onState: (runtime) => {
+          if (!cancelled) setServer((before) => before?.delivery === context.delivery
+            ? { ...before, current: runtime.command, runtime } : before);
+        },
+      });
+      context.controller = controller;
+      controllerRef.current = controller;
+      const tick = async () => {
+        const runtime = await (controller as PatientAutopilotController).pollOnce();
+        if (cancelled || runtime.phase === "paused" || runtime.phase === "scope_completed") return;
+        timer = window.setTimeout(tick, 900);
+      };
+      void tick();
+    })().catch((error: unknown) => {
+      if (cancelled) return;
+      const failurePlan = planAutopilotProbeFailure(
+        error, probeRetryAttempt.current);
+      if (failurePlan.action === "stop-legacy") {
+        void releaseServerToLegacy(context, probeKey);
+      } else if (failurePlan.action === "retry") {
+        stopSpeaking();
+        setMode("probing");
+        setResolvedProbeKey("");
+        setReason("正在重新核对服务器控制权");
+        probeRetryAttempt.current += 1;
+        timer = window.setTimeout(
+          () => setProbeEpoch((value) => value + 1),
+          failurePlan.delayMs,
+        );
+      } else {
+        probeRetryAttempt.current = 0;
+        stopSpeaking();
+        setMode("blocked");
+        setReason(failurePlan.retryExhausted
+          ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
+          : blockedReason(error));
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      const active = controller;
+      if (!active) return;
+      if (controllerRef.current === active) controllerRef.current = null;
+      if (context.controller === active) context.controller = null;
+      context.fence.registerControllerShutdown(active.stopAndWait());
+    };
+  }, [mediaAllowed, server?.delivery, input.sessionId, probeKey, releaseServerToLegacy]);
+
+  // Releasing server ownership requires more than projecting "paused" onto the
+  // screen.  Wait until the exact local controller has closed Audio/MediaRecorder,
+  // finished any durable capture staging and released its device lease, then let
+  // the paired device append one command-bound drain proof. The account takeover
+  // endpoint remains locked until this proof exists.
+  useEffect(() => {
+    const context = serverContextRef.current;
+    if (!input.sessionPaused || input.sessionTerminal || visibleMode !== "server" || !context
+        || !input.sessionId) return;
+    let cancelled = false;
+    let retryTimer: number | null = null;
+    let retryAttempt = 0;
+    let requestAbort: AbortController | null = null;
+
+    const report = async () => {
+      let provenCommandKey: string | null = null;
+      const active = context.controller;
+      let shutdown: Promise<void> | null = null;
+      if (active) {
+        context.controller = null;
+        if (controllerRef.current === active) controllerRef.current = null;
+        shutdown = active.stopAndWait();
+      }
+      try {
+        await acknowledgeDrainAfterShutdown({
+          fence: context.fence,
+          shutdown,
+          acknowledge: async () => {
+            if (cancelled) return;
+            requestAbort = new AbortController();
+            const target = await fetchExactAutopilotDrainTarget(
+              input.sessionId as string,
+              requestAbort.signal,
+              browserAutopilotMediaDependencies,
+            );
+            if (context.drainedCommandKey === target.command_key) return;
+            provenCommandKey = target.command_key;
+            const receipt = await acknowledgeExactAutopilotDrain(
+              input.sessionId as string,
+              target.command_key,
+              requestAbort.signal,
+              browserAutopilotMediaDependencies,
+            );
+            assertExactDrainTransition(target, receipt);
+          },
+        });
+        if (cancelled) return;
+        if (provenCommandKey) context.drainedCommandKey = provenCommandKey;
+        setServer((before) => before?.delivery === context.delivery
+          ? { ...before } : before);
+      } catch (error) {
+        if (cancelled) return;
+        const disposition = classifyAutopilotDrainFailure(error);
+        if (disposition === "released") {
+          // A concurrent, already-audited takeover won; the next ownership probe
+          // will unmount this server runner. Never revive or re-report old media.
+          await releaseServerToLegacy(context, probeKey);
+          return;
+        }
+        if (disposition === "repair-credential") {
+          stopSpeaking();
+          setMode("probing");
+          setReason("老人端设备凭据已失效，请研究者重新配对");
+          window.dispatchEvent(new Event(DEVICE_PAIR_REQUIRED_EVENT));
+          return;
+        }
+        if (disposition === "blocked") {
+          stopSpeaking();
+          setMode("blocked");
+          setReason("收麦证据与服务器状态不一致，已停止重试并等待研究者处置");
+          return;
+        }
+        const delay = drainRetryDelayMs(retryAttempt);
+        retryAttempt += 1;
+        retryTimer = window.setTimeout(() => { void report(); }, delay);
+      }
+    };
+    void report();
+    return () => {
+      cancelled = true;
+      requestAbort?.abort(new DOMException("收麦回执已取消", "AbortError"));
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [input.sessionPaused, input.sessionTerminal, input.sessionId, server?.delivery, visibleMode,
+    probeKey, releaseServerToLegacy]);
+
+  return {
+    mode: visibleMode,
+    runtime: server?.runtime ?? null,
+    current: server?.current ?? null,
+    reason: visibleMode === "server" && !input.ttsOn
+      ? "自动流程需要显式开启语音后才能继续"
+      : reason,
+    assetReadiness,
+    reportAssetReadiness,
+    stopMediaNow: () => controllerRef.current?.stop(),
+    stopRecordingNow: () => controllerRef.current?.stopRecordingNow(),
+  };
+}

@@ -7,10 +7,11 @@ import { useToast } from "../../components/ToastContext";
 import { useWeek1Script } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
 import { useSessionRuntime } from "../../hooks/useSessionRuntime";
-import { flushLiveWrites, useAudioSaved, useCursorWriter, useSaveWatchdog } from "../../sync/useCursorWriter";
-import type { RecState } from "../../sync/messages";
+import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
+import { isPatientRecFailure, type RecState } from "../../sync/messages";
 import type { Session } from "../../types";
 import { SessionControlBar } from "../SessionControlBar";
+import { SessionAbortControl } from "../SessionAbortControl";
 
 function defaultRapportFlags(sectionKey: string): { assentGate: boolean; containsDirectIdentifier: boolean } {
   return {
@@ -23,14 +24,22 @@ function defaultRapportFlags(sectionKey: string): { assentGate: boolean; contain
 // 逐节/逐问广播 rapportStep 推进老人端;录音同训练屏 arm/stop 模式(老人端 VOX 实采字节)。
 // 自我介绍段 containsDirectIdentifier=true 随消息带到老人端登记(导出侧整段红线)。
 // speaker="研究者" 的节是当面话术:老人端不朗读,此处只给研究者看提词。
-export function RelationshipConsoleScreen({ session, onWrapup }: { session: Session; onWrapup: () => void }) {
+export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
+  session: Session;
+  onWrapup: () => void;
+  onExit?: () => void;
+}) {
   const toast = useToast();
   const { script, error: scriptError } = useWeek1Script();
-  const { postSession, postRapport, resetSession, syncError, retrySync } = useCursorWriter(session.session_id);
+  const {
+    postSession, postRapport, beginSafetyPause, releaseSafetyPause,
+    resetSession, syncError, retrySync,
+  } = useCursorWriter(session.session_id);
   const { journal, upsertAudio, hydrateFromServer } = useSessionJournal(session.session_id);
   const runtimeControl = useSessionRuntime(session.session_id);
   const paused = runtimeControl.paused;
   const [pausePending, setPausePending] = useState(false);
+  const [wrapupPending, setWrapupPending] = useState(false);
   const [sectionIdx, setSectionIdx] = useState(0);
   const [qIdx, setQIdx] = useState(0);
   const [recoveredLabel, setRecoveredLabel] = useState<string | null>(null);
@@ -42,8 +51,12 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
   const recoveredOnce = useRef(false);
   const handshakeSent = useRef(false);
   const [recState, setRecState] = useState<RecState>("idle");
-  // 与正式训练共用录音资格护栏：明确 false 永不下发 arm；未评沿用当前“提示但不拦截”口径。
-  const [recStatus, setRecStatus] = useState<"loading" | "error" | "denied" | "allowed" | "unrated">("loading");
+  const patientRec = usePatientRec(session.session_id);
+  const patientDeviceFailure = isPatientRecFailure(patientRec)
+    && patientRec.sessionId === session.session_id ? patientRec : null;
+  // 与正式训练共用录音资格护栏：真实研究只接受明确允许；显式模拟场次才可用未评状态。
+  const [recStatus, setRecStatus] = useState<"loading" | "error" | "denied" | "allowed">("loading");
+  const recordingEligible = recStatus === "allowed";
   const [recRetry, setRecRetry] = useState(0);
   const section = script?.sections[sectionIdx];
   const isSelfIntro = section?.key === "自我介绍";
@@ -58,20 +71,37 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
   // 若按"是否当前节"判清,保存成功也弹假警报。
   const watchdogFor = useRef<string | null>(null);
   const lastArmedKey = useRef<string | null>(null);
+  const handledDeviceFailureId = useRef<string | null>(null);
   const armWatchdog = (k: string | null) => { watchdogFor.current = k; watchdog.start(); };
 
   useEffect(() => {
-    setRecStatus("loading");
-    api.getPatient(session.patient_id)
-      .then((pt) => setRecStatus(pt.recording_allowed === false ? "denied" : pt.recording_allowed === true ? "allowed" : "unrated"))
-      .catch(() => setRecStatus("error"));
-  }, [session.patient_id, recRetry]);
+    let cancelled = false;
+    let inFlight = false;
+    const check = (foreground: boolean) => {
+      if (inFlight) return;
+      inFlight = true;
+      if (foreground) setRecStatus("loading");
+      api.recordingAuthorization(session.session_id)
+        .then((authorization) => {
+          if (!cancelled) setRecStatus(authorization.allowed === true && authorization.runtime_status === "active" ? "allowed" : "denied");
+        })
+        .catch((error) => {
+          if (!cancelled) setRecStatus(error instanceof ApiError && error.status >= 400 && error.status < 500 ? "denied" : "error");
+        })
+        .finally(() => { inFlight = false; });
+    };
+    check(true);
+    const timer = window.setInterval(() => check(false), 5_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [session.session_id, recRetry]);
 
   const recoveryLoading = runtimeControl.loading || journalLoading;
   const recoveryError = runtimeControl.error ?? journalRecoveryError ?? syncError;
   const runtimeReady = runtimeControl.runtime?.sessionId === session.session_id;
   const recoveryPending = recoveryLoading || (!recoveryError && (!runtimeReady || !recoveryApplied));
-  const interactionBlocked = paused || pausePending || recoveryPending || Boolean(recoveryError);
+  const terminal = runtimeControl.terminal;
+  const interactionBlocked = terminal || paused || pausePending || wrapupPending || recoveryPending
+    || Boolean(recoveryError) || Boolean(patientDeviceFailure);
   const retryRecovery = () => {
     setJournalRetry((n) => n + 1);
     void runtimeControl.refresh();
@@ -144,6 +174,41 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
     handshakeSent.current = true;
   }, [interactionBlocked, postRapport, postSession, qIdx, rapportFlags, script, sectionIdx, session]);
 
+  useEffect(() => {
+    if (!script || interactionBlocked || recordingEligible) return;
+    if (recState !== "idle") armWatchdog(lastArmedKey.current);
+    setRecState("idle");
+    postRapport({
+      sectionKey: section?.key ?? "",
+      questionIdx: qIdx,
+      recording: "idle",
+      recSeq: recSeq.current,
+      ...rapportFlags,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recStatus, interactionBlocked]);
+
+  useEffect(() => {
+    if (!terminal) return;
+    watchdog.clear();
+    watchdogFor.current = null;
+    setRecState("idle");
+    // 服务器已把终态投影为 idle/done，不再向只读场次补发旧 rapport。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [terminal]);
+
+  // 权威设备失败已经由服务器原子暂停 runtime；关系建立无判分链，本机只清录音
+  // 按钮/看门狗并冻结导航，不补写任何临床事件或推进指令。
+  useEffect(() => {
+    if (!patientDeviceFailure || handledDeviceFailureId.current === patientDeviceFailure.failureId) return;
+    handledDeviceFailureId.current = patientDeviceFailure.failureId;
+    watchdog.clear();
+    watchdogFor.current = null;
+    setRecState("idle");
+    toast("设备失败，场次已安全暂停。当前对话位置保持不变。", "danger");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [patientDeviceFailure?.failureId]);
+
   // 卸载/换场次无条件收回 rapport 录音指令；即使本地 state 已不同步，也不留下 armed 热麦。
   const withdrawRef = useRef<() => void>(() => {});
   withdrawRef.current = () => {
@@ -204,8 +269,8 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
 
   const armRecording = () => {
     if (interactionBlocked) return;
-    if (recStatus !== "allowed" && recStatus !== "unrated") {
-      toast(recStatus === "denied" ? "该受试者档案明确不允许录音" : "录音资格尚未确认，请稍候或重试", "warn");
+    if (!recordingEligible) {
+      toast(recStatus === "denied" ? "服务器当前未授权本场录音" : "录音授权尚未确认，系统保持关麦", "warn");
       return;
     }
     recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
@@ -232,18 +297,11 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
 
   async function pauseRapport() {
     if (pausePending || paused) return;
+    beginSafetyPause();
     setPausePending(true);
     if (recState !== "idle") armWatchdog(lastArmedKey.current);
-    if (section?.key) {
-      // 同机 bus 先收麦，不让患者端等待 pause HTTP 往返。
-      postRapport({ sectionKey: section.key, questionIdx: qIdx, recording: "idle",
-                    recSeq: recSeq.current, ...rapportFlags });
-    }
     setRecState("idle");
     try {
-      // 先排空已入队的 live 写再发 pause,否则 pause 先落地会把排队中的收麦
-      // rapport 写 409 掉,控制条锁死在"重新同步"循环(与训练屏同根)。
-      await flushLiveWrites();
       const next = await runtimeControl.pause();
       if (next) toast("关系建立已暂停，患者端麦克风保持关闭", "ok");
     } finally {
@@ -253,7 +311,30 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
 
   async function resumeRapport() {
     const next = await runtimeControl.resume();
-    if (next) toast("已恢复到暂停前的对话位置", "ok");
+    if (next) {
+      releaseSafetyPause();
+      toast("已恢复到暂停前的对话位置", "ok");
+    }
+  }
+
+  async function enterWrapup() {
+    if (wrapupPending || interactionBlocked || !section) return;
+    setWrapupPending(true);
+    if (recState !== "idle") armWatchdog(lastArmedKey.current ?? `关系建立·${section.key}`);
+    const accepted = await postRapport({
+      sectionKey: section.key,
+      questionIdx: qIdx,
+      recording: "idle",
+      recSeq: recSeq.current,
+      ...rapportFlags,
+    });
+    if (!accepted) {
+      toast("服务器尚未确认收麦，本场仍停留在关系建立页，请重试同步。", "danger");
+      setWrapupPending(false);
+      return;
+    }
+    setRecState("idle");
+    onWrapup();
   }
 
   return (
@@ -265,12 +346,22 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
           <p className="page-description">按固定脚本与受试者进行轻松对话。本流程不判分，研究者只控制话术推进与合规录音。</p>
         </div>
         {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
-        <Button disabled={interactionBlocked} onClick={() => { if (recState !== "idle") stopRecording(); onWrapup(); }}>进入场次收尾</Button>
+        <Button disabled={interactionBlocked} onClick={() => { void enterWrapup(); }}>
+          {wrapupPending ? "正在确认收麦…" : "进入场次收尾"}
+        </Button>
       </header>
 
-      <SessionControlBar paused={paused} loading={recoveryPending} busy={runtimeControl.busy || pausePending}
+      <SessionControlBar paused={paused} loading={recoveryPending} busy={runtimeControl.busy || pausePending || wrapupPending}
+        terminalStatus={runtimeControl.terminalStatus} onExit={onExit}
         recoveredLabel={recoveredLabel} error={recoveryError} onRetry={retryRecovery}
         onPause={() => void pauseRapport()} onResume={() => void resumeRapport()} />
+
+      <div className="form-actions" style={{ justifyContent: "flex-end" }}>
+        <SessionAbortControl sessionId={session.session_id}
+          expectedRevision={runtimeControl.runtime?.revision ?? null}
+          disabled={recoveryPending || runtimeControl.busy || pausePending || wrapupPending || terminal}
+          onAborted={() => onWrapup()} />
+      </div>
 
       <section className={`form-section rapport-console-card${interactionBlocked ? " session-paused-surface" : ""}`}>
         <div className="form-section-header">
@@ -303,8 +394,15 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
         )}
         {isSelfIntro && <Alert tone="warn" title="本段录音可能包含直接身份信息">如启动录音，整段会被标记为含直接标识，并在导出时进入受控处理。</Alert>}
 
+        {patientDeviceFailure && (
+          <Alert tone="danger" title="设备失败，场次已安全暂停">
+            老人端麦克风未能安全启动。系统已关闭录音入口并保持当前对话位置；
+            本次技术失败不会生成临床错误记录，也不会推进到下一问。
+          </Alert>
+        )}
+
         {recStatus === "denied" && (
-          <Alert tone="danger" title="本场录音已禁用">受试者档案明确拒绝录音。本次关系建立只能进行现场对话和听记。</Alert>
+          <Alert tone="danger" title="本场录音已禁用">服务器当前未授权录音（可能是同意、撤回、准入或场次状态变化）。麦克风已收回。</Alert>
         )}
         {recStatus === "loading" && <StatusPill tone="muted">正在核对录音资格…</StatusPill>}
         {recStatus === "error" && (
@@ -312,10 +410,11 @@ export function RelationshipConsoleScreen({ session, onWrapup }: { session: Sess
         )}
 
         <div className="recording-panel">
+          {patientDeviceFailure && <StatusPill tone="danger">设备失败 · 录音入口已关闭</StatusPill>}
           {paused && <StatusPill tone="warn">场次暂停中，患者端麦克风保持关闭</StatusPill>}
           {recoveryPending && <StatusPill tone="muted">正在恢复已保存记录</StatusPill>}
           {recoveryError && <StatusPill tone="danger">等待重新同步场次</StatusPill>}
-          {!interactionBlocked && (recStatus === "allowed" || recStatus === "unrated") && (recState === "idle"
+          {!interactionBlocked && recordingEligible && (recState === "idle"
             ? <Button variant="primary" onClick={armRecording}>开始受试者端录音{isSelfIntro ? "（含标识）" : ""}</Button>
             : <Button variant="danger" onClick={stopRecording}>停止受试者端录音</Button>)}
           {recState !== "idle" && <StatusPill tone="danger">正在等待受试者端保存</StatusPill>}

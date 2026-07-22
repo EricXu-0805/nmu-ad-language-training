@@ -1,3 +1,6 @@
+from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 
 import pytest
@@ -6,9 +9,9 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine as sa_create_engine, inspect, text
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import models  # noqa: F401 —— 注册全部表
+from app import auth, content, db, main as main_mod, models  # noqa: F401 —— 注册全部表
 from app.db import get_session
 from app.main import app
 
@@ -18,8 +21,9 @@ _HANDSHAKE_WSEQ = 0
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    monkeypatch.setattr(db, "engine", eng)
     SQLModel.metadata.create_all(eng)
 
     def override():
@@ -27,12 +31,16 @@ def client():
             yield s
 
     app.dependency_overrides[get_session] = override
-    yield TestClient(app)
+    test_client = TestClient(app)
+    test_client.test_engine = eng
+    yield test_client
     app.dependency_overrides.clear()
 
 
 def _patient(client, patient_id: str, recording_allowed: bool | None = True, headers=None):
-    body = {"patient_id": patient_id}
+    body = {"patient_id": patient_id, "consent_status": "已同意",
+            "consent_type": "本人同意", "mandarin_eligible": True,
+            "is_simulation_subject": True}
     if recording_allowed is not None:
         body["recording_allowed"] = recording_allowed
     assert client.post("/patients", json=body, headers=headers).status_code == 200
@@ -46,8 +54,49 @@ def _training_session(client, session_id: str, patient_id: str, headers=None):
         "phase_type": "正式训练",
         "event_line": "正式训练",
         "item_bank_version_id": BANK_VERSION,
+        "is_simulation": True,
+        "trainer_id": "PRESENCE-REVIEWER",
     }, headers=headers)
     assert response.status_code == 200, response.text
+
+
+def _login_confirmation_reviewer(client: TestClient) -> None:
+    with Session(client.test_engine) as session:
+        session.add(models.ResearchUser(
+            username="presence-reviewer", display_id="PRESENCE-REVIEWER",
+            password_hash=auth.hash_password("password-2026"), role="researcher",
+        ))
+        session.commit()
+    assert client.post("/auth/login", json={
+        "username": "presence-reviewer", "password": "password-2026",
+    }).status_code == 200
+    client.headers.update({"X-CSRF-Token": client.cookies.get(auth.CSRF_COOKIE_NAME)})
+
+
+def _authoritative_turn(client, item_id: int):
+    assert client.post("/audio", json={
+        "raw_audio_id": "runtime-lock-audio", "session_id": "S-LOCK",
+        "turn_key": "SE_锚#1",
+    }).status_code == 200
+    assert client.put("/audio/runtime-lock-audio/blob",
+                      content=b"\x1a\x45\xdf\xa3runtime-audio",
+                      headers={"content-type": "audio/webm"}).status_code == 200
+    with Session(client.test_engine) as session:
+        session.add(models.AttemptEvent(
+            session_id="S-LOCK", item_id="SE_锚", turn_seq=1,
+            response_role="命名", attempt_seq=1,
+            raw_audio_id="runtime-lock-audio", prompt_level=0,
+            asr_text="锚", asr_confidence=.9, asr_engine_version="test-asr",
+            operational_answer_type="正确", operational_score=1,
+            operational_needs_review=False, judge_mode="规则确定式",
+            judge_engine_version="rule-test", processing_status="completed",
+            is_simulation=True,
+        ))
+        session.commit()
+    return client.post(f"/items/{item_id}/turns", json={
+        "turn_seq": 1, "response_role": "命名",
+        "raw_audio_id": "runtime-lock-audio",
+    }).json()
 
 
 def _handshake(client, session_id: str, headers=None, mode="task", wseq=None):
@@ -82,58 +131,809 @@ def _cursor(session_id: str | None = None, item_idx=0, turn_idx=0, **overrides):
     return payload
 
 
+def _presentation_cursor(client: TestClient, session_id: str, base: dict,
+                         **overrides) -> dict:
+    """Bind a bedside command to the exact live/runtime snapshot just read."""
+    live_cursor = client.get("/live/state").json()["cursor"]
+    runtime = client.get(f"/sessions/{session_id}/runtime").json()
+    payload = {**base, **overrides}
+    payload["wseq"] = live_cursor["wseq"]
+    payload["expected_revision"] = runtime["revision"]
+    return payload
+
+
+def _presentation_setup(client: TestClient, token: str, *, cue_level: int = 0):
+    patient_id = f"P-PRESENT-{token}"
+    session_id = f"S-PRESENT-{token}"
+    _patient(client, patient_id)
+    _training_session(client, session_id, patient_id)
+    plan_response = client.get(
+        f"/sessions/{session_id}/plan",
+        params={"week_no": 2, "event_line": "正式训练"},
+    )
+    assert plan_response.status_code == 200, plan_response.text
+    item = plan_response.json()["items"][0]
+    turn = item["turns"][0]
+    assert _handshake(client, session_id).status_code == 200
+    base = _cursor(
+        session_id,
+        responseRole=turn["response_role"],
+        cueLevel=cue_level,
+    )
+    current = client.put("/live/state", json={
+        "kind": "cursor", "payload": base,
+    })
+    assert current.status_code == 200, current.text
+    return session_id, item, turn, base
+
+
+def _technical_pause_body(client: TestClient, session_id: str, key: str,
+                          *, error_code: str = "client_microphone",
+                          attempt_id: int | None = None) -> dict:
+    runtime = client.get(f"/sessions/{session_id}/runtime").json()
+    live_cursor = client.get("/live/state").json()["cursor"]
+    body = {
+        "idempotency_key": key,
+        "expected_revision": runtime["revision"],
+        "expected_live_wseq": live_cursor["wseq"],
+        "error_code": error_code,
+    }
+    if attempt_id is not None:
+        body["attempt_id"] = attempt_id
+    return body
+
+
+def _completed_attempt(client: TestClient, *, session_id: str, item: dict,
+                       turn: dict, prompt_level: int = 0,
+                       attempt_seq: int = 1) -> models.AttemptEvent:
+    raw_audio_id = f"presentation-audio-{session_id}-{attempt_seq}"
+    with Session(client.test_engine) as session:
+        session.add(models.AudioAssetRow(
+            raw_audio_id=raw_audio_id,
+            session_id=session_id,
+            is_simulation=True,
+            data_classification="simulation",
+            turn_key=f'{item["item_id"]}#{turn["turn_seq"]}',
+        ))
+        attempt = models.AttemptEvent(
+            session_id=session_id,
+            item_id=item["item_id"],
+            turn_seq=turn["turn_seq"],
+            response_role=turn["response_role"],
+            attempt_seq=attempt_seq,
+            raw_audio_id=raw_audio_id,
+            prompt_level=prompt_level,
+            asr_text="测试回答",
+            asr_engine_version="test-asr",
+            operational_answer_type="正确",
+            operational_score=1,
+            operational_needs_review=False,
+            judge_mode="test",
+            judge_engine_version="test-judge",
+            processing_status="completed",
+            is_simulation=True,
+        )
+        session.add(attempt)
+        session.commit()
+        session.refresh(attempt)
+        session.expunge(attempt)
+    return attempt
+
+
+def test_cue_evidence_and_bedside_presentation_are_atomic_across_pause_and_wrapup(
+        client):
+    _patient(client, "P-CUE-ATOMIC")
+    _training_session(client, "S-CUE-ATOMIC", "P-CUE-ATOMIC")
+    plan = client.get(
+        "/sessions/S-CUE-ATOMIC/plan",
+        params={"week_no": 2, "event_line": "正式训练"},
+    ).json()
+    item = plan["items"][0]
+    turn = item["turns"][0]
+    assert _handshake(client, "S-CUE-ATOMIC").status_code == 200
+    initial_cursor = _cursor(
+        "S-CUE-ATOMIC",
+        responseRole=turn["response_role"],
+        cueLevel=0,
+    )
+    assert client.put("/live/state", json={
+        "kind": "cursor", "payload": initial_cursor,
+    }).status_code == 200
+
+    presentation_attempt = 0
+
+    def present(level: int):
+        nonlocal presentation_attempt
+        presentation_attempt += 1
+        return client.post(
+            "/sessions/S-CUE-ATOMIC/interaction-presentations",
+            json={
+                "idempotency_key": (
+                    f"cue-atomic-{presentation_attempt:04d}-level-{level}"),
+                "interaction": {
+                    "event_type": "cue_selected",
+                    "item_id": item["item_id"],
+                    "turn_seq": turn["turn_seq"],
+                    "prompt_level": level,
+                    "cue_type": f"prompt_level_{level}",
+                },
+                "cursor": _presentation_cursor(
+                    client, "S-CUE-ATOMIC", initial_cursor,
+                    cueLevel=level, recording="idle", selfStart=False),
+            },
+        )
+
+    first = present(1)
+    assert first.status_code == 200, first.text
+    assert first.json()["interaction"]["event_type"] == "cue_selected"
+    assert first.json()["cursor"]["cueLevel"] == 1
+    assert first.json()["cursor"]["wseq"] == first.json()["wseq"]
+    assert client.get("/live/state").json()["cursor"]["cueLevel"] == 1
+    runtime = client.get("/sessions/S-CUE-ATOMIC/runtime").json()
+    assert runtime["cursor"]["cueLevel"] == 1
+
+    legacy = client.post("/sessions/S-CUE-ATOMIC/interactions", json={
+        "event_type": "cue_selected",
+        "item_id": item["item_id"],
+        "turn_seq": turn["turn_seq"],
+        "prompt_level": 2,
+        "cue_type": "prompt_level_2",
+    })
+    assert legacy.status_code == 409
+    assert legacy.json()["detail"]["code"] == (
+        "interaction_presentation_atomic_required")
+
+    assert client.post("/sessions/S-CUE-ATOMIC/pause").status_code == 200
+    paused = present(2)
+    assert paused.status_code == 409
+    assert paused.json()["detail"]["code"] == (
+        "interaction_presentation_runtime_inactive")
+
+    assert client.post("/sessions/S-CUE-ATOMIC/resume").status_code == 200
+    thanks_cursor = {
+        **initial_cursor,
+        "screen": "thanks",
+        "cueLevel": 1,
+        "recording": "stopped",
+        "selfStart": False,
+    }
+    assert client.put("/live/state", json={
+        "kind": "cursor", "payload": thanks_cursor,
+    }).status_code == 200
+    after_thanks = present(2)
+    assert after_thanks.status_code == 409
+    assert after_thanks.json()["detail"]["code"] == (
+        "interaction_presentation_position_changed")
+
+    with Session(client.test_engine) as session:
+        events = list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == "S-CUE-ATOMIC")))
+        assert len(events) == 1
+        assert events[0].event_type == "cue_selected"
+
+
+def test_atomic_presentation_exact_replay_conflict_and_superseded_replay(client):
+    session_id, item, turn, base = _presentation_setup(client, "IDEMP")
+    body = {
+        "idempotency_key": "atomic-idempotency-key-0001",
+        "interaction": {
+            "event_type": "cue_selected",
+            "item_id": item["item_id"],
+            "turn_seq": turn["turn_seq"],
+            "prompt_level": 1,
+            "cue_type": "prompt_level_1",
+        },
+        "cursor": _presentation_cursor(
+            client, session_id, base, cueLevel=1),
+    }
+
+    first = client.post(
+        f"/sessions/{session_id}/interaction-presentations", json=body)
+    assert first.status_code == 200, first.text
+    first_payload = first.json()
+    assert first_payload["idempotent"] is False
+
+    replay = client.post(
+        f"/sessions/{session_id}/interaction-presentations", json=body)
+    assert replay.status_code == 200, replay.text
+    replay_payload = replay.json()
+    assert replay_payload["idempotent"] is True
+    for field in ("interaction", "cursor", "seq", "wseq", "runtimeRevision"):
+        assert replay_payload[field] == first_payload[field]
+
+    conflicting = deepcopy(body)
+    conflicting["interaction"]["cue_type"] = "different_semantic_command"
+    conflict = client.post(
+        f"/sessions/{session_id}/interaction-presentations", json=conflicting)
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["detail"]["code"] == (
+        "interaction_presentation_idempotency_conflict")
+
+    assert client.post(f"/sessions/{session_id}/pause").status_code == 200
+    superseded = client.post(
+        f"/sessions/{session_id}/interaction-presentations", json=body)
+    assert superseded.status_code == 409, superseded.text
+    assert superseded.json()["detail"]["code"] == (
+        "interaction_presentation_replay_superseded")
+
+    with Session(client.test_engine) as session:
+        events = list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id)))
+        receipts = list(session.exec(select(
+            models.InteractionPresentationReceipt).where(
+                models.InteractionPresentationReceipt.session_id == session_id)))
+    assert len(events) == len(receipts) == 1
+    assert receipts[0].interaction_event_id == events[0].id
+
+
+def test_atomic_presentation_rejects_repeated_level_three_without_writes(client):
+    session_id, item, turn, base = _presentation_setup(
+        client, "LEVEL3", cue_level=2)
+    first = client.post(
+        f"/sessions/{session_id}/interaction-presentations",
+        json={
+            "idempotency_key": "atomic-level-three-first-0001",
+            "interaction": {
+                "event_type": "cue_selected",
+                "item_id": item["item_id"],
+                "turn_seq": turn["turn_seq"],
+                "prompt_level": 3,
+                "cue_type": "prompt_level_3",
+            },
+            "cursor": _presentation_cursor(
+                client, session_id, base, cueLevel=3),
+        },
+    )
+    assert first.status_code == 200, first.text
+    before_live = client.get("/live/state").json()
+    before_runtime = client.get(f"/sessions/{session_id}/runtime").json()
+
+    repeated = client.post(
+        f"/sessions/{session_id}/interaction-presentations",
+        json={
+            "idempotency_key": "atomic-level-three-repeat-0002",
+            "interaction": {
+                "event_type": "cue_selected",
+                "item_id": item["item_id"],
+                "turn_seq": turn["turn_seq"],
+                "prompt_level": 3,
+                "cue_type": "prompt_level_3",
+            },
+            "cursor": _presentation_cursor(
+                client, session_id, base, cueLevel=3),
+        },
+    )
+    assert repeated.status_code == 409, repeated.text
+    assert repeated.json()["detail"]["code"] == (
+        "interaction_presentation_cue_not_next")
+    after_live = client.get("/live/state").json()
+    after_runtime = client.get(f"/sessions/{session_id}/runtime").json()
+    assert after_live["seq"] == before_live["seq"]
+    assert after_live["cursor"] == before_live["cursor"]
+    assert after_runtime["revision"] == before_runtime["revision"]
+    assert after_runtime["cursor"] == before_runtime["cursor"]
+
+    with Session(client.test_engine) as session:
+        assert len(list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id)))) == 1
+        assert len(list(session.exec(select(
+            models.InteractionPresentationReceipt).where(
+                models.InteractionPresentationReceipt.session_id == session_id)))) == 1
+
+
+def test_atomic_presentation_preflights_semantic_content_and_rolls_back(client):
+    session_id, item, turn, base = _presentation_setup(client, "CONTENT")
+    attempt = _completed_attempt(
+        client, session_id=session_id, item=item, turn=turn)
+    before_live = client.get("/live/state").json()
+    before_runtime = client.get(f"/sessions/{session_id}/runtime").json()
+
+    unavailable = client.post(
+        f"/sessions/{session_id}/interaction-presentations",
+        json={
+            "idempotency_key": "atomic-unrenderable-feedback-0001",
+            "interaction": {
+                "event_type": "feedback_selected",
+                "attempt_id": attempt.id,
+                # namefix is a valid protocol key, but cannot be rendered for
+                # this single-element naming item.
+                "feedback_key": "namefix_l",
+            },
+            "cursor": _presentation_cursor(
+                client, session_id, base,
+                fbKey="namefix_l", fbItemId=item["item_id"]),
+        },
+    )
+    assert unavailable.status_code == 409, unavailable.text
+    assert unavailable.json()["detail"]["code"] == (
+        "interaction_presentation_content_unavailable")
+    after_live = client.get("/live/state").json()
+    after_runtime = client.get(f"/sessions/{session_id}/runtime").json()
+    assert after_live["seq"] == before_live["seq"]
+    assert after_live["cursor"] == before_live["cursor"]
+    assert after_runtime["revision"] == before_runtime["revision"]
+    assert after_runtime["cursor"] == before_runtime["cursor"]
+    with Session(client.test_engine) as session:
+        assert list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id))) == []
+        assert list(session.exec(select(
+            models.InteractionPresentationReceipt).where(
+                models.InteractionPresentationReceipt.session_id == session_id))) == []
+
+
+def test_interaction_presentation_maps_frozen_protocol_failure_to_503(
+        client, monkeypatch, tmp_path):
+    session_id, item, turn, base = _presentation_setup(client, "CONTENT-503")
+    body = {
+        "idempotency_key": "atomic-content-unavailable-503-0001",
+        "interaction": {
+            "event_type": "cue_selected",
+            "item_id": item["item_id"],
+            "turn_seq": turn["turn_seq"],
+            "prompt_level": 1,
+            "cue_type": "prompt_level_1",
+        },
+        "cursor": _presentation_cursor(
+            client, session_id, base, cueLevel=1),
+    }
+
+    original_dir = content.CONTENT_DIR
+    (tmp_path / "item_bank_v1.json").write_bytes(
+        (original_dir / "item_bank_v1.json").read_bytes()
+    )
+    (tmp_path / "autopilot_protocol_v1.json").write_text(
+        '{"protocol_version_id":', encoding="utf-8"
+    )
+    monkeypatch.setattr(content, "CONTENT_DIR", tmp_path)
+
+    safe = TestClient(app, raise_server_exceptions=False)
+    try:
+        response = safe.post(
+            f"/sessions/{session_id}/interaction-presentations", json=body)
+    finally:
+        safe.close()
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "frozen_content_unavailable"
+    assert str(tmp_path) not in response.text
+    assert "Traceback" not in response.text
+
+    with Session(client.test_engine) as session:
+        assert not list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id)))
+        assert not list(session.exec(select(
+            models.InteractionPresentationReceipt).where(
+                models.InteractionPresentationReceipt.session_id == session_id)))
+
+
+def test_feedback_sequence_is_server_owned_and_attempt_has_one_branch(client):
+    session_id, item, turn, base = _presentation_setup(client, "FEEDBACK")
+    attempt = _completed_attempt(
+        client, session_id=session_id, item=item, turn=turn)
+    body = {
+        "idempotency_key": "atomic-feedback-server-seq-0001",
+        "interaction": {
+            "event_type": "feedback_selected",
+            "attempt_id": attempt.id,
+            "feedback_key": "self",
+        },
+        "cursor": _presentation_cursor(
+            client, session_id, base,
+            fbKey="self", fbItemId=item["item_id"]),
+    }
+    spoofed_sequence = deepcopy(body)
+    spoofed_sequence["idempotency_key"] = "atomic-feedback-spoofed-seq-0000"
+    spoofed_sequence["cursor"]["fbSeq"] = 999_999
+    rejected = client.post(
+        f"/sessions/{session_id}/interaction-presentations",
+        json=spoofed_sequence)
+    assert rejected.status_code == 422, rejected.text
+
+    first = client.post(
+        f"/sessions/{session_id}/interaction-presentations", json=body)
+    assert first.status_code == 200, first.text
+    assert first.json()["idempotent"] is False
+    assert first.json()["cursor"]["fbSeq"] == first.json()["wseq"]
+
+    replay = client.post(
+        f"/sessions/{session_id}/interaction-presentations", json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["idempotent"] is True
+    assert replay.json()["interaction"]["id"] == first.json()["interaction"]["id"]
+
+    second_branch = client.post(
+        f"/sessions/{session_id}/interaction-presentations",
+        json={
+            "idempotency_key": "atomic-feedback-second-branch-0002",
+            "interaction": {
+                "event_type": "feedback_selected",
+                "attempt_id": attempt.id,
+                "feedback_key": "cued1_unknown",
+            },
+            "cursor": _presentation_cursor(
+                client, session_id, base,
+                fbKey="cued1_unknown", fbItemId=item["item_id"]),
+        },
+    )
+    assert second_branch.status_code == 409, second_branch.text
+    assert second_branch.json()["detail"]["code"] == (
+        "interaction_presentation_attempt_already_resolved")
+    with Session(client.test_engine) as session:
+        events = list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.attempt_id == attempt.id)))
+        receipts = list(session.exec(select(
+            models.InteractionPresentationReceipt).where(
+                models.InteractionPresentationReceipt.attempt_id == attempt.id)))
+    assert len(events) == len(receipts) == 1
+
+
+def test_atomic_presentation_requires_snapshot_and_rejects_stale_cas(client):
+    session_id, item, turn, base = _presentation_setup(client, "CAS")
+    valid = {
+        "idempotency_key": "atomic-required-snapshot-0001",
+        "interaction": {
+            "event_type": "cue_selected",
+            "item_id": item["item_id"],
+            "turn_seq": turn["turn_seq"],
+            "prompt_level": 1,
+            "cue_type": "prompt_level_1",
+        },
+        "cursor": _presentation_cursor(
+            client, session_id, base, cueLevel=1),
+    }
+    missing_key = deepcopy(valid)
+    missing_key.pop("idempotency_key")
+    missing_revision = deepcopy(valid)
+    missing_revision["cursor"].pop("expected_revision")
+    missing_wseq = deepcopy(valid)
+    missing_wseq["cursor"].pop("wseq")
+    for malformed in (missing_key, missing_revision, missing_wseq):
+        response = client.post(
+            f"/sessions/{session_id}/interaction-presentations", json=malformed)
+        assert response.status_code == 422, response.text
+
+    advanced = client.put("/live/state", json={
+        "kind": "cursor", "payload": base,
+    })
+    assert advanced.status_code == 200, advanced.text
+    stale_revision = client.post(
+        f"/sessions/{session_id}/interaction-presentations", json=valid)
+    assert stale_revision.status_code == 409, stale_revision.text
+    assert stale_revision.json()["detail"]["code"] == (
+        "interaction_presentation_revision_changed")
+
+    bad_wseq = deepcopy(valid)
+    bad_wseq["idempotency_key"] = "atomic-stale-wseq-snapshot-0002"
+    bad_wseq["cursor"] = _presentation_cursor(
+        client, session_id, base, cueLevel=1)
+    bad_wseq["cursor"]["wseq"] -= 1
+    stale_wseq = client.post(
+        f"/sessions/{session_id}/interaction-presentations", json=bad_wseq)
+    assert stale_wseq.status_code == 409, stale_wseq.text
+    assert stale_wseq.json()["detail"]["code"] == (
+        "interaction_presentation_wseq_changed")
+    with Session(client.test_engine) as session:
+        assert list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id))) == []
+        assert list(session.exec(select(
+            models.InteractionPresentationReceipt).where(
+                models.InteractionPresentationReceipt.session_id == session_id))) == []
+
+
+def test_atomic_presentation_concurrent_cas_commits_one_command(client):
+    session_id, item, turn, base = _presentation_setup(client, "RACE")
+    cursor = _presentation_cursor(client, session_id, base, cueLevel=1)
+
+    def body(key: str) -> dict:
+        return {
+            "idempotency_key": key,
+            "interaction": {
+                "event_type": "cue_selected",
+                "item_id": item["item_id"],
+                "turn_seq": turn["turn_seq"],
+                "prompt_level": 1,
+                "cue_type": "prompt_level_1",
+            },
+            "cursor": deepcopy(cursor),
+        }
+
+    requests = (
+        body("atomic-concurrent-command-a-0001"),
+        body("atomic-concurrent-command-b-0002"),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(
+            lambda payload: client.post(
+                f"/sessions/{session_id}/interaction-presentations",
+                json=payload),
+            requests,
+        ))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    winner = next(response for response in responses if response.status_code == 200)
+    loser = next(response for response in responses if response.status_code == 409)
+    assert winner.json()["idempotent"] is False
+    assert loser.json()["detail"]["code"] in {
+        "interaction_presentation_revision_changed",
+        "interaction_presentation_wseq_changed",
+    }
+    with Session(client.test_engine) as session:
+        events = list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id)))
+        receipts = list(session.exec(select(
+            models.InteractionPresentationReceipt).where(
+                models.InteractionPresentationReceipt.session_id == session_id)))
+    assert len(events) == len(receipts) == 1
+
+
+def test_atomic_technical_pause_commits_stop_evidence_and_exact_receipt(client):
+    session_id, item, turn, _base = _presentation_setup(client, "TECH-STOP")
+    body = _technical_pause_body(
+        client, session_id, "technical-pause-exact-replay-0001")
+
+    first = client.post(
+        f"/sessions/{session_id}/technical-pause", json=body)
+    assert first.status_code == 200, first.text
+    payload = first.json()
+    assert payload["idempotent"] is False
+    assert payload["runtime"]["status"] == "paused"
+    assert payload["runtimeRevision"] == payload["runtime"]["revision"]
+    assert payload["cursor"]["screen"] == "paused"
+    assert payload["cursor"]["recording"] == "stopped"
+    assert payload["cursor"]["wseq"] == payload["wseq"]
+    assert payload["interaction"]["event_type"] == "technical_pause"
+    assert payload["interaction"]["item_id"] == item["item_id"]
+    assert payload["interaction"]["turn_seq"] == turn["turn_seq"]
+    assert payload["interaction"]["payload_json"] == (
+        '{"error_code":"client_microphone"}')
+
+    replay = client.post(
+        f"/sessions/{session_id}/technical-pause", json=body)
+    assert replay.status_code == 200, replay.text
+    replay_payload = replay.json()
+    assert replay_payload["idempotent"] is True
+    for field in (
+            "interaction", "runtime", "cursor", "seq", "wseq",
+            "runtimeRevision"):
+        assert replay_payload[field] == payload[field]
+
+    conflicting = {**body, "error_code": "client_audio"}
+    conflict = client.post(
+        f"/sessions/{session_id}/technical-pause", json=conflicting)
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["detail"]["code"] == (
+        "technical_pause_idempotency_conflict")
+
+    assert client.post(f"/sessions/{session_id}/resume").status_code == 200
+    superseded = client.post(
+        f"/sessions/{session_id}/technical-pause", json=body)
+    assert superseded.status_code == 409, superseded.text
+    assert superseded.json()["detail"]["code"] == (
+        "technical_pause_replay_superseded")
+
+    legacy = client.post(f"/sessions/{session_id}/interactions", json={
+        "event_type": "technical_pause",
+        "error_code": "legacy_split_pause",
+    })
+    assert legacy.status_code == 409, legacy.text
+    assert legacy.json()["detail"]["code"] == (
+        "technical_pause_atomic_required")
+    with Session(client.test_engine) as session:
+        events = list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id)))
+        receipts = list(session.exec(select(models.TechnicalPauseReceipt).where(
+            models.TechnicalPauseReceipt.session_id == session_id)))
+    assert len(events) == len(receipts) == 1
+    assert receipts[0].interaction_event_id == events[0].id
+
+
+def test_atomic_technical_pause_rolls_back_event_attempt_fence_and_stop(
+        client, monkeypatch):
+    session_id, item, turn, _base = _presentation_setup(client, "TECH-ROLLBACK")
+    raw_audio_id = "technical-pause-rollback-audio"
+    with Session(client.test_engine) as session:
+        session.add(models.AudioAssetRow(
+            raw_audio_id=raw_audio_id,
+            session_id=session_id,
+            is_simulation=True,
+            data_classification="simulation",
+            turn_key=f'{item["item_id"]}#{turn["turn_seq"]}',
+        ))
+        attempt = models.AttemptEvent(
+            session_id=session_id,
+            item_id=item["item_id"],
+            turn_seq=turn["turn_seq"],
+            response_role=turn["response_role"],
+            attempt_seq=1,
+            raw_audio_id=raw_audio_id,
+            prompt_level=0,
+            processing_status="received",
+            processing_owner="slow-worker",
+            processing_generation=4,
+            is_simulation=True,
+        )
+        session.add(attempt)
+        session.commit()
+        session.refresh(attempt)
+        attempt_id = attempt.id
+    before_live = client.get("/live/state").json()
+    before_runtime = client.get(f"/sessions/{session_id}/runtime").json()
+    body = _technical_pause_body(
+        client, session_id, "technical-pause-rollback-0001",
+        attempt_id=attempt_id)
+
+    def fail_runtime_pause(*_args, **_kwargs):
+        raise RuntimeError("injected atomic technical pause failure")
+
+    monkeypatch.setattr(
+        main_mod, "_pause_runtime_in_transaction", fail_runtime_pause)
+    with pytest.raises(
+            RuntimeError, match="injected atomic technical pause failure"):
+        client.post(f"/sessions/{session_id}/technical-pause", json=body)
+
+    after_live = client.get("/live/state").json()
+    after_runtime = client.get(f"/sessions/{session_id}/runtime").json()
+    assert after_live["seq"] == before_live["seq"]
+    assert after_live["cursor"] == before_live["cursor"]
+    assert after_runtime == before_runtime
+    with Session(client.test_engine) as session:
+        stored_attempt = session.get(models.AttemptEvent, attempt_id)
+        assert stored_attempt is not None
+        assert stored_attempt.processing_owner == "slow-worker"
+        assert stored_attempt.processing_generation == 4
+        assert list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id))) == []
+        assert list(session.exec(select(models.TechnicalPauseReceipt).where(
+            models.TechnicalPauseReceipt.session_id == session_id))) == []
+
+
+def test_atomic_technical_pause_rejects_missing_and_stale_snapshots_without_writes(
+        client):
+    session_id, _item, _turn, base = _presentation_setup(client, "TECH-CAS")
+    valid = _technical_pause_body(
+        client, session_id, "technical-pause-cas-required-0001")
+    for field in ("idempotency_key", "expected_revision", "expected_live_wseq"):
+        malformed = dict(valid)
+        malformed.pop(field)
+        response = client.post(
+            f"/sessions/{session_id}/technical-pause", json=malformed)
+        assert response.status_code == 422, response.text
+
+    advanced = client.put("/live/state", json={
+        "kind": "cursor", "payload": base,
+    })
+    assert advanced.status_code == 200, advanced.text
+    stale_revision = client.post(
+        f"/sessions/{session_id}/technical-pause", json=valid)
+    assert stale_revision.status_code == 409, stale_revision.text
+    assert stale_revision.json()["detail"]["code"] == (
+        "technical_pause_revision_changed")
+
+    current = _technical_pause_body(
+        client, session_id, "technical-pause-stale-wseq-0002")
+    current["expected_live_wseq"] -= 1
+    stale_wseq = client.post(
+        f"/sessions/{session_id}/technical-pause", json=current)
+    assert stale_wseq.status_code == 409, stale_wseq.text
+    assert stale_wseq.json()["detail"]["code"] == (
+        "technical_pause_wseq_changed")
+
+    # Same wseq/item/turn is not sufficient when a damaged runtime row carries
+    # a different semantic cursor (cue level, role, recording, recSeq, etc.).
+    with Session(client.test_engine) as session:
+        runtime_row = session.get(models.SessionRuntimeState, session_id)
+        assert runtime_row is not None and runtime_row.cursor_json is not None
+        damaged_cursor = json.loads(runtime_row.cursor_json)
+        damaged_cursor["cueLevel"] = 2
+        runtime_row.cursor_json = json.dumps(
+            damaged_cursor, ensure_ascii=False)
+        session.add(runtime_row)
+        session.commit()
+    divergent = _technical_pause_body(
+        client, session_id, "technical-pause-diverged-cursor-0003")
+    diverged_response = client.post(
+        f"/sessions/{session_id}/technical-pause", json=divergent)
+    assert diverged_response.status_code == 409, diverged_response.text
+    assert diverged_response.json()["detail"]["code"] == (
+        "technical_pause_snapshot_diverged")
+    with Session(client.test_engine) as session:
+        assert list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id))) == []
+        assert list(session.exec(select(models.TechnicalPauseReceipt).where(
+            models.TechnicalPauseReceipt.session_id == session_id))) == []
+
+
+def test_atomic_technical_pause_concurrent_snapshot_commits_once(client):
+    session_id, _item, _turn, _base = _presentation_setup(client, "TECH-RACE")
+    snapshot = _technical_pause_body(
+        client, session_id, "technical-pause-race-command-a-0001")
+    requests = (
+        snapshot,
+        {
+            **snapshot,
+            "idempotency_key": "technical-pause-race-command-b-0002",
+        },
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(
+            lambda payload: client.post(
+                f"/sessions/{session_id}/technical-pause", json=payload),
+            requests,
+        ))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    loser = next(response for response in responses if response.status_code == 409)
+    assert loser.json()["detail"]["code"] in {
+        "technical_pause_runtime_inactive",
+        "technical_pause_revision_changed",
+        "technical_pause_wseq_changed",
+        "technical_pause_snapshot_already_committed",
+    }
+    with Session(client.test_engine) as session:
+        events = list(session.exec(select(models.InteractionEvent).where(
+            models.InteractionEvent.session_id == session_id)))
+        receipts = list(session.exec(select(models.TechnicalPauseReceipt).where(
+            models.TechnicalPauseReceipt.session_id == session_id)))
+    assert len(events) == len(receipts) == 1
+
+
 def test_patient_heartbeat_is_minimal_pin_protected_and_does_not_advance_command_seq(
         client, monkeypatch):
     pin = {"X-Console-Pin": "246810"}
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
-    _patient(client, "P-HB", headers=pin)
-    _training_session(client, "S-HB", "P-HB", headers=pin)
-    handshake = _handshake(client, "S-HB", headers=pin, wseq=100)
+    # 研究者在开启独立老人端认证前已建好档案/场次并下发握手。
+    _patient(client, "P-HB")
+    _training_session(client, "S-HB", "P-HB")
+    handshake = _handshake(client, "S-HB", wseq=100)
     assert handshake.status_code == 200
     issued_wseq = handshake.json()["wseq"]
+    monkeypatch.setenv("CONSOLE_PIN", "246810")
     assert client.get("/sessions/S-HB/runtime").status_code == 401
-    assert client.get("/sessions/S-HB/runtime", headers=pin).status_code == 200
+    assert client.get("/sessions/S-HB/runtime", headers=pin).status_code == 401
     assert client.post("/sessions/S-HB/pause").status_code == 401
-    before = client.get("/live/state").json()["seq"]
+    paired = client.post("/device/pair", headers=pin, json={
+        "deviceId": "presence-device-000001",
+    })
+    assert paired.status_code == 200, paired.text
+    capability = {"X-Device-Capability": paired.json()["capability"]}
+    before = client.get("/live/state", headers=capability).json()["seq"]
 
     heartbeat = {
         "session_id": "S-HB", "screen": "present", "cursor_wseq": issued_wseq,
         "client_ts": "2000-01-01T00:00:00",
     }
     assert client.post("/live/patient-heartbeat", json=heartbeat).status_code == 401
-    response = client.post("/live/patient-heartbeat", json=heartbeat, headers=pin)
+    response = client.post("/live/patient-heartbeat", json=heartbeat, headers=capability)
     assert response.status_code == 200, response.text
     presence = response.json()["patientPresence"]
     assert presence["session_id"] == "S-HB"
     assert presence["screen"] == "present" and presence["online"] is True
     assert presence["cursor_wseq"] == issued_wseq
-    live = client.get("/live/state").json()
+    live = client.get("/live/state", headers=capability).json()
     assert live["seq"] == before  # 心跳不伪装成新的研究者命令
     assert "patientPresence" not in live and "audioSaved" not in live and "patientRec" not in live
     assert client.get("/live/console-state").status_code == 401
-    console = client.get("/live/console-state", headers=pin).json()
-    assert console["patientPresence"] == presence
+    denied_console = client.get("/live/console-state", headers=pin)
+    assert denied_console.status_code == 401
+    assert denied_console.json()["code"] == "account_required"
 
-    # 无 PIN 白名单只接最小字段：内容/回答等额外载荷 fail-closed。
+    # capability 白名单只接最小字段：内容/回答等额外载荷 fail-closed。
     assert client.post("/live/patient-heartbeat", json={
         "session_id": "S-HB", "screen": "present", "answer_text": "敏感回答",
-    }, headers=pin).status_code == 422
+    }, headers=capability).status_code == 422
     assert client.post("/live/patient-heartbeat", json={
         "session_id": "other", "screen": "present",
-    }, headers=pin).status_code == 409
+    }, headers=capability).status_code == 409
     # "超前"的 ack 序号必须被接受:同机部署下患者端显示的游标常来自 BroadcastChannel
     # (客户端时钟域),在操作端 HTTP 写落库前天然超前于服务端 command_wseq;
     # 按超前拒绝会让每次推进后的第一拍心跳都 409,在场判定滞后甚至假离线。
     ahead = client.post("/live/patient-heartbeat", json={
         "session_id": "S-HB", "screen": "present", "cursor_wseq": issued_wseq + 1,
-    }, headers=pin)
+    }, headers=capability)
     assert ahead.status_code == 200
     assert ahead.json()["patientPresence"]["cursor_wseq"] == issued_wseq + 1
 
     # 在线状态只信服务器 last_seen；TTL 到期后读取即为离线，不需要额外写库任务。
     import app.main as main_mod
     monkeypatch.setattr(main_mod, "PATIENT_ONLINE_TTL_SECONDS", -1)
-    assert client.get("/live/console-state", headers=pin).json()["patientPresence"]["online"] is False
+    monkeypatch.delenv("CONSOLE_PIN")  # 回到本地开发模式检查服务端投影。
+    assert client.get("/live/console-state").json()["patientPresence"]["online"] is False
 
 
 def test_runtime_cursor_is_persisted_per_session_and_restored_safely(client):
@@ -263,14 +1063,14 @@ def test_live_payload_contract_rejects_extra_content_and_public_projection_is_mi
     assert "sourceWseq" not in public["cursor"] and "answerText" not in public["cursor"]
 
 
-def test_runtime_recording_commands_obey_consent_and_score_lock_gates(client):
+def test_runtime_recording_commands_obey_consent_and_review_window_gates(client):
     _patient(client, "P-NOREC", recording_allowed=False)
-    _training_session(client, "S-NOREC", "P-NOREC")
-    _handshake(client, "S-NOREC")
-    assert client.put("/live/state", json={"kind": "cursor", "payload": _cursor(
-        "S-NOREC", recording="armed")}).status_code == 409
-    assert client.put("/sessions/S-NOREC/runtime/cursor", json=_cursor(
-        "S-NOREC", selfStart=True)).status_code == 409
+    denied = client.post("/sessions", json={
+        "session_id": "S-NOREC", "patient_id": "P-NOREC", "week_no": 2,
+        "phase_type": "正式训练", "event_line": "正式训练",
+        "item_bank_version_id": BANK_VERSION,
+    })
+    assert denied.status_code == 409 and "recording_allowed" in denied.json()["detail"]
 
     _patient(client, "P-LOCK")
     _training_session(client, "S-LOCK", "P-LOCK")
@@ -278,24 +1078,45 @@ def test_runtime_recording_commands_obey_consent_and_score_lock_gates(client):
     item = client.post("/sessions/S-LOCK/items", json={
         "item_id": "SE_锚", "task_type": "单要素",
     }).json()
-    turn = client.post(f"/items/{item['id']}/turns", json={
-        "turn_seq": 1, "response_role": "命名", "prompt_level": 0,
-    }).json()
-    client.patch(f"/turns/{turn['id']}/confirm", json={"confirmed_response_text": "锚"})
-    assert client.patch(f"/turns/{turn['id']}/lock", json={
+    turn = _authoritative_turn(client, item["id"])
+    assert client.put("/live/state", json={"kind": "cursor", "payload": _cursor(
+        "S-LOCK", item_idx=1)}).status_code == 200
+    _login_confirmation_reviewer(client)
+
+    # Human research truth must not mutate while the bedside intervention is
+    # still active.  The operational cursor remains writable because no score
+    # was prematurely frozen.
+    early_confirm = client.patch(f"/turns/{turn['id']}/confirm", json={
+        "confirmed_response_text": "锚",
+        "expected_revision": 0,
+        "idempotency_key": "test-presence-confirm-active-0001",
+    })
+    early_lock = client.patch(f"/turns/{turn['id']}/lock", json={
         "reviewer_id": "R1", "element_value": 1, "prompt_level": 0,
-    }).status_code == 200
+    })
+    for response in (early_confirm, early_lock):
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == (
+            "research_review_requires_intervention_completion")
+        assert response.json()["detail"]["runtime_status"] == "active"
 
     assert client.put("/live/state", json={"kind": "cursor", "payload": _cursor(
-        "S-LOCK", item_idx=2, recording="armed")}).status_code == 409
+        "S-LOCK", item_idx=2, recording="armed")}).status_code == 200
     assert client.put("/live/state", json={"kind": "cursor", "payload": _cursor(
         "S-LOCK", item_idx=2)}).status_code == 200
-    client.post("/sessions/S-LOCK/pause")
-    client.post("/sessions/S-LOCK/resume")
-    # 暂停/恢复只改运行游标，既不解锁也不允许改写已锁定回答。
-    assert client.patch(f"/turns/{turn['id']}/confirm", json={
-        "confirmed_response_text": "改写",
-    }).status_code == 409
+    assert client.post("/sessions/S-LOCK/pause").status_code == 200
+    paused_confirm = client.patch(f"/turns/{turn['id']}/confirm", json={
+        "confirmed_response_text": "暂停期改写",
+        "expected_revision": 0,
+        "idempotency_key": "test-presence-confirm-paused-0001",
+    })
+    assert paused_confirm.status_code == 409
+    assert paused_confirm.json()["detail"] == {
+        "code": "research_review_requires_intervention_completion",
+        "message": "须先由服务端完成床旁干预并生成不可变汇总，当前状态为 paused；禁止修改研究确认回答",
+        "runtime_status": "paused",
+    }
+    assert client.post("/sessions/S-LOCK/resume").status_code == 200
 
 
 def test_relationship_pointer_is_persisted_and_pause_safe(client):
@@ -303,12 +1124,13 @@ def test_relationship_pointer_is_persisted_and_pause_safe(client):
     response = client.post("/sessions", json={
         "session_id": "S-RAP", "patient_id": "P-RAP", "week_no": 1,
         "phase_type": "关系建立", "event_line": "关系建立环节",
-        "item_bank_version_id": BANK_VERSION,
+        "item_bank_version_id": BANK_VERSION, "is_simulation": True,
     })
     assert response.status_code == 200
     assert _handshake(client, "S-RAP", mode="rapport", wseq=100).status_code == 200
     rapport = {"sessionId": "S-RAP", "sectionKey": "自我介绍", "questionIdx": 1,
-               "recording": "armed", "recSeq": 1, "wseq": 101}
+               "recording": "armed", "recSeq": 1,
+               "containsDirectIdentifier": True, "wseq": 101}
     rapport_write = client.put("/live/state", json={"kind": "rapportStep", "payload": rapport})
     assert rapport_write.status_code == 200
     saved = client.get("/sessions/S-RAP/runtime").json()["rapportStep"]
@@ -383,7 +1205,7 @@ def test_audio_turn_key_recovers_without_turn_event_and_rejects_unbound_keys(cli
     relationship = client.post("/sessions", json={
         "session_id": "S-AUDIO-RAP", "patient_id": "P-AUDIO-MAP", "week_no": 1,
         "phase_type": "关系建立", "event_line": "关系建立环节",
-        "item_bank_version_id": BANK_VERSION,
+        "item_bank_version_id": BANK_VERSION, "is_simulation": True,
     })
     assert relationship.status_code == 200
     assert client.post("/audio", json={
@@ -484,6 +1306,72 @@ def test_forward_alembic_upgrade_preserves_existing_live_row(tmp_path):
             "patient_last_seen_at", "patient_ack_seq"} <= columns
     assert "sessionruntimestate" in inspect(eng).get_table_names()
     assert "turn_key" in {col["name"] for col in inspect(eng).get_columns("audioassetrow")}
+    assert "is_simulation" in {col["name"] for col in inspect(eng).get_columns("session")}
+    assert "is_simulation" in {col["name"] for col in inspect(eng).get_columns("audioassetrow")}
+    assert "is_simulation_subject" in {
+        col["name"] for col in inspect(eng).get_columns("patient")}
+    session_columns = {col["name"]: col for col in inspect(eng).get_columns("session")}
+    audio_columns = {col["name"]: col for col in inspect(eng).get_columns("audioassetrow")}
+    assert "data_classification" in session_columns
+    assert "data_classification" in audio_columns
+    assert "legacy_unknown" in str(session_columns["data_classification"]["default"])
+    assert "legacy_unknown" in str(audio_columns["data_classification"]["default"])
+    assert {"attemptevent", "interactionevent",
+            "interactionpresentationreceipt"} <= set(
+                inspect(eng).get_table_names())
+    attempt_uniques = {constraint["name"] for constraint in inspect(eng).get_unique_constraints(
+        "attemptevent")}
+    interaction_uniques = {constraint["name"] for constraint in inspect(eng).get_unique_constraints(
+        "interactionevent")}
+    assert {"uq_attempt_raw_audio_id", "uq_attempt_session_item_turn_seq"} <= attempt_uniques
+    assert "uq_interaction_session_event_seq" in interaction_uniques
+    receipt_uniques = {
+        constraint["name"] for constraint in inspect(eng).get_unique_constraints(
+            "interactionpresentationreceipt")
+    }
+    assert {
+        "uq_interaction_presentation_session_idempotency",
+        "uq_interaction_presentation_event",
+        "uq_interaction_presentation_attempt",
+    } <= receipt_uniques
+    assert {"intervention_completed_at", "intervention_ended_by",
+            "completed_at", "aborted_at", "ended_by", "end_reason"} <= {
+        col["name"] for col in inspect(eng).get_columns("sessionruntimestate")
+    }
     with eng.connect() as conn:
         row = conn.execute(text("SELECT seq, session_json, cursor_json FROM livestate WHERE id=1")).one()
     assert row.seq == 7 and "legacy" in row.session_json and "itemIdx" in row.cursor_json
+
+
+def test_intervention_completion_migration_backfills_existing_completed_session(tmp_path):
+    db_path = tmp_path / "completion-backfill.db"
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.upgrade(config, "f7a4c9d2e531")
+
+    eng = sa_create_engine(f"sqlite:///{db_path}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO patient (patient_id, is_simulation_subject) "
+            "VALUES ('P-MIG', 1)"
+        ))
+        conn.execute(text(
+            "INSERT INTO session "
+            "(session_id, patient_id, session_sitting_no, week_no, phase_type, "
+            "event_line, item_bank_version_id, is_simulation, data_classification) "
+            "VALUES ('S-MIG', 'P-MIG', 1, 2, '正式训练', '正式训练', 'bank-v1', 1, 'simulation')"
+        ))
+        conn.execute(text(
+            "INSERT INTO sessionruntimestate "
+            "(session_id, status, revision, completed_at) "
+            "VALUES ('S-MIG', 'completed', 1, '2026-07-17 12:34:56')"
+        ))
+
+    command.upgrade(config, "head")
+    with eng.connect() as conn:
+        row = conn.execute(text(
+            "SELECT completed_at, intervention_completed_at, intervention_ended_by "
+            "FROM sessionruntimestate WHERE session_id = 'S-MIG'"
+        )).one()
+    assert row.intervention_completed_at == row.completed_at
+    assert row.intervention_ended_by is None
