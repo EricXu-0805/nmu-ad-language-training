@@ -61,7 +61,20 @@ class OffLlmJudge:
         return None
 
 
-_VALID_SCORES = (0.0, 0.5, 1.0)
+_EXPECTED_SCORE_BY_ANSWER_TYPE = {
+    AnswerType.正确: 1.0,
+    AnswerType.部分正确: 0.5,
+    AnswerType.上位词或相关词: 0.5,
+    AnswerType.偏题: 0.0,
+    AnswerType.重复: 0.0,
+    AnswerType.未识别: 0.0,
+}
+_JUDGEMENT_KEYS = frozenset({
+    "answer_type",
+    "score",
+    "needs_review",
+    "reason",
+})
 
 
 class QwenJudge:
@@ -111,18 +124,28 @@ class QwenJudge:
             data = json.loads(text)
         except ValueError:
             return None
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or set(data) != _JUDGEMENT_KEYS:
+            return None
+        score_value = data["score"]
+        needs_review = data["needs_review"]
+        reason = data["reason"]
+        if (
+            type(score_value) not in {int, float}
+            or type(needs_review) is not bool
+            or not isinstance(reason, str)
+            or len(reason) > 500
+        ):
             return None
         try:
-            at = AnswerType(data.get("answer_type"))
-            score = float(data.get("score"))
+            at = AnswerType(data["answer_type"])
+            score = float(score_value)
         except (ValueError, TypeError):
             return None
-        if score not in _VALID_SCORES:
+        if score != _EXPECTED_SCORE_BY_ANSWER_TYPE[at]:
             return None
         return LlmJudgement(answer_type=at, ai_score=score,
-                            ai_needs_review=bool(data.get("needs_review", True)),
-                            reason=str(data.get("reason", ""))[:500])
+                            ai_needs_review=needs_review,
+                            reason=reason)
 
 
 _ENGINES: dict[str, LlmJudgeProvider] = {"off": OffLlmJudge()}

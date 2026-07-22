@@ -450,6 +450,16 @@ def test_qwen_judge_accepts_fenced_json(monkeypatch):
     '{"answer_type": "满分", "score": 1}',                       # 枚举外类型
     '{"answer_type": "正确", "score": 0.7}',                     # 非法分值
     '["正确", 1]',                                               # 非对象
+    # 下列值可被 Python 宽松转型，但不是与 prompt 一致的封闭 JSON 合同。
+    '{"answer_type":"正确","score":"1","needs_review":0,"reason":{}}',
+    # 回答类型与分值矛盾时不得任选一个当真。
+    '{"answer_type":"正确","score":0,"needs_review":false,"reason":"x"}',
+    '{"answer_type":"偏题","score":1,"needs_review":false,"reason":"x"}',
+    # 缺字段、多字段和超长理由都必须回退到确定式规则。
+    '{"answer_type":"正确","score":1,"reason":"x"}',
+    '{"answer_type":"正确","score":1,"needs_review":false,"reason":"x","extra":1}',
+    json.dumps({"answer_type": "正确", "score": 1,
+                "needs_review": False, "reason": "x" * 501}),
 ])
 def test_qwen_judge_suspicious_output_falls_back(monkeypatch, raw):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
