@@ -10,7 +10,7 @@ import threading
 import pytest
 from fastapi import HTTPException, Response
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, event
+from sqlalchemy import delete, event, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -1543,6 +1543,179 @@ def test_abort_fences_autopilot_before_committing_runtime_terminal_fact(
             "reason_code": "session_aborted",
             "source": "session_abort",
         }
+
+
+@pytest.mark.parametrize("stop_kind", ["pause", "abort", "technical_pause"])
+def test_stop_routes_use_one_cross_worker_lock_order(
+        api_clients: ApiClients, monkeypatch, stop_kind):
+    """All account stop paths fence Live/autopilot before runtime authority."""
+    import app.main as main_mod
+
+    _enable_p0a(monkeypatch)
+    if stop_kind == "technical_pause":
+        positioned = api_clients.account.put("/live/state", json={
+            "kind": "cursor",
+            "payload": {
+                "sessionId": SESSION_ID,
+                "screen": "present",
+                "itemIdx": 0,
+                "turnIdx": 0,
+                "responseRole": "命名",
+                "cueLevel": 0,
+                "recording": "idle",
+                "selfStart": False,
+            },
+        })
+        assert positioned.status_code == 200, positioned.text
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+
+    technical_body = None
+    if stop_kind == "technical_pause":
+        runtime_snapshot = api_clients.account.get(
+            f"/sessions/{SESSION_ID}/runtime").json()
+        live_snapshot = api_clients.account.get("/live/console-state").json()
+        technical_body = {
+            "idempotency_key": "technical-pause-lock-order-0001",
+            "expected_revision": runtime_snapshot["revision"],
+            "expected_live_wseq": live_snapshot["cursor"]["wseq"],
+            "error_code": "client_audio",
+        }
+
+    order: list[str] = []
+    position_checks = 0
+    real_admission = main_mod._require_started_visit_plan_session
+    real_live_lock = main_mod._live_row_for_update
+    real_runtime_lock = main_mod._runtime_row_for_update
+    real_pause = main_mod.autopilot_service.pause_autonomous_scope_for_researcher
+    real_fence = main_mod.autopilot_service.fence_autonomous_scope_for_external_stop
+    real_position_check = main_mod._technical_pause_active_position
+
+    def track_admission(*args, **kwargs):
+        order.append("session")
+        return real_admission(*args, **kwargs)
+
+    def track_live_lock(*args, **kwargs):
+        order.append("live")
+        return real_live_lock(*args, **kwargs)
+
+    def track_runtime_lock(*args, **kwargs):
+        order.append("runtime")
+        return real_runtime_lock(*args, **kwargs)
+
+    def track_pause(*args, **kwargs):
+        order.append("autopilot")
+        return real_pause(*args, **kwargs)
+
+    def track_fence(*args, **kwargs):
+        order.append("autopilot")
+        return real_fence(*args, **kwargs)
+
+    def track_position_check(*args, **kwargs):
+        nonlocal position_checks
+        position_checks += 1
+        order.append(f"position_{position_checks}")
+        return real_position_check(*args, **kwargs)
+
+    monkeypatch.setattr(
+        main_mod, "_require_started_visit_plan_session", track_admission)
+    monkeypatch.setattr(main_mod, "_live_row_for_update", track_live_lock)
+    monkeypatch.setattr(main_mod, "_runtime_row_for_update", track_runtime_lock)
+    monkeypatch.setattr(
+        main_mod.autopilot_service,
+        "pause_autonomous_scope_for_researcher",
+        track_pause,
+    )
+    monkeypatch.setattr(
+        main_mod.autopilot_service,
+        "fence_autonomous_scope_for_external_stop",
+        track_fence,
+    )
+    monkeypatch.setattr(
+        main_mod, "_technical_pause_active_position", track_position_check)
+
+    if stop_kind == "pause":
+        stopped = api_clients.account.post(f"/sessions/{SESSION_ID}/pause")
+    elif stop_kind == "abort":
+        stopped = api_clients.account.post(
+            f"/sessions/{SESSION_ID}/abort",
+            json={
+                "reason_code": "researcher_decision",
+                "expected_revision": 0,
+                "idempotency_key": "abort-lock-order-researcher-0001",
+            },
+        )
+    else:
+        assert technical_body is not None
+        stopped = api_clients.account.post(
+            f"/sessions/{SESSION_ID}/technical-pause",
+            json=technical_body,
+        )
+    assert stopped.status_code == 200, stopped.text
+
+    assert order.index("session") < order.index("live") < order.index("autopilot")
+    if stop_kind == "technical_pause":
+        assert position_checks == 2
+        assert (
+            order.index("position_1")
+            < order.index("autopilot")
+            < order.index("position_2")
+        )
+    else:
+        assert order.index("autopilot") < order.index("runtime")
+
+
+def test_abort_revalidates_runtime_after_fence_and_rolls_back_on_race(
+        api_clients: ApiClients, monkeypatch):
+    """A post-preflight runtime change cannot commit a half-applied abort."""
+    import app.main as main_mod
+
+    _enable_p0a(monkeypatch)
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+    real_fence = main_mod.autopilot_service.fence_autonomous_scope_for_external_stop
+
+    def fence_then_advance_runtime(db_session, **kwargs):
+        changed = real_fence(db_session, **kwargs)
+        db_session.execute(
+            update(SessionRuntimeState)
+            .where(SessionRuntimeState.session_id == SESSION_ID)
+            .values(revision=SessionRuntimeState.revision + 1)
+            .execution_options(synchronize_session=False)
+        )
+        return changed
+
+    monkeypatch.setattr(
+        main_mod.autopilot_service,
+        "fence_autonomous_scope_for_external_stop",
+        fence_then_advance_runtime,
+    )
+    raced = api_clients.account.post(
+        f"/sessions/{SESSION_ID}/abort",
+        json={
+            "reason_code": "researcher_decision",
+            "expected_revision": 0,
+            "idempotency_key": "abort-post-lock-runtime-race-0001",
+        },
+    )
+    assert raced.status_code == 409, raced.text
+    assert raced.json()["detail"] == {
+        "code": "session_abort_revision_conflict",
+        "message": "场次运行修订已变化，请重新核对后中止",
+        "current_revision": 1,
+    }
+
+    with Session(api_clients.engine) as session:
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        events = list(session.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == SESSION_ID).order_by(
+                AutopilotControlEvent.event_seq)))
+        assert control is not None and control.status == "waiting_tts"
+        assert control.current_command_id is not None
+        assert runtime_state is not None
+        assert (runtime_state.status, runtime_state.revision) == ("active", 0)
+        assert [event.event_type for event in events] == ["start"]
 
 
 def test_cloud_consent_revoke_fences_admitted_autopilot_and_runtime_together(

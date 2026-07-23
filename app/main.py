@@ -5325,13 +5325,15 @@ def pause_session(session_id: str, request: Request,
         _require_session_operator(request, sess, s, "暂停场次", mutation=True)
         _require_started_visit_plan_session(session_id, s, sess=sess)
         _live_row_for_update(s)
-        _runtime_row_for_update(session_id, s)
         try:
             # Control ownership, pending command fencing, runtime pause and the
             # patient stop projection are one commit.  A partial pause is never
-            # exposed after a process/database failure.
+            # exposed after a process/database failure.  Keep the cross-worker
+            # database order Session -> Live -> Autopilot -> Runtime; the
+            # process-local live mutex is not a PostgreSQL deadlock fence.
             autopilot_service.pause_autonomous_scope_for_researcher(
                 s, session_id=session_id, actor_id=_actor(request))
+            _runtime_row_for_update(session_id, s)
             state = _pause_runtime_in_transaction(session_id, s)
             s.commit()
             s.refresh(state)
@@ -6148,6 +6150,43 @@ def _abort_public_reason(value: str | None) -> str | None:
     return facts[0] if facts is not None else value
 
 
+def _abort_runtime_snapshot_decision(
+        state: SessionRuntimeState | None,
+        *,
+        operation_facts: tuple[str, int, str],
+        expected_revision: int,
+) -> Literal["apply", "replay"]:
+    """Validate one unlocked or locked abort snapshot without mutating it."""
+    if state is not None and state.status == "aborted":
+        stored = _abort_operation_facts(state.end_reason)
+        if stored is not None and stored[2] == operation_facts[2]:
+            if stored != operation_facts:
+                raise HTTPException(status_code=409, detail={
+                    "code": "session_abort_idempotency_conflict",
+                    "message": "同一中止幂等键已绑定不同请求事实",
+                })
+            return "replay"
+        if stored != operation_facts:
+            raise HTTPException(status_code=409, detail={
+                "code": "session_already_aborted",
+                "message": "场次已由另一个受控中止请求关闭，不可改写",
+            })
+    if state is not None and state.status in _TERMINAL_RUNTIME_STATUSES:
+        raise HTTPException(
+            409, f"场次已进入终态 {state.status}，不得改为 aborted")
+    if state is not None and state.status not in _MUTABLE_RUNTIME_STATUSES:
+        raise HTTPException(
+            409, f"场次运行状态 {state.status} 非法，禁止中止")
+    revision = state.revision if state is not None else 0
+    if revision != expected_revision:
+        raise HTTPException(status_code=409, detail={
+            "code": "session_abort_revision_conflict",
+            "message": "场次运行修订已变化，请重新核对后中止",
+            "current_revision": revision,
+        })
+    return "apply"
+
+
 @app.post("/sessions/{session_id}/abort")
 def abort_session(session_id: str, body: AbortSessionIn, request: Request,
                   s: DBSession = Depends(get_session)):
@@ -6168,8 +6207,9 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
     with governance_lock.subject_fence(s, patient_id), _LIVE_WRITE_LOCK:
         # Session is the always-present authority row. Lock it first so two
         # workers cannot both observe a missing/runtime revision and insert or
-        # overwrite divergent abort facts. Runtime is then locked in the same
-        # transaction for the CAS check and terminal transition.
+        # overwrite divergent abort facts. Runtime admission below is an
+        # unlocked preflight; the authoritative row is locked and revalidated
+        # only after Live and the autonomous command plane are fenced.
         sess = s.exec(select(TrainSession).where(
             TrainSession.session_id == session_id,
         ).with_for_update()).first()
@@ -6177,37 +6217,21 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
             raise HTTPException(404, "场次不存在")
         _require_session_operator(request, sess, s, "中止场次", mutation=True)
         _require_started_visit_plan_session(session_id, s, sess=sess)
-        existing = s.exec(select(SessionRuntimeState).where(
-            SessionRuntimeState.session_id == session_id,
-        ).with_for_update()).first()
-        if existing is not None and existing.status == "aborted":
-            stored = _abort_operation_facts(existing.end_reason)
-            if stored is not None and stored[2] == operation_facts[2]:
-                if stored != operation_facts:
-                    raise HTTPException(status_code=409, detail={
-                        "code": "session_abort_idempotency_conflict",
-                        "message": "同一中止幂等键已绑定不同请求事实",
-                    })
-                result = _runtime_payload(session_id, existing)
-                s.rollback()
-                return result
-            if stored != operation_facts:
-                raise HTTPException(status_code=409, detail={
-                    "code": "session_already_aborted",
-                    "message": "场次已由另一个受控中止请求关闭，不可改写",
-                })
-        if existing is not None and existing.status in _TERMINAL_RUNTIME_STATUSES:
-            raise HTTPException(409, f"场次已进入终态 {existing.status}，不得改为 aborted")
-        if existing is not None and existing.status not in _MUTABLE_RUNTIME_STATUSES:
-            raise HTTPException(409, f"场次运行状态 {existing.status} 非法，禁止中止")
+        preflight = s.get(SessionRuntimeState, session_id)
+        decision = _abort_runtime_snapshot_decision(
+            preflight,
+            operation_facts=operation_facts,
+            expected_revision=body.expected_revision,
+        )
+        if decision == "replay":
+            result = _runtime_payload(session_id, preflight)
+            s.rollback()
+            return result
 
-        state = existing or SessionRuntimeState(session_id=session_id, status="active", revision=0)
-        if state.revision != body.expected_revision:
-            raise HTTPException(status_code=409, detail={
-                "code": "session_abort_revision_conflict",
-                "message": "场次运行修订已变化，请重新核对后中止",
-                "current_revision": state.revision,
-            })
+        # Canonical cross-worker order: Session -> Live -> Autopilot/Command ->
+        # Runtime.  Every fact checked above is repeated against the locked
+        # runtime row before any staged fence is committed.
+        live = _live_row_for_update(s)
         now = datetime.now()
         try:
             autopilot_service.fence_autonomous_scope_for_external_stop(
@@ -6225,8 +6249,25 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
                 actor_id=actor_id,
                 now=now,
             )
+            if preflight is not None:
+                s.expire(preflight)
+            state = _runtime_row_for_update(session_id, s)
+            locked_decision = _abort_runtime_snapshot_decision(
+                state,
+                operation_facts=operation_facts,
+                expected_revision=body.expected_revision,
+            )
+            if locked_decision == "replay":
+                result = _runtime_payload(session_id, state)
+                s.rollback()
+                return result
         except autopilot_service.AutopilotServiceError as exc:
             _autopilot_write_failure(s, exc)
+        except HTTPException:
+            # A runtime race detected after the autonomous fence must leave
+            # neither half visible.
+            s.rollback()
+            raise
         state.status = "aborted"
         state.aborted_at = now
         state.completed_at = None
@@ -6238,7 +6279,6 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
         state.revision += 1
         state.updated_at = now
         plan = _session_plan_for_runtime(sess)
-        live = _live_row_for_update(s)
         live_changed = _project_terminal_to_live(live, sess, state, plan)
         s.add(state)
         if live_changed and live is not None:
@@ -8120,8 +8160,8 @@ def _technical_pause_active_position(
     """Validate the complete active CAS and derive its frozen position.
 
     Callers run this once as a cheap preflight and again after acquiring the
-    authoritative runtime row in the global Live->Session->Autopilot/Attempt->
-    Runtime lock order.  The second check prevents a staged fence from ever
+    authoritative runtime row in the global Session->Live->Autopilot->Runtime
+    lock order.  The second check prevents a staged fence from ever
     committing against a state that changed after the preflight.
     """
     if live is None or _live_session_id(live) != sess.session_id:
@@ -9545,7 +9585,6 @@ def commit_technical_pause(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
         sess = s.exec(select(TrainSession).where(
             TrainSession.session_id == session_id,
         ).with_for_update()).first()
@@ -9554,6 +9593,9 @@ def commit_technical_pause(
         operator = _require_session_operator(
             request, sess, s, "提交原子技术暂停", mutation=True)
         _require_started_visit_plan_session(session_id, s, sess=sess)
+        # Match pause/abort across worker processes: the process-local mutex is
+        # advisory only, while these database locks are authoritative.
+        live = _live_row_for_update(s)
         request_hash = _technical_pause_request_hash(session_id, body)
         replay = _technical_pause_replay(
             s, session_id=session_id, body=body,

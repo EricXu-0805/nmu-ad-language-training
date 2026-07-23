@@ -1625,6 +1625,7 @@ def pause_autonomous_scope_for_researcher(
         created_at=observed_at,
     ))
     db.flush()
+    db.expire(state)
     return True
 
 
@@ -1784,6 +1785,7 @@ def fence_autonomous_scope_for_external_stop(
         created_at=observed_at,
     ))
     db.flush()
+    db.expire(state)
     return True
 
 

@@ -886,7 +886,7 @@ def _seed_complete_capture_chain(session: Session) -> tuple[int, int]:
         succeeded_at=now, predecessor_command_id=tts.id,
         issued_capability_token_hash=capability.token_hash,
         issued_device_id_hash=capability.device_id_hash,
-        issued_at=now - timedelta(seconds=1),
+        issued_at=now,
         trigger_ack_idempotency_key=tts_ack.idempotency_key,
         expected_raw_audio_id=audio.raw_audio_id,
         payload_json=record_payload)
@@ -1007,6 +1007,145 @@ def test_only_tts_ended_and_exact_capture_receipt_unlock_attempt_proof(
             autopilot_ledger.verify_record_capture_for_attempt(session, record_id)
 
 
+@pytest.mark.parametrize("payload_json", [
+    "{",
+    '{"stop_reason": "silence"}',
+    '{}',
+    '{"stop_reason":"researcher_override"}',
+    '{"stop_reason":"silence","unexpected":true}',
+])
+def test_terminal_record_proof_rejects_noncanonical_or_unbounded_ack_payload(
+        autopilot_engine, payload_json):
+    with Session(autopilot_engine) as session:
+        record_id, _receipt_id = _seed_complete_capture_chain(session)
+        session.execute(update(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == record_id,
+            RuntimeCommandAck.ack_type == "record_stopped",
+        ).values(payload_json=payload_json))
+        session.commit()
+        session.expire_all()
+
+        with pytest.raises(
+            autopilot_ledger.AutopilotProofError,
+            match="payload is not canonical evidence",
+        ):
+            autopilot_ledger.verify_terminal_record_capture(session, record_id)
+
+
+def test_terminal_record_proof_rejects_ack_after_command_success(
+        autopilot_engine):
+    with Session(autopilot_engine) as session:
+        record_id, _receipt_id = _seed_complete_capture_chain(session)
+        record = session.get(RuntimeCommand, record_id)
+        assert record is not None and record.succeeded_at is not None
+        session.execute(update(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == record_id,
+            RuntimeCommandAck.ack_type == "record_stopped",
+        ).values(received_at=record.succeeded_at + timedelta(microseconds=1)))
+        session.commit()
+        session.expire_all()
+
+        with pytest.raises(
+            autopilot_ledger.AutopilotProofError,
+            match="success timestamp predates its terminal ACK",
+        ):
+            autopilot_ledger.verify_terminal_record_capture(session, record_id)
+
+
+@pytest.mark.parametrize("bad_tts_ack_payload", [
+    '{"media_ended": false, "media_duration_ms": 850}',
+    '{"media_duration_ms": 850}',
+    '{',
+])
+def test_terminal_tts_proof_rejects_noncanonical_media_ended_ack(
+        autopilot_engine, bad_tts_ack_payload):
+    # verify_terminal_tts_ack fails closed unless the tts_ended ACK is a canonical
+    # media_ended=True fact — a record can only open after the cue truly finished.
+    with Session(autopilot_engine) as session:
+        record_id, _receipt_id = _seed_complete_capture_chain(session)
+        session.execute(update(RuntimeCommandAck).where(
+            RuntimeCommandAck.session_id == "S-PROOF",
+            RuntimeCommandAck.ack_type == "tts_ended",
+        ).values(payload_json=bad_tts_ack_payload))
+        session.commit()
+        session.expire_all()
+
+        with pytest.raises(
+            autopilot_ledger.AutopilotProofError,
+            match="tts_ended ACK payload is not canonical evidence",
+        ):
+            autopilot_ledger.verify_terminal_record_capture(session, record_id)
+
+
+def test_record_prerequisite_rejects_issue_before_terminal_tts_evidence(
+        autopilot_engine):
+    with Session(autopilot_engine) as session:
+        record_id, _receipt_id = _seed_complete_capture_chain(session)
+        record = session.get(RuntimeCommand, record_id)
+        assert record is not None
+        session.execute(update(RuntimeCommand).where(
+            RuntimeCommand.id == record_id,
+        ).values(issued_at=record.issued_at - timedelta(seconds=1)))
+        session.commit()
+        session.expire_all()
+
+        with pytest.raises(
+            autopilot_ledger.AutopilotProofError,
+            match="record command predates terminal TTS evidence",
+        ):
+            autopilot_ledger.verify_terminal_record_capture(session, record_id)
+
+
+def test_record_prerequisite_rejects_non_sequential_command_seq(autopilot_engine):
+    with Session(autopilot_engine) as session:
+        record_id, _receipt_id = _seed_complete_capture_chain(session)
+        session.execute(update(RuntimeCommand).where(
+            RuntimeCommand.id == record_id,
+        ).values(command_seq=5))
+        session.commit()
+        session.expire_all()
+
+        with pytest.raises(
+            autopilot_ledger.AutopilotProofError,
+            match="record command is not the next command after TTS",
+        ):
+            autopilot_ledger.verify_terminal_record_capture(session, record_id)
+
+
+def test_record_prerequisite_rejects_foreign_device_issue(autopilot_engine):
+    with Session(autopilot_engine) as session:
+        record_id, _receipt_id = _seed_complete_capture_chain(session)
+        session.execute(update(RuntimeCommand).where(
+            RuntimeCommand.id == record_id,
+        ).values(issued_device_id_hash="device-hash-intruder"))
+        session.commit()
+        session.expire_all()
+
+        with pytest.raises(
+            autopilot_ledger.AutopilotProofError,
+            match="record command was issued to another device",
+        ):
+            autopilot_ledger.verify_terminal_record_capture(session, record_id)
+
+
+def test_terminal_capture_rejects_non_autonomous_control_state(autopilot_engine):
+    # A researcher takeover flips mode away from "autonomous"; a still-pending ACK
+    # must not be allowed to finish the command and mint a patient attempt.
+    with Session(autopilot_engine) as session:
+        record_id, _receipt_id = _seed_complete_capture_chain(session)
+        session.execute(update(SessionAutopilotState).where(
+            SessionAutopilotState.session_id == "S-PROOF",
+        ).values(mode="manual"))
+        session.commit()
+        session.expire_all()
+
+        with pytest.raises(
+            autopilot_ledger.AutopilotProofError,
+            match="command scope is no longer autonomous and current",
+        ):
+            autopilot_ledger.verify_terminal_record_capture(session, record_id)
+
+
 def test_stale_generation_ack_is_fenced_even_with_matching_audio(autopilot_engine):
     with Session(autopilot_engine) as session:
         record_id, _receipt_id = _seed_complete_capture_chain(session)
@@ -1065,7 +1204,10 @@ def test_recovery_ack_requires_command_issued_strictly_before_demotion(
         # isolates the record command's equality boundary.
         session.execute(update(RuntimeCommand).where(
             RuntimeCommand.id == record.predecessor_command_id,
-        ).values(issued_at=record.issued_at - timedelta(seconds=2)))
+        ).values(
+            issued_at=record.issued_at - timedelta(seconds=2),
+            succeeded_at=record.issued_at - timedelta(seconds=1),
+        ))
         session.execute(update(RuntimeCommandAck).where(
             RuntimeCommandAck.command_id == record.predecessor_command_id,
             RuntimeCommandAck.ack_type == "tts_ended",

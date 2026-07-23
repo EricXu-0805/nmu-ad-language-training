@@ -568,6 +568,10 @@ ACK_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "record_failed": frozenset({"error_code"}),
 }
 
+RECORD_STOP_REASONS = frozenset({
+    "silence", "user_done", "max_duration", "stream_end",
+})
+
 CONTROL_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "start": frozenset({"source"}),
     "pause": frozenset({"reason_code", "source"}),
@@ -828,6 +832,8 @@ def _verify_ack_binding(
     state = session.get(SessionAutopilotState, command.session_id)
     if state is None:
         raise AutopilotProofError("session has no autopilot control state")
+    if state.scope_key != command.scope_key or state.mode != "autonomous":
+        raise AutopilotProofError("command scope is no longer autonomous and current")
     if require_current_command:
         if state.current_command_id != command.id:
             raise AutopilotProofError("ACK command is no longer the current command")
@@ -853,6 +859,47 @@ def _verify_ack_binding(
             "recovery-only capability cannot finish a command issued after demotion")
 
 
+def verify_terminal_tts_ack(
+    session: Session,
+    tts_command: RuntimeCommand,
+    *,
+    ack_idempotency_key: str,
+    require_current_command: bool,
+) -> RuntimeCommandAck:
+    """Verify one canonical persisted ``tts_ended`` fact for an exact command."""
+    if tts_command.kind != "tts":
+        raise AutopilotProofError("terminal TTS proof requires a TTS command")
+    if tts_command.state != "succeeded" or tts_command.succeeded_at is None:
+        raise AutopilotProofError("TTS command has not succeeded")
+    ack = session.exec(select(RuntimeCommandAck).where(
+        RuntimeCommandAck.command_id == tts_command.id,
+        RuntimeCommandAck.idempotency_key == ack_idempotency_key,
+        RuntimeCommandAck.ack_type == "tts_ended",
+    )).first()
+    if ack is None:
+        raise AutopilotProofError("TTS trigger is not a persisted tts_ended ACK")
+    try:
+        payload = json.loads(ack.payload_json)
+        if not isinstance(payload, dict) or payload.get("media_ended") is not True:
+            raise ValueError("missing media_ended")
+        if encode_ack_payload("tts_ended", payload) != ack.payload_json:
+            raise ValueError("non-canonical TTS ACK payload")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AutopilotProofError(
+            "tts_ended ACK payload is not canonical evidence") from exc
+    _verify_ack_binding(
+        session,
+        tts_command,
+        ack,
+        ack_type="tts_ended",
+        require_terminal_revision=True,
+        require_current_command=require_current_command,
+    )
+    if tts_command.succeeded_at < ack.received_at:
+        raise AutopilotProofError("TTS success timestamp predates its terminal ACK")
+    return ack
+
+
 def verify_tts_ended_prerequisite(
     session: Session,
     record_command: RuntimeCommand,
@@ -873,8 +920,13 @@ def verify_tts_ended_prerequisite(
     )
     if any(getattr(tts_command, name) != getattr(record_command, name) for name in identity):
         raise AutopilotProofError("record command identity differs from predecessor TTS")
-    if tts_command.state != "succeeded" or tts_command.succeeded_at is None:
-        raise AutopilotProofError("predecessor TTS has not succeeded")
+    if record_command.command_seq != tts_command.command_seq + 1:
+        raise AutopilotProofError("record command is not the next command after TTS")
+    if (record_command.issued_capability_token_hash
+            != tts_command.issued_capability_token_hash
+            or record_command.issued_device_id_hash
+            != tts_command.issued_device_id_hash):
+        raise AutopilotProofError("record command was issued to another device")
     try:
         tts_payload = TtsCommandPayload.model_validate_json(tts_command.payload_json)
     except (TypeError, ValueError) as exc:
@@ -885,16 +937,14 @@ def verify_tts_ended_prerequisite(
             or tts_payload.cue_level != tts_command.prompt_level):
         raise AutopilotProofError(
             "only a turn-bound question/cue TTS may unlock recording")
-    ack = session.exec(select(RuntimeCommandAck).where(
-        RuntimeCommandAck.command_id == tts_command.id,
-        RuntimeCommandAck.idempotency_key == record_command.trigger_ack_idempotency_key,
-        RuntimeCommandAck.ack_type == "tts_ended",
-    )).first()
-    if ack is None:
-        raise AutopilotProofError("record trigger is not a persisted tts_ended ACK")
-    _verify_ack_binding(
-        session, tts_command, ack, ack_type="tts_ended",
-        require_terminal_revision=True)
+    ack = verify_terminal_tts_ack(
+        session,
+        tts_command,
+        ack_idempotency_key=record_command.trigger_ack_idempotency_key,
+        require_current_command=False,
+    )
+    if record_command.issued_at < max(tts_command.succeeded_at, ack.received_at):
+        raise AutopilotProofError("record command predates terminal TTS evidence")
     return ack
 
 
@@ -920,9 +970,21 @@ def verify_terminal_record_capture(
     )).first()
     if ack is None:
         raise AutopilotProofError("record command has no stopped ACK")
+    try:
+        payload = json.loads(ack.payload_json)
+        if (not isinstance(payload, dict)
+                or payload.get("stop_reason") not in RECORD_STOP_REASONS
+                or encode_ack_payload("record_stopped", payload) != ack.payload_json):
+            raise ValueError("invalid or non-canonical record_stopped payload")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AutopilotProofError(
+            "record_stopped ACK payload is not canonical evidence") from exc
     _verify_ack_binding(
         session, command, ack, ack_type="record_stopped",
         require_terminal_revision=True)
+    if command.succeeded_at < ack.received_at:
+        raise AutopilotProofError(
+            "record success timestamp predates its terminal ACK")
     if (ack.receipt_server_seq is None or ack.raw_audio_id is None
             or ack.checksum is None or ack.byte_count is None
             or ack.duration_seconds is None):
