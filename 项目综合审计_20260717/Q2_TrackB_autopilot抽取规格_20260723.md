@@ -1,5 +1,7 @@
 # Q2 Track B — 自动驾驶 P0A 加固 + 并发锁序 抽取规格（待 Eric 拍板后单独一轮执行）
 
+> **✅ 已执行 2026-07-23** — Eric"弄吧，这个弄完我一起来审核"后单独一轮落地。分支 `feature/q2-autopilot-hardening-20260723` commit `e8267fa`，**未部署**。做法=从干净 Track A 基线往上逐 hunk 加（非从脏 HEAD 往下删）。硬 grep 门禁 0 内核 / autopilot **215 passed** / 全量 pytest exit0 / 单头 f9b2d6e4a801 / 新增 7 负向测试。6-agent 对抗验证=**0 代码缺陷**；唯一锁序发现（technical-pause 重排 vs 两 attempt helper）**被独立反驳 not-a-bug**（单 worker + SQLite + 进程级 `_LIVE_WRITE_LOCK`，ABBA 结构不可达）。**关键偏差**：本规格 §「要抽取的」#2（service 外部停止内联命令匹配加强）实际 **DROP** 了——基线 `_command_matches_control_state` 已含 id/session/scope==P0A/双 generation 匹配，01cf27f 内联版在 P0A 分支上没多加东西，只留了两处 `db.expire(state)`。详见独立复核文档 §11。**仍待 Eric 真机自动驾驶验收**（步骤 7，只有他能做）。
+
 > Track A（AI 质量看板）已落 `feature/q2-quality-autopilot-20260723`。Track B 是 30h 审计里**唯一延后的高风险手术**：把 `01cf27f` 里真有价值的自动驾驶失败闭合 + 并发锁序加固择出来，剥掉缠绕的 task_contract 内核。**因它是老人端安全攸关的自动驾驶代码、且"去内核后的围栏"是 Codex 从没测过的新组合，建议单独一轮、配真机自动驾驶测试再落。**
 
 ## 为什么单独一轮（不塞进 Track A）
