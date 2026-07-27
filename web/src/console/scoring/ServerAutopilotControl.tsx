@@ -11,10 +11,15 @@ import {
   type AutopilotConsoleState,
 } from "../../autopilot/startControl";
 import {
+  canAutoStartServerAutopilot,
+  latchBedsideActivation,
+} from "../../autopilot/bedsideAutoStart";
+import {
   isProviderReadinessPrewriteConflict,
   providerReadinessLabel,
   type ProviderReadiness,
 } from "../../autopilot/providerReadiness";
+import { PATIENT_ACTIVATION_EVENT } from "../../sync/messages";
 import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -26,6 +31,8 @@ export function ServerAutopilotControl({
   hasNamedAccount,
   operationalAutopilotReady,
   unsupportedOperationalPositions,
+  patientMicOn,
+  planPositionReady,
   onOwnershipChange,
   prepareOwnership,
 }: {
@@ -34,6 +41,8 @@ export function ServerAutopilotControl({
   hasNamedAccount: boolean;
   operationalAutopilotReady: boolean | null;
   unsupportedOperationalPositions: string[];
+  patientMicOn: boolean;
+  planPositionReady: boolean;
   onOwnershipChange: (owned: boolean, phase: AutopilotConsoleState["phase"]) => void;
   prepareOwnership: () => Promise<boolean>;
 }) {
@@ -54,6 +63,11 @@ export function ServerAutopilotControl({
   const latestRevision = useRef(-1);
   const latestReceipt = useRef<Awaited<ReturnType<typeof api.autopilotStatus>> | null>(null);
   const operationEpoch = useRef(new AutopilotControlOperationEpoch());
+  // 床旁激活信号:锁存 exact-session 的一次激活;自动写请求每个激活周期最多一次。
+  // attempted 用同步 ref 而非 state——StrictMode 双跑同一 effect 时,第二跑必须
+  // 立刻看到第一跑已尝试,不能等 setState 落地。
+  const [bedsideActivation, setBedsideActivation] = useState<string | null>(null);
+  const autoStartAttempted = useRef(false);
   const [confirmTakeover, setConfirmTakeover] = useState(false);
   const [takeoverBusy, setTakeoverBusy] = useState(false);
   const [providerReadiness, setProviderReadiness] = useState<ProviderReadiness | null>(null);
@@ -86,6 +100,8 @@ export function ServerAutopilotControl({
     startInFlight.current = false;
     controlWriteInFlight.current = false;
     statusInFlight.current = false;
+    setBedsideActivation(null);
+    autoStartAttempted.current = false;
     setConfirmTakeover(false);
     setTakeoverBusy(false);
     if (!isSimulation) {
@@ -179,8 +195,6 @@ export function ServerAutopilotControl({
     }
   };
 
-  if (!isSimulation) return null;
-
   const start = async () => {
     if (completePlanBlocked || providerReadiness?.startAllowed !== true
         || !eligibility.allowed
@@ -229,6 +243,47 @@ export function ServerAutopilotControl({
       controlWriteInFlight.current = false;
     }
   };
+
+  // 接收床旁激活信号(窗内事件——不 import 老人端源码)。只锁存与当前场次完全
+  // 匹配的 sessionId;旧场次迟到事件、空值和重复事件都不会改变已锁存的状态。
+  useEffect(() => {
+    const onActivation = (event: Event) => {
+      const sessionId = (event as CustomEvent<{ sessionId?: unknown }>).detail?.sessionId;
+      setBedsideActivation((current) =>
+        latchBedsideActivation(current, sessionId, session.session_id));
+    };
+    window.addEventListener(PATIENT_ACTIVATION_EVENT, onActivation);
+    return () => window.removeEventListener(PATIENT_ACTIVATION_EVENT, onActivation);
+  }, [session.session_id]);
+
+  const startRef = useRef(start);
+  startRef.current = start;
+
+  // 老人端一次明确激活后,替研究者按一次既有的「启动」——同一条 start 链路,
+  // 不新建第二条。信号先到、门禁未明时只等待;checking/starting/uncertain/
+  // 服务器已持有/写前被拒 一律不自动发起,写请求每个激活周期最多一次。
+  useEffect(() => {
+    if (!canAutoStartServerAutopilot({
+      sessionId: session.session_id,
+      latchedActivationSessionId: bedsideActivation,
+      eligibilityAllowed: eligibility.allowed,
+      completePlanBlocked,
+      providerStartAllowed: providerReadiness?.startAllowed === true,
+      phase: state.phase,
+      receiptProvesNoOwner: state.receipt !== null && !state.receipt.serverOwned,
+      interactionBlocked,
+      patientMicOn,
+      planPositionReady,
+      startInFlight: startInFlight.current,
+      alreadyAttempted: autoStartAttempted.current,
+    })) return;
+    autoStartAttempted.current = true;
+    void startRef.current();
+  }, [bedsideActivation, completePlanBlocked, eligibility.allowed, interactionBlocked,
+    patientMicOn, planPositionReady, providerReadiness, session.session_id,
+    state.phase, state.receipt]);
+
+  if (!isSimulation) return null;
 
   const takeover = async () => {
     const receipt = state.receipt;

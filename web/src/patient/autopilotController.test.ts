@@ -13,6 +13,7 @@ import { canOpenAutopilotMicrophone } from "./autopilotRuntime.ts";
 import {
   canProbePatientAutopilot,
   canRunPatientAutopilotMedia,
+  canSignalBedsideActivation,
   resolvePatientAutopilotVisibleMode,
 } from "./autopilotAdmission.ts";
 
@@ -36,6 +37,32 @@ test("media admission requires tap, explicit TTS, connection, and server ownersh
   }
   assert.equal(canRunPatientAutopilotMedia({ ...ready, sessionPaused: true }), false);
   assert.equal(canRunPatientAutopilotMedia({ ...ready, sessionTerminal: true }), false);
+});
+
+test("bedside activation signal needs an explicit tap, tts on and a ready connection", () => {
+  const ready = {
+    sessionId: "S-1",
+    sessionMode: "task" as const,
+    sessionTerminal: false,
+    activatedForSessionId: "S-1",
+    ttsOn: true,
+    connectionReady: true,
+    alreadySignaledSessionId: null,
+  };
+  assert.equal(canSignalBedsideActivation(ready), true);
+  // 未点击激活(null)与上一场遗留的激活("S-0")都发不出本场信号。
+  assert.equal(canSignalBedsideActivation({ ...ready, activatedForSessionId: null }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, activatedForSessionId: "S-0" }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, ttsOn: false }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, connectionReady: false }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, sessionMode: "rapport" as const }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, sessionMode: null }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, sessionTerminal: true }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, sessionId: null }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, sessionId: "" }), false);
+  // 同一场次同一激活生命周期只发一次;只有换到新场次(新的激活周期)才会再发。
+  assert.equal(canSignalBedsideActivation({ ...ready, alreadySignaledSessionId: "S-1" }), false);
+  assert.equal(canSignalBedsideActivation({ ...ready, alreadySignaledSessionId: "S-0" }), true);
 });
 
 test("a fresh unpaired tab never guesses that a non-rapport session is legacy", () => {

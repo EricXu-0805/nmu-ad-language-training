@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { PinPrompt } from "../components/PinPrompt";
 import { bus } from "../sync/bus";
+import { PATIENT_ACTIVATION_EVENT } from "../sync/messages";
 import { useLiveCursor } from "../sync/useLiveCursor";
 import { usePatientHeartbeat } from "../sync/usePatientHeartbeat";
 import type { PatientPresenceScreen } from "../types";
@@ -13,6 +14,7 @@ import {
   reconcileBedsideSafetyLatch,
   type BedsideSafetyLatch,
 } from "./bedsideSafetyLatch";
+import { canSignalBedsideActivation } from "./autopilotAdmission";
 import { PatientAutopilotStage } from "./PatientAutopilotStage";
 import { PatientStage } from "./PatientStage";
 import { parsePatientSessionPlan, type PatientSessionPlan } from "./patientPlan";
@@ -77,7 +79,34 @@ export function PatientShell() {
     ));
   }, [session?.sessionId, session?.paused]);
 
-  useEffect(() => { setPatientActivated(false); }, [session?.sessionId]);
+  // 切场即清空激活态与已发信号记录:旧场次的激活绝不能替新场次说话。
+  // 点击激活在发生的那一刻就绑定当时的 sessionId(ref 同步写,不等 setState),
+  // 切场后的那一次 commit 里即使 patientActivated 还是旧值也发不出信号。
+  const activatedForSession = useRef<string | null>(null);
+  const activationSignaledFor = useRef<string | null>(null);
+  useEffect(() => {
+    setPatientActivated(false);
+    activatedForSession.current = null;
+    activationSignaledFor.current = null;
+  }, [session?.sessionId]);
+
+  // 老人一次明确点击 + 朗读开 + 连接就绪 → 对本窗操作端发一次 exact-session 激活信号。
+  // 同一场次同一激活生命周期只发一次;它只是本机触发条件,操作端仍走全套门禁,
+  // 服务端照常 fail-closed 重验——这里不产生任何授权或使用证据。
+  useEffect(() => {
+    const sessionId = session?.sessionId ?? null;
+    if (!canSignalBedsideActivation({
+      sessionId,
+      sessionMode: session ? session.mode : null,
+      sessionTerminal: terminal,
+      activatedForSessionId: patientActivated ? activatedForSession.current : null,
+      ttsOn,
+      connectionReady,
+      alreadySignaledSessionId: activationSignaledFor.current,
+    })) return;
+    activationSignaledFor.current = sessionId;
+    window.dispatchEvent(new CustomEvent(PATIENT_ACTIVATION_EVENT, { detail: { sessionId } }));
+  }, [session, terminal, patientActivated, ttsOn, connectionReady]);
 
   // useLayoutEffect:paint 前设好 34px 尺度,避免老人端首帧 16px→34px 全屏字号跳变
   useLayoutEffect(() => {
@@ -216,7 +245,16 @@ export function PatientShell() {
         </div>
       </div>
     )}
-    <TapToStart tapped={patientActivated} onTap={() => setPatientActivated(true)} />
+    <TapToStart tapped={patientActivated} onTap={() => {
+      activatedForSession.current = session?.sessionId ?? null;
+      setPatientActivated(true);
+      // 按钮明示"准备声音播放":这一次点击同时把朗读打开,主流程不再需要第二次触碰。
+      // 角落的朗读钮仍可随时关掉。
+      if (!ttsOn) {
+        setTtsEnabled(true);
+        setTtsOn(true);
+      }
+    }} />
     <TtsToggle on={ttsOn} onChange={setTtsOn} sampleContextKey={ttsContextKey} />
     <PinPrompt />
   </>;

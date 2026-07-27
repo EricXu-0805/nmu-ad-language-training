@@ -1656,6 +1656,8 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
           hasNamedAccount={hasNamedAccount}
           operationalAutopilotReady={operationalAutopilotReady}
           unsupportedOperationalPositions={unsupportedOperationalPositions}
+          patientMicOn={patientMicOn}
+          planPositionReady={Boolean(planTurn)}
           onOwnershipChange={onServerOwnershipChange}
           prepareOwnership={prepareServerOwnership}
         />

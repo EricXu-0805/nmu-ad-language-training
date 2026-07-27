@@ -316,3 +316,7 @@ export const PATIENT_VIEW_EVENT = "nmu:patient-view";           // detail: { ope
 export const PATIENT_VIEW_EXIT_EVENT = "nmu:patient-view-exit"; // 宿主按住返回 → 操作端收
 export const PATIENT_VIEW_REC_EVENT = "nmu:patient-view-rec";   // detail: { active } 录音真值→宿主退出钮
 export const CONSOLE_NOTE_EVENT = "nmu:console-note";           // detail: { count } 叠层期间暂存的提示数
+// detail: { sessionId } 老人端一次明确点击激活(浏览器 user activation)+朗读开+连接就绪后,
+// 对本窗操作端发一次"可尝试自动启动"信号。只是本机触发条件:不是研究授权、不是服务器
+// 真值、更不是"阿里已使用"的证据;操作端收到后仍走全套门禁与服务端重验,绝不绕过。
+export const PATIENT_ACTIVATION_EVENT = "nmu:patient-activation";
