@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+import hashlib
 import json
 import threading
 
@@ -40,6 +41,7 @@ from app.models import (
     SessionOutcomeSummary,
     SessionRuntimeState,
     TechnicalPauseReceipt,
+    TtsServeEvidence,
     TurnEvent,
     VisitPlan,
 )
@@ -2878,3 +2880,162 @@ def test_drain_and_takeover_domain_failures_roll_back_every_staged_fact(
             "autonomous", "paused", 3)
         assert [event.event_type for event in events] == [
             "start", "pause", "drain_complete"]
+
+
+def _exact_tts_path(command: dict) -> str:
+    return (
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{command['command_key']}/tts"
+    )
+
+
+def test_exact_tts_serve_appends_command_bound_engine_evidence(
+        api_clients: ApiClients, monkeypatch):
+    """每次实际返回音频都追加一行服务端引擎证据，且精确绑定命令。"""
+    _enable_p0a(monkeypatch)
+    monkeypatch.setattr(
+        "app.main.tts.speak",
+        lambda text: (b"RIFF-evidence-audio", "dashscope/qwen3-tts-flash/Serena", False))
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+    command = _device_next(api_clients)
+    assert command is not None and command["kind"] == "tts"
+
+    first = api_clients.device.post(
+        _exact_tts_path(command), headers=api_clients.device_headers, json={})
+    assert first.status_code == 200, first.text
+    replay = api_clients.device.post(
+        _exact_tts_path(command), headers=api_clients.device_headers, json={})
+    assert replay.status_code == 200, replay.text
+
+    with Session(api_clients.engine) as session:
+        rows = list(session.exec(
+            select(TtsServeEvidence).order_by(TtsServeEvidence.id)))
+        assert len(rows) == 2
+        command_row = session.exec(select(RuntimeCommand).where(
+            RuntimeCommand.idempotency_key == command["command_key"],
+        )).first()
+        assert command_row is not None
+        expected_sha = hashlib.sha256(
+            BANK.single_element[0]["initial_prompt"].encode("utf-8")).hexdigest()
+        for row in rows:
+            assert row.source == "autopilot_command"
+            assert row.command_id == command_row.id
+            assert row.session_id == SESSION_ID
+            assert row.engine_version == "dashscope/qwen3-tts-flash/Serena"
+            assert row.cache_hit is False
+            assert row.result == "served"
+            assert row.byte_count == len(b"RIFF-evidence-audio")
+            assert row.text_sha256 == expected_sha
+            assert row.is_simulation is True
+
+
+def test_exact_tts_degraded_serve_records_honest_degradation(
+        api_clients: ApiClients, monkeypatch):
+    """降级(204)同样如实入账：result=degraded、无字节数、引擎为实际尝试者。"""
+    _enable_p0a(monkeypatch)
+    monkeypatch.setattr(
+        "app.main.tts.speak",
+        lambda text: (None, "piper/zh_CN-huayan-medium", False))
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+    command = _device_next(api_clients)
+    assert command is not None and command["kind"] == "tts"
+
+    degraded = api_clients.device.post(
+        _exact_tts_path(command), headers=api_clients.device_headers, json={})
+    assert degraded.status_code == 204, degraded.text
+
+    with Session(api_clients.engine) as session:
+        rows = list(session.exec(select(TtsServeEvidence)))
+        assert len(rows) == 1
+        assert rows[0].result == "degraded"
+        assert rows[0].byte_count is None
+        assert rows[0].engine_version == "piper/zh_CN-huayan-medium"
+        assert rows[0].command_id is not None
+
+
+def test_discarded_tts_bytes_leave_no_usage_evidence(
+        api_clients: ApiClients, monkeypatch):
+    """授权复核失败被丢弃的音频不得留下任何"已使用"证据行。"""
+    _enable_p0a(monkeypatch)
+    monkeypatch.setattr(
+        "app.main.tts.speak",
+        lambda text: (b"RIFF-discarded-audio", "dashscope/qwen3-tts-flash/Serena", False))
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+    command = _device_next(api_clients)
+    assert command is not None and command["kind"] == "tts"
+
+    real_text = autopilot_service.authorized_tts_text
+    calls = {"n": 0}
+
+    def flaky_authorized_tts_text(db, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise autopilot_service.AutopilotServiceError(
+                "autopilot_command_not_current", "复核时命令已不是当前命令")
+        return real_text(db, **kwargs)
+
+    monkeypatch.setattr(
+        autopilot_service, "authorized_tts_text", flaky_authorized_tts_text)
+    discarded = api_clients.device.post(
+        _exact_tts_path(command), headers=api_clients.device_headers, json={})
+    assert discarded.status_code == 409, discarded.text
+    assert discarded.json()["detail"]["code"] == "tts_authorization_changed"
+
+    with Session(api_clients.engine) as session:
+        assert list(session.exec(select(TtsServeEvidence))) == []
+
+
+def test_generic_tts_speak_appends_live_speak_evidence(
+        api_clients: ApiClients, monkeypatch):
+    """通用 /tts/speak 路径的证据行：source=live_speak、无命令绑定、带场次。"""
+    monkeypatch.setattr(
+        "app.main.tts.speak",
+        lambda text: (b"RIFF-live-audio", "piper/zh_CN-huayan-medium", True))
+    spoken = api_clients.device.post(
+        "/tts/speak",
+        headers=api_clients.device_headers,
+        json={"text": "你好呀"},
+    )
+    assert spoken.status_code == 200, spoken.text
+
+    with Session(api_clients.engine) as session:
+        rows = list(session.exec(select(TtsServeEvidence)))
+        assert len(rows) == 1
+        assert rows[0].source == "live_speak"
+        assert rows[0].command_id is None
+        assert rows[0].session_id == SESSION_ID
+        assert rows[0].cache_hit is True
+        assert rows[0].result == "served"
+
+
+def test_ai_usage_endpoint_reports_actual_usage_not_probe(
+        api_clients: ApiClients, monkeypatch):
+    """/ai-usage 只聚合服务端实际使用账本；匿名不可读。"""
+    _enable_p0a(monkeypatch)
+    monkeypatch.setattr(
+        "app.main.tts.speak",
+        lambda text: (b"RIFF-usage-audio", "dashscope/qwen3-tts-flash/Serena", False))
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+    command = _device_next(api_clients)
+    assert command is not None
+    served = api_clients.device.post(
+        _exact_tts_path(command), headers=api_clients.device_headers, json={})
+    assert served.status_code == 200, served.text
+
+    denied = api_clients.anonymous.get(f"/sessions/{SESSION_ID}/ai-usage")
+    assert denied.status_code in (401, 403), denied.text
+
+    usage = api_clients.account.get(f"/sessions/{SESSION_ID}/ai-usage")
+    assert usage.status_code == 200, usage.text
+    body = usage.json()
+    assert body["tts"]["engines"] == [{
+        "engine_version": "dashscope/qwen3-tts-flash/Serena",
+        "served": 1, "cache_hits": 0, "degraded": 0,
+    }]
+    assert body["asr"]["engines"] == []
+    assert body["asr"]["degraded_attempts"] == 0
+    assert body["judge"]["modes"] == []

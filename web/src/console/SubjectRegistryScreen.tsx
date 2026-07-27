@@ -5,7 +5,8 @@ import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
 import { useToast } from "../components/ToastContext";
 import type { PatientSummary, PatientWithdrawalReceipt, Session } from "../types";
-import { QUICK_DRILL_CONTEXT_LABEL, runQuickDrill } from "./quickDrill";
+import { QUICK_DRILL_CONTEXT_LABEL } from "./quickDrill";
+import { runNextTask } from "./nextTask.ts";
 import { DataBoundaryBadge, DataBoundaryFilter } from "./DataBoundaryFilter";
 import { PatientIntakeScreen } from "./PatientIntakeScreen";
 import {
@@ -63,17 +64,29 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
     try { localStorage.setItem(FLOW_MODE_KEY, next); } catch { /* 存储不可用不阻塞流程 */ }
   };
 
-  // 一键演练:仅对模拟档案,原子走服务端 create→approve→start,成功即把场次交回外壳。
-  // 失败(如同槽位已有安排/内容未冻结)平静提示,绝不静默;不改任何服务端门禁。
-  const startQuickDrill = useCallback(async (patientId: string) => {
+  // 「开始下一项任务」:系统按安全优先级推导(回原场→开已审核到期安排→模拟档案
+  // 才折叠审核/新建),全程逐步走服务端计划账本、不绕过任何门禁。真实研究档案
+  // 的审核是人的决策点:推导只指路(blocked+原因),并把研究者带到安排页处理。
+  const startNextTask = useCallback(async (patientId: string, isSimulation: boolean) => {
     if (!onSessionStarted || quickDrillBusy) return;
     setQuickDrillBusy(patientId);
     try {
-      const session = await runQuickDrill(api, patientId);
-      onSessionStarted(session); // 成功即切走本屏,不再回写本组件状态
+      const outcome = await runNextTask(
+        api, patientId, { autoApproveAndCreate: isSimulation });
+      if (outcome.kind === "blocked") {
+        toast(`还不能直接开场：${outcome.reason}`, "warn");
+        setPlanPatientId(patientId);
+        setMode("plan");
+        setQuickDrillBusy(null);
+        return;
+      }
+      if (outcome.kind === "resumed") {
+        toast("该受试者有未收口的场次，已回到原场继续", "info");
+      }
+      onSessionStarted(outcome.session); // 成功即切走本屏,不再回写本组件状态
     } catch (e) {
       const detail = e instanceof ApiError ? e.detail : e instanceof Error ? e.message : String(e);
-      toast(`一键演练开训未成功：${detail}`, "danger");
+      toast(`开始下一项任务未成功：${detail}`, "danger");
       setQuickDrillBusy(null);
     }
   }, [onSessionStarted, quickDrillBusy, toast]);
@@ -118,8 +131,8 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
           setPlanPatientId(patientId);
           setMode("plan");
           setNonce((n) => n + 1);
-        }} onQuickDrill={flowMode === "quickDrill" && quickDrillEnabled
-          ? (patientId) => { void startQuickDrill(patientId); }
+        }} onNextTask={quickDrillEnabled
+          ? (patientId, isSimulationSubject) => { void startNextTask(patientId, isSimulationSubject); }
           : undefined} />
         {/* 返回也刷新列表：建档请求可能已完成，不能因后续网络失败把新档案隐藏。 */}
         <div className="form-actions"><Button onClick={() => { setMode("list"); setNonce((n) => n + 1); }}>返回登记表</Button></div>
@@ -283,9 +296,9 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
                   {flowMode === "quickDrill" && quickDrillEnabled
                     && classification === "simulation" && !r.withdrawal_status && (
                     <Button variant="primary" disabled={quickDrillBusy !== null}
-                      title={`一键 建档已完成 → 审核 → 开场（${QUICK_DRILL_CONTEXT_LABEL}）；不绕过服务端计划账本`}
-                      onClick={() => { void startQuickDrill(r.patient_id); }}>
-                      {quickDrillBusy === r.patient_id ? "正在开场…" : "一键演练开训"}
+                      title={`系统推导下一项任务：回原场 → 开已审核安排 → 新建（${QUICK_DRILL_CONTEXT_LABEL}）；不绕过服务端计划账本`}
+                      onClick={() => { void startNextTask(r.patient_id, true); }}>
+                      {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
                     </Button>
                   )}
               </span>

@@ -14,7 +14,7 @@ import math
 import secrets
 import threading
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Literal, NamedTuple, NoReturn
 from urllib.parse import unquote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
@@ -54,7 +54,7 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      RuntimeCommand, ScaleResult, SessionAutopilotState,
                      SessionCloseoutReport, SessionOutcomeSummary,
                      SessionRuntimeState, TechnicalPauseReceipt,
-                     TurnConfirmationRevision, TurnEvent,
+                     TtsServeEvidence, TurnConfirmationRevision, TurnEvent,
                      VisitPlan)
 from .models import Session as TrainSession
 
@@ -6525,12 +6525,15 @@ def _revalidate_tts_after_provider(
         command_key: str | None = None,
         capability_token_hash: str | None = None,
         expected_text: str | None = None,
+        serve_facts: _TtsServeFacts | None = None,
 ) -> None:
     """Reauthorize a synthesized result under the same live/capability locks.
 
     Provider/cache I/O has already completed, but its bytes remain process-local
     until this function proves that the exact live/runtime revision and, for an
     autonomous command, the exact command/token/server-derived text still match.
+    Only then is the serve fact appended: evidence row exists ⇔ the response is
+    actually returned; discarded audio leaves no usage claim.
     """
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
@@ -6548,6 +6551,7 @@ def _revalidate_tts_after_provider(
                     live=live,
                     manual_text=manual_text,
                 )
+            command_id: int | None = None
             if command_key is not None:
                 if (session_id is None
                         or capability_token_hash is None
@@ -6564,7 +6568,31 @@ def _revalidate_tts_after_provider(
                     _raise_tts_authorization_changed()
                 if current_text != expected_text:
                     _raise_tts_authorization_changed()
-            s.rollback()
+                command_row = s.exec(select(RuntimeCommand).where(
+                    RuntimeCommand.session_id == session_id,
+                    RuntimeCommand.idempotency_key == command_key,
+                )).first()
+                if command_row is None or command_row.id is None:
+                    _raise_tts_authorization_changed()
+                command_id = command_row.id
+            if serve_facts is None:
+                s.rollback()
+                return
+            sess_row = (s.get(TrainSession, session_id)
+                        if session_id is not None else None)
+            s.add(TtsServeEvidence(
+                session_id=session_id,
+                command_id=command_id,
+                source=("autopilot_command" if command_key is not None
+                        else "live_speak"),
+                engine_version=serve_facts.engine_version,
+                cache_hit=serve_facts.cache_hit,
+                result=serve_facts.result,
+                byte_count=serve_facts.byte_count,
+                text_sha256=serve_facts.text_sha256,
+                is_simulation=bool(sess_row.is_simulation) if sess_row else False,
+            ))
+            s.commit()
         except HTTPException as exc:
             s.rollback()
             detail = exc.detail
@@ -6609,25 +6637,39 @@ def tts_speak(body: TtsSpeakIn, request: Request,
     text = body.text.strip()
     if not text:
         raise HTTPException(422, "text 为空")
-    response = _synthesize_tts_text(text)
+    response, serve_facts = _synthesize_tts_text(text)
     _revalidate_tts_after_provider(
         request,
         s,
         expected_snapshot=authorization_snapshot,
         manual_text=True,
+        serve_facts=serve_facts,
     )
     return response
 
 
-def _synthesize_tts_text(text: str) -> PlainResponse:
+class _TtsServeFacts(NamedTuple):
+    """Server-observed synthesis outcome; the only admissible usage evidence."""
+    engine_version: str
+    cache_hit: bool
+    result: str            # served / degraded
+    byte_count: int | None
+    text_sha256: str
+
+
+def _synthesize_tts_text(text: str) -> tuple[PlainResponse, _TtsServeFacts]:
     """Run provider/cache I/O outside the LiveState/capability transaction."""
     data, version, cached = tts.speak(text)
+    text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if data is None:
         # 204 显式禁缓存:补装模型后老人端刷新要立刻吃到 200,不能被启发式缓存钉死在降级态
-        return PlainResponse(status_code=204, headers={"X-Tts-Engine": version, "Cache-Control": "no-store"})
+        facts = _TtsServeFacts(version, False, "degraded", None, text_sha256)
+        return PlainResponse(status_code=204, headers={
+            "X-Tts-Engine": version, "Cache-Control": "no-store"}), facts
+    facts = _TtsServeFacts(version, cached, "served", len(data), text_sha256)
     return PlainResponse(content=data, media_type="audio/wav",
                          headers={"X-Tts-Engine": version, "X-Tts-Cache": "hit" if cached else "miss",
-                                  "Cache-Control": "no-store"})
+                                  "Cache-Control": "no-store"}), facts
 
 
 @app.post("/sessions/{session_id}/autopilot/commands/{command_key}/tts")
@@ -6671,7 +6713,7 @@ def autopilot_command_tts(
             _raise_autopilot_http_error(exc)
     # Provider/cache I/O can take seconds and must never retain the global live
     # row or capability serialization lock.
-    response = _synthesize_tts_text(text)
+    response, serve_facts = _synthesize_tts_text(text)
     _revalidate_tts_after_provider(
         request,
         s,
@@ -6680,6 +6722,7 @@ def autopilot_command_tts(
         command_key=command_key,
         capability_token_hash=token_hash,
         expected_text=text,
+        serve_facts=serve_facts,
     )
     return response
 
@@ -10138,6 +10181,7 @@ def session_journal(session_id: str, request: Request, response: Response,
             },
             "items": [], "turns": [], "audios": [], "abnormal": [],
             "attempts": [], "interactions": [], "audio_receipts": [],
+            "tts_serves": [], "confirmation_revisions": [],
             "tombstone": tombstone,
         }
     items = list(s.exec(select(ItemEvent)
@@ -10165,11 +10209,100 @@ def session_journal(session_id: str, request: Request, response: Response,
     audio_receipts = list(s.exec(select(AudioCaptureReceipt).where(
         AudioCaptureReceipt.session_id == session_id,
     ).order_by(AudioCaptureReceipt.server_seq)))
+    tts_serves = list(s.exec(select(TtsServeEvidence).where(
+        TtsServeEvidence.session_id == session_id,
+    ).order_by(TtsServeEvidence.id)))
+    # 修订账本的内容自由投影：who/when/revision，不带哈希与文本。
+    turn_ids = [t.id for t in turns if t.id is not None]
+    confirmation_revisions = []
+    if turn_ids:
+        for row in s.exec(select(TurnConfirmationRevision).where(
+                TurnConfirmationRevision.turn_id.in_(turn_ids),
+        ).order_by(TurnConfirmationRevision.turn_id,
+                   TurnConfirmationRevision.revision)):
+            confirmation_revisions.append({
+                "turn_id": row.turn_id,
+                "revision": row.revision,
+                "actor_display_id": row.actor_display_id,
+                "changed_at": row.changed_at,
+            })
     return {"session": sess, "items": items, "turns": turns,
             "audios": audios, "abnormal": abnormal,
             "attempts": [_research_attempt_projection(row) for row in attempts],
             "interactions": interactions,
-            "audio_receipts": audio_receipts}
+            "audio_receipts": audio_receipts,
+            "tts_serves": tts_serves,
+            "confirmation_revisions": confirmation_revisions}
+
+
+@app.get("/sessions/{session_id}/ai-usage")
+def session_ai_usage(session_id: str, request: Request, response: Response,
+                     s: DBSession = Depends(get_session)):
+    """本场次 AI 实际使用汇总，只聚合服务端账本。
+
+    三类证据必须分开呈现，不能互相替代：探针通过（/ai/provider-readiness）
+    只证明配置可达；本端点聚合的 TtsServeEvidence/AttemptEvent 才是"实际
+    使用"；autopilot 控制状态另见 /sessions/{id}/autopilot/status。
+    前端自报的引擎信息从不入账。
+    """
+    sess = s.get(TrainSession, session_id)
+    if not sess:
+        raise HTTPException(404, "场次不存在")
+    _require_session_read_operator_if_admitted(
+        request, sess, s, "读取场次 AI 使用证据")
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    restriction_reason = _session_read_restriction_reason(sess, s)
+    if restriction_reason is not None:
+        _raise_withdrawn_session_read_conflict(
+            sess, resource="ai_usage", reason_code=restriction_reason)
+    tts_engines: dict[str, dict[str, int]] = {}
+    for row in s.exec(select(TtsServeEvidence).where(
+            TtsServeEvidence.session_id == session_id)):
+        agg = tts_engines.setdefault(row.engine_version, {
+            "served": 0, "cache_hits": 0, "degraded": 0})
+        if row.result == "served":
+            agg["served"] += 1
+            if row.cache_hit:
+                agg["cache_hits"] += 1
+        else:
+            agg["degraded"] += 1
+    asr_engines: dict[str, int] = {}
+    asr_degraded = 0
+    judge_modes: dict[tuple[str, str], int] = {}
+    for attempt in s.exec(select(AttemptEvent).where(
+            AttemptEvent.session_id == session_id)):
+        if attempt.asr_engine_version:
+            asr_engines[attempt.asr_engine_version] = (
+                asr_engines.get(attempt.asr_engine_version, 0) + 1)
+        if attempt.error_code == "asr_degraded":
+            asr_degraded += 1
+        if attempt.judge_mode:
+            key = (attempt.judge_mode, attempt.judge_engine_version or "")
+            judge_modes[key] = judge_modes.get(key, 0) + 1
+    return {
+        "session_id": session_id,
+        "tts": {
+            "engines": [
+                {"engine_version": version, **agg}
+                for version, agg in sorted(tts_engines.items())
+            ],
+        },
+        "asr": {
+            "engines": [
+                {"engine_version": version, "attempts": count}
+                for version, count in sorted(asr_engines.items())
+            ],
+            "degraded_attempts": asr_degraded,
+        },
+        "judge": {
+            "modes": [
+                {"judge_mode": mode, "judge_engine_version": engine,
+                 "attempts": count}
+                for (mode, engine), count in sorted(judge_modes.items())
+            ],
+        },
+    }
 
 
 @app.get("/sessions/{session_id}/scores")

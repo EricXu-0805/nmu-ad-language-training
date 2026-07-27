@@ -124,6 +124,8 @@ _ROUTE_RULES = (
            label="读取服务端录音收据"),
     _route({"GET", "HEAD"}, r"/sessions/[^/]+/(?:outcome-summary|closeout)",
            AccessKind.ACCOUNT, label="读取场次自动汇总或现场收尾"),
+    _route({"GET", "HEAD"}, r"/sessions/[^/]+/ai-usage", AccessKind.ACCOUNT,
+           label="读取场次 AI 实际使用证据"),
     _route({"GET", "HEAD"}, r"/sessions/[^/]+/autopilot/status", AccessKind.ACCOUNT,
            label="读取自动驾驶所有权状态"),
     _route({"GET", "HEAD"}, r"/ai/provider-readiness", AccessKind.ACCOUNT,

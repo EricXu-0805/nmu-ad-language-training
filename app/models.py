@@ -1255,6 +1255,54 @@ def _reject_runtime_command_ack_mutation(*_args) -> None:
     raise RuntimeError("RuntimeCommandAck 是只追加回执，禁止更新或删除")
 
 
+class TtsServeEvidence(SQLModel, table=True):
+    """服务端 TTS 实际返回的只追加证据：每次向设备返回(或降级)一句话术记一行。
+
+    这是"某次交互实际使用了哪个 TTS 引擎"的唯一权威来源——engine_version 与
+    cache_hit 由服务端合成路径产生，前端上报不被接受。文本只存 SHA-256
+    （话术本就来自白名单闭集，账本仍不复制内容）。授权复核失败被丢弃的音频
+    不记行：行存在 ⇔ 字节确实返回给了请求方。
+    """
+    __table_args__ = (
+        CheckConstraint("source IN ('autopilot_command','live_speak')",
+                        name="ck_tts_serve_source"),
+        CheckConstraint("result IN ('served','degraded')",
+                        name="ck_tts_serve_result"),
+        CheckConstraint(
+            "length(text_sha256) = 64 AND lower(text_sha256) = text_sha256",
+            name="ck_tts_serve_text_sha256"),
+        CheckConstraint(
+            "(result = 'served' AND byte_count > 0) OR "
+            "(result = 'degraded' AND byte_count IS NULL)",
+            name="ck_tts_serve_bytes_match_result"),
+        CheckConstraint(
+            "(source = 'autopilot_command' AND command_id IS NOT NULL) OR "
+            "(source = 'live_speak' AND command_id IS NULL)",
+            name="ck_tts_serve_command_binding"),
+        Index("ix_tts_serve_session_created", "session_id", "created_at"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: Optional[str] = Field(
+        default=None, foreign_key="session.session_id", index=True)
+    command_id: Optional[int] = Field(
+        default=None, foreign_key="runtimecommand.id", index=True)
+    source: str
+    engine_version: str
+    cache_hit: bool = False
+    result: str
+    byte_count: Optional[int] = None
+    text_sha256: str
+    is_simulation: bool = False
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+@sa_event.listens_for(TtsServeEvidence, "before_update")
+@sa_event.listens_for(TtsServeEvidence, "before_delete")
+def _reject_tts_serve_evidence_mutation(*_args) -> None:
+    raise RuntimeError("TtsServeEvidence 是只追加使用证据，禁止更新或删除")
+
+
 class SessionAutopilotState(SQLModel, table=True):
     """One recoverable, CAS-protected autopilot control row per session."""
     __table_args__ = (

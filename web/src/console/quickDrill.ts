@@ -26,7 +26,7 @@ export interface QuickDrillClient {
   getStartedVisitSession(receipt: VisitPlanReceipt): Promise<Session>;
 }
 
-function localToday(): string {
+export function localToday(): string {
   // 服务端 _research_today 默认 Asia/Shanghai,研究现场同区,故本地日期即研究当天。
   // 只需保证 scheduled_date 不晚于研究当天(start_plan 仅拦「未到期」,允许迟开)。
   const now = new Date();
@@ -38,16 +38,19 @@ function localToday(): string {
 
 // 对已建好的模拟档案原子编排 create → approve → start → 取场次。
 // keySeed 让三条命令的幂等键成套稳定(可注入以便测试);默认每次调用一把新键。
+// sittingNo:协议槽位含 sitting——同人再次演练必须用新 sitting,否则撞
+// uq_visit_plan_protocol_slot_key(服务端 409);由调用方(nextTask 推导)给出。
 export async function runQuickDrill(
   client: QuickDrillClient,
   patientId: string,
   keySeed: string = crypto.randomUUID(),
+  sittingNo: number = 1,
 ): Promise<Session> {
   const created = await client.createVisitPlan({
     idempotency_key: `qd-create-${keySeed}`,
     patient_id: patientId,
     scheduled_date: localToday(),
-    session_sitting_no: 1,
+    session_sitting_no: sittingNo,
     week_no: QUICK_DRILL_WEEK,
     phase_type: QUICK_DRILL_PHASE,
     event_line: QUICK_DRILL_EVENT,
