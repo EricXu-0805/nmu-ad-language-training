@@ -42,9 +42,12 @@ export function isRetryableAutopilotProbeError(error: unknown): boolean {
  *
  * `autopilot_not_active` and an explicitly disabled P0a gate are stable facts for
  * the current capability/session epoch.  They admit the manual runner once, but
- * must never create a 1.5 second 409 request storm.  Network uncertainty remains
- * fail-closed and retries with a finite exponential budget; re-pairing (a new
- * capability epoch) is the explicit way to obtain a fresh budget.
+ * must never create a 1.5 second 409 request storm: polling stops until an
+ * explicit serverOwned wake (sync/autopilotWake.ts — console 权威回执证明服务器
+ * 已持有本场次后发的一次性唤醒) or a capability/session epoch change.  Network
+ * uncertainty remains fail-closed and retries with a finite exponential budget;
+ * re-pairing (a new capability epoch) is the explicit way to obtain a fresh
+ * budget.
  */
 export function planAutopilotProbeFailure(
   error: unknown,

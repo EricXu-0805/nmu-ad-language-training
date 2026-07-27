@@ -46,6 +46,10 @@ import {
 } from "./autopilotProbePolicy.ts";
 import type { PatientAssetReadinessEvent } from "./currentPatientAsset.ts";
 import { PatientAssetMediaGate } from "./patientAssetMediaGate.ts";
+import {
+  PATIENT_AUTOPILOT_WAKE_EVENT,
+  PatientProbeWakeCoordinator,
+} from "../sync/autopilotWake.ts";
 
 export type { PatientAutopilotMode } from "./autopilotAdmission.ts";
 
@@ -120,6 +124,11 @@ export function usePatientAutopilot(input: {
   const [assetReadiness, setAssetReadiness] = useState<PatientAssetReadinessEvent | null>(null);
   const assetGateRef = useRef<PatientAssetMediaGate | null>(null);
   if (assetGateRef.current === null) assetGateRef.current = new PatientAssetMediaGate();
+  const wakeCoordinatorRef = useRef<PatientProbeWakeCoordinator | null>(null);
+  if (wakeCoordinatorRef.current === null) {
+    wakeCoordinatorRef.current = new PatientProbeWakeCoordinator();
+  }
+  const [wakeNonce, setWakeNonce] = useState(0);
   const controllerRef = useRef<PatientAutopilotController | null>(null);
   const serverContextRef = useRef<ServerContext | null>(null);
   const probeRetryAttempt = useRef(0);
@@ -174,6 +183,23 @@ export function usePatientAutopilot(input: {
   useEffect(() => {
     assetGateRef.current?.reset("场次已切换");
     setAssetReadiness(null);
+    wakeCoordinatorRef.current?.reset();
+  }, [input.sessionId]);
+
+  // 服务器取得控制权后的同窗一次性唤醒(console 权威回执→本 hook):监听只锁存,
+  // 严格拒绝旧场次/空场次/畸形与重复 token;真正的重新探测由下面的消费 effect
+  // 按"已解析且仍是 legacy"一次性放行。
+  useEffect(() => {
+    const sessionId = input.sessionId;
+    if (!sessionId) return;
+    const onWake = (event: Event) => {
+      const detail = (event as CustomEvent<unknown>).detail;
+      if (wakeCoordinatorRef.current?.receive(detail, sessionId)) {
+        setWakeNonce((value) => value + 1);
+      }
+    };
+    window.addEventListener(PATIENT_AUTOPILOT_WAKE_EVENT, onWake);
+    return () => window.removeEventListener(PATIENT_AUTOPILOT_WAKE_EVENT, onWake);
   }, [input.sessionId]);
 
   const credential = input.sessionId ? selectDeviceCredential(input.sessionId) : null;
@@ -319,6 +345,17 @@ export function usePatientAutopilot(input: {
       void idle.finally(releaseOwner);
     };
   }, [input.sessionId, input.sessionTerminal, capabilityKey, probeKey, probeEpoch]);
+
+  // stop-legacy 闩(防 409 风暴)保持:被闩住后不轮询,直到明确的 serverOwned 唤醒
+  // 或 capability/session epoch 改变。消费一个待命唤醒 = 恰好一次 probeEpoch+1,
+  // 重新走上面同一个所有权探测 effect 进入既有 server runner,不建第二套执行器;
+  // 探测在途时唤醒被持有不丢弃,server 已在场时标记完成、绝不重建 runner。
+  useEffect(() => {
+    const probeResolved = probeKey !== "" && probeKey === resolvedProbeKey;
+    if (wakeCoordinatorRef.current?.consume({ mode: visibleMode, probeResolved })) {
+      setProbeEpoch((value) => value + 1);
+    }
+  }, [wakeNonce, visibleMode, probeKey, resolvedProbeKey]);
 
   const mediaAllowed = canRunPatientAutopilotMedia({
     serverOwned: visibleMode === "server",

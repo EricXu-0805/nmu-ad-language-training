@@ -20,6 +20,11 @@ import {
   type ProviderReadiness,
 } from "../../autopilot/providerReadiness";
 import { PATIENT_ACTIVATION_EVENT } from "../../sync/messages";
+import {
+  autopilotWakeToken,
+  nextServerOwnershipWake,
+  PATIENT_AUTOPILOT_WAKE_EVENT,
+} from "../../sync/autopilotWake";
 import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -68,6 +73,8 @@ export function ServerAutopilotControl({
   // 立刻看到第一跑已尝试,不能等 setState 落地。
   const [bedsideActivation, setBedsideActivation] = useState<string | null>(null);
   const autoStartAttempted = useRef(false);
+  // 已发出的 serverOwned 唤醒 token:同 session+同权威版本重复轮询不反复唤醒。
+  const lastWakeToken = useRef<string | null>(null);
   const [confirmTakeover, setConfirmTakeover] = useState(false);
   const [takeoverBusy, setTakeoverBusy] = useState(false);
   const [providerReadiness, setProviderReadiness] = useState<ProviderReadiness | null>(null);
@@ -90,6 +97,16 @@ export function ServerAutopilotControl({
       receipt.serverOwned,
       receipt.serverOwned ? receipt.status : "idle",
     );
+    // 权威回执证明服务器已持有当前场次 → 对同窗患者端发一次性唤醒,让被
+    // autopilot_not_active 闩在 legacy 的老人端重新探测一次并进入既有 server
+    // runner。POST /start 回执与响应丢失后的 /status 对账都汇入本收口;
+    // serverOwned=false 与 checking/rejected/uncertain(无权威回执)发不出唤醒。
+    // 唤醒不是授权、不是使用证据,患者端仍由 capability 与服务端权威验证。
+    const wake = nextServerOwnershipWake(lastWakeToken.current, session.session_id, receipt);
+    if (wake) {
+      lastWakeToken.current = autopilotWakeToken(wake);
+      window.dispatchEvent(new CustomEvent(PATIENT_AUTOPILOT_WAKE_EVENT, { detail: wake }));
+    }
   }, [onOwnershipChange, session.session_id]);
 
   useEffect(() => {
@@ -102,6 +119,7 @@ export function ServerAutopilotControl({
     statusInFlight.current = false;
     setBedsideActivation(null);
     autoStartAttempted.current = false;
+    lastWakeToken.current = null;
     setConfirmTakeover(false);
     setTakeoverBusy(false);
     if (!isSimulation) {
