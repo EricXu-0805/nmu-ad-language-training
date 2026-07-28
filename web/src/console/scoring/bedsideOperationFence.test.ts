@@ -91,9 +91,10 @@ test("technical pause retries reuse one exact request and never publish a slow c
 test("a latched technical failure must be reconciled before the ordinary resume control opens", () => {
   const source = readFileSync(
     new URL("./TrainingConsoleScreen.tsx", import.meta.url), "utf8");
+  // observerMode ⊇ serverOwned：服务器拥有、尚不能证伪拥有、重同步未完成都锁 resume。
   assert.match(
     source,
-    /resumeBlocked=\{serverOwned \|\| Boolean\(apFailure\)\}/,
+    /resumeBlocked=\{observerMode \|\| Boolean\(apFailure\)\}/,
   );
   assert.match(source, /reconcilePendingTechnicalPauseForTakeover\(/);
 });

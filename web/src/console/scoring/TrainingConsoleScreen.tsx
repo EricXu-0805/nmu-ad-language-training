@@ -33,6 +33,16 @@ import { answerTimeoutAction, canReleaseAutopilotFailure, makeAutopilotFailure, 
 import { decideAudioSavedAutomation, retireLegacyAudioSavedAutoAdvancePreference } from "./audioSavedProgressSafety";
 import { bedsideOperationIsCurrent, captureBedsideOperation, type BedsideOperationFence } from "./bedsideOperationFence";
 import { ServerAutopilotControl } from "./ServerAutopilotControl";
+import { ObserverConsole } from "./ObserverConsole.tsx";
+import {
+  manualResyncRequired,
+  manualSurfaceLocked,
+  observerPlanPosition,
+  observerResyncResultCurrent,
+  type ManualResyncStatus,
+  type ObserverResyncFence,
+} from "./observerConsoleModel.ts";
+import { deriveOwnershipTransition, runManualResyncTransaction } from "./observerResync.ts";
 import type { AutopilotConsoleState } from "../../autopilot/startControl";
 import { assertPortraitFree, isRelationRole } from "./vm";
 
@@ -131,9 +141,106 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
       phase: mustRecoverServerOwner ? "checking" : "idle",
     };
   });
-  const onServerOwnershipChange = useCallback((owned: boolean, phase: AutopilotConsoleState["phase"]) => {
-    setServerOwnership({ owned, phase });
+  // 所有权回调可能在 React 提交这次 state 更新前就被再次调用（甚至在同一个
+  // tick 里被批处理），而重同步事务的每个异步边界都要核对"此刻"的所有权——ref
+  // 是唯一能保证时序的读取源，不能只靠下一次渲染才跑的 effect。
+  const ownershipRef = useRef(serverOwnership);
+  const manualResyncStatusRef = useRef<ManualResyncStatus>("idle");
+  const [manualResync, setManualResyncState] = useState<{ status: ManualResyncStatus; error: string | null }>({ status: "idle", error: null });
+  const setManualResync = useCallback((next: { status: ManualResyncStatus; error: string | null }) => {
+    manualResyncStatusRef.current = next.status;
+    setManualResyncState(next);
   }, []);
+  // 是否发生过自动化暴露（服务器证实拥有过 / start 写已发出 / 写后状态不明）。
+  // 初次挂载的只读 checking 询问不算：它得到明确 no-owner 时走既有恢复门。
+  const automationExposure = useRef(false);
+  const resyncFence = useRef<ObserverResyncFence>({ sessionId: session.session_id, epoch: 0 });
+  const previousServerOwned = useRef(serverOwnership.owned);
+  const planRef = useRef<SessionPlan | null>(null);
+  planRef.current = plan;
+  const onServerOwnershipChange = useCallback((owned: boolean, phase: AutopilotConsoleState["phase"]) => {
+    const next = { owned, phase };
+    ownershipRef.current = next;
+    const transition = deriveOwnershipTransition(
+      automationExposure.current,
+      next,
+      manualResyncStatusRef.current === "idle",
+    );
+    automationExposure.current = transition.automationExposure;
+    if (transition.invalidateResync) {
+      // 服务器重新证明持有：同步作废在途/失败的重同步，防止旧 fence 下的
+      // Promise 抢在下一次渲染跑到 effect 之前，就把人工面板重挂出来。
+      resyncFence.current = { ...resyncFence.current, epoch: resyncFence.current.epoch + 1 };
+      setManualResync({ status: "idle", error: null });
+    }
+    setServerOwnership(next);
+  }, [setManualResync]);
+  // 从 owned/uncertain 回到明确 no-owner 后的安全重同步：先证明服务器确实已经
+  // 放手，再取当前精确 session 的最新 runtime + journal，全部核验通过后才用
+  // 服务端 cursor 恢复人工位置；完成前人工面板不重挂，失败保持锁定可重试。全程
+  // 不写 cursor——重挂后的既有效应才会补发游标。事务本身是注入依赖的纯编排
+  // （observerResync.ts），这里只接线,并在最终 apply 前再核一次 fence/所有权。
+  const runManualResync = async () => {
+    // 所有权 ref 已经同步更新过：如果服务器已经重新证明持有，直接不发任何
+    // status/runtime/journal 请求，人工面板继续锁定。
+    if (ownershipRef.current.owned) return;
+    const fence: ObserverResyncFence = {
+      sessionId: session.session_id,
+      epoch: resyncFence.current.epoch + 1,
+    };
+    resyncFence.current = fence;
+    setManualResync({ status: "pending", error: null });
+    const guard = {
+      isLive: () => observerResyncResultCurrent(fence, resyncFence.current) && !ownershipRef.current.owned,
+    };
+    const outcome = await runManualResyncTransaction(fence.sessionId, guard, {
+      fetchStatus: (sid) => api.autopilotStatus(sid),
+      fetchRuntime: (sid) => api.getSessionRuntime(sid),
+      fetchJournal: (sid) => api.sessionJournal(sid),
+      getPlan: () => planRef.current,
+      getRuntimeRevisionFloor: () => (
+        runtimeControl.runtime?.sessionId === fence.sessionId ? runtimeControl.runtime.revision : 0
+      ),
+    });
+    if (outcome.kind === "stale") return;
+    if (outcome.kind === "failed") {
+      if (!guard.isLive()) return;
+      setManualResync({ status: "failed", error: outcome.error instanceof ApiError ? outcome.error.detail : String(outcome.error) });
+      return;
+    }
+    // 最终 apply 前再核一次 fence 与所有权：事务内部的最后一次核对与这里恢复
+    // 执行之间仍隔着一次微任务调度，必须再确认一次才允许 hydrate。
+    if (!guard.isLive()) return;
+    hydrateFromServer(outcome.journal);
+    setItemIdx(outcome.cursor.itemIdx);
+    setTurnIdx(outcome.cursor.turnIdx);
+    restoreTarget.current = outcome.cursor;
+    lastAppliedTurnK.current = null; // 重挂时按最新 journal 重建工作卡
+    setRecoveredLabel(`第 ${outcome.cursor.itemIdx + 1} 题 · 第 ${outcome.cursor.turnIdx + 1} 环节`);
+    setManualResync({ status: "idle", error: null });
+  };
+  // 观察台锁定/解锁的唯一协调点。换场先清空观察台/重同步瞬时状态（fence 同时
+  // 作废 A 场次的迟到结果）；同场内 owned→明确 no-owner 且发生过自动化暴露时，
+  // 先重同步成功再允许人工面板重挂。重新上锁的作废已经在 onServerOwnershipChange
+  // 里同步完成，这里不再重复判定。
+  useEffect(() => {
+    if (resyncFence.current.sessionId !== session.session_id) {
+      resyncFence.current = { sessionId: session.session_id, epoch: resyncFence.current.epoch + 1 };
+      automationExposure.current = false;
+      // 子组件对新场次的 (owned, phase) 上报可能晚一拍；先按锁定处理，
+      // 等新场次的真实上报到达后再走正常判定。
+      previousServerOwned.current = true;
+      if (manualResync.status !== "idle") setManualResync({ status: "idle", error: null });
+      return;
+    }
+    if (!serverOwnership.owned
+        && manualResync.status === "idle"
+        && manualResyncRequired(previousServerOwned.current, serverOwnership, automationExposure.current)) {
+      void runManualResync();
+    }
+    previousServerOwned.current = serverOwnership.owned;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manualResync.status, serverOwnership, session.session_id]);
   const [operationalAutopilotReady, setOperationalAutopilotReady] = useState<boolean | null>(null);
   const [unsupportedOperationalPositions, setUnsupportedOperationalPositions] = useState<string[]>([]);
   const [operationalGapSummary, setOperationalGapSummary] = useState({
@@ -318,8 +425,10 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     || Boolean(recoveryError) || Boolean(apFailure) || Boolean(patientDeviceFailure);
   // 服务器一旦可能取得控制权，旧的人工游标、提示、录音与本地自动推进全部停止。
   // `uncertain` 也必须锁定：POST 可能已提交但响应丢失，不能猜测仍是人工模式。
+  // 观察台模式下人工面板整块不挂载（不仅 disabled）；重同步完成前同样保持锁定。
   const serverOwned = serverOwnership.owned;
-  const manualInteractionBlocked = interactionBlocked || serverOwned;
+  const observerMode = manualSurfaceLocked(serverOwnership, manualResync.status);
+  const manualInteractionBlocked = interactionBlocked || observerMode;
   const retryRecovery = () => {
     setRetryNonce((n) => n + 1);
     void runtimeControl.refresh();
@@ -1583,8 +1692,10 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
 
   return (
     <div className="training-layout">
-      <ItemRail plan={plan} itemIdx={itemIdx} lockedCount={countLocked(journal, plan)}
-        onPick={(i) => { if (!manualInteractionBlocked) { setItemIdx(i); setTurnIdx(0); } }} journalTurns={journal.turns} disabled={manualInteractionBlocked} />
+      {!observerMode && (
+        <ItemRail plan={plan} itemIdx={itemIdx} lockedCount={countLocked(journal, plan)}
+          onPick={(i) => { if (!manualInteractionBlocked) { setItemIdx(i); setTurnIdx(0); } }} journalTurns={journal.turns} disabled={manualInteractionBlocked} />
+      )}
 
       <div className="training-main">
         <div className="training-page-header">
@@ -1596,14 +1707,16 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
             </p>
           </div>
           {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
-          <Button variant="ghost" disabled={manualInteractionBlocked}
-            onClick={() => { void enterWrapup(); }}>
-            {wrapupPending ? "正在确认收麦…" : "进入场次收尾"}
-          </Button>
+          {!observerMode && (
+            <Button variant="ghost" disabled={manualInteractionBlocked}
+              onClick={() => { void enterWrapup(); }}>
+              {wrapupPending ? "正在确认收麦…" : "进入场次收尾"}
+            </Button>
+          )}
         </div>
 
         <SessionControlBar paused={paused} loading={recoveryPending} busy={runtimeControl.busy || pausePending || wrapupPending}
-          resumeBlocked={serverOwned || Boolean(apFailure)} recoveredLabel={recoveredLabel}
+          resumeBlocked={observerMode || Boolean(apFailure)} recoveredLabel={recoveredLabel}
           terminalStatus={runtimeControl.terminalStatus} onExit={onExit}
           error={recoveryError} onRetry={retryRecovery}
           onPause={() => void pauseTraining()} onResume={() => void resumeTraining()} />
@@ -1662,6 +1775,19 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
           prepareOwnership={prepareServerOwnership}
         />
 
+        {observerMode ? (
+          // 服务端拥有/尚不能证伪拥有/重同步未完成：人工逐步操作面板整块不挂载，
+          // 只读观察台的位置只来自服务端 runtime.cursor 与冻结计划映射。
+          <ObserverConsole
+            patientCode={session.patient_id}
+            phase={serverOwnership.phase}
+            resyncStatus={manualResync.status}
+            resyncError={manualResync.error}
+            position={observerPlanPosition(runtimeControl.runtime, session.session_id, plan)}
+            onRetryResync={() => { void runManualResync(); }}
+          />
+        ) : (
+          <>
         <div className="toolbar training-toolbar" aria-label="训练设置">
           <StatusPill tone="muted">复核身份由服务器签发</StatusPill>
           <StatusPill tone="muted">收音仅保存记录，不会直接跳题</StatusPill>
@@ -1806,6 +1932,8 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
             )}
             {work.locked && <div className="row wrap"><StatusPill tone="ok">{session.data_classification === "simulation" ? "本环节模拟复核标注已锁定" : "本环节研究评分已锁定"}</StatusPill><Button variant="primary" disabled={manualInteractionBlocked} onClick={advance}>进入下一环节</Button></div>}
           </div>
+        )}
+          </>
         )}
       </div>
     </div>
