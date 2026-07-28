@@ -155,11 +155,26 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   // 初次挂载的只读 checking 询问不算：它得到明确 no-owner 时走既有恢复门。
   const automationExposure = useRef(false);
   const resyncFence = useRef<ObserverResyncFence>({ sessionId: session.session_id, epoch: 0 });
-  const previousServerOwned = useRef(serverOwnership.owned);
+  // 释放后是否需要重同步，由回调同步 latch，effect 只负责消费——不能用
+  // "上一次渲染看到的 owned" 判定下降沿：同一个 tick 内先 true 后 false 会被
+  // React 合并成一次渲染，那时已经看不到中间的 true 了。
+  const releaseNeedsResync = useRef(false);
   const planRef = useRef<SessionPlan | null>(null);
   planRef.current = plan;
+  // 本页此前通过既有 runtime 轮询见过的、当前 session 的最高 revision。每次
+  // 渲染都同步更新，不依赖任何一次 runManualResync 闭包里捕获的 runtimeControl
+  // 引用——否则重同步进行期间背景轮询推高的 revision，旧闭包永远看不到。
+  const runtimeRevisionFloorRef = useRef({ sessionId: session.session_id, revision: 0 });
+  if (runtimeRevisionFloorRef.current.sessionId !== session.session_id) {
+    runtimeRevisionFloorRef.current = { sessionId: session.session_id, revision: 0 };
+  }
+  if (runtimeControl.runtime?.sessionId === session.session_id
+      && runtimeControl.runtime.revision > runtimeRevisionFloorRef.current.revision) {
+    runtimeRevisionFloorRef.current = { sessionId: session.session_id, revision: runtimeControl.runtime.revision };
+  }
   const onServerOwnershipChange = useCallback((owned: boolean, phase: AutopilotConsoleState["phase"]) => {
     const next = { owned, phase };
+    const previousOwned = ownershipRef.current.owned;
     ownershipRef.current = next;
     const transition = deriveOwnershipTransition(
       automationExposure.current,
@@ -171,7 +186,17 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
       // 服务器重新证明持有：同步作废在途/失败的重同步，防止旧 fence 下的
       // Promise 抢在下一次渲染跑到 effect 之前，就把人工面板重挂出来。
       resyncFence.current = { ...resyncFence.current, epoch: resyncFence.current.epoch + 1 };
+      releaseNeedsResync.current = false;
       setManualResync({ status: "idle", error: null });
+    } else if (manualResyncStatusRef.current === "idle"
+        && manualResyncRequired(previousOwned, next, transition.automationExposure)) {
+      // previousOwned 来自"上一次调用"时的 ref 快照，不是渲染批处理后才能看到
+      // 的最终 state——同一个 tick 内先 true 后 false 也能正确捕捉下降沿。真正
+      // 发起请求交给下面的 effect（那里才有这一次渲染最新的闭包）；这里先同步
+      // latch 住 pending，防止本 tick 内紧接着又出现的重新持有被当成"仍是
+      // idle，可以放行"。
+      releaseNeedsResync.current = true;
+      setManualResync({ status: "pending", error: null });
     }
     setServerOwnership(next);
   }, [setManualResync]);
@@ -198,9 +223,12 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
       fetchRuntime: (sid) => api.getSessionRuntime(sid),
       fetchJournal: (sid) => api.sessionJournal(sid),
       getPlan: () => planRef.current,
-      getRuntimeRevisionFloor: () => (
-        runtimeControl.runtime?.sessionId === fence.sessionId ? runtimeControl.runtime.revision : 0
-      ),
+      getRuntimeRevisionFloor: () => runtimeRevisionFloorRef.current.revision,
+      reportRuntimeRevision: (revision) => {
+        if (revision > runtimeRevisionFloorRef.current.revision) {
+          runtimeRevisionFloorRef.current = { sessionId: fence.sessionId, revision };
+        }
+      },
     });
     if (outcome.kind === "stale") return;
     if (outcome.kind === "failed") {
@@ -209,8 +237,15 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
       return;
     }
     // 最终 apply 前再核一次 fence 与所有权：事务内部的最后一次核对与这里恢复
-    // 执行之间仍隔着一次微任务调度，必须再确认一次才允许 hydrate。
+    // 执行之间仍隔着一次微任务调度，必须再确认一次才允许 hydrate。同样的道理，
+    // 事务里对 revision 下限的最后一次核对，与这里的续行之间也隔着一次微任务
+    // 调度——期间背景轮询完全可能把下限推得更高，所以这里要用当下最新的下限
+    // 再核一次这次读到的 runtimeRevision，而不是只信事务内部那一次核对。
     if (!guard.isLive()) return;
+    if (outcome.runtimeRevision < runtimeRevisionFloorRef.current.revision) {
+      setManualResync({ status: "failed", error: "服务器返回的运行时版本落后于本页已知版本，拒绝据此恢复" });
+      return;
+    }
     hydrateFromServer(outcome.journal);
     setItemIdx(outcome.cursor.itemIdx);
     setTurnIdx(outcome.cursor.turnIdx);
@@ -220,25 +255,24 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     setManualResync({ status: "idle", error: null });
   };
   // 观察台锁定/解锁的唯一协调点。换场先清空观察台/重同步瞬时状态（fence 同时
-  // 作废 A 场次的迟到结果）；同场内 owned→明确 no-owner 且发生过自动化暴露时，
-  // 先重同步成功再允许人工面板重挂。重新上锁的作废已经在 onServerOwnershipChange
-  // 里同步完成，这里不再重复判定。
+  // 作废 A 场次的迟到结果）；释放且需要重同步的判定已经在 onServerOwnershipChange
+  // 里逐次同步完成（releaseNeedsResync 是那边 latch 的事实），这里只负责在
+  // session 未变时把它消费掉、真正发起请求——那时才有这一次渲染最新的闭包。
   useEffect(() => {
     if (resyncFence.current.sessionId !== session.session_id) {
       resyncFence.current = { sessionId: session.session_id, epoch: resyncFence.current.epoch + 1 };
       automationExposure.current = false;
       // 子组件对新场次的 (owned, phase) 上报可能晚一拍；先按锁定处理，
       // 等新场次的真实上报到达后再走正常判定。
-      previousServerOwned.current = true;
+      ownershipRef.current = { owned: true, phase: "checking" };
+      releaseNeedsResync.current = false;
       if (manualResync.status !== "idle") setManualResync({ status: "idle", error: null });
       return;
     }
-    if (!serverOwnership.owned
-        && manualResync.status === "idle"
-        && manualResyncRequired(previousServerOwned.current, serverOwnership, automationExposure.current)) {
+    if (releaseNeedsResync.current) {
+      releaseNeedsResync.current = false;
       void runManualResync();
     }
-    previousServerOwned.current = serverOwnership.owned;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [manualResync.status, serverOwnership, session.session_id]);
   const [operationalAutopilotReady, setOperationalAutopilotReady] = useState<boolean | null>(null);
@@ -426,8 +460,13 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   // 服务器一旦可能取得控制权，旧的人工游标、提示、录音与本地自动推进全部停止。
   // `uncertain` 也必须锁定：POST 可能已提交但响应丢失，不能猜测仍是人工模式。
   // 观察台模式下人工面板整块不挂载（不仅 disabled）；重同步完成前同样保持锁定。
+  // releaseNeedsResync.current 必须直接参与这个判定，不能只当 effect 的触发
+  // 信号：它在 onServerOwnershipChange 里与 setServerOwnership 同步 latch，但
+  // 这里仍需要它兜底——不依赖"这两个 setState 一定会被 React 批进同一次渲染"
+  // 这个假设，否则会有一次 observerMode=false 的渲染，期间别的被动 effect
+  // （例如按 itemIdx/turnIdx 补发游标那个）可能用本地旧位置抢先写一次游标。
   const serverOwned = serverOwnership.owned;
-  const observerMode = manualSurfaceLocked(serverOwnership, manualResync.status);
+  const observerMode = manualSurfaceLocked(serverOwnership, manualResync.status) || releaseNeedsResync.current;
   const manualInteractionBlocked = interactionBlocked || observerMode;
   const retryRecovery = () => {
     setRetryNonce((n) => n + 1);

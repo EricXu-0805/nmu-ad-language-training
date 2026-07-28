@@ -10,12 +10,17 @@ function indexOfOrFail(haystack: string, needle: string, from = 0): number {
   return index;
 }
 
-test("observer lock is derived from the shared ownership state, not a shadow machine", () => {
-  assert.match(source, /const observerMode = manualSurfaceLocked\(serverOwnership, manualResync\.status\);/);
+test("observer lock is derived from the shared ownership state plus the synchronous release latch, not a shadow machine", () => {
+  // releaseNeedsResync.current 必须直接参与锁定判定——不能只是 effect 的触发
+  // 信号,否则 released 到 manualResync.status 真正提交为 pending 之间，会有
+  // 一次 observerMode=false 的渲染。
+  assert.match(source, /const observerMode = manualSurfaceLocked\(serverOwnership, manualResync\.status\) \|\| releaseNeedsResync\.current;/);
   assert.match(source, /const manualInteractionBlocked = interactionBlocked \|\| observerMode;/);
   // exposure 判定是所有权回调内同步调用一次的纯函数，不是靠渲染重算的影子状态。
   assert.match(source, /deriveOwnershipTransition\(\s*automationExposure\.current,\s*next,\s*manualResyncStatusRef\.current === "idle",\s*\)/);
-  assert.match(source, /manualResyncRequired\(previousServerOwned\.current, serverOwnership, automationExposure\.current\)/);
+  // 下降沿判定用的是回调里逐次捕获的 previousOwned，不是只在 effect 里更新的
+  // 渲染级快照。
+  assert.match(source, /manualResyncRequired\(previousOwned, next, transition\.automationExposure\)/);
 });
 
 test("observer mode unmounts the item rail, manual toolbar, wrapup entry, and work card", () => {
@@ -67,20 +72,39 @@ test("regaining manual control never reuses the shared runtime poll, and is fenc
   assert.match(body, /fetchStatus: \(sid\) => api\.autopilotStatus\(sid\)/);
   assert.match(body, /fetchRuntime: \(sid\) => api\.getSessionRuntime\(sid\)/);
   assert.match(body, /fetchJournal: \(sid\) => api\.sessionJournal\(sid\)/);
+  // revision 下限读自渲染期同步维护的 ref，不是这次闭包捕获的 runtimeControl。
+  assert.match(body, /getRuntimeRevisionFloor: \(\) => runtimeRevisionFloorRef\.current\.revision/);
+  assert.match(body, /reportRuntimeRevision: \(revision\) => \{/);
   // 已经重新证明持有：不发任何请求，直接短路。
   assert.match(body, /if \(ownershipRef\.current\.owned\) return;/);
   // guard 同时核对 fence 与"此刻"的所有权 ref，不是只信 fence 一项。
   assert.match(body, /isLive: \(\) => observerResyncResultCurrent\(fence, resyncFence\.current\) && !ownershipRef\.current\.owned/);
-  // apply（hydrate/改题位）前必须再核一次 guard，不能只信事务内部最后一次核对。
+  // apply（hydrate/改题位）前必须再核一次 guard，不能只信事务内部最后一次核对；
+  // 同样，还要再核一次 outcome.runtimeRevision 是否仍不低于当下最新的下限——
+  // 事务内部最后一次核对与这里续行之间还隔着一次微任务调度。
   const hydrateIdx = indexOfOrFail(body, "hydrateFromServer(outcome.journal)");
   const lastGuardBeforeHydrate = body.lastIndexOf("if (!guard.isLive()) return;", hydrateIdx);
   assert.ok(lastGuardBeforeHydrate !== -1 && lastGuardBeforeHydrate < hydrateIdx,
     "hydrate 前必须再核一次 guard.isLive()");
+  const floorRecheck = body.lastIndexOf("outcome.runtimeRevision < runtimeRevisionFloorRef.current.revision", hydrateIdx);
+  assert.ok(floorRecheck !== -1 && lastGuardBeforeHydrate < floorRecheck && floorRecheck < hydrateIdx,
+    "hydrate 前必须用当下最新的下限再核一次 outcome.runtimeRevision");
   assert.match(body, /lastAppliedTurnK\.current = null/);
   assert.match(body, /status: "failed"/);
   // 重同步期间不写游标、不启动录音、不动本地自动驾驶。
   assert.doesNotMatch(body, /postCursor\(/);
   assert.doesNotMatch(body, /armRecording|setRecState\("armed"\)|persistAutoPilot/);
+});
+
+test("the current-session runtime revision floor is a render-body ref, updated unconditionally every render", () => {
+  // 必须在组件顶层同步执行（既不在某次 runManualResync 闭包里，也不在
+  // useEffect 里）——否则又会退化成"只有某次渲染的 runtimeControl 快照"。
+  const declIdx = indexOfOrFail(source, "const runtimeRevisionFloorRef = useRef(");
+  const onOwnershipChangeIdx = indexOfOrFail(source, "const onServerOwnershipChange = useCallback(");
+  const ratchetBody = source.slice(declIdx, onOwnershipChangeIdx);
+  assert.match(ratchetBody, /runtimeControl\.runtime\?\.sessionId === session\.session_id/);
+  assert.match(ratchetBody, /runtimeControl\.runtime\.revision > runtimeRevisionFloorRef\.current\.revision/);
+  assert.doesNotMatch(ratchetBody, /useEffect/);
 });
 
 test("resync applies journal and position only after the exact cursor is proven", () => {
@@ -104,7 +128,7 @@ test("resync applies journal and position only after the exact cursor is proven"
   const planGuard = indexOfOrFail(resyncSource, "if (!plan) {");
   const cursorGuard = indexOfOrFail(resyncSource, "exactPlanCursor(runtime, sessionId, plan)");
   const cursorReject = indexOfOrFail(resyncSource, "if (!cursor) {");
-  const applied = indexOfOrFail(resyncSource, 'return { kind: "applied", cursor, journal };');
+  const applied = indexOfOrFail(resyncSource, 'return { kind: "applied", cursor, journal, runtimeRevision: runtime.revision };');
   assert.ok(planGuard < applied && cursorGuard < applied && cursorReject < applied,
     "plan 与精确 cursor 校验必须全部先于 applied 结果");
   assert.doesNotMatch(resyncSource, /\?\? 0/);
@@ -116,10 +140,13 @@ test("the ownership callback invalidates a pending resync synchronously, not via
     indexOfOrFail(source, "const onServerOwnershipChange = useCallback("),
     indexOfOrFail(source, "// 从 owned/uncertain 回到明确 no-owner"),
   );
-  // ownershipRef 在回调体内同步更新，早于任何 setState/effect。
+  // previousOwned 必须在覆写 ownershipRef 之前捕获——它是这一次调用的"上一次
+  // 调用时"快照，不是渲染批处理后才能看到的最终 state。
+  const previousOwnedCapture = indexOfOrFail(body, "const previousOwned = ownershipRef.current.owned;");
   const refWrite = indexOfOrFail(body, "ownershipRef.current = next;");
   const transition = indexOfOrFail(body, "deriveOwnershipTransition(");
-  assert.ok(refWrite < transition, "ownershipRef 必须在算出 transition 之前就同步落地");
+  assert.ok(previousOwnedCapture < refWrite && refWrite < transition,
+    "previousOwned 必须先于 ownershipRef 覆写，ownershipRef 必须在算出 transition 之前就同步落地");
   // 作废动作（fence 前进 + 重同步打回 idle）都在同一个回调体内完成，
   // 不依赖 serverOwnership 这个 state 触发的下一次 effect。
   const invalidateGate = indexOfOrFail(body, "if (transition.invalidateResync) {");
@@ -128,11 +155,34 @@ test("the ownership callback invalidates a pending resync synchronously, not via
   const setState = indexOfOrFail(body, "setServerOwnership(next);");
   assert.ok(invalidateGate < epochBump && epochBump < setState && resetIdle < setState,
     "fence 作废与 resync 复位必须先于 setServerOwnership，回调体内一次做完");
+  // 释放且需要恢复的那条分支：previousOwned 驱动的下降沿判定 + 同步 latch
+  // releaseNeedsResync + 同步把 manualResync 打成 pending——真正发起请求交给
+  // 下面的 effect，但"要不要锁、锁不锁得住"这件事在这里就已经落定。
+  const triggerGate = indexOfOrFail(body, "manualResyncRequired(previousOwned, next, transition.automationExposure)");
+  const latch = indexOfOrFail(body, "releaseNeedsResync.current = true;", triggerGate);
+  const pendingSet = indexOfOrFail(body, 'setManualResync({ status: "pending", error: null });', triggerGate);
+  assert.ok(triggerGate < latch && latch < pendingSet && pendingSet < setState,
+    "下降沿判定为真时必须同步 latch releaseNeedsResync 并同步打成 pending，都先于 setServerOwnership");
+});
+
+test("a stale local cursor cannot be posted during the release render — the cursor-sync effect is gated by manualInteractionBlocked in both its guard and its deps", () => {
+  // 这条被动 effect 一旦在 observerMode 尚未反映为锁定的那次渲染里跑过,就会
+  // 用本地旧 itemIdx/turnIdx 抢先给服务器补发一次游标。它必须直接依赖
+  // manualInteractionBlocked（而 manualInteractionBlocked 已经把
+  // releaseNeedsResync.current 算进 observerMode 了）,不能只依赖题位本身。
+  const effectStart = indexOfOrFail(source, "光标变化 → 重置工作态");
+  const guardIdx = indexOfOrFail(source, "if (!item || !planTurn || manualInteractionBlocked) return;", effectStart);
+  const depsIdx = indexOfOrFail(source, "[itemIdx, turnIdx, plan, manualInteractionBlocked]", guardIdx);
+  assert.ok(guardIdx > effectStart && depsIdx > guardIdx, "该 effect 必须同时在守卫与依赖数组里带上 manualInteractionBlocked");
 });
 
 test("session switch clears transient observer state and no new poller is introduced", () => {
   assert.match(source, /resyncFence\.current\.sessionId !== session\.session_id/);
   assert.match(source, /automationExposure\.current = false;/);
+  // previousOwned 的来源（ownershipRef）与释放-恢复 latch 都要在换场时清零，
+  // 不能带着旧场次的快照进新场次。
+  assert.match(source, /ownershipRef\.current = \{ owned: true, phase: "checking" \};/);
+  assert.match(source, /releaseNeedsResync\.current = false;/);
   // 唯一的 setInterval 仍是既有录音授权周期核查；观察台不新增轮询器。
   assert.equal((source.match(/setInterval/g) ?? []).length, 1);
   // 恢复继续走既有 runtime 轮询与恢复门，不额外常驻请求。

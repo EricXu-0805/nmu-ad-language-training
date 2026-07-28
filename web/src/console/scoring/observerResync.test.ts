@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ServerSessionJournal } from "../../hooks/useSessionJournal.ts";
 import type { SessionPlan, SessionRuntimeState } from "../../types.ts";
-import { manualResyncRequired, observerResyncResultCurrent } from "./observerConsoleModel.ts";
+import { manualResyncRequired, manualSurfaceLocked, observerResyncResultCurrent } from "./observerConsoleModel.ts";
 import {
   deriveOwnershipTransition,
   runManualResyncTransaction,
@@ -50,6 +50,7 @@ function baseDeps(overrides: Partial<ResyncDeps> = {}): ResyncDeps {
     fetchJournal: async (sid) => journalFor(sid),
     getPlan: () => PLAN,
     getRuntimeRevisionFloor: () => 0,
+    reportRuntimeRevision: () => {},
     ...overrides,
   };
 }
@@ -101,17 +102,52 @@ test("2: owner reacquired between the runtime/journal dispatch and its resolutio
   assert.equal(outcome.kind, "stale");
 });
 
-test("3: owner true→false batched into a single render still requires resync — exposure is sticky per call, not per render", () => {
+test("3: owner true→false batched into a single render still requires resync — previousOwned must come from a ref latched per call, not a render-level snapshot", () => {
+  // 模拟真实 onServerOwnershipChange 的逐次调用：previousOwned 取自"上一次调用"
+  // 时的 ref 快照，在覆写 ref 之前捕获——这正是生产代码里 ownershipRef 的角色，
+  // 不是 React 批处理之后才能看到的最终 state。
+  const ownershipRef = { current: { owned: false, phase: "idle" } };
   let exposure = false;
-  // 两次真实回调（owned:true 再 owned:false）发生在同一个 tick 里，React 只会
-  // 提交合并后的最终 state，但 exposure 必须在第一次调用时就落定，不能被第二次
-  // 调用的最终快照冲掉。
-  let effect = deriveOwnershipTransition(exposure, { owned: true, phase: "running" }, true);
-  exposure = effect.automationExposure;
-  effect = deriveOwnershipTransition(exposure, { owned: false, phase: "idle" }, true);
-  exposure = effect.automationExposure;
-  assert.equal(exposure, true);
-  assert.equal(manualResyncRequired(true, { owned: false, phase: "idle" }, exposure), true);
+  function call(next: { owned: boolean; phase: string }) {
+    const previousOwned = ownershipRef.current.owned;
+    ownershipRef.current = next;
+    const transition = deriveOwnershipTransition(exposure, next, true);
+    exposure = transition.automationExposure;
+    return manualResyncRequired(previousOwned, next, exposure);
+  }
+  // 同一个 tick 里两次真实回调：先 owned:true(running)，再 owned:false(idle)。
+  // React 只会把这两次 setState 合并渲染成最终的 false，但下降沿必须在第二次
+  // 调用时就被同步捕捉到。
+  const triggeredOnFirstCall = call({ owned: true, phase: "running" });
+  const triggeredOnSecondCall = call({ owned: false, phase: "idle" });
+  assert.equal(triggeredOnFirstCall, false, "刚变为 owned 不该触发恢复");
+  assert.equal(triggeredOnSecondCall, true, "同一个 tick 内的下降沿必须被逐次捕捉到，不能等渲染后的快照");
+});
+
+test("3b: the release-needs-resync latch must gate the lock directly, not merely trigger an effect", () => {
+  // 复现 onServerOwnershipChange 释放时的真实序列：previousOwned 来自逐次调用
+  // 的 ref，manualResyncRequired 为真时才会同步 latch releaseNeedsResync。
+  const ownershipRef = { current: { owned: true, phase: "running" as const } };
+  let exposure = true; // 之前已经真正暴露过
+  const previousOwned = ownershipRef.current.owned;
+  const next = { owned: false, phase: "idle" as const };
+  ownershipRef.current = next;
+  const transition = deriveOwnershipTransition(exposure, next, true);
+  exposure = transition.automationExposure;
+  const releaseNeedsResync = !transition.invalidateResync && manualResyncRequired(previousOwned, next, exposure);
+  assert.equal(releaseNeedsResync, true, "这就是回调决定要触发恢复、同步 latch 的那一刻");
+
+  // 这一刻，manualResync 的 setState 还没被 React 提交渲染——如果只信
+  // manualSurfaceLocked(state, status)，这一次渲染会显示"解锁"。
+  const stateOnlyObserverMode = manualSurfaceLocked(next, "idle");
+  assert.equal(stateOnlyObserverMode, false,
+    "只用尚未提交的 state 快照判断，released 后这一渲染会误判成解锁");
+
+  // 加上 releaseNeedsResync 这个同步 latch 之后才对：这一渲染必须仍然锁定，
+  // 否则挂在人工分支下、依赖 manualInteractionBlocked 的被动 effect（例如按
+  // itemIdx/turnIdx 补发游标那个）可能在这一拍抢先用本地旧位置写一次游标。
+  const observerMode = stateOnlyObserverMode || releaseNeedsResync;
+  assert.equal(observerMode, true);
 });
 
 test("4: two resyncs race on different epochs — only the latest epoch's result may apply", async () => {
@@ -174,6 +210,7 @@ test("7: stable no-owner + unchanged status revision + fresh exact-session runti
   if (outcome.kind === "applied") {
     assert.deepEqual(outcome.cursor, { itemIdx: 0, turnIdx: 0 });
     assert.equal(outcome.journal.session.session_id, "S-a");
+    assert.equal(outcome.runtimeRevision, 9);
   }
   // 双重 no-owner 核验：status 在 runtime/journal 之前查一次、之后再查一次。
   assert.deepEqual(calls, ["status", "runtime", "journal", "status"]);
@@ -223,4 +260,55 @@ test("10: a foreign-session runtime, a stale-revision runtime, or an unproven cu
     getRuntimeRevisionFloor: () => 10,
   }));
   assert.equal(outcomeD.kind, "failed");
+});
+
+test("11: a floor that rises while statusAfter is provably still in flight rejects, even though the runtime passed at fetch time", async () => {
+  const { begin } = makeWorld("S-a");
+  let floor = 10;
+  // statusAfterDispatched 让测试能确定性地等到"第二次 fetchStatus 已经被调用、
+  // 正处于挂起状态"这个精确时刻——不能只是在事务刚起步时随手改 floor，那样
+  // 证明不了"floor 是在 statusAfter 还没返回期间才变"这件事本身。
+  const statusAfterDispatched = deferred<void>();
+  const statusAfterGate = deferred<{ serverOwned: boolean; stateRevision: number }>();
+  let statusCall = 0;
+  const deps = baseDeps({
+    fetchStatus: async () => {
+      statusCall += 1;
+      if (statusCall === 1) return { serverOwned: false, stateRevision: 1 };
+      statusAfterDispatched.resolve();
+      return statusAfterGate.promise;
+    },
+    fetchRuntime: async (sid) => runtimeAt(sid, 0, 0, 10), // 取到时 revision=10，当时和下限打平
+    getRuntimeRevisionFloor: () => floor,
+  });
+  const pending = runManualResyncTransaction("S-a", begin(1), deps);
+  // 证明顺序：runtime 已经取到(10) → statusAfter 已被派发、仍在挂起 → 这时才把
+  // 下限推到 11 → 才放行 statusAfter。
+  await statusAfterDispatched.promise;
+  floor = 11;
+  statusAfterGate.resolve({ serverOwned: false, stateRevision: 1 });
+  const outcome = await pending;
+  assert.equal(outcome.kind, "failed");
+});
+
+test("12: every session-matched runtime read is reported via a continuation independent of Promise.all, even when the parallel journal request later rejects", async () => {
+  const { begin } = makeWorld("S-a");
+  const reported: number[] = [];
+  const reportedSignal = deferred<void>();
+  const journalGate = deferred<ServerSessionJournal>();
+  const outcome = runManualResyncTransaction("S-a", begin(1), baseDeps({
+    fetchRuntime: async (sid) => runtimeAt(sid, 0, 0, 42),
+    fetchJournal: async () => journalGate.promise,
+    reportRuntimeRevision: (revision) => { reported.push(revision); reportedSignal.resolve(); },
+  }));
+  // 确定性地等到 runtime 的 revision 已经被棘轮进下限——这个上报必须独立于
+  // Promise.all 会不会因为 journal 那一路 reject 而整体短路，不能靠"两条微任务
+  // 链谁先跑完"这种不确定的时序去赌。
+  await reportedSignal.promise;
+  assert.deepEqual(reported, [42]);
+  // 现在才让 journal 那一路真正失败（保留原本"journal throws"这个回归场景），
+  // 证明稍后失败完全不影响已经发生的上报。
+  journalGate.reject(new Error("journal unavailable"));
+  const result = await outcome;
+  assert.equal(result.kind, "failed");
 });
