@@ -161,17 +161,6 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   const releaseNeedsResync = useRef(false);
   const planRef = useRef<SessionPlan | null>(null);
   planRef.current = plan;
-  // 本页此前通过既有 runtime 轮询见过的、当前 session 的最高 revision。每次
-  // 渲染都同步更新，不依赖任何一次 runManualResync 闭包里捕获的 runtimeControl
-  // 引用——否则重同步进行期间背景轮询推高的 revision，旧闭包永远看不到。
-  const runtimeRevisionFloorRef = useRef({ sessionId: session.session_id, revision: 0 });
-  if (runtimeRevisionFloorRef.current.sessionId !== session.session_id) {
-    runtimeRevisionFloorRef.current = { sessionId: session.session_id, revision: 0 };
-  }
-  if (runtimeControl.runtime?.sessionId === session.session_id
-      && runtimeControl.runtime.revision > runtimeRevisionFloorRef.current.revision) {
-    runtimeRevisionFloorRef.current = { sessionId: session.session_id, revision: runtimeControl.runtime.revision };
-  }
   const onServerOwnershipChange = useCallback((owned: boolean, phase: AutopilotConsoleState["phase"]) => {
     const next = { owned, phase };
     const previousOwned = ownershipRef.current.owned;
@@ -223,12 +212,12 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
       fetchRuntime: (sid) => api.getSessionRuntime(sid),
       fetchJournal: (sid) => api.sessionJournal(sid),
       getPlan: () => planRef.current,
-      getRuntimeRevisionFloor: () => runtimeRevisionFloorRef.current.revision,
-      reportRuntimeRevision: (revision) => {
-        if (revision > runtimeRevisionFloorRef.current.revision) {
-          runtimeRevisionFloorRef.current = { sessionId: fence.sessionId, revision };
-        }
-      },
+      // 背景轮询与这里的直读共用同一个 hook 内的 per-session 单调下限：poll/
+      // pause/resume 的回执在各自的 Promise continuation 里已经同步棘轮过，
+      // 不依赖这次渲染是否已经跑过；直读到的 revision 也通过 reportRevision
+      // 汇入同一份，而不是这个组件另开一份自己的、要等渲染才会更新的副本。
+      getRuntimeRevisionFloor: () => runtimeControl.getRevisionFloor(),
+      reportRuntimeRevision: (revision) => runtimeControl.reportRevision(fence.sessionId, revision),
     });
     if (outcome.kind === "stale") return;
     if (outcome.kind === "failed") {
@@ -242,7 +231,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     // 调度——期间背景轮询完全可能把下限推得更高，所以这里要用当下最新的下限
     // 再核一次这次读到的 runtimeRevision，而不是只信事务内部那一次核对。
     if (!guard.isLive()) return;
-    if (outcome.runtimeRevision < runtimeRevisionFloorRef.current.revision) {
+    if (outcome.runtimeRevision < runtimeControl.getRevisionFloor()) {
       setManualResync({ status: "failed", error: "服务器返回的运行时版本落后于本页已知版本，拒绝据此恢复" });
       return;
     }

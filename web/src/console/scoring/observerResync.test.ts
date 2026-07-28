@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ServerSessionJournal } from "../../hooks/useSessionJournal.ts";
+import { ratchetRevisionFloor, type RuntimeRevisionFloor } from "../../hooks/runtimeRevisionFloor.ts";
 import type { SessionPlan, SessionRuntimeState } from "../../types.ts";
 import { manualResyncRequired, manualSurfaceLocked, observerResyncResultCurrent } from "./observerConsoleModel.ts";
 import {
@@ -311,4 +312,55 @@ test("12: every session-matched runtime read is reported via a continuation inde
   journalGate.reject(new Error("journal unavailable"));
   const result = await outcome;
   assert.equal(result.kind, "failed");
+});
+
+test("13: a background poll's own continuation ratchets the shared floor before any render — a resync direct-read of an older revision is rejected", async () => {
+  // 共享 floor：用真实的 ratchetRevisionFloor（与 useSessionRuntime 里
+  // reportRevision 用的同一个函数），模拟 hook 内的 revisionFloorRef。
+  let floor: RuntimeRevisionFloor = { sessionId: "S-a", revision: 8 };
+  const reportRevision = (sessionId: string, revision: number) => {
+    floor = ratchetRevisionFloor(floor, sessionId, revision);
+  };
+  const { begin } = makeWorld("S-a");
+
+  const runtimeDispatched = deferred<void>();
+  const runtimeGate = deferred<SessionRuntimeState>();
+  const statusAfterDispatched = deferred<void>();
+  const statusAfterGate = deferred<{ serverOwned: boolean; stateRevision: number }>();
+  let statusCall = 0;
+
+  const outcome = runManualResyncTransaction("S-a", begin(1), {
+    fetchStatus: async () => {
+      statusCall += 1;
+      if (statusCall === 1) return { serverOwned: false, stateRevision: 1 };
+      statusAfterDispatched.resolve();
+      return statusAfterGate.promise;
+    },
+    fetchRuntime: async () => {
+      runtimeDispatched.resolve();
+      return runtimeGate.promise;
+    },
+    fetchJournal: async (sid) => journalFor(sid),
+    getPlan: () => PLAN,
+    getRuntimeRevisionFloor: () => floor.revision,
+    reportRuntimeRevision: (revision) => reportRevision("S-a", revision),
+  });
+
+  // 1. 等到重同步自己的直读已经发出。
+  await runtimeDispatched.promise;
+  // 2. 直读拿到 r9——早于背景 poll 即将观测到的 r10。
+  runtimeGate.resolve(runtimeAt("S-a", 0, 0, 9));
+  // 3. 等到 statusAfter 也已经发出：这意味着 runtime 那一路已经跑完，事务内部
+  //    的 reportRuntimeRevision(9) 已经同步落地（floor: 8 → 9）。
+  await statusAfterDispatched.promise;
+  assert.equal(floor.revision, 9);
+  // 4. 这时"背景 poll"才在它自己独立的 continuation 里解出 r10 并同步棘轮——
+  //    完全不经过任何 React 渲染，纯粹是另一个 Promise 决议后的同步赋值，正是
+  //    useSessionRuntime 里 reportRevision 在 poll continuation 内扮演的角色。
+  reportRevision("S-a", 10);
+  assert.equal(floor.revision, 10, "poll 的棘轮必须在它自己的 continuation 内同步完成，不等任何渲染");
+  // 5. 才放行 statusAfter；事务这时候才做最后核验，读到的已经是 10。
+  statusAfterGate.resolve({ serverOwned: false, stateRevision: 1 });
+  const result = await outcome;
+  assert.equal(result.kind, "failed", "r9 早于已经同步棘轮的 r10，必须拒绝，不得 hydrate/unlock");
 });

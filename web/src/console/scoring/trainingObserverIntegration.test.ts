@@ -72,21 +72,24 @@ test("regaining manual control never reuses the shared runtime poll, and is fenc
   assert.match(body, /fetchStatus: \(sid\) => api\.autopilotStatus\(sid\)/);
   assert.match(body, /fetchRuntime: \(sid\) => api\.getSessionRuntime\(sid\)/);
   assert.match(body, /fetchJournal: \(sid\) => api\.sessionJournal\(sid\)/);
-  // revision 下限读自渲染期同步维护的 ref，不是这次闭包捕获的 runtimeControl。
-  assert.match(body, /getRuntimeRevisionFloor: \(\) => runtimeRevisionFloorRef\.current\.revision/);
-  assert.match(body, /reportRuntimeRevision: \(revision\) => \{/);
+  // revision 下限读自 useSessionRuntime 那个 hook 内、poll/pause/resume 回执
+  // 各自 continuation 里同步维护的 ref——不是这个组件另开一份、要等渲染才更新
+  // 的副本，也不是这次闭包捕获的某个快照。
+  assert.match(body, /getRuntimeRevisionFloor: \(\) => runtimeControl\.getRevisionFloor\(\)/);
+  assert.match(body, /reportRuntimeRevision: \(revision\) => runtimeControl\.reportRevision\(fence\.sessionId, revision\)/);
   // 已经重新证明持有：不发任何请求，直接短路。
   assert.match(body, /if \(ownershipRef\.current\.owned\) return;/);
   // guard 同时核对 fence 与"此刻"的所有权 ref，不是只信 fence 一项。
   assert.match(body, /isLive: \(\) => observerResyncResultCurrent\(fence, resyncFence\.current\) && !ownershipRef\.current\.owned/);
   // apply（hydrate/改题位）前必须再核一次 guard，不能只信事务内部最后一次核对；
   // 同样，还要再核一次 outcome.runtimeRevision 是否仍不低于当下最新的下限——
-  // 事务内部最后一次核对与这里续行之间还隔着一次微任务调度。
+  // 事务内部最后一次核对与这里续行之间还隔着一次微任务调度，读的必须是
+  // runtimeControl.getRevisionFloor() 这个 hook 级共享下限，不是本地快照。
   const hydrateIdx = indexOfOrFail(body, "hydrateFromServer(outcome.journal)");
   const lastGuardBeforeHydrate = body.lastIndexOf("if (!guard.isLive()) return;", hydrateIdx);
   assert.ok(lastGuardBeforeHydrate !== -1 && lastGuardBeforeHydrate < hydrateIdx,
     "hydrate 前必须再核一次 guard.isLive()");
-  const floorRecheck = body.lastIndexOf("outcome.runtimeRevision < runtimeRevisionFloorRef.current.revision", hydrateIdx);
+  const floorRecheck = body.lastIndexOf("outcome.runtimeRevision < runtimeControl.getRevisionFloor()", hydrateIdx);
   assert.ok(floorRecheck !== -1 && lastGuardBeforeHydrate < floorRecheck && floorRecheck < hydrateIdx,
     "hydrate 前必须用当下最新的下限再核一次 outcome.runtimeRevision");
   assert.match(body, /lastAppliedTurnK\.current = null/);
@@ -94,17 +97,8 @@ test("regaining manual control never reuses the shared runtime poll, and is fenc
   // 重同步期间不写游标、不启动录音、不动本地自动驾驶。
   assert.doesNotMatch(body, /postCursor\(/);
   assert.doesNotMatch(body, /armRecording|setRecState\("armed"\)|persistAutoPilot/);
-});
-
-test("the current-session runtime revision floor is a render-body ref, updated unconditionally every render", () => {
-  // 必须在组件顶层同步执行（既不在某次 runManualResync 闭包里，也不在
-  // useEffect 里）——否则又会退化成"只有某次渲染的 runtimeControl 快照"。
-  const declIdx = indexOfOrFail(source, "const runtimeRevisionFloorRef = useRef(");
-  const onOwnershipChangeIdx = indexOfOrFail(source, "const onServerOwnershipChange = useCallback(");
-  const ratchetBody = source.slice(declIdx, onOwnershipChangeIdx);
-  assert.match(ratchetBody, /runtimeControl\.runtime\?\.sessionId === session\.session_id/);
-  assert.match(ratchetBody, /runtimeControl\.runtime\.revision > runtimeRevisionFloorRef\.current\.revision/);
-  assert.doesNotMatch(ratchetBody, /useEffect/);
+  // 这个组件自己不该再另开一份 revision floor ref——单一事实源在 hook 里。
+  assert.doesNotMatch(source, /runtimeRevisionFloorRef/);
 });
 
 test("resync applies journal and position only after the exact cursor is proven", () => {
