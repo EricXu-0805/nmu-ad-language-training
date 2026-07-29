@@ -227,6 +227,8 @@ export interface Session {
   autopilot_protocol_definition_digest?: string | null;
   // 旧后端不携带时按 active 兼容；终态场次只读，不可续做。
   runtime_status?: SessionRuntimeStatus;
+  // 仅 journal 撤回墓碑投影携带:受试者/录音已撤回,本场内容读取已关闭。
+  content_state?: "withdrawn_tombstone";
 }
 
 export interface SessionRuntimeCursor {

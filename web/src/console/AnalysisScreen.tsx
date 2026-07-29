@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../api";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
@@ -12,6 +12,20 @@ import {
   type TurnEvidence,
 } from "./analysisEvidence";
 import { DataBoundaryBadge, DataBoundaryFilter } from "./DataBoundaryFilter";
+import {
+  parseConfirmationRevisionsByTurn,
+  parseTtsServeEvidenceList,
+} from "./sessionAiEvidenceContract";
+import {
+  buildAiUsageSection,
+  buildConfirmationRevisionSection,
+  buildTtsServeEvidenceSection,
+  sessionAiEvidenceEmptyNotice,
+  type AiUsageViewModel,
+  type ConfirmationRevisionSectionViewModel,
+  type ConfirmationRevisionTurnViewModel,
+  type TtsServeEvidenceSectionViewModel,
+} from "./sessionAiEvidenceViewModel";
 import { AIQualityDashboard } from "./quality/AIQualityDashboard";
 import { qualityDashboardRequestClassification } from "./quality/qualityDashboardRequestPolicy";
 import {
@@ -198,7 +212,16 @@ export function AnalysisScreen() {
   }, [qualityRetryAtMs]);
 
   if (sessionId && patientId) {
-    return <SessionAnalysis patientId={patientId} sessionId={sessionId} onBack={() => setSessionId(null)} />;
+    // key 强制按 exact patient+session 重新挂载:换场次绝不能在 effect 清空前的
+    // 那一次 render 里,把 A 场次的 journal/usage state 短暂配上 B 的标题渲染出来。
+    return (
+      <SessionAnalysis
+        key={`${patientId}:${sessionId}`}
+        patientId={patientId}
+        sessionId={sessionId}
+        onBack={() => setSessionId(null)}
+      />
+    );
   }
   if (patientId) {
     return (
@@ -415,13 +438,31 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
     attempts: AttemptEvent[];
     interactions: InteractionEvent[];
     session: Session;
+    ttsServesRaw: unknown;
+    confirmationRevisionsRaw: unknown;
   } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [contractError, setContractError] = useState<string | null>(null);
   const [audioAccess, setAudioAccess] = useState<"checking" | "allowed" | "denied">("checking");
   useEffect(() => {
-    api.sessionJournal(sessionId)
+    let current = true;
+    const controller = new AbortController();
+    setData(null);
+    setErr(null);
+    setContractError(null);
+    api.sessionJournal(sessionId, controller.signal)
       .then((j) => {
+        if (!current) return;
+        // exact-session fence:晚到的响应必须严格核对本次请求的 sid;撤回墓碑
+        // 因隐私不携带 patient_id,只能核对 sid,不能与当前受试者做进一步核对。
+        if (j.session.session_id !== sessionId) {
+          setErr("服务器返回了其他场次的 journal，已拒绝显示");
+          return;
+        }
+        if (j.session.content_state !== "withdrawn_tombstone" && j.session.patient_id !== patientId) {
+          setErr("服务器返回的场次不属于当前受试者，已拒绝显示");
+          return;
+        }
         const missing: string[] = [];
         if (!Array.isArray(j.attempts)) missing.push("attempts");
         if (!Array.isArray(j.interactions)) missing.push("interactions");
@@ -435,10 +476,19 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
           attempts: Array.isArray(j.attempts) ? j.attempts : [],
           interactions: Array.isArray(j.interactions) ? j.interactions : [],
           session: j.session,
+          ttsServesRaw: j.tts_serves,
+          confirmationRevisionsRaw: j.confirmation_revisions,
         });
       })
-      .catch((e) => setErr(e instanceof ApiError ? e.detail : String(e)));
-  }, [sessionId]);
+      .catch((e: unknown) => {
+        if (!current || (e instanceof DOMException && e.name === "AbortError")) return;
+        setErr(e instanceof ApiError ? e.detail : String(e));
+      });
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [sessionId, patientId]);
   useEffect(() => {
     let cancelled = false;
     setAudioAccess("checking");
@@ -450,8 +500,79 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
       .catch(() => { if (!cancelled) setAudioAccess("denied"); });
     return () => { cancelled = true; };
   }, [sessionId]);
+
+  const [aiUsageState, setAiUsageState] = useState<AiUsageViewModel>({ status: "loading" });
+  useEffect(() => {
+    let current = true;
+    const controller = new AbortController();
+    setAiUsageState({ status: "loading" });
+    api.getSessionAiUsage(sessionId, controller.signal)
+      .then((contract) => {
+        if (!current) return;
+        setAiUsageState({ status: "ready", model: buildAiUsageSection(contract) });
+      })
+      .catch((error: unknown) => {
+        if (!current || (error instanceof DOMException && error.name === "AbortError")) return;
+        if (error instanceof ApiError) {
+          const detailData = error.detailData;
+          const code = detailData !== null && typeof detailData === "object" && !Array.isArray(detailData)
+            ? (detailData as { code?: unknown }).code
+            : undefined;
+          if (error.status === 409 && code === "subject_withdrawn_content_unavailable") {
+            setAiUsageState({ status: "withdrawn" });
+          } else if (error.status === 403) {
+            setAiUsageState({ status: "forbidden" });
+          } else {
+            setAiUsageState({ status: "network-error", message: error.detail });
+          }
+          return;
+        }
+        setAiUsageState({ status: "contract-error", message: error instanceof Error ? error.message : String(error) });
+      });
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [sessionId]);
+
   const classification = data ? sessionDataClassification(data.session) : null;
-  const timeline = data ? buildEvidenceTimeline(data) : null;
+  const withdrawn = data?.session.content_state === "withdrawn_tombstone";
+  // 撤回墓碑没有真实 item/turn/attempt 内容,绝不能喂进逐次证据时间线——
+  // 那会渲染出 0 次统计或"第 undefined 周"这类假信息。
+  const timeline = data && !withdrawn ? buildEvidenceTimeline(data) : null;
+
+  const ttsSection: TtsServeEvidenceSectionViewModel | null = useMemo(() => {
+    if (!data) return null;
+    if (withdrawn) return { status: "withdrawn" };
+    try {
+      const records = parseTtsServeEvidenceList(data.ttsServesRaw, data.session.session_id, data.session.is_simulation);
+      return buildTtsServeEvidenceSection(records);
+    } catch (error) {
+      return { status: "contract-error", message: error instanceof Error ? error.message : String(error) };
+    }
+  }, [data, withdrawn]);
+
+  const confirmationSection: ConfirmationRevisionSectionViewModel | null = useMemo(() => {
+    if (!data) return null;
+    if (withdrawn) return { status: "withdrawn" };
+    try {
+      const byTurn = parseConfirmationRevisionsByTurn(
+        data.confirmationRevisionsRaw,
+        data.turns.map((turn) => ({ id: turn.id, confirmation_revision: turn.confirmation_revision })),
+      );
+      const hasConfirmedTextByTurnId = new Map(
+        data.turns.map((turn) => [turn.id, Boolean(turn.confirmed_response_text?.trim())] as const),
+      );
+      return buildConfirmationRevisionSection(byTurn, hasConfirmedTextByTurnId);
+    } catch (error) {
+      return { status: "contract-error", message: error instanceof Error ? error.message : String(error) };
+    }
+  }, [data, withdrawn]);
+
+  const confirmationByTurnId: Map<number, ConfirmationRevisionTurnViewModel> | null =
+    confirmationSection?.status === "ready"
+      ? new Map(confirmationSection.turns.map((turn) => [turn.turnId, turn]))
+      : null;
 
   return (
     <div className="page-shell page-shell--wide">
@@ -459,78 +580,104 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
         <div>
           <p className="page-kicker">分析后台 · <span className="mono">{patientId}</span></p>
           <h2 className="page-title">
-            {data ? `第 ${data.session.week_no} 周 · ${data.session.phase_type}` : "场次逐环节"}
+            {withdrawn ? "场次内容已撤回" : data ? `第 ${data.session.week_no} 周 · ${data.session.phase_type}` : "场次逐环节"}
           </h2>
           <p className="page-description">按题目、环节和 attempt 回看录音引用、ASR、AI 运营判类、提示/反馈与技术暂停，再与人工锁定的研究真值对照。</p>
         </div>
         <div className="toolbar">
-          {classification && <DataBoundaryBadge classification={classification} />}
+          {classification && !withdrawn && <DataBoundaryBadge classification={classification} />}
           <Button onClick={onBack}>返回场次列表</Button>
         </div>
       </header>
       {err && <Alert tone="danger" title="场次日志读取失败">{err}</Alert>}
-      {classification === "simulation" && (
-        <Alert tone="warn" title="专用模拟场次">本页内容只用于演练和模型核查，不得进入真实研究汇总。</Alert>
-      )}
-      {classification === "legacy_unknown" && (
-        <Alert tone="danger" title="历史场次分类未知">系统未推测该场次类型；完成迁移和人工核对前，不得纳入研究结果。</Alert>
-      )}
-      <Alert tone="info" title="证据口径">
-        <strong>AI operational 判类是自动提示与推进的运营证据，不是研究真值。</strong>
-        只有研究者确认文本并锁定的分值才是研究真值；“数值一致”也不代表两者语义等同。
-      </Alert>
-      {audioAccess === "checking" && <StatusPill tone="muted">正在核对原声回放权限…</StatusPill>}
-      {audioAccess === "denied" && (
-        <Alert tone="warn" title="原声回放未授权">
-          证据元数据仍可核查，但共享 PIN、开放开发模式或无权角色不会显示播放按钮。请使用 researcher、data_steward 或 admin 具名账号登录。
+      {withdrawn && (
+        <Alert tone="warn" title="受试者内容已撤回">
+          该场次因受试者或录音撤回已关闭内容读取。逐次证据、TTS 服务证据、确认修订历史与 AI 使用汇总均不可用——
+          这是隐私关闭，不能据此推断是否发生或发生次数，也不会显示为空表。
         </Alert>
       )}
-      {contractError && <Alert tone="danger" title="AI 证据契约不完整">{contractError}</Alert>}
-      {timeline && timeline.issues.length > 0 && <EvidenceIssues issues={timeline.issues} title="场次级证据异常" />}
+      {!withdrawn && (
+        <>
+          {classification === "simulation" && (
+            <Alert tone="warn" title="专用模拟场次">本页内容只用于演练和模型核查，不得进入真实研究汇总。</Alert>
+          )}
+          {classification === "legacy_unknown" && (
+            <Alert tone="danger" title="历史场次分类未知">系统未推测该场次类型；完成迁移和人工核对前，不得纳入研究结果。</Alert>
+          )}
+          <Alert tone="info" title="证据口径">
+            <strong>AI operational 判类是自动提示与推进的运营证据，不是研究真值。</strong>
+            只有研究者确认文本并锁定的分值才是研究真值；“数值一致”也不代表两者语义等同。
+          </Alert>
+          {audioAccess === "checking" && <StatusPill tone="muted">正在核对原声回放权限…</StatusPill>}
+          {audioAccess === "denied" && (
+            <Alert tone="warn" title="原声回放未授权">
+              证据元数据仍可核查，但共享 PIN、开放开发模式或无权角色不会显示播放按钮。请使用 researcher、data_steward 或 admin 具名账号登录。
+            </Alert>
+          )}
+          {contractError && <Alert tone="danger" title="AI 证据契约不完整">{contractError}</Alert>}
+          {timeline && timeline.issues.length > 0 && <EvidenceIssues issues={timeline.issues} title="场次级证据异常" />}
 
-      {timeline && (
-        <section className="form-section evidence-summary">
-          <div className="form-section-header"><div>
-            <h3>本场证据概览</h3>
-            <p className="muted">仅统计当前数据分区中的这一场；不与模拟或历史未知数据混合。</p>
-          </div></div>
-          <div className="evidence-stat-grid">
-            <EvidenceStat label="AI attempts" value={timeline.summary.totalAttempts} />
-            <EvidenceStat label="已完成 AI" value={timeline.summary.completedAttempts} tone="ok" />
-            <EvidenceStat label="技术失败" value={timeline.summary.technicalFailures} tone={timeline.summary.technicalFailures ? "danger" : "muted"} />
-            <EvidenceStat label="未完成" value={timeline.summary.incompleteAttempts} tone={timeline.summary.incompleteAttempts ? "warn" : "muted"} />
-            <EvidenceStat label="已绑 source" value={timeline.summary.sourceBoundTurns} />
-            <EvidenceStat label="人工真值" value={timeline.summary.lockedTruths} tone="ok" />
-            <EvidenceStat label="严重证据问题" value={timeline.summary.dangerIssues} tone={timeline.summary.dangerIssues ? "danger" : "ok"} />
-            <EvidenceStat label="待核查" value={timeline.summary.warningIssues} tone={timeline.summary.warningIssues ? "warn" : "muted"} />
-          </div>
-        </section>
-      )}
+          {timeline && (
+            <section className="form-section evidence-summary">
+              <div className="form-section-header"><div>
+                <h3>本场证据概览</h3>
+                <p className="muted">仅统计当前数据分区中的这一场；不与模拟或历史未知数据混合。</p>
+              </div></div>
+              <div className="evidence-stat-grid">
+                <EvidenceStat label="AI attempts" value={timeline.summary.totalAttempts} />
+                <EvidenceStat label="已完成 AI" value={timeline.summary.completedAttempts} tone="ok" />
+                <EvidenceStat label="技术失败" value={timeline.summary.technicalFailures} tone={timeline.summary.technicalFailures ? "danger" : "muted"} />
+                <EvidenceStat label="未完成" value={timeline.summary.incompleteAttempts} tone={timeline.summary.incompleteAttempts ? "warn" : "muted"} />
+                <EvidenceStat label="已绑 source" value={timeline.summary.sourceBoundTurns} />
+                <EvidenceStat label="人工真值" value={timeline.summary.lockedTruths} tone="ok" />
+                <EvidenceStat label="严重证据问题" value={timeline.summary.dangerIssues} tone={timeline.summary.dangerIssues ? "danger" : "ok"} />
+                <EvidenceStat label="待核查" value={timeline.summary.warningIssues} tone={timeline.summary.warningIssues ? "warn" : "muted"} />
+              </div>
+            </section>
+          )}
 
-      {timeline && timeline.turns.length === 0 && (timeline.unboundAudios.length === 0
-        ? <Alert tone="info" title="该场次暂无逐次证据">尚未产生 attempt、Turn 或定位到环节的 interaction。</Alert>
-        : <Alert tone="warn" title="只找到未绑定录音">未找到可与环节对齐的 attempt/Turn，下方仅列出原始音频资产。</Alert>)}
+          {ttsSection && <TtsServeEvidenceSectionView section={ttsSection} />}
+          {confirmationSection?.status === "contract-error" && (
+            <Alert tone="danger" title="确认修订契约异常">
+              {confirmationSection.message}
+              下方人工研究真值（确认文本、锁分）仍可读；但本场确认修订履历的完整性目前无法证明，已拒绝显示，不代表无修改。
+            </Alert>
+          )}
+          {data && <AiUsageSectionView state={aiUsageState} />}
 
-      {timeline?.turns.map((row) => <EvidenceTurnCard key={row.key} row={row} canPlayAudio={audioAccess === "allowed"} />)}
+          {timeline && timeline.turns.length === 0 && (timeline.unboundAudios.length === 0
+            ? <Alert tone="info" title="该场次暂无逐次证据">尚未产生 attempt、Turn 或定位到环节的 interaction。</Alert>
+            : <Alert tone="warn" title="只找到未绑定录音">未找到可与环节对齐的 attempt/Turn，下方仅列出原始音频资产。</Alert>)}
 
-      {timeline && timeline.sessionInteractions.length > 0 && (
-        <section className="form-section">
-          <div className="form-section-header"><div>
-            <h3>场次级交互事件</h3>
-            <p className="muted">这些事件未绑定到具体题目/环节，不会被静默塞入某个 attempt。</p>
-          </div></div>
-          <InteractionTimeline rows={timeline.sessionInteractions} />
-        </section>
-      )}
+          {timeline?.turns.map((row) => (
+            <EvidenceTurnCard
+              key={row.key}
+              row={row}
+              canPlayAudio={audioAccess === "allowed"}
+              confirmation={row.turn ? confirmationByTurnId?.get(row.turn.id) : undefined}
+            />
+          ))}
 
-      {timeline && timeline.unboundAudios.length > 0 && (
-        <section className="form-section">
-          <div className="form-section-header"><div>
-            <h3>未配对录音</h3>
-            <p className="muted">已采集但没有被 attempt 或 Turn 引用，可能来自关系建立段或采集异常。</p>
-          </div></div>
-          {timeline.unboundAudios.map((audio) => <AudioEvidence key={audio.raw_audio_id} audio={audio} canPlay={audioAccess === "allowed"} />)}
-        </section>
+          {timeline && timeline.sessionInteractions.length > 0 && (
+            <section className="form-section">
+              <div className="form-section-header"><div>
+                <h3>场次级交互事件</h3>
+                <p className="muted">这些事件未绑定到具体题目/环节，不会被静默塞入某个 attempt。</p>
+              </div></div>
+              <InteractionTimeline rows={timeline.sessionInteractions} />
+            </section>
+          )}
+
+          {timeline && timeline.unboundAudios.length > 0 && (
+            <section className="form-section">
+              <div className="form-section-header"><div>
+                <h3>未配对录音</h3>
+                <p className="muted">已采集但没有被 attempt 或 Turn 引用，可能来自关系建立段或采集异常。</p>
+              </div></div>
+              {timeline.unboundAudios.map((audio) => <AudioEvidence key={audio.raw_audio_id} audio={audio} canPlay={audioAccess === "allowed"} />)}
+            </section>
+          )}
+        </>
       )}
 
       <AuditPanel sessionId={sessionId} />
@@ -547,6 +694,135 @@ function EvidenceStat({ label, value, tone = "muted" }: {
   return <div className="evidence-stat"><span>{label}</span><StatusPill tone={tone}>{value}</StatusPill></div>;
 }
 
+// 场次级 TTS 服务端实际返回/降级证据。served 只证明服务器把音频字节交回了请求方；
+// 终端侧音频消费情况属于 T5 的 started/ended playback ACK，本区不涉及。
+export function TtsServeEvidenceSectionView({ section }: { section: TtsServeEvidenceSectionViewModel }) {
+  return (
+    <section className="form-section" aria-label="TTS 服务端实际返回证据">
+      <div className="form-section-header"><div>
+        <h3>TTS 服务端实际返回/降级证据（场次级）</h3>
+        <p className="muted">这里只证明服务端响应事实；终端侧音频消费情况不在本证据范围，需另行核对播放回执（T5）。</p>
+      </div></div>
+      {section.status === "contract-error" && <Alert tone="danger" title="TTS 证据契约异常">{section.message}</Alert>}
+      {section.status === "empty" && <Alert tone="info" title="暂无 TTS 服务证据">{section.notice}</Alert>}
+      {section.status === "ready" && (
+        <>
+          <div className="evidence-stat-grid">
+            <EvidenceStat label="已实际返回" value={section.summary.served} tone="ok" />
+            <EvidenceStat label="缓存命中" value={section.summary.cacheHits} />
+            <EvidenceStat label="已降级" value={section.summary.degraded} tone={section.summary.degraded ? "warn" : "muted"} />
+          </div>
+          <div className="evidence-attempt-section">
+            {section.rows.map((row) => (
+              <article className="evidence-attempt" key={row.key}>
+                <div className="analysis-turn-head">
+                  <strong className="mono">{row.time}</strong>
+                  <StatusPill tone={row.resultTone} size="sm">{row.resultLabel}</StatusPill>
+                </div>
+                <div className="evidence-detail-grid evidence-detail-grid--attempt">
+                  <EvidenceValue label="来源" value={row.sourceLabel} />
+                  <EvidenceValue label="指令" value={row.commandLabel} mono />
+                  <EvidenceValue label="引擎" value={row.engineVersion} mono />
+                  <EvidenceValue label="缓存" value={row.cacheLabel} />
+                  <EvidenceValue label="字节" value={row.byteLabel} mono />
+                </div>
+              </article>
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+// 内容无关的确认修订履历:只列 revision/actor/时间,绝不复述确认文本或校验哈希链。
+export function ConfirmationRevisionHistory({ confirmation }: { confirmation: ConfirmationRevisionTurnViewModel }) {
+  if (confirmation.status === "no_ledger") {
+    return (
+      <div className="evidence-confirmation-history">
+        <div className="evidence-section-title"><strong>确认修订历史</strong></div>
+        <p className="muted">{confirmation.notice}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="evidence-confirmation-history">
+      <div className="evidence-section-title">
+        <strong>确认修订历史</strong>
+        <span className="muted">共 {confirmation.finalRevision} 次 · 内容无关记录</span>
+      </div>
+      <ol className="evidence-timeline">
+        {confirmation.entries.map((entry) => (
+          <li key={entry.key}>
+            <span className="evidence-timeline-dot" aria-hidden />
+            <div>
+              <span className="mono muted">revision {entry.revision} · {entry.time}</span>
+              <strong>操作者 {entry.actorDisplayId}</strong>
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+// 场次级 AI 实际使用汇总:后端聚合账本,不是 provider readiness、模型准确率或 autopilot 控制状态。
+export function AiUsageSectionView({ state }: { state: AiUsageViewModel }) {
+  return (
+    <section className="form-section" aria-label="场次级 AI 实际使用汇总">
+      <div className="form-section-header"><div>
+        <h3>场次级 AI 实际使用汇总</h3>
+        <p className="muted">服务端账本聚合的实际使用证据；不是配置可达性探针，也不是模型准确率或 autopilot 控制状态。</p>
+        <p className="muted">本区与上方逐次证据来自两次独立、非原子的服务端快照；活跃场次里两者出现短暂计数差异是正常的，不代表契约损坏，前端不会据此重算或强行对齐。</p>
+      </div></div>
+      {state.status === "loading" && <StatusPill role="status" tone="muted">正在加载 AI 使用汇总…</StatusPill>}
+      {state.status === "forbidden" && (
+        <Alert tone="warn" title="当前账号无权查看 AI 使用汇总">该证据仅向获授权账号开放。</Alert>
+      )}
+      {state.status === "withdrawn" && (
+        <Alert tone="warn" title="受试者内容已撤回">该场次 AI 使用汇总因隐私关闭已不可读，无法据此判断使用情况。</Alert>
+      )}
+      {state.status === "network-error" && <Alert tone="danger" title="AI 使用汇总读取失败">{state.message}</Alert>}
+      {state.status === "contract-error" && <Alert tone="danger" title="AI 使用汇总契约异常">{state.message}</Alert>}
+      {state.status === "ready" && (
+        <>
+          {!state.model.hasAnyRecords && <Alert tone="info" title="暂无实际使用证据">{sessionAiEvidenceEmptyNotice}</Alert>}
+          <div className="evidence-attempt-section">
+            <div className="evidence-section-title"><strong>TTS</strong></div>
+            {state.model.ttsRows.length === 0 && <p className="muted">无记录。</p>}
+            {state.model.ttsRows.map((row) => (
+              <div className="evidence-value" key={row.key}>
+                <span className="mono">{row.label}</span>
+                <strong>{row.detail}</strong>
+              </div>
+            ))}
+          </div>
+          <div className="evidence-attempt-section">
+            <div className="evidence-section-title"><strong>ASR</strong></div>
+            {state.model.asrRows.length === 0 && <p className="muted">无记录。</p>}
+            {state.model.asrRows.map((row) => (
+              <div className="evidence-value" key={row.key}>
+                <span className="mono">{row.label}</span>
+                <strong>{row.detail}</strong>
+              </div>
+            ))}
+          </div>
+          <div className="evidence-attempt-section">
+            <div className="evidence-section-title"><strong>判类（judge）</strong></div>
+            {state.model.judgeRows.length === 0 && <p className="muted">无记录。</p>}
+            {state.model.judgeRows.map((row) => (
+              <div className="evidence-value" key={row.key}>
+                <span className="mono">{row.label}</span>
+                <strong>{row.detail}</strong>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 function EvidenceIssues({ issues, title = "证据问题" }: { issues: EvidenceIssue[]; title?: string }) {
   if (issues.length === 0) return null;
   const danger = issues.some((row) => row.tone === "danger");
@@ -559,7 +835,11 @@ function EvidenceIssues({ issues, title = "证据问题" }: { issues: EvidenceIs
   );
 }
 
-function EvidenceTurnCard({ row, canPlayAudio }: { row: TurnEvidence; canPlayAudio: boolean }) {
+function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
+  row: TurnEvidence;
+  canPlayAudio: boolean;
+  confirmation?: ConfirmationRevisionTurnViewModel;
+}) {
   const turn = row.turn;
   const researchValue = turn?.element_value ?? turn?.reviewed_score;
   const corrected = turn?.confirmed_response_text != null && turn.confirmed_response_text !== turn.asr_text;
@@ -601,6 +881,7 @@ function EvidenceTurnCard({ row, canPlayAudio }: { row: TurnEvidence; canPlayAud
           </div>
         ) : <p className="muted">尚未生成 Turn，因此没有可用的人工研究真值。</p>}
         <p className={`evidence-comparison is-${row.comparison.state}`}>{row.comparison.message}</p>
+        {confirmation && <ConfirmationRevisionHistory confirmation={confirmation} />}
       </div>
 
       <div className="evidence-attempt-section">

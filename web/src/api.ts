@@ -63,6 +63,7 @@ import {
   type QualityDataClassification,
 } from "./console/quality/qualityDashboardContract";
 import { qualityDashboardRequestPath } from "./console/quality/qualityDashboardRequestPolicy";
+import { parseSessionAiUsage, type SessionAiUsageContract } from "./console/sessionAiUsageContract";
 import type { CursorMsg } from "./sync/messages";
 
 export { ApiError } from "./apiResponse";
@@ -573,11 +574,18 @@ export const api = {
       DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
     ), receipt);
   },
-  sessionJournal: (sid: string) => req<{
+  sessionJournal: (sid: string, signal?: AbortSignal) => req<{
     session: Session; items: ItemEvent[]; turns: TurnEvent[]; audios: AudioAsset[]; abnormal: AbnormalEvent[];
     attempts: import("./types").AttemptEvent[]; interactions: import("./types").InteractionEvent[];
     audio_receipts: AudioCaptureReceipt[];
-  }>("GET", `/sessions/${encodeURIComponent(sid)}/journal`),
+    // 未经运行时校验的原始负载；调用方必须用 sessionAiEvidenceContract 的严格 parser
+    // 校验后才能展示，缺字段/畸形不得静默当空数组。
+    tts_serves: unknown;
+    confirmation_revisions: unknown;
+  }>(
+    "GET", `/sessions/${encodeURIComponent(sid)}/journal`, undefined,
+    DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
+  ),
   audioReceipts: (sid: string, afterSeq = 0, limit = 500) => {
     const q = new URLSearchParams({ after_seq: String(afterSeq), limit: String(limit) });
     return req<{
@@ -587,6 +595,11 @@ export const api = {
   getSessionRuntime: async (sid: string, signal?: AbortSignal): Promise<SessionRuntimeState> =>
     parseSessionRuntimeState(await req<unknown>(
       "GET", `/sessions/${encodeURIComponent(sid)}/runtime`, undefined,
+      DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
+    ), sid),
+  getSessionAiUsage: async (sid: string, signal?: AbortSignal): Promise<SessionAiUsageContract> =>
+    parseSessionAiUsage(await req<unknown>(
+      "GET", `/sessions/${encodeURIComponent(sid)}/ai-usage`, undefined,
       DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
     ), sid),
   pauseSession: async (sid: string): Promise<SessionRuntimeState> =>
