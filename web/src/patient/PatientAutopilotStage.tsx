@@ -107,13 +107,22 @@ export function PatientAutopilotStage({
       <div className="stage-mic" aria-live="polite">
         <p className="patient-status" role="status">{status}</p>
         {runtime?.phase === "recording" && (
-          <button
-            type="button"
-            className="patient-primary-action patient-primary-action--secondary"
-            onClick={autopilot.stopRecordingNow}
-          >
-            我说好了
-          </button>
+          <>
+            {/* 服务器托管的自动流程里这个按钮只是提前结束，不是完成链路的必要条件：
+                不点，到作答窗口尽头也会自动收麦并继续。文案必须把这点说清楚，
+                否则老人会以为不点就卡住。人工/legacy 平面的麦克风按钮不受影响。 */}
+            <button
+              type="button"
+              className="patient-primary-action patient-primary-action--secondary"
+              onClick={autopilot.stopRecordingNow}
+              aria-describedby="autopilot-stop-optional"
+            >
+              说完了可以点这里
+            </button>
+            <p className="patient-optional-hint" id="autopilot-stop-optional">
+              不点也可以，我们会自动继续
+            </p>
+          </>
         )}
       </div>
     </div>

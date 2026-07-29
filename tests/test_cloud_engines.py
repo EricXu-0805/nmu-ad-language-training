@@ -4,6 +4,7 @@
 """
 import base64
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -393,7 +394,7 @@ def test_asr_cloud_transcribes_with_hotword_context(monkeypatch):
 
     def fake_call(self, audio_bytes, context):
         seen["context"] = context
-        return "这是胡萝卜"
+        return asr._AsrCall(ok=True, text="这是胡萝卜")
 
     monkeypatch.setattr(asr.DashScopeAsrEngine, "_call", fake_call)
     eng = asr.DashScopeAsrEngine("qwen3-asr-flash")
@@ -411,6 +412,93 @@ def test_asr_cloud_error_degrades(monkeypatch):
     monkeypatch.setattr(asr.DashScopeAsrEngine, "_call", boom)
     res = asr.DashScopeAsrEngine("qwen3-asr-flash").transcribe(WEBM, ["胡萝卜"])
     assert res.asr_text is None                          # 降级人工转写口径,不炸
+
+
+def test_asr_cloud_successful_empty_transcript_is_silence_not_degradation(monkeypatch):
+    """provider 明确成功、响应合法但一个字都没识别出来 = 沉默，不是技术失败。
+
+    折成 None 的话，老人第一次没出声会被当成 ASR 不可用而暂停整场，冻结协议里
+    那条 silence 一级提示永远播不出来。
+    """
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    monkeypatch.setattr(
+        asr.DashScopeAsrEngine, "_call",
+        lambda self, audio_bytes, context: asr._AsrCall(ok=True, text=""))
+    res = asr.DashScopeAsrEngine("qwen3-asr-flash").transcribe(WEBM, ["胡萝卜"])
+    assert res.asr_text == ""                            # 空字符串，不是 None
+    assert res.asr_text is not None
+    assert res.hotword_hit is False
+    assert res.asr_confidence is None
+
+
+def test_asr_cloud_unsuccessful_call_stays_a_technical_failure(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    monkeypatch.setattr(
+        asr.DashScopeAsrEngine, "_call",
+        lambda self, audio_bytes, context: asr._AsrCall(ok=False))
+    res = asr.DashScopeAsrEngine("qwen3-asr-flash").transcribe(WEBM, ["胡萝卜"])
+    assert res.asr_text is None                          # 与"成功但空"严格区分
+
+
+_NO_OUTPUT = object()
+_NO_STATUS = object()
+
+
+def _asr_response(*, status_code=200, choices=_NO_OUTPUT):
+    fields = {}
+    if status_code is not _NO_STATUS:
+        fields["status_code"] = status_code
+    fields["output"] = (
+        None if choices is _NO_OUTPUT else SimpleNamespace(choices=choices))
+    return SimpleNamespace(**fields)
+
+
+def _asr_choice(content):
+    return SimpleNamespace(message=SimpleNamespace(content=content))
+
+
+_OK = asr._AsrCall(ok=True, text="胡萝卜")
+_EMPTY = asr._AsrCall(ok=True, text="")
+_BROKEN = asr._AsrCall(ok=False, text="")
+
+
+@pytest.mark.parametrize(("case", "response", "expected"), [
+    ("分段转写", _asr_response(choices=[_asr_choice([{"text": "胡萝卜"}])]), _OK),
+    ("字符串转写", _asr_response(choices=[_asr_choice("胡萝卜")]), _OK),
+    # 明确 200 + 合法转写结构 + 没有文本 → 运营层"本轮无转写"。
+    ("分段但只有空白", _asr_response(choices=[_asr_choice([{"text": "  "}])]), _EMPTY),
+    ("显式空字符串段", _asr_response(choices=[_asr_choice([{"text": ""}])]), _EMPTY),
+    ("空字符串转写", _asr_response(choices=[_asr_choice("")]), _EMPTY),
+    # 以下全部按技术失败 fail closed，绝不映射成"本轮无转写"。
+    ("缺 status_code", _asr_response(status_code=_NO_STATUS,
+                                     choices=[_asr_choice([{"text": "胡萝卜"}])]), _BROKEN),
+    ("非 200", _asr_response(status_code=500,
+                             choices=[_asr_choice([{"text": "胡萝卜"}])]), _BROKEN),
+    ("status_code 非整数", _asr_response(status_code="200",
+                                        choices=[_asr_choice([{"text": "x"}])]), _BROKEN),
+    ("缺 output", _asr_response(), _BROKEN),
+    ("空 choices", _asr_response(choices=[]), _BROKEN),
+    ("空转写段列表", _asr_response(choices=[_asr_choice([])]), _BROKEN),
+    ("段里缺 text", _asr_response(choices=[_asr_choice([{"foo": "bar"}])]), _BROKEN),
+    ("段 text 不是字符串", _asr_response(choices=[_asr_choice([{"text": 42}])]), _BROKEN),
+    ("混入坏段", _asr_response(
+        choices=[_asr_choice([{"text": "胡"}, "萝卜"])]), _BROKEN),
+    ("content 为 None", _asr_response(choices=[_asr_choice(None)]), _BROKEN),
+    ("content 类型不对", _asr_response(choices=[_asr_choice(42)]), _BROKEN),
+])
+def test_asr_call_separates_empty_transcript_from_broken_response(
+        monkeypatch, tmp_path, case, response, expected):
+    from dashscope import MultiModalConversation
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    # 患者音频副本只落测试临时目录，绝不写进 data/。
+    monkeypatch.setattr(asr, "SCRATCH_DIR", tmp_path / "asr-scratch")
+    monkeypatch.setattr(
+        MultiModalConversation, "call",
+        staticmethod(lambda **_kwargs: response))
+    eng = asr.DashScopeAsrEngine("qwen3-asr-flash")
+    assert eng._call(WEBM, "胡萝卜") == expected, case
+    assert list((tmp_path / "asr-scratch").glob("asr-*")) == []   # 副本已删净
 
 
 def test_asr_sniff_ext():

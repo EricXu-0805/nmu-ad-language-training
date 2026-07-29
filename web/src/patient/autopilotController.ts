@@ -88,6 +88,14 @@ export interface PatientAutopilotControllerOptions {
   recording: AutopilotRecordingExecutor;
   ackDelivery?: AutopilotAckDelivery;
   initialCommand?: unknown | null;
+  /**
+   * Full restored runtime seed (e.g. from restoreAutopilotRuntimeAfterRefresh),
+   * mutually exclusive with initialCommand. Rebuilding from just a command
+   * loses phase/pause_reason — a paused runtime with a null command would
+   * silently become waiting_command if only its command were passed through.
+   * Its last_device_event_seq must match the controller's own seq origin.
+   */
+  initialRuntime?: AutopilotRuntimeState;
   initialDeviceEventSeq?: number;
   idempotencyKey?: (
     command: NextCommandProjection,
@@ -193,10 +201,20 @@ export class PatientAutopilotController {
         && options.initialDeviceEventSeq !== initialSeq) {
       throw new Error("ACK delivery 与控制器序号起点不一致");
     }
-    this.stateValue = restoreAutopilotRuntime(
-      options.initialCommand ?? null,
-      initialSeq,
-    );
+    if (options.initialRuntime && options.initialCommand !== undefined) {
+      throw new Error("initialRuntime 与 initialCommand 不得同时提供");
+    }
+    if (options.initialRuntime) {
+      if (options.initialRuntime.last_device_event_seq !== initialSeq) {
+        throw new Error("initialRuntime 与控制器序号起点不一致");
+      }
+      this.stateValue = options.initialRuntime;
+    } else {
+      this.stateValue = restoreAutopilotRuntime(
+        options.initialCommand ?? null,
+        initialSeq,
+      );
+    }
     this.emitState();
   }
 

@@ -11,6 +11,7 @@ import {
   selectDeviceCredential,
 } from "../api";
 import type { LiveStateResponse } from "../types";
+import { PATIENT_AUTOPILOT_WAKE_EVENT, liveSnapshotWake } from "./autopilotWake";
 import { bus } from "./bus";
 import { LiveAuthorizationFence } from "./liveAuthorizationFence";
 import { livePollingHasActiveCapability } from "./livePollPolicy";
@@ -200,6 +201,16 @@ export function useLiveCursor(): LiveState {
           serverProjectionAuthorized = true;
           markConnected();
           const seq = typeof d.seq === "number" ? d.seq : 0;
+          const s = parseSyncPayload("session", d.session) ?? undefined;
+          // 跨设备所有权唤醒必须在"seq 未变就返回"之前处理:console 启动服务器 AI
+          // 不推进 LiveState.seq,放在 early-return 之后就永远收不到。
+          const wake = liveSnapshotWake(d.autopilotWake, s?.sessionId);
+          // 卸载后的旧 poll 或已被轮换掉的 capability 都不得再发唤醒：
+          // 那会让一个已经离场的凭据把床旁 runner 叫起来。
+          if (wake && !cancelled && credentialStillSelected()) {
+            window.dispatchEvent(
+              new CustomEvent(PATIENT_AUTOPILOT_WAKE_EVENT, { detail: wake }));
+          }
           const firstServerSnapshot = !serverSnapshotSeen.current;
           if (!firstServerSnapshot && seq === lastSeq.current) return;   // 无新事
           // 单飞轮询不会乱序；seq 变小意味服务重启/换库，应当作为新服务端 epoch 接受，
@@ -207,7 +218,6 @@ export function useLiveCursor(): LiveState {
           const epochReset = firstServerSnapshot || seq < lastSeq.current;
           serverSnapshotSeen.current = true;
           lastSeq.current = seq;
-          const s = parseSyncPayload("session", d.session) ?? undefined;
           const c = parseSyncPayload("cursor", d.cursor) ?? undefined;
           const r = parseSyncPayload("rapportStep", d.rapportStep) ?? undefined;
           const prev = stateRef.current;

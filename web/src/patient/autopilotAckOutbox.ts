@@ -10,9 +10,13 @@ const CONTROL_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 const ENVELOPE_KEYS = new Set([
   "schemaVersion", "ownerKey", "sessionId", "commandKey", "command", "ack", "createdAtMs",
 ]);
-const CHECKPOINT_KEYS = new Set([
+const CHECKPOINT_V1_KEYS = new Set([
   "schemaVersion", "ownerKey", "sessionId", "lastDeviceEventSeq", "updatedAtMs",
 ]);
+const CHECKPOINT_V2_KEYS = new Set([
+  "schemaVersion", "ownerKey", "sessionId", "lastDeviceEventSeq", "updatedAtMs", "latch",
+]);
+const LATCH_KEYS = new Set(["commandKey", "command", "ack"]);
 
 export interface AutopilotAckEnvelope {
   schemaVersion: 1;
@@ -25,13 +29,34 @@ export interface AutopilotAckEnvelope {
   createdAtMs: number;
 }
 
-export interface AutopilotAckCheckpoint {
+export type AutopilotTerminalFailureAck =
+  Extract<AutopilotAck, { ack_type: "tts_failed" | "record_failed" }>;
+
+/** Exact evidence for a completed tts_failed/record_failed ACK that a refresh must not forget. */
+export interface AutopilotTerminalFailureLatch {
+  commandKey: string;
+  command: NextCommandProjection;
+  ack: AutopilotTerminalFailureAck;
+}
+
+export interface AutopilotAckCheckpointV1 {
   schemaVersion: 1;
   ownerKey: string;
   sessionId: string;
   lastDeviceEventSeq: number;
   updatedAtMs: number;
 }
+
+export interface AutopilotAckCheckpointV2 {
+  schemaVersion: 2;
+  ownerKey: string;
+  sessionId: string;
+  lastDeviceEventSeq: number;
+  updatedAtMs: number;
+  latch: AutopilotTerminalFailureLatch | null;
+}
+
+export type AutopilotAckCheckpoint = AutopilotAckCheckpointV1 | AutopilotAckCheckpointV2;
 
 function exactKeys(value: Record<string, unknown>, allowed: Set<string>): boolean {
   const keys = Object.keys(value);
@@ -106,34 +131,110 @@ export function createAutopilotAckEnvelope(input: {
   });
 }
 
+/** latch 的 tts_failed/record_failed 限定复用既有 ackMatchesCommand 的代际/revision 校验。 */
+function parseTerminalFailureLatch(value: unknown): AutopilotTerminalFailureLatch {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("自动驾驶终态失败 latch 不是对象");
+  }
+  const row = value as Record<string, unknown>;
+  if (!exactKeys(row, LATCH_KEYS) || typeof row.commandKey !== "string") {
+    throw new Error("自动驾驶终态失败 latch 元数据非法");
+  }
+  const command = parseNextCommandProjection(row.command);
+  const ack = parseAutopilotAck(row.ack);
+  if (ack.ack_type !== "tts_failed" && ack.ack_type !== "record_failed") {
+    throw new Error("自动驾驶终态失败 latch 与冻结命令不一致");
+  }
+  if (row.commandKey !== command.command_key || !ackMatchesCommand(ack, command)) {
+    throw new Error("自动驾驶终态失败 latch 与冻结命令不一致");
+  }
+  return { commandKey: row.commandKey, command, ack };
+}
+
+/** schemaVersion 1（无 latch）必须继续可读；新写入一律走 2。 */
 export function parseAutopilotAckCheckpoint(value: unknown): AutopilotAckCheckpoint {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("自动驾驶 ACK checkpoint 不是对象");
   }
   const row = value as Record<string, unknown>;
-  if (!exactKeys(row, CHECKPOINT_KEYS) || row.schemaVersion !== 1
-      || typeof row.ownerKey !== "string" || !OWNER_KEY.test(row.ownerKey)
-      || !safeSessionId(row.sessionId)
-      || !Number.isSafeInteger(row.lastDeviceEventSeq)
-      || (row.lastDeviceEventSeq as number) < 0
-      || !Number.isSafeInteger(row.updatedAtMs) || (row.updatedAtMs as number) <= 0) {
-    throw new Error("自动驾驶 ACK checkpoint 非法");
+  const commonValid = typeof row.ownerKey === "string" && OWNER_KEY.test(row.ownerKey)
+    && safeSessionId(row.sessionId)
+    && Number.isSafeInteger(row.lastDeviceEventSeq) && (row.lastDeviceEventSeq as number) >= 0
+    && Number.isSafeInteger(row.updatedAtMs) && (row.updatedAtMs as number) > 0;
+  if (row.schemaVersion === 1) {
+    if (!commonValid || !exactKeys(row, CHECKPOINT_V1_KEYS)) {
+      throw new Error("自动驾驶 ACK checkpoint 非法");
+    }
+    return {
+      schemaVersion: 1,
+      ownerKey: row.ownerKey as string,
+      sessionId: row.sessionId as string,
+      lastDeviceEventSeq: row.lastDeviceEventSeq as number,
+      updatedAtMs: row.updatedAtMs as number,
+    };
   }
-  return row as unknown as AutopilotAckCheckpoint;
+  if (row.schemaVersion === 2) {
+    if (!commonValid || !exactKeys(row, CHECKPOINT_V2_KEYS)) {
+      throw new Error("自动驾驶 ACK checkpoint 非法");
+    }
+    const latch = row.latch === null ? null : parseTerminalFailureLatch(row.latch);
+    if (latch && latch.ack.device_event_seq !== row.lastDeviceEventSeq) {
+      throw new Error("自动驾驶终态失败 latch 与 checkpoint 序号不一致");
+    }
+    return {
+      schemaVersion: 2,
+      ownerKey: row.ownerKey as string,
+      sessionId: row.sessionId as string,
+      lastDeviceEventSeq: row.lastDeviceEventSeq as number,
+      updatedAtMs: row.updatedAtMs as number,
+      latch,
+    };
+  }
+  throw new Error("自动驾驶 ACK checkpoint 非法");
 }
 
 export function createAutopilotAckCheckpoint(input: {
   ownerKey: string;
   sessionId: string;
   lastDeviceEventSeq: number;
+  latch?: AutopilotTerminalFailureLatch | null;
   nowMs?: number;
 }): AutopilotAckCheckpoint {
   return parseAutopilotAckCheckpoint({
-    schemaVersion: 1,
+    schemaVersion: 2,
     ownerKey: input.ownerKey,
     sessionId: input.sessionId,
     lastDeviceEventSeq: input.lastDeviceEventSeq,
     updatedAtMs: input.nowMs ?? Date.now(),
+    latch: input.latch ?? null,
+  });
+}
+
+/** 无论 checkpoint 是 v1 迁移读还是 v2，统一取 latch（v1 恒为 null）。 */
+export function checkpointTerminalFailureLatch(
+  checkpoint: AutopilotAckCheckpoint | null,
+): AutopilotTerminalFailureLatch | null {
+  return checkpoint && checkpoint.schemaVersion === 2 ? checkpoint.latch : null;
+}
+
+/** completeAutopilotAck 的原子决策核心：失败类 ACK 落 latch，其余一律清。 */
+export function nextAutopilotAckLatch(
+  entry: AutopilotAckEnvelope,
+): AutopilotTerminalFailureLatch | null {
+  if (entry.ack.ack_type !== "tts_failed" && entry.ack.ack_type !== "record_failed") return null;
+  return { commandKey: entry.command.command_key, command: entry.command, ack: entry.ack };
+}
+
+export function nextAutopilotAckCheckpoint(
+  entry: AutopilotAckEnvelope,
+  nowMs?: number,
+): AutopilotAckCheckpoint {
+  return createAutopilotAckCheckpoint({
+    ownerKey: entry.ownerKey,
+    sessionId: entry.sessionId,
+    lastDeviceEventSeq: entry.ack.device_event_seq,
+    latch: nextAutopilotAckLatch(entry),
+    nowMs,
   });
 }
 

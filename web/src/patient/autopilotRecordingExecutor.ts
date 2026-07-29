@@ -15,11 +15,22 @@ import {
 } from "../audio/audioUploadReceipt.ts";
 import { Recorder } from "../audio/recorder.ts";
 import {
+  admitCaptureBeforeDeadline,
+  answerWindowMs,
+  assertCaptureDurationWithinCommandLimit,
+  remainingAnswerWindowMs,
+} from "./autopilotCaptureWindow.ts";
+import {
   AUTOPILOT_MIME_TYPES,
   type AutopilotMimeType,
   type AutopilotStopReason,
   type NextCommandProjection,
 } from "./autopilotProtocol.ts";
+import {
+  assertEntryMatchesCommand,
+  settleCaptureCleanup,
+  type AutopilotRecoveryDependencies,
+} from "./autopilotRecordingRecovery.ts";
 import type {
   AutopilotRecordingCapture,
   AutopilotRecordingExecutor,
@@ -37,16 +48,6 @@ function exactAutopilotMime(value: string | null): AutopilotMimeType {
   const match = AUTOPILOT_MIME_TYPES.find((candidate) => candidate === normalized);
   if (!match) throw new Error("录音编码不在服务器自动驾驶白名单");
   return match;
-}
-
-function assertEntryMatchesCommand(entry: AudioOutboxEntry, command: RecordCommand): void {
-  if (entry.rawAudioId !== command.payload.raw_audio_id
-      || entry.sessionId.length === 0
-      || entry.turnKey !== command.payload.turn_ref
-      || entry.containsDirectIdentifier !== command.payload.contains_direct_identifier
-      || entry.autopilotStopReason === undefined) {
-    throw new Error("本机录音 outbox 与服务器当前录音命令不一致");
-  }
 }
 
 async function finishExactCapture(
@@ -229,14 +230,39 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         this.recorder.discardActive();
         throw new Error("麦克风未真实进入 recording 状态");
       }
+      const recordingStartedAt = this.recorder.startedAtMs;
+      if (recordingStartedAt === null) throw new Error("录音缺少真实起点时刻");
+      const remainingWindowMs = () => remainingAnswerWindowMs(
+        this.command.payload.max_duration_seconds,
+        performance.now() - recordingStartedAt,
+      );
       // Permission prompts can outlive the command that authorized opening.
       // Revalidate after the stream really exists; a pause/takeover during the
       // prompt closes tracks before record_started is exposed or ACKed.
-      const postPermissionAuthorization = await authorizeExactAutopilotRecording(
-        this.sessionId,
-        this.command.command_key,
-        this.abortController.signal,
-        browserAutopilotMediaDependencies,
+      //
+      // 这次复核是一整个网络往返，而麦克风已经在录了。所以它必须与本次录音的
+      // 截止时刻赛跑：复核卡过截止时刻（或永不返回）时，由截止时刻立刻物理关麦、
+      // 中止请求、判死这次采集，绝不留热麦、也绝不上传一段必被拒的超限音频。
+      const postPermissionAuthorization = await admitCaptureBeforeDeadline(
+        authorizeExactAutopilotRecording(
+          this.sessionId,
+          this.command.command_key,
+          this.abortController.signal,
+          browserAutopilotMediaDependencies,
+        ),
+        {
+          // 绝对截止时刻直接绑在真实录音起点上，不受这一路的调度抖动影响。
+          deadlineAt: recordingStartedAt
+            + answerWindowMs(this.command.payload.max_duration_seconds),
+          now: () => performance.now(),
+          setTimer: (callback, delayMs) => window.setTimeout(callback, delayMs),
+          clearTimer: (handle) => window.clearTimeout(handle),
+          failClosed: (reason) => {
+            this.abortController.abort(reason);
+            this.recorder.cancelPendingStart();
+            this.recorder.discardActive();
+          },
+        },
       );
       if (!authorizesMicrophoneStart(postPermissionAuthorization)
           || this.abortController.signal.aborted) {
@@ -244,19 +270,24 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         throw new Error("麦克风权限返回后自动驾驶命令已失效");
       }
       const mimeType = exactAutopilotMime(this.recorder.mimeType);
+      // 从这里到 didStart 之间没有 await：截止定时器插不进来，不会出现
+      // "已经允许持久化却被当成准入超时丢掉"的中间态。
       this.didStart = true;
       phase = "recording";
       this.startedDeferred.resolve({ mime_type: mimeType });
+      // 准入通过后才换成停麦定时器，延时仍从真实录音起点算，复核耗时已经扣掉。
       this.maxTimer = window.setTimeout(
-        () => this.signalStop("max_duration"),
-        this.command.payload.max_duration_seconds * 1_000,
-      );
+        () => this.signalStop("max_duration"), remainingWindowMs());
 
       const stopReason = await this.waitForStop();
       if (this.maxTimer !== null) window.clearTimeout(this.maxTimer);
       this.maxTimer = null;
       const recording = await this.recorder.stop();
       if (recording.blob.size <= 0) throw new Error("录音没有产生可持久化字节");
+      // 顶穿上限的录音在 ACK 阶段必被拒。照实上报、绝不 cap，但也不必先把它
+      // stage 进 outbox 再上传一遍。
+      assertCaptureDurationWithinCommandLimit(
+        recording.durationSeconds, this.command.payload.max_duration_seconds);
       phase = "persistence";
       let entry = createAudioOutboxEntry({
         rawAudioId: this.command.payload.raw_audio_id,
@@ -296,22 +327,31 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
             );
       if (!this.didStart) this.startedDeferred.reject(mapped);
       this.stoppedDeferred.reject(mapped);
-      if (this.recorder.active) this.recorder.discardActive();
+      try {
+        if (this.recorder.active) this.recorder.discardActive();
+      } catch { /* 设备层已不可用；dispose 与 Recorder 内部的断引用仍会跑 */ }
     } finally {
-      if (this.maxTimer !== null) window.clearTimeout(this.maxTimer);
-      this.maxTimer = null;
-      this.recorder.dispose();
+      // closed 是 controller 判断"麦克风物理上已经不可能再出声"的唯一依据。
+      // 清理里任何一步抛错都不能让它悬着，否则 controller 永远等在 await
+      // capture.closed 上，整台设备卡死。主错误码已经在上面定型，这里吞掉的
+      // 只是清理异常。
       const lease = this.lease;
       this.lease = null;
-      if (lease) {
-        lease.release();
-        await lease.released;
-      }
-      if (!this.settled && this.didStart && this.requestedStop === null) {
-        // Defensive only; all real starts should either persist or reject stopped.
-        this.signalStop("stream_end");
-      }
-      this.closedDeferred.resolve(undefined);
+      await settleCaptureCleanup([
+        () => {
+          if (this.maxTimer !== null) window.clearTimeout(this.maxTimer);
+          this.maxTimer = null;
+        },
+        () => this.recorder.dispose(),
+        () => { lease?.release(); },
+        () => lease?.released,
+        () => {
+          if (!this.settled && this.didStart && this.requestedStop === null) {
+            // Defensive only; all real starts should either persist or reject stopped.
+            this.signalStop("stream_end");
+          }
+        },
+      ], () => this.closedDeferred.resolve(undefined));
     }
   }
 }
@@ -327,34 +367,10 @@ export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExec
   }
 }
 
-/**
- * Refresh recovery for a physically stopped capture. It can finish upload and
- * audioSaved only when the server's exact started command matches the durable
- * outbox; otherwise it refuses to reopen or synthesize a recording.
- */
-export async function recoverAutopilotRecording(
-  sessionId: string,
-  command: RecordCommand,
-): Promise<RecordStoppedFacts | null> {
-  if (command.state !== "started") return null;
-  const lease = await acquireAudioDeviceLease();
-  try {
-    const snapshot = await blobStore.recoverySnapshot();
-    if (snapshot.invalidBlobKeyCount > 0 || snapshot.legacyOrphans.length > 0) {
-      throw new Error("本机录音恢复存储状态非法");
-    }
-    if (snapshot.entries.length === 0) return null;
-    if (snapshot.entries.length !== 1) {
-      throw new Error("自动驾驶恢复期存在多份待处置录音");
-    }
-    const entry = snapshot.entries[0];
-    assertEntryMatchesCommand(entry, command);
-    if (entry.sessionId !== sessionId) throw new Error("恢复录音属于其他场次");
-    const blob = await blobStore.get(entry.rawAudioId);
-    if (!blob) throw new Error("恢复录音缺少本机原始字节");
-    return (await finishExactCapture(command, entry, blob)).facts;
-  } finally {
-    lease.release();
-    await lease.released;
-  }
-}
+export const browserAutopilotRecoveryDependencies: AutopilotRecoveryDependencies = {
+  acquireLease: () => acquireAudioDeviceLease(),
+  recoverySnapshot: () => blobStore.recoverySnapshot(),
+  readBlob: (rawAudioId) => blobStore.get(rawAudioId),
+  finish: async (command, entry, blob) =>
+    (await finishExactCapture(command, entry, blob)).facts,
+};

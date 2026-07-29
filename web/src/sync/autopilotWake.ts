@@ -55,6 +55,26 @@ export function nextServerOwnershipWake(
   return msg;
 }
 
+/**
+ * 跨设备路径。同窗 CustomEvent 只在 console 与患者端同一个浏览器里成立;真实验收
+ * 是两台设备/两个独立浏览器,console 那条 window 事件根本到不了患者端。患者端已有的
+ * 每 1.5 秒 /live/state 轮询于是成为唯一有界的服务端权威通道。
+ *
+ * 这里只做严格解析与"同一响应内自洽"两件事:唤醒必须指向这次快照里那个 session,
+ * 否则就是旧场次/串场的投影,一律拒绝。重复同 token 不在这里去重——首个 live 响应
+ * 可能早于患者 hook 挂载,提前把 token 记成已发会把真正可消费的那一次丢掉;去重由
+ * PatientProbeWakeCoordinator 的 pending/handled 负责。
+ */
+export function liveSnapshotWake(
+  projection: unknown,
+  liveSessionId: string | null | undefined,
+): AutopilotWakeMsg | null {
+  const msg = parseAutopilotWake(projection);
+  if (msg === null) return null;
+  if (!liveSessionId || msg.sessionId !== liveSessionId) return null;
+  return msg;
+}
+
 // 与患者端 PatientAutopilotMode 同构;字面重复是有意的,sync 层不得 import
 // 老人端源码,否则 console 经 sync 会传递性越过 console↛patient 红线。
 export type PatientWakeMode = "legacy" | "probing" | "server" | "blocked";

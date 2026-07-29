@@ -8,6 +8,8 @@
 - NullAsrEngine:恒返回 None → 操作端人工转写降级,判分链不断。
 ASR_ENGINE 选择(默认 auto:有 DASHSCOPE_API_KEY → dashscope,无 → null)。
 云端失败(断网/欠费/超格式)一律降级 null 口径,不 fail-hard。
+转写结果是三态,不是两态:有文本 / 明确成功但无转写文本("") / 技术失败(None)。
+""  只表示运营层"本轮无转写",不等于已证明声学静音。
 """
 from __future__ import annotations
 
@@ -34,10 +36,29 @@ def cleanup_scratch() -> None:
 
 @dataclass(frozen=True)
 class AsrResult:
-    asr_text: str | None            # None = 引擎不可用/未接 → 人工转写降级
+    # None = 技术失败(引擎不可用/异常/非 200/响应结构损坏) → 人工转写降级;
+    # ""   = provider 明确返回 200、转写结构合法、但没有给出任何转写文本。
+    #        这只是**运营层"本轮无转写"**,不是已证明声学静音:音量过低、设备
+    #        问题、模型漏识都会落到这里。运行决策据此走冻结的 operational 沉默
+    #        分支;研究结论不得据此推断老人没说话。
+    # 两者绝不能折成同一个值:折了之后本轮无转写会被当成技术失败暂停整场,
+    # 冻结协议里那句"我们慢慢来"永远播不出来。
+    asr_text: str | None
     asr_confidence: float | None
     engine_version: str
     hotword_hit: bool = False
+
+
+@dataclass(frozen=True)
+class _AsrCall:
+    """provider 单次调用的结构化结果:把"调用成功"与"拿到转写文本"分开。
+
+    ok=True 的门槛是**明确的** 200 + 合法转写结构;缺 status_code、缺 choices、
+    空转写段列表、段里没有显式 string text、混入坏段——一律 ok=False 技术失败。
+    ok=True 且 text="" 只表示这次调用没有给出任何转写文本。
+    """
+    ok: bool
+    text: str = ""
 
 
 class AsrProvider(Protocol):
@@ -87,16 +108,21 @@ class DashScopeAsrEngine:
             return AsrResult(None, None, self.version)
         context = "、".join(dict.fromkeys(w for w in hotwords if w))
         try:
-            text = self._call(audio_bytes, context)
+            call = self._call(audio_bytes, context)
         except Exception:
-            text = None
-        if not text:
             return AsrResult(None, None, self.version)
-        hit = any(w and w in text for w in hotwords)
-        return AsrResult(asr_text=text, asr_confidence=None,
+        if not call.ok:
+            return AsrResult(None, None, self.version)
+        if not call.text:
+            # 明确 200 + 合法转写结构 + 没有转写文本 = 运营层"本轮无转写"。
+            # 这不是"已证明老人没出声";判类链只把它当运行决策依据。
+            return AsrResult(asr_text="", asr_confidence=None,
+                             engine_version=self.version)
+        hit = any(w and w in call.text for w in hotwords)
+        return AsrResult(asr_text=call.text, asr_confidence=None,
                          engine_version=self.version, hotword_hit=hit)
 
-    def _call(self, audio_bytes: bytes, context: str) -> str | None:
+    def _call(self, audio_bytes: bytes, context: str) -> _AsrCall:
         from dashscope import MultiModalConversation
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
         f = tempfile.NamedTemporaryFile(dir=SCRATCH_DIR, prefix="asr-",
@@ -114,17 +140,35 @@ class DashScopeAsrEngine:
                 request_timeout=30,
                 # itn 关:数字保持汉字口语形态,与题库可接受表达的匹配口径一致
                 asr_options={"enable_lid": False, "enable_itn": False})
+            # 只有**明确的** 200 才算调用成功;缺这个字段说明响应不是我们认识的
+            # 那个形状,不能默认放行。
+            if getattr(resp, "status_code", None) != 200:
+                return _AsrCall(ok=False)
             out = getattr(resp, "output", None)
             choices = getattr(out, "choices", None) if out is not None else None
             if not choices:
-                return None
+                return _AsrCall(ok=False)
             content = choices[0].message.content
             if isinstance(content, list):
-                parts = [c.get("text", "") for c in content if isinstance(c, dict)]
+                # 空段列表、缺 text、text 不是字符串、混进非 dict 的段——都是损坏
+                # 结构,不能当成"这次没有转写"。
+                if not content:
+                    return _AsrCall(ok=False)
+                parts = []
+                for segment in content:
+                    if not isinstance(segment, dict):
+                        return _AsrCall(ok=False)
+                    piece = segment.get("text")
+                    if not isinstance(piece, str):
+                        return _AsrCall(ok=False)
+                    parts.append(piece)
                 text = "".join(parts)
+            elif isinstance(content, str):
+                text = content
             else:
-                text = str(content or "")
-            return text.strip() or None
+                # content 既不是分段列表也不是字符串 = 响应结构损坏,按技术失败处理。
+                return _AsrCall(ok=False)
+            return _AsrCall(ok=True, text=text.strip())
         finally:
             tmp.unlink(missing_ok=True)
 

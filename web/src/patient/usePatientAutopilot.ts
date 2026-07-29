@@ -9,9 +9,24 @@ import {
   PatientAutopilotController,
   deviceCapabilityAllowsAutopilot,
 } from "./autopilotController.ts";
+import {
+  canStartAutopilotRunner,
+  shouldBootstrapAutopilotRunner,
+  shouldSchedulePassiveAutopilotPoll,
+} from "./autopilotHookRuntimeGate.ts";
 import { autopilotHttpTransport } from "./autopilotHttpTransport.ts";
-import { recoverAutopilotRecording, BrowserAutopilotRecordingExecutor } from "./autopilotRecordingExecutor.ts";
-import { restoreAutopilotRuntime, type AutopilotRuntimeState } from "./autopilotRuntime.ts";
+import {
+  BrowserAutopilotRecordingExecutor,
+  browserAutopilotRecoveryDependencies,
+} from "./autopilotRecordingExecutor.ts";
+import {
+  restoreAutopilotRuntimeAfterRefresh,
+  type AutopilotDrainedAck,
+} from "./autopilotRecordingRecovery.ts";
+import {
+  autopilotNextTickDelayMs,
+  type AutopilotRuntimeState,
+} from "./autopilotRuntime.ts";
 import { BrowserAutopilotSpeechExecutor } from "./autopilotSpeechExecutor.ts";
 import {
   acknowledgeExactAutopilotDrain,
@@ -90,20 +105,15 @@ function blockedReason(error: unknown): string {
 async function loadServerRuntime(
   sessionId: string,
   delivery: DurableAutopilotAckDelivery,
+  drained?: AutopilotDrainedAck | null,
 ): Promise<{ current: NextCommandProjection | null; runtime: AutopilotRuntimeState }> {
-  let current = await autopilotHttpTransport.next(sessionId);
-  let runtime = restoreAutopilotRuntime(current, delivery.initialDeviceEventSeq);
-  if (runtime.command?.kind === "record" && runtime.command.state === "started") {
-    const recovered = await recoverAutopilotRecording(sessionId, runtime.command);
-    if (recovered) {
-      await delivery.send(runtime.command, delivery.initialDeviceEventSeq, {
-        ack_type: "record_stopped",
-        ...recovered,
-      });
-      current = await autopilotHttpTransport.next(sessionId);
-      runtime = restoreAutopilotRuntime(current, delivery.initialDeviceEventSeq);
-    }
-  }
+  const runtime = await restoreAutopilotRuntimeAfterRefresh({
+    sessionId,
+    next: (id) => autopilotHttpTransport.next(id),
+    delivery,
+    deps: browserAutopilotRecoveryDependencies,
+    drained,
+  });
   return { current: runtime.command, runtime };
 }
 
@@ -281,8 +291,8 @@ export function usePatientAutopilot(input: {
           capability: activeCapability,
           transport: autopilotHttpTransport,
         });
-        await delivery.drainPending();
-        const restored = await loadServerRuntime(sessionId, delivery);
+        const drained = await delivery.drainPending();
+        const restored = await loadServerRuntime(sessionId, delivery, drained);
         if (cancelled) return;
         stopSpeaking();
         const context: ServerContext = {
@@ -370,7 +380,8 @@ export function usePatientAutopilot(input: {
   // Before user activation (or while explicitly gated), polling may update the
   // visible command but can never enter either media executor or emit an ACK.
   useEffect(() => {
-    if (visibleMode !== "server" || !server || mediaAllowed || !probeAllowed) return;
+    if (visibleMode !== "server" || !server || mediaAllowed || !probeAllowed
+        || !shouldSchedulePassiveAutopilotPoll(server.runtime.phase)) return;
     let cancelled = false;
     let timer: number | null = null;
     let retryAttempt = 0;
@@ -416,7 +427,8 @@ export function usePatientAutopilot(input: {
 
   useEffect(() => {
     const context = serverContextRef.current;
-    if (!mediaAllowed || !context || !input.sessionId) return;
+    if (!mediaAllowed || !context || !input.sessionId
+        || !shouldBootstrapAutopilotRunner(context.runtime.phase)) return;
     let cancelled = false;
     let timer: number | null = null;
     let controller: PatientAutopilotController | null = null;
@@ -431,13 +443,14 @@ export function usePatientAutopilot(input: {
       if (cancelled || restored === null) return;
       setServer((before) => before?.delivery === context.delivery
         ? { ...before, current: restored.current, runtime: restored.runtime } : before);
+      if (!canStartAutopilotRunner(restored.runtime)) return;
       controller = new PatientAutopilotController({
         sessionId: input.sessionId as string,
         transport: autopilotHttpTransport,
         speech: new BrowserAutopilotSpeechExecutor(input.sessionId as string),
         recording: new BrowserAutopilotRecordingExecutor(input.sessionId as string),
         ackDelivery: context.delivery,
-        initialCommand: restored.current,
+        initialRuntime: restored.runtime,
         waitForPresentation: (command, signal) => (
           assetGateRef.current as PatientAssetMediaGate
         ).waitFor(command, signal),
@@ -451,7 +464,9 @@ export function usePatientAutopilot(input: {
       const tick = async () => {
         const runtime = await (controller as PatientAutopilotController).pollOnce();
         if (cancelled || runtime.phase === "paused" || runtime.phase === "scope_completed") return;
-        timer = window.setTimeout(tick, 900);
+        // 仍然走 setTimeout 而不是 queueMicrotask：卸载/暂停的取消路径靠这个
+        // timer 句柄，换成微任务就没法在同一个清理里撤掉。
+        timer = window.setTimeout(tick, autopilotNextTickDelayMs(runtime));
       };
       void tick();
     })().catch((error: unknown) => {

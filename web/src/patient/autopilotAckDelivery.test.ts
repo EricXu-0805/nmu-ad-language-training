@@ -8,6 +8,7 @@ import {
 } from "./autopilotAckDelivery.ts";
 import {
   createAutopilotAckEnvelope,
+  nextAutopilotAckCheckpoint,
   type AutopilotAckCheckpoint,
   type AutopilotAckEnvelope,
 } from "./autopilotAckOutbox.ts";
@@ -67,6 +68,20 @@ function startedRecord(): NextCommandProjection {
   };
 }
 
+function failureReceipt(ack: AutopilotAck): unknown {
+  return {
+    scope_key: "p0a_sim_first_single_v1",
+    ack_idempotency_key: ack.idempotency_key,
+    ack_type: ack.ack_type,
+    replayed: false,
+    command_state: "failed",
+    command_revision: ack.command_revision + 1,
+    status: "paused",
+    state_revision: 2,
+    command: null,
+  };
+}
+
 function receipt(ack: AutopilotAck, replayed: boolean): unknown {
   return {
     scope_key: "p0a_sim_first_single_v1",
@@ -99,13 +114,7 @@ class MemoryAckStore implements AutopilotAckStore {
   async complete(entry: AutopilotAckEnvelope) {
     this.events.push("complete");
     assert.deepEqual(this.pending, entry);
-    this.checkpoint = {
-      schemaVersion: 1,
-      ownerKey: entry.ownerKey,
-      sessionId: entry.sessionId,
-      lastDeviceEventSeq: entry.ack.device_event_seq,
-      updatedAtMs: Date.now(),
-    };
+    this.checkpoint = nextAutopilotAckCheckpoint(entry, 1);
     this.pending = null;
   }
 }
@@ -144,7 +153,9 @@ test("response loss is recovered by retransmitting the exact persisted ACK", asy
     },
   });
   const drained = await recovered.drainPending();
-  assert.deepEqual(drained, sent);
+  // envelope 而不是裸 ack：调用方要靠里面那条 exact command 恢复本地暂停态。
+  assert.deepEqual(drained?.ack, sent);
+  assert.equal(drained?.commandKey, question().command_key);
   assert.equal(recovered.initialDeviceEventSeq, 1);
   assert.equal(store.pending, null);
   assert.deepEqual(store.events, ["stage", "http-lost", "http-retry", "complete"]);
@@ -230,4 +241,107 @@ test("record_stopped uses the atomic audio handoff before HTTP", async () => {
     duration_seconds: 1.25,
   });
   assert.deepEqual(store.events, ["stage-record", "http", "complete"]);
+});
+
+// ---------------- 持久终态失败 latch ----------------
+
+test("tts_failed complete 后持久 latch，新建 delivery（模拟刷新）读到同一份 exact 证据", async () => {
+  const store = new MemoryAckStore();
+  const command = question();
+  const delivery = await DurableAutopilotAckDelivery.create({
+    capability,
+    store,
+    transport: {
+      next: async () => null,
+      ack: async (_sid, _key, ack) => failureReceipt(ack),
+    },
+  });
+  const ack = await delivery.send(command, 0, {
+    ack_type: "tts_failed", error_code: "audio_playback_failed",
+  });
+  assert.ok(delivery.terminalFailureLatch);
+  assert.equal(delivery.terminalFailureLatch?.ack.idempotency_key, ack.idempotency_key);
+  assert.equal(delivery.terminalFailureLatch?.commandKey, command.command_key);
+
+  const reloaded = await DurableAutopilotAckDelivery.create({ capability, store, transport: { next: async () => null, ack: async () => { throw new Error("不应再次发送"); } } });
+  assert.deepEqual(reloaded.terminalFailureLatch, delivery.terminalFailureLatch);
+});
+
+test("非失败 ACK complete 会清空此前持久的 latch", async () => {
+  const store = new MemoryAckStore();
+  const failed = await DurableAutopilotAckDelivery.create({
+    capability, store,
+    transport: { next: async () => null, ack: async (_sid, _key, ack) => failureReceipt(ack) },
+  });
+  await failed.send(question(), 0, { ack_type: "tts_failed", error_code: "audio_playback_failed" });
+  assert.ok(store.checkpoint && store.checkpoint.schemaVersion === 2 && store.checkpoint.latch);
+
+  // 新命令（不同 key/更高代际）走完 tts_started：非失败 ACK 必须原子清掉旧 latch。
+  const nextCommand = {
+    ...question(),
+    command_key: "cmd-ack-delivery-question-0002",
+    command_seq: 2,
+    control_generation: 2,
+    runner_generation: 2,
+  };
+  const resumed = await DurableAutopilotAckDelivery.create({
+    capability, store,
+    transport: {
+      next: async () => null,
+      ack: async (_sid, _key, ack) => ({
+        ...(receipt(ack, false) as Record<string, unknown>),
+        status: "processing_attempt",
+      }),
+    },
+  });
+  await resumed.send(nextCommand, 1, { ack_type: "tts_started" });
+  assert.equal(resumed.terminalFailureLatch, null);
+  assert.ok(store.checkpoint && store.checkpoint.schemaVersion === 2 && store.checkpoint.latch === null);
+});
+
+test("latch 已存在时，未证明严格新权威的 send 在任何 stage/音频接管前被拒绝（stage-record 调用 0 次）", async () => {
+  const store = new MemoryAckStore();
+  const delivery = await DurableAutopilotAckDelivery.create({
+    capability, store,
+    transport: {
+      next: async () => null,
+      ack: async (_sid, _key, ack) => { store.events.push("http"); return failureReceipt(ack); },
+    },
+  });
+  await delivery.send(question(), 0, { ack_type: "tts_failed", error_code: "audio_playback_failed" });
+  assert.ok(delivery.terminalFailureLatch);
+  const eventsBeforeStaleAttempt = [...store.events];
+
+  // startedRecord() 的 seq 比 latch 高，但代际没有严格双双前进——不构成新权威。
+  await assert.rejects(() => delivery.send(startedRecord(), 1, {
+    ack_type: "record_stopped",
+    stop_reason: "user_done",
+    raw_audio_id: "raw-ack-delivery-record-0001",
+    receipt_server_seq: 9,
+    checksum: "b".repeat(64),
+    byte_count: 1024,
+    duration_seconds: 1.25,
+  }), /严格新权威/);
+
+  assert.deepEqual(store.events, eventsBeforeStaleAttempt);
+  assert.equal(store.events.includes("stage-record"), false);
+  assert.ok(delivery.terminalFailureLatch);   // latch 原样保留，没被半途清掉
+});
+
+test("record_failed 走通用 stage/complete；record_stopped 专用的音频原子接管方法调用次数为 0", async () => {
+  const store = new MemoryAckStore();
+  const delivery = await DurableAutopilotAckDelivery.create({
+    capability, store,
+    transport: {
+      next: async () => null,
+      ack: async (_sid, _key, ack) => { store.events.push("http"); return failureReceipt(ack); },
+    },
+  });
+  await delivery.send(startedRecord(), 0, {
+    ack_type: "record_failed", error_code: "recording_runtime_failed",
+  });
+  assert.deepEqual(store.events, ["stage", "http", "complete"]);
+  assert.equal(store.events.includes("stage-record"), false);
+  assert.ok(delivery.terminalFailureLatch);
+  assert.equal(delivery.terminalFailureLatch?.ack.ack_type, "record_failed");
 });

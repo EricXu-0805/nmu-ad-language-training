@@ -430,7 +430,7 @@ def test_item_bank_endpoint(client):
     assert d["qc_status"] == "draft" and d["ready_for_research"] is False
     assert d["operational_autopilot_ready"] is False
     assert len(d["item_bank_definition_digest"]) == 64
-    assert d["autopilot_protocol_version_id"] == "autopilot-v1-20260717"
+    assert d["autopilot_protocol_version_id"] == "autopilot-v1-20260729"
     assert len(d["autopilot_protocol_definition_digest"]) == 64
     assert d["protocol_validation_issues"] == []
     assert d["selector_validation_issues"] == []

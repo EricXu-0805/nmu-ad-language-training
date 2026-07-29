@@ -75,10 +75,82 @@ def test_judge_classify_correct_answer(client):
     contains = client.post("/judge/classify", json={"item_id": "SE_胡萝卜", "response_role": "命名",
                                                     "text": "这是胡萝卜"}).json()
     assert contains["answer_type"] == "部分正确" and contains["contains_target"] is True
-    # 只说目标词子串"萝卜":部分正确但不含全词 → contains_target 假 → 按不准确升级,不当成功
+    # 只说"萝卜":题库把它列进 related_but_inaccurate,所以判"上位词或相关词"而不是
+    # 泛化子串规则的"部分正确"。关键不变量仍是 contains_target 假 → 按不准确升级,
+    # 不当成功;两种类型在冻结分支里也都落 close。
     subword = client.post("/judge/classify", json={"item_id": "SE_胡萝卜", "response_role": "命名",
                                                    "text": "萝卜"}).json()
-    assert subword["answer_type"] == "部分正确" and subword["contains_target"] is False
+    assert subword["answer_type"] == "上位词或相关词" and subword["contains_target"] is False
+
+
+def test_related_but_inaccurate_is_wired_and_never_counts_as_success(client):
+    """题库字段叫 related_but_inaccurate;判分输入侧的字段名是 upper_terms。
+
+    之前读的是题库里根本不存在的 upper_terms,"蔬菜"一路掉到未识别 → unknown 分支,
+    冻结的 close 一级提示永远选不中。
+    """
+    close = client.post("/judge/classify", json={
+        "item_id": "SE_胡萝卜", "response_role": "命名", "text": "蔬菜"}).json()
+    assert close["answer_type"] == "上位词或相关词"      # → _failed_response_path 的 close
+    assert close["matched_on"] == "upper"
+    assert close["contains_target"] is False            # 相关但不准确,绝不算说对
+    assert close["ai_score"] == 0.5 and close["needs_review"] is True
+    assert close["truth_scope"] == "operational_only"
+
+    # 保护:显式拒答仍是拒答,不得被相关词表吸走(→ unknown 分支)。
+    refusal = client.post("/judge/classify", json={
+        "item_id": "SE_胡萝卜", "response_role": "命名", "text": "不知道"}).json()
+    assert refusal["answer_type"] == "拒答" and refusal["matched_on"] == "refusal"
+    assert refusal["contains_target"] is False
+
+    # 保护:表外的无关回答仍是未识别(→ unknown 分支),没有被放宽。
+    unknown = client.post("/judge/classify", json={
+        "item_id": "SE_胡萝卜", "response_role": "命名", "text": "汽车"}).json()
+    assert unknown["answer_type"] == "未识别" and unknown["matched_on"] is None
+
+    # 保护:空转写仍是沉默(→ silence 分支)。
+    silence = client.post("/judge/classify", json={
+        "item_id": "SE_胡萝卜", "response_role": "命名", "text": ""}).json()
+    assert silence["answer_type"] == "沉默" and silence["matched_on"] == "silence"
+
+
+def test_frozen_related_term_is_decided_before_the_llm_is_consulted():
+    """精确命中冻结相关词表的这一格由确定式规则定,不交给 LLM 赌。
+
+    生产 Qwen 对"蔬菜"这类回答并不稳定;判成正确会把 close 一级提示换成表扬,
+    判成未识别会换成 unknown 分支的提示——两种都改了老人真正听到的话。
+    """
+    from app.enums import AnswerType
+    from app.llm_judge import LlmJudgement
+    from app.main import _classify_operational
+
+    class _WrongEngine:
+        version = "stub-judge-v1"
+        data_boundary = "local"
+        provider_id = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def judge(self, _ji):
+            self.calls += 1
+            return LlmJudgement(answer_type=AnswerType.正确, ai_score=1.0,
+                                ai_needs_review=False, reason="stub")
+
+    engine = _WrongEngine()
+    result = _classify_operational(
+        item_id="SE_胡萝卜", response_role="命名", text="蔬菜",
+        bank=BANK, llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 0                              # 根本没问 LLM
+    assert result["judge_mode"] == "规则确定式"
+    assert result["answer_type"] == "上位词或相关词"
+    assert result["contains_target"] is False
+
+    # 对照:表外回答仍然照常走 LLM,这条旁路没有把整个 LLM 通道关掉。
+    other = _classify_operational(
+        item_id="SE_胡萝卜", response_role="命名", text="一个红色的东西",
+        bank=BANK, llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 1 and other["judge_mode"] == "LLM辅助"
 
 
 def test_contextless_judge_route_never_initializes_cloud_engine(client, monkeypatch):

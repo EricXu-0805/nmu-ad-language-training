@@ -5111,9 +5111,32 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
     return result
 
 
+def _autopilot_wake_projection(
+        s: DBSession, live_session_id: str | None) -> dict | None:
+    """跨设备的服务器所有权唤醒：证明床旁必须重探测一次，仅此而已。
+
+    只在当前 live 场次的 autopilot 状态严格证明 server_owned 时返回，且只含
+    sessionId 与 state_revision——没有命令载荷、没有 kind、没有 token、没有设备
+    指纹、没有账号数据。disabled/manual/inactive/非法状态一律不发唤醒；状态异常
+    时 fail closed 成"无唤醒"，不能让一条可选投影把无关的实时呈现打挂。
+    """
+    if not live_session_id:
+        return None
+    try:
+        status = autopilot_service.get_autopilot_status(
+            s, session_id=live_session_id)
+    except autopilot_service.AutopilotServiceError:
+        return None
+    if (status.server_owned is not True
+            or status.scope_key != autopilot_service.P0A_SCOPE_KEY
+            or status.state_revision < 1):
+        return None
+    return {"sessionId": live_session_id, "stateRevision": status.state_revision}
+
+
 @app.get("/live/state")
 def live_get(request: Request, s: DBSession = Depends(get_session)):
-    """患者端最小读快照：仅含呈现所需 session/cursor/rapportStep。"""
+    """患者端最小读快照：仅含呈现所需 session/cursor/rapportStep 与所有权唤醒。"""
     with _LIVE_WRITE_LOCK:
         row = s.get(LiveState, 1)
         _require_capability_current_live(
@@ -5123,11 +5146,13 @@ def live_get(request: Request, s: DBSession = Depends(get_session)):
             _require_device_route_session_read(
                 request, live_session_id, s, "读取实时呈现")
         if not row:
-            return {"seq": 0, "session": None, "cursor": None, "rapportStep": None}
+            return {"seq": 0, "session": None, "cursor": None, "rapportStep": None,
+                    "autopilotWake": None}
         return {"seq": row.seq,
                 "session": _public_live_projection("session", row.session_json),
                 "cursor": _public_live_projection("cursor", row.cursor_json),
-                "rapportStep": _public_live_projection("rapportStep", row.rapport_json)}
+                "rapportStep": _public_live_projection("rapportStep", row.rapport_json),
+                "autopilotWake": _autopilot_wake_projection(s, live_session_id)}
 
 
 @app.get("/live/console-state")
@@ -6674,7 +6699,8 @@ def _synthesize_tts_text(text: str) -> tuple[PlainResponse, _TtsServeFacts]:
 
 @app.post("/sessions/{session_id}/autopilot/commands/{command_key}/tts")
 def autopilot_command_tts(
-        session_id: str, command_key: str, body: AutopilotTtsIn, request: Request,
+        session_id: str, command_key: str, request: Request,
+        body: AutopilotTtsIn = AutopilotTtsIn(),
         s: DBSession = Depends(get_session)):
     """Synthesize only server-derived text for the exact pending TTS command."""
     del body
@@ -7827,11 +7853,25 @@ def _classify_operational(*, item_id: str, response_role: str,
     ji = judging.build_judge_input(
         item_id=item_id, task_type=task_type, target_word=target,
         acceptable_expressions=tuple(bank_item.get("acceptable_expressions", []) or []),
-        upper_terms=tuple(bank_item.get("upper_terms", []) or []),
+        # 题库里这张表叫 related_but_inaccurate,判分输入侧沿用旧字段名 upper_terms。
+        # 之前读的 upper_terms 在题库里根本不存在,恒空,"蔬菜"这类相关但不准确的
+        # 回答一路掉到未识别,冻结的 close 分支永远选不中。
+        upper_terms=tuple(bank_item.get("related_but_inaccurate", []) or []),
         dialect_synonyms=tuple(bank_item.get("dialect_synonyms", []) or []),
         asr_text=text,
     )
     engine = (llm_engine or llm_judge.get_engine()) if allow_llm else None
+    if not raw_text.strip():
+        # 空转写没有可判的语义:沉默由确定式规则冻结判定,也没有理由把一个空
+        # 载荷推过云边界。
+        engine = None
+    elif rule_judge.normalize(raw_text) in {
+            rule_judge.normalize(term) for term in ji.upper_terms}:
+        # 精确命中题库冻结的 related_but_inaccurate 表:这一格由确定式规则定,
+        # 不问 LLM。云判分对"蔬菜"这类回答并不稳定,一次判成正确或未识别就会
+        # 把冻结的 close 一级提示换掉;命中冻结表本身已经是确定事实。
+        # 这不改成功口径——contains_target 仍只认目标词/可接受表达。
+        engine = None
     if engine is not None:
         boundary = cloud_processing.provider_boundary(engine)
         if boundary is cloud_processing.DataBoundary.UNKNOWN:

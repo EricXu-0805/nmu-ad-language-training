@@ -332,6 +332,8 @@ export interface LiveStateResponse {
   session: unknown;
   cursor: unknown;
   rapportStep: unknown;
+  // 可选的服务器所有权唤醒投影；旧后端没有这个字段，按 undefined 处理。
+  autopilotWake?: unknown;
   audioSaved: unknown;
   patientRec: unknown;
   patientPresence?: PatientPresence | null;

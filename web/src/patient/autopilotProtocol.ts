@@ -32,10 +32,16 @@ export const AUTOPILOT_ERROR_CODES = [
 ] as const;
 export type AutopilotErrorCode = typeof AUTOPILOT_ERROR_CODES[number];
 
+export const AUTOPILOT_RESPONSE_PATHS = ["unknown", "close", "silence"] as const;
+export type AutopilotResponsePath = typeof AUTOPILOT_RESPONSE_PATHS[number];
+
 export interface DeviceTtsPayload {
   speech_key: string;
   speech_text: string;
   purpose: AutopilotTtsPurpose;
+  // 服务端冻结分支的证据，只在一级 cue/feedback 出现。客户端不据此选分支，
+  // 话术永远来自 speech_text；这里带上它只是为了让契约可核对。
+  response_path?: AutopilotResponsePath;
 }
 
 export interface DeviceRecordPayload {
@@ -125,6 +131,7 @@ const COMMAND_KEYS = [
   "turn_seq", "attempt_seq", "prompt_level", "payload",
 ] as const;
 const TTS_PAYLOAD_KEYS = ["speech_key", "speech_text", "purpose"] as const;
+const TTS_PAYLOAD_OPTIONAL_KEYS = ["response_path"] as const;
 const RECORD_PAYLOAD_KEYS = [
   "raw_audio_id", "turn_ref", "max_duration_seconds", "contains_direct_identifier",
   "presentation_speech_key", "presentation_speech_text", "presentation_purpose",
@@ -196,18 +203,37 @@ function commandBaseIsValid(row: UnknownRecord): boolean {
 
 function parseTtsPayload(value: unknown, row: UnknownRecord): DeviceTtsPayload | null {
   const payload = record(value);
-  if (!payload || !hasExactKeys(payload, TTS_PAYLOAD_KEYS)
+  if (!payload || !hasExactKeys(payload, TTS_PAYLOAD_KEYS, TTS_PAYLOAD_OPTIONAL_KEYS)
       || !SPEECH_KEY.test(typeof payload.speech_key === "string" ? payload.speech_key : "")
       || !boundedText(payload.speech_text, 2_000)
       || !oneOf(payload.purpose, AUTOPILOT_TTS_PURPOSES)) return null;
 
   // 与服务端冻结语义保持同一封闭值域。这里不判断文本“像不像答案”，
   // 只允许服务端显式授权的当前 purpose；额外 target/answer 字段已被 exact keys 拒绝。
-  if (payload.purpose === "question"
-      && (row.prompt_level !== 0 || row.attempt_seq !== 1)) return null;
-  if (payload.purpose === "cue" && !oneOf(row.prompt_level, [1, 2] as const)) return null;
-  if (payload.purpose === "feedback" && !oneOf(row.prompt_level, [0, 1, 2] as const)) return null;
-  if (payload.purpose === "tell_answer" && row.prompt_level !== 3) return null;
+  // 与服务端 _validate_tts_semantics 同一张 (prompt_level, attempt_seq) 矩阵。
+  // 只绑 prompt_level 不够：例如 cue(2,2) 的等级合法而尝试序号不合法，冻结语义里
+  // 根本不存在这一格，放过去等于承认一条服务端拒绝签发的话术。
+  const FROZEN_STAGES: Record<AutopilotTtsPurpose, readonly (readonly [number, number])[]> = {
+    question: [[0, 1]],
+    cue: [[1, 2], [2, 3]],
+    feedback: [[0, 1], [1, 2], [2, 3]],
+    tell_answer: [[3, 3]],
+  };
+  const stageAllowed = FROZEN_STAGES[payload.purpose as AutopilotTtsPurpose]
+    .some(([level, attempt]) => row.prompt_level === level && row.attempt_seq === attempt);
+  if (!stageAllowed) return null;
+
+  // response_path 是服务端冻结分支的证据，不是客户端选分支的依据。服务端只在
+  // 一级 cue(1,2) 与一级 feedback(1,2) 上冻结它，其余环节根本没有这个字段。
+  // 所以这里核对的是"该有的必须有、不该有的必须没有"，两边都不放过：
+  // 缺失会让分支证据凭空消失，多出来则说明投影与冻结语义已经对不上。
+  const firstLevelBranch = (payload.purpose === "cue" || payload.purpose === "feedback")
+    && row.prompt_level === 1 && row.attempt_seq === 2;
+  const carriesResponsePath = Object.hasOwn(payload, "response_path");
+  if (firstLevelBranch !== carriesResponsePath) return null;
+  // null 不在闭集里，被这一句一并拒掉。
+  if (carriesResponsePath
+      && !oneOf(payload.response_path, AUTOPILOT_RESPONSE_PATHS)) return null;
   return payload as unknown as DeviceTtsPayload;
 }
 

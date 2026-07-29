@@ -23,7 +23,8 @@ import re
 import secrets
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
+                      model_serializer)
 from sqlalchemy import update
 from sqlmodel import Session, select
 
@@ -107,6 +108,22 @@ class DeviceTtsPayload(BaseModel):
     speech_text: str
     purpose: Literal["question", "cue", "feedback", "tell_answer"]
     response_path: ResponsePath | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_response_path(self, handler):
+        """缺席的分支证据必须**整个键消失**，不能序列化成 response_path:null。
+
+        设备端严格 parser 按闭集校验字段集合，多一个 null 键就拒绝整条投影，老人端
+        会停在"自动流程暂时无法确认"。省略挂在模型上而不是某条路由上：这个投影既走
+        GET /autopilot/next，也嵌在 ACK 收据里返回，两个出口必须一致；而路由级
+        exclude_none 又会顺手吃掉收据顶层那些必须显式保留的 null。
+        用 model_serializer 而不是 Field(exclude_if=...)，是因为后者要 Pydantic 2.12+，
+        而 requirements.txt 声明的下限是 2.7。
+        """
+        data = handler(self)
+        if data.get("response_path", "") is None:
+            data.pop("response_path")
+        return data
 
 
 class DeviceRecordPayload(BaseModel):

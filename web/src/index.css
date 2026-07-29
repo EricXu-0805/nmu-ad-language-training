@@ -765,6 +765,14 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   box-shadow: var(--shadow-sm);
 }
 .patient-primary-action--secondary:hover:not(:disabled) { background: var(--c-primary-soft); border-color: var(--c-primary); }
+.patient-optional-hint {
+  margin: 0;
+  max-width: min(76vw, 420px);
+  color: var(--c-muted);
+  font-size: clamp(18px, 1.9vw, 24px);
+  line-height: 1.4;
+  text-align: center;
+}
 .patient-mic-control { width: 100%; max-width: 760px; }
 .mic-brand {
   display: inline-flex;

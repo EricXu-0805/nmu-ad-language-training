@@ -32,6 +32,7 @@ from app.models import (
     ItemEvent,
     LiveState,
     Patient,
+    PatientDeviceCapability,
     ProviderReadinessProbe,
     ResearchUser,
     RuntimeCommand,
@@ -254,6 +255,13 @@ def _start(clients: ApiClients, **overrides):
         f"/sessions/{SESSION_ID}/autopilot/start", json=body)
 
 
+def _device_live(clients: ApiClients) -> dict:
+    response = clients.device.get(
+        "/live/state", headers=clients.device_headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def _device_next(clients: ApiClients) -> dict | None:
     response = clients.device.get(
         f"/sessions/{SESSION_ID}/autopilot/next",
@@ -277,7 +285,8 @@ def _ack_body(command: dict, *, ack_type: str, ack_key: str,
     return body
 
 
-def _drive_to_processing_attempt(clients: ApiClients) -> dict:
+def _drive_to_processing_attempt(
+        clients: ApiClients, *, stop_reason: str = "silence") -> dict:
     """Use only public device APIs to persist a proof-complete P0a capture."""
     started = _start(clients)
     assert started.status_code == 200, started.text
@@ -334,7 +343,7 @@ def _drive_to_processing_attempt(clients: ApiClients) -> dict:
             ack_type="record_stopped",
             ack_key="ack-worker-record-stopped-0001",
             device_event_seq=2,
-            stop_reason="silence",
+            stop_reason=stop_reason,
             raw_audio_id=raw_audio_id,
             receipt_server_seq=receipt["serverSeq"],
             checksum=upload_fact["checksum"],
@@ -554,6 +563,162 @@ def test_account_start_and_exact_device_get_are_separate_principals(
         assert len(list(session.exec(select(RuntimeCommand)))) == 1
 
 
+def test_next_projection_omits_absent_response_path_over_real_http(
+        api_clients: ApiClients, monkeypatch):
+    """初始 question 的 /autopilot/next JSON 里不得出现 response_path。
+
+    默认 response_model 会把 None 序列化成 response_path:null，设备端严格 parser
+    因这个多余键拒绝整条 200 投影，老人端卡在"自动流程暂时无法确认"。
+    """
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+
+    response = api_clients.device.get(
+        f"/sessions/{SESSION_ID}/autopilot/next",
+        headers=api_clients.device_headers,
+    )
+    assert response.status_code == 200, response.text
+    # 原始字节层面核对：不依赖 json() 的键遍历。
+    assert "response_path" not in response.text
+    projection = response.json()
+    assert projection["kind"] == "tts"
+    payload = projection["payload"]
+    assert sorted(payload) == ["purpose", "speech_key", "speech_text"]
+    assert payload["purpose"] == "question"
+    assert (projection["prompt_level"], projection["attempt_seq"]) == (0, 1)
+
+
+def test_ack_receipt_nests_the_same_omission_without_dropping_explicit_nulls(
+        api_clients: ApiClients, monkeypatch):
+    """首条 tts_started ACK 的嵌套 command 同样不得带 response_path。
+
+    只给 /next 加路由级 exclude_none 是不够的：浏览器解析首条 question 之后立刻
+    POST tts_started，收据里嵌的是同一个 NextCommandProjection，会在这里第二次
+    被严格 parser 拒掉，黄金链照断。而路由级 exclude_none 又会顺手吃掉收据顶层
+    那些必须显式保留的 null——所以省略必须落在字段上。
+    """
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    command = _device_next(api_clients)
+    assert command is not None and command["kind"] == "tts"
+
+    ack_path = (f"/sessions/{SESSION_ID}/autopilot/commands/"
+                f"{command['command_key']}/acks")
+    body = _ack_body(
+        command,
+        ack_type="tts_started",
+        ack_key="ack-response-path-omission-0001",
+        device_event_seq=1,
+    )
+    acked = api_clients.device.post(
+        ack_path, headers=api_clients.device_headers, json=body)
+    assert acked.status_code == 200, acked.text
+    assert "response_path" not in acked.text
+
+    receipt = acked.json()
+    nested = receipt["command"]
+    assert nested["state"] == "started"
+    assert sorted(nested["payload"]) == ["purpose", "speech_key", "speech_text"]
+
+    # 精确重放的收据故意不投影命令。这个 null 必须原样留在 JSON 里——路由级
+    # exclude_none 会把整个 command 键删掉，设备端的闭集校验随即失败。
+    replayed = api_clients.device.post(
+        ack_path, headers=api_clients.device_headers, json=body)
+    assert replayed.status_code == 200, replayed.text
+    replay_receipt = replayed.json()
+    assert replay_receipt["replayed"] is True
+    assert "command" in replay_receipt and replay_receipt["command"] is None
+
+
+def test_non_null_first_level_response_path_survives_real_serialization():
+    """字段级省略只吞掉缺席的分支证据；非空一级分支必须照常出现在 JSON 里。"""
+    branch = autopilot_service.DeviceTtsPayload(
+        speech_key="cue1.close",
+        speech_text="一级线索话术",
+        purpose="cue",
+        response_path="close",
+    )
+    # 不传 exclude_none：省略规则挂在字段上，默认序列化就该是最终形状。
+    serialized = branch.model_dump(mode="json")
+    assert serialized["response_path"] == "close"
+    assert sorted(serialized) == [
+        "purpose", "response_path", "speech_key", "speech_text"]
+
+    absent = autopilot_service.DeviceTtsPayload(
+        speech_key="q.initial", speech_text="首次提问", purpose="question")
+    assert "response_path" not in absent.model_dump(mode="json")
+    assert json.loads(absent.model_dump_json()) == {
+        "speech_key": "q.initial", "speech_text": "首次提问", "purpose": "question"}
+
+
+def test_live_state_carries_cross_device_ownership_wake_only_when_autonomous(
+        api_clients: ApiClients, monkeypatch):
+    """跨设备唤醒：console 启动不推进 live seq，同一个 seq 上必须从 null 变出唤醒。"""
+    _enable_p0a(monkeypatch)
+
+    before = _device_live(api_clients)
+    assert before["autopilotWake"] is None          # disabled scope 不发唤醒
+    seq_before = before["seq"]
+
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+    assert (started.json()["mode"], started.json()["status"]) == (
+        "autonomous", "waiting_tts")
+
+    after = _device_live(api_clients)
+    # 这正是真机故障的形状：seq 没动，患者端只有靠这个字段才知道该重探测一次。
+    assert after["seq"] == seq_before
+    wake = after["autopilotWake"]
+    assert wake == {
+        "sessionId": SESSION_ID,
+        "stateRevision": started.json()["state_revision"],
+    }
+    assert wake["stateRevision"] >= 1
+    # 投影只有这两个键：没有命令载荷/kind、没有 token、没有设备指纹、没有账号数据。
+    assert sorted(wake) == ["sessionId", "stateRevision"]
+
+    # 状态推进产生新 revision，唤醒随之前进。
+    command = _device_next(api_clients)
+    assert command is not None and command["kind"] == "tts"
+    advanced = _device_live(api_clients)["autopilotWake"]
+    assert advanced["sessionId"] == SESSION_ID
+    assert advanced["stateRevision"] >= wake["stateRevision"]
+
+
+def test_live_ownership_wake_requires_capability_bound_to_the_live_session(
+        api_clients: ApiClients, monkeypatch):
+    """唤醒读走的是同一道能力门禁：绑到别的场次的设备根本读不到这份快照。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+
+    with Session(api_clients.engine) as session:
+        capability = session.exec(select(PatientDeviceCapability)).one()
+        capability.session_id = OTHER_SESSION_ID
+        capability.active_session_key = OTHER_SESSION_ID
+        session.add(capability)
+        session.commit()
+
+    foreign = api_clients.device.get(
+        "/live/state", headers=api_clients.device_headers)
+    assert foreign.status_code in (401, 403, 409), foreign.text
+    assert "autopilotWake" not in foreign.text
+
+
+def test_manual_takeover_stops_the_cross_device_ownership_wake(
+        api_clients: ApiClients, monkeypatch):
+    """manual 不是服务器所有权：接管之后唤醒必须回到 null。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    command = _device_next(api_clients)
+    assert command is not None and command["kind"] == "tts"
+    assert _device_live(api_clients)["autopilotWake"] is not None
+
+    taken = _pause_drain_takeover(
+        api_clients, command, takeover_key="takeover-wake-stop-0001")
+    assert taken["mode"] == "manual"
+    assert _device_live(api_clients)["autopilotWake"] is None
+
+
 def test_exact_tts_is_server_derived_and_generic_text_route_is_locked(
         api_clients: ApiClients, monkeypatch):
     _enable_p0a(monkeypatch)
@@ -601,8 +766,10 @@ def test_exact_tts_is_server_derived_and_generic_text_route_is_locked(
     )
     assert injected.status_code == 422
     assert synthesized == []
+    # The shipped patient transport POSTs this route with no body and no
+    # Content-Type; the success path must accept exactly that.
     exact = api_clients.device.post(
-        exact_path, headers=api_clients.device_headers, json={})
+        exact_path, headers=api_clients.device_headers)
     assert exact.status_code == 204, exact.text
     assert exact.headers["x-tts-engine"] == "exact-tts-test"
     assert synthesized == [BANK.single_element[0]["initial_prompt"]]
@@ -1860,6 +2027,22 @@ class _WorkerAsr:
             "胡萝卜", 0.96, self.version, hotword_hit=True)
 
 
+class _EmptyTranscriptAsr(_WorkerAsr):
+    """provider 明确成功、响应合法、但一个字都没识别出来。"""
+
+    def transcribe(self, _audio_bytes, _hotwords):
+        self.calls += 1
+        return asr.AsrResult("", None, self.version)
+
+
+class _DegradedAsr(_WorkerAsr):
+    """引擎不可用/响应损坏的技术失败:asr_text 是 None,不是空字符串。"""
+
+    def transcribe(self, _audio_bytes, _hotwords):
+        self.calls += 1
+        return asr.AsrResult(None, None, self.version)
+
+
 class _BlockingWorkerAsr(_WorkerAsr):
     """Provider double whose completion is controlled by persisted-state tests."""
 
@@ -2232,6 +2415,122 @@ def test_worker_technical_failure_atomically_pauses_runtime_and_autopilot(
             "source": "attempt_processing",
         }
     assert fake_asr.calls == 1
+
+
+def test_first_operational_silence_plays_the_frozen_cue_then_reopens_the_mic(
+        api_clients: ApiClients, monkeypatch):
+    """第一次没听到 → 冻结的 silence 一级提示 → 提示播完后再自动开一次麦。
+
+    这条链此前跑不到:成功但空转写被折成 None,当技术失败暂停整场。
+    """
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+    fake_asr = _EmptyTranscriptAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: fake_asr)
+
+    _run_p0a_attempt_worker(SESSION_ID)
+
+    item = BANK.single_element[0]
+    expected_cue = item["cues"]["1"]["variants"]["silence"]["text"]
+    with Session(api_clients.engine) as session:
+        attempt = session.exec(select(AttemptEvent)).one()
+        commands = list(session.exec(select(RuntimeCommand).order_by(
+            RuntimeCommand.command_seq)))
+        # 空转写是完成的 attempt,不是技术失败。
+        assert attempt.processing_status == "completed"
+        assert attempt.error_code is None
+        assert attempt.asr_text == ""
+        assert attempt.operational_answer_type == "沉默"
+        assert attempt.contains_target is False
+        assert attempt.prompt_level == 0 and attempt.attempt_seq == 1
+        assert [(row.kind, row.state) for row in commands] == [
+            ("tts", "succeeded"), ("record", "succeeded"), ("tts", "pending")]
+        cue_payload = json.loads(commands[-1].payload_json)
+        assert cue_payload["purpose"] == "cue"
+        assert cue_payload["response_path"] == "silence"
+        assert cue_payload["speech_text"] == expected_cue
+        assert (commands[-1].prompt_level, commands[-1].attempt_seq) == (1, 2)
+    assert fake_asr.calls == 1
+
+    # 老人端拿到的正是这条冻结提示,分支证据随投影一起下发。
+    cue = _device_next(api_clients)
+    assert cue is not None and cue["kind"] == "tts"
+    assert cue["payload"]["purpose"] == "cue"
+    assert cue["payload"]["response_path"] == "silence"
+    assert cue["payload"]["speech_text"] == expected_cue
+
+    # 提示真的播完(tts_ended)之后,服务器同一笔事务里就把下一条录音命令开出来:
+    # "第一次没听到,温和再问一次"——不需要任何按钮。
+    ended = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{cue['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(
+            cue,
+            ack_type="tts_ended",
+            ack_key="ack-silence-cue-ended-0001",
+            device_event_seq=3,
+            media_ended=True,
+            media_duration_ms=4_200,
+        ),
+    )
+    assert ended.status_code == 200, ended.text
+    reopened = ended.json()["command"]
+    assert reopened["kind"] == "record" and reopened["state"] == "pending"
+    assert (reopened["prompt_level"], reopened["attempt_seq"]) == (1, 2)
+    # 作答窗口上限仍是冻结协议的 silence_seconds + 5。
+    assert reopened["payload"]["max_duration_seconds"] == (
+        PROTOCOL["silence_seconds"] + 5)
+    # 提示按既有临床协议消费首轮 attempt/cue,没有新增第二个 attempt。
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(AttemptEvent)))) == 1
+        assert len(list(session.exec(select(RuntimeCommand)))) == 4
+
+
+def test_asr_degradation_pauses_without_consuming_a_cue_or_inventing_an_answer(
+        api_clients: ApiClients, monkeypatch):
+    """技术失败(asr_text=None)仍是安全暂停:不判类、不发提示、不伪造回答。"""
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+    fake_asr = _DegradedAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: fake_asr)
+
+    _run_p0a_attempt_worker(SESSION_ID)
+    with Session(api_clients.engine) as session:
+        attempt = session.exec(select(AttemptEvent)).one()
+        commands = list(session.exec(select(RuntimeCommand)))
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert attempt.processing_status == "technical_failure"
+        assert attempt.error_code == "asr_degraded"
+        assert attempt.asr_text is None
+        assert attempt.operational_answer_type is None   # 没有伪造任何回答类型
+        assert len(commands) == 2                        # 一条提示都没被消费
+        assert control is not None and control.status == "paused"
+        assert control.last_error_code == "asr_degraded"
+        assert control.current_command_id is None
+        assert runtime_state is not None and runtime_state.status == "paused"
+    assert fake_asr.calls == 1
+
+
+def test_max_duration_capture_with_real_speech_is_judged_by_text_not_stop_reason(
+        api_clients: ApiClients, monkeypatch):
+    """15 秒内完全可能有真话:stop_reason=max_duration 不得被当成沉默。"""
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients, stop_reason="max_duration")
+    fake_asr = _WorkerAsr()                              # 返回"胡萝卜"
+    monkeypatch.setattr(asr, "get_engine", lambda: fake_asr)
+
+    _run_p0a_attempt_worker(SESSION_ID)
+    with Session(api_clients.engine) as session:
+        attempt = session.exec(select(AttemptEvent)).one()
+        commands = list(session.exec(select(RuntimeCommand).order_by(
+            RuntimeCommand.command_seq)))
+        assert attempt.operational_answer_type == "正确"
+        assert attempt.contains_target is True
+        payload = json.loads(commands[-1].payload_json)
+        assert payload["purpose"] == "feedback"
+        assert payload["speech_text"] == BANK.single_element[0]["success_line"]
+        assert "response_path" not in payload            # 零级成功不带分支证据
 
 
 def test_worker_exception_before_attempt_creation_fails_closed_without_advancing(

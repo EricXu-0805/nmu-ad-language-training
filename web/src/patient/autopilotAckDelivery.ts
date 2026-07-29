@@ -11,10 +11,14 @@ import type {
   AutopilotAckDelivery,
   AutopilotTransport,
 } from "./autopilotController.ts";
+import { commandSupersedesTerminalLatch } from "./autopilotRuntime.ts";
 import {
+  checkpointTerminalFailureLatch,
   createAutopilotAckEnvelope,
   fingerprintAutopilotCapability,
+  nextAutopilotAckLatch,
   type AutopilotAckEnvelope,
+  type AutopilotTerminalFailureLatch,
 } from "./autopilotAckOutbox.ts";
 
 const RECEIPT_KEYS = new Set([
@@ -128,6 +132,7 @@ function newIdempotencyKey(ackType: AutopilotAck["ack_type"], seq: number): stri
 export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
   private lastSeq: number;
   private pending: AutopilotAckEnvelope | null;
+  private latch: AutopilotTerminalFailureLatch | null;
   private readonly ownerKey: string;
   private readonly sessionId: string;
   private readonly transport: AutopilotTransport;
@@ -146,6 +151,7 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
     this.store = store;
     this.lastSeq = snapshot.checkpoint?.lastDeviceEventSeq ?? 0;
     this.pending = snapshot.pending;
+    this.latch = checkpointTerminalFailureLatch(snapshot.checkpoint);
     if (this.pending && this.pending.ack.device_event_seq !== this.lastSeq + 1) {
       throw new Error("ACK outbox 与 checkpoint 事件序号不连续");
     }
@@ -170,12 +176,21 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
 
   get initialDeviceEventSeq(): number { return this.lastSeq; }
 
-  /** Refresh recovery always drains the exact persisted event before /next. */
-  async drainPending(): Promise<AutopilotAck | null> {
+  /** Persisted exact evidence of the last completed tts_failed/record_failed ACK, if any. */
+  get terminalFailureLatch(): AutopilotTerminalFailureLatch | null { return this.latch; }
+
+  /**
+   * Refresh recovery always drains the exact persisted event before /next.
+   *
+   * 返回的是整个持久 envelope 而不只是 ack：响应丢失后重启时，调用方要靠
+   * envelope 里那条 exact command 才能把本地 runtime 恢复成正确的暂停态。
+   * 只给 ack 的话，随后 /next 返回 null 会把状态冲成 waiting_command。
+   */
+  async drainPending(): Promise<AutopilotAckEnvelope | null> {
     const entry = this.pending;
     if (!entry) return null;
     await this.deliver(entry);
-    return entry.ack;
+    return entry;
   }
 
   async send(
@@ -188,6 +203,12 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
     }
     if (this.pending) {
       throw new Error("已有待恢复 ACK，禁止生成新事件序号");
+    }
+    if (this.latch && !commandSupersedesTerminalLatch(this.latch.command, command)) {
+      // 已锁存的终态失败必须在任何 stage/音频原子接管之前挡住：这是
+      // Hook 侧终态闸失守时的最后一道防线，绝不能因为调用方传错命令就
+      // 悄悄发出一条 ACK 或接管本机录音字节。
+      throw new Error("已锁存终态失败，命令未证明严格新权威，拒绝发送");
     }
     const seq = this.lastSeq + 1;
     const ack = buildAutopilotAck(
@@ -222,5 +243,6 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
     await this.store.complete(entry);
     this.lastSeq = entry.ack.device_event_seq;
     this.pending = null;
+    this.latch = nextAutopilotAckLatch(entry);
   }
 }

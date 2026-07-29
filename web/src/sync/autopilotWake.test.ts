@@ -6,6 +6,7 @@ import { parseAutopilotStatusReceipt } from "../autopilot/startControl.ts";
 import { planAutopilotProbeFailure } from "../patient/autopilotProbePolicy.ts";
 import {
   autopilotWakeToken,
+  liveSnapshotWake,
   nextServerOwnershipWake,
   parseAutopilotWake,
   PatientProbeWakeCoordinator,
@@ -233,4 +234,100 @@ test("console ownership receipts are actually wired to the patient probe epoch",
   assert.match(hookSource, /setProbeEpoch\(\(value\) => value \+ 1\)/);
   // 场次切换必须清空协调器(旧场 token 不得跨场存活)。
   assert.match(hookSource, /wakeCoordinatorRef\.current\?\.reset\(\)/);
+});
+
+// ---------------------------------------------------------------------------
+// 跨设备路径：console 与患者端在两台设备/两个独立浏览器上，同窗 CustomEvent 到不了。
+// ---------------------------------------------------------------------------
+test("live-snapshot wakes are strict and must match the session in the same snapshot", () => {
+  assert.deepEqual(
+    liveSnapshotWake({ sessionId: SESSION_ID, stateRevision: 2 }, SESSION_ID),
+    { sessionId: SESSION_ID, stateRevision: 2 });
+  // 旧后端没有这个字段；缺字段不是唤醒，也不能变成异常。
+  assert.equal(liveSnapshotWake(undefined, SESSION_ID), null);
+  assert.equal(liveSnapshotWake(null, SESSION_ID), null);
+  // 畸形一律拒绝。
+  for (const bad of [
+    "garbage", [], { sessionId: SESSION_ID },
+    { sessionId: SESSION_ID, stateRevision: 0 },
+    { sessionId: SESSION_ID, stateRevision: 1, extra: 1 },
+  ]) {
+    assert.equal(liveSnapshotWake(bad, SESSION_ID), null);
+  }
+  // 串场：唤醒指向的不是这次快照里的 session。
+  assert.equal(
+    liveSnapshotWake({ sessionId: "S-other", stateRevision: 1 }, SESSION_ID), null);
+  // 快照里根本没有 session 时不发唤醒。
+  assert.equal(
+    liveSnapshotWake({ sessionId: SESSION_ID, stateRevision: 1 }, null), null);
+  assert.equal(
+    liveSnapshotWake({ sessionId: SESSION_ID, stateRevision: 1 }, ""), null);
+});
+
+test("cross-device: first /next 409 → no window event → live snapshot → exactly one re-probe", () => {
+  const patient = new PatientHarness();
+  // 1. 患者端在独立浏览器里配对激活后首探：权威 409 autopilot_not_active，闩住。
+  patient.probeOnce();
+  assert.equal(patient.mode, "legacy");
+  assert.equal(patient.probeRequests, 1);
+
+  // 2. console 在另一台设备上 start 成功。同窗事件不存在，患者端什么也收不到。
+  assert.equal(patient.probeEpoch, 0);
+  assert.equal(patient.probeRequests, 1);
+
+  // 3. 下一次 1.5 秒 /live/state 快照带回服务端权威所有权投影。
+  patient.serverActive = true;
+  const snapshot = { seq: 7, autopilotWake: { sessionId: SESSION_ID, stateRevision: 1 } };
+  const wake = liveSnapshotWake(snapshot.autopilotWake, SESSION_ID);
+  assert.notEqual(wake, null);
+  patient.deliverWake(wake);
+  assert.equal(patient.mode, "server");
+  assert.equal(patient.probeEpoch, 1);
+  assert.equal(patient.probeRequests, 2);   // 恰好一次重探测
+
+  // 4. 同一 token 的重复快照不再产生任何请求——轮询继续，探测不叠加。
+  for (let i = 0; i < 5; i += 1) {
+    patient.deliverWake(liveSnapshotWake(snapshot.autopilotWake, SESSION_ID));
+  }
+  assert.equal(patient.probeRequests, 2);
+  assert.equal(patient.probeEpoch, 1);
+
+  // 5. server 已在场时，更高的 revision 也不得重建媒体 runner。
+  patient.deliverWake(
+    liveSnapshotWake({ sessionId: SESSION_ID, stateRevision: 9 }, SESSION_ID));
+  assert.equal(patient.mode, "server");
+  assert.equal(patient.probeRequests, 2);
+});
+
+test("a still-inactive session never turns live polling into a /next standby loop", () => {
+  const patient = new PatientHarness();
+  patient.probeOnce();
+  // 服务端没有所有权 → 每次快照的投影都是 null → 一次请求都不新增。
+  for (let i = 0; i < 10; i += 1) {
+    patient.deliverWake(liveSnapshotWake(null, SESSION_ID));
+  }
+  assert.equal(patient.mode, "legacy");
+  assert.equal(patient.probeEpoch, 0);
+  assert.equal(patient.probeRequests, 1);
+});
+
+test("live poll emitter is wired before the unchanged-seq early return, and probing drops legacy", () => {
+  const liveSource = readFileSync(
+    new URL("./useLiveCursor.ts", import.meta.url), "utf8");
+  const wakeAt = liveSource.indexOf("liveSnapshotWake(d.autopilotWake");
+  const earlyReturnAt = liveSource.indexOf("if (!firstServerSnapshot && seq === lastSeq.current) return;");
+  assert.ok(wakeAt > 0, "useLiveCursor 必须消费 autopilotWake 投影");
+  assert.ok(earlyReturnAt > 0);
+  // start 不推进 LiveState.seq：放在 early-return 之后就永远收不到跨设备唤醒。
+  assert.ok(wakeAt < earlyReturnAt, "唤醒必须在 seq 未变的 early-return 之前处理");
+  assert.match(liveSource, /PATIENT_AUTOPILOT_WAKE_EVENT, \{ detail: wake \}/);
+  // 复用既有一次性 probeEpoch 路径，不建第二套 runner。
+  assert.doesNotMatch(liveSource, /autopilot\/next/);
+
+  // 唤醒被接受后可视态转 probing；PatientShell 在同一 render 边界撤下 legacy 子树，
+  // 老人端不会继续走 generic /tts/speak。
+  const shellSource = readFileSync(
+    new URL("../patient/PatientShell.tsx", import.meta.url), "utf8");
+  assert.match(shellSource, /autopilot\.mode === "legacy"/);
+  assert.match(shellSource, /autopilot\.mode !== "legacy"/);
 });

@@ -287,6 +287,99 @@ function reduceDeviceAck(
   return pause(advanced, "protocol_violation");
 }
 
+/**
+ * 刷新恢复里那条 exact record_failed 的落地。
+ *
+ * 恢复起点是 paused(inflight_command_recovery_required) + 一条 started 录音命令。
+ * 通用 reducer 在 paused 状态下会原样返回设备事实——那是有意的，暂停之后不再
+ * 接受设备说了什么。但这一条不是设备自说自话：它是恢复链针对**同一条命令**
+ * 发出、并已被服务器接受的失败回执，必须落地：推进 seq/last_ack、把暂停原因
+ * 从"需要恢复"收敛成 record_failed，并保留命令证据。
+ *
+ * 落地之后 /next 只剩一致性核对的作用。它返回 null 不代表"没有命令要执行"，
+ * 绝不能把这个暂停事实冲回 waiting_command——那会让老人端重新开始轮询、
+ * 甚至接受下一条命令，而本机那段录音还躺着等人工处置。
+ */
+export function applyRecoveredRecordFailure(
+  state: AutopilotRuntimeState,
+  value: unknown,
+): AutopilotRuntimeState {
+  let ack: AutopilotAck;
+  try { ack = parseAutopilotAck(value); }
+  catch { return pause(state, "protocol_violation"); }
+  const command = state.command;
+  if (ack.ack_type !== "record_failed"
+      || !command || command.kind !== "record" || command.state !== "started"
+      || state.phase !== "paused"
+      || state.pause_reason !== "inflight_command_recovery_required"
+      || !ackMatchesCommand(ack, command)
+      || ack.device_event_seq !== state.last_device_event_seq + 1) {
+    return pause(state, "protocol_violation");
+  }
+  return {
+    ...state,
+    last_device_event_seq: ack.device_event_seq,
+    last_ack: ack,
+    phase: "paused",
+    pause_reason: "record_failed",
+  };
+}
+
+/**
+ * 从持久 ACK envelope 重建"这条命令已经失败、场次已暂停"的本地状态。
+ *
+ * 响应丢失后重启时，drainPending 会精确重放那条失败回执。服务器其实早就接受过
+ * 它、已经暂停，所以 /next 返回 null——但 null 只说明"现在没有命令要执行"，不是
+ * "一切正常"。照 restoreAutopilotRuntime 走会变成 waiting_command，老人端于是
+ * 继续轮询、甚至接受下一条命令。
+ *
+ * 这里只认封闭的失败形状：ack_type 必须是 tts_failed / record_failed，命令种类、
+ * 三代际与 revision 必须与 envelope 里那条 exact 命令完全对上，pending 与 started
+ * 两种 revision 都覆盖（麦克风被拒发生在 pending，超限恢复发生在 started）。
+ * 对不上一律返回 null，由调用方走原路径——绝不据此伪造一个暂停。
+ */
+export function restoreFailedAckRuntime(
+  envelope: { command: unknown; ack: unknown },
+): AutopilotRuntimeState | null {
+  let ack: AutopilotAck;
+  let command: NextCommandProjection;
+  try {
+    ack = parseAutopilotAck(envelope.ack);
+    command = parseNextCommandProjection(envelope.command);
+  } catch { return null; }
+  if (ack.ack_type !== "tts_failed" && ack.ack_type !== "record_failed") return null;
+  const expectedKind = ack.ack_type === "tts_failed" ? "tts" : "record";
+  if (command.kind !== expectedKind
+      || (command.state !== "pending" && command.state !== "started")
+      || !ackMatchesCommand(ack, command)) {
+    return null;
+  }
+  return {
+    phase: "paused",
+    command,
+    last_device_event_seq: ack.device_event_seq,
+    last_ack: ack,
+    pause_reason: ack.ack_type,
+  };
+}
+
+/**
+ * 唯一的解闩判据：相对锁存的终态失败命令 F，候选投影 N 必须同时满足
+ * command_key 不同、command_seq 严格更大、control_generation 与
+ * runner_generation 都严格更大，才算"真正新权威"。command_revision 不参与
+ * 比较。null、畸形、同 key、同代、只升一代、seq 回退，一律不解闩——不确定
+ * 就维持 paused。
+ */
+export function commandSupersedesTerminalLatch(
+  latched: NextCommandProjection,
+  candidate: NextCommandProjection,
+): boolean {
+  return candidate.command_key !== latched.command_key
+    && candidate.command_seq > latched.command_seq
+    && candidate.control_generation > latched.control_generation
+    && candidate.runner_generation > latched.runner_generation;
+}
+
 /** Pure fail-closed reducer; media code may only act through the guards below. */
 export function autopilotRuntimeReducer(
   state: AutopilotRuntimeState,
@@ -310,4 +403,19 @@ export function canOpenAutopilotMicrophone(state: AutopilotRuntimeState): boolea
   return state.phase === "record_ready"
     && state.command?.kind === "record"
     && state.command.state === "pending";
+}
+
+/** 没有可执行媒体时的有界轮询节拍，防 busy loop。 */
+export const AUTOPILOT_IDLE_TICK_MS = 900;
+
+/**
+ * 下一次 runner tick 的间隔。
+ *
+ * 服务器已经签发本轮录音命令(record_ready)时必须是 0：提问音频真的播完了、
+ * tts_ended 也已持久化，这时再压一个空闲节拍，老人那头就是"问完了没反应"。
+ * 其余状态保留有界间隔。真正的开麦仍然发生在 runRecording 里，仍然排在
+ * 音频 ended 与持久化 tts_ended 之后——这里只去掉人为的等待。
+ */
+export function autopilotNextTickDelayMs(state: AutopilotRuntimeState): number {
+  return canOpenAutopilotMicrophone(state) ? 0 : AUTOPILOT_IDLE_TICK_MS;
 }

@@ -12,7 +12,7 @@ import {
   type LegacyAudioOrphan,
 } from "./audioStoragePolicy.ts";
 import {
-  createAutopilotAckCheckpoint,
+  nextAutopilotAckCheckpoint,
   parseAutopilotAckCheckpoint,
   parseAutopilotAckEnvelope,
   sameAutopilotAckEnvelope,
@@ -675,11 +675,7 @@ export const blobStore = {
           if (expected.ack.device_event_seq !== lastSeq + 1) {
             throw new Error("ACK checkpoint 不允许跳号完成");
           }
-          checkpointStore.put(createAutopilotAckCheckpoint({
-            ownerKey: expected.ownerKey,
-            sessionId: expected.sessionId,
-            lastDeviceEventSeq: expected.ack.device_event_seq,
-          }));
+          checkpointStore.put(nextAutopilotAckCheckpoint(expected));
           pendingStore.delete(expected.ownerKey);
         } catch (error) {
           integrityError = error;
