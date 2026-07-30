@@ -9,6 +9,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -19,6 +20,7 @@ from app.judging import PortraitLeakError
 from app.llm_judge import LlmJudgement
 from app.main import app
 from app.models import (
+    AttemptCaptureProcessing,
     AttemptEvent, InteractionEvent, Session as TrainSession,
     SessionCloseoutReport, SessionOutcomeSummary, SessionRuntimeState,
 )
@@ -428,6 +430,224 @@ def test_atomic_expired_takeover_and_generation_fence_on_sqlite(tmp_path):
         assert advanced.processing_status == "asr_completed"
         assert advanced.asr_text == "锚"
         assert advanced.processing_generation == 8
+
+
+def test_capture_processing_atomic_expired_takeover_and_generation_fence_on_sqlite(
+        tmp_path):
+    """Same CAS race as AttemptEvent's claim, one layer earlier.
+
+    R1-foundation: the persistent capture-processing claim is made durable at
+    record_stopped time, before ASR ever runs, so a future repeat-classifier
+    can inspect ASR text before attempt_seq is consumed. Its claim/lease/
+    generation fencing mirrors AttemptEvent's exactly.
+    """
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'capture-claim-race.db'}",
+        connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    expired_at = datetime.now() - timedelta(seconds=1)
+    with Session(engine) as session:
+        row = AttemptCaptureProcessing(
+            record_command_id=1, predecessor_command_id=2,
+            receipt_server_seq=1, raw_audio_id="race-capture-audio",
+            session_id="S-CAPTURE-RACE", item_id="SE_锚", turn_seq=1,
+            proof_attempt_seq=1, proof_prompt_level=0,
+            processing_status="received",
+            processing_owner="crashed", processing_lease_expires_at=expired_at,
+            processing_claimed_at=expired_at - timedelta(seconds=10),
+            processing_generation=7, is_simulation=True,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        capture_id = int(row.id)
+
+    barrier = threading.Barrier(2)
+
+    def claim(owner: str) -> bool:
+        with Session(engine) as session:
+            barrier.wait(timeout=5)
+            won = evidence_ledger.try_claim_capture(
+                session, capture_id, owner=owner, now=datetime.now())
+            if won:
+                session.commit()
+            else:
+                session.rollback()
+            return won
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(claim, ["worker-a", "worker-b"]))
+    assert outcomes.count(True) == 1
+
+    with Session(engine) as session:
+        current = session.get(AttemptCaptureProcessing, capture_id)
+        assert current is not None
+        assert current.processing_generation == 8
+        winning_claim = evidence_ledger.claim_from_capture(current)
+
+        stale_claim = evidence_ledger.CaptureClaim(
+            capture_id=capture_id, owner="crashed", generation=7,
+            proof_attempt_seq=1, proof_prompt_level=0,
+            lease_expires_at=expired_at)
+        assert evidence_ledger.fenced_capture_update(
+            session, stale_claim, next_status="asr_completed", values={
+                "asr_engine_version": "stale-asr",
+                "disposition": "answer_candidate", "error_code": None,
+                "final_attempt_id": 999, "processed_at": datetime.now(),
+            }) is False
+        assert evidence_ledger.fenced_capture_update(
+            session, winning_claim, next_status="asr_completed", values={
+                "asr_engine_version": "winner-asr",
+                "disposition": "answer_candidate", "error_code": None,
+                "final_attempt_id": 999, "processed_at": datetime.now(),
+            }) is True
+        session.commit()
+        session.expire_all()
+        advanced = session.get(AttemptCaptureProcessing, capture_id)
+        assert advanced.processing_status == "asr_completed"
+        assert advanced.asr_engine_version == "winner-asr"
+        assert advanced.disposition == "answer_candidate"
+        assert advanced.final_attempt_id == 999
+        assert advanced.processing_owner is None
+        assert advanced.processing_lease_expires_at is None
+        assert advanced.processing_generation == 8
+
+
+def test_invalidate_capture_processing_claims_fences_in_flight_worker(tmp_path):
+    """Pause/takeover/withdrawal must fence an in-flight capture claim.
+
+    Mirrors invalidate_processing_claims for AttemptEvent: a late ASR result
+    for a fenced generation may no longer transition the row.
+    """
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'capture-claim-invalidate.db'}",
+        connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        row = AttemptCaptureProcessing(
+            record_command_id=1, predecessor_command_id=2,
+            receipt_server_seq=1, raw_audio_id="invalidate-capture-audio",
+            session_id="S-CAPTURE-INVALIDATE", item_id="SE_锚", turn_seq=1,
+            proof_attempt_seq=1, proof_prompt_level=0,
+            processing_status="received",
+            processing_owner="in-flight-worker",
+            processing_lease_expires_at=datetime.now() + timedelta(seconds=60),
+            processing_claimed_at=datetime.now(),
+            processing_generation=3, is_simulation=True,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        capture_id = int(row.id)
+        claim = evidence_ledger.claim_from_capture(row)
+
+    with Session(engine) as session:
+        fenced = evidence_ledger.invalidate_capture_processing_claims(
+            session, session_id="S-CAPTURE-INVALIDATE")
+        session.commit()
+    assert fenced == 1
+
+    with Session(engine) as session:
+        current = session.get(AttemptCaptureProcessing, capture_id)
+        assert current.processing_owner is None
+        assert current.processing_lease_expires_at is None
+        assert current.processing_generation == 4
+        # The pre-fence claim can no longer transition the row.
+        assert evidence_ledger.fenced_capture_update(
+            session, claim, next_status="asr_completed", values={
+                "asr_engine_version": "late-asr",
+                "disposition": "answer_candidate", "error_code": None,
+                "final_attempt_id": 42,
+            }) is False
+
+
+def test_ensure_capture_processing_is_idempotent_per_record_command(tmp_path):
+    """record_stopped's admission never duplicates a row for the same command."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'capture-ensure-idempotent.db'}",
+        connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        first = evidence_ledger.ensure_capture_processing(
+            session, record_command_id=1, predecessor_command_id=2,
+            receipt_server_seq=1, raw_audio_id="ensure-capture-audio",
+            session_id="S-CAPTURE-ENSURE", item_id="SE_锚", turn_seq=1,
+            proof_attempt_seq=1, proof_prompt_level=0, is_simulation=True,
+        )
+        session.commit()
+        second = evidence_ledger.ensure_capture_processing(
+            session, record_command_id=1, predecessor_command_id=2,
+            receipt_server_seq=1, raw_audio_id="ensure-capture-audio",
+            session_id="S-CAPTURE-ENSURE", item_id="SE_锚", turn_seq=1,
+            proof_attempt_seq=1, proof_prompt_level=0, is_simulation=True,
+        )
+        session.commit()
+        assert first.id == second.id
+        rows = list(session.exec(select(AttemptCaptureProcessing)))
+        assert len(rows) == 1
+
+
+def test_ensure_capture_processing_integrity_error_only_rolls_back_its_own_savepoint(
+        tmp_path):
+    """A conflicting insert inside ensure_capture_processing must only unwind
+    its own SAVEPOINT — never the caller's already-staged outer-transaction
+    work (e.g. apply_device_ack's ACK/command/state changes earlier in the
+    same request). A plain ``session.rollback()`` here would silently
+    discard that prior work while the caller believes its request succeeded.
+    """
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'capture-savepoint-fault.db'}",
+        connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        # Occupies the raw_audio_id unique slot under a different
+        # record_command_id: ensure_capture_processing's own SELECT-by-
+        # record_command_id finds nothing and proceeds to INSERT, which then
+        # collides on raw_audio_id — a genuine, unrecoverable-by-record-
+        # command-id conflict that must still fail loud without destroying
+        # unrelated work.
+        session.add(AttemptCaptureProcessing(
+            record_command_id=999, predecessor_command_id=998,
+            receipt_server_seq=1, raw_audio_id="conflicting-audio-id",
+            session_id="S-SAVEPOINT", item_id="SE_锚", turn_seq=1,
+            proof_attempt_seq=1, proof_prompt_level=0,
+            processing_status="received", is_simulation=True,
+        ))
+        session.commit()
+
+    with Session(engine) as session:
+        # Stand-in for apply_device_ack's own earlier, still-uncommitted
+        # work in the same outer transaction (an ACK/command/state write).
+        marker = AttemptEvent(
+            session_id="S-SAVEPOINT", item_id="SE_锚", turn_seq=1,
+            response_role="命名", attempt_seq=1,
+            raw_audio_id="unrelated-marker-audio",
+            prompt_level=0, processing_status="received", is_simulation=True,
+        )
+        session.add(marker)
+        session.flush()
+        marker_id = marker.id
+
+        with pytest.raises(IntegrityError):
+            evidence_ledger.ensure_capture_processing(
+                session, record_command_id=1, predecessor_command_id=2,
+                receipt_server_seq=2, raw_audio_id="conflicting-audio-id",
+                session_id="S-SAVEPOINT", item_id="SE_锚", turn_seq=1,
+                proof_attempt_seq=1, proof_prompt_level=0, is_simulation=True,
+            )
+
+        # The outer transaction's own earlier write survives the failed
+        # savepoint intact and is still committable.
+        assert session.get(AttemptEvent, marker_id) is not None
+        session.commit()
+
+    with Session(engine) as session:
+        assert session.get(AttemptEvent, marker_id) is not None
+        conflicting_rows = list(session.exec(select(AttemptCaptureProcessing).where(
+            AttemptCaptureProcessing.raw_audio_id == "conflicting-audio-id")))
+        assert len(conflicting_rows) == 1
+        assert conflicting_rows[0].record_command_id == 999
 
 
 def test_claim_lease_migration_preserves_a8_attempts_and_makes_stalls_claimable(

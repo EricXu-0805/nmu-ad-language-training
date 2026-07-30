@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import hashlib
@@ -16,14 +17,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import (asr, audio_store, auth, autopilot_orchestration,
-                 autopilot_service, content, db, provider_readiness)
+                 autopilot_service, content, db, device_capability,
+                 evidence_ledger, llm_judge, provider_readiness)
+from app import main as main_module
+from app.llm_judge import LlmJudgement
+from app.enums import AnswerType
 from app.main import (
     AttemptProcessIn,
+    _fail_closed_p0a_attempt_worker,
     _process_attempt,
     _run_p0a_attempt_worker,
     app,
 )
 from app.models import (
+    AttemptCaptureProcessing,
     AttemptEvent,
     AuditLog,
     AudioAssetRow,
@@ -353,7 +360,12 @@ def _drive_to_processing_attempt(
     )
     assert stopped.status_code == 200, stopped.text
     assert stopped.json()["status"] == "processing_attempt"
-    return {"record": record, "raw_audio_id": raw_audio_id}
+    return {
+        "record": record, "raw_audio_id": raw_audio_id,
+        "receipt_server_seq": receipt["serverSeq"],
+        "checksum": upload_fact["checksum"], "byte_count": upload_fact["bytes"],
+        "duration_seconds": 1.5, "stop_reason": stop_reason,
+    }
 
 
 def _valid_attempt_body(raw_audio_id: str, **overrides) -> dict:
@@ -408,6 +420,59 @@ def test_start_without_current_provider_probe_fails_before_control_ownership(
         assert session.get(SessionAutopilotState, SESSION_ID) is None
         assert list(session.exec(select(RuntimeCommand))) == []
         assert list(session.exec(select(AutopilotControlEvent))) == []
+
+
+def test_start_over_http_fails_closed_on_exact_stale_protocol_version_with_zero_writes(
+        api_clients: ApiClients, monkeypatch):
+    """HTTP-adapter counterpart of the service-level protocol-version-
+    mismatch test: a genuine old (version, digest) binding pair -- not a
+    corrupted or missing one -- must 409 with the exact stable code before
+    any runtime/live/session-mutation/control/command/ack/event write.
+    """
+    _enable_p0a(monkeypatch)
+    stale_version_id = "autopilot-v1-20260717"
+    stale_digest = (
+        "7e1f812972a07b80f4e88c01ae838254d2fbaae5e1f8c6d52aa06a18de61eccb")
+    with Session(api_clients.engine) as session:
+        legacy = session.get(TrainSession, SESSION_ID)
+        assert legacy is not None
+        assert legacy.autopilot_protocol_version_id == PROTOCOL["protocol_version_id"]
+        legacy.autopilot_protocol_version_id = stale_version_id
+        legacy.autopilot_protocol_definition_digest = stale_digest
+        session.add(legacy)
+        session.commit()
+
+    def _snapshot():
+        with Session(api_clients.engine) as session:
+            train_session = session.get(TrainSession, SESSION_ID)
+            runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+            live_rows = list(session.exec(select(LiveState)))
+            return (
+                (train_session.autopilot_protocol_version_id,
+                 train_session.autopilot_protocol_definition_digest)
+                if train_session is not None else None,
+                (runtime_state.status, runtime_state.revision)
+                if runtime_state is not None else None,
+                tuple((row.id, row.seq, row.session_json) for row in live_rows),
+                session.get(SessionAutopilotState, SESSION_ID),
+                list(session.exec(select(RuntimeCommand))),
+                list(session.exec(select(RuntimeCommandAck))),
+                list(session.exec(select(AutopilotControlEvent))),
+            )
+
+    before = _snapshot()
+    assert before[0] == (stale_version_id, stale_digest)
+    assert before[3] is None
+    assert before[4] == []
+    assert before[5] == []
+    assert before[6] == []
+
+    denied = _start(api_clients)
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "autopilot_protocol_version_mismatch"
+
+    after = _snapshot()
+    assert after == before
 
 
 def test_default_draft_week2_plan_returns_structured_gap_before_ownership(
@@ -2062,6 +2127,45 @@ class _BlockingWorkerAsr(_WorkerAsr):
             "胡萝卜", 0.96, self.version, hotword_hit=True)
 
 
+class _BlockingWorkerJudge:
+    """Judge provider double that blocks in ``judge`` until released."""
+
+    version = "blocking-judge-test"
+    data_boundary = "local"
+    provider_id = None
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def judge(self, _judge_input):
+        self.calls += 1
+        self.entered.set()
+        if not self.release.wait(timeout=10):
+            raise AssertionError("test did not release blocked judge provider")
+        return LlmJudgement(AnswerType.正确, 1.0, False, reason="命中目标词")
+
+
+class _FailingBlockingWorkerJudge(_BlockingWorkerJudge):
+    """Blocks like ``_BlockingWorkerJudge``, then raises on release."""
+
+    def judge(self, _judge_input):
+        self.calls += 1
+        self.entered.set()
+        if not self.release.wait(timeout=10):
+            raise AssertionError("test did not release blocked judge provider")
+        raise RuntimeError("injected delayed judge failure")
+
+
+class _WrongAnswerAsr(_WorkerAsr):
+    """Fast, non-blocking ASR whose transcript never matches the target."""
+
+    def transcribe(self, _audio_bytes, _hotwords):
+        self.calls += 1
+        return asr.AsrResult("西瓜", 0.9, self.version, hotword_hit=False)
+
+
 def _pause_drain_takeover(
         clients: ApiClients, record: dict, *, takeover_key: str) -> dict:
     paused = clients.account.post(f"/sessions/{SESSION_ID}/pause")
@@ -2369,6 +2473,8 @@ def test_internal_worker_rejects_non_authoritative_attempt_body_without_evidence
         capture["raw_audio_id"], duration_seconds=1.75))
 
     with Session(api_clients.engine) as session:
+        target = autopilot_orchestration.derive_worker_target(
+            session, session_id=SESSION_ID)
         with pytest.raises(HTTPException) as caught:
             _process_attempt(
                 SESSION_ID,
@@ -2376,6 +2482,7 @@ def test_internal_worker_rejects_non_authoritative_attempt_body_without_evidence
                 Response(),
                 session,
                 control_plane="autopilot_worker",
+                worker_target=target,
             )
         assert caught.value.status_code == 409
         assert caught.value.detail["code"] == "autopilot_attempt_input_mismatch"
@@ -2386,6 +2493,145 @@ def test_internal_worker_rejects_non_authoritative_attempt_body_without_evidence
         assert list(session.exec(select(InteractionEvent))) == []
         state = session.get(SessionAutopilotState, SESSION_ID)
         assert state is not None and state.status == "processing_attempt"
+
+
+def test_internal_worker_without_frozen_target_is_rejected_before_any_mutation(
+        api_clients: ApiClients, monkeypatch):
+    """A missing ``worker_target`` on the autopilot_worker plane is not a
+    legitimate production call shape — it must fail before any provider I/O
+    or write, never silently fall back to session-only behavior.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+    body = AttemptProcessIn.model_validate(
+        _valid_attempt_body(capture["raw_audio_id"]))
+    never_called = _WorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: never_called)
+
+    with Session(api_clients.engine) as session:
+        with pytest.raises(RuntimeError, match="frozen worker_target"):
+            _process_attempt(
+                SESSION_ID,
+                body,
+                Response(),
+                session,
+                control_plane="autopilot_worker",
+            )
+        session.rollback()
+
+    assert never_called.calls == 0
+    with Session(api_clients.engine) as session:
+        assert list(session.exec(select(AttemptEvent))) == []
+        assert list(session.exec(select(InteractionEvent))) == []
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "processing_attempt"
+        assert state.current_command_id is not None
+
+
+@pytest.mark.parametrize("field,mutate", [
+    ("session_id", lambda t: t.session_id + "-OTHER"),
+    ("record_command_id", lambda t: t.record_command_id + 999_000),
+    ("raw_audio_id", lambda t: "raw-" + "0" * 32),
+    ("control_generation", lambda t: t.control_generation + 1),
+    ("runner_generation", lambda t: t.runner_generation + 1),
+])
+def test_internal_worker_rejects_a_target_mismatched_in_any_single_field(
+        api_clients: ApiClients, monkeypatch, field, mutate):
+    """Each of the 5 target fields is independently load-bearing. A target
+    that mismatches in exactly one field, with everything else — including a
+    ``body`` that legitimately matches the current authoritative attempt —
+    unchanged, must still be rejected before any provider I/O or mutation. A
+    coincidentally-matching body must never let a forged/lagged target ride
+    through on any single field.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+    body = AttemptProcessIn.model_validate(
+        _valid_attempt_body(capture["raw_audio_id"]))
+    never_called = _WorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: never_called)
+
+    with Session(api_clients.engine) as session:
+        real_target = autopilot_orchestration.derive_worker_target(
+            session, session_id=SESSION_ID)
+        session.rollback()
+    mismatched_target = real_target.model_copy(
+        update={field: mutate(real_target)})
+    assert mismatched_target != real_target
+
+    with Session(api_clients.engine) as session:
+        with pytest.raises(autopilot_orchestration.AutopilotOrchestrationError) as caught:
+            _process_attempt(
+                SESSION_ID,
+                body,
+                Response(),
+                session,
+                control_plane="autopilot_worker",
+                worker_target=mismatched_target,
+            )
+        assert caught.value.code == "autopilot_attempt_input_mismatch"
+        session.rollback()
+
+    assert never_called.calls == 0
+    with Session(api_clients.engine) as session:
+        assert list(session.exec(select(AttemptEvent))) == []
+        assert list(session.exec(select(InteractionEvent))) == []
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "processing_attempt"
+        assert state.current_command_id is not None
+
+
+def test_prepare_admission_independently_rechecks_target_within_its_own_lock(
+        api_clients: ApiClients, monkeypatch):
+    """A caller-side (pre-admission) target-freshness check and
+    ``_prepare_capture_or_attempt_processing``'s own lock are two different
+    transactions — the caller-side check alone cannot close the gap between
+    them (control/runner generation could change in that gap even while
+    ``body``/its raw audio stay identical). This deterministically proves
+    admission's own lock-scoped target recheck is what actually protects it:
+    the caller-side precheck is neutralized (forced to always report "still
+    current"), and a forged target is still rejected — by admission's own
+    independent recheck, not the (here defeated) precheck.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+    body = AttemptProcessIn.model_validate(
+        _valid_attempt_body(capture["raw_audio_id"]))
+    never_called = _WorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: never_called)
+
+    with Session(api_clients.engine) as session:
+        real_target = autopilot_orchestration.derive_worker_target(
+            session, session_id=SESSION_ID)
+        session.rollback()
+    forged_target = autopilot_orchestration.FrozenWorkerTarget(
+        session_id=real_target.session_id,
+        record_command_id=real_target.record_command_id + 999_000,
+        raw_audio_id=real_target.raw_audio_id,
+        control_generation=real_target.control_generation,
+        runner_generation=real_target.runner_generation,
+    )
+    monkeypatch.setattr(
+        autopilot_orchestration, "worker_target_still_current",
+        lambda _db, _target: True)
+
+    with Session(api_clients.engine) as session:
+        with pytest.raises(HTTPException) as caught:
+            _process_attempt(
+                SESSION_ID, body, Response(), session,
+                control_plane="autopilot_worker", worker_target=forged_target,
+            )
+        assert caught.value.status_code == 409
+        assert caught.value.detail["code"] == "autopilot_attempt_input_mismatch"
+        session.rollback()
+
+    assert never_called.calls == 0
+    with Session(api_clients.engine) as session:
+        assert list(session.exec(select(AttemptEvent))) == []
+        assert list(session.exec(select(InteractionEvent))) == []
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "processing_attempt"
+        assert state.current_command_id is not None
 
 
 def test_worker_technical_failure_atomically_pauses_runtime_and_autopilot(
@@ -2579,9 +2825,13 @@ def test_pause_drain_takeover_fences_a_provider_result_already_in_flight(
         worker.result(timeout=10)
 
     with Session(api_clients.engine) as session:
-        attempt = session.exec(select(AttemptEvent)).one()
-        interactions = list(session.exec(select(InteractionEvent).order_by(
-            InteractionEvent.event_seq)))
+        # R1-foundation: AttemptEvent creation (and attempt_seq consumption) is
+        # deferred until ASR resolves. Pause/takeover won the race before the
+        # blocked ASR call returned, so no AttemptEvent/InteractionEvent was
+        # ever created — only the pre-attempt capture claim was fenced.
+        assert list(session.exec(select(AttemptEvent))) == []
+        assert list(session.exec(select(InteractionEvent))) == []
+        capture_row = session.exec(select(AttemptCaptureProcessing)).one()
         commands = list(session.exec(select(RuntimeCommand).order_by(
             RuntimeCommand.command_seq)))
         events = list(session.exec(select(AutopilotControlEvent).order_by(
@@ -2589,17 +2839,17 @@ def test_pause_drain_takeover_fences_a_provider_result_already_in_flight(
         control = session.get(SessionAutopilotState, SESSION_ID)
         runtime_state = session.get(SessionRuntimeState, SESSION_ID)
 
-        assert attempt.processing_status == "received"
+        assert capture_row.raw_audio_id == capture["raw_audio_id"]
+        assert capture_row.processing_status == "received"
+        assert capture_row.final_attempt_id is None
+        assert capture_row.processing_owner is None
         assert (
-            attempt.asr_text,
-            attempt.asr_confidence,
-            attempt.asr_engine_version,
-            attempt.operational_answer_type,
-            attempt.operational_score,
-            attempt.judge_engine_version,
-        ) == (None, None, None, None, None, None)
-        assert [event.event_type for event in interactions] == [
-            "attempt_received"]
+            capture_row.asr_confidence,
+            capture_row.asr_engine_version, capture_row.disposition,
+            capture_row.error_code,
+        ) == (None, None, None, None)
+        # Original record command and capture receipt survive untouched; only
+        # the ephemeral in-process claim was invalidated.
         assert [(command.kind, command.state) for command in commands] == [
             ("tts", "succeeded"), ("record", "succeeded")]
         assert [event.event_type for event in events] == [
@@ -2640,9 +2890,13 @@ def test_old_provider_failure_cannot_repause_after_takeover_and_manual_resume(
         worker.result(timeout=10)
 
     with Session(api_clients.engine) as session:
-        attempt = session.exec(select(AttemptEvent)).one()
-        interactions = list(session.exec(select(InteractionEvent).order_by(
-            InteractionEvent.event_seq)))
+        # R1-foundation: the delayed provider failure arrives after pause/
+        # takeover already fenced the pre-attempt capture claim, so it is
+        # observation-only — no AttemptEvent is ever created (attempt_seq is
+        # never consumed) and no InteractionEvent is appended.
+        assert list(session.exec(select(AttemptEvent))) == []
+        assert list(session.exec(select(InteractionEvent))) == []
+        capture_row = session.exec(select(AttemptCaptureProcessing)).one()
         commands = list(session.exec(select(RuntimeCommand).order_by(
             RuntimeCommand.command_seq)))
         events = list(session.exec(select(AutopilotControlEvent).order_by(
@@ -2650,11 +2904,14 @@ def test_old_provider_failure_cannot_repause_after_takeover_and_manual_resume(
         control = session.get(SessionAutopilotState, SESSION_ID)
         runtime_state = session.get(SessionRuntimeState, SESSION_ID)
 
-        assert attempt.processing_status == "received"
-        assert attempt.asr_text is None and attempt.asr_engine_version is None
-        assert attempt.error_code is None
-        assert [event.event_type for event in interactions] == [
-            "attempt_received"]
+        assert capture_row.raw_audio_id == capture["raw_audio_id"]
+        assert capture_row.processing_status == "received"
+        assert capture_row.final_attempt_id is None
+        assert capture_row.processing_owner is None
+        assert (
+            capture_row.asr_engine_version,
+            capture_row.error_code,
+        ) == (None, None)
         assert [(command.kind, command.state) for command in commands] == [
             ("tts", "succeeded"), ("record", "succeeded")]
         assert [event.event_type for event in events] == [
@@ -2666,6 +2923,1339 @@ def test_old_provider_failure_cannot_repause_after_takeover_and_manual_resume(
         assert (runtime_state.status, runtime_state.revision) == (
             "active", resumed_revision)
     assert blocked_asr.calls == 1
+
+
+def test_dual_worker_race_on_fresh_capture_claims_exactly_once_and_completes_once(
+        api_clients: ApiClients, monkeypatch):
+    """Two concurrent recovery triggers before ASR ever ran must not double-process.
+
+    R1-foundation: before ASR resolves, only the capture-processing claim
+    exists (no AttemptEvent yet). A second concurrent trigger — e.g. another
+    device polling GET /autopilot/next — must observe the active capture
+    lease and back off, exactly like the existing AttemptEvent claim already
+    did before this batch.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+    blocked_asr = _BlockingWorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: blocked_asr)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert blocked_asr.entered.wait(timeout=10), "first worker never entered ASR"
+        second = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        second.result(timeout=10)
+        blocked_asr.release.set()
+        first.result(timeout=10)
+
+    assert blocked_asr.calls == 1
+    with Session(api_clients.engine) as session:
+        attempts = list(session.exec(select(AttemptEvent)))
+        assert len(attempts) == 1
+        attempt = attempts[0]
+        assert attempt.processing_status == "completed"
+        assert attempt.attempt_seq == 1
+        assert attempt.raw_audio_id == capture["raw_audio_id"]
+        capture_rows = list(session.exec(select(AttemptCaptureProcessing)))
+        assert len(capture_rows) == 1
+        assert capture_rows[0].processing_status == "asr_completed"
+        assert capture_rows[0].disposition == "answer_candidate"
+        assert capture_rows[0].final_attempt_id == attempt.id
+        interactions = [event.event_type for event in session.exec(
+            select(InteractionEvent).order_by(InteractionEvent.event_seq))]
+        assert interactions.count("attempt_received") == 1
+        assert interactions.count("asr_completed") == 1
+
+
+def test_late_generation_result_after_newer_generation_materializes_is_observation_only(
+        api_clients: ApiClients, monkeypatch):
+    """A stale generation's ASR result must never fail-close a scope a newer
+    generation already advanced into judgement.
+
+    Deterministic interleaving: worker A claims the capture and blocks in
+    ASR. While A is blocked, its lease is force-expired and worker B takes
+    over (a newer generation), finishes ASR quickly, materializes the
+    AttemptEvent directly to ``asr_completed``, and then blocks in
+    judgement. Only then is A's stale ASR result released. Before this
+    fix, A would reach the attempt_seq check/insert using its
+    already-superseded claim, and the terminal-capture projection would
+    report a false terminal outcome — either could trigger a spurious
+    fail-close against a scope B still legitimately owns.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+
+    a_asr = _BlockingWorkerAsr()
+    b_judge = _BlockingWorkerJudge()
+
+    monkeypatch.setattr(asr, "get_engine", lambda: a_asr)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        worker_a = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert a_asr.entered.wait(timeout=10), "worker A never entered ASR"
+
+        # Force A's capture lease to expire so worker B can take over —
+        # models a crashed/slow worker A without waiting out a real lease.
+        with Session(api_clients.engine) as session:
+            row = session.exec(select(AttemptCaptureProcessing).where(
+                AttemptCaptureProcessing.raw_audio_id == capture["raw_audio_id"],
+            )).one()
+            session.execute(update(AttemptCaptureProcessing).where(
+                AttemptCaptureProcessing.id == row.id,
+            ).values(processing_lease_expires_at=datetime.now() - timedelta(seconds=1)))
+            session.commit()
+
+        b_asr = _WorkerAsr()
+        monkeypatch.setattr(asr, "get_engine", lambda: b_asr)
+        monkeypatch.setattr(llm_judge, "get_engine", lambda: b_judge)
+        worker_b = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert b_judge.entered.wait(timeout=10), "worker B never entered judgement"
+
+        # Only now release A's stale ASR result — after B already
+        # materialized the AttemptEvent and moved on into judgement.
+        a_asr.release.set()
+        worker_a.result(timeout=10)
+
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            assert control is not None and control.status == "processing_attempt"
+            attempts = list(session.exec(select(AttemptEvent)))
+            assert len(attempts) == 1
+            assert attempts[0].processing_status == "asr_completed"
+
+        b_judge.release.set()
+        worker_b.result(timeout=10)
+
+    with Session(api_clients.engine) as session:
+        attempts = list(session.exec(select(AttemptEvent)))
+        assert len(attempts) == 1
+        attempt = attempts[0]
+        assert attempt.processing_status == "completed"
+        assert attempt.attempt_seq == 1
+        capture_rows = list(session.exec(select(AttemptCaptureProcessing)))
+        assert len(capture_rows) == 1
+        assert capture_rows[0].final_attempt_id == attempt.id
+        commands = list(session.exec(select(RuntimeCommand)))
+        assert len(commands) == 3
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        assert control is not None and control.status == "waiting_tts"
+        interactions = [event.event_type for event in session.exec(
+            select(InteractionEvent).order_by(InteractionEvent.event_seq))]
+        assert interactions.count("attempt_received") == 1
+        assert interactions.count("asr_completed") == 1
+        assert interactions.count("judgement_completed") == 1
+    assert a_asr.calls == 1
+    assert b_asr.calls == 1
+    assert b_judge.calls == 1
+
+
+def _drive_second_processing_attempt_via_silence_cue(
+        clients: ApiClients) -> dict:
+    """Advance an already-answered/cued session to the next processing_attempt.
+
+    Mirrors ``_drive_to_processing_attempt``'s TTS/record ACK sequence, but for
+    the cue turn a completed (silence) first attempt just opened — i.e. one
+    step further along the same real device flow, not a shortcut.
+    """
+    cue = _device_next(clients)
+    assert cue is not None and cue["kind"] == "tts"
+    ended = clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{cue['command_key']}/acks",
+        headers=clients.device_headers,
+        json=_ack_body(
+            cue, ack_type="tts_ended", ack_key="ack-cross-attempt-cue-ended-0001",
+            device_event_seq=3, media_ended=True, media_duration_ms=4200,
+        ),
+    )
+    assert ended.status_code == 200, ended.text
+    record = ended.json()["command"]
+    raw_audio_id = record["payload"]["raw_audio_id"]
+    blob = b"\x1a\x45\xdf\xa3p0a-second-attempt-worker"
+    uploaded = clients.device.put(
+        f"/audio/{raw_audio_id}/blob",
+        headers={**clients.device_headers, "content-type": "audio/webm"},
+        content=blob,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    upload_fact = uploaded.json()
+    saved = clients.device.put(
+        "/live/state",
+        headers=clients.device_headers,
+        json={
+            "kind": "audioSaved",
+            "payload": {
+                "rawAudioId": raw_audio_id,
+                "durationSeconds": 1.5,
+                "byteCount": upload_fact["bytes"],
+                "checksum": upload_fact["checksum"],
+                "turnKey": record["payload"]["turn_ref"],
+                "sessionId": SESSION_ID,
+                "containsDirectIdentifier": False,
+            },
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    receipt = saved.json()["audioReceipt"]
+    stopped = clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{record['command_key']}/acks",
+        headers=clients.device_headers,
+        json=_ack_body(
+            record, ack_type="record_stopped",
+            ack_key="ack-cross-attempt-record-stopped-0001",
+            device_event_seq=4, stop_reason="silence",
+            raw_audio_id=raw_audio_id, receipt_server_seq=receipt["serverSeq"],
+            checksum=upload_fact["checksum"], byte_count=upload_fact["bytes"],
+            duration_seconds=1.5,
+        ),
+    )
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json()["status"] == "processing_attempt"
+    return {"record": record, "raw_audio_id": raw_audio_id}
+
+
+def _live_snapshot(session: Session) -> tuple:
+    control = session.get(SessionAutopilotState, SESSION_ID)
+    runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+    commands = [
+        (c.id, c.kind, c.state, c.prompt_level, c.attempt_seq)
+        for c in session.exec(select(RuntimeCommand).where(
+            RuntimeCommand.session_id == SESSION_ID,
+        ).order_by(RuntimeCommand.command_seq))
+    ]
+    events = [
+        (e.event_type, e.reason_code, e.command_id)
+        for e in session.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == SESSION_ID,
+        ).order_by(AutopilotControlEvent.event_seq))
+    ]
+    attempts = [
+        (a.id, a.processing_status, a.error_code, a.processing_owner,
+         a.processing_generation, a.processing_lease_expires_at)
+        for a in session.exec(select(AttemptEvent).where(
+            AttemptEvent.session_id == SESSION_ID,
+        ).order_by(AttemptEvent.id))
+    ]
+    captures = [
+        (c.id, c.processing_status, c.error_code, c.processing_owner,
+         c.processing_generation, c.processing_lease_expires_at,
+         c.final_attempt_id)
+        for c in session.exec(select(AttemptCaptureProcessing).where(
+            AttemptCaptureProcessing.session_id == SESSION_ID,
+        ).order_by(AttemptCaptureProcessing.id))
+    ]
+    return (
+        (control.mode, control.status, control.current_command_id,
+         control.revision, control.next_command_seq, control.last_error_code,
+         control.lease_owner, control.lease_acquired_at,
+         control.lease_expires_at, control.control_generation,
+         control.runner_generation) if control is not None else None,
+        (runtime_state.status, runtime_state.revision)
+        if runtime_state is not None else None,
+        tuple(commands), tuple(events), tuple(attempts), tuple(captures),
+    )
+
+
+def _full_evidence_snapshot(session: Session) -> tuple:
+    """``_live_snapshot`` plus every AI-fact/projection field a late worker
+    could still corrupt without ever touching lease/generation fencing state:
+    the full Attempt ASR/judge fact set (not just its lease fencing), the
+    session's InteractionEvent ledger, and the ItemEvent/TurnEvent review-
+    ledger projection ``materialize_terminal_attempt_evidence`` writes.
+    ``_live_snapshot`` alone would miss a late worker wrongly appending a
+    second ``judgement_completed`` interaction, or a duplicate/corrupted
+    TurnEvent projection, since neither touches a lease/generation/command
+    field.
+    """
+    attempts = tuple(
+        (a.id, a.asr_text, a.asr_confidence, a.asr_engine_version,
+         a.operational_answer_type, a.operational_score, a.operational_needs_review,
+         a.judge_mode, a.judge_engine_version, a.judge_reason,
+         a.matched_on, a.contains_target, a.error_code, a.processed_at)
+        for a in session.exec(select(AttemptEvent).where(
+            AttemptEvent.session_id == SESSION_ID,
+        ).order_by(AttemptEvent.id))
+    )
+    interactions = tuple(
+        (e.id, e.event_seq, e.event_type, e.attempt_id, e.payload_json)
+        for e in session.exec(select(InteractionEvent).where(
+            InteractionEvent.session_id == SESSION_ID,
+        ).order_by(InteractionEvent.event_seq))
+    )
+    items = tuple(
+        (i.id, i.item_id) for i in session.exec(select(ItemEvent).where(
+            ItemEvent.session_id == SESSION_ID,
+        ).order_by(ItemEvent.id))
+    )
+    turns = tuple(
+        (t.id, t.item_event_id, t.turn_seq, t.source_attempt_id,
+         t.ai_answer_type, t.ai_score, t.ai_needs_review, t.ai_judge_mode,
+         t.reviewer_id, t.reviewed_score, t.score_locked, t.element_value)
+        for t in session.exec(
+            select(TurnEvent)
+            .join(ItemEvent, TurnEvent.item_event_id == ItemEvent.id)
+            .where(ItemEvent.session_id == SESSION_ID)
+            .order_by(TurnEvent.id))
+    )
+    return (_live_snapshot(session), attempts, interactions, items, turns)
+
+
+def test_stale_worker_that_lost_a_still_unrouted_completion_never_routes_then_fresh_recovery_routes_once(
+        api_clients: ApiClients, monkeypatch):
+    """Sharper counter-example than the cross-attempt races above: A loses its
+    claim to B on the *same* logical attempt, and B is stopped right after
+    committing the completed judgement — before B's own route call. A must
+    still be pure observation (``claim_lost``, not merely a stale-target
+    check, since the target is still exactly current at this point — nothing
+    has routed yet). A fresh recovery worker then routes the completed-but-
+    unrouted attempt exactly once.
+    """
+    _enable_p0a(monkeypatch)
+    capture1 = _drive_to_processing_attempt(api_clients)
+
+    a_asr = _BlockingWorkerAsr()  # succeeds when released; this is not a
+                                   # fail-close case, A's own claim is simply
+                                   # already gone by the time it returns.
+    monkeypatch.setattr(asr, "get_engine", lambda: a_asr)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker_a = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert a_asr.entered.wait(timeout=10), "worker A never entered ASR"
+
+        # Force A's capture lease to expire so B can take over.
+        with Session(api_clients.engine) as session:
+            row = session.exec(select(AttemptCaptureProcessing).where(
+                AttemptCaptureProcessing.raw_audio_id == capture1["raw_audio_id"],
+            )).one()
+            session.execute(update(AttemptCaptureProcessing).where(
+                AttemptCaptureProcessing.id == row.id,
+            ).values(processing_lease_expires_at=datetime.now() - timedelta(seconds=1)))
+            session.commit()
+
+        # B completes the attempt for real (ASR+judge) via _process_attempt
+        # directly — deliberately not calling _run_p0a_attempt_worker's own
+        # post-processing route step, modeling a worker stopped/crashed right
+        # after committing the completed judgement and before it ever reaches
+        # route_completed_attempt.
+        b_asr = _WorkerAsr()
+        monkeypatch.setattr(asr, "get_engine", lambda: b_asr)
+        with Session(api_clients.engine) as session:
+            b_target = autopilot_orchestration.derive_worker_target(
+                session, session_id=SESSION_ID)
+            b_derived = autopilot_orchestration.derive_authoritative_attempt_input(
+                session, session_id=SESSION_ID)
+            session.rollback()
+            b_body = AttemptProcessIn.model_validate(
+                b_derived.model_dump(mode="python"))
+            b_result = _process_attempt(
+                SESSION_ID, b_body, Response(), session,
+                control_plane="autopilot_worker", worker_target=b_target,
+            )
+        assert b_result.get("status") == "completed"
+        assert b_result.get("idempotent") is not True
+
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            # B completed the judgement but never routed: still
+            # processing_attempt, still pointing at the exact same record —
+            # the target itself has not gone stale, only the claim has.
+            assert control is not None and control.status == "processing_attempt"
+            before = _live_snapshot(session)
+
+        # Only now release A's stale (not itself failing) ASR result.
+        a_asr.release.set()
+        worker_a.result(timeout=10)
+
+        with Session(api_clients.engine) as session:
+            after = _live_snapshot(session)
+    assert after == before
+    assert a_asr.calls == 1
+    assert b_asr.calls == 1
+
+    # A fresh recovery worker now routes the completed-but-unrouted attempt
+    # exactly once.
+    _run_p0a_attempt_worker(SESSION_ID)
+    with Session(api_clients.engine) as session:
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        assert control is not None and control.status == "waiting_tts"
+        commands = list(session.exec(select(RuntimeCommand).where(
+            RuntimeCommand.session_id == SESSION_ID,
+        )))
+        # question tts, record, feedback tts — routed exactly once.
+        assert len(commands) == 3
+
+
+def test_stale_capture_asr_worker_across_logical_attempts_is_observation_only(
+        api_clients: ApiClients, monkeypatch):
+    """R1-foundation A, required test 1: worker A freezes a target on attempt
+    #1, blocks in ASR; worker B takes the same capture over, completes it
+    (silence) and routes a cue; the device answers the cue and reaches a
+    brand-new processing_attempt #2. Only then is A released with a failed
+    ASR result. A's stale target must never touch #2's state/claims.
+    """
+    _enable_p0a(monkeypatch)
+    capture1 = _drive_to_processing_attempt(api_clients)
+
+    a_asr = _BlockingWorkerAsr(fails=True)
+    monkeypatch.setattr(asr, "get_engine", lambda: a_asr)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker_a = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert a_asr.entered.wait(timeout=10), "worker A never entered ASR"
+
+        # Force A's capture lease to expire so worker B can take over — models
+        # a crashed/slow worker A without waiting out a real lease.
+        with Session(api_clients.engine) as session:
+            row = session.exec(select(AttemptCaptureProcessing).where(
+                AttemptCaptureProcessing.raw_audio_id == capture1["raw_audio_id"],
+            )).one()
+            session.execute(update(AttemptCaptureProcessing).where(
+                AttemptCaptureProcessing.id == row.id,
+            ).values(processing_lease_expires_at=datetime.now() - timedelta(seconds=1)))
+            session.commit()
+
+        # B completes the OLD attempt with an empty transcript (silence) — a
+        # completed attempt, but not a matching answer, so routing issues a
+        # cue for a genuinely new logical attempt rather than ending the plan.
+        b_asr = _EmptyTranscriptAsr()
+        monkeypatch.setattr(asr, "get_engine", lambda: b_asr)
+        _run_p0a_attempt_worker(SESSION_ID)
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            assert control is not None and control.status == "waiting_tts"
+
+        # Device answers the cue and reaches processing_attempt #2 — a
+        # different record, different raw_audio_id, same control/runner
+        # generation as #1 (no pause/resume happened in between).
+        capture2 = _drive_second_processing_attempt_via_silence_cue(api_clients)
+        assert capture2["raw_audio_id"] != capture1["raw_audio_id"]
+        assert capture2["record"]["command_key"] != capture1["record"]["command_key"]
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            assert control is not None and control.status == "processing_attempt"
+            assert control.control_generation == 1 and control.runner_generation == 1
+            before = _live_snapshot(session)
+
+        # Only now release A's stale, failing ASR result.
+        a_asr.release.set()
+        worker_a.result(timeout=10)
+
+        with Session(api_clients.engine) as session:
+            after = _live_snapshot(session)
+    assert after == before
+    assert a_asr.calls == 1
+    assert b_asr.calls == 1
+
+
+def test_stale_judgement_worker_across_logical_attempts_is_observation_only(
+        api_clients: ApiClients, monkeypatch):
+    """R1-foundation A, required test 2: worker A freezes a target on attempt
+    #1, completes its own ASR (a wrong answer), then blocks in judgement;
+    worker B recovers the same claim, finishes judgement fast against A's own
+    already-committed transcript (still wrong, so it routes a cue) and routes
+    it; the device answers the cue and reaches a brand-new processing_attempt
+    #2. Only then is A released with a failed judgement result. A's stale
+    target must never touch #2's state/claims.
+    """
+    _enable_p0a(monkeypatch)
+    capture1 = _drive_to_processing_attempt(api_clients)
+
+    original_judge_engine = llm_judge.get_engine
+    a_asr = _WrongAnswerAsr()
+    a_judge = _FailingBlockingWorkerJudge()
+    monkeypatch.setattr(asr, "get_engine", lambda: a_asr)
+    monkeypatch.setattr(llm_judge, "get_engine", lambda: a_judge)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker_a = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert a_judge.entered.wait(timeout=10), "worker A never entered judgement"
+
+        # Force A's attempt lease to expire so worker B can take over — A's
+        # own ASR already committed by this point (asr_completed).
+        with Session(api_clients.engine) as session:
+            row = session.exec(select(AttemptEvent).where(
+                AttemptEvent.raw_audio_id == capture1["raw_audio_id"],
+            )).one()
+            session.execute(update(AttemptEvent).where(
+                AttemptEvent.id == row.id,
+            ).values(processing_lease_expires_at=datetime.now() - timedelta(seconds=1)))
+            session.commit()
+
+        # B recovers the same claim; its judgement runs fast (the real
+        # engine) against A's own already-committed wrong transcript.
+        monkeypatch.setattr(llm_judge, "get_engine", original_judge_engine)
+        _run_p0a_attempt_worker(SESSION_ID)
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            assert control is not None and control.status == "waiting_tts"
+            attempts = list(session.exec(select(AttemptEvent)))
+            assert len(attempts) == 1 and attempts[0].processing_status == "completed"
+            assert attempts[0].contains_target is False
+
+        capture2 = _drive_second_processing_attempt_via_silence_cue(api_clients)
+        assert capture2["raw_audio_id"] != capture1["raw_audio_id"]
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            assert control is not None and control.status == "processing_attempt"
+            before = _live_snapshot(session)
+
+        # Only now release A's stale, failing judgement result.
+        a_judge.release.set()
+        worker_a.result(timeout=10)
+
+        with Session(api_clients.engine) as session:
+            after = _live_snapshot(session)
+    assert after == before
+    assert a_asr.calls == 1
+    assert a_judge.calls == 1
+
+
+def test_stale_route_across_logical_attempts_is_observation_only(
+        api_clients: ApiClients, monkeypatch):
+    """R1-foundation A, required test 3: worker A's own route_completed_attempt
+    call for attempt #1 is blocked (a real interleaving, not a simulated
+    fail-close); a second, unblocked route call — modeling a fresh recovery —
+    finishes routing the same (only) completed attempt for real, the device
+    reaches a brand-new processing_attempt #2, and only then does A's blocked
+    route call raise. A's stale target must never touch #2.
+
+    ``_run_p0a_attempt_worker``'s route step holds the module-level
+    ``_LIVE_WRITE_LOCK``/``device_capability._PAIR_LOCK`` (both plain
+    ``RLock``s, not cross-thread-safe) around the route call. Blocking A's own
+    call inside that section while holding those locks would deadlock the
+    second (unblocked) call and the device ACKs below, which run in this same
+    process. They are replaced with a no-op context manager for this test
+    only; the real synchronization being exercised here is the DB-level
+    generation/target CAS, not the in-process lock.
+    """
+    _enable_p0a(monkeypatch)
+    monkeypatch.setattr(main_module, "_LIVE_WRITE_LOCK", contextlib.nullcontext())
+    monkeypatch.setattr(device_capability, "_PAIR_LOCK", contextlib.nullcontext())
+    capture1 = _drive_to_processing_attempt(api_clients)
+
+    real_route_completed_attempt = autopilot_service.route_completed_attempt
+    route_calls = {"n": 0}
+    a_route_entered = threading.Event()
+    a_route_release = threading.Event()
+
+    def blocking_route(route_db, *, session_id, attempt_id, **kwargs):
+        route_calls["n"] += 1
+        if route_calls["n"] == 1:
+            # Release A's own SQLite transaction before blocking — SQLite is
+            # single-writer; an open transaction here would itself deadlock
+            # the second call's real route at the DB layer, not just the
+            # (now no-op) Python locks.
+            route_db.rollback()
+            a_route_entered.set()
+            if not a_route_release.wait(timeout=10):
+                raise AssertionError("test did not release blocked route call")
+            raise RuntimeError("injected delayed route failure")
+        return real_route_completed_attempt(
+            route_db, session_id=session_id, attempt_id=attempt_id, **kwargs)
+
+    fake_asr = _EmptyTranscriptAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: fake_asr)
+    monkeypatch.setattr(autopilot_service, "route_completed_attempt", blocking_route)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker_a = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert a_route_entered.wait(timeout=10), "worker A never entered route"
+
+        # A second, unblocked route call — the shape of a fresh recovery
+        # picking up the same still-unrouted completed attempt — finishes the
+        # real routing for attempt #1.
+        _run_p0a_attempt_worker(SESSION_ID)
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            assert control is not None and control.status == "waiting_tts"
+
+        capture2 = _drive_second_processing_attempt_via_silence_cue(api_clients)
+        assert capture2["raw_audio_id"] != capture1["raw_audio_id"]
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            assert control is not None and control.status == "processing_attempt"
+            before = _live_snapshot(session)
+
+        # Only now release A's stale, failing route call.
+        a_route_release.set()
+        worker_a.result(timeout=10)
+
+        with Session(api_clients.engine) as session:
+            after = _live_snapshot(session)
+    assert after == before
+    assert route_calls["n"] == 2
+
+
+def test_matching_target_route_failure_pauses_atomically_and_clears_only_its_claims(
+        api_clients: ApiClients, monkeypatch):
+    """R1-foundation A, required test 4 (positive case): a target that is
+    still exactly current stages the fail-close pause exactly once, atomic
+    with the runtime pause, and clears only the capture claim bound to that
+    exact target — never a broader/narrower set.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+
+    a_asr = _BlockingWorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: a_asr)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker_a = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert a_asr.entered.wait(timeout=10), "worker never entered ASR"
+
+        with Session(api_clients.engine) as session:
+            target = autopilot_orchestration.derive_worker_target(
+                session, session_id=SESSION_ID)
+            session.rollback()
+            claim_before = session.exec(select(AttemptCaptureProcessing).where(
+                AttemptCaptureProcessing.raw_audio_id == capture["raw_audio_id"],
+            )).one()
+            assert claim_before.processing_owner is not None
+            assert claim_before.processing_lease_expires_at is not None
+
+        _fail_closed_p0a_attempt_worker(
+            SESSION_ID, "autopilot_attempt_route_failed", target=target)
+
+        with Session(api_clients.engine) as session:
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+            events = list(session.exec(select(AutopilotControlEvent).where(
+                AutopilotControlEvent.session_id == SESSION_ID,
+                AutopilotControlEvent.event_type == "failure",
+            )))
+            claim_after = session.exec(select(AttemptCaptureProcessing).where(
+                AttemptCaptureProcessing.raw_audio_id == capture["raw_audio_id"],
+            )).one()
+            assert control is not None and control.status == "paused"
+            assert control.current_command_id is None
+            assert control.last_error_code == "autopilot_attempt_route_failed"
+            assert runtime_state is not None and runtime_state.status == "paused"
+            assert len(events) == 1
+            assert events[0].command_id == target.record_command_id
+            assert claim_after.processing_owner is None
+            assert claim_after.processing_lease_expires_at is None
+
+            # Repeating the same (now stale, since state is paused) fail-close
+            # must not double-pause or write a second event.
+            again = autopilot_orchestration.stage_processing_failure(
+                session, session_id=SESSION_ID,
+                error_code="autopilot_attempt_route_failed",
+                source="worker_exception", target=target)
+            assert again is False
+            session.rollback()
+            events_again = list(session.exec(select(AutopilotControlEvent).where(
+                AutopilotControlEvent.session_id == SESSION_ID,
+                AutopilotControlEvent.event_type == "failure",
+            )))
+            assert len(events_again) == 1
+
+        # Release the real blocked worker so its thread doesn't leak past the
+        # test; its own now-invalidated claim makes this a graceful no-op.
+        a_asr.release.set()
+        worker_a.result(timeout=10)
+
+
+def test_same_target_judgement_claim_lost_is_pure_observation_then_fresh_recovery_routes_once(
+        api_clients: ApiClients, monkeypatch):
+    """Codex audit item 1: the AttemptEvent-level ``claim_lost`` branch, not
+    the earlier capture-level one. Worker A's own ASR commits for real (its
+    transcript materializes the AttemptEvent), then A blocks in judgement
+    holding the live AttemptEvent claim. Its lease is force-expired; worker B
+    recovers the *same* AttemptEvent (the target is still exactly current --
+    nothing has routed) and completes judgement for real, but is stopped
+    before its own route call. Releasing A must hit
+    ``_record_judgement_success``'s own CAS failure -> ``_claim_lost_payload``
+    with ``control_plane="autopilot_worker"`` -> the ``claim_lost`` branch in
+    ``_run_p0a_attempt_worker`` -- never ``route_completed_attempt``, never a
+    fail-close pause, and a completely unchanged snapshot. A fresh recovery
+    worker afterwards still routes the completed attempt exactly once.
+
+    A's own returned result is spied directly (not just inferred from zero
+    mutation) so ``result.get("claim_lost") is True`` is proven, not assumed.
+    B calls the pre-patch original ``_process_attempt`` reference so the spy
+    only ever observes A's own call.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+
+    real_route_completed_attempt = autopilot_service.route_completed_attempt
+    route_calls = {"n": 0}
+
+    def counting_route(route_db, *, session_id, attempt_id, **kwargs):
+        route_calls["n"] += 1
+        return real_route_completed_attempt(
+            route_db, session_id=session_id, attempt_id=attempt_id, **kwargs)
+
+    monkeypatch.setattr(autopilot_service, "route_completed_attempt", counting_route)
+
+    real_fail_closed = main_module._fail_closed_p0a_attempt_worker
+    fail_close_calls = {"n": 0}
+
+    def counting_fail_closed(*args, **kwargs):
+        fail_close_calls["n"] += 1
+        return real_fail_closed(*args, **kwargs)
+
+    monkeypatch.setattr(
+        main_module, "_fail_closed_p0a_attempt_worker", counting_fail_closed)
+
+    # _run_p0a_attempt_worker calls ``_process_attempt`` by bare name, which
+    # Python resolves through this module's globals -- patching the module
+    # attribute is what lets this spy see exactly A's own call and return
+    # value. B below calls ``original_process_attempt`` directly (the
+    # reference captured before patching, identical to the test module's own
+    # top-level ``_process_attempt`` import), so it is never recorded here.
+    original_process_attempt = main_module._process_attempt
+    a_results: list[dict] = []
+
+    def spy_process_attempt(*args, **kwargs):
+        result = original_process_attempt(*args, **kwargs)
+        a_results.append(result)
+        return result
+
+    monkeypatch.setattr(main_module, "_process_attempt", spy_process_attempt)
+
+    original_judge_engine = llm_judge.get_engine
+    a_asr = _WrongAnswerAsr()
+    a_judge = _BlockingWorkerJudge()
+    monkeypatch.setattr(asr, "get_engine", lambda: a_asr)
+    monkeypatch.setattr(llm_judge, "get_engine", lambda: a_judge)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker_a = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        try:
+            assert a_judge.entered.wait(timeout=10), "worker A never entered judgement"
+
+            # A's own ASR already committed (asr_completed); force its
+            # AttemptEvent lease to expire so B can take over the identical
+            # target/attempt.
+            with Session(api_clients.engine) as session:
+                row = session.exec(select(AttemptEvent).where(
+                    AttemptEvent.raw_audio_id == capture["raw_audio_id"],
+                )).one()
+                assert row.processing_status == "asr_completed"
+                session.execute(update(AttemptEvent).where(
+                    AttemptEvent.id == row.id,
+                ).values(
+                    processing_lease_expires_at=datetime.now() - timedelta(seconds=1)))
+                session.commit()
+
+            # B recovers the same AttemptEvent claim and completes judgement
+            # for real, via the pre-patch original _process_attempt --
+            # deliberately not _run_p0a_attempt_worker, so it never reaches
+            # its own route step, and deliberately not the (now spied) module
+            # attribute, so only A's own call is recorded above.
+            monkeypatch.setattr(llm_judge, "get_engine", original_judge_engine)
+            with Session(api_clients.engine) as session:
+                b_target = autopilot_orchestration.derive_worker_target(
+                    session, session_id=SESSION_ID)
+                b_derived = autopilot_orchestration.derive_authoritative_attempt_input(
+                    session, session_id=SESSION_ID)
+                session.rollback()
+                b_body = AttemptProcessIn.model_validate(
+                    b_derived.model_dump(mode="python"))
+                b_result = original_process_attempt(
+                    SESSION_ID, b_body, Response(), session,
+                    control_plane="autopilot_worker", worker_target=b_target,
+                )
+            assert b_result.get("status") == "completed"
+            assert b_result.get("idempotent") is not True
+            assert route_calls["n"] == 0  # B stopped before its own route call
+            assert a_results == []  # B's call must never be recorded as A's
+
+            with Session(api_clients.engine) as session:
+                # B did not route: the frozen target itself is still exactly
+                # current, only the claim moved.
+                assert autopilot_orchestration.worker_target_still_current(
+                    session, b_target) is True
+                control = session.get(SessionAutopilotState, SESSION_ID)
+                assert control is not None and control.status == "processing_attempt"
+                before = _full_evidence_snapshot(session)
+        finally:
+            # Release and join before any assertion above can leave the pool
+            # waiting on a thread that will never unblock, and before
+            # monkeypatch tears down the provider/spy patches A's thread
+            # still depends on.
+            a_judge.release.set()
+            worker_a.result(timeout=10)
+
+        with Session(api_clients.engine) as session:
+            after = _full_evidence_snapshot(session)
+            # The frozen target is still exactly current after A's stale
+            # judgement result was observed and discarded.
+            assert autopilot_orchestration.worker_target_still_current(
+                session, b_target) is True
+    assert after == before
+    assert route_calls["n"] == 0  # A never routed either
+    assert fail_close_calls["n"] == 0  # A never fail-closed either
+    assert a_asr.calls == 1
+    assert a_judge.calls == 1
+
+    # A's own result -- not inferred, directly observed -- proves it actually
+    # took the AttemptEvent-level claim_lost branch.
+    assert len(a_results) == 1
+    assert a_results[0].get("status") == "completed"
+    assert a_results[0].get("claim_lost") is True
+
+    # A fresh recovery worker now routes the completed-but-unrouted attempt
+    # exactly once.
+    _run_p0a_attempt_worker(SESSION_ID)
+    with Session(api_clients.engine) as session:
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        assert control is not None and control.status == "waiting_tts"
+        commands = list(session.exec(select(RuntimeCommand).where(
+            RuntimeCommand.session_id == SESSION_ID,
+        )))
+        assert len(commands) == 3
+    assert route_calls["n"] == 1
+    assert fail_close_calls["n"] == 0
+
+
+def test_manual_http_terminal_readback_never_leaks_claim_lost_marker(
+        api_clients: ApiClients, monkeypatch):
+    """Codex audit item 2: ``claim_lost`` is an ``autopilot_worker``-only
+    internal dispatch signal. The exact same terminal-attempt read-back
+    through ``_claim_lost_payload`` must never carry it on the
+    ``manual_http`` plane -- device-side strict parsers reject unexpected
+    extra response keys (see the docstring on ``_claim_lost_payload``).
+
+    Both payloads are first proven to be the genuine terminal read-back this
+    helper is documented to produce (status/idempotent), then proven
+    identical to each other in every field except ``claim_lost`` itself --
+    not just "missing a key", but "nothing else differs either" -- and the
+    key is checked absent from both the dict and its serialized form.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+    fake_asr = _WorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: fake_asr)
+    _run_p0a_attempt_worker(SESSION_ID)
+
+    with Session(api_clients.engine) as session:
+        attempt = session.exec(select(AttemptEvent).where(
+            AttemptEvent.raw_audio_id == capture["raw_audio_id"],
+        )).one()
+        assert attempt.processing_status == "completed"
+        # _claim_lost_payload only uses claim.attempt_id to re-read the
+        # current (already terminal) row; a claim's own owner/generation are
+        # irrelevant to this read-back path, exactly as a genuinely lost
+        # claim's would be by the time this helper runs.
+        stale_claim = evidence_ledger.AttemptClaim(
+            attempt_id=attempt.id, owner="stale-owner", generation=0,
+            stage="asr_completed", lease_expires_at=datetime.now())
+
+        manual_payload = main_module._claim_lost_payload(
+            stale_claim, session, Response(), control_plane="manual_http")
+        assert manual_payload.get("status") == "completed"
+        assert manual_payload.get("idempotent") is True
+        assert "claim_lost" not in manual_payload
+        assert "claim_lost" not in json.dumps(manual_payload, default=str)
+
+        worker_payload = main_module._claim_lost_payload(
+            stale_claim, session, Response(), control_plane="autopilot_worker")
+        assert worker_payload.get("status") == "completed"
+        assert worker_payload.get("idempotent") is True
+        assert worker_payload.get("claim_lost") is True
+
+        # The two payloads agree on every field except claim_lost itself --
+        # the gating adds exactly one key, changes nothing else.
+        worker_base = {
+            key: value for key, value in worker_payload.items()
+            if key != "claim_lost"
+        }
+        assert worker_base == manual_payload
+
+
+def _judgement_fail_close_snapshot(session: Session, raw_audio_id: str) -> dict:
+    """Field-precise snapshot for the judgement-stage fail-close test.
+
+    Deliberately named fields, not an opaque tuple like ``_live_snapshot``:
+    this test asserts exact revision/generation arithmetic (``+1``, not just
+    "changed"). Also covers every field a late (post-pause) worker A could
+    still corrupt without ever touching lease/generation fencing: full
+    Attempt ASR/judge facts, full Capture identity/lifecycle facts, and the
+    InteractionEvent/ItemEvent/TurnEvent projections A's own delayed
+    judgement completion would append/create if it were ever wrongly allowed
+    to proceed past the pause.
+    """
+    control = session.get(SessionAutopilotState, SESSION_ID)
+    runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+    attempt = session.exec(select(AttemptEvent).where(
+        AttemptEvent.raw_audio_id == raw_audio_id,
+    )).one()
+    capture_row = session.exec(select(AttemptCaptureProcessing).where(
+        AttemptCaptureProcessing.raw_audio_id == raw_audio_id,
+    )).one()
+    interactions = tuple(
+        (e.id, e.event_seq, e.event_type, e.attempt_id, e.payload_json)
+        for e in session.exec(select(InteractionEvent).where(
+            InteractionEvent.session_id == SESSION_ID,
+        ).order_by(InteractionEvent.event_seq))
+    )
+    items = tuple(
+        (i.id, i.item_id) for i in session.exec(select(ItemEvent).where(
+            ItemEvent.session_id == SESSION_ID,
+        ).order_by(ItemEvent.id))
+    )
+    turns = tuple(
+        (t.id, t.item_event_id, t.turn_seq, t.source_attempt_id,
+         t.ai_answer_type, t.ai_score, t.ai_needs_review, t.ai_judge_mode,
+         t.reviewer_id, t.reviewed_score, t.score_locked, t.element_value)
+        for t in session.exec(
+            select(TurnEvent)
+            .join(ItemEvent, TurnEvent.item_event_id == ItemEvent.id)
+            .where(ItemEvent.session_id == SESSION_ID)
+            .order_by(TurnEvent.id))
+    )
+    return {
+        "control_status": control.status if control else None,
+        "control_revision": control.revision if control else None,
+        "control_current_command_id": control.current_command_id if control else None,
+        "control_last_error_code": control.last_error_code if control else None,
+        "runtime_status": runtime_state.status if runtime_state else None,
+        "runtime_revision": runtime_state.revision if runtime_state else None,
+        "attempt_status": attempt.processing_status,
+        "attempt_owner": attempt.processing_owner,
+        "attempt_lease_expires_at": attempt.processing_lease_expires_at,
+        "attempt_claimed_at": attempt.processing_claimed_at,
+        "attempt_generation": attempt.processing_generation,
+        "attempt_judge_portrait_used": attempt.judge_portrait_used,
+        "attempt_asr_text": attempt.asr_text,
+        "attempt_asr_confidence": attempt.asr_confidence,
+        "attempt_asr_engine_version": attempt.asr_engine_version,
+        "attempt_operational_answer_type": attempt.operational_answer_type,
+        "attempt_operational_score": attempt.operational_score,
+        "attempt_operational_needs_review": attempt.operational_needs_review,
+        "attempt_judge_mode": attempt.judge_mode,
+        "attempt_judge_engine_version": attempt.judge_engine_version,
+        "attempt_judge_reason": attempt.judge_reason,
+        "attempt_matched_on": attempt.matched_on,
+        "attempt_contains_target": attempt.contains_target,
+        "attempt_error_code": attempt.error_code,
+        "attempt_processed_at": attempt.processed_at,
+        "capture_status": capture_row.processing_status,
+        "capture_owner": capture_row.processing_owner,
+        "capture_lease_expires_at": capture_row.processing_lease_expires_at,
+        "capture_claimed_at": capture_row.processing_claimed_at,
+        "capture_generation": capture_row.processing_generation,
+        "capture_final_attempt_id": capture_row.final_attempt_id,
+        "capture_asr_confidence": capture_row.asr_confidence,
+        "capture_asr_engine_version": capture_row.asr_engine_version,
+        "capture_disposition": capture_row.disposition,
+        "capture_error_code": capture_row.error_code,
+        "capture_processed_at": capture_row.processed_at,
+        "capture_created_at": capture_row.created_at,
+        "capture_id": capture_row.id,
+        "capture_raw_audio_id": capture_row.raw_audio_id,
+        "capture_session_id": capture_row.session_id,
+        "capture_item_id": capture_row.item_id,
+        "capture_turn_seq": capture_row.turn_seq,
+        "capture_record_command_id": capture_row.record_command_id,
+        "capture_proof_attempt_seq": capture_row.proof_attempt_seq,
+        "capture_proof_prompt_level": capture_row.proof_prompt_level,
+        "interactions": interactions,
+        "items": items,
+        "turns": turns,
+    }
+
+
+def test_matching_target_judgement_stage_failure_pauses_atomically_and_clears_only_its_attempt_claim(
+        api_clients: ApiClients, monkeypatch):
+    """Codex audit item 3, the positive counterpart of item 1: a target-bound
+    fail-close while a worker is blocked in judgement -- i.e. while an
+    AttemptEvent (not just the earlier capture row) holds the live claim --
+    must still pause control+runtime atomically, write exactly one failure
+    event, and clear only the exact target's AttemptEvent claim. The bound
+    capture row must still correctly report its terminal ASR outcome and its
+    final_attempt_id link, untouched by the pause. A second fail-close call,
+    and A's own delayed judgement result finally landing, must cause no
+    further change to any of it.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+
+    a_asr = _WrongAnswerAsr()
+    a_judge = _BlockingWorkerJudge()
+    monkeypatch.setattr(asr, "get_engine", lambda: a_asr)
+    monkeypatch.setattr(llm_judge, "get_engine", lambda: a_judge)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker_a = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        after_fail_close = None
+        try:
+            assert a_judge.entered.wait(timeout=10), "worker never entered judgement"
+
+            with Session(api_clients.engine) as session:
+                target = autopilot_orchestration.derive_worker_target(
+                    session, session_id=SESSION_ID)
+                session.rollback()
+                before = _judgement_fail_close_snapshot(
+                    session, capture["raw_audio_id"])
+            assert before["attempt_status"] == "asr_completed"
+            assert before["attempt_owner"] is not None
+            assert before["attempt_lease_expires_at"] is not None
+            assert before["capture_status"] == "asr_completed"
+            assert before["capture_final_attempt_id"] is not None
+            # Judgement never ran yet (A is still blocked in it): no
+            # judgement_completed interaction and no review-ledger
+            # projection exist before the pause either.
+            assert before["attempt_judge_mode"] is None
+            assert before["items"] == ()
+            assert before["turns"] == ()
+
+            _fail_closed_p0a_attempt_worker(
+                SESSION_ID, "autopilot_attempt_route_failed", target=target)
+
+            with Session(api_clients.engine) as session:
+                events = list(session.exec(select(AutopilotControlEvent).where(
+                    AutopilotControlEvent.session_id == SESSION_ID,
+                    AutopilotControlEvent.event_type == "failure",
+                )))
+                after_fail_close = _judgement_fail_close_snapshot(
+                    session, capture["raw_audio_id"])
+            assert after_fail_close["control_status"] == "paused"
+            assert (after_fail_close["control_revision"]
+                    == before["control_revision"] + 1)
+            assert after_fail_close["runtime_status"] == "paused"
+            assert (after_fail_close["runtime_revision"]
+                    == before["runtime_revision"] + 1)
+            assert len(events) == 1
+            assert events[0].command_id == target.record_command_id
+            assert events[0].reason_code == "autopilot_attempt_route_failed"
+            assert json.loads(events[0].payload_json) == {
+                "error_code": "autopilot_attempt_route_failed",
+                "source": "worker_exception",
+            }
+            assert after_fail_close["control_current_command_id"] is None
+            assert (after_fail_close["control_last_error_code"]
+                    == "autopilot_attempt_route_failed")
+            # Exact target's AttemptEvent claim is cleared, its fencing
+            # generation moved by exactly one, and its underlying ASR fact/
+            # status is untouched (still recoverable, never forced to a
+            # terminal status by a pause).
+            assert after_fail_close["attempt_status"] == "asr_completed"
+            assert after_fail_close["attempt_owner"] is None
+            assert after_fail_close["attempt_lease_expires_at"] is None
+            assert after_fail_close["attempt_claimed_at"] is None
+            assert (after_fail_close["attempt_generation"]
+                    == before["attempt_generation"] + 1)
+            # The capture row -- generation, final_attempt_id link, every ASR
+            # fact, and its full identity -- is completely untouched by this
+            # pause: it was already terminal (asr_completed is not in the
+            # recoverable capture set invalidate_capture_processing_claims
+            # fences). Likewise the attempt's own ASR/judge content facts
+            # (judgement never having run), and the InteractionEvent/
+            # ItemEvent/TurnEvent projections (still empty of judgement):
+            # this pause writes lease/generation/control-state fields only,
+            # nothing else.
+            for key in (
+                    "capture_status", "capture_owner", "capture_lease_expires_at",
+                    "capture_claimed_at", "capture_generation",
+                    "capture_final_attempt_id", "capture_asr_confidence",
+                    "capture_asr_engine_version", "capture_disposition",
+                    "capture_error_code", "capture_processed_at",
+                    "capture_created_at", "capture_id", "capture_raw_audio_id",
+                    "capture_session_id", "capture_item_id", "capture_turn_seq",
+                    "capture_record_command_id", "capture_proof_attempt_seq",
+                    "capture_proof_prompt_level",
+                    "attempt_asr_text", "attempt_asr_confidence",
+                    "attempt_asr_engine_version", "attempt_operational_answer_type",
+                    "attempt_operational_score", "attempt_operational_needs_review",
+                    "attempt_judge_mode", "attempt_judge_engine_version",
+                    "attempt_judge_reason", "attempt_matched_on",
+                    "attempt_contains_target", "attempt_error_code",
+                    "attempt_processed_at", "attempt_judge_portrait_used",
+                    "interactions", "items", "turns"):
+                assert after_fail_close[key] == before[key], key
+            assert after_fail_close["items"] == ()
+            assert after_fail_close["turns"] == ()
+
+            # Repeating the same (now stale, since state is paused) fail-close
+            # must not double-pause or write a second event.
+            with Session(api_clients.engine) as session:
+                again = autopilot_orchestration.stage_processing_failure(
+                    session, session_id=SESSION_ID,
+                    error_code="autopilot_attempt_route_failed",
+                    source="worker_exception", target=target)
+                assert again is False
+                session.rollback()
+                events_again = list(session.exec(select(AutopilotControlEvent).where(
+                    AutopilotControlEvent.session_id == SESSION_ID,
+                    AutopilotControlEvent.event_type == "failure",
+                )))
+                assert len(events_again) == 1
+                repeat_snapshot = _judgement_fail_close_snapshot(
+                    session, capture["raw_audio_id"])
+            assert repeat_snapshot == after_fail_close
+        finally:
+            # Release and join before any assertion above can leave the pool
+            # waiting on a thread that will never unblock, and before
+            # monkeypatch tears down the provider patches A's thread still
+            # depends on. A's own now-invalidated claim makes its resumed
+            # judgement CAS a graceful no-op (see the same-target claim-lost
+            # test above), not a second fail-close.
+            a_judge.release.set()
+            worker_a.result(timeout=10)
+
+        with Session(api_clients.engine) as session:
+            events_after_join = list(session.exec(select(AutopilotControlEvent).where(
+                AutopilotControlEvent.session_id == SESSION_ID,
+                AutopilotControlEvent.event_type == "failure",
+            )))
+            after_join = _judgement_fail_close_snapshot(
+                session, capture["raw_audio_id"])
+    assert len(events_after_join) == 1
+    assert after_join == after_fail_close
+
+
+def test_capture_processing_internals_never_leak_through_read_endpoints(
+        api_clients: ApiClients, monkeypatch):
+    """Governance: capture-processing internals are not part of any read contract.
+
+    ``/attempts`` and ``/journal`` are the two general-purpose read endpoints
+    that already project AttemptEvent/InteractionEvent. Neither queries
+    AttemptCaptureProcessing at all (verified independently by source
+    inspection); this guards against a future change silently starting to.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+    fake_asr = _WorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: fake_asr)
+    _run_p0a_attempt_worker(SESSION_ID)
+
+    with Session(api_clients.engine) as session:
+        capture_row = session.exec(select(AttemptCaptureProcessing).where(
+            AttemptCaptureProcessing.raw_audio_id == capture["raw_audio_id"],
+        )).one()
+        assert capture_row.processing_status == "asr_completed"
+
+    capture_only_fields = (
+        "record_command_id", "predecessor_command_id", "receipt_server_seq",
+        "proof_attempt_seq", "proof_prompt_level", "disposition",
+        "final_attempt_id",
+    )
+    attempts_response = api_clients.account.get(f"/sessions/{SESSION_ID}/attempts")
+    assert attempts_response.status_code == 200, attempts_response.text
+    journal_response = api_clients.account.get(f"/sessions/{SESSION_ID}/journal")
+    assert journal_response.status_code == 200, journal_response.text
+    for response in (attempts_response, journal_response):
+        body_text = response.text
+        for field in capture_only_fields:
+            assert field not in body_text, (
+                f"{field!r} leaked through {response.request.url}")
+
+
+def test_record_stopped_exact_replay_keeps_single_capture_row_and_identity(
+        api_clients: ApiClients, monkeypatch):
+    """An exact record_stopped ACK replay must never duplicate or mutate the
+    persistent capture-processing row admitted on the first delivery.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+
+    with Session(api_clients.engine) as session:
+        before = session.exec(select(AttemptCaptureProcessing).where(
+            AttemptCaptureProcessing.raw_audio_id == capture["raw_audio_id"],
+        )).one()
+        before_snapshot = (
+            before.id, before.record_command_id, before.predecessor_command_id,
+            before.receipt_server_seq, before.raw_audio_id, before.session_id,
+            before.item_id, before.turn_seq, before.proof_attempt_seq,
+            before.proof_prompt_level, before.processing_status,
+            before.processing_owner, before.processing_generation,
+        )
+
+    record = capture["record"]
+    replay = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{record['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(
+            record,
+            ack_type="record_stopped",
+            ack_key="ack-worker-record-stopped-0001",
+            device_event_seq=2,
+            stop_reason=capture["stop_reason"],
+            raw_audio_id=capture["raw_audio_id"],
+            receipt_server_seq=capture["receipt_server_seq"],
+            checksum=capture["checksum"],
+            byte_count=capture["byte_count"],
+            duration_seconds=capture["duration_seconds"],
+        ),
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "processing_attempt"
+
+    with Session(api_clients.engine) as session:
+        rows = list(session.exec(select(AttemptCaptureProcessing).where(
+            AttemptCaptureProcessing.raw_audio_id == capture["raw_audio_id"],
+        )))
+        assert len(rows) == 1
+        after = rows[0]
+        after_snapshot = (
+            after.id, after.record_command_id, after.predecessor_command_id,
+            after.receipt_server_seq, after.raw_audio_id, after.session_id,
+            after.item_id, after.turn_seq, after.proof_attempt_seq,
+            after.proof_prompt_level, after.processing_status,
+            after.processing_owner, after.processing_generation,
+        )
+        assert after_snapshot == before_snapshot
+
+
+def test_device_rotation_during_active_processing_fences_both_claims_and_pauses(
+        api_clients: ApiClients, monkeypatch):
+    """A same-session re-pair while a capture claim is active must fail-safe.
+
+    Gap this closes: /device/pair used to revoke the old capability and
+    commit a new one with zero awareness of autopilot state. A stale
+    in-flight ASR result bound to the old device generation must not
+    silently materialize and then route a command to the newly paired
+    device that never asked for or saw the old recording.
+    """
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients)
+    blocked_asr = _BlockingWorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: blocked_asr)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        worker = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert blocked_asr.entered.wait(timeout=10), "worker never entered ASR"
+        new_device = TestClient(app)
+        try:
+            paired = new_device.post(
+                "/device/pair",
+                headers={"X-Console-Pin": "246810"},
+                json={"deviceId": "p0a-http-device-rotated-000002"},
+            )
+            assert paired.status_code == 200, paired.text
+            new_device_headers = {
+                "X-Device-Capability": paired.json()["capability"]}
+        finally:
+            blocked_asr.release.set()
+        worker.result(timeout=10)
+
+    with Session(api_clients.engine) as session:
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        capture_row = session.exec(select(AttemptCaptureProcessing).where(
+            AttemptCaptureProcessing.raw_audio_id == capture["raw_audio_id"],
+        )).one()
+        assert list(session.exec(select(AttemptEvent))) == []
+        assert control is not None and control.status == "paused"
+        assert control.last_error_code == "autopilot_device_rotated"
+        assert control.current_command_id is None
+        assert runtime_state is not None and runtime_state.status == "paused"
+        assert capture_row.processing_status == "received"
+        assert capture_row.processing_owner is None
+    assert blocked_asr.calls == 1
+
+    # The scope and runtime are paused: the newly paired device gets no
+    # autonomous command, fail-closed rather than a stale/empty 200.
+    next_for_new_device = new_device.get(
+        f"/sessions/{SESSION_ID}/autopilot/next", headers=new_device_headers)
+    assert next_for_new_device.status_code == 409, next_for_new_device.text
+    assert next_for_new_device.json()["detail"]["code"] == "autopilot_runtime_inactive"
+    new_device.close()
+
+
+def test_device_rotation_fencing_failure_rolls_back_capability_atomically(
+        api_clients: ApiClients, monkeypatch):
+    """A failure while fencing a rotation must undo the capability rotation too.
+
+    There must be no window where a new capability is durable but the old
+    generation's claim is still unfenced: pairing and its fencing commit in
+    one transaction, or neither does.
+    """
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+
+    with Session(api_clients.engine) as session:
+        old_capability = session.exec(select(PatientDeviceCapability).where(
+            PatientDeviceCapability.session_id == SESSION_ID,
+            PatientDeviceCapability.revoked_at.is_(None),
+        )).one()
+        old_token_hash = old_capability.token_hash
+
+    def _boom(*_args, **_kwargs):
+        raise autopilot_service.AutopilotServiceError(
+            "test_injected_fencing_failure", "注入测试：换绑 fencing 失败")
+
+    monkeypatch.setattr(
+        autopilot_service, "fence_autonomous_scope_for_device_rotation", _boom)
+    new_device = TestClient(app)
+    try:
+        response = new_device.post(
+            "/device/pair",
+            headers={"X-Console-Pin": "246810"},
+            json={"deviceId": "p0a-http-device-fault-000003"},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "test_injected_fencing_failure"
+
+        with Session(api_clients.engine) as session:
+            capabilities = list(session.exec(select(PatientDeviceCapability).where(
+                PatientDeviceCapability.session_id == SESSION_ID,
+            )))
+            assert len(capabilities) == 1
+            assert capabilities[0].token_hash == old_token_hash
+            assert capabilities[0].revoked_at is None
+            control = session.get(SessionAutopilotState, SESSION_ID)
+            assert control is not None and control.status == "processing_attempt"
+
+        # The old device's capability is untouched and still fully usable.
+        still_works = api_clients.device.get(
+            f"/sessions/{SESSION_ID}/autopilot/next",
+            headers=api_clients.device_headers)
+        assert still_works.status_code == 200, still_works.text
+    finally:
+        new_device.close()
+
+
+def test_device_pair_capability_collision_rolls_back_entire_request_atomically(
+        api_clients: ApiClients, monkeypatch):
+    """A concurrent-pairing collision must fail the whole request, never
+    partially commit off a stale ``had_active_capability``/LiveState
+    snapshot taken moments before the collision.
+
+    ``create_capability`` deliberately no longer catches/retries its own
+    IntegrityError internally (an internal rollback-and-retry would silently
+    invalidate the LiveState/session/runtime reads and the
+    had_active_capability fact already taken earlier in this same
+    transaction, without the caller's knowledge). The whole request must
+    fail atomically instead, leaving the old capability and autopilot state
+    completely untouched for the client to retry from a fresh snapshot.
+    """
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+
+    with Session(api_clients.engine) as session:
+        old_capability = session.exec(select(PatientDeviceCapability).where(
+            PatientDeviceCapability.session_id == SESSION_ID,
+            PatientDeviceCapability.revoked_at.is_(None),
+        )).one()
+        old_token_hash = old_capability.token_hash
+
+    def _boom(*_args, **_kwargs):
+        raise IntegrityError(
+            "INSERT", {}, Exception("simulated concurrent pairing collision"))
+
+    monkeypatch.setattr(device_capability, "create_capability", _boom)
+    new_device = TestClient(app)
+    try:
+        response = new_device.post(
+            "/device/pair",
+            headers={"X-Console-Pin": "246810"},
+            json={"deviceId": "p0a-http-device-integrity-000004"},
+        )
+        assert response.status_code == 503, response.text
+    finally:
+        new_device.close()
+
+    with Session(api_clients.engine) as session:
+        capabilities = list(session.exec(select(PatientDeviceCapability).where(
+            PatientDeviceCapability.session_id == SESSION_ID,
+        )))
+        assert len(capabilities) == 1
+        assert capabilities[0].token_hash == old_token_hash
+        assert capabilities[0].revoked_at is None
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        assert control is not None and control.status == "processing_attempt"
+
+    still_works = api_clients.device.get(
+        f"/sessions/{SESSION_ID}/autopilot/next", headers=api_clients.device_headers)
+    assert still_works.status_code == 200, still_works.text
 
 
 @pytest.mark.parametrize(("governance_change", "expected_error_code"), [

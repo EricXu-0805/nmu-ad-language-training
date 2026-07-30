@@ -852,3 +852,64 @@ test("旧 API：只传 initialCommand 时行为不变（向后兼容）", () => 
   assert.equal(controller.state.phase, "tts_ready");
   assert.equal(controller.state.pause_reason, null);
 });
+
+test("stopRecordingNow：仅 recording 阶段向当前 capture 转发 user_done", () => {
+  const requestStopCalls: Array<"user_done" | undefined> = [];
+  const capture = {
+    started: Promise.resolve({ mime_type: "audio/webm" as const }),
+    stopped: new Promise<never>(() => {}),
+    closed: new Promise<void>(() => {}),
+    requestStop: (reason?: "user_done") => { requestStopCalls.push(reason); },
+    cancel: () => { throw new Error("stopRecordingNow 不应触发 cancel"); },
+  };
+  const recordingRuntime: AutopilotRuntimeState = {
+    phase: "recording",
+    command: recordCommand("started"),
+    last_device_event_seq: 3,
+    last_ack: null,
+    pause_reason: null,
+  };
+  const controller = new PatientAutopilotController({
+    sessionId: "S-STOP-NOW",
+    ...inertControllerDeps(),
+    initialDeviceEventSeq: 3,
+    initialRuntime: recordingRuntime,
+  });
+  // 直接注入 activeMedia：这是控制器自身在真实 record 命令跑完 runOnce 后才会
+  // 设置的私有字段。这里只钉住 stopRecordingNow 自己的判定边界（是否转发/
+  // 转给谁），不重放 getUserMedia → audioSaved → record_stopped 整条链
+  // （该链在 BrowserAutopilotCapture，未被这份测试覆盖，见下方 gap 说明）。
+  (controller as unknown as { activeMedia: unknown }).activeMedia = capture;
+
+  controller.stopRecordingNow();
+  assert.deepEqual(requestStopCalls, ["user_done"]);
+  // stopRecordingNow 本身不改 phase；真实链路里 phase 要等 record_stopped
+  // ACK 经 runOnce 回来才推进到 waiting_server_after_record。
+  assert.equal(controller.state.phase, "recording");
+
+  // 仍在 recording 阶段再次点击：controller 这一层逐次原样转发，不去重——
+  // “最终只生效一次”的幂等保证在 BrowserAutopilotCapture.signalStop 自己的
+  // requestedStop 闩门里（阅读该源码确认：先到者赢，之后同一实例上无论
+  // requestStop/cancel/max_duration 定时器谁再调用 signalStop 都是纯 no-op），
+  // 不是这个 controller 方法的契约，也未被这份测试直接验证（见下方 gap）。
+  controller.stopRecordingNow();
+  assert.deepEqual(requestStopCalls, ["user_done", "user_done"]);
+
+  // 阶段一旦不再是 recording，再点击就是纯无效操作：不再转发给旧 capture。
+  (controller as unknown as { stateValue: AutopilotRuntimeState }).stateValue = {
+    ...recordingRuntime,
+    phase: "waiting_server_after_record",
+  };
+  controller.stopRecordingNow();
+  assert.deepEqual(requestStopCalls, ["user_done", "user_done"]);
+});
+
+test("stopRecordingNow：非 recording 阶段（无 activeMedia）静默无效，不抛异常", () => {
+  const controller = new PatientAutopilotController({
+    sessionId: "S-STOP-NOW-IDLE",
+    ...inertControllerDeps(),
+  });
+  assert.equal(controller.state.phase, "waiting_command");
+  controller.stopRecordingNow();
+  assert.equal(controller.state.phase, "waiting_command");
+});

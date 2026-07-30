@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, inspect, text
 
 
 PARENT = "e8a1c4b7d902"
-HEAD = "a3c8e5f7d904"
+HEAD = "c7d4f9a1e603"
 TABLES = {
     "assessmentevent",
     "assessmentinstance",

@@ -759,6 +759,103 @@ def test_session_and_issued_command_fail_closed_on_definition_drift(
         assert caught.value.code == "autopilot_protocol_digest_mismatch"
 
 
+def test_start_fails_closed_on_exact_stale_protocol_version_with_zero_semantic_writes(
+        service_engine, monkeypatch):
+    """An old-but-well-formed protocol version binding -- not a corrupted or
+    missing one like the sibling cases above -- must still fail start()
+    before any control/runtime/command/event write, with the specific
+    ``autopilot_protocol_version_mismatch`` code (not the digest-drift or
+    missing-binding codes already covered by
+    ``test_session_and_issued_command_fail_closed_on_definition_drift``).
+    Never migrates or rebinds the stale session to the current protocol.
+    """
+    _enable_p0a(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_ready(db)
+
+        # A genuine old binding pair, not "old version + still-current digest"
+        # -- a real historical protocol revision's digest differs too.
+        stale_version_id = "autopilot-v1-20260717"
+        stale_digest = (
+            "7e1f812972a07b80f4e88c01ae838254d2fbaae5e1f8c6d52aa06a18de61eccb")
+        legacy = db.get(TrainSession, SESSION_ID)
+        assert legacy is not None
+        assert legacy.autopilot_protocol_version_id == PROTOCOL["protocol_version_id"]
+        legacy.autopilot_protocol_version_id = stale_version_id
+        legacy.autopilot_protocol_definition_digest = stale_digest
+        db.add(legacy)
+        db.commit()
+
+        def _snapshot() -> tuple:
+            """Detached primitive projection, taken fresh every call.
+
+            Deliberately never returns raw ORM instances (or lists of them):
+            SQLAlchemy's identity map hands back the *same* Python object,
+            refreshed in place, for a given PK across queries on the same
+            ``db``. A before/after pair built from live ORM rows can end up
+            comparing an object against itself post-rollback -- silently
+            "passing" even if a write briefly happened and was then rolled
+            back, which is exactly the regression this test exists to catch.
+            """
+            train_session = db.get(TrainSession, SESSION_ID)
+            runtime_state = db.get(SessionRuntimeState, SESSION_ID)
+            live_state = db.get(LiveState, 1)
+            autopilot_state = db.get(SessionAutopilotState, SESSION_ID)
+            commands = list(db.exec(select(RuntimeCommand).where(
+                RuntimeCommand.session_id == SESSION_ID,
+            ).order_by(RuntimeCommand.id)))
+            acks = list(db.exec(select(RuntimeCommandAck).where(
+                RuntimeCommandAck.session_id == SESSION_ID,
+            ).order_by(RuntimeCommandAck.id)))
+            events = list(db.exec(select(AutopilotControlEvent).where(
+                AutopilotControlEvent.session_id == SESSION_ID,
+            ).order_by(AutopilotControlEvent.event_seq)))
+            return (
+                (train_session.session_id,
+                 train_session.autopilot_protocol_version_id,
+                 train_session.autopilot_protocol_definition_digest,
+                 train_session.item_bank_version_id,
+                 train_session.item_bank_definition_digest)
+                if train_session is not None else None,
+                (runtime_state.status, runtime_state.revision)
+                if runtime_state is not None else None,
+                (live_state.seq, live_state.session_json)
+                if live_state is not None else None,
+                (autopilot_state.mode, autopilot_state.status,
+                 autopilot_state.revision, autopilot_state.current_command_id)
+                if autopilot_state is not None else None,
+                tuple(
+                    (c.id, c.command_seq, c.kind, c.state) for c in commands),
+                tuple(
+                    (a.id, a.command_id, a.idempotency_key, a.ack_type)
+                    for a in acks),
+                tuple(
+                    (e.id, e.event_seq, e.event_type, e.reason_code,
+                     e.command_id)
+                    for e in events),
+            )
+
+        before = _snapshot()
+        assert before[0] == (
+            SESSION_ID, stale_version_id, stale_digest,
+            FIRST_ONLY_BANK.version_id,
+            content.item_bank_definition_digest(FIRST_ONLY_BANK))
+        assert before[1] == ("active", 0)
+        assert before[3] is None
+        assert before[4] == ()
+        assert before[5] == ()
+        assert before[6] == ()
+
+        try:
+            with pytest.raises(AutopilotServiceError) as caught:
+                _start(db)
+            assert caught.value.code == "autopilot_protocol_version_mismatch"
+            after = _snapshot()
+            assert after == before
+        finally:
+            db.rollback()
+
+
 def test_legacy_runtime_command_binding_is_not_replayed(
         service_engine, monkeypatch):
     _enable_p0a(monkeypatch)
@@ -3029,6 +3126,128 @@ def test_authoritative_attempt_input_is_derived_only_from_capture_and_frozen_pla
         db.rollback()
         assert len(list(db.exec(select(RuntimeCommand)))) == before_commands
         assert db.get(SessionAutopilotState, SESSION_ID).status == "processing_attempt"
+
+
+def _cross_attempt_snapshot(db: Session) -> tuple:
+    state = db.get(SessionAutopilotState, SESSION_ID)
+    runtime = db.get(SessionRuntimeState, SESSION_ID)
+    commands = [
+        (c.id, c.kind, c.state, c.prompt_level, c.attempt_seq)
+        for c in db.exec(select(RuntimeCommand).where(
+            RuntimeCommand.session_id == SESSION_ID,
+        ).order_by(RuntimeCommand.command_seq))
+    ]
+    events = [
+        (e.event_type, e.reason_code, e.command_id)
+        for e in db.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == SESSION_ID,
+        ).order_by(AutopilotControlEvent.event_seq))
+    ]
+    attempts = [
+        (a.id, a.processing_status, a.error_code)
+        for a in db.exec(select(AttemptEvent).where(
+            AttemptEvent.session_id == SESSION_ID,
+        ).order_by(AttemptEvent.id))
+    ]
+    return (
+        (state.status, state.current_command_id, state.revision,
+         state.last_error_code, state.control_generation, state.runner_generation,
+         state.lease_owner) if state is not None else None,
+        (runtime.status, runtime.revision) if runtime is not None else None,
+        tuple(commands), tuple(events), tuple(attempts),
+    )
+
+
+def test_stale_target_from_earlier_logical_attempt_is_pure_noop(
+    service_engine, monkeypatch,
+):
+    """R1-foundation A: a target frozen on a completed-and-routed earlier
+    attempt must never mutate the session once a newer logical attempt (a
+    different record/raw_audio_id, same generation) is current — covers the
+    stale-ASR/stale-judgement/route-lag failure shape at the shared CAS layer
+    every one of those call sites funnels through.
+    """
+    _enable_p0a(monkeypatch)
+    monkeypatch.setattr(content, "load_item_bank", lambda _path: FIRST_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db)
+        _seed_completed_autopilot_attempt(db, prompt_level=1)
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "processing_attempt"
+        stale_record = db.exec(select(RuntimeCommand).where(
+            RuntimeCommand.session_id == SESSION_ID,
+            RuntimeCommand.kind == "record",
+            RuntimeCommand.prompt_level == 0,
+        )).one()
+        stale_target = autopilot_orchestration.FrozenWorkerTarget(
+            session_id=SESSION_ID,
+            record_command_id=stale_record.id,
+            raw_audio_id=stale_record.expected_raw_audio_id,
+            control_generation=state.control_generation,
+            runner_generation=state.runner_generation,
+        )
+        assert autopilot_orchestration.worker_target_still_current(
+            db, stale_target) is False
+        before = _cross_attempt_snapshot(db)
+
+        staged = autopilot_orchestration.stage_processing_failure(
+            db, session_id=SESSION_ID, error_code="autopilot_worker_exception",
+            source="worker_exception", target=stale_target)
+        assert staged is False
+        db.rollback()
+
+        assert _cross_attempt_snapshot(db) == before
+
+
+def test_matching_target_pauses_exactly_once_and_clears_only_its_claims(
+    service_engine, monkeypatch,
+):
+    """Positive case: a target that is still exactly current stages the
+    failure pause exactly once; a repeat call against the same (now stale)
+    target is a pure no-op.
+    """
+    _enable_p0a(monkeypatch)
+    monkeypatch.setattr(content, "load_item_bank", lambda _path: FIRST_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db)
+        _seed_completed_autopilot_attempt(db, prompt_level=1)
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "processing_attempt"
+        current_target = autopilot_orchestration.derive_worker_target(
+            db, session_id=SESSION_ID)
+        assert autopilot_orchestration.worker_target_still_current(
+            db, current_target) is True
+
+        staged = autopilot_orchestration.stage_processing_failure(
+            db, session_id=SESSION_ID, error_code="autopilot_worker_exception",
+            source="worker_exception", target=current_target)
+        assert staged is True
+        db.commit()
+
+        after = db.get(SessionAutopilotState, SESSION_ID)
+        assert after is not None
+        assert after.status == "paused"
+        assert after.current_command_id is None
+        assert after.last_error_code == "autopilot_worker_exception"
+        events = list(db.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == SESSION_ID,
+            AutopilotControlEvent.event_type == "failure",
+        )))
+        assert len(events) == 1
+        assert events[0].command_id == current_target.record_command_id
+
+        # A second attempt against the same (now stale, since state moved to
+        # paused) target must not double-pause or write a second event.
+        again = autopilot_orchestration.stage_processing_failure(
+            db, session_id=SESSION_ID, error_code="autopilot_worker_exception",
+            source="worker_exception", target=current_target)
+        assert again is False
+        db.rollback()
+        events_again = list(db.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == SESSION_ID,
+            AutopilotControlEvent.event_type == "failure",
+        )))
+        assert len(events_again) == 1
 
 
 def test_attempt_submission_is_nonblocking_and_deduplicates_in_process(

@@ -12,7 +12,7 @@ from app.models import TtsServeEvidence
 
 
 PARENT = "f9b2d6e4a801"
-HEAD = "a3c8e5f7d904"
+HEAD = "c7d4f9a1e603"
 
 
 def _config(db_path) -> Config:

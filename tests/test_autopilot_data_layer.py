@@ -1439,7 +1439,7 @@ def test_zero_to_head_creates_single_current_autopilot_schema(tmp_path):
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.connect() as connection:
         assert connection.execute(text(
-            "SELECT version_num FROM alembic_version")).scalar_one() == "a3c8e5f7d904"
+            "SELECT version_num FROM alembic_version")).scalar_one() == "c7d4f9a1e603"
     command.check(config)
 
 

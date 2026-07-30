@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, inspect, text
 
 
 PARENT = "9f2c6a8d4e10"
-HEAD = "a3c8e5f7d904"
+HEAD = "c7d4f9a1e603"
 
 
 def _config(db_path) -> Config:

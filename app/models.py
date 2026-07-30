@@ -464,6 +464,103 @@ class AttemptEvent(SQLModel, table=True):
     is_simulation: bool = False
 
 
+class AttemptCaptureProcessing(SQLModel, table=True):
+    """Persistent, recoverable claim binding one succeeded record command to
+    the AttemptEvent it will eventually produce.
+
+    This row is admitted at ``record_stopped`` time, before ASR runs, so a
+    worker can crash-safely resume ASR without re-consuming ``attempt_seq``.
+    AttemptEvent creation itself is deferred until ASR resolves, so a future
+    repeat-classifier can inspect the transcript before ``attempt_seq`` is
+    ever committed. This batch always disposes a successful transcript as
+    ``answer_candidate``; the repeat branch is intentionally inert. The
+    answer text itself lives only in ``AttemptEvent.asr_text`` — this row
+    never holds a second permanent copy of patient-derived transcript text.
+    """
+    __table_args__ = (
+        UniqueConstraint("record_command_id",
+                         name="uq_capture_processing_record_command"),
+        UniqueConstraint("raw_audio_id",
+                         name="uq_capture_processing_raw_audio_id"),
+        UniqueConstraint("receipt_server_seq",
+                         name="uq_capture_processing_receipt_seq"),
+        UniqueConstraint("final_attempt_id",
+                         name="uq_capture_processing_final_attempt_id"),
+        CheckConstraint("proof_attempt_seq >= 1",
+                        name="ck_capture_processing_proof_seq_positive"),
+        CheckConstraint("proof_prompt_level >= 0 AND proof_prompt_level <= 3",
+                        name="ck_capture_processing_proof_prompt_level"),
+        CheckConstraint(
+            "processing_status IN ('received','asr_completed','technical_failure')",
+            name="ck_capture_processing_status"),
+        CheckConstraint("processing_generation >= 0",
+                        name="ck_capture_processing_generation_nonnegative"),
+        CheckConstraint(
+            "disposition IS NULL OR disposition IN ('answer_candidate')",
+            name="ck_capture_processing_disposition"),
+        CheckConstraint(
+            "((processing_status = 'asr_completed' AND disposition IS NOT NULL) OR "
+            "(processing_status != 'asr_completed' AND disposition IS NULL))",
+            name="ck_capture_processing_disposition_matches_status"),
+        CheckConstraint(
+            "((processing_status IN ('asr_completed','technical_failure') "
+            "AND final_attempt_id IS NOT NULL) OR "
+            "(processing_status = 'received' AND final_attempt_id IS NULL))",
+            name="ck_capture_processing_final_attempt_matches_status"),
+        CheckConstraint(
+            "((processing_owner IS NULL AND processing_lease_expires_at IS NULL) OR "
+            "(processing_owner IS NOT NULL AND processing_lease_expires_at IS NOT NULL))",
+            name="ck_capture_processing_lease_complete"),
+        CheckConstraint(
+            "(processing_owner IS NULL OR processing_claimed_at IS NOT NULL)",
+            name="ck_capture_processing_claimed_at_when_owned"),
+        CheckConstraint(
+            "(processing_status = 'received' OR "
+            "(processing_owner IS NULL AND processing_lease_expires_at IS NULL))",
+            name="ck_capture_processing_terminal_lease_released"),
+        CheckConstraint(
+            "((processing_status = 'received' AND processed_at IS NULL) OR "
+            "(processing_status != 'received' AND processed_at IS NOT NULL))",
+            name="ck_capture_processing_terminal_processed_at"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    record_command_id: int = Field(foreign_key="runtimecommand.id", index=True)
+    predecessor_command_id: int = Field(foreign_key="runtimecommand.id", index=True)
+    receipt_server_seq: int = Field(
+        foreign_key="audiocapturereceipt.server_seq", index=True)
+    raw_audio_id: str = Field(foreign_key="audioassetrow.raw_audio_id", index=True)
+    session_id: str = Field(foreign_key="session.session_id", index=True)
+    item_id: str = Field(index=True)
+    turn_seq: int
+    proof_attempt_seq: int
+    proof_prompt_level: int
+    processing_status: str = "received"
+    # 与 AttemptEvent 相同的可恢复租约结构；status 是阶段真源，
+    # owner/generation 是防陈旧 worker 回写的 fencing token。
+    processing_owner: Optional[str] = None
+    processing_lease_expires_at: Optional[datetime] = None
+    processing_claimed_at: Optional[datetime] = None
+    processing_generation: int = 0
+    asr_confidence: Optional[float] = None
+    asr_engine_version: Optional[str] = None
+    disposition: Optional[str] = None
+    error_code: Optional[str] = None
+    final_attempt_id: Optional[int] = Field(
+        default=None, foreign_key="attemptevent.id", index=True)
+    created_at: datetime = Field(default_factory=datetime.now)
+    processed_at: Optional[datetime] = None
+    is_simulation: bool = False
+
+
+@sa_event.listens_for(AttemptCaptureProcessing, "before_update")
+@sa_event.listens_for(AttemptCaptureProcessing, "before_delete")
+def _reject_attempt_capture_processing_orm_mutation(*_args) -> None:
+    """生命周期只能走 fenced Core UPDATE；ORM 层一律拒绝改写或删除。"""
+    raise RuntimeError(
+        "AttemptCaptureProcessing 禁止 ORM 更新或删除，须走 evidence_ledger 的 fenced Core 事务")
+
+
 class InteractionEvent(SQLModel, table=True):
     """运行交互只追加账本。
 

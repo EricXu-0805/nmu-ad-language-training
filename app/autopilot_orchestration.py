@@ -119,6 +119,102 @@ def _frozen_attempt_context(
     return position.response_role, cue_type.strip()
 
 
+class FrozenWorkerTarget(BaseModel):
+    """Immutable identity of the one P0a attempt a worker is bound to.
+
+    Must be captured once, in the same locked snapshot as (and immediately
+    alongside) :func:`derive_authoritative_attempt_input`, before any provider
+    I/O begins. Every ``control_plane="autopilot_worker"`` failure path must
+    carry this exact target so a worker that blocked on provider I/O and
+    returns late can never mutate a different, newer logical attempt that a
+    faster worker has since taken over and completed.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    session_id: str = Field(min_length=1)
+    record_command_id: int
+    raw_audio_id: str = Field(min_length=1)
+    control_generation: int = Field(ge=1)
+    runner_generation: int = Field(ge=1)
+
+
+def _lock_pending_command(
+    db: Session, *, session_id: str,
+) -> tuple[SessionAutopilotState, RuntimeCommand]:
+    """Lock and validate the one currently-pending P0a attempt command.
+
+    Shared by :func:`derive_authoritative_attempt_input` and
+    :func:`derive_worker_target` so both read the identical invariant from the
+    identical locked rows within the caller's transaction.
+    """
+    state = db.exec(select(SessionAutopilotState).where(
+        SessionAutopilotState.session_id == session_id,
+    ).with_for_update()).first()
+    if (state is None or state.scope_key != autopilot_service.P0A_SCOPE_KEY
+            or state.mode != "autonomous" or state.status != "processing_attempt"
+            or state.current_command_id is None):
+        _fail("autopilot_attempt_not_pending", "当前没有待处理的 P0a attempt")
+    record = db.exec(select(RuntimeCommand).where(
+        RuntimeCommand.id == state.current_command_id,
+        RuntimeCommand.session_id == session_id,
+    ).with_for_update()).first()
+    if (record is None or record.kind != "record" or record.state != "succeeded"
+            or record.scope_key != state.scope_key
+            or record.control_generation != state.control_generation
+            or record.runner_generation != state.runner_generation):
+        _fail("autopilot_attempt_capture_invalid", "当前 attempt 缺少已成功录音命令")
+    return state, record
+
+
+def derive_worker_target(
+    db: Session, *, session_id: str,
+) -> FrozenWorkerTarget:
+    """Freeze the immutable worker target from the current locked P0a snapshot.
+
+    Callers must invoke this in the same transaction as, and never after
+    releasing the locks taken by, :func:`derive_authoritative_attempt_input` —
+    before any provider I/O begins.
+    """
+    state, record = _lock_pending_command(db, session_id=session_id)
+    return FrozenWorkerTarget(
+        session_id=session_id,
+        record_command_id=record.id,
+        raw_audio_id=record.expected_raw_audio_id,
+        control_generation=state.control_generation,
+        runner_generation=state.runner_generation,
+    )
+
+
+def worker_target_still_current(db: Session, target: FrozenWorkerTarget) -> bool:
+    """Read-only: is this frozen target still exactly the session's live one?
+
+    Verifies every field of ``target`` — including the exact raw audio, not
+    just the command id/generations — against the current row. Used to skip a
+    stale/lost-claim worker's redundant route attempt, and to reject a
+    mismatched (forged or lagged) target before any provider I/O in
+    :func:`autopilot_service` callers. Never used to authorize a mutation by
+    itself — :func:`stage_processing_failure`'s own CAS remains the sole
+    mutation gate, and ``route_completed_attempt`` keeps its own independent
+    generation/state CAS regardless of this check.
+    """
+    state = db.exec(select(SessionAutopilotState).where(
+        SessionAutopilotState.session_id == target.session_id,
+    )).first()
+    if state is None or state.scope_key != autopilot_service.P0A_SCOPE_KEY:
+        return False
+    if (state.status != "processing_attempt"
+            or state.current_command_id != target.record_command_id
+            or state.control_generation != target.control_generation
+            or state.runner_generation != target.runner_generation):
+        return False
+    record = db.exec(select(RuntimeCommand).where(
+        RuntimeCommand.id == target.record_command_id,
+        RuntimeCommand.session_id == target.session_id,
+    )).first()
+    return record is not None and record.expected_raw_audio_id == target.raw_audio_id
+
+
 def derive_authoritative_attempt_input(
     db: Session,
     *,
@@ -139,22 +235,7 @@ def derive_authoritative_attempt_input(
     bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
-    state = db.exec(select(SessionAutopilotState).where(
-        SessionAutopilotState.session_id == session_id,
-    ).with_for_update()).first()
-    if (state is None or state.scope_key != autopilot_service.P0A_SCOPE_KEY
-            or state.mode != "autonomous" or state.status != "processing_attempt"
-            or state.current_command_id is None):
-        _fail("autopilot_attempt_not_pending", "当前没有待处理的 P0a attempt")
-    record = db.exec(select(RuntimeCommand).where(
-        RuntimeCommand.id == state.current_command_id,
-        RuntimeCommand.session_id == session_id,
-    ).with_for_update()).first()
-    if (record is None or record.kind != "record" or record.state != "succeeded"
-            or record.scope_key != state.scope_key
-            or record.control_generation != state.control_generation
-            or record.runner_generation != state.runner_generation):
-        _fail("autopilot_attempt_capture_invalid", "当前 attempt 缺少已成功录音命令")
+    _state, record = _lock_pending_command(db, session_id=session_id)
     try:
         gate = autopilot_service._require_gate(  # noqa: SLF001 - same bounded domain
             db,
@@ -231,14 +312,33 @@ def stage_processing_failure(
     session_id: str,
     error_code: str,
     source: Literal["attempt_processing", "worker_exception"],
+    target: FrozenWorkerTarget | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Stage the autopilot half of an atomic runtime+autopilot pause.
 
     The caller must invoke its existing runtime/LiveState pause helper and commit in
     the same transaction.  ``False`` means there is no current P0a processing state
-    to pause; it never broadens this safety path to ordinary sessions.
+    to pause, or ``target`` does not (or no longer) match it exactly; it never
+    broadens this safety path to ordinary sessions.
+
+    ``target`` must be the exact :class:`FrozenWorkerTarget` the caller froze
+    before any provider I/O. A missing or session-mismatched target is an
+    immediate no-op, checked before this function ever locks or even reads the
+    current row — there is no session-current fallback. Every other target
+    field (command id, raw audio, both generations) is then re-checked against
+    the current locked row: any mismatch (a newer worker has since taken over
+    and completed/routed a different logical attempt) is also a pure no-op —
+    ``False`` is returned without writing an event, changing
+    state/revision/last_error, pausing runtime, or touching the new attempt's
+    claims. The ``manual_http`` plane always passes ``target=None`` and is
+    therefore always a no-op here — that plane never reaches a P0a
+    ``processing_attempt`` row in the first place, since
+    ``_ensure_manual_plane_writable`` already rejects any manual write while
+    ``mode == "autonomous"``.
     """
+    if target is None or target.session_id != session_id:
+        return False
     if not isinstance(error_code, str) or _ERROR_CODE_RE.fullmatch(error_code) is None:
         error_code = "autopilot_worker_exception"
     observed_at = (
@@ -252,6 +352,12 @@ def stage_processing_failure(
         return False
     if state.status != "processing_attempt" or state.current_command_id is None:
         return False
+    if (state.current_command_id != target.record_command_id
+            or state.control_generation != target.control_generation
+            or state.runner_generation != target.runner_generation):
+        # The frozen target no longer matches the current attempt: a newer
+        # worker has already taken over. Never mutate someone else's attempt.
+        return False
     record = db.exec(select(RuntimeCommand).where(
         RuntimeCommand.id == state.current_command_id,
         RuntimeCommand.session_id == session_id,
@@ -260,6 +366,8 @@ def stage_processing_failure(
             or record.control_generation != state.control_generation
             or record.runner_generation != state.runner_generation):
         _fail("autopilot_failure_capture_invalid", "技术失败无法绑定当前录音命令")
+    if record.expected_raw_audio_id != target.raw_audio_id:
+        return False
     if (state.lease_owner is not None and state.lease_expires_at is not None
             and state.lease_expires_at > observed_at):
         _fail("autopilot_failure_state_busy", "attempt 路由状态正被其他 worker 占用")
@@ -286,9 +394,9 @@ def stage_processing_failure(
             SessionAutopilotState.scope_key == state.scope_key,
             SessionAutopilotState.mode == "autonomous",
             SessionAutopilotState.status == "processing_attempt",
-            SessionAutopilotState.current_command_id == record.id,
-            SessionAutopilotState.control_generation == state.control_generation,
-            SessionAutopilotState.runner_generation == state.runner_generation,
+            SessionAutopilotState.current_command_id == target.record_command_id,
+            SessionAutopilotState.control_generation == target.control_generation,
+            SessionAutopilotState.runner_generation == target.runner_generation,
             SessionAutopilotState.revision == state.revision,
         )
         .values(
@@ -304,11 +412,21 @@ def stage_processing_failure(
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
-        _fail("autopilot_failure_cas_conflict", "attempt 技术失败暂停 CAS 已失效")
+        # Lost a race against another writer between our checks above and this
+        # CAS — a newer worker just won. Quiet no-op, never a raised failure.
+        return False
     # A safety-close may race an already-issued provider call.  Invalidate the
     # attempt lease in the same transaction as the control/runtime pause so the
     # late result cannot append patient-derived evidence.
     evidence_ledger.invalidate_processing_claims(
+        db,
+        session_id=session_id,
+        raw_audio_id=record.expected_raw_audio_id,
+    )
+    # The provider call may still be in the pre-attempt capture-claim stage
+    # (ASR not yet resolved); fence it the same way so a late ASR result
+    # cannot materialize an AttemptEvent after this safety-close commits.
+    evidence_ledger.invalidate_capture_processing_claims(
         db,
         session_id=session_id,
         raw_audio_id=record.expected_raw_audio_id,

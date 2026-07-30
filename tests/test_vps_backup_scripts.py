@@ -646,6 +646,9 @@ exec /bin/df "$@"
         **os.environ,
         "PATH": f"{stubs}:{os.environ.get('PATH', '/usr/bin:/bin:/sbin')}",
         "PYTHON_BIN": sys.executable,
+        # An ambient/poisoned parent-process DATABASE_URL must never leak into
+        # the copied backup.sh; pin it to the fixture DB this harness created.
+        "DATABASE_URL": f"sqlite:///{data / 'app.db'}",
         "NMU_BACKUP_APP_DIR": str(app),
         "NMU_BACKUP_ROOT": str(root),
         "NMU_BACKUP_CADDYFILE": str(configs["Caddyfile"]),
@@ -679,6 +682,33 @@ def test_daily_critical_failure_never_logs_ok_or_publishes(failure, tmp_path):
 
 def test_daily_success_publishes_only_verified_snapshot_and_logs_ok(tmp_path):
     app, root, env = _daily_harness(tmp_path)
+
+    completed = subprocess.run(
+        ["bash", "scripts/vps-backup-daily.sh"], cwd=app, env=env,
+        check=False, capture_output=True, text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    snapshots = [
+        child for child in (root / "daily").iterdir()
+        if child.is_dir() and _STRICT_STAMP.fullmatch(child.name)
+    ]
+    assert len(snapshots) == 1
+    assert "] ok " in (root / "backup.log").read_text(encoding="utf-8")
+    verified = subprocess.run(
+        [sys.executable, "-I", str(GUARD_SOURCE), "verify-vps", str(snapshots[0])],
+        check=False, capture_output=True, text=True,
+    )
+    assert verified.returncode == 0, verified.stderr
+
+
+def test_daily_harness_pins_database_url_despite_poisoned_parent_env(monkeypatch, tmp_path):
+    # A leaked/stale DATABASE_URL in the outer pytest process (e.g. left behind
+    # by another test) must not reach the copied backup.sh via {**os.environ}.
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///not-the-fixture-db.sqlite")
+    app, root, env = _daily_harness(tmp_path)
+
+    assert env["DATABASE_URL"] == f"sqlite:///{app / 'data' / 'app.db'}"
 
     completed = subprocess.run(
         ["bash", "scripts/vps-backup-daily.sh"], cwd=app, env=env,

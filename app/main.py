@@ -47,6 +47,7 @@ from .auth import COOKIE_NAME, CSRF_COOKIE_NAME
 from .db import get_session, init_db
 from .enums import AudioStatus, ConsentType
 from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
+                     AttemptCaptureProcessing,
                      AttemptEvent, AuditLog, AudioAssetRow,
                      AudioCaptureReceipt, ExportBatch, InteractionEvent,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
@@ -4146,7 +4147,7 @@ def device_pair(body: DevicePairIn, request: Request, response: Response,
             "code": "device_pair_forbidden",
             "message": "此接口只接受当面设备配对",
         })
-    with _LIVE_WRITE_LOCK:
+    with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         live = _live_row_for_update(s)
         session_id = _live_session_id(live)
         if not session_id:
@@ -4160,6 +4161,18 @@ def device_pair(body: DevicePairIn, request: Request, response: Response,
         runtime_status = state.status if state is not None else "active"
         if runtime_status not in _MUTABLE_RUNTIME_STATUSES:
             _raise_device_conflict("device_pair_session_inactive", "当前训练场次不可配对")
+        # A same-session rotation (an active capability already exists) must
+        # fail-safe: any server-hosted P0a scope waiting on, or mid-capture/
+        # attempt on, the old device's audio is paused in the same commit as
+        # the rotation itself below, so a stale in-flight result from the old
+        # device generation cannot silently materialize and route a command
+        # to the newly paired device, and a failure anywhere in this combined
+        # operation rolls back the capability rotation too — never a
+        # committed new capability with a not-yet-fenced old claim.
+        had_active_capability = s.exec(select(PatientDeviceCapability).where(
+            PatientDeviceCapability.session_id == session_id,
+            PatientDeviceCapability.revoked_at.is_(None),
+        )).first() is not None
         try:
             token, capability = device_capability.create_capability(
                 s, session_id=session_id, device_id=body.deviceId)
@@ -4168,11 +4181,32 @@ def device_pair(body: DevicePairIn, request: Request, response: Response,
                 "code": "device_capability_configuration_invalid",
                 "message": "设备能力时限配置无效",
             }) from exc
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, IntegrityError) as exc:
+            # A concurrent-pairing collision must fail the whole request, not
+            # retry internally: this transaction's LiveState/session/runtime
+            # reads (including had_active_capability) become stale the moment
+            # any rollback happens. The client retries the entire request,
+            # re-acquiring a fresh snapshot from scratch.
+            s.rollback()
             raise HTTPException(503, detail={
                 "code": "device_pair_unavailable",
                 "message": "暂时无法完成设备配对，请重试",
             }) from exc
+        if had_active_capability:
+            try:
+                fenced = autopilot_service.fence_autonomous_scope_for_device_rotation(
+                    s, session_id=session_id)
+                if fenced:
+                    _pause_runtime_in_transaction(session_id, s)
+            except autopilot_service.AutopilotServiceError as exc:
+                _autopilot_write_failure(s, exc)
+            except IntegrityError as exc:
+                _autopilot_integrity_conflict(s, exc)
+        # Single commit for the whole operation: pairing (create_capability
+        # only staged/flushed above) and any rotation fencing land in one
+        # atomic snapshot, or neither does.
+        s.commit()
+        s.refresh(capability)
     # Bearer appears exactly once.  Do not rely on POST's usual cache behavior.
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Pragma"] = "no-cache"
@@ -8570,14 +8604,28 @@ def _attempt_in_progress_payload(attempt: AttemptEvent, s: DBSession,
 
 
 def _claim_lost_payload(claim: evidence_ledger.AttemptClaim, s: DBSession,
-                        response: Response) -> dict:
-    """A newer generation or terminal transition won; stale workers only read back."""
+                        response: Response, *,
+                        control_plane: Literal["manual_http", "autopilot_worker"],
+                        ) -> dict:
+    """A newer generation or terminal transition won; stale workers only read back.
+
+    ``claim_lost=True`` marks that *this* invocation held a live claim and lost
+    the race — as opposed to a fresh recovery admission finding an already-
+    terminal row with no race at all. Only the former must never route: the
+    completion is provably someone else's, possibly still mid-route itself.
+    This is an internal-only signal for :func:`_run_p0a_attempt_worker`'s own
+    dispatch and must never appear in a real HTTP response — it is set only
+    on the ``autopilot_worker`` plane, whose payload never reaches a client.
+    """
     s.rollback()
     current = s.get(AttemptEvent, claim.attempt_id)
     if current is None:
         raise HTTPException(409, "attempt claim 已失效且证据行不存在")
     if current.processing_status in evidence_ledger.TERMINAL_ATTEMPT_STATUSES:
-        return _attempt_rows_payload(current, s, idempotent=True)
+        payload = _attempt_rows_payload(current, s, idempotent=True)
+        if control_plane == "autopilot_worker":
+            payload["claim_lost"] = True
+        return payload
     return _attempt_in_progress_payload(current, s, response)
 
 
@@ -8685,6 +8733,7 @@ def _cloud_processing_revoked_for_session(session_id: str, s: DBSession) -> bool
 def _revalidate_attempt_commit_fence(
         session_id: str, body: AttemptProcessIn, s: DBSession, *,
         control_plane: Literal["manual_http", "autopilot_worker"],
+        worker_target: autopilot_orchestration.FrozenWorkerTarget | None = None,
 ) -> TrainSession:
     """Re-check ownership and mutable eligibility in the evidence commit txn.
 
@@ -8693,7 +8742,10 @@ def _revalidate_attempt_commit_fence(
     TrainSession -> autopilot-state order used by start/pause and proves that the
     exact audio is still readable.  A pause wins by invalidating the attempt claim;
     withdrawal/quarantine/feature disablement wins here before any provider-derived
-    text or judgement is written.
+    text or judgement is written.  On the ``autopilot_worker`` plane, every commit
+    point re-verifies the same frozen ``worker_target`` (session, exact command,
+    raw audio, both generations) within this same lock — not just ``body`` — so a
+    forged or lagged target can never ride a coincidentally-matching body through.
     """
     s.rollback()
     s.expire_all()
@@ -8708,6 +8760,11 @@ def _revalidate_attempt_commit_fence(
         _ensure_manual_plane_writable(
             session_id, s, "提交旧人工 attempt 处理结果")
     elif control_plane == "autopilot_worker":
+        if worker_target is None:
+            raise autopilot_orchestration.AutopilotOrchestrationError(
+                "autopilot_attempt_input_mismatch",
+                "内部 worker 缺少冻结目标，拒绝提交",
+            )
         # Lock the current state before re-deriving every capture/control fact.
         s.exec(select(SessionAutopilotState).where(
             SessionAutopilotState.session_id == session_id,
@@ -8721,6 +8778,13 @@ def _revalidate_attempt_commit_fence(
             raise autopilot_orchestration.AutopilotOrchestrationError(
                 "autopilot_attempt_input_mismatch",
                 "内部 worker 输入与当前权威录音证据不一致",
+            )
+        current_target = autopilot_orchestration.derive_worker_target(
+            s, session_id=session_id)
+        if current_target != worker_target:
+            raise autopilot_orchestration.AutopilotOrchestrationError(
+                "autopilot_attempt_input_mismatch",
+                "内部 worker 目标与当前权威录音证据不一致",
             )
     else:  # pragma: no cover - Literal callers, defensive privilege boundary
         raise RuntimeError(f"unsupported attempt control plane: {control_plane!r}")
@@ -8764,12 +8828,15 @@ def _finish_attempt_failure(claim: evidence_ledger.AttemptClaim, sess: TrainSess
                             engine_version: str | None,
                             body: AttemptProcessIn,
                             control_plane: Literal["manual_http", "autopilot_worker"],
+                            worker_target:
+                                autopilot_orchestration.FrozenWorkerTarget | None = None,
                             ) -> dict:
     # 失败证据与权威暂停是一个服务端事务：客户端即使在收到响应前断线，
     # 也不会留下“technical_pause 已记账，但 runtime 仍 active”的危险半状态。
     with _LIVE_WRITE_LOCK:
         sess = _revalidate_attempt_commit_fence(
-            sess.session_id, body, s, control_plane=control_plane)
+            sess.session_id, body, s, control_plane=control_plane,
+            worker_target=worker_target)
         _lock_evidence_session(sess.session_id, s)
         expected_stage = "received" if stage == "asr" else "asr_completed"
         if claim.stage != expected_stage:
@@ -8783,7 +8850,7 @@ def _finish_attempt_failure(claim: evidence_ledger.AttemptClaim, sess: TrainSess
         if not evidence_ledger.fenced_attempt_update(
                 s, claim, expected_status=expected_stage,
                 next_status="technical_failure", values=values):
-            return _claim_lost_payload(claim, s, response)
+            return _claim_lost_payload(claim, s, response, control_plane=control_plane)
         s.expire_all()
         attempt = s.get(AttemptEvent, claim.attempt_id)
         if attempt is None:
@@ -8809,6 +8876,7 @@ def _finish_attempt_failure(claim: evidence_ledger.AttemptClaim, sess: TrainSess
             session_id=sess.session_id,
             error_code=error_code,
             source="attempt_processing",
+            target=worker_target,
         )
         if control_plane == "autopilot_worker" and not staged_autopilot_pause:
             s.rollback()
@@ -8826,10 +8894,13 @@ def _record_asr_success(claim: evidence_ledger.AttemptClaim, sess: TrainSession,
                         s: DBSession, asr_result: asr.AsrResult, *,
                         body: AttemptProcessIn,
                         control_plane: Literal["manual_http", "autopilot_worker"],
+                        worker_target:
+                            autopilot_orchestration.FrozenWorkerTarget | None = None,
                         ) -> AttemptEvent | None:
     with _LIVE_WRITE_LOCK:
         sess = _revalidate_attempt_commit_fence(
-            sess.session_id, body, s, control_plane=control_plane)
+            sess.session_id, body, s, control_plane=control_plane,
+            worker_target=worker_target)
         _lock_evidence_session(sess.session_id, s)
         if not evidence_ledger.fenced_attempt_update(
                 s, claim, expected_status="received", next_status="asr_completed",
@@ -8861,10 +8932,14 @@ def _record_judgement_success(claim: evidence_ledger.AttemptClaim,
                               bank: content.ItemBank,
                               control_plane: Literal[
                                   "manual_http", "autopilot_worker"],
+                              worker_target:
+                                  autopilot_orchestration.FrozenWorkerTarget
+                                  | None = None,
                               ) -> AttemptEvent | None:
     with _LIVE_WRITE_LOCK:
         sess = _revalidate_attempt_commit_fence(
-            sess.session_id, body, s, control_plane=control_plane)
+            sess.session_id, body, s, control_plane=control_plane,
+            worker_target=worker_target)
         _lock_evidence_session(sess.session_id, s)
         if not evidence_ledger.fenced_attempt_update(
                 s, claim, expected_status="asr_completed", next_status="completed",
@@ -8911,6 +8986,419 @@ def _record_judgement_success(claim: evidence_ledger.AttemptClaim,
         s.commit()
         s.refresh(attempt)
         return attempt
+
+
+def _capture_in_progress_payload(capture: AttemptCaptureProcessing, s: DBSession,
+                                 response: Response) -> dict:
+    """Pre-attempt analog of :func:`_attempt_in_progress_payload`.
+
+    No AttemptEvent exists yet at this stage. This shape only has to satisfy
+    ``_run_p0a_attempt_worker``'s internal dispatch, which checks
+    ``in_progress`` before ever looking at ``status``/``attempt`` — the
+    ``autopilot_worker`` control plane never returns this to a real HTTP
+    client.
+    """
+    now = datetime.now()
+    lease = capture.processing_lease_expires_at
+    retry_after = max(1, math.ceil((lease - now).total_seconds())) if lease else 1
+    response.status_code = 202
+    response.headers["Retry-After"] = str(retry_after)
+    return {
+        "status": capture.processing_status,
+        "idempotent": True,
+        "in_progress": True,
+        "retry_after_seconds": retry_after,
+        "truth_scope": "operational_only",
+        "attempt": None,
+        "interactions": [],
+    }
+
+
+def _verify_capture_attempt_identity(
+        capture: AttemptCaptureProcessing, attempt: AttemptEvent) -> None:
+    """A terminal capture's FK must agree with its bound Attempt on every fact.
+
+    ``final_attempt_id`` is trusted only after this check; a mismatch is an
+    invariant violation, not something to project to any caller.
+    """
+    matches = (
+        capture.session_id == attempt.session_id,
+        capture.raw_audio_id == attempt.raw_audio_id,
+        capture.item_id == attempt.item_id,
+        capture.turn_seq == attempt.turn_seq,
+        capture.proof_attempt_seq == attempt.attempt_seq,
+        capture.proof_prompt_level == attempt.prompt_level,
+        capture.is_simulation == attempt.is_simulation,
+    )
+    if not all(matches):
+        raise RuntimeError(
+            "capture-processing row and its bound AttemptEvent disagree on "
+            "identity; refusing to project a mismatched result")
+
+
+def _capture_terminal_attempt_payload(
+        capture: AttemptCaptureProcessing, s: DBSession,
+        response: Response) -> dict:
+    """Project the AttemptEvent a terminal capture row already materialized.
+
+    The capture row itself is terminal as soon as ASR resolves, but its bound
+    Attempt may still be non-terminal (``asr_completed``, awaiting judgement).
+    A fenced-out worker reading this must observe a quiet in-progress outcome
+    in that case, not a false terminal projection — otherwise a stale worker
+    could trigger a spurious fail-close against a scope a newer generation
+    still legitimately owns.
+    """
+    if capture.final_attempt_id is None:
+        raise RuntimeError("capture reached a terminal status without a bound attempt")
+    attempt = s.get(AttemptEvent, capture.final_attempt_id)
+    if attempt is None:
+        raise RuntimeError("capture's bound attempt row is missing")
+    _verify_capture_attempt_identity(capture, attempt)
+    if attempt.processing_status in evidence_ledger.RECOVERABLE_ATTEMPT_STATUSES:
+        return _attempt_in_progress_payload(attempt, s, response)
+    return _attempt_rows_payload(attempt, s, idempotent=True)
+
+
+def _try_recovery_capture_claim(
+        capture: AttemptCaptureProcessing, s: DBSession,
+        response: Response) -> tuple[
+            AttemptCaptureProcessing | None,
+            evidence_ledger.CaptureClaim | None, dict | None]:
+    """Claim an abandoned capture lease, or return the current worker/terminal result.
+
+    Mirrors :func:`_try_recovery_claim` one layer earlier: before an
+    AttemptEvent (and its attempt_seq) exists at all.
+    """
+    if capture.processing_status in evidence_ledger.TERMINAL_CAPTURE_STATUSES:
+        return None, None, _capture_terminal_attempt_payload(capture, s, response)
+    if capture.processing_status not in evidence_ledger.RECOVERABLE_CAPTURE_STATUSES:
+        raise HTTPException(409, f"capture 处理阶段异常: {capture.processing_status}")
+    if evidence_ledger.has_active_capture_lease(capture):
+        return None, None, _capture_in_progress_payload(capture, s, response)
+
+    owner = evidence_ledger.new_claim_owner()
+    if evidence_ledger.try_claim_capture(s, capture.id, owner=owner):
+        s.commit()
+        claimed = s.get(AttemptCaptureProcessing, capture.id)
+        if claimed is None:
+            raise HTTPException(409, "capture 在接管后丢失")
+        return claimed, evidence_ledger.claim_from_capture(claimed), None
+
+    # 条件 UPDATE 未命中：另一 worker 已续租/接管，或已进入终态。
+    s.rollback()
+    current = s.get(AttemptCaptureProcessing, capture.id)
+    if current is None:
+        raise HTTPException(409, "capture 并发接管后证据行不存在")
+    if current.processing_status in evidence_ledger.TERMINAL_CAPTURE_STATUSES:
+        return None, None, _capture_terminal_attempt_payload(current, s, response)
+    return None, None, _capture_in_progress_payload(current, s, response)
+
+
+def _capture_claim_lost_payload(capture_claim: evidence_ledger.CaptureClaim,
+                                s: DBSession, response: Response, *,
+                                control_plane: Literal[
+                                    "manual_http", "autopilot_worker"] = (
+                                        "autopilot_worker"),
+                                ) -> dict:
+    """A newer generation or terminal transition won; stale workers only read back.
+
+    ``claim_lost=True`` marks that *this* invocation held a live capture claim
+    and lost the race — see :func:`_claim_lost_payload` for why that must
+    never route, even when the underlying attempt already reads ``completed``.
+    Internal-only, like :func:`_claim_lost_payload`: this function is only
+    ever reached on the ``autopilot_worker`` plane in practice (the capture-
+    claim path ``attempt is None`` implies), but the flag is still gated on
+    ``control_plane`` explicitly rather than on that structural fact alone.
+    """
+    s.rollback()
+    current = s.get(AttemptCaptureProcessing, capture_claim.capture_id)
+    if current is None:
+        raise HTTPException(409, "capture claim 已失效且证据行不存在")
+    if current.processing_status in evidence_ledger.TERMINAL_CAPTURE_STATUSES:
+        payload = _capture_terminal_attempt_payload(current, s, response)
+        if control_plane == "autopilot_worker":
+            payload["claim_lost"] = True
+        return payload
+    return _capture_in_progress_payload(current, s, response)
+
+
+def _materialize_attempt_from_capture(
+        capture_claim: evidence_ledger.CaptureClaim, sess: TrainSession,
+        s: DBSession, *, body: AttemptProcessIn,
+        control_plane: Literal["manual_http", "autopilot_worker"],
+        outcome: Literal["asr_completed", "technical_failure"],
+        asr_result: asr.AsrResult | None = None,
+        error_code: str | None = None,
+        engine_version: str | None = None,
+        worker_target: autopilot_orchestration.FrozenWorkerTarget | None = None,
+) -> AttemptEvent | None:
+    """Atomically create the deferred AttemptEvent for one claimed capture.
+
+    R1-foundation: this is the only place attempt_seq is ever consumed for the
+    autopilot_worker control plane. Repeat detection is fixed disabled this
+    batch, so a successful transcript always disposes ``answer_candidate``; a
+    future repeat-classifier would branch here, before attempt_seq is used.
+    ``None`` return means the capture claim was lost (fenced out by a newer
+    generation or an intervening pause/withdrawal) — including when it was
+    already lost *before* this function's own work began. A stale/fenced-out
+    worker must never reach the sequence check or insert below using a claim
+    that is no longer current: doing so could either collide with a newer
+    generation's already-committed attempt_seq, or (if it raced ahead of that
+    collision) wrongly report a fail-closed error against a scope a newer
+    worker already owns. The caller re-reads state via
+    :func:`_capture_claim_lost_payload`.
+    """
+    with _LIVE_WRITE_LOCK:
+        sess = _revalidate_attempt_commit_fence(
+            sess.session_id, body, s, control_plane=control_plane,
+            worker_target=worker_target)
+        _lock_evidence_session(sess.session_id, s)
+        now = datetime.now()
+        # Prove the claim is still current before any sequence computation or
+        # insert, via a real conditional UPDATE — not a SELECT-then-compare,
+        # which is not a genuine mutual-exclusion primitive on SQLite (no
+        # FOR UPDATE) or across processes. A claim that fails this atomic
+        # check is fenced out and must be pure observation.
+        if not evidence_ledger.confirm_capture_claim(
+                s, capture_claim.capture_id, owner=capture_claim.owner,
+                generation=capture_claim.generation, now=now):
+            s.rollback()
+            return None
+
+        # The capture proof is immutable server state fixed at record_stopped
+        # time. Verify it against the live sequence rather than trust it blindly
+        # or re-derive a fresh number with ``_next_attempt_seq``.
+        current_max = s.exec(select(func.max(AttemptEvent.attempt_seq)).where(
+            AttemptEvent.session_id == sess.session_id,
+            AttemptEvent.item_id == body.item_id,
+            AttemptEvent.turn_seq == body.turn_seq,
+        )).one()
+        proof_attempt_seq = capture_claim.proof_attempt_seq
+        if (int(current_max or 0) + 1 != proof_attempt_seq
+                or body.prompt_level != capture_claim.proof_prompt_level):
+            s.rollback()
+            raise RuntimeError(
+                "capture proof attempt_seq/prompt_level does not match the "
+                "next server sequence; refusing to guess a value")
+
+        disposition = "answer_candidate" if outcome == "asr_completed" else None
+        asr_text = asr_result.asr_text if asr_result is not None else None
+        asr_confidence = asr_result.asr_confidence if asr_result is not None else None
+        attempt = AttemptEvent(
+            session_id=sess.session_id,
+            item_id=body.item_id,
+            turn_seq=body.turn_seq,
+            response_role=body.response_role,
+            attempt_seq=proof_attempt_seq,
+            raw_audio_id=body.raw_audio_id,
+            prompt_level=body.prompt_level,
+            cue_type=body.cue_type,
+            duration_seconds=body.duration_seconds,
+            asr_text=asr_text,
+            asr_confidence=asr_confidence,
+            asr_engine_version=engine_version,
+            error_code=error_code,
+            processing_status=outcome,
+            processing_owner=None if outcome == "technical_failure" else capture_claim.owner,
+            processing_lease_expires_at=(
+                None if outcome == "technical_failure"
+                else evidence_ledger.lease_deadline(now=now)),
+            processing_claimed_at=now,
+            processing_generation=1,
+            created_at=now,
+            processed_at=now if outcome == "technical_failure" else None,
+            is_simulation=sess.is_simulation,
+            judge_portrait_used=False,
+        )
+        s.add(attempt)
+        try:
+            s.flush()
+        except IntegrityError:
+            s.rollback()
+            # Re-confirm with the same atomic conditional UPDATE used above:
+            # fail loud only if I still hold the claim (a genuine invariant
+            # violation). If a newer generation or terminal transition
+            # already won, this is a stale race — observation-only, same as
+            # the claim-current check at the top of this function. The
+            # rollback above already undid that check's own lease refresh,
+            # so this re-confirms fresh rather than trusting a stale read.
+            if evidence_ledger.confirm_capture_claim(
+                    s, capture_claim.capture_id, owner=capture_claim.owner,
+                    generation=capture_claim.generation, now=now):
+                raise RuntimeError(
+                    "capture materialized attempt collided with an existing "
+                    "raw_audio_id/attempt_seq row")
+            return None
+        if not evidence_ledger.fenced_capture_update(
+                s, capture_claim, next_status=outcome,
+                values={
+                    "asr_confidence": asr_confidence,
+                    "asr_engine_version": engine_version,
+                    "disposition": disposition,
+                    "error_code": error_code,
+                    "processed_at": now,
+                    "final_attempt_id": attempt.id,
+                }):
+            s.rollback()
+            return None
+        _append_interaction(s, sess, "attempt_received", {
+            "raw_audio_id": body.raw_audio_id,
+            "prompt_level": body.prompt_level,
+            "cue_type": body.cue_type,
+            "duration_seconds": body.duration_seconds,
+            "processing_status": "received",
+        }, item_id=body.item_id, turn_seq=body.turn_seq, attempt=attempt)
+        if outcome == "asr_completed":
+            _append_interaction(s, sess, "asr_completed", {
+                "asr_engine_version": engine_version,
+                "asr_confidence": asr_confidence,
+                "degraded": False,
+                "hotword_hit": asr_result.hotword_hit if asr_result is not None else False,
+            }, item_id=attempt.item_id, turn_seq=attempt.turn_seq, attempt=attempt)
+        else:
+            _append_interaction(s, sess, "asr_failed", {
+                "asr_engine_version": engine_version,
+                "error_code": error_code,
+            }, item_id=attempt.item_id, turn_seq=attempt.turn_seq, attempt=attempt)
+            _append_interaction(s, sess, "technical_pause", {"error_code": error_code},
+                                item_id=attempt.item_id, turn_seq=attempt.turn_seq,
+                                attempt=attempt)
+            # For P0a this stages the control-state pause and stable failure event
+            # in this same transaction, mirroring _finish_attempt_failure exactly.
+            staged_autopilot_pause = autopilot_orchestration.stage_processing_failure(
+                s,
+                session_id=sess.session_id,
+                error_code=error_code,
+                source="attempt_processing",
+                target=worker_target,
+            )
+            if control_plane == "autopilot_worker" and not staged_autopilot_pause:
+                s.rollback()
+                raise autopilot_orchestration.AutopilotOrchestrationError(
+                    "autopilot_attempt_commit_fence_lost",
+                    "attempt 失败提交时自动驾驶所有权已变化",
+                )
+            _pause_runtime_in_transaction(sess.session_id, s)
+        s.commit()
+        s.refresh(attempt)
+        return attempt
+
+
+def _prepare_capture_or_attempt_processing(
+        session_id: str,
+        body: AttemptProcessIn,
+        response: Response,
+        s: DBSession,
+        *,
+        worker_target: autopilot_orchestration.FrozenWorkerTarget,
+) -> dict | tuple[TrainSession, Path, AttemptEvent, evidence_ledger.AttemptClaim] | tuple[
+        TrainSession, Path, evidence_ledger.CaptureClaim]:
+    """Autopilot-worker admission: claim a capture row instead of a fresh AttemptEvent.
+
+    Identical eligibility/idempotency checks to :func:`_prepare_attempt_processing`.
+    An existing AttemptEvent (ASR already ran at least once) is recovered exactly
+    as before. A raw_audio_id with no AttemptEvent yet claims the persistent
+    capture-processing row created at record_stopped time; AttemptEvent creation
+    is deferred to :func:`_materialize_attempt_from_capture`, after ASR resolves.
+
+    ``worker_target`` is re-verified exactly, within this same lock, before any
+    terminal read or claim recovery/creation below — not just via an earlier,
+    separately-locked caller-side check. A caller-side precheck and this
+    function's own lock are two different transactions; control/runner
+    generation can change in the gap between them even while ``body``/its raw
+    audio stay identical, so the caller-side check alone is not sufficient to
+    keep a stale worker from recovering or creating a claim here.
+    """
+    with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
+        s.rollback()
+        s.expire_all()
+        _live_row_for_update(s)
+        sess = s.exec(select(TrainSession).where(
+            TrainSession.session_id == session_id,
+        ).with_for_update()).first()
+        if not sess:
+            raise HTTPException(404, "场次不存在")
+
+        # Re-derive inside the same state-locking transaction used to claim the
+        # capture; an old worker body can never bypass a pause/new command.
+        s.exec(select(SessionAutopilotState).where(
+            SessionAutopilotState.session_id == session_id,
+        ).with_for_update()).first()
+        try:
+            derived = autopilot_orchestration.derive_authoritative_attempt_input(
+                s, session_id=session_id)
+        except autopilot_orchestration.AutopilotOrchestrationError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": exc.code,
+                "message": str(exc),
+            }) from exc
+        if body.model_dump(mode="python") != derived.model_dump(mode="python"):
+            raise HTTPException(status_code=409, detail={
+                "code": "autopilot_attempt_input_mismatch",
+                "message": "内部 worker 输入与当前权威录音证据不一致",
+            })
+        current_target = autopilot_orchestration.derive_worker_target(
+            s, session_id=session_id)
+        if current_target != worker_target:
+            raise HTTPException(status_code=409, detail={
+                "code": "autopilot_attempt_input_mismatch",
+                "message": "内部 worker 目标与当前权威录音证据不一致",
+            })
+
+        _require_classified_session(sess)
+        asset = s.get(AudioAssetRow, body.raw_audio_id)
+        if not asset or asset.session_id != session_id:
+            raise HTTPException(404, "音频资产不存在")
+        expected_turn_key = f"{body.item_id}#{body.turn_seq}"
+        if asset.turn_key != expected_turn_key:
+            raise HTTPException(409, "音频 turn_key 与冻结计划位置不一致")
+        _ensure_audio_read_allowed(asset, s)
+        blob = audio_store.find_blob(body.raw_audio_id)
+        if not blob:
+            raise HTTPException(409, "音频字节不存在，禁止伪造 ASR 证据")
+
+        existing = _existing_attempt_for_audio(session_id, body, s)
+        if existing is not None:
+            if existing.processing_status in evidence_ledger.TERMINAL_ATTEMPT_STATUSES:
+                return _attempt_rows_payload(existing, s, idempotent=True)
+            if evidence_ledger.has_active_lease(existing):
+                return _attempt_in_progress_payload(existing, s, response)
+
+        state = _ensure_runtime_writable(session_id, s, "新建逐次 AI 证据")
+        if state is not None and state.status == "paused":
+            raise HTTPException(409, "场次已暂停，禁止处理新 attempt")
+        _frozen_plan_turn(sess, body.item_id, body.turn_seq, body.response_role)
+
+        if asset.is_simulation != sess.is_simulation:
+            raise HTTPException(409, "音频与场次的真实/模拟属性不一致")
+        if asset.data_classification != sess.data_classification:
+            raise HTTPException(409, "音频与场次 data_classification 不一致")
+        if asset.withdrawn or (asset.withdrawal_status or "").strip():
+            raise HTTPException(409, "音频已进入撤回/隔离流程，禁止 AI 处理")
+        _ensure_recording_allowed_for_session(
+            session_id, s, is_simulation=asset.is_simulation)
+
+        if existing is not None:
+            claimed, recovered_claim, early = _try_recovery_claim(existing, s, response)
+            if early is not None:
+                return early
+            if claimed is None or recovered_claim is None:
+                raise RuntimeError("attempt recovery returned no claim and no response")
+            return sess, blob, claimed, recovered_claim
+
+        capture = s.exec(select(AttemptCaptureProcessing).where(
+            AttemptCaptureProcessing.raw_audio_id == body.raw_audio_id,
+        ).with_for_update()).first()
+        if capture is None:
+            raise HTTPException(
+                409, "音频对应的采集处理行不存在，无法开始 AI 处理")
+        claimed_capture, recovered_capture_claim, early = _try_recovery_capture_claim(
+            capture, s, response)
+        if early is not None:
+            return early
+        if claimed_capture is None or recovered_capture_claim is None:
+            raise RuntimeError("capture recovery returned no claim and no response")
+        return sess, blob, recovered_capture_claim
 
 
 def _prepare_attempt_processing(
@@ -9068,21 +9556,63 @@ def _prepare_attempt_processing(
 def _process_attempt(
         session_id: str, body: AttemptProcessIn, response: Response,
         s: DBSession, *,
-        control_plane: Literal["manual_http", "autopilot_worker"]):
+        control_plane: Literal["manual_http", "autopilot_worker"],
+        worker_target: autopilot_orchestration.FrozenWorkerTarget | None = None):
     """登记录音后的单一权威 ASR + operational 判类链。
 
     技术失败也以 200 + ``status=technical_failure`` 返回，便于老人端停在原位置；
     输入/场次/音频违约仍是 4xx。``raw_audio_id`` 是幂等键。
     """
-    prepared = _prepare_attempt_processing(
-        session_id, body, response, s, control_plane=control_plane)
+    if control_plane == "autopilot_worker":
+        if worker_target is None:
+            # Structural invariant: the only caller on this control plane
+            # (_run_p0a_attempt_worker) always freezes a target before any
+            # provider I/O. A missing target here would mean a fail-close path
+            # could fall back to mutating whatever attempt is currently
+            # current — fail loud, before any provider I/O or mutation.
+            raise RuntimeError(
+                "autopilot_worker control plane requires a frozen worker_target")
+        # Do not trust a target's mere presence: verify it against the current
+        # locked row before any provider I/O. A target's own fields — session,
+        # exact raw audio, command id, both generations — must agree with
+        # ``body`` and with the live row; a forged or lagged target must never
+        # ride a coincidentally-matching body through to a provider call.
+        if (worker_target.session_id != session_id
+                or worker_target.raw_audio_id != body.raw_audio_id
+                or not autopilot_orchestration.worker_target_still_current(
+                    s, worker_target)):
+            raise autopilot_orchestration.AutopilotOrchestrationError(
+                "autopilot_attempt_input_mismatch",
+                "内部 worker 目标与当前权威录音证据不一致",
+            )
+    capture_claim: evidence_ledger.CaptureClaim | None = None
+    if control_plane == "autopilot_worker":
+        prepared = _prepare_capture_or_attempt_processing(
+            session_id, body, response, s, worker_target=worker_target)
+    else:
+        prepared = _prepare_attempt_processing(
+            session_id, body, response, s, control_plane=control_plane)
     if isinstance(prepared, dict):
         return prepared
-    sess, blob, attempt, claim = prepared
+    if len(prepared) == 4:
+        sess, blob, attempt, claim = prepared
+    else:
+        # R1-foundation: a fresh raw_audio_id for the autopilot_worker control
+        # plane claims the persistent capture row instead of an AttemptEvent.
+        # ASR runs against the capture claim; the AttemptEvent (and its
+        # attempt_seq) is created only after ASR resolves, in
+        # _materialize_attempt_from_capture below.
+        sess, blob, capture_claim = prepared
+        attempt = None
+        claim = None
 
     bank = _load_bank_for_session(sess)
-    attempt_asr_text = attempt.asr_text
-    attempt_asr_engine_version = attempt.asr_engine_version
+    if attempt is not None:
+        attempt_asr_text = attempt.asr_text
+        attempt_asr_engine_version = attempt.asr_engine_version
+    else:
+        attempt_asr_text = None
+        attempt_asr_engine_version = None
     # Loading expired ORM attributes above may begin a read transaction after the
     # claim commit.  End it before any provider call; no DB connection/transaction
     # is held while ASR or LLM I/O is in flight.
@@ -9091,6 +9621,15 @@ def _process_attempt(
     def finish_failure(
             *, stage: Literal["asr", "judgement"], error_code: str,
             engine_version: str | None) -> dict:
+        if attempt is None:
+            materialized = _materialize_attempt_from_capture(
+                capture_claim, sess, s, body=body, control_plane=control_plane,
+                outcome="technical_failure", error_code=error_code,
+                engine_version=engine_version, worker_target=worker_target)
+            if materialized is None:
+                return _capture_claim_lost_payload(
+                    capture_claim, s, response, control_plane=control_plane)
+            return _attempt_rows_payload(materialized, s, idempotent=False)
         return _finish_attempt_failure(
             claim, sess, s, response,
             stage=stage,
@@ -9098,9 +9637,10 @@ def _process_attempt(
             engine_version=engine_version,
             body=body,
             control_plane=control_plane,
+            worker_target=worker_target,
         )
 
-    if claim.stage == "received":
+    if attempt is None or claim.stage == "received":
         asr_engine_version: str | None = None
         try:
             asr_engine = asr.get_engine()
@@ -9155,13 +9695,24 @@ def _process_attempt(
                 stage="asr", error_code="asr_degraded",
                 engine_version=asr_result.engine_version)
 
-        advanced = _record_asr_success(
-            claim, sess, s, asr_result,
-            body=body,
-            control_plane=control_plane,
-        )
-        if advanced is None:
-            return _claim_lost_payload(claim, s, response)
+        if attempt is None:
+            advanced = _materialize_attempt_from_capture(
+                capture_claim, sess, s, body=body, control_plane=control_plane,
+                outcome="asr_completed", asr_result=asr_result,
+                engine_version=asr_result.engine_version,
+                worker_target=worker_target)
+            if advanced is None:
+                return _capture_claim_lost_payload(
+                    capture_claim, s, response, control_plane=control_plane)
+        else:
+            advanced = _record_asr_success(
+                claim, sess, s, asr_result,
+                body=body,
+                control_plane=control_plane,
+                worker_target=worker_target,
+            )
+            if advanced is None:
+                return _claim_lost_payload(claim, s, response, control_plane=control_plane)
         attempt = advanced
         attempt_asr_text = attempt.asr_text
         attempt_asr_engine_version = attempt.asr_engine_version
@@ -9180,7 +9731,8 @@ def _process_attempt(
     # withdrawal, quarantine or feature disablement.
     with _LIVE_WRITE_LOCK:
         _revalidate_attempt_commit_fence(
-            session_id, body, s, control_plane=control_plane)
+            session_id, body, s, control_plane=control_plane,
+            worker_target=worker_target)
         s.rollback()
     try:
         judge_engine = llm_judge.get_engine()
@@ -9244,9 +9796,10 @@ def _process_attempt(
         body=body,
         bank=bank,
         control_plane=control_plane,
+        worker_target=worker_target,
     )
     if completed is None:
-        return _claim_lost_payload(claim, s, response)
+        return _claim_lost_payload(claim, s, response, control_plane=control_plane)
     return _attempt_rows_payload(completed, s, idempotent=False)
 
 
@@ -9264,13 +9817,23 @@ def process_attempt(session_id: str, body: AttemptProcessIn,
         session_id, body, response, s, control_plane="manual_http")
 
 
-def _fail_closed_p0a_attempt_worker(session_id: str, error_code: str) -> None:
+def _fail_closed_p0a_attempt_worker(
+        session_id: str, error_code: str, *,
+        target: autopilot_orchestration.FrozenWorkerTarget | None = None) -> None:
     """Best-effort safe terminal action for an unexpected worker failure.
 
     This path never raises into the executor.  It only acts while the exact P0a
     capture is still ``processing_attempt``; a competing successful route or human
     state change wins and is left untouched.
+
+    ``target`` must be the exact target this worker froze before any provider I/O.
+    A worker that never froze one (its very first read of the pending command
+    already failed) has no safe binding to act on: this is pure observation, and
+    normal GET recovery is relied on instead — it must never fall back to mutating
+    whatever attempt happens to be current.
     """
+    if target is None:
+        return
     try:
         with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
             with DBSession(db.engine) as worker_db:
@@ -9280,6 +9843,7 @@ def _fail_closed_p0a_attempt_worker(session_id: str, error_code: str) -> None:
                     session_id=session_id,
                     error_code=error_code,
                     source="worker_exception",
+                    target=target,
                 )
                 if not staged:
                     worker_db.rollback()
@@ -9294,10 +9858,30 @@ def _fail_closed_p0a_attempt_worker(session_id: str, error_code: str) -> None:
 
 def _run_p0a_attempt_worker(session_id: str) -> None:
     """Run one recoverable P0a attempt outside the ACK request transaction."""
+    target: autopilot_orchestration.FrozenWorkerTarget | None = None
     try:
         with DBSession(db.engine) as worker_db:
+            # Freeze the immutable target first, from the same locked snapshot,
+            # before deriving the authoritative body and before any provider
+            # I/O. Deriving the body first would risk losing an already-
+            # obtainable target to a later, unrelated gate failure (withdrawal,
+            # quarantine, feature disablement) and degrading fail-close into a
+            # no-op. Every fail-close below must bind to this exact target so a
+            # worker that returns late (after a newer worker has already taken
+            # over and completed/routed a different logical attempt) can only
+            # observe, never mutate that new attempt.
+            target = autopilot_orchestration.derive_worker_target(
+                worker_db, session_id=session_id)
             derived = autopilot_orchestration.derive_authoritative_attempt_input(
                 worker_db, session_id=session_id)
+            if target.raw_audio_id != derived.raw_audio_id:
+                # Two reads of the same locked snapshot within one transaction
+                # cannot legitimately disagree; fail closed rather than trust
+                # either value if they ever do.
+                raise autopilot_orchestration.AutopilotOrchestrationError(
+                    "autopilot_attempt_target_divergence",
+                    "worker target 与 authoritative body 在同一锁定快照内不一致",
+                )
             # Release capture/control read locks before ASR/LLM provider I/O.
             worker_db.rollback()
             body = AttemptProcessIn.model_validate(derived.model_dump(mode="python"))
@@ -9307,13 +9891,14 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
                 Response(),
                 worker_db,
                 control_plane="autopilot_worker",
+                worker_target=target,
             )
     except autopilot_orchestration.AutopilotOrchestrationError as exc:
-        _fail_closed_p0a_attempt_worker(session_id, exc.code)
+        _fail_closed_p0a_attempt_worker(session_id, exc.code, target=target)
         return
     except Exception:
         _fail_closed_p0a_attempt_worker(
-            session_id, "autopilot_worker_exception")
+            session_id, "autopilot_worker_exception", target=target)
         return
 
     if result.get("in_progress") is True:
@@ -9330,16 +9915,37 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
             session_id,
             error_code if isinstance(error_code, str)
             else "autopilot_attempt_technical_failure",
+            target=target,
         )
         return
     if status != "completed" or not isinstance(attempt_payload, dict):
         _fail_closed_p0a_attempt_worker(
-            session_id, "autopilot_attempt_result_invalid")
+            session_id, "autopilot_attempt_result_invalid", target=target)
         return
     attempt_id = attempt_payload.get("id")
     if not isinstance(attempt_id, int) or isinstance(attempt_id, bool):
         _fail_closed_p0a_attempt_worker(
-            session_id, "autopilot_attempt_result_invalid")
+            session_id, "autopilot_attempt_result_invalid", target=target)
+        return
+    if result.get("claim_lost") is True:
+        # This invocation held a live claim on the exact same target and lost
+        # the race to a concurrent worker; the "completed" projection is that
+        # worker's write, not this one's. It may not even be routed yet — this
+        # must be pure observation, never a race to route it too. A fresh
+        # admission-time terminal read (no live claim ever held here) is not
+        # marked this way and still falls through to the target-freshness
+        # check below, so a genuine recovery GET can still route.
+        return
+
+    with DBSession(db.engine) as still_current_db:
+        still_current = autopilot_orchestration.worker_target_still_current(
+            still_current_db, target)
+    if not still_current:
+        # A newer worker has already taken this exact target past
+        # processing_attempt (already routed, or now routing itself). This
+        # completion is not this worker's to route — pure observation; a
+        # normal recovery GET against the session's current target will still
+        # route correctly on its own.
         return
 
     try:
@@ -9359,7 +9965,7 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
         # longer processing_attempt. Otherwise capture proof is rechecked and both
         # runtime/control planes are atomically paused.
         _fail_closed_p0a_attempt_worker(
-            session_id, "autopilot_attempt_route_failed")
+            session_id, "autopilot_attempt_route_failed", target=target)
 
 
 def _manual_interaction_payload(body: InteractionAppendIn) -> dict:
@@ -9706,6 +10312,8 @@ def commit_technical_pause(
                 # call in flight.  Its generation must lose before evidence and
                 # the bedside stop become visible.
                 evidence_ledger.invalidate_processing_claims(
+                    s, session_id=session_id)
+                evidence_ledger.invalidate_capture_processing_claims(
                     s, session_id=session_id)
             # Match the worker/control lock order: runtime is acquired only
             # after autopilot and recoverable attempt generations are fenced.

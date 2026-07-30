@@ -202,7 +202,7 @@ def test_export_ledger_migration_roundtrip_includes_staging_lease(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version"
-            )).scalar_one() == "a3c8e5f7d904"
+            )).scalar_one() == "c7d4f9a1e603"
 
 
 def test_mask_redacts_all_free_text_without_trusting_client_flag():

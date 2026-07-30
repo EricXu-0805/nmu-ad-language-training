@@ -17,7 +17,6 @@ import threading
 from typing import Iterator
 
 from sqlmodel import Session, select
-from sqlalchemy.exc import IntegrityError
 
 from .models import PatientDeviceCapability
 
@@ -94,60 +93,65 @@ def device_id_hash(device_id: str) -> str:
 def create_capability(
         s: Session, *, session_id: str, device_id: str,
         now: datetime | None = None) -> tuple[str, PatientDeviceCapability]:
-    """撤销该场次旧的活跃能力，创建新能力并且只返回一次明文。"""
+    """撤销该场次旧的活跃能力，创建新能力并且只返回一次明文。
+
+    只 stage/flush，从不提交：这是 ``/device/pair`` 唯一调用点，调用方必须在
+    同一事务内完成配对随附的治理动作（例如同场次换绑时的自动驾驶/运行态暂停与
+    claim 失效）后统一提交，让配对本身与其治理防护落在同一个原子快照里。调用
+    方任何一步失败都必须让整个事务回滚——绝不能只重试本函数、丢弃已计划的
+    治理动作后仍把这次配对当作成功返回。
+    """
     issued_at = _utc_naive(now) if now is not None else _utc_now_naive()
     expires_at = issued_at + timedelta(minutes=ttl_minutes())
     hashed_device = device_id_hash(device_id)
 
     with _PAIR_LOCK:
         # ``SELECT FOR UPDATE`` alone cannot lock an absent row.  The nullable
-        # active_session_key has a DB unique constraint, so concurrent workers cannot
-        # both commit an active token.  A loser retries after rollback, revoking the
-        # winner and making the latest completed pair authoritative.
-        for attempt in range(4):
-            try:
-                prior = list(s.exec(
-                    select(PatientDeviceCapability).where(
-                        PatientDeviceCapability.session_id == session_id,
-                        PatientDeviceCapability.revoked_at.is_(None),
-                    ).with_for_update()
-                ))
-                for prior_row in prior:
-                    prior_row.revoked_at = issued_at
-                    prior_row.active_session_key = None
-                    s.add(prior_row)
-                s.flush()
+        # active_session_key has a DB unique constraint, so concurrent workers
+        # cannot both flush an active token undetected. A single attempt only:
+        # this call already sits inside the caller's outer transaction, which
+        # by now holds the LiveState/session/runtime reads and facts (e.g.
+        # ``had_active_capability``) that decide whether rotation fencing
+        # runs. An internal ``rollback()``-and-retry here would silently
+        # invalidate those already-taken locks and snapshots without the
+        # caller's knowledge, so a collision must instead propagate and let
+        # the caller's *entire* transaction retry from a fresh snapshot.
+        prior = list(s.exec(
+            select(PatientDeviceCapability).where(
+                PatientDeviceCapability.session_id == session_id,
+                PatientDeviceCapability.revoked_at.is_(None),
+            ).with_for_update()
+        ))
+        for prior_row in prior:
+            prior_row.revoked_at = issued_at
+            prior_row.active_session_key = None
+            s.add(prior_row)
+        s.flush()
 
-                # 256-bit random bearer; collision is already negligible, but the PK
-                # check keeps the function fail closed under a replaced test RNG.
-                for _ in range(4):
-                    token = secrets.token_urlsafe(32)
-                    hashed = token_hash(token)
-                    if s.get(PatientDeviceCapability, hashed) is None:
-                        break
-                else:  # pragma: no cover - only reachable with a broken/replaced CSPRNG
-                    raise RuntimeError("无法生成唯一设备能力凭据")
+        # 256-bit random bearer; collision is already negligible, but the PK
+        # check keeps the function fail closed under a replaced test RNG.
+        for _ in range(4):
+            token = secrets.token_urlsafe(32)
+            hashed = token_hash(token)
+            if s.get(PatientDeviceCapability, hashed) is None:
+                break
+        else:  # pragma: no cover - only reachable with a broken/replaced CSPRNG
+            raise RuntimeError("无法生成唯一设备能力凭据")
 
-                row = PatientDeviceCapability(
-                    token_hash=hashed,
-                    session_id=session_id,
-                    device_id_hash=hashed_device,
-                    active_session_key=session_id,
-                    created_at=issued_at,
-                    expires_at=expires_at,
-                    last_seen_at=issued_at,
-                    recovery_only_at=None,
-                    revoked_at=None,
-                )
-                s.add(row)
-                s.commit()
-                s.refresh(row)
-                return token, row
-            except IntegrityError as exc:
-                s.rollback()
-                if attempt == 3:
-                    raise RuntimeError("并发设备配对未能安全收敛") from exc
-    raise RuntimeError("无法创建设备能力凭据")  # pragma: no cover
+        row = PatientDeviceCapability(
+            token_hash=hashed,
+            session_id=session_id,
+            device_id_hash=hashed_device,
+            active_session_key=session_id,
+            created_at=issued_at,
+            expires_at=expires_at,
+            last_seen_at=issued_at,
+            recovery_only_at=None,
+            revoked_at=None,
+        )
+        s.add(row)
+        s.flush()
+        return token, row
 
 
 def resolve_capability(

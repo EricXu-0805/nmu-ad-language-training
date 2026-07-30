@@ -1608,6 +1608,13 @@ def pause_autonomous_scope_for_researcher(
         db,
         session_id=session_id,
     )
+    # A pre-attempt capture claim (ASR not yet resolved) needs the identical
+    # fence: a late ASR result must not materialize an AttemptEvent after this
+    # same transaction pauses the scope.
+    evidence_ledger.invalidate_capture_processing_claims(
+        db,
+        session_id=session_id,
+    )
     state.status = "paused"
     state.current_command_id = None
     state.revision += 1
@@ -1638,6 +1645,89 @@ def pause_autonomous_scope_for_researcher(
             "pause", {
                 "reason_code": reason_code,
                 "source": source,
+            }),
+        created_at=observed_at,
+    ))
+    db.flush()
+    db.expire(state)
+    return True
+
+
+def fence_autonomous_scope_for_device_rotation(
+    db: Session,
+    *,
+    session_id: str,
+    now: datetime | None = None,
+) -> bool:
+    """Atomically pause a server-hosted P0a scope when its device is rotated.
+
+    A same-session re-pair (``/device/pair`` issuing a new capability while an
+    old one was still active) revokes the old capability and stages a new one
+    entirely independently of autopilot state — it is not itself an ACK, pause,
+    or withdrawal, so it never used to fence anything here. That left a real
+    gap: an in-flight ASR/judgement result bound to the old device generation
+    could still silently materialize an AttemptEvent and route a next command
+    to the newly paired device, which never asked for or saw the old
+    recording. ``device_capability.create_capability`` only stages/flushes —
+    it never commits. The caller must invoke this function in that same
+    still-uncommitted pairing transaction, after the capability rotation is
+    staged, must pause SessionRuntimeState in the same transaction when this
+    returns ``True``, and must commit the whole thing exactly once: pairing
+    and its fencing land in one atomic snapshot, or neither does. Returns
+    ``False`` when there is no autonomous P0a scope to fence (manual mode, or
+    already paused/terminal) — an ordinary re-pair during manual operation
+    must not be disrupted.
+    """
+    observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
+    state = db.exec(select(SessionAutopilotState).where(
+        SessionAutopilotState.session_id == session_id,
+    ).with_for_update()).first()
+    if state is None or state.mode != "autonomous":
+        return False
+    if state.scope_key != P0A_SCOPE_KEY:
+        _fail("autopilot_state_invalid", "自动驾驶 scope 非法")
+    if state.status in {"paused", "scope_completed", "failed"}:
+        return False
+
+    from_status = state.status
+    command_id = state.current_command_id
+    previous_revision = state.revision
+    # Same fencing as pause_autonomous_scope_for_researcher: a stale in-flight
+    # provider result from the old device generation must never persist ASR/
+    # judgement facts or route a command after this transaction commits.
+    evidence_ledger.invalidate_processing_claims(db, session_id=session_id)
+    evidence_ledger.invalidate_capture_processing_claims(db, session_id=session_id)
+    state.status = "paused"
+    state.current_command_id = None
+    state.revision += 1
+    state.lease_owner = None
+    state.lease_acquired_at = None
+    state.lease_expires_at = None
+    state.last_error_code = "autopilot_device_rotated"
+    state.updated_at = observed_at
+    db.add(state)
+    db.add(AutopilotControlEvent(
+        idempotency_key=_derived_key(
+            "device-rotation-pause", session_id, state.control_generation,
+            state.runner_generation, previous_revision),
+        session_id=session_id,
+        event_seq=_next_control_event_seq(db, session_id),
+        event_type="pause",
+        scope_key=P0A_SCOPE_KEY,
+        control_generation=state.control_generation,
+        runner_generation=state.runner_generation,
+        command_id=command_id,
+        actor_type="system",
+        actor_id=None,
+        reason_code="autopilot_device_rotated",
+        from_mode="autonomous",
+        to_mode="autonomous",
+        from_status=from_status,
+        to_status="paused",
+        payload_json=autopilot_ledger.encode_control_event_payload(
+            "pause", {
+                "reason_code": "autopilot_device_rotated",
+                "source": "device_rotation",
             }),
         created_at=observed_at,
     ))
@@ -1753,6 +1843,11 @@ def fence_autonomous_scope_for_external_stop(
     previous_revision = state.revision
     previous_status = state.status
     evidence_ledger.invalidate_processing_claims(db, session_id=session_id)
+    # Withdrawal/consent-revocation/patient-rec-failure/session-abort all route
+    # through this external-stop path; fence any pre-attempt capture claim the
+    # same way. Same-session device re-pairing does NOT route through here —
+    # see fence_autonomous_scope_for_device_rotation, called from /device/pair.
+    evidence_ledger.invalidate_capture_processing_claims(db, session_id=session_id)
     result = db.execute(
         update(SessionAutopilotState)
         .where(
@@ -4242,12 +4337,30 @@ def apply_device_ack(
         db.add(state)
         db.flush()
         try:
-            autopilot_ledger.verify_record_capture_for_attempt(db, command.id)
+            proof = autopilot_ledger.verify_record_capture_for_attempt(db, command.id)
         except autopilot_ledger.AutopilotProofError as exc:
             raise AutopilotServiceError(
                 "autopilot_record_capture_invalid",
                 "录音回执与服务端采集证据不一致",
             ) from exc
+        # Admit the persistent capture-processing claim in this same transaction,
+        # before any ASR runs. R1-foundation: this decouples audio-capture
+        # admission from AttemptEvent/attempt_seq creation, which still happens
+        # only after ASR resolves (see evidence_ledger.ensure_capture_processing).
+        evidence_ledger.ensure_capture_processing(
+            db,
+            record_command_id=proof.command_id,
+            predecessor_command_id=command.predecessor_command_id,
+            receipt_server_seq=proof.receipt_server_seq,
+            raw_audio_id=proof.raw_audio_id,
+            session_id=proof.session_id,
+            item_id=proof.item_id,
+            turn_seq=proof.turn_seq,
+            proof_attempt_seq=proof.attempt_seq,
+            proof_prompt_level=proof.prompt_level,
+            is_simulation=gate.train_session.is_simulation,
+            now=observed_at,
+        )
         return _ack_result(
             ack=ack, command=command, state=state, replayed=False)
 
