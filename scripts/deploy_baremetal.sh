@@ -10,16 +10,18 @@
 #     自动回滚脚本自己出错时，破坏比它要修的更大。
 #
 # 用法：
-#   scripts/deploy_baremetal.sh deploy   <user@host>
-#   scripts/deploy_baremetal.sh rollback <user@host>   # 用上一次记录的存档回退
+#   scripts/deploy_baremetal.sh deploy   <user@host> [公网入口]
+#   scripts/deploy_baremetal.sh rollback <user@host> [公网入口]  # 用上次的存档回退
+# 给了公网入口，验收才会连红线与受保护路由一起查；不给就只查本机那两组。
 set -euo pipefail
 umask 077
 
 MODE="${1:-}"
 TARGET="${2:-}"
+BASE_URL="${3:-}"
 case "$MODE" in
   deploy|rollback) : ;;
-  *) echo "用法: $0 deploy|rollback <user@host>" >&2; exit 64 ;;
+  *) echo "用法: $0 deploy|rollback <user@host> [公网入口]" >&2; exit 64 ;;
 esac
 [ -n "$TARGET" ] || { echo "缺少 <user@host>" >&2; exit 64; }
 
@@ -33,6 +35,11 @@ STATE_FILE=/opt/nmu/last-deploy.state
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
 
 remote() { "${SSH[@]}" "$TARGET" "$@"; }
+
+# 给了公网入口就连红线与受保护路由一起验；没给就只验本机那两组，并在输出里
+# 留下 SKIP，不假装全验过了。
+preflight_url=""
+[ -z "$BASE_URL" ] || preflight_url="--base-url $BASE_URL"
 
 stamp=$(date +%Y%m%d-%H%M%S)
 
@@ -53,7 +60,7 @@ if [ "$MODE" = "rollback" ]; then
   remote "tar -xzf '$archive' -C /opt/nmu"
   remote "systemctl start nmu.service"
   echo "== 代码已回到存档版本。数据库仍在新头，若结构不兼容必须按 DEPLOY.md 8.1 处置。 =="
-  remote "$VENV_PY $APP_DIR/scripts/preflight_check.py --db $APP_DIR/data/app.db --backup-root $BACKUP_ROOT" || true
+  remote "$VENV_PY $APP_DIR/scripts/preflight_check.py --db $APP_DIR/data/app.db --backup-root $BACKUP_ROOT $preflight_url" || true
   exit 0
 fi
 
@@ -105,8 +112,10 @@ remote "printf 'commit = %s\narchive = %s\nsnapshot = %s\nprevious_head = %s\nat
 remote "chmod 600 $STATE_FILE"
 
 echo "== 7. 验收 =="
-if remote "$VENV_PY $APP_DIR/scripts/preflight_check.py --db $APP_DIR/data/app.db --backup-root $BACKUP_ROOT"; then
-  echo "上线完成。commit $head_commit，回滚存档 $archive"
+if remote "$VENV_PY $APP_DIR/scripts/preflight_check.py --db $APP_DIR/data/app.db --backup-root $BACKUP_ROOT $preflight_url"; then
+  # 变量后面紧跟全角标点必须加花括号：bash 在 UTF-8 locale 下会把那几个字节
+  # 算进变量名，set -u 报一个查不出来的 unbound variable。
+  echo "上线完成。commit ${head_commit}，回滚存档 ${archive}"
 else
   echo "" >&2
   echo "preflight 没过。不自动回滚——自动回滚脚本自己出错时破坏更大。" >&2
