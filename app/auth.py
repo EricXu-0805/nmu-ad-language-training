@@ -338,16 +338,34 @@ def _drop_tracked_key(key: str) -> None:
     _TRACKED_KEYS.pop(key, None)
 
 
-def _touch_tracked_key(key: str) -> None:
+def _evict_one_tracked_key(now: float) -> bool:
+    """腾一个位置；腾不出来返回 False，绝不为了塞新 key 去解一把还生效的锁。
+
+    原来是无条件 LRU 弹最旧。一个刚被锁住的攻击者只要再用伪造来源灌满
+    _TRACKED_KEYS(默认 4096)，就能把自己那把锁挤出去接着猜密码/PIN——而
+    X-Forwarded-For 的最左一跳本来就是客户端可写的，伪造来源不需要什么本事。
+    现在只淘汰没锁或锁已过期的条目。整张表都在锁定中时不再腾位，新失败落到
+    按 scope 计数的全局限速器(默认 64 次/300 秒 → 全局锁 30 秒)上——那一层
+    不按来源分桶，正是为分布式失败准备的，伪造来源撑不爆它。
+    """
+    for candidate in _TRACKED_KEYS:
+        until = _LOCKED_UNTIL.get(candidate)
+        if until is None or now >= until:
+            _drop_tracked_key(candidate)
+            return True
+    return False
+
+
+def _touch_tracked_key(key: str, now: float) -> bool:
     if key in _TRACKED_KEYS:
         _TRACKED_KEYS.move_to_end(key)
-        return
+        return True
     capacity = _tracked_keys_max()
     while len(_TRACKED_KEYS) >= capacity:
-        oldest, _ = _TRACKED_KEYS.popitem(last=False)
-        _FAILURES.pop(oldest, None)
-        _LOCKED_UNTIL.pop(oldest, None)
+        if not _evict_one_tracked_key(now):
+            return False
     _TRACKED_KEYS[key] = None
+    return True
 
 
 def _sweep(now: float) -> None:
@@ -415,13 +433,13 @@ def is_locked(key: str, *, now: float | None = None) -> bool:
         until = _LOCKED_UNTIL.get(key)
         if until is None:
             if key in _FAILURES:
-                _touch_tracked_key(key)
+                _touch_tracked_key(key, current)
             return False
         if current >= until:
             _drop_tracked_key(key)
             return False
         _LOCKED_UNTIL.move_to_end(key)
-        _touch_tracked_key(key)
+        _touch_tracked_key(key, current)
         return True
 
 
@@ -442,7 +460,10 @@ def record_failure(key: str, *, now: float | None = None) -> None:
         else:
             _GLOBAL_FAILURES[scope] = global_hits
 
-        _touch_tracked_key(key)
+        # 全局计数已经在上面记过了。表满且全部在锁定中时，这条失败只进全局
+        # 限速器，不再为了给它腾位而放掉别人的锁。
+        if not _touch_tracked_key(key, current):
+            return
         hits = [t for t in _FAILURES.get(key, []) if current - t < window]
         hits.append(current)
         _FAILURES[key] = hits

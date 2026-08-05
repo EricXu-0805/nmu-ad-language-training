@@ -222,7 +222,36 @@ def test_unique_ip_flood_is_lru_bounded_for_failures_and_locks(monkeypatch):
     assert len(auth._TRACKED_KEYS) <= 4
     assert len(set(auth._FAILURES) | set(auth._LOCKED_UNTIL)) <= 4
     assert set(auth._FAILURES) | set(auth._LOCKED_UNTIL) == set(auth._TRACKED_KEYS)
-    assert "pair:spoofed-11" in auth._LOCKED_UNTIL
+    # 只有还没锁上的那个会被腾掉;先到的四把锁一把不少地留着。表满之后新来的
+    # 伪造来源不再入表——它们交给按 scope 的全局限速器,见下一条用例。
+    assert "login:failure-only" not in auth._TRACKED_KEYS
+    assert all(auth.is_locked(f"pair:spoofed-{index}", now=20.0) for index in range(4))
+    assert "pair:spoofed-11" not in auth._LOCKED_UNTIL
+
+
+def test_a_locked_attacker_cannot_flush_their_own_lock_by_flooding(monkeypatch):
+    """锁定表满了也不能拿"解锁"去换"腾位"。
+
+    这条对着的是真实攻击路径:X-Forwarded-For 的最左一跳客户端可写,所以
+    _client_ip 看到的来源是攻击者自己填的。旧实现无条件 LRU 弹最旧,攻击者
+    被锁之后灌 4096 个伪造来源就能把自己那把锁挤掉,锁定形同虚设。
+    """
+    monkeypatch.setenv("AUTH_TRACKED_KEYS_MAX", "3")
+    monkeypatch.setenv("AUTH_FAIL_MAX", "2")
+    monkeypatch.setenv("AUTH_LOCK_SECONDS", "300")
+    monkeypatch.setenv("AUTH_GLOBAL_FAIL_MAX", "10000")
+
+    auth.record_failure("pair:attacker", now=100.0)
+    auth.record_failure("pair:attacker", now=100.0)
+    assert auth.is_locked("pair:attacker", now=100.0)
+
+    for index in range(200):
+        forged = f"pair:forged-{index}"
+        auth.record_failure(forged, now=100.0 + index * 0.01)
+        auth.record_failure(forged, now=100.0 + index * 0.01)
+
+    assert auth.is_locked("pair:attacker", now=100.0 + 200 * 0.01)
+    assert len(auth._TRACKED_KEYS) <= 3
 
 
 def test_distributed_failure_fallback_is_scoped_and_expires(monkeypatch):

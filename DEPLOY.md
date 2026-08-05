@@ -464,6 +464,17 @@ docker compose ps
 
 ## 部署自检清单
 
+下面这些里，迁移头、备份新鲜度、公网红线与受保护路由这四项可以先跑一条命令
+自动过一遍（不打任何供应商云 API，不花钱，不把文本发出去）：
+
+```bash
+.venv/bin/python scripts/preflight_check.py \
+    --db data/app.db --backup-root /opt/nmu/backups \
+    --base-url https://<公网入口>
+```
+
+任一项 FAIL 即非零退出。其余项目仍须人工核对。
+
 - [ ] 仓库私有；`.env` 已 `chmod 600` 且未入库
 - [ ] Compose project 精确为 `nmu-platform`；命令和运行环境均无 `-p` / `COMPOSE_PROJECT_NAME` 覆盖；现场旧 project/卷已先盘点，没有因身份漂移新建空卷
 - [ ] `APP_IMAGE` 是已审查的 `@sha256` 引用，实际容器镜像 ID 与发布证据一致；生产 Compose 不含 `build:`
