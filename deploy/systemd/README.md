@@ -7,12 +7,22 @@
 安装：
 
 ```bash
-install -m 644 deploy/systemd/nmu.service        /etc/systemd/system/nmu.service
-install -m 644 deploy/systemd/nmu-caddy.service  /etc/systemd/system/nmu-caddy.service
-install -m 644 deploy/systemd/nmu-backup.service /etc/systemd/system/nmu-backup.service
-install -m 644 deploy/systemd/nmu-backup.timer   /etc/systemd/system/nmu-backup.timer
+for unit in deploy/systemd/*.service deploy/systemd/*.timer; do
+  install -m 644 "$unit" "/etc/systemd/system/$(basename "$unit")"
+done
 systemctl daemon-reload
+systemctl enable --now nmu-backup.timer nmu-backup-health.timer \
+                       nmu-capacity.timer nmu-restore-drill.timer
 ```
+
+四个定时任务（时间都写 UTC，因为机器时区是 UTC；括号里是上海时间）：
+
+| 单元 | 何时 | 干什么 | 结论落在哪 |
+| --- | --- | --- | --- |
+| `nmu-backup` | 每天 19:30（03:30） | 快照 + 校验 + 原子发布 | `backup.log` |
+| `nmu-backup-health` | 每天 20:40（04:40） | 判备份链健不健康 | `health.state` |
+| `nmu-capacity` | 每天 21:10（05:10） | 占用率、备份增长、还能撑几天 | `capacity.state` |
+| `nmu-restore-drill` | 每周日 21:30（周一 05:30） | 把最新快照真恢复出来并启动应用 | `restore-drill.state` |
 
 改完单元必须现场核对，别只看 `systemctl status`：
 

@@ -1,0 +1,9 @@
+[Unit]
+Description=NMU capacity check 05:10 Asia/Shanghai (21:10 UTC), after the backup and its health verdict
+
+[Timer]
+OnCalendar=*-*-* 21:10:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

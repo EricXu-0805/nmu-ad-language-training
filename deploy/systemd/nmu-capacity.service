@@ -1,0 +1,12 @@
+[Unit]
+Description=NMU disk capacity and backup growth verdict (writes /opt/nmu/backups/capacity.state)
+
+[Service]
+Type=oneshot
+# 只用标准库，系统 python3 足够——容量告警不能依赖应用 venv 是否健在。
+ExecStart=/usr/bin/python3 /opt/nmu/app/scripts/capacity_check.py \
+    --backup-root /opt/nmu/backups \
+    --data-dir /opt/nmu/app/data \
+    --state-file /opt/nmu/backups/capacity.state
+Nice=15
+IOSchedulingClass=idle

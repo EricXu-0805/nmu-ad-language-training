@@ -1,0 +1,12 @@
+[Unit]
+Description=NMU weekly restore drill on the newest snapshot (writes /opt/nmu/backups/restore-drill.state)
+
+[Service]
+Type=oneshot
+# 校验器和应用启动都要 SQLAlchemy/FastAPI，只能用应用自己的 venv。
+ExecStart=/bin/sh -c '/opt/nmu/venv/bin/python /opt/nmu/app/scripts/restore_drill.py \
+    "$(ls -d /opt/nmu/backups/daily/*/ | tail -1)" \
+    > /opt/nmu/backups/restore-drill.state 2>&1'
+ExecStartPost=/bin/chmod 600 /opt/nmu/backups/restore-drill.state
+Nice=15
+IOSchedulingClass=idle
