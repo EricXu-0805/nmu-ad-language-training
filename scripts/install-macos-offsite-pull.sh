@@ -30,7 +30,13 @@ REMOTE_ROOT="${3:-/opt/nmu/backups}"
 [ "$(uname -s)" = "Darwin" ] || { echo "只面向 macOS 工作站" >&2; exit 64; }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-ROOT="$HOME/Library/Application Support/nmu-backup"
+# 路径里不许有空格。第一版放在 ~/Library/Application Support/nmu-backup，config.env
+# 被 `set -a; . config.env` 读进来时，"Application" 后面那半截直接被当成命令执行
+# （`Support/nmu-backup/offsite: No such file or directory`）。拉取脚本本身有六百行
+# shell、上百处路径展开，只要有一处没加引号就会以同样的方式在生产里炸——换个不带
+# 空格的根目录，整类问题一次消掉。
+ROOT="$HOME/Library/nmu-backup"
+LEGACY_ROOT="$HOME/Library/Application Support/nmu-backup"
 PLIST="$HOME/Library/LaunchAgents/com.nmu.vps-backup-pull.plist"
 LABEL="com.nmu.vps-backup-pull"
 SQLALCHEMY_PIN="2.0.51"
@@ -54,24 +60,34 @@ fi
   "sqlalchemy==$SQLALCHEMY_PIN"
 
 cat > "$ROOT/config.env" <<EOF
-NMU_BACKUP_SSH_USER=$SSH_USER
-NMU_BACKUP_SSH_HOST=$SSH_HOST
-NMU_BACKUP_REMOTE_ROOT=$REMOTE_ROOT
-NMU_BACKUP_LOCAL_ROOT=$ROOT/offsite
-PYTHON_BIN=$ROOT/venv/bin/python
+NMU_BACKUP_SSH_USER='$SSH_USER'
+NMU_BACKUP_SSH_HOST='$SSH_HOST'
+NMU_BACKUP_REMOTE_ROOT='$REMOTE_ROOT'
+NMU_BACKUP_LOCAL_ROOT='$ROOT/offsite'
+PYTHON_BIN='$ROOT/venv/bin/python'
 EOF
 chmod 600 "$ROOT/config.env"
 
-cat > "$ROOT/run-pull.sh" <<'EOF'
+# config.env 是被 `set -a; .` 读进去的。值没加引号时，bash 会把值里第一个空格
+# 之后的部分当成一条命令去执行，而这个错误只会出现在 launchd 的日志里——第一版
+# 就是这么静默失败的。这里直接查发出去的每一行是不是 KEY='...' 的形状，不靠执行。
+while IFS= read -r config_line; do
+  [ -n "$config_line" ] || continue
+  [[ "$config_line" =~ ^[A-Z_]+=\'[^\']*\'$ ]] || {
+    echo "config.env 有一行没有正确加引号：${config_line%%=*}" >&2
+    exit 1
+  }
+done < "$ROOT/config.env"
+
+cat > "$ROOT/run-pull.sh" <<EOF
 #!/bin/bash
 # launchd 入口。只做三件事：读配置、进运行时目录、跑拉取脚本。
 set -euo pipefail
 umask 077
-ROOT="$HOME/Library/Application Support/nmu-backup"
 set -a
-. "$ROOT/config.env"
+. '$ROOT/config.env'
 set +a
-cd "$ROOT/runtime"
+cd '$ROOT/runtime'
 exec ./scripts/vps-backup-pull.sh
 EOF
 chmod 700 "$ROOT/run-pull.sh"
@@ -106,21 +122,42 @@ chmod 644 "$PLIST"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
+if [ -d "$LEGACY_ROOT" ]; then
+  # 变量后面紧跟全角标点必须加花括号：bash 在 UTF-8 locale 下会把那几个字节
+  # 当成变量名的一部分，set -u 直接报一个查不出来的 unbound variable。
+  echo "提示：旧的带空格根目录还在 ${LEGACY_ROOT}，确认无快照后自行 trash 掉。"
+fi
+
 echo "已安装到 $ROOT"
 echo "现在立刻跑一次，验证 launchd 这条路真的通："
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
-for _ in $(seq 1 60); do
-  state=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk '/^\tstate = /{print $3}')
-  [ "$state" = "running" ] || break
-  sleep 2
+job_state() {
+  launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
+    | awk -F'= ' '/^\tstate = /{print $2; exit}'
+}
+
+# 首轮要把远端十几份快照逐个校验、按 manifest 白名单二次 rsync，十分钟是常态。
+# 第一版只等两分钟就去读退出码，读到的是 "(never exited)"，于是把一次正在正常
+# 运行的拉取报成了失败。
+echo "等它跑完（首轮可能十几分钟）……"
+waited=0
+while [ "$(job_state)" = "running" ] && [ "$waited" -lt 1800 ]; do
+  sleep 10
+  waited=$((waited + 10))
 done
 
+if [ "$(job_state)" = "running" ]; then
+  echo "等了 ${waited} 秒还在跑。自己盯：launchctl print gui/$(id -u)/$LABEL" >&2
+  exit 1
+fi
+
 status=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
-  | awk '/last exit code = /{print $NF}')
+  | awk -F'= ' '/last exit code/{print $2; exit}')
 echo "launchd 上次退出码: ${status:-未知}"
 tail -3 "$ROOT/offsite/pull.log" 2>/dev/null || echo "(还没有 pull.log)"
 [ "${status:-1}" = "0" ] || {
   echo "launchd 这一路仍然不通，看 $HOME/Library/Logs/nmu-vps-backup-pull.log" >&2
   exit 1
 }
+echo "异地拉取这条路已经跑通，每天 12:30 自动执行。"
