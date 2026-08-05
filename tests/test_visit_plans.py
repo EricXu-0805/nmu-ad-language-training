@@ -11,20 +11,36 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
+import hashlib
+import json
 from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import auth, content, db, visit_plan_service
+from app import (
+    auth, autopilot_plan_profiles, content, db, repeat_intent,
+    visit_plan_service,
+)
 from app.main import app
 from app.models import (
     AssessmentEvent,
+    AttemptCaptureProcessing,
+    AttemptEvent,
+    AudioAssetRow,
     AuditLog,
+    AutopilotControlEvent,
+    AutopilotRepeatRequest,
+    InteractionEvent,
+    LiveState,
     Patient,
+    PatientDeviceCapability,
     ResearchUser,
+    RuntimeCommand,
+    RuntimeCommandAck,
     Session as TrainSession,
+    SessionAutopilotState,
     SessionCloseoutReport,
     SessionRuntimeState,
     VisitPlan,
@@ -35,7 +51,10 @@ from app.models import (
 BANK = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
 PROTOCOL = content.load_autopilot_protocol(
     content.CONTENT_DIR / "autopilot_protocol_v1.json")
-TODAY = date.today()
+REPEAT_PROTOCOL = repeat_intent.active_protocol()
+# 服务端的"今天"按 RESEARCH_TIMEZONE(默认 Asia/Shanghai)算,不是机器本地时区。
+# date.today() 会让这套用例在 UTC 机器上每天有八小时整片翻红。
+TODAY = visit_plan_service._research_today()
 RECEIPT_KEYS = {
     "plan_id",
     "patient_id",
@@ -47,6 +66,7 @@ RECEIPT_KEYS = {
     "phase_type",
     "event_line",
     "item_bank_version_id",
+    "autopilot_profile_version_id",
     "is_simulation",
     "data_classification",
     "status",
@@ -75,6 +95,10 @@ STARTED_SESSION_KEYS = {
     "item_bank_definition_digest",
     "autopilot_protocol_version_id",
     "autopilot_protocol_definition_digest",
+    "repeat_protocol_version_id",
+    "repeat_protocol_definition_digest",
+    "autopilot_profile_version_id",
+    "autopilot_profile_definition_digest",
     "is_simulation",
     "data_classification",
 }
@@ -215,6 +239,1419 @@ def _command(
     if action == "cancel":
         body["reason_code"] = reason_code
     return client.post(f"/visit-plans/{plan_id}/{action}", json=body)
+
+
+# --------------------------------------------------------------------------
+# D1A autopilot demo profile: draft-only binding contract
+#
+# This release freezes the 20-item simulation demo at the draft stage.  Nothing
+# here may approve, start, run or complete a demo scope; the canonical plan
+# must keep behaving exactly as it did before the profile columns existed.
+# --------------------------------------------------------------------------
+
+
+DEMO_VERSION = autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_VERSION
+DEMO_DIGEST = autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_DIGEST
+# The exact pre-D1A create payload field set.  Byte compatibility is pinned by
+# rebuilding the legacy hash from this literal list, not by re-running today's
+# production helper against itself.
+LEGACY_CREATE_FIELDS = (
+    "idempotency_key", "patient_id", "scheduled_date", "scheduled_time",
+    "queue_order", "session_sitting_no", "week_no", "phase_type", "event_line",
+)
+
+
+def _frozen_request_hash(command_type: str, payload: dict) -> str:
+    """The pre-D1A canonical encoding, restated here instead of imported.
+
+    Written out independently so a defect in the production hash helper cannot
+    be hidden by comparing that helper against itself.
+    """
+    def encoded(value):
+        if isinstance(value, (date, datetime, time)):
+            return value.isoformat()
+        return getattr(value, "value", value)
+
+    canonical = json.dumps(
+        {
+            "command_type": command_type,
+            **{key: encoded(value) for key, value in payload.items()},
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# Immutable pre-D1A evidence.  These are literal receipts, not values derived
+# from today's globals: a fixture that recomputes both sides from live content
+# would co-move with a regression and stay green.
+LEGACY_DATE = date(2026, 7, 31)
+LEGACY_TIME = time(9, 30)
+LEGACY_BANK_VERSION = "wk2-v1-20260707"
+LEGACY_BANK_DIGEST = (
+    "80ca521df07de060b8f31f0c768c776ac4d2a62ef9114513aaae3c0cd5a016c4")
+LEGACY_PROTOCOL_VERSION = "autopilot-v1-20260729"
+LEGACY_PROTOCOL_DIGEST = (
+    "51fe62990cc0bc6934b4fbe7c8d902369c0b9fd7e092136572da3fa375b989d9")
+LEGACY_REPEAT_VERSION = "repeat-intent-v1-20260730-proposal"
+LEGACY_REPEAT_DIGEST = (
+    "51e8ce30d6273df52fc25011ed00ebc5fba15b30c9ed98b4ccc146b72e05484f")
+LEGACY_STARTED_CREATE_HASH = (
+    "ab06a584340613a60717ba98f9721e6ca56e0f4fa6000460e4fa11f229fee8ec")
+LEGACY_STARTED_APPROVE_HASH = (
+    "8f088e1579fa691b1c55665875a4e18e61dc5a3172b3ac370ee30f3f83830a4f")
+LEGACY_STARTED_START_HASH = (
+    "7230d030a02c379fceb1d2ee42e78918bd296071e3c2328ec150b45a6f60eb12")
+LEGACY_CANCELLED_CREATE_HASH = (
+    "1e521e4062167559a7f76169d5d6d3aa9aad7892985f6af2246eeb6f841c210d")
+LEGACY_CANCELLED_CANCEL_HASH = (
+    "8d6571b2ff63fa9c978c64c0a249a28a9dc36105791a2c37aad7e93ffd81d7df")
+LEGACY_STARTED_SLOT = (
+    "51d3e0e6411f99b5a2f844286946627af80f85e74695fa92eb8bca649d147cf5")
+LEGACY_CANCELLED_SLOT = (
+    "07d7f2bd33b03c6e26aa07f72c0cbd339194bc95ab12196b7f70a2adb09ce28b")
+
+
+def _legacy_create_hash(body: dict) -> str:
+    """The frozen pre-D1A create payload.
+
+    Nine of these keys are the client-supplied create fields; the remaining two
+    are the server-owned repeat pair that already existed before D1A.  The
+    canonical payload therefore has eleven keys, and the new profile key is
+    absent entirely rather than present as NULL.
+    """
+    client_fields = {
+        "idempotency_key": body["idempotency_key"],
+        "patient_id": body["patient_id"],
+        "scheduled_date": date.fromisoformat(body["scheduled_date"]),
+        "scheduled_time": (
+            time.fromisoformat(body["scheduled_time"])
+            if body["scheduled_time"] is not None else None),
+        "queue_order": body["queue_order"],
+        "session_sitting_no": body["session_sitting_no"],
+        "week_no": body["week_no"],
+        "phase_type": body["phase_type"],
+        "event_line": body["event_line"],
+    }
+    assert set(client_fields) == set(LEGACY_CREATE_FIELDS)
+    payload = {
+        **client_fields,
+        "repeat_protocol_version_id": LEGACY_REPEAT_VERSION,
+        "repeat_protocol_definition_digest": LEGACY_REPEAT_DIGEST,
+    }
+    assert len(payload) == 11
+    assert "autopilot_profile_version_id" not in payload
+    return _frozen_request_hash("create", payload)
+
+
+def _legacy_mutation_hash(
+        command_type: str, plan_id: str, key: str, expected_revision: int,
+        *, reason_code: str | None = None) -> str:
+    payload: dict = {
+        "plan_id": plan_id,
+        "idempotency_key": key,
+        "expected_revision": expected_revision,
+    }
+    if reason_code is not None:
+        payload["reason_code"] = reason_code
+    if command_type in {"approve", "start"}:
+        payload["repeat_protocol_version_id"] = LEGACY_REPEAT_VERSION
+        payload["repeat_protocol_definition_digest"] = LEGACY_REPEAT_DIGEST
+    assert "autopilot_profile_version_id" not in payload
+    return _frozen_request_hash(command_type, payload)
+
+
+def _plan_row(engine, plan_id: str) -> VisitPlan:
+    with Session(engine) as session:
+        row = session.get(VisitPlan, plan_id)
+        assert row is not None
+        session.expunge(row)
+        return row
+
+
+_PROFILE_WRITE_MODELS = (
+    VisitPlan, VisitPlanCommand, TrainSession, SessionRuntimeState)
+
+
+def _write_counts(engine) -> dict:
+    """Every column of every row, so a row *update* is detectable too.
+
+    Counting rows would false-green an insert paired with a delete, and would
+    miss a refusal that still mutated an existing Plan or command in place.
+    Columns are read from ``__table__.columns`` at call time so a field added
+    later is covered without maintaining a list.
+    """
+    snapshot: dict[str, dict] = {}
+    with Session(engine) as session:
+        for model in _PROFILE_WRITE_MODELS:
+            names = tuple(column.name for column in model.__table__.columns)
+            rows = [tuple(getattr(row, name) for name in names)
+                    for row in session.exec(select(model))]
+            snapshot[model.__name__] = {
+                "columns": names, "rows": sorted(rows, key=repr)}
+    return snapshot
+
+
+def _force_profile_pair(
+        engine, plan_id: str, version: str | None, digest: str | None,
+        *, status: str | None = None) -> None:
+    """Seed an anomalous stored pair the product path can never produce.
+
+    A half pair is exactly what the database CHECK forbids, so this models a
+    corrupted restore by suspending the check for the one seeding write.  The
+    service must still refuse it on its own.
+    """
+    half_pair = (version is None) != (digest is None)
+    with Session(engine) as session:
+        if half_pair:
+            session.connection().exec_driver_sql(
+                "PRAGMA ignore_check_constraints=ON")
+        row = session.get(VisitPlan, plan_id)
+        assert row is not None
+        row.autopilot_profile_version_id = version
+        row.autopilot_profile_definition_digest = digest
+        if status is not None:
+            row.status = status
+        session.add(row)
+        session.commit()
+
+
+def _add_research_patient(engine, patient_id: str) -> None:
+    with Session(engine) as session:
+        session.add(Patient(
+            patient_id=patient_id,
+            is_simulation_subject=False,
+            consent_status="已同意",
+            consent_type="本人同意",
+            mandarin_eligible=True,
+            recording_allowed=True,
+            secondary_use_allowed=True,
+        ))
+        session.commit()
+
+
+def _detail_code(response) -> str:
+    payload = response.json()
+    assert isinstance(payload.get("detail"), dict), response.text
+    return payload["detail"]["code"]
+
+
+# ---- contract shape -------------------------------------------------------
+
+
+def test_client_supplied_profile_digest_is_rejected(visit_clients):
+    response = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-01", "create-digest-forbid-01",
+        autopilot_profile_definition_digest=DEMO_DIGEST))
+
+    assert response.status_code == 422, response.text
+
+
+def test_simulation_demo_create_exposes_version_but_never_digest(visit_clients):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-01", "create-demo-draft-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+
+    assert created["autopilot_profile_version_id"] == DEMO_VERSION
+    assert "autopilot_profile_definition_digest" not in created
+    assert set(created) == RECEIPT_KEYS
+    assert created["status"] == "draft"
+    row = _plan_row(visit_clients.engine, created["plan_id"])
+    assert row.autopilot_profile_version_id == DEMO_VERSION
+    assert row.autopilot_profile_definition_digest == DEMO_DIGEST
+
+
+def test_canonical_create_stays_paired_null(visit_clients):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-02", "create-canon-null-01")
+
+    assert created["autopilot_profile_version_id"] is None
+    row = _plan_row(visit_clients.engine, created["plan_id"])
+    assert row.autopilot_profile_version_id is None
+    assert row.autopilot_profile_definition_digest is None
+
+
+# The unsupported-canonical-week journey is already owned by
+# ``test_unsupported_protocol_may_be_drafted_but_cannot_be_approved``; the only
+# thing D1A adds there is that the receipt stays paired-null, asserted below.
+
+
+def test_unsupported_canonical_draft_is_still_paired_null(visit_clients):
+    """A NULL selector must never reach the Week-2 demo context gate."""
+    created = _create(
+        visit_clients.researcher, "P-VISIT-03", "create-w1rel-0001",
+        week_no=1, phase_type="关系建立", event_line="关系建立环节")
+
+    assert created["autopilot_profile_version_id"] is None
+    row = _plan_row(visit_clients.engine, created["plan_id"])
+    assert row.autopilot_profile_version_id is None
+    assert row.autopilot_profile_definition_digest is None
+
+
+# ---- create-time refusal, always with zero writes -------------------------
+
+
+def test_unknown_profile_version_is_refused_without_writes(visit_clients):
+    before = _write_counts(visit_clients.engine)
+
+    response = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-04", "create-unknown-prof-01",
+        autopilot_profile_version_id="no-such-demo-v9"))
+
+    assert response.status_code == 422, response.text
+    assert _detail_code(response) == "visit_plan_profile_unknown"
+    assert _write_counts(visit_clients.engine) == before
+
+
+@pytest.mark.parametrize(
+    "slug,overrides",
+    [
+        # Exactly one field moves away from the valid demo context each time,
+        # so the failure can only be attributed to that field.
+        ("week", {"week_no": 3}),
+        ("phase", {"phase_type": "基线测评"}),
+        ("event", {"event_line": "基线测评窗"}),
+    ],
+)
+def test_demo_selector_with_wrong_context_is_refused_without_writes(
+        visit_clients, slug, overrides):
+    before = _write_counts(visit_clients.engine)
+
+    response = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-04", f"create-ctx-{slug}-0001",
+        autopilot_profile_version_id=DEMO_VERSION, **overrides))
+
+    assert response.status_code == 422, response.text
+    assert _detail_code(response) == "visit_plan_profile_context_mismatch"
+    assert _write_counts(visit_clients.engine) == before
+
+
+def test_real_subject_cannot_select_the_demo_profile(visit_clients):
+    _add_research_patient(visit_clients.engine, "P-REAL-01")
+    before = _write_counts(visit_clients.engine)
+
+    response = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-REAL-01", "create-real-demo-01",
+        autopilot_profile_version_id=DEMO_VERSION))
+
+    assert response.status_code == 409, response.text
+    assert _detail_code(response) == "visit_plan_profile_simulation_required"
+    assert _write_counts(visit_clients.engine) == before
+
+
+@pytest.mark.parametrize(
+    "core_code,expected_code,expected_status",
+    [
+        ("plan_profile_binding_incomplete",
+         "visit_plan_profile_binding_incomplete", 409),
+        ("plan_profile_digest_mismatch",
+         "visit_plan_profile_digest_mismatch", 409),
+        ("plan_profile_parent_mismatch",
+         "visit_plan_profile_parent_mismatch", 409),
+        ("plan_profile_invalid", "visit_plan_profile_invalid", 409),
+    ],
+)
+def test_core_profile_codes_map_to_stable_service_codes_without_writes(
+        visit_clients, monkeypatch, core_code, expected_code, expected_status):
+    """Classification is structural: the service never parses a message."""
+    def refuse(*_args, **_kwargs):
+        raise autopilot_plan_profiles.PlanProfileError(core_code, "注入失败")
+
+    monkeypatch.setattr(
+        autopilot_plan_profiles, "resolve_requested_definition", refuse)
+    before = _write_counts(visit_clients.engine)
+
+    response = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-04", f"create-map-{core_code[13:21]}-01",
+        autopilot_profile_version_id=DEMO_VERSION))
+
+    assert response.status_code == expected_status, response.text
+    assert _detail_code(response) == expected_code
+    assert _write_counts(visit_clients.engine) == before
+
+
+def test_demo_create_reads_the_bundle_exactly_twice(visit_clients,
+                                                    monkeypatch):
+    """Pre-lock resolution and one lock-anchored resolution, nothing more.
+
+    A third read is made fatal, so a successful create proves both that only
+    two reads happened and that no post-lock read could mix parents into the
+    persisted Plan.
+    """
+    real = visit_plan_service._current_definition_bundle
+    reads = {"n": 0}
+
+    def counted():
+        reads["n"] += 1
+        if reads["n"] > 2:
+            raise AssertionError("third canonical bundle read")
+        return real()
+
+    monkeypatch.setattr(
+        visit_plan_service, "_current_definition_bundle", counted)
+
+    created = _create(
+        visit_clients.researcher, "P-VISIT-12", "create-two-reads-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+
+    assert reads["n"] == 2
+    assert created["autopilot_profile_version_id"] == DEMO_VERSION
+    row = _plan_row(visit_clients.engine, created["plan_id"])
+    assert row.autopilot_profile_definition_digest == DEMO_DIGEST
+    assert row.item_bank_version_id == BANK.version_id
+
+
+def test_canonical_create_reads_the_bundle_exactly_once(visit_clients,
+                                                        monkeypatch):
+    """A NULL selector loads the canonical bundle once, after the lock."""
+    real = visit_plan_service._current_definition_bundle
+    reads = {"n": 0}
+
+    def counted():
+        reads["n"] += 1
+        return real()
+
+    monkeypatch.setattr(
+        visit_plan_service, "_current_definition_bundle", counted)
+
+    _create(visit_clients.researcher, "P-VISIT-12", "create-one-read-01")
+
+    assert reads["n"] == 1
+
+
+def test_definition_change_across_the_patient_lock_is_refused(visit_clients,
+                                                              monkeypatch):
+    """The second, locked resolution must reproduce the pinned identity."""
+    real = autopilot_plan_profiles.resolve_requested_definition
+    calls = {"n": 0}
+
+    def drifting(version_id, *, bank, protocol):
+        definition = real(version_id, bank=bank, protocol=protocol)
+        calls["n"] += 1
+        if calls["n"] == 1 or definition is None:
+            return definition
+        return replace(definition, profile_definition_digest="f" * 64)
+
+    monkeypatch.setattr(
+        autopilot_plan_profiles, "resolve_requested_definition", drifting)
+    before = _write_counts(visit_clients.engine)
+
+    response = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-05", "create-toctou-prof-01",
+        autopilot_profile_version_id=DEMO_VERSION))
+
+    assert response.status_code == 409, response.text
+    assert _detail_code(response) == "visit_plan_profile_digest_mismatch"
+    assert calls["n"] >= 2
+    assert _write_counts(visit_clients.engine) == before
+
+
+# ---- replay may never answer for a tampered pair --------------------------
+
+
+def test_demo_replay_refuses_after_the_stored_pair_is_cleared(visit_clients):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-06", "create-tamper-null-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+    _force_profile_pair(visit_clients.engine, created["plan_id"], None, None)
+
+    replayed = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-06", "create-tamper-null-01",
+        autopilot_profile_version_id=DEMO_VERSION))
+
+    assert replayed.status_code == 409, replayed.text
+    assert _detail_code(replayed) == "visit_plan_profile_digest_mismatch"
+
+
+def test_canonical_replay_refuses_after_a_demo_pair_is_injected(visit_clients):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-06", "create-tamper-demo-01")
+    _force_profile_pair(
+        visit_clients.engine, created["plan_id"], DEMO_VERSION, DEMO_DIGEST)
+
+    replayed = visit_clients.researcher.post(
+        "/visit-plans",
+        json=_plan_body("P-VISIT-06", "create-tamper-demo-01"))
+
+    assert replayed.status_code == 409, replayed.text
+    assert _detail_code(replayed) == "visit_plan_profile_digest_mismatch"
+
+
+def test_same_idempotency_key_across_profiles_is_an_idempotency_conflict(
+        visit_clients):
+    _create(visit_clients.researcher, "P-VISIT-07", "create-cross-key-01")
+
+    conflict = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-07", "create-cross-key-01",
+        autopilot_profile_version_id=DEMO_VERSION))
+
+    assert conflict.status_code == 409, conflict.text
+    assert _detail_code(conflict) == "visit_plan_idempotency_conflict"
+
+
+def test_same_protocol_slot_across_profiles_is_a_slot_conflict(visit_clients):
+    _create(visit_clients.researcher, "P-VISIT-08", "create-slot-canon-01")
+
+    conflict = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-08", "create-slot-demo-0001",
+        autopilot_profile_version_id=DEMO_VERSION))
+
+    assert conflict.status_code == 409, conflict.text
+    assert _detail_code(conflict) == "visit_plan_protocol_slot_conflict"
+
+
+# ---- demo drafts can never be approved, started or projected --------------
+
+
+def test_demo_draft_approve_is_refused_with_zero_writes(visit_clients):
+    """A demo draft reaches the runtime gate: draft is approve's legal CAS."""
+    created = _create(
+        visit_clients.researcher, "P-VISIT-09", "create-mut-approve-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+    before = _write_counts(visit_clients.engine)
+
+    refused = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key="cmd-mut-approve-0001", expected_revision=created["revision"])
+
+    assert refused.status_code == 409, refused.text
+    assert _detail_code(refused) == "visit_plan_profile_runtime_not_enabled"
+    assert _write_counts(visit_clients.engine) == before
+    row = _plan_row(visit_clients.engine, created["plan_id"])
+    assert row.status == "draft"
+    assert row.revision == created["revision"]
+
+
+def test_demo_approved_start_is_refused_with_zero_writes(visit_clients):
+    """Start needs an approved plan, otherwise CAS legitimately fires first.
+
+    The frozen order puts revision/status CAS ahead of the runtime gate, so a
+    draft would correctly answer ``visit_plan_transition_invalid``.  Seeding a
+    consistent approved history is what actually exercises the gate.
+    """
+    created = _create(
+        visit_clients.researcher, "P-VISIT-09", "create-mut-start-001",
+        autopilot_profile_version_id=DEMO_VERSION)
+    _seed_paired_set_history(
+        visit_clients.engine, created["plan_id"], "approve",
+        "cmd-seed-approve-001", created["revision"])
+    before = _write_counts(visit_clients.engine)
+
+    refused = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key="cmd-mut-start-00001",
+        expected_revision=created["revision"] + 1)
+
+    assert refused.status_code == 409, refused.text
+    assert _detail_code(refused) == "visit_plan_profile_runtime_not_enabled"
+    assert _write_counts(visit_clients.engine) == before
+    row = _plan_row(visit_clients.engine, created["plan_id"])
+    assert row.status == "approved"
+
+
+def _paired_set_mutation_hash(
+        action: str, plan_id: str, key: str, expected_revision: int) -> str:
+    """Independently rebuild the authoritative paired-set mutation hash.
+
+    Constructed from the frozen payload shape rather than by calling the
+    production mutation helper, so a defect in that helper cannot make this
+    fixture agree with it.
+    """
+    payload: dict = {
+        "plan_id": plan_id,
+        "idempotency_key": key,
+        "expected_revision": expected_revision,
+        "repeat_protocol_version_id": REPEAT_PROTOCOL.version_id,
+        "repeat_protocol_definition_digest": REPEAT_PROTOCOL.definition_digest,
+        "autopilot_profile_version_id": DEMO_VERSION,
+        "autopilot_profile_definition_digest": DEMO_DIGEST,
+    }
+    return _frozen_request_hash(action, payload)
+
+
+def _seed_paired_set_history(
+        engine, plan_id: str, action: str, key: str, revision: int) -> None:
+    """A fully consistent demo ledger: real hash, aligned revision and status.
+
+    ``start`` additionally receives the Session and RuntimeState its status
+    implies, so the replay must traverse the whole chain before it is refused.
+    """
+    status = "approved" if action == "approve" else "started"
+    now = datetime.now()
+    with Session(engine) as session:
+        plan = session.get(VisitPlan, plan_id)
+        assert plan is not None
+        if action == "start":
+            session.add(VisitPlanCommand(
+                plan_id=plan_id, event_seq=2,
+                idempotency_key=f"{key}-approve",
+                command_type="approve",
+                request_hash=_paired_set_mutation_hash(
+                    "approve", plan_id, f"{key}-approve", revision),
+                actor_id="ACTOR-visit-researcher",
+                expected_revision=revision, resulting_revision=revision + 1,
+                created_at=now,
+            ))
+            plan.approved_by = "ACTOR-visit-researcher"
+            plan.approved_at = now
+        session.add(VisitPlanCommand(
+            plan_id=plan_id,
+            event_seq=3 if action == "start" else 2,
+            idempotency_key=key,
+            command_type=action,
+            request_hash=_paired_set_mutation_hash(
+                action, plan_id, key,
+                revision + 1 if action == "start" else revision),
+            actor_id="ACTOR-visit-researcher",
+            expected_revision=revision + 1 if action == "start" else revision,
+            resulting_revision=revision + 2 if action == "start" else revision + 1,
+            created_at=now,
+        ))
+        plan.status = status
+        plan.revision = revision + 2 if action == "start" else revision + 1
+        plan.autopilot_profile_version_id = DEMO_VERSION
+        plan.autopilot_profile_definition_digest = DEMO_DIGEST
+        # Both histories pass through "approved", so the approval actor and
+        # timestamp belong on either branch; ``updated_at`` tracks the last
+        # transition.  Without these the row is not the complete, internally
+        # consistent history this helper claims to build.
+        plan.approved_by = "ACTOR-visit-researcher"
+        plan.approved_at = now
+        plan.updated_at = now
+        if action == "start":
+            plan.started_by = "ACTOR-visit-researcher"
+            plan.started_at = now
+            session.add(TrainSession(
+                session_id=f"s-hist-{plan_id[-8:]}",
+                patient_id=plan.patient_id,
+                visit_plan_id=plan_id,
+                session_sitting_no=plan.session_sitting_no,
+                training_date=TODAY,
+                week_no=plan.week_no,
+                phase_type=plan.phase_type,
+                event_line=plan.event_line,
+                trainer_id="ACTOR-visit-researcher",
+                item_bank_version_id=plan.item_bank_version_id,
+                item_bank_definition_digest=plan.item_bank_definition_digest,
+                autopilot_protocol_version_id=(
+                    plan.autopilot_protocol_version_id),
+                autopilot_protocol_definition_digest=(
+                    plan.autopilot_protocol_definition_digest),
+                repeat_protocol_version_id=plan.repeat_protocol_version_id,
+                repeat_protocol_definition_digest=(
+                    plan.repeat_protocol_definition_digest),
+                autopilot_profile_version_id=DEMO_VERSION,
+                autopilot_profile_definition_digest=DEMO_DIGEST,
+                is_simulation=True,
+                data_classification="simulation",
+            ))
+            session.add(SessionRuntimeState(
+                session_id=f"s-hist-{plan_id[-8:]}",
+                status="active", revision=0, updated_at=now,
+            ))
+        session.add(plan)
+        session.commit()
+
+
+@pytest.mark.parametrize("action", ["approve", "start"])
+def test_exact_paired_set_history_reaches_the_stable_runtime_error(
+        visit_clients, action):
+    """A fully consistent demo ledger is refused only after it is validated."""
+    created = _create(
+        visit_clients.researcher, "P-VISIT-10", f"create-hist-{action}-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+    key = f"cmd-hist-{action}-0001"
+    revision = created["revision"]
+    _seed_paired_set_history(
+        visit_clients.engine, created["plan_id"], action, key, revision)
+    before = _write_counts(visit_clients.engine)
+
+    refused = _command(
+        visit_clients.researcher, created["plan_id"], action, key=key,
+        expected_revision=revision + 1 if action == "start" else revision)
+
+    assert refused.status_code == 409, refused.text
+    assert _detail_code(refused) == "visit_plan_profile_runtime_not_enabled"
+    assert _write_counts(visit_clients.engine) == before
+
+
+@pytest.mark.parametrize("action", ["approve", "start"])
+def test_paired_set_replay_survives_a_future_active_bank_and_protocol(
+        visit_clients, monkeypatch, action):
+    """A historical demo row resolves from the registry, never from today.
+
+    Every current-content loader is made fatal after the row exists, so the
+    replay can only succeed by reading the immutable registered definition and
+    the Plan's own frozen parents.  It must still end at the runtime gate,
+    after its identity, ledger and Plan/Session facts have all passed.
+    """
+    created = _create(
+        visit_clients.researcher, "P-VISIT-12", f"create-future-{action[:3]}",
+        autopilot_profile_version_id=DEMO_VERSION)
+    key = f"cmd-future-{action[:3]}-01"
+    _seed_paired_set_history(
+        visit_clients.engine, created["plan_id"], action, key,
+        created["revision"])
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError(
+            "historical paired-set replay must not read current content")
+
+    # The service's real route to current content is this bundle loader, not
+    # the profile module's default helpers.  Without it the test would still
+    # pass if paired-set replay regressed to today's parents.  Installed only
+    # now, because the setup demo create legitimately reads the bundle twice.
+    monkeypatch.setattr(
+        visit_plan_service, "_current_definition_bundle", boom)
+    monkeypatch.setattr(autopilot_plan_profiles, "_default_bank", boom)
+    monkeypatch.setattr(autopilot_plan_profiles, "_default_protocol", boom)
+    monkeypatch.setattr(
+        autopilot_plan_profiles, "resolve_for_visit_plan", boom)
+    before = _write_counts(visit_clients.engine)
+
+    refused = _command(
+        visit_clients.researcher, created["plan_id"], action, key=key,
+        expected_revision=(
+            created["revision"] + 1 if action == "start"
+            else created["revision"]))
+
+    assert refused.status_code == 409, refused.text
+    assert _detail_code(refused) == "visit_plan_profile_runtime_not_enabled"
+    assert _write_counts(visit_clients.engine) == before
+
+
+def test_wrong_history_hash_is_not_masked_by_the_runtime_error(visit_clients):
+    """A stale expected_revision changes the hash, so idempotency answers."""
+    created = _create(
+        visit_clients.researcher, "P-VISIT-11", "create-mask-hash-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+    key = "cmd-mask-hash-00001"
+    revision = created["revision"]
+    _seed_paired_set_history(
+        visit_clients.engine, created["plan_id"], "approve", key, revision)
+
+    refused = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key=key, expected_revision=revision + 5)
+
+    assert refused.status_code == 409, refused.text
+    assert _detail_code(refused) == "visit_plan_idempotency_conflict"
+
+
+def test_wrong_history_actor_is_not_masked_by_the_runtime_error(visit_clients):
+    """The ledger stays intact; a different authenticated caller replays it.
+
+    ``VisitPlanCommand`` is append-only and its model guard is never disabled,
+    so the alternate actor comes from the second researcher client rather than
+    from mutating the seeded row.
+    """
+    created = _create(
+        visit_clients.researcher, "P-VISIT-11", "create-mask-actor-1",
+        autopilot_profile_version_id=DEMO_VERSION)
+    key = "cmd-mask-actor-00001"
+    revision = created["revision"]
+    _seed_paired_set_history(
+        visit_clients.engine, created["plan_id"], "approve", key, revision)
+
+    refused = _command(
+        visit_clients.researcher_b, created["plan_id"], "approve",
+        key=key, expected_revision=revision)
+
+    assert refused.status_code == 409, refused.text
+    assert _detail_code(refused) == "visit_plan_idempotency_conflict"
+
+
+def test_today_queue_fails_closed_on_an_anomalous_demo_row(visit_clients):
+    """The queue only selects approved rows, so that is the reachable case."""
+    created = _create(
+        visit_clients.researcher, "P-VISIT-11", "create-today-demo-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+    _force_profile_pair(
+        visit_clients.engine, created["plan_id"], DEMO_VERSION, DEMO_DIGEST,
+        status="approved")
+
+    queue = visit_clients.researcher.get("/visit-plans/today")
+
+    assert queue.status_code == 409, queue.text
+    assert _detail_code(queue) == "visit_plan_profile_runtime_not_enabled"
+
+
+@pytest.mark.parametrize("status", ["approved", "started"])
+def test_patient_listing_fails_closed_for_both_runtime_statuses(
+        visit_clients, status):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-07", f"create-both-{status[:4]}-1",
+        autopilot_profile_version_id=DEMO_VERSION)
+    _force_profile_pair(
+        visit_clients.engine, created["plan_id"], DEMO_VERSION, DEMO_DIGEST,
+        status=status)
+
+    listing = visit_clients.researcher.get(
+        "/visit-plans", params={"patient_id": "P-VISIT-07"})
+
+    assert listing.status_code == 409, listing.text
+    assert _detail_code(listing) == "visit_plan_profile_runtime_not_enabled"
+
+
+def test_patient_listing_fails_closed_on_an_anomalous_demo_row(visit_clients):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-11", "create-list-demo-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+    _force_profile_pair(
+        visit_clients.engine, created["plan_id"], DEMO_VERSION, DEMO_DIGEST,
+        status="approved")
+
+    listing = visit_clients.researcher.get(
+        "/visit-plans", params={"patient_id": "P-VISIT-11"})
+
+    assert listing.status_code == 409, listing.text
+    assert _detail_code(listing) == "visit_plan_profile_runtime_not_enabled"
+
+
+def test_demo_draft_listing_stays_governable(visit_clients):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-12", "create-draft-list-01",
+        autopilot_profile_version_id=DEMO_VERSION)
+
+    listing = visit_clients.researcher.get(
+        "/visit-plans", params={"patient_id": "P-VISIT-12"})
+
+    assert listing.status_code == 200, listing.text
+    rows = [row for row in listing.json()
+            if row["plan_id"] == created["plan_id"]]
+    assert len(rows) == 1
+    assert rows[0]["autopilot_profile_version_id"] == DEMO_VERSION
+    assert "autopilot_profile_definition_digest" not in rows[0]
+
+
+# ---- cancel must survive definition drift ---------------------------------
+
+
+def test_manifest_loss_cancel_journey_releases_the_slot(visit_clients,
+                                                        monkeypatch):
+    """One journey: lose the definition, cancel, verify hash, replay, reuse.
+
+    Every profile resolution entry point is made fatal after the draft exists,
+    so a single manifest read anywhere in cancel would fail the test outright.
+    """
+    key = "cancel-drift-000001"
+    created = _create(
+        visit_clients.researcher, "P-VISIT-09", "create-cancel-drift-1",
+        autopilot_profile_version_id=DEMO_VERSION)
+    revision = created["revision"]
+
+    def gone(*_args, **_kwargs):
+        raise AssertionError("cancel must not resolve the current manifest")
+
+    # Scoped to exactly these four attributes.  A global ``monkeypatch.undo()``
+    # would also revert the ``visit_clients`` fixture's own ``db.engine`` patch
+    # and let the closing request escape the isolated test database entirely.
+    with monkeypatch.context() as manifest_lost:
+        for name in (
+            "resolve_requested_definition",
+            "resolve_registered_binding",
+            "resolve_for_visit_plan",
+            "_load_registered_definition",
+        ):
+            manifest_lost.setattr(autopilot_plan_profiles, name, gone)
+
+        cancelled = _command(
+            visit_clients.researcher, created["plan_id"], "cancel",
+            key=key, expected_revision=revision,
+            reason_code="protocol_correction")
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelled"
+        assert cancelled.json()["autopilot_profile_version_id"] == DEMO_VERSION
+
+        # The stored pair, and only the stored pair, entered the cancel hash.
+        assert _stored_hash(visit_clients.engine, key) == _frozen_request_hash(
+            "cancel",
+            {
+                "plan_id": created["plan_id"],
+                "idempotency_key": key,
+                "expected_revision": revision,
+                "reason_code": "protocol_correction",
+                "autopilot_profile_version_id": DEMO_VERSION,
+                "autopilot_profile_definition_digest": DEMO_DIGEST,
+            },
+        )
+
+        replayed = _command(
+            visit_clients.researcher, created["plan_id"], "cancel",
+            key=key, expected_revision=revision,
+            reason_code="protocol_correction")
+        assert replayed.status_code == 200, replayed.text
+        assert replayed.json() == cancelled.json()
+
+        row = _plan_row(visit_clients.engine, created["plan_id"])
+        assert row.protocol_slot_key is None
+        assert row.autopilot_profile_version_id == DEMO_VERSION
+
+    reused = _create(
+        visit_clients.researcher, "P-VISIT-09", "create-slot-reuse-2")
+    assert reused["autopilot_profile_version_id"] is None
+    assert reused["status"] == "draft"
+
+
+# ---- canonical byte compatibility -----------------------------------------
+
+
+def _stored_hash(engine, key: str) -> str:
+    with Session(engine) as session:
+        command = session.exec(select(VisitPlanCommand).where(
+            VisitPlanCommand.idempotency_key == key)).one()
+        return command.request_hash
+
+
+ACTOR = "ACTOR-visit-researcher"
+
+
+def _seed_legacy_plan(session, *, plan_id, patient_id, slot_key, now):
+    """A pre-D1A canonical Plan seeded entirely from the frozen constants.
+
+    Nothing here reads ``TODAY`` or the live BANK/PROTOCOL/REPEAT globals: the
+    row is immutable historical evidence, so it must not co-move with whatever
+    the current content happens to be.  Profile pair stays NULL/NULL.
+    """
+    return VisitPlan(
+        plan_id=plan_id,
+        protocol_slot_key=slot_key,
+        patient_id=patient_id,
+        scheduled_date=LEGACY_DATE,
+        scheduled_time=LEGACY_TIME,
+        queue_order=1,
+        session_sitting_no=1,
+        week_no=2,
+        phase_type="正式训练",
+        event_line="正式训练",
+        item_bank_version_id=LEGACY_BANK_VERSION,
+        item_bank_definition_digest=LEGACY_BANK_DIGEST,
+        autopilot_protocol_version_id=LEGACY_PROTOCOL_VERSION,
+        autopilot_protocol_definition_digest=LEGACY_PROTOCOL_DIGEST,
+        repeat_protocol_version_id=LEGACY_REPEAT_VERSION,
+        repeat_protocol_definition_digest=LEGACY_REPEAT_DIGEST,
+        autopilot_profile_version_id=None,
+        autopilot_profile_definition_digest=None,
+        is_simulation=True,
+        data_classification="simulation",
+        status="draft",
+        revision=1,
+        created_by=ACTOR,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _legacy_command(*, plan_id, seq, key, command_type, request_hash,
+                    expected_revision, now, reason_code=None):
+    return VisitPlanCommand(
+        plan_id=plan_id, event_seq=seq, idempotency_key=key,
+        command_type=command_type, request_hash=request_hash, actor_id=ACTOR,
+        expected_revision=expected_revision,
+        resulting_revision=expected_revision + 1,
+        reason_code=reason_code, created_at=now,
+    )
+
+
+def _seed_legacy_started_chain(engine, patient_id: str) -> dict:
+    """create -> approve -> start, hashed by the test-side legacy algorithms."""
+    plan_id = "vp_" + "L" * 24
+    session_id = "s_" + "L" * 24
+    body = _plan_body(
+        patient_id, "legacy-create-started1", scheduled_date=LEGACY_DATE)
+    # The independently rebuilt hashes must reproduce the literal receipts.
+    assert _legacy_create_hash(body) == LEGACY_STARTED_CREATE_HASH
+    assert _legacy_mutation_hash(
+        "approve", plan_id, "legacy-approve-started", 1) == (
+            LEGACY_STARTED_APPROVE_HASH)
+    assert _legacy_mutation_hash(
+        "start", plan_id, "legacy-start-started1", 2) == (
+            LEGACY_STARTED_START_HASH)
+    now = datetime(2026, 7, 31, 9, 30)
+    with Session(engine) as session:
+        plan = _seed_legacy_plan(
+            session, plan_id=plan_id, patient_id=patient_id,
+            slot_key=LEGACY_STARTED_SLOT, now=now)
+        plan.status = "started"
+        plan.revision = 3
+        plan.approved_by = ACTOR
+        plan.approved_at = now
+        plan.started_by = ACTOR
+        plan.started_at = now
+        session.add(plan)
+        session.add(_legacy_command(
+            plan_id=plan_id, seq=1, key="legacy-create-started1",
+            command_type="create", request_hash=LEGACY_STARTED_CREATE_HASH,
+            expected_revision=0, now=now))
+        session.add(_legacy_command(
+            plan_id=plan_id, seq=2, key="legacy-approve-started",
+            command_type="approve",
+            request_hash=LEGACY_STARTED_APPROVE_HASH,
+            expected_revision=1, now=now))
+        session.add(_legacy_command(
+            plan_id=plan_id, seq=3, key="legacy-start-started1",
+            command_type="start",
+            request_hash=LEGACY_STARTED_START_HASH,
+            expected_revision=2, now=now))
+        session.add(TrainSession(
+            session_id=session_id, patient_id=patient_id,
+            visit_plan_id=plan_id, session_sitting_no=1,
+            training_date=LEGACY_DATE,
+            week_no=2, phase_type="正式训练", event_line="正式训练",
+            trainer_id=ACTOR,
+            item_bank_version_id=LEGACY_BANK_VERSION,
+            item_bank_definition_digest=LEGACY_BANK_DIGEST,
+            autopilot_protocol_version_id=LEGACY_PROTOCOL_VERSION,
+            autopilot_protocol_definition_digest=LEGACY_PROTOCOL_DIGEST,
+            repeat_protocol_version_id=LEGACY_REPEAT_VERSION,
+            repeat_protocol_definition_digest=LEGACY_REPEAT_DIGEST,
+            autopilot_profile_version_id=None,
+            autopilot_profile_definition_digest=None,
+            is_simulation=True, data_classification="simulation",
+        ))
+        session.add(SessionRuntimeState(
+            session_id=session_id, status="active", revision=0,
+            updated_at=now))
+        session.commit()
+    return {"plan_id": plan_id, "session_id": session_id, "body": body}
+
+
+def _seed_legacy_cancelled_chain(engine, patient_id: str) -> dict:
+    plan_id = "vp_" + "C" * 24
+    body = _plan_body(
+        patient_id, "legacy-create-cancelled", scheduled_date=LEGACY_DATE)
+    assert _legacy_create_hash(body) == LEGACY_CANCELLED_CREATE_HASH
+    assert _legacy_mutation_hash(
+        "cancel", plan_id, "legacy-cancel-cancelled", 1,
+        reason_code="schedule_changed") == LEGACY_CANCELLED_CANCEL_HASH
+    now = datetime(2026, 7, 31, 9, 30)
+    with Session(engine) as session:
+        # Seeded with the slot it held before cancellation, then released to
+        # NULL exactly as ``cancel_plan`` leaves it.
+        plan = _seed_legacy_plan(
+            session, plan_id=plan_id, patient_id=patient_id,
+            slot_key=LEGACY_CANCELLED_SLOT, now=now)
+        plan.status = "cancelled"
+        plan.revision = 2
+        plan.protocol_slot_key = None
+        plan.cancelled_by = ACTOR
+        plan.cancelled_at = now
+        plan.updated_at = now
+        session.add(plan)
+        session.add(_legacy_command(
+            plan_id=plan_id, seq=1, key="legacy-create-cancelled",
+            command_type="create", request_hash=LEGACY_CANCELLED_CREATE_HASH,
+            expected_revision=0, now=now))
+        session.add(_legacy_command(
+            plan_id=plan_id, seq=2, key="legacy-cancel-cancelled",
+            command_type="cancel",
+            request_hash=LEGACY_CANCELLED_CANCEL_HASH,
+            expected_revision=1, now=now, reason_code="schedule_changed"))
+        session.commit()
+    return {"plan_id": plan_id, "body": body}
+
+
+def test_seeded_pre_d1a_history_replays_without_idempotency_conflict(
+        visit_clients):
+    """Authentic pre-D1A ledgers must still answer today's identical requests.
+
+    The rows are seeded rather than produced by the current mutators, and every
+    hash comes from the test-side frozen legacy algorithm, so this proves byte
+    compatibility instead of comparing a helper with itself.
+    """
+    started = _seed_legacy_started_chain(visit_clients.engine, "P-VISIT-05")
+    cancelled = _seed_legacy_cancelled_chain(visit_clients.engine, "P-VISIT-06")
+
+    replay_create = visit_clients.researcher.post(
+        "/visit-plans", json=started["body"])
+    assert replay_create.status_code == 200, replay_create.text
+    assert replay_create.json()["plan_id"] == started["plan_id"]
+    assert replay_create.json()["status"] == "draft"
+    assert replay_create.json()["autopilot_profile_version_id"] is None
+
+    replay_approve = _command(
+        visit_clients.researcher, started["plan_id"], "approve",
+        key="legacy-approve-started", expected_revision=1)
+    assert replay_approve.status_code == 200, replay_approve.text
+    assert replay_approve.json()["status"] == "approved"
+
+    replay_start = _command(
+        visit_clients.researcher, started["plan_id"], "start",
+        key="legacy-start-started1", expected_revision=2)
+    assert replay_start.status_code == 200, replay_start.text
+    assert replay_start.json()["status"] == "started"
+    assert replay_start.json()["session_id"] == started["session_id"]
+
+    replay_create_cancelled = visit_clients.researcher.post(
+        "/visit-plans", json=cancelled["body"])
+    assert replay_create_cancelled.status_code == 200, (
+        replay_create_cancelled.text)
+    assert replay_create_cancelled.json()["plan_id"] == cancelled["plan_id"]
+
+    replay_cancel = _command(
+        visit_clients.researcher, cancelled["plan_id"], "cancel",
+        key="legacy-cancel-cancelled", expected_revision=1,
+        reason_code="schedule_changed")
+    assert replay_cancel.status_code == 200, replay_cancel.text
+    assert replay_cancel.json()["status"] == "cancelled"
+    assert replay_cancel.json()["autopilot_profile_version_id"] is None
+
+
+# ---- session copy, admission gate and direct-session refusal --------------
+
+
+def test_canonical_start_copies_a_null_profile_pair_onto_the_session(
+        visit_clients):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-12", "create-null-start-01")
+    approved = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key="approve-null-start-01", expected_revision=created["revision"])
+    assert approved.status_code == 200, approved.text
+    started = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key="start-null-start-001",
+        expected_revision=approved.json()["revision"])
+    assert started.status_code == 200, started.text
+
+    with Session(visit_clients.engine) as session:
+        train_session = session.get(
+            TrainSession, started.json()["session_id"])
+        assert train_session is not None
+        assert train_session.autopilot_profile_version_id is None
+        assert train_session.autopilot_profile_definition_digest is None
+
+
+@pytest.mark.parametrize(
+    "slug,version,digest",
+    [
+        ("version", DEMO_VERSION, None),
+        ("digest", None, DEMO_DIGEST),
+        ("both", DEMO_VERSION, DEMO_DIGEST),
+    ],
+)
+def test_direct_session_creation_rejects_any_profile_field(
+        visit_clients, monkeypatch, slug, version, digest):
+    monkeypatch.setenv("NMU_TEST_ALLOW_DIRECT_SESSION_CREATE", "1")
+    before = _write_counts(visit_clients.engine)
+
+    response = visit_clients.researcher.post("/sessions", json={
+        "session_id": f"s-direct-{slug}",
+        "patient_id": "P-VISIT-01",
+        "session_sitting_no": 1,
+        "week_no": 2,
+        "phase_type": "正式训练",
+        "event_line": "正式训练",
+        "item_bank_version_id": BANK.version_id,
+        "is_simulation": True,
+        "autopilot_profile_version_id": version,
+        "autopilot_profile_definition_digest": digest,
+    })
+
+    assert response.status_code == 409, response.text
+    assert _detail_code(response) == "direct_session_profile_forbidden"
+    assert _write_counts(visit_clients.engine) == before
+
+
+def _started_canonical_session(visit_clients, patient_id: str, slug: str):
+    created = _create(
+        visit_clients.researcher, patient_id, f"create-{slug}-0001")
+    approved = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key=f"approve-{slug}-0001", expected_revision=created["revision"])
+    assert approved.status_code == 200, approved.text
+    started = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key=f"start-{slug}-00001",
+        expected_revision=approved.json()["revision"])
+    assert started.status_code == 200, started.text
+    return created, started.json()["session_id"]
+
+
+@pytest.mark.parametrize(
+    "slug,on_plan,on_session",
+    [
+        ("session-only", False, True),
+        ("plan-only", True, False),
+        ("matching", True, True),
+    ],
+)
+def test_live_admission_closes_on_every_profile_pair_shape(
+        visit_clients, monkeypatch, slug, on_plan, on_session):
+    """A mismatch and a perfectly matching pair are both kept out of runtime.
+
+    Uses the write-capable microphone endpoint and the whole admission write
+    set, so a refusal that still mutated something cannot pass.
+    """
+    # The production admission must really run; the pytest escape would return
+    # before any binding is compared.
+    monkeypatch.delenv("NMU_TEST_ALLOW_DIRECT_SESSION_CREATE", raising=False)
+    created, session_id = _started_canonical_session(
+        visit_clients, "P-VISIT-02", f"admit-{slug}")
+
+    with Session(visit_clients.engine) as session:
+        plan = session.get(VisitPlan, created["plan_id"])
+        train_session = session.get(TrainSession, session_id)
+        assert plan is not None and train_session is not None
+        if on_plan:
+            plan.autopilot_profile_version_id = DEMO_VERSION
+            plan.autopilot_profile_definition_digest = DEMO_DIGEST
+            session.add(plan)
+        if on_session:
+            train_session.autopilot_profile_version_id = DEMO_VERSION
+            train_session.autopilot_profile_definition_digest = DEMO_DIGEST
+            session.add(train_session)
+        session.commit()
+
+    before = _admission_write_set(visit_clients.engine)
+
+    _assert_visit_plan_admission_rejected(visit_clients.researcher.post(
+        f"/sessions/{session_id}/recording-authorization"))
+
+    assert _admission_write_set(visit_clients.engine) == before
+
+
+# ---- half-pair corruption across mutation and read surfaces ---------------
+
+
+@pytest.mark.parametrize(
+    "slug,version,digest",
+    [("version-only", DEMO_VERSION, None), ("digest-only", None, DEMO_DIGEST)],
+)
+@pytest.mark.parametrize("surface", ["cancel", "receipt", "list"])
+def test_half_pair_corruption_fails_closed_everywhere(
+        visit_clients, slug, version, digest, surface):
+    """A half pair is never canonical, never hashed and never projected."""
+    created = _create(
+        visit_clients.researcher, "P-VISIT-04",
+        f"create-half-{surface[:4]}-{slug[:4]}")
+    _force_profile_pair(
+        visit_clients.engine, created["plan_id"], version, digest)
+    before = _write_counts(visit_clients.engine)
+
+    if surface == "cancel":
+        response = _command(
+            visit_clients.researcher, created["plan_id"], "cancel",
+            key=f"cancel-half-{surface[:4]}-{slug[:4]}",
+            expected_revision=created["revision"],
+            reason_code="protocol_correction")
+    elif surface == "receipt":
+        response = visit_clients.researcher.post(
+            "/visit-plans",
+            json=_plan_body(
+                "P-VISIT-04", f"create-half-{surface[:4]}-{slug[:4]}"))
+    else:
+        response = visit_clients.researcher.get(
+            "/visit-plans", params={"patient_id": "P-VISIT-04"})
+
+    assert response.status_code == 409, response.text
+    assert _detail_code(response) == "visit_plan_profile_binding_incomplete"
+    assert _write_counts(visit_clients.engine) == before
+
+
+# ---- command receipt gates on the plan's current status -------------------
+
+
+@pytest.mark.parametrize("status", ["approved", "started"])
+def test_tampered_canonical_plan_reports_integrity_before_the_runtime_gate(
+        visit_clients, status):
+    """A canonical request against a force-written demo pair is an integrity fault.
+
+    The request pair is ``(None, None)`` while the Plan now stores a demo pair,
+    so the mismatch is the honest answer.  The runtime code must not mask it.
+    """
+    created = _create(
+        visit_clients.researcher, "P-VISIT-05",
+        f"create-now-{status[:4]}-001")
+    _force_profile_pair(
+        visit_clients.engine, created["plan_id"], DEMO_VERSION, DEMO_DIGEST,
+        status=status)
+
+    replayed = visit_clients.researcher.post(
+        "/visit-plans",
+        json=_plan_body("P-VISIT-05", f"create-now-{status[:4]}-001"))
+
+    assert replayed.status_code == 409, replayed.text
+    assert _detail_code(replayed) == "visit_plan_profile_digest_mismatch"
+
+
+@pytest.mark.parametrize("action", ["approve", "start"])
+def test_demo_create_key_replay_fails_closed_once_the_plan_is_runtime(
+        visit_clients, action):
+    """Only a pair-consistent whole row reaches the current-status gate.
+
+    The create command is genuinely produced by the demo create path, so its
+    hash and pair are authentic; the approve/start chain is then seeded around
+    it.  Replaying the original demo body must fail closed on the Plan's
+    current status rather than hand back its old draft receipt.
+    """
+    key = f"create-demo-now-{action[:3]}"
+    created = _create(
+        visit_clients.researcher, "P-VISIT-05", key,
+        autopilot_profile_version_id=DEMO_VERSION)
+    _seed_paired_set_history(
+        visit_clients.engine, created["plan_id"], action,
+        f"cmd-demo-now-{action[:3]}", created["revision"])
+
+    replayed = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-05", key, autopilot_profile_version_id=DEMO_VERSION))
+
+    assert replayed.status_code == 409, replayed.text
+    assert _detail_code(replayed) == "visit_plan_profile_runtime_not_enabled"
+
+
+def test_withdrawn_early_return_still_detects_an_anomalous_demo_row(
+        visit_clients):
+    """Privacy must not hide a demo runtime anomaly from governance."""
+    created = _create(
+        visit_clients.researcher, "P-VISIT-06", "create-withdrawn-anom",
+        autopilot_profile_version_id=DEMO_VERSION)
+    _force_profile_pair(
+        visit_clients.engine, created["plan_id"], DEMO_VERSION, DEMO_DIGEST,
+        status="approved")
+    with Session(visit_clients.engine) as session:
+        patient = session.get(Patient, "P-VISIT-06")
+        assert patient is not None
+        patient.withdrawal_status = "已撤回"
+        session.add(patient)
+        session.commit()
+
+    listing = visit_clients.researcher.get(
+        "/visit-plans", params={"patient_id": "P-VISIT-06"})
+
+    assert listing.status_code == 409, listing.text
+    assert _detail_code(listing) == "visit_plan_profile_runtime_not_enabled"
+
+
+def test_withdrawn_early_return_is_unchanged_without_an_anomaly(visit_clients):
+    _create(visit_clients.researcher, "P-VISIT-07", "create-withdrawn-ok01")
+    with Session(visit_clients.engine) as session:
+        patient = session.get(Patient, "P-VISIT-07")
+        assert patient is not None
+        patient.withdrawal_status = "已撤回"
+        session.add(patient)
+        session.commit()
+
+    listing = visit_clients.researcher.get(
+        "/visit-plans", params={"patient_id": "P-VISIT-07"})
+
+    assert listing.status_code == 200, listing.text
+    assert listing.json() == []
+
+
+def test_create_replay_refuses_after_the_subject_becomes_real(visit_clients):
+    """The locked patient row is the subject authority, not the first read."""
+    created = _create(
+        visit_clients.researcher, "P-VISIT-08", "create-subject-flip1",
+        autopilot_profile_version_id=DEMO_VERSION)
+    with Session(visit_clients.engine) as session:
+        patient = session.get(Patient, "P-VISIT-08")
+        assert patient is not None
+        patient.is_simulation_subject = False
+        session.add(patient)
+        session.commit()
+    before = _write_counts(visit_clients.engine)
+
+    replayed = visit_clients.researcher.post("/visit-plans", json=_plan_body(
+        "P-VISIT-08", "create-subject-flip1",
+        autopilot_profile_version_id=DEMO_VERSION))
+
+    assert replayed.status_code == 409, replayed.text
+    assert _detail_code(replayed) == "visit_plan_profile_simulation_required"
+    assert _write_counts(visit_clients.engine) == before
+    assert created["autopilot_profile_version_id"] == DEMO_VERSION
+
+
+def _apply_persisted_drift(engine, plan_id: str, shape: str) -> None:
+    """Corrupt the stored row itself; never inject a synthetic exception.
+
+    Each shape stays inside the database CHECKs so the real resolver and the
+    real service comparison are what produce the error, which is the only way
+    these assertions say anything about the historical-binding seam.
+    """
+    with Session(engine) as session:
+        row = session.get(VisitPlan, plan_id)
+        assert row is not None
+        if shape == "unknown":
+            # Complete, well-formed pair whose version is not registered.
+            row.autopilot_profile_version_id = "unregistered-demo-v9"
+            row.autopilot_profile_definition_digest = DEMO_DIGEST
+        elif shape == "digest":
+            # Real registered version, wrong but syntactically valid digest.
+            row.autopilot_profile_version_id = DEMO_VERSION
+            row.autopilot_profile_definition_digest = "f" * 64
+        else:
+            # Profile pair left authentic; exactly one frozen parent moves, so
+            # only the service's own four-field comparison can catch it.
+            row.item_bank_version_id = "wk2-v1-drifted-parent"
+        session.add(row)
+        session.commit()
+
+
+@pytest.mark.parametrize(
+    "shape,expected_code",
+    [
+        ("unknown", "visit_plan_profile_unknown"),
+        ("digest", "visit_plan_profile_digest_mismatch"),
+        ("parent", "visit_plan_profile_parent_mismatch"),
+    ],
+)
+@pytest.mark.parametrize("action", ["approve", "start"])
+def test_persisted_profile_drift_is_reported_before_the_runtime_gate(
+        visit_clients, shape, expected_code, action):
+    """A genuinely drifted stored row reports its own code, not the gate.
+
+    ``plan_profile_parent_mismatch`` is deliberately not raised from
+    ``resolve_registered_binding``: that helper does not own the Plan-parent
+    comparison, so faking it there would assert nothing.
+    """
+    created = _create(
+        visit_clients.researcher, "P-VISIT-09",
+        f"create-drift-{shape}-{action[:3]}",
+        autopilot_profile_version_id=DEMO_VERSION)
+    if action == "start":
+        _seed_paired_set_history(
+            visit_clients.engine, created["plan_id"], "approve",
+            f"seed-drift-{shape}-{action[:3]}", created["revision"])
+    _apply_persisted_drift(visit_clients.engine, created["plan_id"], shape)
+    # Snapshot after every fixture write, so only the refusal is measured.
+    before = _write_counts(visit_clients.engine)
+
+    refused = _command(
+        visit_clients.researcher, created["plan_id"], action,
+        key=f"cmd-drift-{shape}-{action[:3]}",
+        expected_revision=(
+            created["revision"] + 1 if action == "start"
+            else created["revision"]))
+
+    assert refused.status_code in {409, 422}, refused.text
+    assert _detail_code(refused) == expected_code
+    assert _write_counts(visit_clients.engine) == before
+
+
+def test_started_session_projection_still_carries_both_profile_keys(
+        visit_clients):
+    created = _create(
+        visit_clients.researcher, "P-VISIT-03", "create-session-keys-1")
+    approved = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key="approve-session-keys-1", expected_revision=created["revision"])
+    assert approved.status_code == 200, approved.text
+    started = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key="start-session-keys-01",
+        expected_revision=approved.json()["revision"])
+    assert started.status_code == 200, started.text
+
+    read = visit_clients.researcher.get(
+        f"/sessions/{started.json()['session_id']}")
+
+    assert read.status_code == 200, read.text
+    assert STARTED_SESSION_KEYS <= set(read.json())
+    assert read.json()["autopilot_profile_version_id"] is None
+    assert read.json()["autopilot_profile_definition_digest"] is None
 
 
 def test_started_plan_list_conceals_session_binding_from_non_owner(
@@ -487,6 +1924,146 @@ def _assert_visit_plan_admission_rejected(response) -> None:
         "session_visit_plan_admission_required")
 
 
+PLAN_SESSION_BINDING_DRIFTS = [
+    pytest.param("item_bank_definition_digest", "d" * 64, id="item-digest"),
+    pytest.param("autopilot_protocol_version_id", "autopilot-vX-drifted",
+                 id="autopilot-version"),
+    pytest.param("autopilot_protocol_definition_digest", "a" * 64,
+                 id="autopilot-digest"),
+    pytest.param("repeat_protocol_version_id", "repeat-intent-vX-drifted",
+                 id="repeat-version"),
+    pytest.param("repeat_protocol_definition_digest", "b" * 64,
+                 id="repeat-digest"),
+]
+
+
+@pytest.mark.parametrize("column,value", PLAN_SESSION_BINDING_DRIFTS)
+def test_every_frozen_binding_drift_closes_the_started_session_admission(
+        visit_clients: VisitClients, monkeypatch, column, value):
+    """计划与场次的任一冻结绑定漂移，人工写入口一律 409 且零写入。"""
+    # The production admission must really run; the pytest escape would return
+    # before any binding is compared.
+    monkeypatch.delenv("NMU_TEST_ALLOW_DIRECT_SESSION_CREATE", raising=False)
+    created = _create(
+        visit_clients.researcher, "P-VISIT-03",
+        f"visit-create-drift-{column}"[:60],
+        scheduled_time="10:15:00", queue_order=3)
+    approved = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key=f"visit-approve-drift-{column}"[:60],
+        expected_revision=created["revision"]).json()
+    started = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key=f"visit-start-drift-{column}"[:60],
+        expected_revision=approved["revision"])
+    assert started.status_code == 200, started.text
+
+    with Session(visit_clients.engine) as session:
+        train_session = session.exec(select(TrainSession).where(
+            TrainSession.visit_plan_id == created["plan_id"])).one()
+        session_id = train_session.session_id
+        # Whatever the plan currently holds, the session must differ from it.
+        plan = session.get(VisitPlan, created["plan_id"])
+        assert getattr(plan, column) != value
+        setattr(train_session, column, value)
+        session.add(train_session)
+        session.commit()
+
+    before = _admission_write_set(visit_clients.engine)
+
+    _assert_visit_plan_admission_rejected(visit_clients.researcher.post(
+        f"/sessions/{session_id}/recording-authorization"))
+
+    assert _admission_write_set(visit_clients.engine) == before
+
+
+_ADMISSION_WRITE_MODELS = (
+    VisitPlan,
+    VisitPlanCommand,
+    TrainSession,
+    SessionRuntimeState,
+    LiveState,
+    SessionAutopilotState,
+    AutopilotControlEvent,
+    RuntimeCommand,
+    RuntimeCommandAck,
+    AttemptCaptureProcessing,
+    AttemptEvent,
+    InteractionEvent,
+    AudioAssetRow,
+    PatientDeviceCapability,
+    AutopilotRepeatRequest,
+    AuditLog,
+)
+
+
+def _admission_write_set(engine) -> dict:
+    """Every column of every row of every table a manual write could move.
+
+    Columns come from ``__table__.columns`` at call time rather than a
+    hand-picked list, so a field added later is covered automatically and no
+    maintained selection can silently drift and false-green. Rows sort by
+    ``repr`` so ``None``, datetimes and mixed types order without raising.
+    """
+    snapshot: dict[str, dict] = {}
+    with Session(engine) as session:
+        for model in _ADMISSION_WRITE_MODELS:
+            names = tuple(column.name for column in model.__table__.columns)
+            rows = [tuple(getattr(row, name) for name in names)
+                    for row in session.exec(select(model))]
+            snapshot[model.__name__] = {
+                "columns": names, "rows": sorted(rows, key=repr)}
+    return snapshot
+
+
+def test_a_frozen_repeat_binding_absent_from_the_registry_closes_manual_work(
+        visit_clients: VisitClients, monkeypatch):
+    """绑定成对且合法、但历史注册表里没有这个版本：必须稳定映射为另一个 409。
+
+    这条覆盖 session_repeat_protocol_unavailable —— 与缺绑定不同的第二个映射。
+    计划与场次两侧改成同一个 pair，所以 started admission 仍然通过，被挡住的
+    只能是协议解析本身。
+    """
+    monkeypatch.delenv("NMU_TEST_ALLOW_DIRECT_SESSION_CREATE", raising=False)
+    created = _create(
+        visit_clients.researcher, "P-VISIT-03", "visit-create-unavailable-0001",
+        scheduled_time="10:15:00", queue_order=3)
+    approved = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key="visit-approve-unavailable-0001",
+        expected_revision=created["revision"]).json()
+    started = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key="visit-start-unavailable-0001",
+        expected_revision=approved["revision"])
+    assert started.status_code == 200, started.text
+
+    # A constraint-valid pair that no historical registry file provides. Both
+    # sides get the identical value, so plan/session admission still passes.
+    absent_version = "repeat-intent-v404"
+    absent_digest = "c" * 64
+    with Session(visit_clients.engine) as session:
+        train_session = session.exec(select(TrainSession).where(
+            TrainSession.visit_plan_id == created["plan_id"])).one()
+        session_id = train_session.session_id
+        plan = session.get(VisitPlan, created["plan_id"])
+        for row in (plan, train_session):
+            row.repeat_protocol_version_id = absent_version
+            row.repeat_protocol_definition_digest = absent_digest
+            session.add(row)
+        session.commit()
+
+    before = _admission_write_set(visit_clients.engine)
+
+    refused = visit_clients.researcher.post(
+        f"/sessions/{session_id}/recording-authorization")
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == (
+        "session_repeat_protocol_unavailable")
+    assert _admission_write_set(visit_clients.engine) == before
+
+
 def test_historical_orphan_sessions_are_read_only_and_cannot_reenter_runtime(
         visit_clients: VisitClients, monkeypatch):
     """NULL, missing and non-started plan links are all isolated, never grandfathered."""
@@ -613,9 +2190,16 @@ def test_started_visit_plan_session_remains_admitted_to_live_runtime(
         "autopilot_protocol_version_id": PROTOCOL["protocol_version_id"],
         "autopilot_protocol_definition_digest": (
             content.autopilot_protocol_definition_digest(PROTOCOL)),
+        "repeat_protocol_version_id": REPEAT_PROTOCOL.version_id,
+        "repeat_protocol_definition_digest": (
+            REPEAT_PROTOCOL.definition_digest),
+        # A canonical start is paired-null on both sides, item by item.
+        "autopilot_profile_version_id": None,
+        "autopilot_profile_definition_digest": None,
         "is_simulation": True,
         "data_classification": "simulation",
     }
+    assert created["autopilot_profile_version_id"] is None
 
     # The real VisitPlan vertical must pass even with all direct-session test
     # escapes disabled.
@@ -827,6 +2411,10 @@ def test_approve_today_queue_and_start_form_one_atomic_idempotent_vertical(
             plan.autopilot_protocol_version_id)
         assert train_session.autopilot_protocol_definition_digest == (
             plan.autopilot_protocol_definition_digest)
+        assert plan.autopilot_profile_version_id is None
+        assert plan.autopilot_profile_definition_digest is None
+        assert train_session.autopilot_profile_version_id is None
+        assert train_session.autopilot_profile_definition_digest is None
         assert train_session.is_simulation is True
         assert train_session.data_classification == "simulation"
         assert getattr(train_session, "visit_plan_id") == created["plan_id"]
@@ -2257,10 +3845,20 @@ def test_start_integrity_failure_rolls_back_session_runtime_plan_and_command(
     with Session(visit_clients.engine) as session:
         plan = session.get(VisitPlan, created["plan_id"])
         assert plan is not None
+        assert (
+            plan.autopilot_profile_version_id,
+            plan.autopilot_profile_definition_digest,
+        ) == (None, None)
         assert (plan.status, plan.revision, plan.started_by, plan.started_at) == (
             "approved", 2, None, None)
         assert list(session.exec(select(TrainSession).where(
             TrainSession.visit_plan_id == created["plan_id"]))) == []
+        collision = session.get(TrainSession, collision_id)
+        assert collision is not None
+        assert (
+            collision.autopilot_profile_version_id,
+            collision.autopilot_profile_definition_digest,
+        ) == (None, None)
         assert session.get(SessionRuntimeState, collision_id).revision == 7
         commands = list(session.exec(
             select(VisitPlanCommand)

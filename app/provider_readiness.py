@@ -15,6 +15,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 from typing import Any
 
@@ -26,7 +27,7 @@ from .enums import AnswerType
 from .models import ProviderReadinessProbe
 
 
-SCHEMA_VERSION = "provider-readiness.v1"
+SCHEMA_VERSION = "provider-readiness.v2"
 RUNTIME_CONTRACT = "p0a_sim_first_single_v1"
 PROBE_TEXT = "您好"
 TTL_ENV = "PROVIDER_READINESS_TTL_MINUTES"
@@ -40,6 +41,20 @@ _NON_REUSABLE_SECRET_ENV_NAMES = (
     "DEIDENTIFICATION_KEY",
     "CONSOLE_PIN",
 )
+# Narrow public request-shape contract: only the currently supported
+# non-secret cache_params shapes (Qwen/CosyVoice speech_rate, Piper
+# length_scale, the synthetic test-double contract voice=synthetic, and the
+# harness stand-in engine's versioned literal harness-synthetic-v1).
+# Anything outside this allowlist is not trusted as safe/non-secret by
+# construction -- see _cache_params().  Deliberately not "or hash it": a
+# hash of a low-entropy secret is offline-guessable, so an unrecognized
+# value is rejected outright, never digested.
+_CACHE_PARAMS_ALLOWLIST = re.compile(
+    r"^(?:(?:speech_rate|length_scale)=\d{1,3}(?:\.\d{1,3})?"
+    r"|voice=synthetic|harness-synthetic-v1)$")
+_UNAPPROVED_CACHE_PARAMS_MESSAGE = (
+    "engine cache_params does not match the approved public request-shape "
+    "allowlist; refusing to fingerprint an unrecognized/unapproved value")
 
 
 def _utc_now_naive() -> datetime:
@@ -81,11 +96,32 @@ def _provider_id(engine: object) -> str | None:
     return None
 
 
+def _cache_params(engine: object) -> str:
+    """Public, non-secret request-shape descriptor (e.g. speech_rate=0.9).
+
+    Only the narrow allowlisted shapes are ever embedded, verbatim and
+    untruncated (so two approved values can never collide regardless of
+    length).  An unrecognized value is not assumed safe/non-secret and is
+    never embedded, truncated, hashed, persisted, or printed in any form:
+    a low-entropy secret run through SHA-256 is still offline-guessable, so
+    "digest it instead" is not a safe fallback.  The only correct response
+    to an unapproved shape is to refuse before fingerprint construction.
+    """
+    value = getattr(engine, "cache_params", None)
+    if not value:
+        return ""
+    text = str(value)
+    if not _CACHE_PARAMS_ALLOWLIST.fullmatch(text):
+        raise ValueError(_UNAPPROVED_CACHE_PARAMS_MESSAGE)
+    return text
+
+
 def _engine_descriptor(engine: object) -> dict[str, object]:
     return {
         "version": _clean_version(getattr(engine, "version", None)),
         "boundary": _boundary(engine),
         "provider_id": _provider_id(engine),
+        "cache_params": _cache_params(engine),
     }
 
 
@@ -156,7 +192,12 @@ def capture_configuration(*, tts_engine: object | None = None,
     while neither credential nor an offline-verifiable key digest reaches the
     readiness ledger.
     """
-    selected_tts = tts_engine or tts.engine()
+    # The exact/autopilot channel is Qwen-only (tts.get_autopilot_engine);
+    # the generic tts.engine() can be Piper/CosyVoice/Null depending on
+    # config.  Probing the generic engine would fingerprint and ready-check
+    # a provider that autopilot never actually calls.  `is None` (not
+    # truthiness) so a supplied test double is never silently replaced.
+    selected_tts = tts_engine if tts_engine is not None else tts.get_autopilot_engine()
     selected_asr = asr_engine or asr.get_engine()
     selected_llm = llm_engine or llm_judge.get_engine()
     llm_version = _clean_version(getattr(selected_llm, "version", None))
@@ -443,7 +484,8 @@ def readiness_projection(session: DBSession, *,
             probe_failure_code="probe_missing",
         )
     matches = (
-        row.config_fingerprint == current.fingerprint
+        row.schema_version == SCHEMA_VERSION
+        and row.config_fingerprint == current.fingerprint
         and row.runtime_contract == current.runtime_contract)
     expired = row.expires_at <= checked_now
     if not matches:
@@ -455,7 +497,14 @@ def readiness_projection(session: DBSession, *,
     else:
         status = "ready"
     return ReadinessProjection(
-        schema_version=row.schema_version,
+        # The response schema describes THIS projection's structure, so it is
+        # always the current constant.  A historical row's own schema version
+        # is an input to `matches` above and nothing else: it downgrades the
+        # row to config_mismatch rather than changing the wire contract.
+        schema_version=SCHEMA_VERSION,
+        # Returned verbatim on purpose.  Substituting the current constant here
+        # would let an old runtime contract masquerade as the current one; the
+        # strict client fails such a row closed instead.
         runtime_contract=row.runtime_contract,
         status=status,
         start_allowed=status == "ready",

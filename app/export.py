@@ -24,15 +24,19 @@ from pathlib import Path
 from typing import Callable, Optional
 from uuid import uuid4
 
+from sqlalchemy import or_
 from sqlmodel import Session as DBSession
 from sqlmodel import select
 
 from . import (audio_gate, audio_store, evidence_ledger, export_security,
+               repeat_evidence,
                governance_lock, scoring)
 from .enums import AudioStatus
 from .models import (
-    AbnormalEvent, AttemptEvent, AudioAssetRow, InteractionEvent, ItemEvent, Patient,
-    PatientWithdrawalEvent,
+    AbnormalEvent, AttemptCaptureProcessing, AttemptEvent, AudioAssetRow,
+    AudioCaptureReceipt, AutopilotRepeatRequest, InteractionEvent, ItemEvent,
+    AutopilotControlEvent, Patient, PatientDeviceCapability,
+    PatientWithdrawalEvent, RuntimeCommand, RuntimeCommandAck,
     ExportArtifact, ExportBatch, ScaleResult, Session as TrainSession, SessionCloseoutReport,
     SessionOutcomeSummary, SessionRuntimeState, TurnEvent,
 )
@@ -1177,6 +1181,24 @@ def export_session_bundle(
         actor_role=actor_role,
     )
     export_scope_hash = _export_scope_hash(deidentification_config, session_id)
+    # Only now is the request's own identity fully validated, so an existing
+    # batch can be judged.  A same-key retry is a recovery only when every
+    # identity fact closes; anything else stays an idempotency conflict and must
+    # not be reinterpreted as an asset-lifecycle problem.
+    existing_batch = _resolve_recoverable_batch(
+        db,
+        key_hash=_idempotency_hash(idempotency_key),
+        request_fingerprint=request_fingerprint,
+        export_scope_hash=export_scope_hash,
+        requested_batch_id=batch_id,
+        data_classification=sess.data_classification,
+    )
+    # Prove the repeat evidence before any batch row, artifact or file exists,
+    # so a refusal leaves no residue to reconcile later.
+    repeat_by_audio = _proved_repeat_requests_by_audio(
+        db, session_id, existing_batch=existing_batch)
+    preflight_repeat_fingerprint = _repeat_evidence_fingerprint(
+        db, repeat_by_audio)
     batch, replay = _ensure_export_batch(
         db,
         requested_batch_id=batch_id,
@@ -1381,7 +1403,12 @@ def export_session_bundle(
     # 去标识分析包只放元数据清单，原始声纹始终另存受控目录。
     # 只有在源字节存在、已登记 checksum 且受控副本成功后，才会推进 recorded→exported。
     audio_sheet, touched = [], []
+    repeat_audio_sheet: list[dict] = []
     export_candidates: list[tuple[AudioAssetRow, Path]] = []
+    # An explicit repeat produces a real recording with no AttemptEvent.  The
+    # controlled manifest classifies it with closed metadata only, so the
+    # exported bytes never become an unattributed file.  Phrase keys,
+    # normalized-text digests and internal command/capture ids stay out.
     for a in audios:
         if (a.is_simulation != sess.is_simulation
                 or a.data_classification != sess.data_classification):
@@ -1397,6 +1424,18 @@ def export_session_bundle(
                 raise ValueError(f"音频 {a.raw_audio_id} 缺采集期 checksum，拒绝标记导出")
             export_candidates.append((a, source_blob))
         effective_export_batch_id = batch_id if will_export else a.export_batch_id
+        repeat_request = repeat_by_audio.get(a.raw_audio_id)
+        if repeat_request is not None:
+            # Governed projection for an explicit repeat is metadata-only and
+            # is exactly the four approved fields — nothing about the session,
+            # subject, turn, format or lifecycle joins it.
+            repeat_audio_sheet.append({
+                "capture_kind": "explicit_repeat",
+                "repeat_ordinal": repeat_request.repeat_ordinal,
+                "outcome": repeat_request.outcome,
+                "opaque_audio_code": audio_code(a.raw_audio_id),
+            })
+            continue
         audio_sheet.append({"audio_code": audio_code(a.raw_audio_id),
                             "session_code": session_code,
                             "subject_code": subj,
@@ -1417,12 +1456,27 @@ def export_session_bundle(
               "interactions": interaction_sheet, "item_scores": score_sheet,
               "scales": scale_sheet,
               "legacy_unverified_scales": legacy_unverified_scale_sheet,
-              "abnormal": abn_sheet, "audio_manifest": audio_sheet}
+              "abnormal": abn_sheet, "audio_manifest": audio_sheet,
+              "repeat_audio_manifest": repeat_audio_sheet}
+    for row in repeat_audio_sheet:
+        if set(row) != set(REPEAT_AUDIO_MANIFEST_FIELDS):
+            raise ValueError("重复请求音频清单字段不等于批准的四项白名单，拒绝导出")
     _assert_no_direct_identifiers(sheets)
 
     # 顺序是数据保护边界：先完整写分析 CSV 与受控音频，再把预期 manifest
     # 摘要持久化，最后原子发布 manifest。artifact 账本、recorded→exported 与
     # published 状态分别由可恢复事务收口；任何中间失败都不得盲推删除闸门。
+    # Close the window between preflight and the first write.  Comparing keys
+    # alone would miss a swap that keeps the same recordings but changes what
+    # they are bound to, so the whole fingerprint is compared; the identity map
+    # is expired first so an external write cannot be masked by cached rows.
+    _repeat_evidence_reproof_boundary()
+    db.expire_all()
+    if _repeat_evidence_fingerprint(
+            db, _proved_repeat_requests_by_audio(
+                db, session_id, existing_batch=existing_batch)) != (
+                preflight_repeat_fingerprint):
+        raise ValueError("重复请求证据集合在导出准备期间发生变化，拒绝导出")
     csv_root = Path(write_dir or EXPORT_DIR)
     controlled_root = Path(
         CONTROLLED_AUDIO_DIR if write_dir is None else write_dir / "_controlled_audio")
@@ -1565,6 +1619,337 @@ def export_session_bundle(
         raise
 
 
+# The frozen governance contract for explicit-repeat audio: metadata only, and
+# exactly these four fields.  A repeat recording has no AttemptEvent, so without
+# this classification its controlled bytes would export as an unattributed file.
+# Phrase keys, normalized-text digests and internal command/capture/repeat ids
+# are never part of it.
+REPEAT_AUDIO_MANIFEST_FIELDS = (
+    "capture_kind", "repeat_ordinal", "outcome", "opaque_audio_code",
+)
+REPEAT_AUDIO_MANIFEST_FORBIDDEN_FIELDS = frozenset({
+    "phrase_key", "normalized_text_sha256", "source_payload_sha256",
+    "capture_processing_id", "repeat_request_id", "record_command_id",
+    "source_tts_command_id", "replay_command_id", "raw_audio_id",
+    "pause_control_event_seq",
+})
+
+
+def _repeat_evidence_reproof_boundary() -> None:
+    """Explicit seam between the two repeat proofs.
+
+    A no-op in production.  It exists so a test can inject a concurrent change
+    exactly in the window the pre-write re-proof is meant to close, without
+    reordering any real validation to create that window.
+    """
+
+
+def _resolve_recoverable_batch(
+        db, *, key_hash: str, request_fingerprint: str, export_scope_hash: str,
+        requested_batch_id: Optional[str], data_classification: str,
+) -> "ExportBatch | None":
+    """Pure read: the existing batch this request may legitimately recover.
+
+    A row that shares the key but not the rest of the request identity is an
+    idempotency conflict, and it is raised *here*.  Deferring it to
+    :func:`_ensure_export_batch` would not work: the repeat preflight runs in
+    between, so an already-published recording would first fail the fresh
+    capture rule and surface as an asset-lifecycle error instead — wrong
+    exception type and wrong boundary.  The conditions are exactly the ones
+    :func:`_ensure_export_batch` uses, just evaluated earlier.
+
+    ``None`` means "not a recovery": either no such key, or the identity closes
+    but the batch has not reached a stage where its recordings have advanced.
+    """
+    existing = db.exec(select(ExportBatch).where(
+        ExportBatch.idempotency_key_hash == key_hash)).first()
+    if existing is None:
+        # Same session under a different key is the other ordering with the same
+        # defect: it too must be an idempotency conflict, not a lifecycle error.
+        scope_winner = db.exec(select(ExportBatch).where(
+            ExportBatch.export_scope_hash == export_scope_hash)).first()
+        if scope_winner is not None:
+            raise ExportIdempotencyConflict(
+                "该场次已有导出意图；必须使用原幂等键恢复，不能创建第二批次")
+        return None
+    if (existing.request_fingerprint != request_fingerprint
+            or existing.export_scope_hash != export_scope_hash
+            or (requested_batch_id is not None
+                and existing.batch_id != requested_batch_id)):
+        raise ExportIdempotencyConflict("导出幂等键已绑定另一请求")
+    # Identity closes, so this really is the same request.  A batch whose
+    # classification no longer matches the session is a corrupt authority row,
+    # not a fresh export: report it as the integrity failure the published-read
+    # path already reports, never as an asset-lifecycle error.
+    if existing.data_classification != data_classification:
+        raise ExportArtifactIntegrityError("导出批次与场次数据分类不一致")
+    if existing.status not in {"published", "artifacts_ready"}:
+        return None
+    return existing
+
+
+def _row_fingerprint(row, *, identity) -> tuple:
+    """Every column of one row, in the table's own declared order.
+
+    Listing columns by hand lets a newly added one silently drop out of the
+    concurrency window; driving it off ``__table__.columns`` cannot.  A missing
+    row still contributes an identity sentinel so its disappearance is visible.
+    """
+    if row is None:
+        return ("missing", identity)
+    table = type(row).__table__
+    return tuple(
+        (column.name, getattr(row, column.name, None))
+        for column in table.columns
+    )
+
+
+def _command_fingerprint(db, command_id) -> tuple:
+    return _row_fingerprint(
+        None if command_id is None else db.get(RuntimeCommand, command_id),
+        identity=("runtimecommand", command_id))
+
+
+def _session_fingerprint(db, session_id: str) -> tuple:
+    return _row_fingerprint(
+        db.get(TrainSession, session_id), identity=("session", session_id))
+
+
+def _pause_event_fingerprint(db, session_id: str, event_seq) -> tuple | None:
+    if event_seq is None:
+        return None
+    row = db.exec(select(AutopilotControlEvent).where(
+        AutopilotControlEvent.session_id == session_id,
+        AutopilotControlEvent.event_seq == event_seq)).first()
+    return _row_fingerprint(
+        row, identity=("autopilotcontrolevent", session_id, event_seq))
+
+
+def _acks_fingerprint(db, command_ids) -> tuple:
+    rows = []
+    for command_id in command_ids:
+        if command_id is None:
+            continue
+        for ack in db.exec(select(RuntimeCommandAck).where(
+                RuntimeCommandAck.command_id == command_id)):
+            rows.append(_row_fingerprint(
+                ack, identity=("runtimecommandack", ack.id)))
+    return tuple(sorted(rows, key=repr))
+
+
+def _chain_capability_tokens(db, request) -> tuple:
+    tokens = []
+    for command_id in (request.record_command_id, request.source_tts_command_id,
+                       request.replay_command_id):
+        if command_id is None:
+            continue
+        row = db.get(RuntimeCommand, command_id)
+        if row is not None:
+            tokens.append(row.issued_capability_token_hash)
+        for ack in db.exec(select(RuntimeCommandAck).where(
+                RuntimeCommandAck.command_id == command_id)):
+            tokens.append(ack.capability_token_hash)
+    return tuple(tokens)
+
+
+def _capabilities_fingerprint(db, token_hashes) -> tuple:
+    """The current authority rows the commands and ACKs are bound to."""
+    return tuple(
+        _row_fingerprint(
+            db.get(PatientDeviceCapability, token_hash),
+            identity=("patientdevicecapability", token_hash))
+        for token_hash in sorted({h for h in token_hashes if h})
+    )
+
+
+def _repeat_evidence_fingerprint(
+        db, indexed: dict[str, AutopilotRepeatRequest]) -> tuple:
+    """A stable, order-free identity for one session's whole repeat evidence set."""
+    rows = []
+    for raw_audio_id, request in indexed.items():
+        capture = db.get(AttemptCaptureProcessing, request.capture_processing_id)
+        asset = db.get(AudioAssetRow, raw_audio_id)
+        receipt = (None if capture is None
+                   else db.get(AudioCaptureReceipt, capture.receipt_server_seq))
+        rows.append((
+            raw_audio_id,
+            _row_fingerprint(
+                request, identity=("autopilotrepeatrequest", request.id)),
+            _row_fingerprint(
+                capture,
+                identity=("attemptcaptureprocessing",
+                          request.capture_processing_id)),
+            _row_fingerprint(asset, identity=("audioassetrow", raw_audio_id)),
+            _row_fingerprint(
+                receipt,
+                identity=("audiocapturereceipt",
+                          None if capture is None else capture.receipt_server_seq)),
+            _command_fingerprint(db, request.record_command_id),
+            _command_fingerprint(db, request.source_tts_command_id),
+            _command_fingerprint(db, request.replay_command_id),
+            _session_fingerprint(db, request.session_id),
+            _pause_event_fingerprint(
+                db, request.session_id, request.pause_control_event_seq),
+            _acks_fingerprint(db, (request.record_command_id,
+                                   request.source_tts_command_id,
+                                   request.replay_command_id)),
+            _capabilities_fingerprint(db, _chain_capability_tokens(db, request)),
+        ))
+    return tuple(sorted(rows, key=repr))
+
+
+def _proved_repeat_requests_by_audio(
+        db, session_id: str, *,
+        existing_batch: "ExportBatch | None" = None,
+) -> dict[str, AutopilotRepeatRequest]:
+    """Index this session's repeat recordings, capture-first and proved both ways.
+
+    The truth source is the session's own terminal repeat-disposition captures,
+    not the ledger: a ledger row carrying a foreign ``session_id`` must never be
+    able to hide a repeat capture and let its bytes export as ordinary answer
+    audio.  Every capture is fully re-verified through the shared evidence
+    module, and the two directions must then agree exactly — same ids, same
+    counts — or the whole export refuses.
+    """
+    captures = list(db.exec(select(AttemptCaptureProcessing).where(
+        AttemptCaptureProcessing.session_id == session_id,
+        or_(
+            AttemptCaptureProcessing.repeat_request_id.is_not(None),
+            AttemptCaptureProcessing.disposition.in_(
+                ("repeat_replayed", "repeat_limit_paused")),
+        ),
+    )))
+    indexed: dict[str, AutopilotRepeatRequest] = {}
+    capture_ids: set[int] = set()
+    request_ids: set[int] = set()
+    for capture in captures:
+        try:
+            chain = repeat_evidence.verify_repeat_capture(db, capture)
+        except repeat_evidence.RepeatEvidenceError as exc:
+            raise ValueError(f"重复请求证据链不成立，拒绝导出：{exc}") from exc
+        request = chain.request
+        if request.session_id != session_id:
+            raise ValueError("重复请求账本属于另一场次，拒绝导出")
+        if request.raw_audio_id in indexed:
+            raise ValueError("同一录音绑定了多条重复请求账本，拒绝导出")
+        indexed[request.raw_audio_id] = request
+        capture_ids.add(capture.id)
+        request_ids.add(request.id)
+
+    # Two more independent directions, then all three compared exactly.
+    #
+    # ``by_session`` catches a ledger row that claims this session.  ``by_pointer``
+    # additionally catches a ledger row belonging to *another* session whose
+    # capture pointer reaches into this one — that row would otherwise stay
+    # invisible here while its capture's own pointer/disposition had been wiped,
+    # letting a repeat recording export as ordinary answer audio.
+    by_session = list(db.exec(select(AutopilotRepeatRequest).where(
+        AutopilotRepeatRequest.session_id == session_id)))
+    by_pointer = list(db.exec(
+        select(AutopilotRepeatRequest)
+        .join(AttemptCaptureProcessing,
+              AutopilotRepeatRequest.capture_processing_id
+              == AttemptCaptureProcessing.id)
+        .where(AttemptCaptureProcessing.session_id == session_id)))
+    if ({row.id for row in by_session} != request_ids
+            or {row.id for row in by_pointer} != request_ids):
+        raise ValueError("重复请求账本与采集处理行不是一一对应，拒绝导出")
+    if ({row.capture_processing_id for row in by_session} != capture_ids
+            or {row.capture_processing_id for row in by_pointer} != capture_ids):
+        raise ValueError("重复请求账本反向指针与采集处理行不一致，拒绝导出")
+    if (len(by_session) != len(captures) or len(by_pointer) != len(captures)
+            or len(indexed) != len(captures)):
+        raise ValueError("重复请求账本与采集处理行数量不一致，拒绝导出")
+    # One recording is either an answer or a repeat request, never both — and
+    # the Attempt may live in any session, so this query is deliberately global.
+    if indexed and db.exec(select(AttemptEvent).where(
+            AttemptEvent.raw_audio_id.in_(tuple(indexed)))).first() is not None:
+        raise ValueError("同一录音同时绑定回答与重复请求，拒绝导出")
+
+    # Every repeat recording must belong to *this* session's audio set and close
+    # over its receipt and its bytes.  Without this an asset moved to another
+    # session would silently drop out of the audio loop below, and its repeat
+    # recording would never be classified at all.
+    train_session = db.get(TrainSession, session_id)
+    if train_session is None:
+        raise ValueError("场次不存在，拒绝导出")
+    session_audio = {
+        row.raw_audio_id: row for row in db.exec(select(AudioAssetRow).where(
+            AudioAssetRow.session_id == session_id))
+    }
+    if set(indexed) - set(session_audio):
+        raise ValueError("重复请求录音不属于本场次音频集合，拒绝导出")
+    for raw_audio_id, request in indexed.items():
+        asset = session_audio[raw_audio_id]
+        capture = db.get(AttemptCaptureProcessing, request.capture_processing_id)
+        if capture is None:
+            raise ValueError("重复请求账本失去其采集处理行，拒绝导出")
+        receipt = db.get(AudioCaptureReceipt, capture.receipt_server_seq)
+        if (receipt is None or receipt.session_id != session_id
+                or receipt.raw_audio_id != raw_audio_id
+                or asset.checksum != receipt.checksum
+                or asset.byte_count != receipt.byte_count
+                or asset.data_classification != receipt.data_classification
+                or asset.is_simulation != receipt.is_simulation
+                or asset.data_classification != train_session.data_classification
+                or asset.is_simulation != train_session.is_simulation
+                or receipt.data_classification != train_session.data_classification
+                or receipt.is_simulation != train_session.is_simulation):
+            raise ValueError("重复请求录音与其采集回执/场次分类不闭合，拒绝导出")
+        record = db.get(RuntimeCommand, request.record_command_id)
+        if (record is None or asset.turn_key != receipt.turn_key
+                or receipt.turn_key != record.turn_key):
+            raise ValueError("重复请求录音与其环节键不闭合，拒绝导出")
+        # A repeat recording must be in the exact state this export expects.
+        # For a new batch that is a fresh capture; for a recovery replay of an
+        # already-advanced batch it is that same batch's exported recording.
+        # Neither branch relaxes the other.
+        # Only a *published* batch has advanced its recordings.  An
+        # ``artifacts_ready`` batch has files and artifact rows but has not
+        # finalized, so its assets are still ``recorded`` and must satisfy the
+        # ordinary fresh-capture rule.
+        recovering = (existing_batch is not None
+                      and existing_batch.status == "published")
+        common = (
+            asset.uploaded_at is not None,
+            asset.checksum is not None,
+            asset.byte_count is not None,
+            asset.delete_gate_passed is False,
+            asset.withdrawn is False,
+            not (asset.withdrawal_status or "").strip(),
+            asset.contains_direct_identifier == receipt.contains_direct_identifier,
+        )
+        if recovering:
+            lifecycle = (
+                asset.status == AudioStatus.exported,
+                asset.export_batch_id == existing_batch.batch_id,
+                asset.exported_at is not None,
+            )
+            message = "重复请求录音与其已发布批次的导出状态不一致，拒绝导出"
+        else:
+            lifecycle = (
+                asset.status == AudioStatus.recorded,
+                asset.exported_at is None,
+                asset.export_batch_id is None,
+            )
+            message = "重复请求录音不处于可导出的全新采集状态，拒绝导出"
+        if not all(common + lifecycle):
+            raise ValueError(message)
+        # Bytes land before the stopped ACK writes the receipt, never after.
+        if asset.uploaded_at > receipt.received_at:
+            raise ValueError("重复请求录音上传时间晚于其采集回执，拒绝导出")
+        blob = audio_store.find_blob(raw_audio_id)
+        if blob is None:
+            raise ValueError("重复请求录音源文件缺失，拒绝导出")
+        # One streaming pass yields both the digest and the true length.
+        blob_digest, blob_size = audio_store.sha256_file(blob)
+        if blob_size != asset.byte_count:
+            raise ValueError("重复请求录音文件大小与采集账本不一致，拒绝导出")
+        if blob_digest != asset.checksum:
+            raise ValueError("重复请求录音字节与采集期校验和不一致，拒绝导出")
+    return indexed
+
+
 def _assert_no_direct_identifiers(sheets: dict) -> None:
     """默认包最终自检：直接标识列与未经审核自由文本均 fail closed。"""
     export_security.assert_deidentified_sheets(sheets)
@@ -1591,7 +1976,14 @@ def _write_csvs(
         if not _SAFE_BATCH_ID.fullmatch(name):
             raise ValueError("导出表名含非法路径字符")
         p = base / f"{name}.csv"
-        cols = sorted({k for r in rows for k in r}) if rows else []
+        if name == "repeat_audio_manifest":
+            # The approved governance contract fixes both the field set and
+            # their order; it must not inherit the generic sorted ordering.
+            cols = list(REPEAT_AUDIO_MANIFEST_FIELDS)
+            if any(set(r) != set(cols) for r in rows):
+                raise ValueError("重复请求音频清单字段不等于批准的四项白名单，拒绝导出")
+        else:
+            cols = sorted({k for r in rows for k in r}) if rows else []
         export_security.atomic_write_csv(p, cols, rows)
         files.append(str(p))
     return files, staging_receipt

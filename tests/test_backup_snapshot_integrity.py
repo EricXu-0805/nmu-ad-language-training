@@ -734,6 +734,53 @@ def test_removed_check_constraint_is_rejected(tmp_path):
     assert "code=recovery_schema_incomplete" in completed.stderr
 
 
+def test_removed_runtime_replay_requires_repeat_binding_check_is_rejected(
+        tmp_path):
+    """删掉 replay->repeat 绑定 CHECK 后，即使重算 manifest 也必须被 schema 层拒绝。
+
+    这条约束是"重播命令必须带完整重复请求绑定"的唯一数据库级保证；一份把它
+    悄悄去掉的恢复快照在字节层面完全自洽，只能由 schema 校验器挡下来。
+    """
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    _database(snapshot)
+    connection = sqlite3.connect(snapshot / "app.db")
+    try:
+        table = "runtimecommand"
+        constraint = "ck_runtime_command_replay_requires_repeat_binding"
+        original_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()[0]
+        check_clause = (
+            ", \n\tCONSTRAINT " + constraint + " CHECK ("
+            + _models.REPLAY_REQUIRES_REPEAT_BINDING_CHECK + ")"
+        )
+        assert original_sql.count(check_clause) == 1
+        weakened_sql = original_sql.replace(check_clause, "", 1)
+        assert weakened_sql != original_sql
+        assert constraint not in weakened_sql
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='table' AND name=?",
+            (weakened_sql, table),
+        )
+        connection.execute("PRAGMA writable_schema=OFF")
+        connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+        connection.commit()
+    finally:
+        connection.close()
+    # Recomputed on purpose: without it the run would stop at
+    # manifest_hash_mismatch and never reach the schema verifier under test.
+    _manifest(snapshot)
+
+    completed = _run("verify", snapshot)
+
+    assert completed.returncode == 2
+    assert completed.stderr.strip() == "REJECTED code=recovery_schema_incomplete"
+
+
 def test_generated_hidden_column_is_rejected(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
@@ -1366,3 +1413,291 @@ def test_publish_parent_fsync_failure_rolls_back_to_staging(monkeypatch, tmp_pat
     assert caught.value.code == "publish_parent_fsync_failed"
     assert source.is_dir()
     assert not destination.exists()
+
+
+# --------------------------------------------------------------------------
+# Autopilot plan profile head: e4a7c1d9b206 recovery-schema contract
+# --------------------------------------------------------------------------
+
+
+PROFILE_HEAD = "e4a7c1d9b206"
+PRE_PROFILE_HEAD = "d3f8b5c1a704"
+PROFILE_COLUMNS = (
+    "autopilot_profile_version_id",
+    "autopilot_profile_definition_digest",
+)
+PROFILE_CHECKS = (
+    ("visitplan", "ck_visit_plan_autopilot_profile_binding_complete"),
+    ("visitplan", "ck_visit_plan_autopilot_profile_simulation_only"),
+    ("session", "ck_session_autopilot_profile_binding_complete"),
+    ("session", "ck_session_autopilot_profile_simulation_only"),
+    ("session", "ck_session_autopilot_profile_requires_visit_plan"),
+)
+
+
+def _alembic_config(db_path: Path) -> Config:
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    return config
+
+
+def _database_at(snapshot: Path, revision: str) -> Path:
+    db_path = snapshot / "app.db"
+    command.upgrade(_alembic_config(db_path), revision)
+    return db_path
+
+
+def _rewrite_stored_table_sql(db_path: Path, table: str, transform) -> None:
+    """Forge schema drift the way a tampered restore would present it."""
+    connection = sqlite3.connect(db_path)
+    try:
+        original = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()[0]
+        replacement = transform(original)
+        assert replacement != original, "drift fixture did not change the DDL"
+        version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='table' AND name=?",
+            (replacement, table),
+        )
+        connection.execute(f"PRAGMA schema_version={int(version) + 1}")
+        connection.execute("PRAGMA writable_schema=OFF")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _drop_check_clause(sql: str, name: str) -> str:
+    marker = f"CONSTRAINT {name} CHECK ("
+    start = sql.index(marker)
+    index = start + len(marker)
+    depth = 1
+    while depth:
+        if sql[index] == "(":
+            depth += 1
+        elif sql[index] == ")":
+            depth -= 1
+        index += 1
+    prefix = sql[:start].rstrip()
+    assert prefix.endswith(","), "unexpected constraint position"
+    return prefix[:-1] + sql[index:]
+
+
+def _drop_profile_column(
+        db_path: Path, table: str, column: str) -> tuple[str, ...]:
+    """Remove only a profile column and the CHECKs that depend on it."""
+    dependent = tuple(
+        name for owner, name in PROFILE_CHECKS if owner == table
+    )
+    expected = (
+        (
+            "ck_visit_plan_autopilot_profile_binding_complete",
+            "ck_visit_plan_autopilot_profile_simulation_only",
+        )
+        if table == "visitplan"
+        else (
+            "ck_session_autopilot_profile_binding_complete",
+            "ck_session_autopilot_profile_simulation_only",
+            "ck_session_autopilot_profile_requires_visit_plan",
+        )
+    )
+    assert dependent == expected
+
+    def without_dependent_checks(sql: str) -> str:
+        for name in dependent:
+            sql = _drop_check_clause(sql, name)
+        return sql
+
+    _rewrite_stored_table_sql(db_path, table, without_dependent_checks)
+    connection = sqlite3.connect(db_path)
+    try:
+        quoted_table = _GUARD_MODULE._quote_identifier(table)
+        quoted_column = _GUARD_MODULE._quote_identifier(column)
+        connection.execute(
+            f"ALTER TABLE {quoted_table} DROP COLUMN {quoted_column}"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return dependent
+
+
+def test_recovery_contract_pins_the_profile_head_only():
+    assert _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS == frozenset({PROFILE_HEAD})
+    assert PRE_PROFILE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
+
+
+def test_recovery_fingerprint_literal_matches_a_fresh_profile_head(tmp_path):
+    """The constant is a hardcoded literal, recomputed here from a fresh head."""
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    db_path = _database_at(snapshot, "head")
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()[0] == PROFILE_HEAD
+        computed = _GUARD_MODULE._schema_contract_fingerprint(connection)
+    finally:
+        connection.close()
+
+    assert computed == _GUARD_MODULE.CURRENT_RECOVERY_SCHEMA_SHA256
+
+
+def test_real_pre_profile_snapshot_is_rejected_as_unsupported_revision(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    _database_at(snapshot, PRE_PROFILE_HEAD)
+    _manifest(snapshot)
+
+    completed = _run("verify", snapshot)
+
+    assert completed.returncode == 2
+    assert "code=alembic_revision_unsupported" in completed.stderr
+
+
+def test_pre_profile_schema_with_forged_head_revision_is_rejected(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    db_path = _database_at(snapshot, PRE_PROFILE_HEAD)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "UPDATE alembic_version SET version_num=?", (PROFILE_HEAD,))
+        connection.commit()
+    finally:
+        connection.close()
+    _manifest(snapshot)
+
+    completed = _run("verify", snapshot)
+
+    assert completed.returncode == 2
+    assert "code=recovery_schema_incomplete" in completed.stderr
+
+
+@pytest.mark.parametrize("table", ["visitplan", "session"])
+@pytest.mark.parametrize("column", PROFILE_COLUMNS)
+def test_profile_column_removal_is_rejected(tmp_path, table, column):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    db_path = _database_at(snapshot, "head")
+    connection = sqlite3.connect(db_path)
+    try:
+        before = _GUARD_MODULE._schema_contract(connection)
+    finally:
+        connection.close()
+
+    dependent = _drop_profile_column(db_path, table, column)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        after = _GUARD_MODULE._schema_contract(connection)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
+    finally:
+        connection.close()
+
+    for other_table in set(before) - {table}:
+        assert after[other_table] == before[other_table]
+
+    before_table = before[table]
+    after_table = after[table]
+    assert [row[1:] for row in after_table["columns"]] == [
+        row[1:] for row in before_table["columns"] if row[1] != column
+    ]
+    assert after_table["checks"] == [
+        row for row in before_table["checks"] if row[0] not in dependent
+    ]
+    assert after_table["foreign_keys"] == before_table["foreign_keys"]
+    assert after_table["indexes"] == before_table["indexes"]
+
+    old_clauses, old_suffix = before_table["table_sql"]
+    removed = {
+        clause for clause in old_clauses
+        if clause.startswith(f"{column} ")
+        or any(
+            clause.startswith(f"CONSTRAINT {name} CHECK (")
+            for name in dependent
+        )
+    }
+    assert len(removed) == 1 + len(dependent)
+    assert after_table["table_sql"] == (
+        tuple(clause for clause in old_clauses if clause not in removed),
+        old_suffix,
+    )
+    _manifest(snapshot)
+
+    completed = _run("verify", snapshot)
+
+    assert completed.returncode == 2
+    assert completed.stderr.strip() == "REJECTED code=recovery_schema_incomplete"
+
+
+@pytest.mark.parametrize(
+    "table,constraint", PROFILE_CHECKS,
+    ids=[name for _table, name in PROFILE_CHECKS],
+)
+def test_named_profile_check_removal_is_rejected(tmp_path, table, constraint):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    db_path = _database_at(snapshot, "head")
+    _rewrite_stored_table_sql(
+        db_path, table, lambda sql: _drop_check_clause(sql, constraint))
+    _manifest(snapshot)
+
+    completed = _run("verify", snapshot)
+
+    assert completed.returncode == 2
+    assert "code=recovery_schema_incomplete" in completed.stderr
+
+
+def test_wrong_recovery_fingerprint_is_rejected(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    _database_at(snapshot, "head")
+    _manifest(snapshot)
+    _harden(snapshot)
+
+    wrong = "0" * 64
+    assert wrong != _GUARD_MODULE.CURRENT_RECOVERY_SCHEMA_SHA256
+    monkeypatch.setattr(
+        _GUARD_MODULE,
+        "CURRENT_RECOVERY_SCHEMA_SHA256",
+        wrong,
+    )
+
+    with pytest.raises(_GUARD_MODULE.SnapshotError) as caught:
+        _GUARD_MODULE.verify_snapshot(snapshot)
+
+    assert caught.value.code == "recovery_schema_incomplete"
+
+
+def test_fresh_profile_head_snapshot_still_passes_end_to_end(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    audio = snapshot / "audio"
+    audio.mkdir(parents=True)
+    payload = b"profile-head-authoritative-audio"
+    (audio / "aud-profile.webm").write_bytes(payload)
+    _database(snapshot, [
+        ("aud-profile", "recorded", 0, None,
+         _digest(payload), len(payload), "webm"),
+    ])
+    _manifest(snapshot)
+
+    completed = _run("verify", snapshot)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "OK"
+    connection = sqlite3.connect(snapshot / "app.db")
+    try:
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()[0] == PROFILE_HEAD
+    finally:
+        connection.close()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -227,6 +228,30 @@ def test_projection_fails_closed_for_expiry_and_config_change(tmp_path):
         assert mismatch.start_allowed is False
 
 
+def test_projection_reports_required_capability_failure_on_a_current_config(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'required-failure.db'}")
+    SQLModel.metadata.create_all(engine)
+    now = datetime(2026, 7, 19, 10, 0, 0)
+    config = _configuration(tts_engine=FakeTts(valid=False))
+    result = provider_readiness.run_synthetic_probe(config)
+    with Session(engine) as session:
+        provider_readiness.persist_probe(
+            session, result=result, actor_display_id="ADMIN-1", checked_at=now)
+        session.commit()
+        projection = provider_readiness.readiness_projection(
+            session, configuration=config, now=now + timedelta(minutes=1))
+
+    # The configuration never changed and the row is still fresh, so the failed
+    # required capability is the only thing left that can refuse the start.
+    assert projection.schema_version == "provider-readiness.v2"
+    assert projection.matches_current_config is True
+    assert projection.status == "required_capability_failed"
+    assert projection.start_allowed is False
+    assert projection.tts.success is False
+    assert projection.tts.failure_code == "tts_audio_invalid"
+    assert projection.required_capabilities_ready is False
+
+
 def test_persisted_ready_probe_becomes_mismatch_after_api_key_rotation(
         monkeypatch, tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'key-rotation.db'}")
@@ -390,3 +415,417 @@ def test_provider_configuration_change_during_probe_is_ledgered_and_blocked(
         assert row is not None
         assert row.required_capabilities_ready is False
         assert row.probe_failure_code == "provider_config_changed_during_probe"
+
+
+class _FakeQwenAutopilotEngine:
+    version = "dashscope/qwen3-tts-flash/Serena"
+    cloud = True
+
+    def __init__(self, *, speech_rate: float = 0.9):
+        self.cache_params = f"speech_rate={speech_rate}"
+        self.calls: list[str] = []
+
+    def synthesize(self, text: str):
+        self.calls.append(text)
+        return b"RIFF" + (b"\x00" * 80)
+
+
+class _FakeGenericPiperEngine:
+    version = "piper/zh_CN-huayan-medium"
+    cache_params = "length_scale=1.15"
+    cloud = False
+
+    def synthesize(self, text: str):
+        raise AssertionError(
+            "generic engine must never be probed for the exact autopilot channel")
+
+
+def test_default_configuration_resolves_autopilot_engine_not_generic(monkeypatch):
+    autopilot_calls: list[int] = []
+    generic_calls: list[int] = []
+    qwen = _FakeQwenAutopilotEngine()
+
+    def fake_autopilot_engine():
+        autopilot_calls.append(1)
+        return qwen
+
+    def fake_generic_engine():
+        generic_calls.append(1)
+        return _FakeGenericPiperEngine()
+
+    monkeypatch.setattr(provider_readiness.tts, "get_autopilot_engine", fake_autopilot_engine)
+    monkeypatch.setattr(provider_readiness.tts, "engine", fake_generic_engine)
+
+    config = provider_readiness.capture_configuration(
+        asr_engine=FakeAsr(), llm_engine=FakeLlm())
+
+    assert autopilot_calls == [1]
+    assert generic_calls == []
+    assert config.tts_engine_version == "dashscope/qwen3-tts-flash/Serena"
+
+
+def test_explicit_tts_injection_bypasses_both_resolvers(monkeypatch):
+    def _must_not_resolve():
+        raise AssertionError("resolver must not run when tts_engine is injected")
+
+    monkeypatch.setattr(provider_readiness.tts, "get_autopilot_engine", _must_not_resolve)
+    monkeypatch.setattr(provider_readiness.tts, "engine", _must_not_resolve)
+
+    config = provider_readiness.capture_configuration(
+        tts_engine=FakeTts(), asr_engine=FakeAsr(), llm_engine=FakeLlm())
+
+    assert config.tts_engine_version == FakeTts.version
+
+
+# A frozen literal, deliberately NOT derived from provider_readiness.
+# RUNTIME_CONTRACT.  An implementation that wrongly rewrites the response
+# runtime_contract to the current constant must fail against this value.
+LEGACY_RUNTIME_SENTINEL = "legacy_runtime_contract_v0_frozen_sentinel"
+
+PROJECTION_KEYS = {
+    "schema_version", "runtime_contract", "status", "start_allowed",
+    "required_capabilities_ready", "all_configured_capabilities_ready",
+    "matches_current_config", "tts", "asr", "llm",
+    "checked_at", "expires_at", "actor_display_id", "probe_failure_code",
+}
+CAPABILITY_KEYS = {
+    "required", "configured", "success", "engine_version", "failure_code"}
+
+
+def _row_snapshot(engine, probe_id: str) -> dict:
+    """Every scalar column, read through a brand-new Session.
+
+    Re-reading inside the projecting session would hand back the same
+    identity-mapped object and could not detect a rewrite at all.
+    """
+    with Session(engine) as reader:
+        row = reader.exec(select(ProviderReadinessProbe).where(
+            ProviderReadinessProbe.probe_id == probe_id)).one()
+        return {
+            name: getattr(row, name)
+            for name in ProviderReadinessProbe.__table__.columns.keys()
+        }
+
+
+def _insert_legacy_row(session, *, probe_id, result, now,
+                       schema_version, runtime_contract):
+    """ProviderReadinessProbe is append-only, so a legacy row is a fresh INSERT.
+
+    Every field except the two under test copies what a real probe would have
+    produced, so nothing but schema/runtime can explain a refusal.
+    """
+    row = ProviderReadinessProbe(
+        probe_id=probe_id,
+        schema_version=schema_version,
+        runtime_contract=runtime_contract,
+        config_fingerprint=result.configuration.fingerprint,
+        tts_engine_version=result.configuration.tts_engine_version,
+        asr_engine_version=result.configuration.asr_engine_version,
+        llm_engine_version=result.configuration.llm_engine_version,
+        tts_required=result.tts.required, tts_success=result.tts.success,
+        tts_failure_code=result.tts.failure_code,
+        asr_required=result.asr.required, asr_success=result.asr.success,
+        asr_failure_code=result.asr.failure_code,
+        llm_required=result.llm.required,
+        llm_configured=result.configuration.llm_configured,
+        llm_success=result.llm.success, llm_failure_code=result.llm.failure_code,
+        required_capabilities_ready=result.required_capabilities_ready,
+        all_configured_capabilities_ready=result.all_configured_capabilities_ready,
+        probe_failure_code=result.probe_failure_code,
+        checked_at=now, expires_at=now + timedelta(minutes=30),
+        actor_display_id="ADMIN-1",
+    )
+    session.add(row)
+    session.commit()
+    return row
+
+
+def test_no_row_projection_reports_current_schema_and_blocks_start(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'no-row.db'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        projection = provider_readiness.readiness_projection(
+            session, configuration=_configuration())
+
+    assert projection.schema_version == "provider-readiness.v2"
+    assert projection.status == "missing"
+    assert projection.start_allowed is False
+    assert projection.matches_current_config is False
+
+
+def test_current_row_projects_current_schema_and_allows_start(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'current-row.db'}")
+    SQLModel.metadata.create_all(engine)
+    now = datetime(2026, 7, 19, 10, 0, 0)
+    config = _configuration()
+    result = provider_readiness.run_synthetic_probe(config)
+    with Session(engine) as session:
+        provider_readiness.persist_probe(
+            session, result=result, actor_display_id="ADMIN-1", checked_at=now)
+        session.commit()
+        projection = provider_readiness.readiness_projection(
+            session, configuration=config, now=now + timedelta(minutes=1))
+
+    assert projection.schema_version == "provider-readiness.v2"
+    assert projection.status == "ready"
+    assert projection.matches_current_config is True
+    assert projection.start_allowed is True
+
+
+@pytest.mark.parametrize(
+    "probe_id,runtime_contract,expected_runtime",
+    [
+        # Runtime contract forged equal to the current one: only the schema
+        # version differs, so only the schema rule can explain the refusal.
+        ("prb_legacy_current_runtime", None, None),
+        # A genuinely old runtime contract must survive into the response
+        # verbatim rather than being rewritten to today's constant.
+        ("prb_legacy_sentinel_runtime", LEGACY_RUNTIME_SENTINEL,
+         LEGACY_RUNTIME_SENTINEL),
+    ],
+)
+def test_legacy_row_projects_as_v2_config_mismatch_without_any_rewrite(
+        tmp_path, probe_id, runtime_contract, expected_runtime):
+    engine = create_engine(f"sqlite:///{tmp_path / f'{probe_id}.db'}")
+    SQLModel.metadata.create_all(engine)
+    now = datetime(2026, 7, 19, 10, 0, 0)
+    config = _configuration()
+    result = provider_readiness.run_synthetic_probe(config)
+    contract = runtime_contract or result.configuration.runtime_contract
+    with Session(engine) as session:
+        _insert_legacy_row(
+            session, probe_id=probe_id, result=result, now=now,
+            schema_version="provider-readiness.v1", runtime_contract=contract)
+
+    before = _row_snapshot(engine, probe_id)
+    assert before["schema_version"] == "provider-readiness.v1"
+    assert before["runtime_contract"] == contract
+
+    with Session(engine) as session:
+        projection = provider_readiness.readiness_projection(
+            session, configuration=config, now=now + timedelta(minutes=1))
+        # The projecting session must not have staged a single change.
+        assert not session.dirty
+        assert not session.new
+        assert not session.deleted
+
+    # Response schema is the current constant even though the row is v1.
+    assert projection.schema_version == "provider-readiness.v2"
+    assert projection.runtime_contract == (
+        expected_runtime if expected_runtime is not None else contract)
+    assert projection.status == "config_mismatch"
+    assert projection.matches_current_config is False
+    assert projection.start_allowed is False
+
+    after = _row_snapshot(engine, probe_id)
+    assert after == before
+    with Session(engine) as reader:
+        assert len(list(reader.exec(select(ProviderReadinessProbe)))) == 1
+
+
+def test_projection_keys_are_exact_and_carry_no_secret_or_payload(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'keys.db'}")
+    SQLModel.metadata.create_all(engine)
+    now = datetime(2026, 7, 19, 10, 0, 0)
+    config = _configuration()
+    result = provider_readiness.run_synthetic_probe(config)
+    with Session(engine) as session:
+        provider_readiness.persist_probe(
+            session, result=result, actor_display_id="ADMIN-1", checked_at=now)
+        session.commit()
+        payload = provider_readiness.readiness_projection(
+            session, configuration=config,
+            now=now + timedelta(minutes=1)).model_dump(mode="json")
+
+    assert set(payload) == PROJECTION_KEYS
+    for capability in ("tts", "asr", "llm"):
+        assert set(payload[capability]) == CAPABILITY_KEYS
+    serialized = json.dumps(payload, ensure_ascii=False)
+    for forbidden in (
+        "config_fingerprint", "api_key", "audio", "transcript",
+        provider_readiness.PROBE_TEXT, config.fingerprint,
+    ):
+        assert forbidden not in serialized
+
+
+def test_http_projection_reports_current_schema_for_missing_and_ready(
+        readiness_api):
+    clients, _engine = readiness_api
+    admin = clients["probe-admin"]
+
+    missing = admin.get("/ai/provider-readiness")
+    assert missing.status_code == 200, missing.text
+    assert missing.json()["schema_version"] == "provider-readiness.v2"
+    assert missing.json()["status"] == "missing"
+    assert "config_fingerprint" not in missing.json()
+
+    probed = admin.post("/ai/provider-readiness/probe")
+    assert probed.status_code == 200, probed.text
+    assert probed.json()["schema_version"] == "provider-readiness.v2"
+    assert probed.json()["start_allowed"] is True
+    assert "config_fingerprint" not in probed.json()
+
+
+def test_old_schema_version_row_fails_closed_even_if_other_fields_forged_equal(tmp_path):
+    # ProviderReadinessProbe is an append-only ledger (before_update is
+    # rejected), so a legacy row is simulated with a fresh INSERT that copies
+    # every field a real probe would have produced except schema_version,
+    # never by mutating an already-persisted row.
+    engine = create_engine(f"sqlite:///{tmp_path / 'schema-mismatch.db'}")
+    SQLModel.metadata.create_all(engine)
+    now = datetime(2026, 7, 19, 10, 0, 0)
+    config = _configuration()
+    result = provider_readiness.run_synthetic_probe(config)
+    with Session(engine) as session:
+        row = ProviderReadinessProbe(
+            probe_id="prb_legacy_schema_mismatch_test",
+            schema_version="provider-readiness.v1",
+            runtime_contract=result.configuration.runtime_contract,
+            config_fingerprint=result.configuration.fingerprint,
+            tts_engine_version=result.configuration.tts_engine_version,
+            asr_engine_version=result.configuration.asr_engine_version,
+            llm_engine_version=result.configuration.llm_engine_version,
+            tts_required=result.tts.required, tts_success=result.tts.success,
+            tts_failure_code=result.tts.failure_code,
+            asr_required=result.asr.required, asr_success=result.asr.success,
+            asr_failure_code=result.asr.failure_code,
+            llm_required=result.llm.required,
+            llm_configured=result.configuration.llm_configured,
+            llm_success=result.llm.success, llm_failure_code=result.llm.failure_code,
+            required_capabilities_ready=result.required_capabilities_ready,
+            all_configured_capabilities_ready=result.all_configured_capabilities_ready,
+            probe_failure_code=result.probe_failure_code,
+            checked_at=now, expires_at=now + timedelta(minutes=30),
+            actor_display_id="ADMIN-1",
+        )
+        session.add(row)
+        session.commit()
+
+        projection = provider_readiness.readiness_projection(
+            session, configuration=config, now=now + timedelta(minutes=1))
+
+        assert projection.status == "config_mismatch"
+        assert projection.start_allowed is False
+        # The row stays v1; only the response schema is the current constant.
+        assert projection.schema_version == "provider-readiness.v2"
+
+
+def test_speech_rate_only_change_invalidates_fingerprint():
+    slow = provider_readiness.capture_configuration(
+        tts_engine=_FakeQwenAutopilotEngine(speech_rate=0.9),
+        asr_engine=FakeAsr(), llm_engine=FakeLlm())
+    fast = provider_readiness.capture_configuration(
+        tts_engine=_FakeQwenAutopilotEngine(speech_rate=1.0),
+        asr_engine=FakeAsr(), llm_engine=FakeLlm())
+
+    assert slow.tts_engine_version == fast.tts_engine_version
+    assert slow.fingerprint != fast.fingerprint
+
+
+def test_default_autopilot_resolver_missing_key_fails_closed_without_network(monkeypatch):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    transport_calls: list[str] = []
+
+    def _sentinel_stream(self, text):
+        # The real streaming/SDK transport boundary.  If the missing-key
+        # path ever regresses to reach this, fail loudly rather than let a
+        # real network attempt happen; synthesize() catches broad
+        # Exception, so the explicit call-recording assertion below is the
+        # actual proof, independent of whether this raise gets swallowed.
+        transport_calls.append(text)
+        raise AssertionError(
+            "transport boundary reached on a missing-key probe: must fail "
+            "closed before any provider call")
+
+    monkeypatch.setattr(
+        provider_readiness.tts.DashScopeQwenTtsEngine, "_stream", _sentinel_stream)
+
+    # tts_engine is left unset so the real default get_autopilot_engine()
+    # resolver runs and builds a genuine DashScopeQwenTtsEngine; only the
+    # transport method is patched, never the whole engine.
+    config = provider_readiness.capture_configuration(
+        asr_engine=FakeAsr(), llm_engine=FakeLlm())
+    result = provider_readiness.run_synthetic_probe(config)
+
+    assert transport_calls == []
+    assert result.tts.success is False
+    assert result.tts.failure_code == "tts_audio_invalid"
+    assert result.required_capabilities_ready is False
+
+
+def test_cache_params_allowlists_exact_qwen_speech_rate_shape():
+    descriptor = provider_readiness._cache_params(
+        _FakeQwenAutopilotEngine(speech_rate=0.9))
+
+    assert descriptor == "speech_rate=0.9"
+
+
+def test_allowlist_accepts_every_tts_engine_that_actually_ships():
+    # 上面几条用的都是假引擎，所以白名单可以整条与现实脱节而全绿:允许了
+    # voice=synthetic(只存在于本文件的 FakeTts)，却漏掉 harness 里真正会被
+    # 探针读到的 harness-synthetic-v1,整套 TTS ACK 演练直接起不来。这条把
+    # 仓库里每个真引擎类的真值逐个喂进去,漏一个就红。
+    from pathlib import Path
+
+    from app import tts
+    from harness import tts_ack_harness
+
+    real_engines = (
+        tts.NullTtsEngine(),
+        tts.PiperTtsEngine(Path("/nonexistent/voice.onnx")),
+        tts.DashScopeCosyVoiceEngine(
+            model="cosyvoice-v2", voice="longyuan_v2", speech_rate=0.9),
+        tts.DashScopeQwenTtsEngine(
+            model="qwen3-tts-flash", voice="Serena", speech_rate=0.9),
+        tts_ack_harness.DeterministicHarnessTtsEngine(),
+    )
+
+    for engine in real_engines:
+        descriptor = provider_readiness._cache_params(engine)
+        assert descriptor == (engine.cache_params or "")
+
+
+def test_cache_params_tail_drift_past_200_chars_is_rejected_fail_closed():
+    # Approved shapes are intentionally bounded (a handful of chars), so a
+    # >200-char value can never be an approved shape -- rejecting it before
+    # fingerprint construction, rather than truncating-then-hashing it, is
+    # the correct no-collision behavior: two differing-only-after-200-chars
+    # values must never be silently treated as the same probed config.
+    prefix = "x" * 200
+
+    class TailA:
+        cache_params = prefix + "AAAA"
+
+    class TailB:
+        cache_params = prefix + "BBBB"
+
+    with pytest.raises(ValueError) as excinfo_a:
+        provider_readiness._cache_params(TailA())
+    with pytest.raises(ValueError) as excinfo_b:
+        provider_readiness._cache_params(TailB())
+
+    message_a, message_b = str(excinfo_a.value), str(excinfo_b.value)
+    assert message_a == message_b  # fixed message, never derived from the value
+    assert "AAAA" not in message_a
+    assert "BBBB" not in message_a
+    assert prefix not in message_a
+
+    with pytest.raises(ValueError):
+        provider_readiness.capture_configuration(
+            tts_engine=TailA(), asr_engine=FakeAsr(), llm_engine=FakeLlm())
+
+
+def test_unapproved_cache_params_value_fails_closed_without_leaking_it():
+    class SecretLikeTts:
+        cache_params = "sk-live-AbCdEf1234567890SECRETLOOKING"
+
+    with pytest.raises(ValueError) as excinfo:
+        provider_readiness._cache_params(SecretLikeTts())
+
+    message = str(excinfo.value)
+    assert "sk-live" not in message
+    assert SecretLikeTts.cache_params not in message
+
+    with pytest.raises(ValueError):
+        provider_readiness.capture_configuration(
+            tts_engine=SecretLikeTts(), asr_engine=FakeAsr(), llm_engine=FakeLlm())

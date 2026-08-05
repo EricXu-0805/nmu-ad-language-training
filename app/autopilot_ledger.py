@@ -810,15 +810,22 @@ def _verify_ack_capability(
     return capability
 
 
-def _verify_ack_binding(
+def _verify_ack_static_identity(
     session: Session,
     command: RuntimeCommand,
     ack: RuntimeCommandAck,
     *,
     ack_type: str,
     require_terminal_revision: bool,
-    require_current_command: bool = False,
-) -> None:
+) -> PatientDeviceCapability:
+    """Immutable ACK identity: nothing here can change after the ACK landed.
+
+    Command/session binding, ACK type, both generations, the terminal revision
+    transition, the issuing device and capability as they stood *at receipt
+    time*, and issuance ordering.  A capability revoked later cannot retroactively
+    invalidate an ACK it legitimately produced, so the checks below all compare
+    against ``ack.received_at``.
+    """
     if ack.command_id != command.id or ack.ack_type != ack_type:
         raise AutopilotProofError("ACK does not identify the expected command event")
     if ack.session_id != command.session_id:
@@ -829,6 +836,33 @@ def _verify_ack_binding(
         raise AutopilotProofError("ACK runner generation is stale")
     if require_terminal_revision and ack.command_revision + 1 != command.revision:
         raise AutopilotProofError("ACK command revision is stale")
+    capability = _verify_ack_capability(
+        session, ack, allow_recovery_only=(ack_type == "record_stopped"))
+    if (command.issued_capability_token_hash != ack.capability_token_hash
+            or command.issued_device_id_hash != ack.device_id_hash):
+        raise AutopilotProofError("ACK was not emitted by the command's issued device")
+    if command.issued_at > ack.received_at:
+        raise AutopilotProofError("ACK predates command issuance")
+    if (capability.recovery_only_at is not None
+            and capability.recovery_only_at <= ack.received_at
+            and command.issued_at >= capability.recovery_only_at):
+        raise AutopilotProofError(
+            "recovery-only capability cannot finish a command issued after demotion")
+    return capability
+
+
+def _verify_ack_live_authority(
+    session: Session,
+    command: RuntimeCommand,
+    *,
+    require_current_command: bool,
+) -> None:
+    """Mutable authority: is this command's scope still the live autonomous one.
+
+    Required by every write path and by nothing that merely re-reads historical
+    evidence — a legitimate drain, takeover or generation bump must not make an
+    already-proved capture stop verifying.
+    """
     state = session.get(SessionAutopilotState, command.session_id)
     if state is None:
         raise AutopilotProofError("session has no autopilot control state")
@@ -845,18 +879,24 @@ def _verify_ack_binding(
         raise AutopilotProofError("command control generation is no longer current")
     if state.runner_generation != command.runner_generation:
         raise AutopilotProofError("command runner generation is no longer current")
-    capability = _verify_ack_capability(
-        session, ack, allow_recovery_only=(ack_type == "record_stopped"))
-    if (command.issued_capability_token_hash != ack.capability_token_hash
-            or command.issued_device_id_hash != ack.device_id_hash):
-        raise AutopilotProofError("ACK was not emitted by the command's issued device")
-    if command.issued_at > ack.received_at:
-        raise AutopilotProofError("ACK predates command issuance")
-    if (capability.recovery_only_at is not None
-            and capability.recovery_only_at <= ack.received_at
-            and command.issued_at >= capability.recovery_only_at):
-        raise AutopilotProofError(
-            "recovery-only capability cannot finish a command issued after demotion")
+
+
+def _verify_ack_binding(
+    session: Session,
+    command: RuntimeCommand,
+    ack: RuntimeCommandAck,
+    *,
+    ack_type: str,
+    require_terminal_revision: bool,
+    require_current_command: bool = False,
+    require_live_scope: bool = True,
+) -> None:
+    _verify_ack_static_identity(
+        session, command, ack, ack_type=ack_type,
+        require_terminal_revision=require_terminal_revision)
+    if require_live_scope:
+        _verify_ack_live_authority(
+            session, command, require_current_command=require_current_command)
 
 
 def verify_terminal_tts_ack(
@@ -865,6 +905,7 @@ def verify_terminal_tts_ack(
     *,
     ack_idempotency_key: str,
     require_current_command: bool,
+    require_live_scope: bool = True,
 ) -> RuntimeCommandAck:
     """Verify one canonical persisted ``tts_ended`` fact for an exact command."""
     if tts_command.kind != "tts":
@@ -894,6 +935,7 @@ def verify_terminal_tts_ack(
         ack_type="tts_ended",
         require_terminal_revision=True,
         require_current_command=require_current_command,
+        require_live_scope=require_live_scope,
     )
     if tts_command.succeeded_at < ack.received_at:
         raise AutopilotProofError("TTS success timestamp predates its terminal ACK")
@@ -903,6 +945,8 @@ def verify_terminal_tts_ack(
 def verify_tts_ended_prerequisite(
     session: Session,
     record_command: RuntimeCommand,
+    *,
+    require_live_scope: bool = True,
 ) -> RuntimeCommandAck:
     """Prove that a record command was issued after a real, current ``tts_ended`` ACK."""
     if record_command.kind != "record":
@@ -942,30 +986,37 @@ def verify_tts_ended_prerequisite(
         tts_command,
         ack_idempotency_key=record_command.trigger_ack_idempotency_key,
         require_current_command=False,
+        require_live_scope=require_live_scope,
     )
     if record_command.issued_at < max(tts_command.succeeded_at, ack.received_at):
         raise AutopilotProofError("record command predates terminal TTS evidence")
     return ack
 
 
-def verify_terminal_record_capture(
+def verify_immutable_record_capture(
     session: Session,
-    command_id: int,
+    record: RuntimeCommand,
 ) -> AttemptCaptureProof:
-    """Verify immutable stopped-capture proof without requiring an active worker.
+    """The single re-verification of one stopped capture's immutable facts.
 
-    This narrower primitive remains valid after a fail-closed pause and is used
-    only to prove that patient media is terminal.  Attempt processing adds the
-    current-state/runtime gates in :func:`verify_record_capture_for_attempt`.
+    Succeeded record command, canonical ``record_stopped`` ACK with its exact
+    device/generation/revision binding, the capture receipt tuple, the record
+    command payload contract, and the canonical ``tts_ended`` trigger for its
+    predecessor.  Every reader that must re-prove a *historical* capture calls
+    this — the repeat terminal readback and the controlled export both do.
+
+    It deliberately says nothing about the current scope, runtime, patient
+    governance or audio lifecycle: those are mutable, and a readback long after
+    a legitimate drain, takeover or resume must not inherit them.
+    :func:`verify_terminal_record_capture` layers the live gates on top.
     """
-    command = session.get(RuntimeCommand, command_id)
-    if command is None or command.kind != "record":
+    if record.kind != "record":
         raise AutopilotProofError("record command does not exist")
-    if command.state != "succeeded" or command.succeeded_at is None:
+    if record.state != "succeeded" or record.succeeded_at is None:
         raise AutopilotProofError("record command has not succeeded")
-    verify_tts_ended_prerequisite(session, command)
+    verify_tts_ended_prerequisite(session, record, require_live_scope=False)
     ack = session.exec(select(RuntimeCommandAck).where(
-        RuntimeCommandAck.command_id == command_id,
+        RuntimeCommandAck.command_id == record.id,
         RuntimeCommandAck.ack_type == "record_stopped",
     )).first()
     if ack is None:
@@ -980,23 +1031,23 @@ def verify_terminal_record_capture(
         raise AutopilotProofError(
             "record_stopped ACK payload is not canonical evidence") from exc
     _verify_ack_binding(
-        session, command, ack, ack_type="record_stopped",
-        require_terminal_revision=True)
-    if command.succeeded_at < ack.received_at:
+        session, record, ack, ack_type="record_stopped",
+        require_terminal_revision=True, require_live_scope=False)
+    if record.succeeded_at < ack.received_at:
         raise AutopilotProofError(
             "record success timestamp predates its terminal ACK")
     if (ack.receipt_server_seq is None or ack.raw_audio_id is None
             or ack.checksum is None or ack.byte_count is None
             or ack.duration_seconds is None):
         raise AutopilotProofError("record stopped ACK has no complete capture tuple")
-    if command.expected_raw_audio_id != ack.raw_audio_id:
+    if record.expected_raw_audio_id != ack.raw_audio_id:
         raise AutopilotProofError("record stopped ACK is not for the command-bound audio id")
     receipt = session.get(AudioCaptureReceipt, ack.receipt_server_seq)
     if receipt is None:
         raise AutopilotProofError("capture receipt does not exist")
     expected_receipt = (
-        receipt.session_id == command.session_id,
-        receipt.turn_key == command.turn_key,
+        receipt.session_id == record.session_id,
+        receipt.turn_key == record.turn_key,
         receipt.raw_audio_id == ack.raw_audio_id,
         receipt.checksum == ack.checksum,
         receipt.byte_count == ack.byte_count,
@@ -1005,32 +1056,51 @@ def verify_terminal_record_capture(
     if not all(expected_receipt):
         raise AutopilotProofError("stopped ACK does not exactly match capture receipt")
     try:
-        command_payload = RecordCommandPayload.model_validate_json(command.payload_json)
+        command_payload = RecordCommandPayload.model_validate_json(record.payload_json)
     except (TypeError, ValueError) as exc:
         raise AutopilotProofError("record command payload violates its contract") from exc
-    if (command_payload.turn_key != command.turn_key
-            or command_payload.item_id != command.item_id
-            or command_payload.turn_seq != command.turn_seq
-            or command_payload.cue_level != command.prompt_level
-            or command_payload.raw_audio_id != command.expected_raw_audio_id
+    if (command_payload.turn_key != record.turn_key
+            or command_payload.item_id != record.item_id
+            or command_payload.turn_seq != record.turn_seq
+            or command_payload.cue_level != record.prompt_level
+            or command_payload.raw_audio_id != record.expected_raw_audio_id
             or command_payload.contains_direct_identifier
             != receipt.contains_direct_identifier):
         raise AutopilotProofError("record command payload differs from capture evidence")
     if receipt.duration_seconds > command_payload.max_duration_seconds:
         raise AutopilotProofError("capture duration exceeds record command limit")
     return AttemptCaptureProof(
-        command_id=command_id,
-        session_id=command.session_id,
-        item_id=command.item_id,
-        turn_seq=command.turn_seq,
-        attempt_seq=command.attempt_seq,
-        prompt_level=command.prompt_level,
+        command_id=record.id,
+        session_id=record.session_id,
+        item_id=record.item_id,
+        turn_seq=record.turn_seq,
+        attempt_seq=record.attempt_seq,
+        prompt_level=record.prompt_level,
         raw_audio_id=ack.raw_audio_id,
         receipt_server_seq=ack.receipt_server_seq,
         checksum=ack.checksum,
         byte_count=ack.byte_count,
         duration_seconds=ack.duration_seconds,
     )
+
+
+def verify_terminal_record_capture(
+    session: Session,
+    command_id: int,
+) -> AttemptCaptureProof:
+    """Immutable capture proof plus the write-time live-scope requirement.
+
+    Thin wrapper: the evidence itself is proved once, in
+    :func:`verify_immutable_record_capture`; this adds only the fact that the
+    command still belongs to an autonomous scope of the same generation, which
+    the write paths require and a historical readback must not.
+    """
+    command = session.get(RuntimeCommand, command_id)
+    if command is None:
+        raise AutopilotProofError("record command does not exist")
+    proof = verify_immutable_record_capture(session, command)
+    _verify_ack_live_authority(session, command, require_current_command=False)
+    return proof
 
 
 def verify_record_capture_for_attempt(

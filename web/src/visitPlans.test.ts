@@ -18,6 +18,8 @@ const PLAN_B = `vp_${"B".repeat(24)}`;
 const SESSION_A = `s_${"C".repeat(24)}`;
 const BANK_DIGEST = "1".repeat(64);
 const PROTOCOL_DIGEST = "2".repeat(64);
+const REPEAT_DIGEST = "3".repeat(64);
+const REPEAT_VERSION = "repeat-intent-v1-20260730-proposal";
 
 function draft(planId = PLAN_A) {
   return {
@@ -31,6 +33,7 @@ function draft(planId = PLAN_A) {
     phase_type: "正式训练",
     event_line: "正式训练",
     item_bank_version_id: "wk2-v1-20260707",
+    autopilot_profile_version_id: null,
     is_simulation: true,
     data_classification: "simulation",
     status: "draft",
@@ -83,10 +86,221 @@ function startedSession() {
     item_bank_definition_digest: BANK_DIGEST,
     autopilot_protocol_version_id: "autopilot-v1-20260717",
     autopilot_protocol_definition_digest: PROTOCOL_DIGEST,
+    // This fixture models a D1A modern immediate start, whose contract requires
+    // the complete frozen repeat-protocol pair.
+    repeat_protocol_version_id: REPEAT_VERSION,
+    repeat_protocol_definition_digest: REPEAT_DIGEST,
+    // Canonical full-source plan.  Both keys must be present; the strict parser
+    // never defaults a missing key to null.
+    autopilot_profile_version_id: null,
+    autopilot_profile_definition_digest: null,
     is_simulation: true,
     data_classification: "simulation",
   };
 }
+
+/** A pre-VisitPlan session: no plan link, and every frozen binding still null. */
+function directSession() {
+  return {
+    ...startedSession(),
+    visit_plan_id: null,
+    item_bank_definition_digest: null,
+    autopilot_protocol_version_id: null,
+    autopilot_protocol_definition_digest: null,
+    repeat_protocol_version_id: null,
+    repeat_protocol_definition_digest: null,
+  };
+}
+
+// Literal oracles.  Deliberately not imported from the production allowlist:
+// a test that shares its constant with the parser proves only self-consistency.
+const DEMO_VERSION = "week2-single20-demo-v1";
+const DEMO_DIGEST =
+  "a82bf3910e2e4f0f5a0b78eb3e4c9b8fc4d8a73f16bb570f118f1d5136311f34";
+
+/** A demo draft: the only profile state D1A's server can actually produce. */
+function demoDraft(planId = PLAN_A) {
+  return { ...draft(planId), autopilot_profile_version_id: DEMO_VERSION };
+}
+
+test("governance accepts the exact known demo draft and both cancelled shapes", () => {
+  const fromDraft = {
+    ...demoDraft(), status: "cancelled", revision: 2,
+    cancelled_by: "ACTOR-researcher", cancelled_at: "2026-07-19T01:03:00",
+  };
+  // An approved-to-cancelled row legitimately keeps its approval facts.
+  const fromApproved = {
+    ...demoDraft(), status: "cancelled", revision: 3,
+    approved_by: "ACTOR-reviewer", approved_at: "2026-07-19T01:01:00",
+    cancelled_by: "ACTOR-researcher", cancelled_at: "2026-07-19T01:03:00",
+  };
+  for (const receipt of [demoDraft(), fromDraft, fromApproved]) {
+    const parsed = parseVisitPlanReceipt(receipt);
+    assert.deepEqual(parsed, receipt);
+    assert.equal(parsed.autopilot_profile_version_id, DEMO_VERSION);
+  }
+});
+
+test("profile receipts are refused outside the exact known governance shape", () => {
+  const invalid = [
+    // Missing key, and a leaked digest key, both break the exact key set.
+    (() => {
+      const { autopilot_profile_version_id: _gone, ...missing } = draft();
+      return missing;
+    })(),
+    { ...draft(), autopilot_profile_definition_digest: DEMO_DIGEST },
+    { ...demoDraft(), autopilot_profile_definition_digest: DEMO_DIGEST },
+    // Malformed or unknown versions.
+    { ...draft(), autopilot_profile_version_id: "" },
+    { ...draft(), autopilot_profile_version_id: "   " },
+    { ...draft(), autopilot_profile_version_id: ` ${DEMO_VERSION}` },
+    { ...draft(), autopilot_profile_version_id: `${DEMO_VERSION} ` },
+    { ...draft(), autopilot_profile_version_id: 1 },
+    { ...draft(), autopilot_profile_version_id: "week2-single20-demo-v2" },
+    // A demo scope is simulation-only.
+    { ...demoDraft(), is_simulation: false, data_classification: "research" },
+    // D1A's server fails these closed; the browser must not resurrect them.
+    {
+      ...demoDraft(), status: "approved", revision: 2,
+      approved_by: "ACTOR-reviewer", approved_at: "2026-07-19T01:01:00",
+    },
+    {
+      ...demoDraft(), status: "started", revision: 3,
+      approved_by: "ACTOR-reviewer", approved_at: "2026-07-19T01:01:00",
+      started_by: "ACTOR-researcher", started_at: "2026-07-19T01:02:00",
+      session_id: SESSION_A,
+    },
+    // A cancelled row may never carry started facts.  Coherent in revision and
+    // approval history so the started pair is the only remaining defect.
+    {
+      ...demoDraft(), status: "cancelled", revision: 3,
+      approved_by: "ACTOR-reviewer", approved_at: "2026-07-19T01:01:00",
+      started_by: "ACTOR-researcher", started_at: "2026-07-19T01:02:00",
+      cancelled_by: "ACTOR-researcher", cancelled_at: "2026-07-19T01:03:00",
+    },
+  ];
+  for (const value of invalid) assert.throws(() => parseVisitPlanReceipt(value));
+});
+
+test("profile version is frozen across approve identity and start reconciliation", () => {
+  const approvedReceipt = parseVisitPlanReceipt(approved());
+  const startedReceipt = parseVisitPlanReceipt(started());
+  assert.equal(reconcileStartedVisitPlan(approvedReceipt, startedReceipt),
+    startedReceipt);
+  assert.equal(
+    isSameApprovedVisitPlan(approvedReceipt, parseVisitPlanReceipt(approved())),
+    true);
+
+  // Constructed from already-parsed receipts on purpose: the wire parser can
+  // never emit an approved or started demo receipt, so drifting a parsed one is
+  // the only way to prove the frozen-fact list actually covers this key.
+  assert.throws(() => reconcileStartedVisitPlan(approvedReceipt, {
+    ...startedReceipt, autopilot_profile_version_id: DEMO_VERSION,
+  }));
+  assert.equal(isSameApprovedVisitPlan(approvedReceipt, {
+    ...approvedReceipt, autopilot_profile_version_id: DEMO_VERSION,
+  }), false);
+});
+
+const RUNTIME_DISABLED = /尚未开放模拟演示计划的床旁运行/;
+
+test("every paired-null projection keeps both profile keys present and null", () => {
+  const receipt = parseVisitPlanReceipt(started());
+  const outputs = [
+    parseStartedVisitSession(startedSession(), receipt),
+    parsePatientSessionList(
+      [{ ...startedSession(), runtime_status: "paused" }], "P-VISIT-01")[0],
+    parsePatientSessionList(
+      [{ ...directSession(), runtime_status: "completed" }], "P-VISIT-01")[0],
+  ];
+  for (const output of outputs) {
+    assert.ok(output);
+    assert.equal(Object.hasOwn(output, "autopilot_profile_version_id"), true);
+    assert.equal(
+      Object.hasOwn(output, "autopilot_profile_definition_digest"), true);
+    assert.equal(output.autopilot_profile_version_id, null);
+    assert.equal(output.autopilot_profile_definition_digest, null);
+  }
+});
+
+test("every session profile pair other than absent is refused by the shared parser", () => {
+  const receipt = parseVisitPlanReceipt(started());
+  const complete = {
+    ...startedSession(),
+    autopilot_profile_version_id: DEMO_VERSION,
+    autopilot_profile_definition_digest: DEMO_DIGEST,
+  };
+  const invalid = [
+    // Missing keys are never defaulted to null.
+    (() => {
+      const { autopilot_profile_version_id: _a, ...missing } = startedSession();
+      return missing;
+    })(),
+    (() => {
+      const { autopilot_profile_definition_digest: _b, ...missing } = startedSession();
+      return missing;
+    })(),
+    // Both half pairs.
+    { ...startedSession(), autopilot_profile_version_id: DEMO_VERSION },
+    { ...startedSession(), autopilot_profile_definition_digest: DEMO_DIGEST },
+    // Malformed halves.
+    { ...complete, autopilot_profile_version_id: "week2-single20-demo-v2" },
+    { ...complete, autopilot_profile_version_id: "" },
+    { ...complete, autopilot_profile_definition_digest: DEMO_DIGEST.toUpperCase() },
+    { ...complete, autopilot_profile_definition_digest: "a".repeat(63) },
+    { ...complete, autopilot_profile_definition_digest: "not-hex" },
+    // A complete pair still needs a plan link and simulation classification.
+    { ...complete, visit_plan_id: null },
+    { ...complete, is_simulation: false, data_classification: "research" },
+    { ...complete, data_classification: "legacy_unknown" },
+  ];
+  for (const session of invalid) {
+    assert.throws(() => parseStartedVisitSession(session, receipt));
+    // Also driven straight through the shared parser: a receipt-binding
+    // mismatch in parseStartedVisitSession would otherwise be enough to make
+    // these green without the profile rules existing at all.
+    assert.throws(() => parsePatientSessionList(
+      [{ ...session, runtime_status: "paused" }], "P-VISIT-01"));
+  }
+
+  // Fully valid in shape, link and classification.  Matched against the
+  // dedicated runtime-disabled error so an earlier shape gate cannot be the
+  // reason either call throws.
+  assert.throws(() => parseStartedVisitSession(complete, receipt), RUNTIME_DISABLED);
+  assert.throws(() => parsePatientSessionList(
+    [{ ...complete, runtime_status: "paused" }], "P-VISIT-01"), RUNTIME_DISABLED);
+});
+
+test("started session profile version is compared against the started receipt", () => {
+  // The Session is canonical paired-null and passes every shape gate; only the
+  // receipt's profile version is drifted, so deleting the Session-versus-
+  // receipt comparison is the single change that makes this pass.
+  const receipt = parseVisitPlanReceipt(started());
+  const driftedReceipt = {
+    ...receipt, autopilot_profile_version_id: DEMO_VERSION,
+  };
+  assert.deepEqual(
+    parseStartedVisitSession(startedSession(), receipt), startedSession());
+  assert.throws(() => parseStartedVisitSession(startedSession(), driftedReceipt));
+});
+
+test("pre-repeat plan-linked history recovers, but a new start must be complete", () => {
+  // The backend admits NULL == NULL repeat bindings so one legacy recovery can
+  // finish; recovery/list parsing must not equate a plan link with a repeat
+  // pair.  A freshly returned start is still held to the stricter rule.
+  const historical = {
+    ...startedSession(),
+    repeat_protocol_version_id: null,
+    repeat_protocol_definition_digest: null,
+    runtime_status: "paused",
+  };
+  assert.deepEqual(
+    parsePatientSessionList([historical], "P-VISIT-01"), [historical]);
+
+  const receipt = parseVisitPlanReceipt(started());
+  const { runtime_status: _live, ...immediate } = historical;
+  assert.throws(() => parseStartedVisitSession(immediate, receipt));
+});
 
 test("strict receipt parser accepts every coherent VisitPlan state", () => {
   const cancelledDraft = {
@@ -216,6 +430,21 @@ test("started session parser binds every available server fact to the started re
     { ...startedSession(), autopilot_protocol_definition_digest: null },
     { ...startedSession(), item_bank_definition_digest: null,
       autopilot_protocol_version_id: null, autopilot_protocol_definition_digest: null },
+    // This list exercises the same modern immediate-start contract: the repeat
+    // pair must be complete. Half a binding is never a legacy shape.
+    { ...startedSession(), repeat_protocol_definition_digest: null },
+    { ...startedSession(), repeat_protocol_version_id: null },
+    { ...startedSession(), repeat_protocol_version_id: null,
+      repeat_protocol_definition_digest: null },
+    { ...startedSession(), repeat_protocol_version_id: "bad version" },
+    { ...startedSession(), repeat_protocol_version_id: "" },
+    { ...startedSession(), repeat_protocol_definition_digest: "3".repeat(63) },
+    { ...startedSession(), repeat_protocol_definition_digest: "F".repeat(64) },
+    { ...startedSession(), repeat_protocol_definition_digest: "   " },
+    (() => {
+      const { repeat_protocol_version_id: _absent, ...missing } = startedSession();
+      return missing;
+    })(),
     { ...startedSession(), is_simulation: false, data_classification: "research" },
     { ...startedSession(), data_classification: "legacy_unknown" },
     { ...startedSession(), trainer_id: "ACTOR-other" },
@@ -230,6 +459,35 @@ test("started session parser binds every available server fact to the started re
   ];
   for (const session of invalid) {
     assert.throws(() => parseStartedVisitSession(session, receipt));
+  }
+});
+
+test("repeat protocol binding is absent-or-complete on direct legacy sessions", () => {
+  // A pre-protocol session legitimately carries neither half.
+  assert.deepEqual(
+    parsePatientSessionList([{ ...directSession(), runtime_status: "completed" }],
+      "P-VISIT-01"),
+    [{ ...directSession(), runtime_status: "completed" }]);
+  // A direct session that really was frozen under the protocol is also valid.
+  const boundDirect = {
+    ...directSession(),
+    repeat_protocol_version_id: REPEAT_VERSION,
+    repeat_protocol_definition_digest: REPEAT_DIGEST,
+    runtime_status: "completed",
+  };
+  assert.deepEqual(parsePatientSessionList([boundDirect], "P-VISIT-01"), [boundDirect]);
+  // Half a pair is refused even where the legacy null shape is allowed.
+  for (const session of [
+    { ...directSession(), repeat_protocol_version_id: REPEAT_VERSION,
+      runtime_status: "completed" },
+    { ...directSession(), repeat_protocol_definition_digest: REPEAT_DIGEST,
+      runtime_status: "completed" },
+    { ...directSession(), repeat_protocol_version_id: "bad version",
+      repeat_protocol_definition_digest: REPEAT_DIGEST, runtime_status: "completed" },
+    { ...directSession(), repeat_protocol_version_id: REPEAT_VERSION,
+      repeat_protocol_definition_digest: "not-hex", runtime_status: "completed" },
+  ]) {
+    assert.throws(() => parsePatientSessionList([session], "P-VISIT-01"));
   }
 });
 

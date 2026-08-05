@@ -18,7 +18,8 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import (asr, audio_store, auth, autopilot_orchestration,
                  autopilot_service, content, db, device_capability,
-                 evidence_ledger, llm_judge, provider_readiness)
+                 evidence_ledger, llm_judge, provider_readiness,
+                 repeat_intent)
 from app import main as main_module
 from app.llm_judge import LlmJudgement
 from app.enums import AnswerType
@@ -58,6 +59,7 @@ from app.models import (
 SESSION_ID = "S-P0A-HTTP"
 OTHER_SESSION_ID = "S-P0A-HTTP-OTHER"
 PATIENT_ID = "P-P0A-HTTP"
+REPEAT_PROTOCOL = repeat_intent.active_protocol()
 START_KEY = "start-p0a-http-0001"
 BANK = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
 FIRST_ONLY_BANK = replace(
@@ -139,6 +141,9 @@ def api_clients(monkeypatch, tmp_path) -> ApiClients:
                 autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
                 autopilot_protocol_definition_digest=(
                     content.autopilot_protocol_definition_digest(PROTOCOL)),
+                repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
+                repeat_protocol_definition_digest=(
+                    REPEAT_PROTOCOL.definition_digest),
                 is_simulation=True,
                 data_classification="simulation",
                 trainer_id="ACTOR-P0A-HTTP",
@@ -155,6 +160,9 @@ def api_clients(monkeypatch, tmp_path) -> ApiClients:
                 autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
                 autopilot_protocol_definition_digest=(
                     content.autopilot_protocol_definition_digest(PROTOCOL)),
+                repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
+                repeat_protocol_definition_digest=(
+                    REPEAT_PROTOCOL.definition_digest),
                 is_simulation=True,
                 data_classification="simulation",
                 trainer_id="ACTOR-P0A-HTTP",
@@ -793,7 +801,9 @@ def test_exact_tts_is_server_derived_and_generic_text_route_is_locked(
         synthesized.append(text)
         return None, "exact-tts-test", False
 
-    monkeypatch.setattr("app.main.tts.speak", fake_speak)
+    # The exact autopilot route has its own Qwen-only synthesizer; patching the
+    # generic one would leave this test driving the real provider selection.
+    monkeypatch.setattr("app.main.tts.speak_autopilot", fake_speak)
     started = _start(api_clients)
     assert started.status_code == 200, started.text
     command = _device_next(api_clients)
@@ -906,7 +916,7 @@ def test_exact_tts_discards_provider_bytes_if_session_is_aborted_in_flight(
         assert provider_release.wait(10), "exact TTS provider was never released"
         return stale_audio, "blocked-exact-tts", False
 
-    monkeypatch.setattr("app.main.tts.speak", blocked_speak)
+    monkeypatch.setattr("app.main.tts.speak_autopilot", blocked_speak)
     exact_path = (
         f"/sessions/{SESSION_ID}/autopilot/commands/"
         f"{command['command_key']}/tts"
@@ -1973,6 +1983,9 @@ def test_cloud_consent_revoke_fences_admitted_autopilot_and_runtime_together(
             autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
             autopilot_protocol_definition_digest=(
                 content.autopilot_protocol_definition_digest(PROTOCOL)),
+            repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
+            repeat_protocol_definition_digest=(
+                REPEAT_PROTOCOL.definition_digest),
             is_simulation=True,
             data_classification="simulation",
             status="started",
@@ -4783,7 +4796,7 @@ def test_exact_tts_serve_appends_command_bound_engine_evidence(
     """每次实际返回音频都追加一行服务端引擎证据，且精确绑定命令。"""
     _enable_p0a(monkeypatch)
     monkeypatch.setattr(
-        "app.main.tts.speak",
+        "app.main.tts.speak_autopilot",
         lambda text: (b"RIFF-evidence-audio", "dashscope/qwen3-tts-flash/Serena", False))
     started = _start(api_clients)
     assert started.status_code == 200, started.text
@@ -4823,9 +4836,11 @@ def test_exact_tts_degraded_serve_records_honest_degradation(
         api_clients: ApiClients, monkeypatch):
     """降级(204)同样如实入账：result=degraded、无字节数、引擎为实际尝试者。"""
     _enable_p0a(monkeypatch)
+    # The strict path can only ever attribute a degradation to Qwen: a local
+    # engine is not in its chain, so it can never be the honest attempt either.
     monkeypatch.setattr(
-        "app.main.tts.speak",
-        lambda text: (None, "piper/zh_CN-huayan-medium", False))
+        "app.main.tts.speak_autopilot",
+        lambda text: (None, "dashscope/qwen3-tts-flash/Serena", False))
     started = _start(api_clients)
     assert started.status_code == 200, started.text
     command = _device_next(api_clients)
@@ -4840,7 +4855,7 @@ def test_exact_tts_degraded_serve_records_honest_degradation(
         assert len(rows) == 1
         assert rows[0].result == "degraded"
         assert rows[0].byte_count is None
-        assert rows[0].engine_version == "piper/zh_CN-huayan-medium"
+        assert rows[0].engine_version == "dashscope/qwen3-tts-flash/Serena"
         assert rows[0].command_id is not None
 
 
@@ -4848,9 +4863,22 @@ def test_discarded_tts_bytes_leave_no_usage_evidence(
         api_clients: ApiClients, monkeypatch):
     """授权复核失败被丢弃的音频不得留下任何"已使用"证据行。"""
     _enable_p0a(monkeypatch)
-    monkeypatch.setattr(
-        "app.main.tts.speak",
-        lambda text: (b"RIFF-discarded-audio", "dashscope/qwen3-tts-flash/Serena", False))
+    synthesized: list[str] = []
+    generic_calls: list[str] = []
+
+    def fake_speak_autopilot(text: str):
+        synthesized.append(text)
+        return b"RIFF-discarded-audio", "dashscope/qwen3-tts-flash/Serena", False
+
+    def unreachable_generic_speak(text: str):  # pragma: no cover - guard only
+        generic_calls.append(text)
+        raise AssertionError("exact route must not use the generic synthesizer")
+
+    # This route is the exact one, so the strict seam is the one that has to be
+    # replaced; patching the generic seam left the real Qwen resolver running
+    # and the assertion below could pass on a repository cache hit instead.
+    monkeypatch.setattr("app.main.tts.speak_autopilot", fake_speak_autopilot)
+    monkeypatch.setattr("app.main.tts.speak", unreachable_generic_speak)
     started = _start(api_clients)
     assert started.status_code == 200, started.text
     command = _device_next(api_clients)
@@ -4872,6 +4900,10 @@ def test_discarded_tts_bytes_leave_no_usage_evidence(
         _exact_tts_path(command), headers=api_clients.device_headers, json={})
     assert discarded.status_code == 409, discarded.text
     assert discarded.json()["detail"]["code"] == "tts_authorization_changed"
+    # The bytes really were produced and then really were thrown away: without
+    # this the 409 alone would also be satisfied by a synthesis that never ran.
+    assert len(synthesized) == 1
+    assert generic_calls == []
 
     with Session(api_clients.engine) as session:
         assert list(session.exec(select(TtsServeEvidence))) == []
@@ -4905,7 +4937,7 @@ def test_ai_usage_endpoint_reports_actual_usage_not_probe(
     """/ai-usage 只聚合服务端实际使用账本；匿名不可读。"""
     _enable_p0a(monkeypatch)
     monkeypatch.setattr(
-        "app.main.tts.speak",
+        "app.main.tts.speak_autopilot",
         lambda text: (b"RIFF-usage-audio", "dashscope/qwen3-tts-flash/Serena", False))
     started = _start(api_clients)
     assert started.status_code == 200, started.text

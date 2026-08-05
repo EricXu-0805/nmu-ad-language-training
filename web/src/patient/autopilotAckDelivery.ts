@@ -7,9 +7,13 @@ import {
   type AutopilotAckFacts,
   type NextCommandProjection,
 } from "./autopilotProtocol.ts";
-import type {
-  AutopilotAckDelivery,
-  AutopilotTransport,
+import {
+  AutopilotAckPersistenceError,
+  type AutopilotAckDelivery,
+  type AutopilotAckPersistenceIdentity,
+  type AutopilotAckPersistenceOutcome,
+  type AutopilotAckPersistencePhase,
+  type AutopilotTransport,
 } from "./autopilotController.ts";
 import { commandSupersedesTerminalLatch } from "./autopilotRuntime.ts";
 import {
@@ -17,6 +21,8 @@ import {
   createAutopilotAckEnvelope,
   fingerprintAutopilotCapability,
   nextAutopilotAckLatch,
+  sameAutopilotAckEnvelope,
+  type AutopilotAckCheckpoint,
   type AutopilotAckEnvelope,
   type AutopilotTerminalFailureLatch,
 } from "./autopilotAckOutbox.ts";
@@ -123,16 +129,68 @@ const indexedDbAckStore: AutopilotAckStore = {
   complete: (entry) => blobStore.completeAutopilotAck(entry),
 };
 
+/**
+ * 结构化比较用的规范 JSON。IndexedDB 交回来的永远是结构化克隆，不是内存里那个
+ * 对象，所以 checkpoint / latch / command / ACK 一律不能用引用相等去判。
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/** 终态 latch 的逐字相等：失败 ACK 必须绑同一条命令与同一条 ACK，非失败恒为 null。 */
+function sameTerminalLatch(
+  left: AutopilotTerminalFailureLatch | null,
+  right: AutopilotTerminalFailureLatch | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return left.commandKey === right.commandKey
+    && canonicalJson(left.command) === canonicalJson(right.command)
+    && canonicalJson(left.ack) === canonicalJson(right.ack);
+}
+
 function newIdempotencyKey(ackType: AutopilotAck["ack_type"], seq: number): string {
   const uuid = globalThis.crypto?.randomUUID?.();
   if (!uuid) throw new Error("当前浏览器不能安全生成 ACK 幂等键");
   return `ack:${ackType}:${seq}:${uuid}`;
 }
 
+/**
+ * 一条 ACK 被服务器严格确认之后留下的权威事实。
+ *
+ * `command` 可能是 null：后端在 exact 重放和非媒体等待状态下**故意**不投影命令。
+ * 那种情况下调用方没有权威 revision 可用，只能进安全暂停，绝不许本地合成一个。
+ */
+export interface AutopilotAckReceiptAuthority {
+  readonly commandKey: string;
+  readonly ackIdempotencyKey: string;
+  readonly ackType: AutopilotAck["ack_type"];
+  readonly commandRevision: number;
+  readonly command: NextCommandProjection | null;
+}
+
 export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
   private lastSeq: number;
   private pending: AutopilotAckEnvelope | null;
   private latch: AutopilotTerminalFailureLatch | null;
+  // pending 只有在 durable stage 落定之后才置位。stage 在途的那一小段里它仍是
+  // null，若不另设标记，第二条 send 就能挤进来抢同一个 device_event_seq。
+  private staging: AutopilotAckEnvelope | null = null;
+  // 一次投递尝试的瞬时闸：第一次 transport 之前置位，一直握到严格收据、complete
+  // 与结果判定全部收口。它在手时，任何 send/drain 都不许再发第二条 HTTP。
+  private attempt: AutopilotAckEnvelope | null = null;
+  // 结果不确定时的粘滞闸：同页 send/drain 一律 fail closed，等刷新后由 durable
+  // 存储自己收敛，本页绝不猜。
+  private unresolved: AutopilotAckPersistenceError | null = null;
+  // 本实例造出来的 typed 拒绝。归属证明不落在错误对象上，所以伪造不出来。
+  private readonly ownedFailures = new WeakSet<AutopilotAckPersistenceError>();
+  private receiptAuthority: AutopilotAckReceiptAuthority | null = null;
   private readonly ownerKey: string;
   private readonly sessionId: string;
   private readonly transport: AutopilotTransport;
@@ -180,6 +238,38 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
   get terminalFailureLatch(): AutopilotTerminalFailureLatch | null { return this.latch; }
 
   /**
+   * The exact command the server itself returned with the last confirmed ACK.
+   *
+   * A pagehide landing in the "record_started confirmed, /next refresh still in
+   * flight or failed" window has to build its failure ACK from this, because the
+   * only other source of the started revision is a refresh that has not
+   * returned. Verifiable by command key + ACK idempotency key, so a caller
+   * cannot mistake some other command's authority for this one.
+   */
+  get lastReceiptAuthority(): AutopilotAckReceiptAuthority | null {
+    return this.receiptAuthority;
+  }
+
+  /** Is an ACK currently between "envelope created" and "durably staged"? */
+  get stagingInFlight(): boolean { return this.staging !== null; }
+
+  /** 未定型的持久化结果。非 null 时本页 send/drain 一律 fail closed。 */
+  get unresolvedSettlement(): AutopilotAckPersistenceError | null {
+    return this.unresolved;
+  }
+
+  /**
+   * 归属证明。字段全等但 owner 不同的伪造错误必须被拒，所以判据是本实例私有的
+   * WeakSet 加 owner/session，而不是错误对象上的任何自述字段。
+   */
+  ownsPersistenceError(error: unknown): error is AutopilotAckPersistenceError {
+    return error instanceof AutopilotAckPersistenceError
+      && this.ownedFailures.has(error)
+      && error.identity.ownerKey === this.ownerKey
+      && error.identity.sessionId === this.sessionId;
+  }
+
+  /**
    * Refresh recovery always drains the exact persisted event before /next.
    *
    * 返回的是整个持久 envelope 而不只是 ack：响应丢失后重启时，调用方要靠
@@ -187,10 +277,121 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
    * 只给 ack 的话，随后 /next 返回 null 会把状态冲成 waiting_command。
    */
   async drainPending(): Promise<AutopilotAckEnvelope | null> {
+    // 未定型的结果是粘滞的：本页绝不据此再发一条 HTTP，也绝不造第二个 key。
+    if (this.unresolved) throw this.unresolved;
+    if (this.attempt || this.staging) {
+      throw new Error("已有未定型的 ACK 投递，禁止重放");
+    }
     const entry = this.pending;
     if (!entry) return null;
     await this.deliver(entry);
     return entry;
+  }
+
+  private async readOwnerSnapshot(): Promise<
+    { ok: true; value: AutopilotAckStorageSnapshot } | { ok: false; error: unknown }
+  > {
+    try {
+      return { ok: true, value: await this.store.snapshot(this.ownerKey, this.sessionId) };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  }
+
+  /** snapshot 的 pending 是不是逐字等于这条候选。畸形与外来一律 false，不外抛。 */
+  private isExactPending(
+    pending: AutopilotAckEnvelope | null,
+    entry: AutopilotAckEnvelope,
+  ): boolean {
+    if (!pending) return false;
+    try { return sameAutopilotAckEnvelope(pending, entry); }
+    catch { return false; }
+  }
+
+  /** checkpoint 是否仍然证明本实例当前的语义 C：owner/session/lastSeq/latch 全等。 */
+  private provesCurrentCheckpoint(checkpoint: AutopilotAckCheckpoint | null): boolean {
+    if (checkpoint === null) return this.lastSeq === 0 && this.latch === null;
+    return checkpoint.ownerKey === this.ownerKey
+      && checkpoint.sessionId === this.sessionId
+      && checkpoint.lastDeviceEventSeq === this.lastSeq
+      && sameTerminalLatch(checkpointTerminalFailureLatch(checkpoint), this.latch);
+  }
+
+  /**
+   * checkpoint 是否证明这条 entry 已经 complete。
+   *
+   * schema v1 落在目标 seq 上**不是**完成证明：v1 根本不记 latch，拿它当证据就等于
+   * 把"终态失败有没有锁存"这件事猜过去。
+   */
+  private provesCompleted(
+    checkpoint: AutopilotAckCheckpoint | null,
+    entry: AutopilotAckEnvelope,
+  ): boolean {
+    if (checkpoint === null || checkpoint.schemaVersion !== 2) return false;
+    return checkpoint.ownerKey === this.ownerKey
+      && checkpoint.sessionId === this.sessionId
+      && checkpoint.lastDeviceEventSeq === entry.ack.device_event_seq
+      && sameTerminalLatch(checkpoint.latch, nextAutopilotAckLatch(entry));
+  }
+
+  /** 每一次失败都新造一个，调用方正在判的那条事实不会被后来的调用改写。 */
+  private persistenceFailure(
+    entry: AutopilotAckEnvelope,
+    phase: AutopilotAckPersistencePhase,
+    outcome: AutopilotAckPersistenceOutcome,
+    message: string,
+    cause: unknown,
+  ): AutopilotAckPersistenceError {
+    const identity: AutopilotAckPersistenceIdentity = {
+      ownerKey: entry.ownerKey,
+      sessionId: entry.sessionId,
+      commandKey: entry.commandKey,
+      command: entry.command,
+      ack: entry.ack,
+      ackType: entry.ack.ack_type,
+      idempotencyKey: entry.ack.idempotency_key,
+      deviceEventSeq: entry.ack.device_event_seq,
+      commandRevision: entry.ack.command_revision,
+      controlGeneration: entry.ack.control_generation,
+      runnerGeneration: entry.ack.runner_generation,
+      mimeType: entry.ack.ack_type === "record_started" ? entry.ack.mime_type : null,
+    };
+    const failure = new AutopilotAckPersistenceError({
+      phase, outcome, identity, message, cause,
+    });
+    this.ownedFailures.add(failure);
+    return failure;
+  }
+
+  /** unknown：保留 exact identity，转成粘滞闸，之后同页零网络、零新 key。 */
+  private retainUnresolved(
+    entry: AutopilotAckEnvelope,
+    phase: AutopilotAckPersistencePhase,
+    message: string,
+    cause: unknown,
+  ): AutopilotAckPersistenceError {
+    const failure = this.persistenceFailure(entry, phase, "unknown", message, cause);
+    this.staging = null;
+    this.attempt = null;
+    this.unresolved = failure;
+    return failure;
+  }
+
+  /**
+   * 正常 complete 成功与 snapshot 证明已完成，必须收敛到这一个内存提交点，
+   * 否则 lastSeq、pending、latch 与回执权威迟早会各走各的。
+   */
+  private commitCompleted(entry: AutopilotAckEnvelope, receipt: AutopilotAckReceipt): void {
+    this.lastSeq = entry.ack.device_event_seq;
+    this.pending = null;
+    this.latch = nextAutopilotAckLatch(entry);
+    this.receiptAuthority = {
+      commandKey: entry.commandKey,
+      ackIdempotencyKey: entry.ack.idempotency_key,
+      ackType: receipt.ack_type,
+      commandRevision: receipt.command_revision,
+      command: receipt.command,
+    };
   }
 
   async send(
@@ -201,7 +402,8 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
     if (lastDeviceEventSeq !== this.lastSeq) {
       throw new Error("控制器与 ACK checkpoint 序号不一致");
     }
-    if (this.pending) {
+    if (this.unresolved) throw this.unresolved;
+    if (this.pending || this.staging || this.attempt) {
       throw new Error("已有待恢复 ACK，禁止生成新事件序号");
     }
     if (this.latch && !commandSupersedesTerminalLatch(this.latch.command, command)) {
@@ -223,26 +425,100 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
       command,
       ack,
     });
-    if (ack.ack_type === "record_stopped") {
-      await this.store.stageRecordStoppedAndCompleteAudio(entry);
-    } else {
-      await this.store.stage(entry);
+    // 顺序是冻结的：唯一 envelope → 标记 in-flight（挡住任何新 send）→ durable
+    // stage → 证明 durable 之后才允许 transport。stage 证明前 transport.ack、
+    // /next 与 device event seq 推进都必须是 0 次。
+    this.staging = entry;
+    try {
+      if (ack.ack_type === "record_stopped") {
+        await this.store.stageRecordStoppedAndCompleteAudio(entry);
+      } else {
+        await this.store.stage(entry);
+      }
+    } catch (stageError) {
+      // 闸绝不在这里无条件松开：整段 snapshot 判定都必须握着它，否则并发的
+      // drain/send 能挤进来发第二条 HTTP，或者给同一个 seq 造第二个 key。
+      const snapshot = await this.readOwnerSnapshot();
+      if (!snapshot.ok) {
+        throw this.retainUnresolved(entry, "stage",
+          "ACK 暂存结果不可读，已保留原 envelope 并安全暂停", snapshot.error);
+      }
+      const { pending, checkpoint } = snapshot.value;
+      if (this.isExactPending(pending, entry) && this.provesCurrentCheckpoint(checkpoint)) {
+        // matching：这条 exact envelope 其实已经 durable（record_stopped 则连音频
+        // 原子接管一起提交了）。只松开瞬时暂存标记，绝不再 stage 一次，继续同一个
+        // key 走 transport → 严格收据 → complete。
+        this.staging = null;
+        this.pending = entry;
+        await this.deliver(entry);
+        return ack;
+      }
+      if (pending === null && this.provesCurrentCheckpoint(checkpoint)) {
+        // 证明未提交：stage 证明之前 transport 一次都没跑过，这条候选既不是
+        // durable 事实也不是 server 事件。松开被丢弃的候选闸，由调用方决定那条
+        // 唯一的同 seq 替换——这是唯一能授权替换的持久化结果。
+        this.staging = null;
+        throw this.persistenceFailure(entry, "stage", "confirmed_empty",
+          "ACK 暂存事务未提交", stageError);
+      }
+      throw this.retainUnresolved(entry, "stage",
+        "ACK 暂存结果不确定，已保留原 envelope 并安全暂停", stageError);
     }
+    this.staging = null;
     this.pending = entry;
     await this.deliver(entry);
     return ack;
   }
 
   private async deliver(entry: AutopilotAckEnvelope): Promise<void> {
-    const response = await this.transport.ack(
-      this.sessionId,
-      entry.commandKey,
-      entry.ack,
-    );
-    parseAutopilotAckReceipt(response, entry);
-    await this.store.complete(entry);
-    this.lastSeq = entry.ack.device_event_seq;
-    this.pending = null;
-    this.latch = nextAutopilotAckLatch(entry);
+    // 投递尝试闸：第一次 transport 之前置位，一直握到严格收据、complete 与结果
+    // 判定全部收口。并发的 send/drain 在此期间零 HTTP、零 complete、零新 key。
+    this.attempt = entry;
+    let response: unknown;
+    try {
+      response = await this.transport.ack(this.sessionId, entry.commandKey, entry.ack);
+    } catch (error) {
+      // 只松开这一层瞬时闸：exact pending 原样保留，之后 drain 只能重放同一个 key。
+      this.attempt = null;
+      throw error;
+    }
+    let receipt: AutopilotAckReceipt;
+    try {
+      receipt = parseAutopilotAckReceipt(response, entry);
+    } catch (error) {
+      // 严格解析被拒同理：complete 一次都不调，seq/latch/权威都不推进，只松开
+      // 瞬时闸。它绝不算作 stage/complete 的 empty，也授权不了任何替换。
+      this.attempt = null;
+      throw error;
+    }
+    try {
+      await this.store.complete(entry);
+    } catch (completeError) {
+      // 收据已经严格验过，所以这里没有任何结果可以授权替换：只能证明它到底
+      // 提交没有。闸继续握着，snapshot 也读在闸内。
+      const snapshot = await this.readOwnerSnapshot();
+      if (!snapshot.ok) {
+        throw this.retainUnresolved(entry, "complete",
+          "ACK 完成结果不可读，已保留原 envelope 并安全暂停", snapshot.error);
+      }
+      const { pending, checkpoint } = snapshot.value;
+      if (pending === null && this.provesCompleted(checkpoint, entry)) {
+        // 已提交：把那条已经严格校验过的收据一次性落进内存，原 ACK 正常返回。
+        this.commitCompleted(entry, receipt);
+        this.attempt = null;
+        return;
+      }
+      if (this.isExactPending(pending, entry) && this.provesCurrentCheckpoint(checkpoint)) {
+        // 仍然 pending：保留 exact envelope，seq/latch/权威一步不推，之后的恢复
+        // 只能重放同一条 envelope 与同一个 key。
+        this.attempt = null;
+        throw this.persistenceFailure(entry, "complete", "matching_pending",
+          "ACK 完成事务未提交，保留原 envelope 待重放", completeError);
+      }
+      throw this.retainUnresolved(entry, "complete",
+        "ACK 完成结果不确定，已保留原 envelope 并安全暂停", completeError);
+    }
+    this.commitCompleted(entry, receipt);
+    this.attempt = null;
   }
 }

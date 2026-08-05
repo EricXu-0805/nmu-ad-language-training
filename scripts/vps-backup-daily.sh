@@ -351,7 +351,14 @@ if OUT=$(cd "$APP" && BACKUP_DIR="$DAILY" BACKUP_STAGING_ONLY=1 \
 else
   rc=$?
   FAIL_CODE="base_snapshot_failed"
-  note "FAIL code=$FAIL_CODE rc=$rc"
+  # 只写固定码会把"备份连着十四夜没跑成"压缩成一个查不动的字符串:
+  # 2026-07-23 之后每晚都是 base_snapshot_failed rc=1,真因(子进程解释器缺
+  # sqlalchemy)全在这个被丢掉的 $OUT 里。取最后三行压成单行、按字符(不是字节,
+  # 免得截断出半个汉字)截到 200,写进审计日志,同时回吐 stderr 让 journal 也有。
+  detail=$(printf '%s' "$OUT" | tail -n 3 | tr -d '\000' | tr '\n\t' '  ' \
+    | tr -s ' ' | sed 's/^ *//; s/ *$//' | cut -c1-200)
+  note "FAIL code=$FAIL_CODE rc=$rc detail=${detail:-none}"
+  printf '备份失败(code=%s rc=%s): %s\n' "$FAIL_CODE" "$rc" "${detail:-none}" >&2
   exit "$rc"
 fi
 [ -d "$WORK" ] && [ ! -L "$WORK" ] || fail "staging_handoff_invalid"

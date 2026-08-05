@@ -11,7 +11,8 @@ type UnknownRecord = Record<string, unknown>;
 const RECEIPT_KEYS = [
   "plan_id", "patient_id", "scheduled_date", "scheduled_time", "queue_order",
   "session_sitting_no", "week_no", "phase_type", "event_line",
-  "item_bank_version_id", "is_simulation", "data_classification", "status",
+  "item_bank_version_id", "autopilot_profile_version_id",
+  "is_simulation", "data_classification", "status",
   "revision", "created_by", "created_at", "approved_by", "approved_at",
   "started_by", "started_at", "cancelled_by", "cancelled_at", "session_id",
 ] as const;
@@ -21,8 +22,21 @@ const SESSION_KEYS = [
   "training_date", "week_no", "phase_type", "event_line", "trainer_id",
   "item_bank_version_id", "item_bank_definition_digest",
   "autopilot_protocol_version_id", "autopilot_protocol_definition_digest",
+  "repeat_protocol_version_id", "repeat_protocol_definition_digest",
+  "autopilot_profile_version_id", "autopilot_profile_definition_digest",
   "is_simulation", "data_classification",
 ] as const;
+/**
+ * Immutable historical allowlist.  Every version ever accepted must stay listed
+ * literally; this is deliberately not an "active version" pointer, because a
+ * governance read of an old demo draft must not follow a moving target.
+ */
+const KNOWN_PROFILE_VERSIONS = ["week2-single20-demo-v1"] as const;
+
+function knownProfileVersion(value: unknown): value is string {
+  return typeof value === "string"
+    && (KNOWN_PROFILE_VERSIONS as readonly string[]).includes(value);
+}
 const RECOVERY_SESSION_KEYS = [...SESSION_KEYS, "runtime_status"] as const;
 const PLAN_ID = /^vp_[A-Za-z0-9_-]{24}$/;
 const SESSION_ID = /^s_[A-Za-z0-9_-]{24}$/;
@@ -150,6 +164,20 @@ export function parseVisitPlanReceipt(
         : revision === (hasApproved ? 3 : 2) && !hasStarted && hasCancelled && row.session_id === null;
   if (!stateValid) throw new Error("训练安排状态、版本与审计事实矛盾");
 
+  // A demo profile is readable for governance only as a draft, or as a
+  // cancelled row that came from either a draft or an approved plan.  D1A's
+  // server fails approved/started demo rows closed, so a receipt in those
+  // states can only be tampered or corrupted evidence and is never projected
+  // as actionable canonical work.
+  const profileVersion = row.autopilot_profile_version_id as string | null;
+  if (profileVersion !== null
+      && (!knownProfileVersion(profileVersion)
+        || row.is_simulation !== true
+        || row.data_classification !== "simulation"
+        || (status !== "draft" && status !== "cancelled"))) {
+    throw new Error("训练安排的模拟演示计划绑定不可接受");
+  }
+
   const createdMs = timestampMillis(row.created_at);
   const factTimes = [approved.occurredAt, started.occurredAt, cancelled.occurredAt]
     .filter((entry): entry is string => entry !== null);
@@ -169,6 +197,7 @@ export function parseVisitPlanReceipt(
     session_sitting_no: row.session_sitting_no as number, week_no: weekNo,
     phase_type: phase, event_line: eventLine,
     item_bank_version_id: row.item_bank_version_id,
+    autopilot_profile_version_id: profileVersion,
     is_simulation: row.is_simulation, data_classification: row.data_classification,
     status, revision, created_by: row.created_by, created_at: row.created_at,
     approved_by: approved.actor, approved_at: approved.occurredAt,
@@ -243,7 +272,8 @@ export function startedVisitSessionId(receipt: VisitPlanReceipt): string {
 const FROZEN_PLAN_FACTS = [
   "plan_id", "patient_id", "scheduled_date", "scheduled_time", "queue_order",
   "session_sitting_no", "week_no", "phase_type", "event_line",
-  "item_bank_version_id", "is_simulation", "data_classification",
+  "item_bank_version_id", "autopilot_profile_version_id",
+  "is_simulation", "data_classification",
   "created_by", "created_at", "approved_by", "approved_at",
 ] as const satisfies readonly (keyof VisitPlanReceipt)[];
 
@@ -290,6 +320,25 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
     && VERSION_ID.test(row.autopilot_protocol_version_id)
     && typeof row.autopilot_protocol_definition_digest === "string"
     && SHA256.test(row.autopilot_protocol_definition_digest);
+  // The repeat-protocol pair is judged on its own: it was frozen later than the
+  // item/autopilot bindings, so a session can legitimately carry those three
+  // and still predate this one.  Absent means both null; anything else must be
+  // a complete, well-formed pair.
+  const repeatBindingAbsent = row?.repeat_protocol_version_id === null
+    && row?.repeat_protocol_definition_digest === null;
+  const repeatBindingComplete = typeof row?.repeat_protocol_version_id === "string"
+    && VERSION_ID.test(row.repeat_protocol_version_id)
+    && typeof row.repeat_protocol_definition_digest === "string"
+    && SHA256.test(row.repeat_protocol_definition_digest);
+  // The demo profile pair is judged on its own, exactly like the repeat pair.
+  // Absent means both null; anything else must be a complete, well-formed pair
+  // whose version is one this build already knows.
+  const profileBindingAbsent = row?.autopilot_profile_version_id === null
+    && row?.autopilot_profile_definition_digest === null;
+  const profileBindingComplete = typeof row?.autopilot_profile_version_id === "string"
+    && knownProfileVersion(row.autopilot_profile_version_id)
+    && typeof row.autopilot_profile_definition_digest === "string"
+    && SHA256.test(row.autopilot_profile_definition_digest);
   if (!row
       || typeof row.session_id !== "string" || !PATIENT_ID.test(row.session_id)
       || typeof row.patient_id !== "string" || !PATIENT_ID.test(row.patient_id)
@@ -305,6 +354,20 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
       || typeof row.item_bank_version_id !== "string" || !VERSION_ID.test(row.item_bank_version_id)
       || (!definitionBindingAbsent && !definitionBindingComplete)
       || (row.visit_plan_id !== null && !definitionBindingComplete)
+      || (!repeatBindingAbsent && !repeatBindingComplete)
+      // Deliberately NOT "every plan link implies a repeat pair".  The backend
+      // admits a genuine pre-repeat started plan/session whose pair is
+      // NULL == NULL so its one legacy recovery can finish, and this shared
+      // parser also serves recovery, list and cached-console reads.  A newly
+      // returned modern start is held to the stricter rule in
+      // parseStartedVisitSession instead.
+      || (!profileBindingAbsent && !profileBindingComplete)
+      // A demo scope only exists inside a VisitPlan and only as simulation
+      // data, so a complete pair without either is malformed, not merely
+      // disabled.
+      || (profileBindingComplete && (row.visit_plan_id === null
+        || row.is_simulation !== true
+        || row.data_classification !== "simulation"))
       || typeof row.is_simulation !== "boolean"
       || (row.data_classification !== "research"
         && row.data_classification !== "simulation"
@@ -319,6 +382,15 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
   const phase = row.phase_type as PhaseType;
   const eventLine = row.event_line as EventLine;
   if (!validContext(weekNo, phase, eventLine)) throw new Error("训练场次周次与事件线矛盾");
+  // Shape validity is not runtime authority.  No D1B consumer resolves a
+  // Session-frozen demo profile yet, and the server's own admission gate still
+  // refuses even a perfectly consistent Plan/Session pair, so every complete
+  // pair is rejected here — including the exact known version with a valid
+  // digest.  The reason is that D1A runtime is disabled, not that the row is
+  // malformed; malformed shapes were already refused above.
+  if (!profileBindingAbsent) {
+    throw new Error("当前版本尚未开放模拟演示计划的床旁运行，已阻止进入");
+  }
   return {
     session_id: row.session_id,
     patient_id: row.patient_id,
@@ -333,6 +405,13 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
     item_bank_definition_digest: row.item_bank_definition_digest as string | null,
     autopilot_protocol_version_id: row.autopilot_protocol_version_id as string | null,
     autopilot_protocol_definition_digest: row.autopilot_protocol_definition_digest as string | null,
+    repeat_protocol_version_id: row.repeat_protocol_version_id as string | null,
+    repeat_protocol_definition_digest: row.repeat_protocol_definition_digest as string | null,
+    // Copied unconditionally so own-property presence and the explicit nulls
+    // survive into the console; a spread-conditional would silently drop them.
+    autopilot_profile_version_id: row.autopilot_profile_version_id as string | null,
+    autopilot_profile_definition_digest:
+      row.autopilot_profile_definition_digest as string | null,
     is_simulation: row.is_simulation,
     data_classification: row.data_classification,
     ...(includeRuntime
@@ -351,6 +430,13 @@ export function parseStartedVisitSession(
 ): Session {
   const session = parseSessionRecord(value, false);
   const sessionId = startedVisitSessionId(startedReceipt);
+  // The D1A modern immediate-start contract requires the complete frozen
+  // repeat pair. Historical pre-repeat recovery may legitimately show
+  // null/null, so this stricter rule stays out of the shared parser.
+  if (typeof session.repeat_protocol_version_id !== "string"
+      || typeof session.repeat_protocol_definition_digest !== "string") {
+    throw new Error("新建场次缺少冻结的重复请求协议绑定，系统已阻止进入");
+  }
   if (session.session_id !== sessionId
       || session.visit_plan_id !== startedReceipt.plan_id
       || session.patient_id !== startedReceipt.patient_id
@@ -361,6 +447,10 @@ export function parseStartedVisitSession(
       || session.item_bank_version_id !== startedReceipt.item_bank_version_id
       || session.is_simulation !== startedReceipt.is_simulation
       || session.data_classification !== startedReceipt.data_classification
+      // Both sides are null for every D1A started fact; comparing them keeps a
+      // future paired-set Session from being bound to a canonical receipt.
+      || (session.autopilot_profile_version_id ?? null)
+        !== startedReceipt.autopilot_profile_version_id
       || session.trainer_id !== startedReceipt.started_by
       || typeof session.training_date !== "string"
       || session.training_date < startedReceipt.scheduled_date) {

@@ -11,6 +11,7 @@ from .enums import EventLine, PhaseType
 
 _OPAQUE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
 _PATIENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+_PROFILE_VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 
 
 class VisitPlanCreateIn(BaseModel):
@@ -27,6 +28,12 @@ class VisitPlanCreateIn(BaseModel):
     week_no: int = Field(ge=1, le=8)
     phase_type: PhaseType
     event_line: EventLine
+    # Omitting this selects the canonical full-source plan.  Only an explicit
+    # version may select a demo profile, and its digest is always resolved
+    # server-side: ``extra="forbid"`` rejects a client-supplied digest.
+    autopilot_profile_version_id: str | None = Field(
+        default=None, min_length=1, max_length=128,
+        pattern=_PROFILE_VERSION_PATTERN)
 
 
 class VisitPlanMutationIn(BaseModel):
@@ -67,6 +74,9 @@ class VisitPlanReceipt(BaseModel):
     phase_type: PhaseType
     event_line: EventLine
     item_bank_version_id: str
+    # Required nullable server fact.  NULL is the canonical full-source plan;
+    # the paired digest is deliberately never exposed to any account client.
+    autopilot_profile_version_id: str | None
     is_simulation: bool
     data_classification: Literal["research", "simulation"]
     status: Literal["draft", "approved", "started", "cancelled"]

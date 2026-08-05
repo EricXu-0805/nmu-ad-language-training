@@ -21,6 +21,7 @@ from app import (
     content,
     db,
     evidence_ledger,
+    repeat_intent,
     runtime,
 )
 from app.db import get_session
@@ -47,6 +48,7 @@ PROTOCOL = content.load_autopilot_protocol(
     content.CONTENT_DIR / "autopilot_protocol_v1.json")
 BANK_DIGEST = content.item_bank_definition_digest(BANK)
 PROTOCOL_DIGEST = content.autopilot_protocol_definition_digest(PROTOCOL)
+REPEAT_PROTOCOL = repeat_intent.active_protocol()
 PLAN = runtime.build_session_plan(BANK, 2, "正式训练")
 FIRST_ITEM = PLAN.items[0]
 FIRST_TURN = FIRST_ITEM.turns[0]
@@ -148,6 +150,8 @@ def _seed_session(
         item_bank_definition_digest=BANK_DIGEST,
         autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
         autopilot_protocol_definition_digest=PROTOCOL_DIGEST,
+        repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
+        repeat_protocol_definition_digest=REPEAT_PROTOCOL.definition_digest,
         is_simulation=simulation,
         data_classification="simulation" if simulation else "research",
     )

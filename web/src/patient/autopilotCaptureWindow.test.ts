@@ -3,8 +3,10 @@ import test from "node:test";
 import {
   CAPTURE_STOP_JITTER_TOLERANCE_MS,
   MIN_ANSWER_WINDOW_MS,
+  PRE_START_BUDGET_MS,
   admitCaptureBeforeDeadline,
   answerWindowMs,
+  armCaptureDeadline,
   assertCaptureDurationWithinCommandLimit,
   remainingAnswerWindowMs,
 } from "./autopilotCaptureWindow.ts";
@@ -165,16 +167,28 @@ function ports(clock: ReturnType<typeof fakeClock>, mic: ReturnType<typeof micro
   };
 }
 
+/** 单段准入：武装唯一那个截止时刻，用完就撤，和生产的 finally 一致。 */
+function admitOnce<T>(
+  authorization: Promise<T>,
+  clock: ReturnType<typeof fakeClock>,
+  mic: ReturnType<typeof microphoneDouble>,
+  deadlineAt: number,
+): Promise<T> {
+  const deadline = armCaptureDeadline(ports(clock, mic, deadlineAt));
+  return admitCaptureBeforeDeadline(authorization, deadline)
+    .finally(() => deadline.clear());
+}
+
 test("后置授权永不返回时，由截止时刻关麦并判死这次采集", async () => {
   const clock = fakeClock();
   const mic = microphoneDouble();
   let admitted = false;
   const never = new Promise<"authorized">(() => {});   // 请求悬着，永远不回
 
-  const settled = admitCaptureBeforeDeadline(
-    never,
-    // 真实录音起点 30ms 前；绝对截止 = 起点 + 14 秒作答窗口。
-    ports(clock, mic, clock.now() - 30 + answerWindowMs(P0A_MAX_DURATION_SECONDS)),
+  const settled = admitOnce(
+    never, clock, mic,
+    // pre-start 进入 30ms 之后；绝对截止 = 进入时刻 + 剩余预算。
+    clock.now() - 30 + answerWindowMs(P0A_MAX_DURATION_SECONDS),
   ).then(() => { admitted = true; });
 
   assert.deepEqual(clock.armed, [13_970]);
@@ -200,10 +214,7 @@ test("剩余窗口已经归零时，一个已 resolved 的授权也不得抢先�
   // 已 resolved 的 promise 稳赢 setTimeout(0)：只信 Promise.race 就会放行一次
   // 事实上已经越界的采集。判据必须是绝对截止时刻。
   await assert.rejects(
-    admitCaptureBeforeDeadline(
-      Promise.resolve<"authorized">("authorized"),
-      ports(clock, mic, clock.now()),
-    ),
+    admitOnce(Promise.resolve<"authorized">("authorized"), clock, mic, clock.now()),
     (error: unknown) =>
       error instanceof AutopilotMediaError && error.errorCode === "device_command_timeout",
   );
@@ -218,8 +229,7 @@ test("授权在定时器烧掉之前一刻返回，但单调时钟已过期：�
   let resolveAuth!: (value: "authorized") => void;
   const authorization = new Promise<"authorized">((resolve) => { resolveAuth = resolve; });
 
-  const settled = admitCaptureBeforeDeadline(
-    authorization, ports(clock, mic, deadlineAt));
+  const settled = admitOnce(authorization, clock, mic, deadlineAt);
   // 定时器还没烧，但真实时间已经越过截止时刻（后台标签页节流的典型形态）。
   clock.advance(14_500);
   resolveAuth("authorized");
@@ -235,8 +245,7 @@ test("后置授权晚于截止时刻返回时，那次迟到的授权不再放�
   let resolveLate!: (value: "authorized") => void;
   const late = new Promise<"authorized">((resolve) => { resolveLate = resolve; });
 
-  const settled = admitCaptureBeforeDeadline(
-    late, ports(clock, mic, clock.now() + 14_000));
+  const settled = admitOnce(late, clock, mic, clock.now() + 14_000);
   clock.fireAll(14_000);                          // 截止时刻先赢
   resolveLate("authorized");                      // 授权随后才回来，且是"仍授权"
 
@@ -251,8 +260,7 @@ test("判死之后迟到的授权拒绝不会泄漏成 unhandled rejection", asy
   let rejectLate!: (error: unknown) => void;
   const late = new Promise<"authorized">((_resolve, reject) => { rejectLate = reject; });
 
-  const settled = admitCaptureBeforeDeadline(
-    late, ports(clock, mic, clock.now() + 14_000));
+  const settled = admitOnce(late, clock, mic, clock.now() + 14_000);
   clock.fireAll(14_000);
   await assert.rejects(settled);
   // 请求被中止后才抛出的网络错误已经没人消费；它不得把进程掀翻。
@@ -268,8 +276,7 @@ test("正常 400ms 授权路径照常放行，且撤掉准入定时器", async (
   let resolveAuth!: (value: "authorized") => void;
   const authorization = new Promise<"authorized">((resolve) => { resolveAuth = resolve; });
 
-  const settled = admitCaptureBeforeDeadline(
-    authorization, ports(clock, mic, deadlineAt));
+  const settled = admitOnce(authorization, clock, mic, deadlineAt);
   clock.advance(400);                             // 复核真的花了 400ms
   resolveAuth("authorized");
 
@@ -287,7 +294,7 @@ test("failClosed 内部同步拒绝授权时，对外仍然是 device_command_ti
     rejectAuth = reject;
   });
   const log: string[] = [];
-  const settled = admitCaptureBeforeDeadline(authorization, {
+  const settled = admitCaptureBeforeDeadline(authorization, armCaptureDeadline({
     deadlineAt: clock.now() + 14_000,
     now: clock.now,
     setTimer: clock.setTimer.bind(clock),
@@ -297,7 +304,7 @@ test("failClosed 内部同步拒绝授权时，对外仍然是 device_command_ti
       // 生产里这一步 abort 在途 fetch；AbortError 可能抢先落地赢下 race。
       rejectAuth(new DOMException("录音已到截止时刻", "AbortError"));
     },
-  });
+  }));
   clock.fireAll(14_000);
 
   await assert.rejects(settled, (error: unknown) =>
@@ -308,13 +315,13 @@ test("failClosed 内部同步拒绝授权时，对外仍然是 device_command_ti
 test("failClosed 自己抛错也不悬：deadline 仍然稳定超时", async () => {
   const clock = fakeClock();
   const never = new Promise<"authorized">(() => {});   // 授权永不返回
-  const settled = admitCaptureBeforeDeadline(never, {
+  const settled = admitCaptureBeforeDeadline(never, armCaptureDeadline({
     deadlineAt: clock.now() + 14_000,
     now: clock.now,
     setTimer: clock.setTimer.bind(clock),
     clearTimer: clock.clearTimer.bind(clock),
     failClosed: () => { throw new Error("关麦时设备已被系统回收"); },
-  });
+  }));
   assert.doesNotThrow(() => clock.fireAll(14_000));    // 定时器回调不外抛
 
   await assert.rejects(settled, (error: unknown) =>
@@ -354,6 +361,69 @@ test("停麦读数顶穿服务器上限或读数本身不可用时，不许进�
       `${durationSeconds}/${maxDurationSeconds} 应被拒绝`);
     assert.equal(failure.errorCode, "recording_runtime_failed");
   }
+});
+
+test("整段 pre-start 只武装一个定时器：三段共用同一个绝对截止时刻", async () => {
+  const clock = fakeClock();
+  const mic = microphoneDouble();
+  const deadline = armCaptureDeadline(
+    ports(clock, mic, clock.now() + PRE_START_BUDGET_MS));
+
+  assert.equal(PRE_START_BUDGET_MS, 20_000);
+  assert.deepEqual(clock.armed, [20_000]);          // 武装恰好一次
+
+  // 第一次授权、prepare、第二次授权：三段都 race 同一个已武装的截止时刻。
+  clock.advance(300);
+  assert.equal(await deadline.race(Promise.resolve("authorized")), "authorized");
+  clock.advance(200);
+  assert.equal(await deadline.race(Promise.resolve(true)), true);
+  clock.advance(400);
+  assert.equal(await admitCaptureBeforeDeadline(Promise.resolve("authorized"), deadline),
+    "authorized");
+
+  assert.deepEqual(clock.armed, [20_000]);          // 还是那一个，没有第二个 owner
+  assert.equal(clock.pendingCount, 1);
+  deadline.clear();
+  assert.equal(clock.cleared.length, 1);            // 也只撤这一次
+  assert.equal(clock.pendingCount, 0);
+  assert.deepEqual(mic.log, []);
+});
+
+test("pre-start 预算被耗尽：剩余段一律判死，关麦只发生一次", async () => {
+  const clock = fakeClock();
+  const mic = microphoneDouble();
+  const deadline = armCaptureDeadline(
+    ports(clock, mic, clock.now() + PRE_START_BUDGET_MS));
+
+  clock.fireAll(PRE_START_BUDGET_MS);               // 第二次授权卡穿了整段预算
+  assert.deepEqual(mic.log, [
+    "abort:麦克风权限复核晚于录音截止时刻",
+    "mic:physically-stopped",
+  ]);
+
+  // 之后每一段都拿到同一个稳定错误码，且不会再关一次麦。
+  for (const segment of [Promise.resolve("authorized"), Promise.resolve(true)]) {
+    await assert.rejects(deadline.race(segment), (error: unknown) =>
+      error instanceof AutopilotMediaError && error.errorCode === "device_command_timeout");
+  }
+  assert.equal(deadline.check()?.errorCode, "device_command_timeout");
+  assert.equal(mic.log.length, 2);
+  deadline.clear();
+  assert.deepEqual(clock.armed, [20_000]);
+});
+
+test("开麦前预算与作答窗口是两笔账：授权往返不再从 14 秒里扣", () => {
+  // 旧顺序：先真开录，再花一整个往返复核，那段往返直接吃掉作答时间。
+  const authRoundTripMs = 1_800;
+  const oldRemaining = remainingAnswerWindowMs(P0A_MAX_DURATION_SECONDS, authRoundTripMs);
+  assert.equal(oldRemaining, 14_000 - authRoundTripMs);
+
+  // 新顺序：复核发生在开录之前，走的是 20 秒开麦前预算；真实 onstart 之后
+  // 只剩武装定时器那点耗时会被扣。
+  const armGapMs = 5;
+  assert.equal(
+    remainingAnswerWindowMs(P0A_MAX_DURATION_SECONDS, armGapMs), 14_000 - armGapMs);
+  assert.ok(PRE_START_BUDGET_MS > authRoundTripMs);
 });
 
 test("上限本身短于容差时窗口退化成上限，不假装还有余量", () => {

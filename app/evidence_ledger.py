@@ -22,6 +22,11 @@ from .judging import PORTRAIT_FIELDS, PortraitLeakError
 from .models import AttemptCaptureProcessing, AttemptEvent
 
 
+# Written once at admission.  ``legacy_pre_repeat`` exists only on rows the
+# migration backfilled; the running service can only ever write the other one.
+LEGACY_PRE_REPEAT_ADMISSION = "legacy_pre_repeat"
+REPEAT_BOUND_ADMISSION = "repeat_bound"
+
 RECOVERABLE_ATTEMPT_STATUSES = frozenset({"received", "asr_completed"})
 TERMINAL_ATTEMPT_STATUSES = frozenset({"completed", "technical_failure"})
 ATTEMPT_LEASE_SECONDS = 90
@@ -205,6 +210,37 @@ def fenced_attempt_update(session: Session, claim: AttemptClaim, *,
     return result.rowcount == 1
 
 
+def confirm_attempt_claim(session: Session, attempt_id: int, *,
+                          owner: str, generation: int,
+                          stage: Literal["received", "asr_completed"],
+                          now: datetime | None = None) -> bool:
+    """Atomically prove ``owner``/``generation`` still own this attempt stage.
+
+    The attempt-level analogue of :func:`confirm_capture_claim`, and a real
+    conditional UPDATE for the same reason: a SELECT-then-compare is not a
+    mutual-exclusion primitive on SQLite or across processes.  The lease is
+    refreshed as a harmless side effect; owner and generation are untouched, so
+    the caller's :class:`AttemptClaim` stays valid for a later
+    :func:`fenced_attempt_update`.  Used before a second provider boundary so a
+    stale or taken-over worker never calls the provider at all, rather than
+    only failing when it tries to write the result.
+    """
+    observed_at = now or datetime.now()
+    result = session.execute(
+        update(AttemptEvent)
+        .where(
+            AttemptEvent.id == attempt_id,
+            AttemptEvent.processing_status == stage,
+            AttemptEvent.processing_owner == owner,
+            AttemptEvent.processing_generation == generation,
+            AttemptEvent.processing_lease_expires_at > observed_at,
+        )
+        .values(processing_lease_expires_at=lease_deadline(now=observed_at))
+        .execution_options(synchronize_session=False)
+    )
+    return result.rowcount == 1
+
+
 @dataclass(frozen=True)
 class CaptureClaim:
     """A persisted capture-processing lease plus its fencing generation.
@@ -220,6 +256,11 @@ class CaptureClaim:
     proof_attempt_seq: int
     proof_prompt_level: int
     lease_expires_at: datetime
+    # Both NULL for a capture admitted before the repeat protocol existed; such
+    # a worker runs the pre-repeat answer flow and never invokes the detector.
+    repeat_protocol_version_id: str | None
+    repeat_protocol_definition_digest: str | None
+    repeat_admission_semantics: str
 
 
 def claim_from_capture(capture: AttemptCaptureProcessing) -> CaptureClaim:
@@ -236,6 +277,10 @@ def claim_from_capture(capture: AttemptCaptureProcessing) -> CaptureClaim:
         proof_attempt_seq=capture.proof_attempt_seq,
         proof_prompt_level=capture.proof_prompt_level,
         lease_expires_at=capture.processing_lease_expires_at,
+        repeat_protocol_version_id=capture.repeat_protocol_version_id,
+        repeat_protocol_definition_digest=(
+            capture.repeat_protocol_definition_digest),
+        repeat_admission_semantics=capture.repeat_admission_semantics,
     )
 
 
@@ -367,6 +412,8 @@ def fenced_capture_update(session: Session, claim: CaptureClaim, *,
         "record_command_id", "predecessor_command_id", "receipt_server_seq",
         "raw_audio_id", "session_id", "item_id", "turn_seq",
         "proof_attempt_seq", "proof_prompt_level", "created_at", "is_simulation",
+        "repeat_protocol_version_id", "repeat_protocol_definition_digest",
+        "repeat_admission_semantics",
     } & set(values)
     if forbidden:
         raise ValueError(f"fenced capture update contains protected fields: {sorted(forbidden)}")
@@ -391,10 +438,14 @@ def fenced_capture_update(session: Session, claim: CaptureClaim, *,
 def _capture_identity_tuple(
     *, predecessor_command_id: int, receipt_server_seq: int, raw_audio_id: str,
     session_id: str, item_id: str, turn_seq: int, proof_attempt_seq: int,
-    proof_prompt_level: int, is_simulation: bool,
+    proof_prompt_level: int, repeat_protocol_version_id: str | None,
+    repeat_protocol_definition_digest: str | None,
+    repeat_admission_semantics: str, is_simulation: bool,
 ) -> tuple:
     return (predecessor_command_id, receipt_server_seq, raw_audio_id, session_id,
-            item_id, turn_seq, proof_attempt_seq, proof_prompt_level, is_simulation)
+            item_id, turn_seq, proof_attempt_seq, proof_prompt_level,
+            repeat_protocol_version_id, repeat_protocol_definition_digest,
+            repeat_admission_semantics, is_simulation)
 
 
 def _verify_capture_identity(
@@ -410,6 +461,10 @@ def _verify_capture_identity(
         turn_seq=row.turn_seq,
         proof_attempt_seq=row.proof_attempt_seq,
         proof_prompt_level=row.proof_prompt_level,
+        repeat_protocol_version_id=row.repeat_protocol_version_id,
+        repeat_protocol_definition_digest=(
+            row.repeat_protocol_definition_digest),
+        repeat_admission_semantics=row.repeat_admission_semantics,
         is_simulation=row.is_simulation,
     )
     if expected != actual:
@@ -429,6 +484,8 @@ def ensure_capture_processing(
     turn_seq: int,
     proof_attempt_seq: int,
     proof_prompt_level: int,
+    repeat_protocol_version_id: str | None,
+    repeat_protocol_definition_digest: str | None,
     is_simulation: bool,
     now: datetime | None = None,
 ) -> AttemptCaptureProcessing:
@@ -447,6 +504,10 @@ def ensure_capture_processing(
         receipt_server_seq=receipt_server_seq, raw_audio_id=raw_audio_id,
         session_id=session_id, item_id=item_id, turn_seq=turn_seq,
         proof_attempt_seq=proof_attempt_seq, proof_prompt_level=proof_prompt_level,
+        repeat_protocol_version_id=repeat_protocol_version_id,
+        repeat_protocol_definition_digest=repeat_protocol_definition_digest,
+        # Never a parameter: a running service can only admit bound rows.
+        repeat_admission_semantics=REPEAT_BOUND_ADMISSION,
         is_simulation=is_simulation,
     )
     existing = session.exec(select(AttemptCaptureProcessing).where(

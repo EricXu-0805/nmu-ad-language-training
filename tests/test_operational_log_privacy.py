@@ -95,11 +95,26 @@ def test_runtime_output_static_privacy_contract():
                         f"{source_path}:{node.lineno}"
                     )
 
-    # Runtime code has one deliberately narrow output choke point.  Its only
-    # dynamic value is the allowlisted safe_code produced immediately above it.
-    assert len(output_calls) == 1
-    source_path, call = output_calls[0]
-    assert source_path.name == "main.py"
+    # Runtime code has exactly two deliberately narrow output choke points,
+    # matched by exact path relative to app_root (not basename/order/lineno).
+    assert len(output_calls) == 2
+    main_rel = Path("main.py")
+    tts_rel = Path("tts.py")
+
+    main_calls = [
+        item for item in output_calls
+        if item[0].relative_to(app_root) == main_rel
+    ]
+    tts_calls = [
+        item for item in output_calls
+        if item[0].relative_to(app_root) == tts_rel
+    ]
+    assert len(main_calls) == 1
+    assert len(tts_calls) == 1
+
+    # 1) main.py's allowlisted safe_code choke point: the full
+    # print(f"[ops] code={safe_code}", flush=True) shape, frozen exactly.
+    source_path, call = main_calls[0]
     referenced = {
         node.id for node in ast.walk(call) if isinstance(node, ast.Name)
     }
@@ -111,3 +126,67 @@ def test_runtime_output_static_privacy_contract():
         and node.func.id == "str"
         for node in ast.walk(call)
     )
+    assert isinstance(call.func, ast.Name) and call.func.id == "print"
+    assert len(call.args) == 1
+    assert {kw.arg for kw in call.keywords} == {"flush"}
+    flush_kw = next(kw for kw in call.keywords if kw.arg == "flush")
+    assert isinstance(flush_kw.value, ast.Constant)
+    assert flush_kw.value.value is True
+
+    message = call.args[0]
+    assert isinstance(message, ast.JoinedStr)
+    assert len(message.values) == 2
+    literal_part, formatted_part = message.values
+    assert isinstance(literal_part, ast.Constant)
+    assert literal_part.value == "[ops] code="
+    assert isinstance(formatted_part, ast.FormattedValue)
+    assert isinstance(formatted_part.value, ast.Name)
+    assert formatted_part.value.id == "safe_code"
+    assert formatted_part.conversion == -1
+    assert formatted_part.format_spec is None
+
+    # 2) app/tts.py's _log_failure(reason): logs only the closed reason enum,
+    # via the module-level logger = logging.getLogger("app.tts") binding.
+    tts_path, tts_call = tts_calls[0]
+    tts_tree = ast.parse(tts_path.read_text(encoding="utf-8"), tts_path)
+    log_failure = next(
+        node for node in ast.walk(tts_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_log_failure"
+    )
+    assert log_failure.lineno <= tts_call.lineno <= log_failure.end_lineno
+
+    logger_binding = next(
+        node for node in ast.walk(tts_tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "logger"
+    )
+    assert isinstance(logger_binding.value, ast.Call)
+    assert isinstance(logger_binding.value.func, ast.Attribute)
+    assert logger_binding.value.func.attr == "getLogger"
+    assert isinstance(logger_binding.value.func.value, ast.Name)
+    assert logger_binding.value.func.value.id == "logging"
+    assert len(logger_binding.value.args) == 1
+    assert isinstance(logger_binding.value.args[0], ast.Constant)
+    assert logger_binding.value.args[0].value == "app.tts"
+
+    assert isinstance(tts_call.func, ast.Attribute)
+    assert tts_call.func.attr == "warning"
+    assert isinstance(tts_call.func.value, ast.Name)
+    assert tts_call.func.value.id == "logger"
+    assert not tts_call.keywords
+    assert len(tts_call.args) == 2
+    message_arg, reason_arg = tts_call.args
+    assert isinstance(message_arg, ast.Constant)
+    assert message_arg.value == "qwen_tts_failed reason=%s"
+    assert isinstance(reason_arg, ast.Attribute)
+    assert reason_arg.attr == "value"
+    assert isinstance(reason_arg.value, ast.Name)
+    assert reason_arg.value.id == "reason"
+
+    tts_referenced = {
+        node.id for node in ast.walk(tts_call) if isinstance(node, ast.Name)
+    }
+    assert tts_referenced.isdisjoint(sensitive_names)
+    assert tts_referenced == {"logger", "reason"}

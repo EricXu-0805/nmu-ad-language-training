@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import { ImagePane } from "../components/ImagePane.tsx";
 import { Centered } from "./Centered.tsx";
+import { capturePhaseMatches } from "./autopilotCapturePresentation.ts";
 import {
   resolveExactAutopilotDisplayText,
   type ExactAutopilotDisplayText,
@@ -77,16 +78,29 @@ export function PatientAutopilotStage({
 
   const speechText = displayRef.current?.text
     ?? "请稍候，研究者正在核对当前提示。";
+  // 两端都以浏览器自己的事实为准，不等服务器 runtime。
+  // 开录那一端：真实 onstart 之后 record_started 还要走一整个网络往返，服务器
+  // 此刻仍是 waiting_recording；等它才显示"正在听您说"，就是白白吃掉老人的
+  // 作答时间。收麦那一端：麦克风已经物理关闭、字节还在保存上传时，服务器
+  // 仍合法地是 recording，这时说"正在听您说"等于请老人对着已关的麦克风继续讲。
+  const localPhase = capturePhaseMatches(
+    autopilot.localCapturePhase, sessionId, command.command_key)
+    ? autopilot.localCapturePhase
+    : null;
+  const listening = localPhase?.phase === "listening";
+  const persisting = localPhase?.phase === "persisting";
   const status = !activated
     ? "点一下屏幕后开始"
     : autopilot.assetReadiness?.requestKey !== command.command_key
         || autopilot.assetReadiness.readiness === "loading"
       ? "正在准备题目图片"
+    : persisting
+      ? "已收音，正在保存，请稍候"
+    : listening
+      ? "正在听您说"
     : runtime?.phase === "tts_playing"
       ? "正在为您朗读"
-      : runtime?.phase === "recording"
-        ? "正在听您说"
-        : command.kind === "record" ? "正在准备麦克风" : "正在准备朗读";
+      : command.kind === "record" ? "正在准备麦克风" : "正在准备朗读";
 
   return (
     <div className="patient-stage">
@@ -106,7 +120,7 @@ export function PatientAutopilotStage({
       </div>
       <div className="stage-mic" aria-live="polite">
         <p className="patient-status" role="status">{status}</p>
-        {runtime?.phase === "recording" && (
+        {listening && (
           <>
             {/* 服务器托管的自动流程里这个按钮只是提前结束，不是完成链路的必要条件：
                 不点，到作答窗口尽头也会自动收麦并继续。文案必须把这点说清楚，

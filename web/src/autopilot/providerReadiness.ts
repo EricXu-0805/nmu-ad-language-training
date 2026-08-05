@@ -14,7 +14,10 @@ export interface ProviderCapabilityReadiness {
 }
 
 export interface ProviderReadiness {
-  schemaVersion: "provider-readiness.v1";
+  // Exactly one accepted response schema, never a v1∪v2 union: the server
+  // always projects the current version, and a historical v1 probe surfaces as
+  // config_mismatch inside a v2 envelope rather than as a v1 response.
+  schemaVersion: "provider-readiness.v2";
   runtimeContract: "p0a_sim_first_single_v1";
   status: ProviderReadinessStatus;
   startAllowed: boolean;
@@ -60,6 +63,10 @@ function parseCapability(value: unknown): ProviderCapabilityReadiness {
   if (candidate.success === (candidate.failure_code !== null)) {
     throw new Error("AI 服务能力检查成功状态与错误码矛盾");
   }
+  // An unconfigured engine was never probed, so it cannot have succeeded.
+  if (!candidate.configured && candidate.success) {
+    throw new Error("AI 服务能力未配置却声称检查通过");
+  }
   return {
     required: candidate.required,
     configured: candidate.configured,
@@ -84,7 +91,7 @@ export function parseProviderReadiness(value: unknown): ProviderReadiness {
     "required_capabilities_ready", "all_configured_capabilities_ready",
     "matches_current_config", "tts", "asr", "llm",
     "checked_at", "expires_at", "actor_display_id", "probe_failure_code",
-  ]) || candidate.schema_version !== "provider-readiness.v1"
+  ]) || candidate.schema_version !== "provider-readiness.v2"
       || candidate.runtime_contract !== "p0a_sim_first_single_v1"
       || !statuses.includes(candidate.status as ProviderReadinessStatus)
       || typeof candidate.start_allowed !== "boolean"
@@ -122,7 +129,7 @@ export function parseProviderReadiness(value: unknown): ProviderReadiness {
     throw new Error("AI 服务就绪状态内部矛盾");
   }
   return {
-    schemaVersion: "provider-readiness.v1",
+    schemaVersion: "provider-readiness.v2",
     runtimeContract: "p0a_sim_first_single_v1",
     status,
     startAllowed,

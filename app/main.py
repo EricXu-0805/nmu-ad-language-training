@@ -14,7 +14,7 @@ import math
 import secrets
 import threading
 from pathlib import Path
-from typing import Literal, NamedTuple, NoReturn
+from typing import Callable, Literal, NamedTuple, NoReturn
 from urllib.parse import unquote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
@@ -33,16 +33,18 @@ from fastapi.responses import Response as PlainResponse
 
 from . import (access_policy, assessment_contract, assessment_service, asr,
                audio_capture, audio_gate, audio_store, audit, auth,
-               autopilot_contract, autopilot_orchestration, autopilot_positions,
-               autopilot_service,
+               autopilot_contract, autopilot_orchestration,
+               autopilot_positions, autopilot_service,
                cloud_processing, content, db, export_security, governance_lock,
                device_capability, evidence_ledger, export, http_security, judging,
                ai_quality_service, llm_judge, rule_judge, runtime, scoring,
                session_completion,
                resource_limits, patient_asset, patient_presentation,
-               provider_readiness, scale_protocol,
+               provider_readiness, repeat_evidence, repeat_intent,
+               scale_protocol,
                session_admission, session_closeout, tts,
                visit_plan_contract, visit_plan_service)
+from .autopilot_ledger import utc_now_naive
 from .auth import COOKIE_NAME, CSRF_COOKIE_NAME
 from .db import get_session, init_db
 from .enums import AudioStatus, ConsentType
@@ -52,7 +54,8 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      AudioCaptureReceipt, ExportBatch, InteractionEvent,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
                      Patient, PatientDeviceCapability, PatientWithdrawalEvent,
-                     RuntimeCommand, ScaleResult, SessionAutopilotState,
+                     RuntimeCommand, ScaleResult,
+                     SessionAutopilotState,
                      SessionCloseoutReport, SessionOutcomeSummary,
                      SessionRuntimeState, TechnicalPauseReceipt,
                      TtsServeEvidence, TurnConfirmationRevision, TurnEvent,
@@ -508,17 +511,41 @@ async def console_auth_guard(request: Request, call_next):
                 capability_token_hash = capability_row.token_hash
             else:
                 capability_session_id = capability_device_hash = capability_token_hash = None
+            # Digest-matched identity of a *rejected* row, carried out of the
+            # read-only resolution purely so the terminal-pause exception below
+            # can re-lock and re-resolve that exact row. INVALID never yields a
+            # row, so an unknown or malformed bearer carries nothing.
+            capability_row_session = (
+                capability_row.session_id if capability_row is not None else None)
+            capability_row_hash = (
+                capability_row.token_hash if capability_row is not None else None)
         if capability_status not in {
                 device_capability.CapabilityResolution.VALID,
                 device_capability.CapabilityResolution.RECOVERY_ONLY}:
+            # Exactly one narrow exception, and it never calls the route: an
+            # expired bearer addressing its own session's autopilot-next may
+            # still finish a legacy recovery whose judgement is already durable.
+            # Refusing would strand that scope in processing_attempt forever,
+            # while the pause needs no device, no provider and no command
+            # projection. The response stays the original 401 either way.
+            outcome = _try_stale_bearer_terminal_pause(
+                request, path, capability_status, capability_row_session,
+                capability_row_hash)
             codes = {
                 device_capability.CapabilityResolution.INVALID: "device_capability_invalid",
                 device_capability.CapabilityResolution.EXPIRED: "device_capability_expired",
                 device_capability.CapabilityResolution.REVOKED: "device_capability_revoked",
+                device_capability.CapabilityResolution.RECOVERY_ONLY:
+                    "device_capability_recovery_only",
             }
+            # The locked read inside that transaction is newer than this
+            # preflight, so a bearer revoked or re-paired while we waited for
+            # the row lock is answered with its current status, not a stale one.
+            reported = (outcome.current if outcome.current in codes
+                        else capability_status)
             return JSONResponse(status_code=401, content={
                 "detail": "设备配对已失效，请由研究者重新配对",
-                "code": codes[capability_status],
+                "code": codes[reported],
             })
         request.state.auth_kind = "device_capability"
         request.state.device_capability_session_id = capability_session_id
@@ -551,6 +578,23 @@ async def console_auth_guard(request: Request, call_next):
                          or kind == "audioSaved")):
                 return await call_next(request)
         if capability_status == device_capability.CapabilityResolution.RECOVERY_ONLY:
+            # Same narrow exception for a recovery-only bearer, which is the
+            # usual state once the session has left LiveState.
+            outcome = _try_stale_bearer_terminal_pause(
+                request, path, capability_status, capability_session_id,
+                capability_token_hash)
+            if outcome.current in {
+                    device_capability.CapabilityResolution.EXPIRED,
+                    device_capability.CapabilityResolution.REVOKED}:
+                # Decayed further while we held the row lock; report what the
+                # locked transaction actually saw.
+                return JSONResponse(status_code=401, content={
+                    "detail": "设备配对已失效，请由研究者重新配对",
+                    "code": ("device_capability_expired"
+                             if outcome.current
+                             is device_capability.CapabilityResolution.EXPIRED
+                             else "device_capability_revoked"),
+                })
             return JSONResponse(status_code=401, content={
                 "detail": "本场设备配对只可恢复已落库的录音回执，请重新配对",
                 "code": "device_capability_recovery_only",
@@ -1633,6 +1677,33 @@ def _require_started_visit_plan_session(
         and enum_value(plan.phase_type) == enum_value(resolved.phase_type)
         and enum_value(plan.event_line) == enum_value(resolved.event_line)
         and plan.item_bank_version_id == resolved.item_bank_version_id
+        # Every frozen definition binding start_plan copied onto the Session,
+        # compared only for equality: a genuine pre-protocol pair is
+        # ``NULL == NULL`` and must still be admitted, so that its one legacy
+        # recovery can finish and the scope can be closed out safely. Requiring
+        # a non-null repeat binding here would strand exactly that data.
+        and plan.item_bank_definition_digest
+        == resolved.item_bank_definition_digest
+        and plan.autopilot_protocol_version_id
+        == resolved.autopilot_protocol_version_id
+        and plan.autopilot_protocol_definition_digest
+        == resolved.autopilot_protocol_definition_digest
+        and plan.repeat_protocol_version_id
+        == resolved.repeat_protocol_version_id
+        and plan.repeat_protocol_definition_digest
+        == resolved.repeat_protocol_definition_digest
+        and plan.autopilot_profile_version_id
+        == resolved.autopilot_profile_version_id
+        and plan.autopilot_profile_definition_digest
+        == resolved.autopilot_profile_definition_digest
+        # Temporary D1A gate: no runtime, worker, ACK or completion consumer
+        # resolves a demo profile yet, so even a Plan/Session pair that matches
+        # perfectly stays out of bedside control.  Remove this clause only once
+        # every D1B consumer reads the same Session-frozen resolver.
+        and plan.autopilot_profile_version_id is None
+        and plan.autopilot_profile_definition_digest is None
+        and resolved.autopilot_profile_version_id is None
+        and resolved.autopilot_profile_definition_digest is None
         and plan.is_simulation == resolved.is_simulation
         and plan.data_classification == resolved.data_classification
         and bool((plan.protocol_slot_key or "").strip())
@@ -2370,6 +2441,16 @@ def create_session(sess: TrainSession, s: DBSession = Depends(get_session)):
             "code": "direct_session_creation_disabled",
             "message": "场次必须由已审批训练安排启动；禁止直接建立场次",
         })
+    # Refused before any database work.  The server never accepts a client
+    # profile digest, and a direct historical session has no VisitPlan to carry
+    # a demo binding, so letting either column through would only surface as an
+    # opaque IntegrityError instead of a stable contract failure.
+    if (sess.autopilot_profile_version_id is not None
+            or sess.autopilot_profile_definition_digest is not None):
+        raise HTTPException(status_code=409, detail={
+            "code": "direct_session_profile_forbidden",
+            "message": "测试专用直接建场不接受自动演示计划绑定；历史场次只能为空绑定",
+        })
     if s.get(TrainSession, sess.session_id):
         raise HTTPException(409, f"session_id {sess.session_id} 已存在(可取回续做)")
     patient = s.get(Patient, sess.patient_id)
@@ -2570,6 +2651,7 @@ def get_item_bank():
     source_unstructured_count = readiness["source_unstructured_position_count"]
     selector_issues: list[dict[str, object]] = []
     admission_issue: dict[str, object] | None = None
+    active_repeat_protocol = repeat_intent.active_protocol()
     readiness_session = TrainSession(
         session_id="content-readiness",
         patient_id="content-readiness",
@@ -2581,6 +2663,11 @@ def get_item_bank():
         autopilot_protocol_version_id=str(
             protocol.get("protocol_version_id") or ""),
         autopilot_protocol_definition_digest=protocol_digest,
+        # The readiness probe must look exactly like a session a new VisitPlan
+        # would create, including the frozen repeat binding.
+        repeat_protocol_version_id=active_repeat_protocol.version_id,
+        repeat_protocol_definition_digest=(
+            active_repeat_protocol.definition_digest),
         is_simulation=True,
         data_classification="simulation",
     )
@@ -2903,8 +2990,17 @@ def _ensure_manual_plane_writable(
     that stale ownership only after locking and proving the separate runtime has
     entered ``intervention_completed``; active/paused bedside writes remain
     blocked exactly as before.
+
+    A session frozen before the repeat protocol existed stops for good once its
+    single legacy recovery has finished.  Draining closes the patient screen and
+    a researcher may take over, which flips the control plane to
+    ``manual``/``paused`` — and that alone used to be enough to pass this gate
+    and resume the old manual flow.  It must not be: the session never froze
+    repeat semantics, so a patient asking to hear the prompt again would be
+    scored as an answer.  The frozen binding is therefore resolved here too,
+    after the autonomous check so the pre-takeover error code is unchanged.
     """
-    _require_started_visit_plan_session(session_id, s)
+    resolved = _require_started_visit_plan_session(session_id, s)
     if allow_after_intervention:
         runtime_state = s.exec(select(SessionRuntimeState).where(
             SessionRuntimeState.session_id == session_id,
@@ -2920,6 +3016,31 @@ def _ensure_manual_plane_writable(
             "code": "autopilot_manual_control_locked",
             "message": f"服务端自动驾驶已接管当前场次；禁止{action}",
         })
+    if _direct_session_test_escape_enabled():
+        # Only the explicit pytest escape, which already exempts these sessions
+        # from plan admission above. It cannot be reached in production, and
+        # honouring it here keeps the many historical directly-constructed test
+        # fixtures — none of which froze a repeat binding — from failing on a
+        # gate that has nothing to do with what they cover. The autonomous
+        # ownership check above still runs for them.
+        return
+    try:
+        # The session's own historical binding, resolved through the versioned
+        # registry — never today's active protocol, and never a second copy of
+        # this resolution logic.
+        autopilot_service.session_repeat_protocol(resolved)
+    except autopilot_service.AutopilotServiceError as exc:
+        code = {
+            "autopilot_repeat_binding_missing": "session_repeat_binding_missing",
+            "autopilot_repeat_protocol_unavailable":
+                "session_repeat_protocol_unavailable",
+        }.get(exc.code)
+        if code is None:
+            raise
+        raise HTTPException(status_code=409, detail={
+            "code": code,
+            "message": f"场次缺少可用的冻结重复请求协议绑定；禁止{action}",
+        }) from exc
 
 
 def _ensure_research_review_writable(
@@ -3892,7 +4013,11 @@ async def audio_upload_blob(raw_audio_id: str, request: Request, s: DBSession = 
                 raise HTTPException(409, "音频发布后物理原件完整性检查失败")
             row.checksum = saved.checksum
             row.byte_count = saved.byte_count
-            row.uploaded_at = row.uploaded_at or datetime.now()
+            # Every other capture timestamp (command issued_at, ACK
+            # received_at, receipt received_at) is UTC-naive. A local-naive
+            # value here would read as ~8h in the future in Asia/Shanghai
+            # and break every ordering proof built on those rows.
+            row.uploaded_at = row.uploaded_at or utc_now_naive()
             row.audio_format = saved.path.suffix.lstrip(".")
             s.add(row)
             s.commit()
@@ -6716,9 +6841,18 @@ class _TtsServeFacts(NamedTuple):
     text_sha256: str
 
 
-def _synthesize_tts_text(text: str) -> tuple[PlainResponse, _TtsServeFacts]:
-    """Run provider/cache I/O outside the LiveState/capability transaction."""
-    data, version, cached = tts.speak(text)
+def _synthesize_tts_text(
+        text: str,
+        synthesize: Callable[[str], tuple[bytes | None, str, bool]] | None = None,
+) -> tuple[PlainResponse, _TtsServeFacts]:
+    """Run provider/cache I/O outside the LiveState/capability transaction.
+
+    ``synthesize`` selects the engine policy.  The generic operator path keeps
+    its local fallback; the exact autopilot path passes the strict Qwen-only
+    synthesizer, so a degraded result there is a real 204 rather than another
+    engine's audio.
+    """
+    data, version, cached = (synthesize or tts.speak)(text)
     text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if data is None:
         # 204 显式禁缓存:补装模型后老人端刷新要立刻吃到 200,不能被启发式缓存钉死在降级态
@@ -6773,7 +6907,7 @@ def autopilot_command_tts(
             _raise_autopilot_http_error(exc)
     # Provider/cache I/O can take seconds and must never retain the global live
     # row or capability serialization lock.
-    response, serve_facts = _synthesize_tts_text(text)
+    response, serve_facts = _synthesize_tts_text(text, tts.speak_autopilot)
     _revalidate_tts_after_provider(
         request,
         s,
@@ -7169,29 +7303,119 @@ def autopilot_next(
     """只向精确绑定当前场次的活跃设备投影当前一条命令。"""
     token_hash = _require_device_capability_token_hash(request, "读取自动驾驶命令")
     _require_capability_bound_session(request, session_id, "读取自动驾驶命令")
+    result = None
+    should_recover_attempt = False
+    should_recover_legacy = False
+    # A terminal legacy pause is provider-free and device-free: once the
+    # judgement has durably committed, nothing about a device capability or a
+    # feature toggle can make finishing the scope unsafe, and refusing to
+    # finish it would strand the session in processing_attempt for good. It is
+    # therefore honoured even on the paths that must still return an error, and
+    # it can admit nothing else — no ASR, no judgement, no command, no other
+    # write.
+    should_pause_legacy = False
+    terminal_resolutions: frozenset = frozenset()
+    pending_error: Exception | None = None
     # 读取也与重配对串行，避免在轮换设备的中间态泄露旧命令。
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
         live = _live_row_for_update(s)
         _require_capability_bound_session(request, session_id, "读取自动驾驶命令")
-        _require_capability_current_live(
-            request, s, "读取自动驾驶命令", live_row=live)
-        _require_capability_active_for_write(request, s, session_id)
-        try:
-            result = autopilot_service.get_next_command(
-                s,
-                session_id=session_id,
-                capability_token_hash=token_hash,
-            )
-            state = s.get(SessionAutopilotState, session_id)
-            should_recover_attempt = bool(
-                result is None and state is not None
-                and state.scope_key == autopilot_service.P0A_SCOPE_KEY
-                and state.status == "processing_attempt")
-        except autopilot_service.AutopilotServiceError as exc:
+        # One locked resolution, branched on directly — never on the shape of an
+        # exception, and never via the unlocked resolver followed by a gate that
+        # could itself cross expiry and throw outside these branches. Running
+        # the current-live gate before this would also let a capability demoted
+        # to recovery-only by a LiveState switch die on device_session_changed
+        # and never reach the terminal closure it is still allowed to finish.
+        status, capability = device_capability.revalidate_active_for_write(
+            s, token_hash, session_id)
+        if (capability is None or capability.session_id != session_id
+                or status in {device_capability.CapabilityResolution.REVOKED,
+                              device_capability.CapabilityResolution.INVALID}):
             s.rollback()
-            _raise_autopilot_http_error(exc)
+            pending_error = _capability_error(
+                status if capability is not None
+                and capability.session_id == session_id
+                else device_capability.CapabilityResolution.INVALID)
+        elif status is not device_capability.CapabilityResolution.VALID:
+            # EXPIRED / RECOVERY_ONLY: terminal-only. No current-live gate, no
+            # command projection, no provider work — and the original 401.
+            s.rollback()
+            should_pause_legacy = True
+            terminal_resolutions = _SAFE_CAPABILITY_TRANSITIONS[status]
+            pending_error = _capability_error(status)
+        else:
+            # The locked revalidation above is the *only* capability resolution
+            # this handler performs. Calling the combined write gate here would
+            # resolve the row a second time and reopen exactly the expiry window
+            # this branch exists to close, so only its VisitPlan admission is
+            # invoked explicitly.
+            _require_started_visit_plan_session(session_id, s)
+            _require_capability_current_live(
+                request, s, "读取自动驾驶命令", live_row=live)
+        if pending_error is None:
+            try:
+                result = autopilot_service.get_next_command(
+                    s,
+                    session_id=session_id,
+                    capability_token_hash=token_hash,
+                )
+                state = s.get(SessionAutopilotState, session_id)
+                should_recover_attempt = bool(
+                    result is None and state is not None
+                    and state.scope_key == autopilot_service.P0A_SCOPE_KEY
+                    and state.status == "processing_attempt")
+            except autopilot_service.AutopilotServiceError as exc:
+                # A session frozen before the repeat protocol existed is refused
+                # by every generic gate, which would strand its one
+                # already-recorded capture forever. The dedicated legacy worker
+                # is scheduled instead — still projecting no command, old or
+                # new, to the device.
+                #
+                # Only the one refusal a missing pre-repeat binding actually
+                # produces opens that door: feature disablement, content-digest
+                # drift, device/capability, control-generation and consent
+                # refusals keep failing closed, so the marker can never let a
+                # different safety gate be answered with a worker submission.
+                if autopilot_orchestration.legacy_terminal_pause_owed(
+                        s, session_id=session_id):
+                    # The bearer passed the active-capability gate, so a feature
+                    # toggle or content drift committed after the judgement must
+                    # not strand the scope.
+                    s.rollback()
+                    should_pause_legacy = True
+                    terminal_resolutions = _SAFE_CAPABILITY_TRANSITIONS[
+                        device_capability.CapabilityResolution.VALID]
+                    pending_error = exc
+                elif (exc.code not in _LEGACY_RECOVERY_GATE_CODES
+                        or not autopilot_orchestration
+                        .legacy_pre_repeat_recovery_pending(
+                            s, session_id=session_id)):
+                    s.rollback()
+                    pending_error = exc
+                else:
+                    s.rollback()
+                    should_recover_legacy = True
+    if should_pause_legacy:
+        # Committed inline rather than scheduled: FastAPI does not run
+        # background tasks when the response is an error, and this path must
+        # still return the original refusal. Authorization is re-resolved under
+        # the capability row lock inside the transaction that writes, so a
+        # revoke committed while we waited for that lock still wins.
+        outcome = _commit_http_legacy_terminal_pause(
+            token_hash=token_hash, session_id=session_id,
+            allowed=terminal_resolutions)
+        if (outcome.current is not None
+                and outcome.current
+                is not device_capability.CapabilityResolution.VALID):
+            # The locked read is the authority: never answer a bearer that has
+            # since decayed or been revoked with a stale non-auth refusal.
+            pending_error = _capability_error(outcome.current)
+    if pending_error is not None:
+        if isinstance(pending_error, HTTPException):
+            raise pending_error
+        _raise_autopilot_http_error(pending_error)
     if should_recover_attempt:
         # FastAPI awaits BackgroundTasks, so that task only submits to our executor;
         # provider I/O runs in the executor and cannot delay this GET response.
@@ -7199,6 +7423,12 @@ def autopilot_next(
             autopilot_orchestration.submit,
             session_id,
             _run_p0a_attempt_worker,
+        )
+    if should_recover_legacy:
+        background_tasks.add_task(
+            autopilot_orchestration.submit,
+            session_id,
+            _run_legacy_repeat_recovery_worker,
         )
     return result
 
@@ -7921,7 +8151,14 @@ def _classify_operational(*, item_id: str, response_role: str,
             "needs_review": llm_result.ai_needs_review,
             "judge_mode": "LLM辅助",
             "judge_engine_version": engine.version,
-            "judge_reason": llm_result.reason or None,
+            # Only a real string is normalised: a whitespace-only reason is the
+            # same as none at all. Any other type is passed through completely
+            # unchanged — not even ``or None`` — so a falsey invalid value such
+            # as ``0`` or ``False`` reaches the closed validator and is rejected
+            # there, instead of being silently coerced into a legal-looking NULL.
+            "judge_reason": (llm_result.reason.strip() or None
+                             if isinstance(llm_result.reason, str)
+                             else llm_result.reason),
             "matched_on": None,
             "contains_target": contains,
             "judge_portrait_used": False,
@@ -9036,18 +9273,62 @@ def _verify_capture_attempt_identity(
             "identity; refusing to project a mismatched result")
 
 
+_REPEAT_DISPOSITIONS = frozenset({"repeat_replayed", "repeat_limit_paused"})
+# Internal worker dispatch markers.  The capture-claim path exists only on the
+# ``autopilot_worker`` control plane, so these never reach an HTTP client, and
+# they deliberately carry no transcript, command id or capture id.
+_REPEAT_TERMINAL_STATUSES = frozenset(_REPEAT_DISPOSITIONS)
+# A lost race for the capture claim is observation-only, never a fail-close.
+_REPEAT_CLAIM_LOST_CODES = frozenset({
+    "autopilot_repeat_capture_cas_conflict",
+    "autopilot_repeat_route_cas_conflict",
+    "autopilot_repeat_not_current",
+})
+# A missing, drifted or unresolvable repeat activation is a configuration
+# rejection, not a runtime technical failure: the worker must leave the scope
+# exactly as it found it instead of consuming the safe-pause path, which exists
+# for provider/device failures. A researcher recreates the plan/session instead.
+_NON_PAUSING_WORKER_CODES = frozenset({
+    "autopilot_repeat_binding_missing",
+    "autopilot_repeat_binding_incomplete",
+    "autopilot_repeat_protocol_unavailable",
+    "autopilot_command_repeat_binding_mismatch",
+})
+# The single modern-gate refusal a genuinely unbound pre-protocol session
+# produces.  Every other refusal — feature flag, content digest, device,
+# capability, generation, consent, runtime — must keep failing closed rather
+# than being answered with an internal legacy recovery submission.
+_LEGACY_RECOVERY_GATE_CODES = frozenset({"autopilot_repeat_binding_missing"})
+
+
+def _capture_repeat_terminal_payload(
+        capture: AttemptCaptureProcessing, s: DBSession) -> dict:
+    """Verify a committed repeat outcome and return its internal marker.
+
+    A repeat capture never has an AttemptEvent, so the ordinary attempt
+    projection cannot describe it.  Both outcomes are re-proved against their
+    own frozen evidence chain before any worker treats them as terminal.
+    """
+    repeat_evidence.verify_repeat_capture(s, capture)
+    return {"status": capture.disposition, "in_progress": False}
+
+
 def _capture_terminal_attempt_payload(
         capture: AttemptCaptureProcessing, s: DBSession,
         response: Response) -> dict:
-    """Project the AttemptEvent a terminal capture row already materialized.
+    """Project the outcome a terminal capture row already committed.
 
-    The capture row itself is terminal as soon as ASR resolves, but its bound
-    Attempt may still be non-terminal (``asr_completed``, awaiting judgement).
-    A fenced-out worker reading this must observe a quiet in-progress outcome
-    in that case, not a false terminal projection — otherwise a stale worker
-    could trigger a spurious fail-close against a scope a newer generation
-    still legitimately owns.
+    An answer candidate or technical failure resolves through its bound
+    AttemptEvent; the capture row itself is terminal as soon as ASR resolves,
+    but that Attempt may still be non-terminal (``asr_completed``, awaiting
+    judgement).  A fenced-out worker reading this must observe a quiet
+    in-progress outcome in that case, not a false terminal projection —
+    otherwise a stale worker could trigger a spurious fail-close against a
+    scope a newer generation still legitimately owns.  An explicit-repeat
+    disposition has no Attempt at all and is proved against its own ledger.
     """
+    if capture.disposition in _REPEAT_DISPOSITIONS:
+        return _capture_repeat_terminal_payload(capture, s)
     if capture.final_attempt_id is None:
         raise RuntimeError("capture reached a terminal status without a bound attempt")
     attempt = s.get(AttemptEvent, capture.final_attempt_id)
@@ -9282,6 +9563,92 @@ def _materialize_attempt_from_capture(
         s.commit()
         s.refresh(attempt)
         return attempt
+
+
+def _detect_repeat_request(
+        capture_claim: evidence_ledger.CaptureClaim,
+        asr_text: str | None) -> repeat_intent.RepeatMatch | None:
+    """Classify a successful transcript against the capture's frozen protocol.
+
+    Only a capture admitted under the protocol may be classified, and the
+    admission marker says so — not the mere presence or absence of a binding.
+    A ``legacy_pre_repeat`` capture never reaches this function at all: it is
+    dispatched to the dedicated legacy recovery worker instead, so an unexpected
+    marker here is an invariant violation and fails closed rather than silently
+    degrading into the pre-repeat answer flow.
+
+    Resolution then goes through the version and digest frozen on the capture at
+    admission time, so a worker recovering after a deployment upgrade keeps
+    using the definition the session actually ran under.
+
+    ``stop_reason`` is deliberately not an input: whether the patient tapped
+    "说完了" or the max timer closed the microphone, only the complete
+    successful transcript decides.
+    """
+    version_id = capture_claim.repeat_protocol_version_id
+    digest = capture_claim.repeat_protocol_definition_digest
+    if (capture_claim.repeat_admission_semantics
+            != evidence_ledger.REPEAT_BOUND_ADMISSION
+            or version_id is None or digest is None):
+        raise autopilot_orchestration.AutopilotOrchestrationError(
+            "autopilot_repeat_admission_not_bound",
+            "采集未按重复请求协议准入，禁止在现代流程内分类",
+        )
+    protocol = repeat_intent.protocol_for_binding(version_id, digest)
+    return repeat_intent.detect(protocol, asr_text)
+
+
+def _terminalize_capture_as_repeat(
+        capture_claim: evidence_ledger.CaptureClaim, sess: TrainSession,
+        s: DBSession, *, body: AttemptProcessIn,
+        control_plane: Literal["manual_http", "autopilot_worker"],
+        match: repeat_intent.RepeatMatch,
+        asr_result: asr.AsrResult,
+        engine_version: str | None,
+        worker_target: autopilot_orchestration.FrozenWorkerTarget | None,
+) -> dict | None:
+    """Commit one explicit-repeat decision without creating an AttemptEvent.
+
+    ``None`` means the capture claim was lost — the same observation-only
+    contract as :func:`_materialize_attempt_from_capture`.  Everything else
+    either commits the full repeat transaction (replay command, ledger row,
+    capture terminalization and the control CAS) or rolls it back whole.
+    """
+    with _LIVE_WRITE_LOCK:
+        sess = _revalidate_attempt_commit_fence(
+            sess.session_id, body, s, control_plane=control_plane,
+            worker_target=worker_target)
+        _lock_evidence_session(sess.session_id, s)
+        now = datetime.now()
+        if not evidence_ledger.confirm_capture_claim(
+                s, capture_claim.capture_id, owner=capture_claim.owner,
+                generation=capture_claim.generation, now=now):
+            s.rollback()
+            return None
+        try:
+            result = autopilot_service.route_explicit_repeat(
+                s,
+                session_id=sess.session_id,
+                capture_claim=capture_claim,
+                match=match,
+                asr_confidence=asr_result.asr_confidence,
+                asr_engine_version=engine_version,
+            )
+        except autopilot_service.AutopilotServiceError as exc:
+            s.rollback()
+            if exc.code in _REPEAT_CLAIM_LOST_CODES:
+                return None
+            raise autopilot_orchestration.AutopilotOrchestrationError(
+                exc.code, exc.message) from exc
+        if result.outcome == "limit_paused":
+            # The researcher-facing pause must be atomic with the control CAS.
+            _pause_runtime_in_transaction(sess.session_id, s)
+        s.commit()
+        return {
+            "status": ("repeat_replayed" if result.outcome == "replayed"
+                       else "repeat_limit_paused"),
+            "in_progress": False,
+        }
 
 
 def _prepare_capture_or_attempt_processing(
@@ -9696,6 +10063,21 @@ def _process_attempt(
                 engine_version=asr_result.engine_version)
 
         if attempt is None:
+            # Classify before any AttemptEvent exists: an explicit repeat must
+            # not consume attempt_seq, a cue or a prompt level.
+            repeat_match = _detect_repeat_request(
+                capture_claim, asr_result.asr_text)
+            if repeat_match is not None:
+                repeated = _terminalize_capture_as_repeat(
+                    capture_claim, sess, s, body=body,
+                    control_plane=control_plane, match=repeat_match,
+                    asr_result=asr_result,
+                    engine_version=asr_result.engine_version,
+                    worker_target=worker_target)
+                if repeated is None:
+                    return _capture_claim_lost_payload(
+                        capture_claim, s, response, control_plane=control_plane)
+                return repeated
             advanced = _materialize_attempt_from_capture(
                 capture_claim, sess, s, body=body, control_plane=control_plane,
                 outcome="asr_completed", asr_result=asr_result,
@@ -9832,7 +10214,7 @@ def _fail_closed_p0a_attempt_worker(
     normal GET recovery is relied on instead — it must never fall back to mutating
     whatever attempt happens to be current.
     """
-    if target is None:
+    if target is None or error_code in _NON_PAUSING_WORKER_CODES:
         return
     try:
         with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
@@ -9896,6 +10278,20 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
     except autopilot_orchestration.AutopilotOrchestrationError as exc:
         _fail_closed_p0a_attempt_worker(session_id, exc.code, target=target)
         return
+    except HTTPException as exc:
+        # A repeat activation/binding rejection is surfaced as a 409 by the
+        # admission helper. It is a configuration refusal, so carry its exact
+        # code through and leave the scope untouched; every other HTTP failure
+        # keeps the existing generic safe-pause.
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        code = detail.get("code")
+        _fail_closed_p0a_attempt_worker(
+            session_id,
+            code if isinstance(code, str) and code in _NON_PAUSING_WORKER_CODES
+            else "autopilot_worker_exception",
+            target=target,
+        )
+        return
     except Exception:
         _fail_closed_p0a_attempt_worker(
             session_id, "autopilot_worker_exception", target=target)
@@ -9907,6 +10303,11 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
         return
     status = result.get("status")
     attempt_payload = result.get("attempt")
+    if status in _REPEAT_TERMINAL_STATUSES:
+        # An explicit repeat already committed everything it owns: either the
+        # replay command is issued and current, or the scope is safely paused.
+        # There is no Attempt to route and nothing left to fail closed.
+        return
     if status == "technical_failure":
         error_code = (
             attempt_payload.get("error_code")
@@ -9966,6 +10367,754 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
         # runtime/control planes are atomically paused.
         _fail_closed_p0a_attempt_worker(
             session_id, "autopilot_attempt_route_failed", target=target)
+
+
+def _legacy_asr_result_is_well_formed(result: object) -> bool:
+    """Full AsrResult contract, checked before anything durable is written.
+
+    A malformed provider or stub must leave the capture exactly as it was so a
+    later retry is still possible; it must never reach a checkpoint and persist
+    half a transcript or a nonsense confidence.
+    """
+    if not isinstance(result, asr.AsrResult):
+        return False
+    # One shared contract with the terminal readback; duplicating it here is
+    # exactly how the two sides drifted apart before.
+    return autopilot_service.legacy_asr_facts_are_legal(
+        text=result.asr_text,
+        confidence=result.asr_confidence,
+        engine_version=result.engine_version,
+        hotword_hit=result.hotword_hit,
+    )
+
+
+def _legacy_recovery_asr(
+        target: autopilot_orchestration.LegacyRepeatRecoveryTarget,
+        blob: Path, bank: content.ItemBank) -> asr.AsrResult | None:
+    """Run the one ASR call a legacy capture still owes, or give up quietly.
+
+    The bytes actually read are hashed and measured against the checksum and
+    size frozen in ``target`` before a single byte reaches a provider, so a
+    replaced or truncated blob is never transcribed under this chain's identity.
+
+    ``None`` means no usable transcript.  The legacy path deliberately writes
+    nothing in that case: it has no failure semantics of its own, and inventing
+    a technical-failure Attempt for a pre-protocol recording would manufacture
+    evidence the recording never produced.  The capture lease simply expires and
+    a later recovery trigger retries, exactly as for an abandoned worker.
+    """
+    engine = asr.get_engine()
+    boundary = cloud_processing.provider_boundary(engine)
+    if boundary is cloud_processing.DataBoundary.UNKNOWN:
+        return None
+    try:
+        script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
+    except Exception:
+        script = None
+    hotwords = asr.build_hotwords(bank, script)
+    audio_bytes = blob.read_bytes()
+    if (audio_store.sha256_hex(audio_bytes) != target.audio_checksum
+            or len(audio_bytes) != target.audio_byte_count):
+        return None
+    try:
+        if boundary is cloud_processing.DataBoundary.CLOUD:
+            with _serialized_cloud_provider_call(
+                    session_id=target.session_id,
+                    patient_id=target.patient_id,
+                    provider=engine,
+                    bind=db.engine):
+                result = engine.transcribe(audio_bytes, hotwords)
+        else:
+            result = engine.transcribe(audio_bytes, hotwords)
+    except Exception:
+        return None
+    if not _legacy_asr_result_is_well_formed(result):
+        return None
+    return result
+
+
+def _legacy_recovery_judgement(
+        target: autopilot_orchestration.LegacyRepeatRecoveryTarget,
+        asr_text: str, bank: content.ItemBank) -> dict | None:
+    """Judge the recovered transcript through the ordinary operational path.
+
+    Every return value is checked against the same closed contract the terminal
+    readback enforces, *before* it can be written. A provider that returns a
+    shape the readback would later refuse must not reach a durable write: that
+    would leave the Attempt completed-but-unclosable, with no way to retry.
+    """
+    try:
+        engine = llm_judge.get_engine()
+        boundary = cloud_processing.provider_boundary(engine)
+        if boundary is cloud_processing.DataBoundary.UNKNOWN:
+            return None
+        if boundary is cloud_processing.DataBoundary.CLOUD:
+            try:
+                with _serialized_cloud_provider_call(
+                        session_id=target.session_id,
+                        patient_id=target.patient_id,
+                        provider=engine,
+                        bind=db.engine):
+                    return _classify_operational(
+                        item_id=target.attempt_input.item_id,
+                        response_role=target.attempt_input.response_role,
+                        text=asr_text, bank=bank, llm_engine=engine,
+                        cloud_llm_allowed=True)
+            except _CloudEgressNotAuthorized:
+                return _classify_operational(
+                    item_id=target.attempt_input.item_id,
+                    response_role=target.attempt_input.response_role,
+                    text=asr_text, bank=bank, allow_llm=False)
+        result = _classify_operational(
+            item_id=target.attempt_input.item_id,
+            response_role=target.attempt_input.response_role,
+            text=asr_text, bank=bank, llm_engine=engine)
+    except Exception:
+        return None
+    return result
+
+
+def _legacy_blob_matches(
+        blob: Path | None,
+        target: autopilot_orchestration.LegacyRepeatRecoveryTarget) -> bool:
+    """Do the bytes on disk still hash and measure to the frozen capture?"""
+    if blob is None or not blob.exists():
+        return False
+    data = blob.read_bytes()
+    return (audio_store.sha256_hex(data) == target.audio_checksum
+            and len(data) == target.audio_byte_count)
+
+
+def _legacy_recovery_fence_holds(
+        worker_db: DBSession, *,
+        target: autopilot_orchestration.LegacyRepeatRecoveryTarget,
+        expect_stage: str,
+        blob: Path | None = None,
+        claim_check: Callable[[DBSession], bool] | None = None) -> bool:
+    """Re-prove the frozen target between two provider boundaries.
+
+    ASR and judgement are two separate egress points.  A re-pair, cloud-consent
+    revocation, researcher pause or takeover committed while a provider call was
+    in flight must stop the next step before it happens: the whole evidence
+    fingerprint — including the stage-specific Attempt and interaction facts —
+    plus device pairing, consent, control generation and runtime status are
+    re-derived here from the database, the audio bytes are re-hashed against the
+    frozen checksum, and the caller's lease is re-confirmed atomically.
+    ``False`` means this worker no longer owns the work: it then writes nothing
+    at all and never touches the governance facts that won.
+    """
+    # Unconditional: a recording that has disappeared is exactly as disqualifying
+    # as one whose bytes changed, and must never be treated as "nothing to check".
+    if not _legacy_blob_matches(blob, target):
+        return False
+    with _LIVE_WRITE_LOCK:
+        worker_db.rollback()
+        worker_db.expire_all()
+        try:
+            current = autopilot_orchestration.verify_legacy_pre_repeat_recovery(
+                worker_db, session_id=target.session_id)
+        except autopilot_orchestration.AutopilotOrchestrationError:
+            worker_db.rollback()
+            return False
+        if current.target != target or current.stage != expect_stage:
+            worker_db.rollback()
+            return False
+        held = claim_check is None or claim_check(worker_db)
+        if held:
+            worker_db.commit()
+        else:
+            worker_db.rollback()
+        return held
+
+
+def _commit_legacy_recovery_asr(
+        worker_db: DBSession, *,
+        target: autopilot_orchestration.LegacyRepeatRecoveryTarget,
+        claim: evidence_ledger.CaptureClaim,
+        asr_result: asr.AsrResult) -> evidence_ledger.AttemptClaim | None:
+    """Durable checkpoint 1: the transcript becomes a real ordinary Attempt.
+
+    This is the crash boundary that makes ASR run exactly once.  After it
+    commits, the capture is terminal, the Attempt exists at ``asr_completed``
+    and every re-entry resumes at judgement instead of transcribing again —
+    which could otherwise produce a second, different transcript for the same
+    recording.
+
+    The Attempt is created already holding this worker's own lease, and that
+    lease is handed straight back as the returned :class:`AttemptClaim`; the
+    same worker therefore continues into judgement without racing itself for a
+    claim it already owns.  Only a crash lets the lease expire so another worker
+    can legitimately take the judgement stage over.  ``None`` means the claim or
+    the target was lost, and nothing is written in that case.
+    """
+    derived = target.attempt_input
+    # Preserve raw-id -> LIVE order; the LIFO rollback callback runs before
+    # either lock is released, on success, early return or exception.
+    with ExitStack() as locks:
+        locks.enter_context(
+            audio_store.blob_mutation_lock(derived.raw_audio_id))
+        locks.enter_context(_LIVE_WRITE_LOCK)
+        worker_db.rollback()
+        worker_db.expire_all()
+        locks.callback(worker_db.rollback)
+        # The pre-provider fence hashed the bytes before the transcript
+        # existed, and nothing downstream reads the file again.  Re-resolve the
+        # authoritative path now and re-prove it, before any durable write:
+        # otherwise a recording replaced during transcription would become a
+        # permanent Attempt describing bytes that no longer exist.
+        if not _legacy_blob_matches(
+                audio_store.find_blob(derived.raw_audio_id), target):
+            worker_db.rollback()
+            return None
+        _live_row_for_update(worker_db)
+        sess = worker_db.exec(select(TrainSession).where(
+            TrainSession.session_id == target.session_id,
+        ).with_for_update()).first()
+        if sess is None:
+            return None
+        _lock_evidence_session(target.session_id, worker_db)
+        current = autopilot_orchestration.verify_legacy_pre_repeat_recovery(
+            worker_db, session_id=target.session_id)
+        if (current.target != target
+                or current.stage != autopilot_orchestration.LEGACY_STAGE_ASR):
+            worker_db.rollback()
+            return None
+        now = datetime.now()
+        if not evidence_ledger.confirm_capture_claim(
+                worker_db, claim.capture_id, owner=claim.owner,
+                generation=claim.generation, now=now):
+            worker_db.rollback()
+            return None
+        attempt_owner = evidence_ledger.new_claim_owner()
+        attempt = AttemptEvent(
+            session_id=target.session_id,
+            item_id=derived.item_id,
+            turn_seq=derived.turn_seq,
+            response_role=derived.response_role,
+            attempt_seq=claim.proof_attempt_seq,
+            raw_audio_id=derived.raw_audio_id,
+            prompt_level=derived.prompt_level,
+            cue_type=derived.cue_type,
+            duration_seconds=derived.duration_seconds,
+            asr_text=asr_result.asr_text,
+            asr_confidence=asr_result.asr_confidence,
+            asr_engine_version=asr_result.engine_version,
+            processing_status="asr_completed",
+            processing_owner=attempt_owner,
+            processing_lease_expires_at=evidence_ledger.lease_deadline(now=now),
+            processing_claimed_at=now,
+            processing_generation=1,
+            created_at=now,
+            is_simulation=sess.is_simulation,
+            judge_portrait_used=False,
+        )
+        worker_db.add(attempt)
+        worker_db.flush()
+        if not evidence_ledger.fenced_capture_update(
+                worker_db, claim, next_status="asr_completed",
+                values={
+                    "asr_confidence": asr_result.asr_confidence,
+                    "asr_engine_version": asr_result.engine_version,
+                    "disposition": "answer_candidate",
+                    "error_code": None,
+                    "processed_at": now,
+                    "final_attempt_id": attempt.id,
+                }):
+            worker_db.rollback()
+            return None
+        for event_type, payload in (
+            ("attempt_received", {
+                "raw_audio_id": derived.raw_audio_id,
+                "prompt_level": derived.prompt_level,
+                "cue_type": derived.cue_type,
+                "duration_seconds": derived.duration_seconds,
+                "processing_status": "received",
+            }),
+            ("asr_completed", {
+                "asr_engine_version": asr_result.engine_version,
+                "asr_confidence": asr_result.asr_confidence,
+                "degraded": False,
+                "hotword_hit": asr_result.hotword_hit,
+            }),
+        ):
+            _append_interaction(
+                worker_db, sess, event_type, payload,
+                item_id=derived.item_id, turn_seq=derived.turn_seq,
+                attempt=attempt)
+        worker_db.commit()
+        worker_db.expire_all()
+        stored = worker_db.get(AttemptEvent, attempt.id)
+        if stored is None:  # pragma: no cover - commit postcondition
+            raise RuntimeError("legacy recovery lost its attempt row")
+        return evidence_ledger.claim_from_attempt(stored)
+
+
+def _legal_legacy_judgement(result: dict | None) -> dict | None:
+    if result is None or not autopilot_service.legacy_judgement_result_is_legal(
+            result):
+        return None
+    return result
+
+
+def _commit_legacy_recovery_judgement(
+        worker_db: DBSession, *,
+        target: autopilot_orchestration.LegacyRepeatRecoveryTarget,
+        claim: evidence_ledger.AttemptClaim,
+        judgement: dict) -> bool:
+    """Durable checkpoint 2: the already-persisted Attempt becomes completed."""
+    derived = target.attempt_input
+    # Preserve raw-id -> LIVE order.  The raw lock is taken before the final
+    # byte check and held through the commit, so a legal upload or delete
+    # cannot swap the recording while this transaction waits for LIVE.
+    with ExitStack() as locks:
+        locks.enter_context(
+            audio_store.blob_mutation_lock(derived.raw_audio_id))
+        worker_db.rollback()
+        worker_db.expire_all()
+        # The provider judged a transcript of these bytes; re-prove them here,
+        # before any durable write, exactly as the ASR checkpoint does.
+        if not _legacy_blob_matches(
+                audio_store.find_blob(derived.raw_audio_id), target):
+            worker_db.rollback()
+            return False
+        # Hash first, then take the global lock, to keep LIVE held briefly.
+        locks.enter_context(_LIVE_WRITE_LOCK)
+        # LIFO: rollback runs before either lock is released, on success,
+        # early return or exception.
+        locks.callback(worker_db.rollback)
+        _live_row_for_update(worker_db)
+        sess = worker_db.exec(select(TrainSession).where(
+            TrainSession.session_id == target.session_id,
+        ).with_for_update()).first()
+        if sess is None:
+            return False
+        _lock_evidence_session(target.session_id, worker_db)
+        current = autopilot_orchestration.verify_legacy_pre_repeat_recovery(
+            worker_db, session_id=target.session_id)
+        if (current.target != target
+                or current.stage != autopilot_orchestration.LEGACY_STAGE_JUDGEMENT
+                or current.attempt_id != claim.attempt_id):
+            worker_db.rollback()
+            return False
+        if not evidence_ledger.fenced_attempt_update(
+                worker_db, claim, expected_status="asr_completed",
+                next_status="completed",
+                values={
+                    "operational_answer_type": judgement["answer_type"],
+                    "operational_score": judgement["ai_score"],
+                    "operational_needs_review": judgement["needs_review"],
+                    "judge_mode": judgement["judge_mode"],
+                    "judge_engine_version": judgement["judge_engine_version"],
+                    "judge_reason": judgement["judge_reason"],
+                    "matched_on": judgement["matched_on"],
+                    "contains_target": judgement["contains_target"],
+                    "judge_portrait_used": judgement["judge_portrait_used"],
+                    "error_code": None,
+                    "processed_at": datetime.now(),
+                }):
+            worker_db.rollback()
+            return False
+        worker_db.expire_all()
+        stored = worker_db.get(AttemptEvent, claim.attempt_id)
+        if stored is None:  # pragma: no cover - fenced-update postcondition
+            raise RuntimeError("legacy recovery lost its attempt row")
+        _append_interaction(worker_db, sess, "judgement_completed", {
+            "answer_type": judgement["answer_type"],
+            "score": judgement["ai_score"],
+            "needs_review": judgement["needs_review"],
+            "judge_mode": judgement["judge_mode"],
+            "judge_engine_version": judgement["judge_engine_version"],
+            "matched_on": judgement["matched_on"],
+            "contains_target": judgement["contains_target"],
+            "truth_scope": "operational_only",
+        }, item_id=stored.item_id, turn_seq=stored.turn_seq, attempt=stored)
+        worker_db.commit()
+        return True
+
+
+def _commit_legacy_recovery_pause(session_id: str) -> bool:
+    """Atomically stop a legacy scope for good once its Attempt is judged."""
+    with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
+        with DBSession(db.engine) as pause_db:
+            _live_row_for_update(pause_db)
+            if not autopilot_orchestration.stage_legacy_repeat_recovery_pause(
+                    pause_db, session_id=session_id):
+                pause_db.rollback()
+                return False
+            _pause_runtime_in_transaction(session_id, pause_db)
+            pause_db.commit()
+            return True
+
+
+def _claim_legacy_recovery_capture(
+        worker_db: DBSession,
+        target: autopilot_orchestration.LegacyRepeatRecoveryTarget,
+) -> evidence_ledger.CaptureClaim | None:
+    capture = worker_db.get(AttemptCaptureProcessing, target.capture_id)
+    if evidence_ledger.has_active_capture_lease(capture):
+        return None
+    owner = evidence_ledger.new_claim_owner()
+    if not evidence_ledger.try_claim_capture(
+            worker_db, target.capture_id, owner=owner):
+        return None
+    worker_db.commit()
+    claimed = worker_db.get(AttemptCaptureProcessing, target.capture_id)
+    return evidence_ledger.claim_from_capture(claimed)
+
+
+def _claim_legacy_recovery_attempt(
+        worker_db: DBSession, attempt_id: int,
+) -> evidence_ledger.AttemptClaim | None:
+    """Take over an abandoned judgement stage after its lease really expired."""
+    attempt = worker_db.get(AttemptEvent, attempt_id)
+    if attempt is None or evidence_ledger.has_active_lease(attempt):
+        return None
+    owner = evidence_ledger.new_claim_owner()
+    if not evidence_ledger.try_claim_attempt(
+            worker_db, attempt_id, owner=owner):
+        return None
+    worker_db.commit()
+    claimed = worker_db.get(AttemptEvent, attempt_id)
+    return evidence_ledger.claim_from_attempt(claimed)
+
+
+_LEGACY_STABLE_TARGET_FIELDS = (
+    "session_id", "patient_id", "record_command_id", "source_command_id",
+    "capture_id", "control_generation", "runner_generation", "state_revision",
+    "audio_checksum", "audio_byte_count", "base_evidence_fingerprint",
+    "attempt_input",
+)
+
+
+def _rebind_legacy_stage(
+        worker_db: DBSession, *, session_id: str, expect_stage: str,
+        previous: autopilot_orchestration.LegacyRepeatRecoveryTarget,
+        expect_attempt_id: int | None,
+) -> autopilot_orchestration.LegacyRepeatRecovery | None:
+    """Re-freeze the target after a legitimate stage or claim transition.
+
+    Claiming an attempt bumps its ``processing_generation``, and the ASR
+    checkpoint creates the Attempt and its interactions outright — both live in
+    the stage fingerprint, which is therefore allowed to change here. Nothing
+    else is: the entire stable base — plan, session, patient, capability,
+    control generations and revision, both commands, ACKs, receipt, audio tuple
+    and the derived attempt input — must come back bit-identical, so a mutation
+    slipped into the checkpoint or claim window cannot be laundered into a new,
+    self-consistent target. Re-verifying alone would never notice that, because
+    a rewritten chain is still internally consistent.
+    """
+    resolved = autopilot_orchestration.verify_legacy_pre_repeat_recovery(
+        worker_db, session_id=session_id)
+    if (resolved.stage != expect_stage
+            or resolved.target.session_id != session_id
+            or resolved.attempt_id != expect_attempt_id):
+        return None
+    if any(getattr(resolved.target, name) != getattr(previous, name)
+           for name in _LEGACY_STABLE_TARGET_FIELDS):
+        return None
+    return resolved
+
+
+def _try_stale_bearer_terminal_pause(
+        request, path: str, status, row_session_id: str | None,
+        row_token_hash: str | None) -> TerminalPauseOutcome:
+    """The one authentication failure that may still finish a durable pause.
+
+    Scoped to the exact ``GET /sessions/{id}/autopilot/next`` of the very
+    session the digest-matched row is bound to, and to ``EXPIRED`` /
+    ``RECOVERY_ONLY`` only.  It never calls the route, so no command projection
+    and no provider work can follow, and it never changes the response.  Any
+    failure inside is swallowed: an authentication refusal must not become a
+    500 because an opportunistic recovery could not run.
+    """
+    if status not in {
+            device_capability.CapabilityResolution.EXPIRED,
+            device_capability.CapabilityResolution.RECOVERY_ONLY}:
+        return TerminalPauseOutcome(False, None)
+    if row_session_id is None or row_token_hash is None:
+        return TerminalPauseOutcome(False, None)
+    requested = access_policy.autopilot_next_session_id(request.method, path)
+    if requested is None or requested != row_session_id:
+        return TerminalPauseOutcome(False, None)
+    try:
+        return _commit_http_legacy_terminal_pause(
+            token_hash=row_token_hash, session_id=row_session_id,
+            allowed=_SAFE_CAPABILITY_TRANSITIONS[status])
+    except Exception:  # noqa: BLE001 - opportunistic; the 401 stands either way
+        return TerminalPauseOutcome(False, None)
+
+
+_TERMINAL_PAUSE_ALLOWED_RESOLUTIONS = frozenset({
+    device_capability.CapabilityResolution.EXPIRED,
+    device_capability.CapabilityResolution.RECOVERY_ONLY,
+    device_capability.CapabilityResolution.VALID,
+})
+# While a caller waits for the capability row lock a capability may only decay.
+# Anything outside these sets means the locked row is not the one the caller
+# resolved, so it may not act on it.
+_SAFE_CAPABILITY_TRANSITIONS = {
+    device_capability.CapabilityResolution.VALID: frozenset({
+        device_capability.CapabilityResolution.VALID,
+        device_capability.CapabilityResolution.EXPIRED,
+        device_capability.CapabilityResolution.RECOVERY_ONLY,
+    }),
+    device_capability.CapabilityResolution.RECOVERY_ONLY: frozenset({
+        device_capability.CapabilityResolution.RECOVERY_ONLY,
+        device_capability.CapabilityResolution.EXPIRED,
+    }),
+    device_capability.CapabilityResolution.EXPIRED: frozenset({
+        device_capability.CapabilityResolution.EXPIRED,
+    }),
+}
+_CAPABILITY_ERROR_CODES = {
+    device_capability.CapabilityResolution.INVALID: (
+        "device_capability_invalid", "设备配对已失效，请由研究者重新配对"),
+    device_capability.CapabilityResolution.EXPIRED: (
+        "device_capability_expired", "设备配对已失效，请由研究者重新配对"),
+    device_capability.CapabilityResolution.REVOKED: (
+        "device_capability_revoked", "设备配对已失效，请由研究者重新配对"),
+    device_capability.CapabilityResolution.RECOVERY_ONLY: (
+        "device_capability_recovery_only",
+        "本场设备配对只可恢复已落库的录音回执，请重新配对"),
+}
+
+
+class TerminalPauseOutcome(NamedTuple):
+    """What the locked terminal transaction committed, and what it saw there.
+
+    ``current`` comes from the same locked read that decided the write, so the
+    caller never needs a second resolution and can never answer a bearer that
+    has since been revoked with a stale feature/content refusal.
+    """
+
+    committed: bool
+    current: object | None
+
+
+def _capability_error(status) -> HTTPException:
+    code, message = _CAPABILITY_ERROR_CODES[status]
+    # Handler convention: FastAPI already wraps this under "detail", so the
+    # payload itself must not carry a second "detail" key.
+    return HTTPException(401, detail={"code": code, "message": message})
+
+
+def _capability_slot_shape_allows_terminal(
+        row: PatientDeviceCapability, *, session_id: str, status) -> bool:
+    """The row's active/recovery slot must be one of exactly two legal shapes.
+
+    The resolution enum alone is not enough: expiry is resolved before the
+    recovery-only demotion, so an orphaned row (no active slot and no demotion
+    timestamp), a contradictory one (demoted yet still holding an active slot)
+    or one whose active slot belongs to another session can all surface as
+    ``EXPIRED`` and would otherwise pass a pure enum test.
+    """
+    active_shape = (row.active_session_key == session_id
+                    and row.recovery_only_at is None)
+    recovery_shape = (row.active_session_key is None
+                      and row.recovery_only_at is not None)
+    if status is device_capability.CapabilityResolution.VALID:
+        return active_shape
+    if status is device_capability.CapabilityResolution.RECOVERY_ONLY:
+        return recovery_shape
+    if status is device_capability.CapabilityResolution.EXPIRED:
+        return active_shape or recovery_shape
+    return False
+
+
+def _commit_http_legacy_terminal_pause(
+        *, token_hash: str, session_id: str,
+        allowed: frozenset) -> TerminalPauseOutcome:
+    """Finish an already-durable legacy recovery for one exact bearer, atomically.
+
+    Authorization and mutation are one critical section.  Resolving the bearer
+    in an earlier transaction and committing in a later one leaves a real window
+    in which a revoke commits in between and the old bearer still writes, so the
+    exact capability row is locked and re-resolved *inside* the transaction that
+    will write the pause.  Lock order matches pairing and revocation: LiveState,
+    then the capability row, then the autopilot/runtime/evidence rows.
+
+    Only a row still bound to the requested session may act, and only
+    ``EXPIRED``/``RECOVERY_ONLY``/``VALID``: a ``REVOKED`` row, an unknown
+    digest, a re-paired predecessor whose ``active_session_key`` moved on, or
+    any session mismatch is a pure no-op.  Current LiveState is deliberately not
+    required — a recovery-only capability usually means the session already left
+    live, and this path projects no command.
+
+    The scope must genuinely still owe the pause.  If a re-pair, researcher
+    takeover, withdrawal or consent revocation already paused it, that pause is
+    the governance winner and is never overwritten.  The trusted background
+    worker keeps its own token-free helper; only this HTTP-triggered variant
+    requires and revalidates a bearer.
+    """
+    with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
+        with DBSession(db.engine) as terminal_db:
+            _live_row_for_update(terminal_db)
+            row = terminal_db.exec(select(PatientDeviceCapability).where(
+                PatientDeviceCapability.token_hash == token_hash,
+            ).with_for_update()).first()
+            if row is None or row.session_id != session_id:
+                terminal_db.rollback()
+                return TerminalPauseOutcome(False, None)
+            status, resolved = device_capability.resolve_capability_hash(
+                terminal_db, token_hash)
+            if (resolved is None or resolved.token_hash != token_hash
+                    or status not in allowed
+                    or status not in _TERMINAL_PAUSE_ALLOWED_RESOLUTIONS
+                    or not _capability_slot_shape_allows_terminal(
+                        resolved, session_id=session_id, status=status)):
+                terminal_db.rollback()
+                return TerminalPauseOutcome(False, status)
+            if not autopilot_orchestration.stage_legacy_repeat_recovery_pause(
+                    terminal_db, session_id=session_id):
+                terminal_db.rollback()
+                return TerminalPauseOutcome(False, status)
+            _pause_runtime_in_transaction(session_id, terminal_db)
+            terminal_db.commit()
+            return TerminalPauseOutcome(True, status)
+
+
+def _run_legacy_repeat_recovery_worker(session_id: str) -> None:
+    """Finish the one recording a pre-protocol session left outstanding.
+
+    A session admitted before the repeat protocol was frozen cannot run the
+    modern flow: every generic gate refuses it, and its single ``received``
+    capture would otherwise stay stuck forever.  This worker is the only path
+    that resolves it, and it deliberately ends the scope: exactly one ordinary
+    AttemptEvent, then a terminal pause.  It never classifies the transcript as
+    an explicit repeat, never issues a command, and never routes onward — a
+    patient asking to hear the prompt again under a protocol the session never
+    froze is simply the ordinary answer this batch of data always recorded.
+
+    The three stages are separated by commits, so a crash, a restart or a lease
+    takeover resumes at the stage the database actually reached: a transcript is
+    never produced twice, and a completed Attempt is never judged twice.  The
+    target is re-frozen at every stage boundary, because the evidence identity
+    legitimately grows as each checkpoint lands.
+    """
+    try:
+        # A crash between the judgement commit and the pause leaves only the
+        # pause owed. Finishing it needs no provider, no device and no content
+        # resolution, so it is attempted first: routing that re-entry through
+        # the full verifier would let a capability that expired afterwards
+        # strand the scope in processing_attempt for good.
+        if _commit_legacy_recovery_pause(session_id):
+            return
+        with DBSession(db.engine) as worker_db:
+            with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
+                worker_db.rollback()
+                worker_db.expire_all()
+                _live_row_for_update(worker_db)
+                resolved = (
+                    autopilot_orchestration.verify_legacy_pre_repeat_recovery(
+                        worker_db, session_id=session_id))
+                bank = content.load_item_bank(
+                    content.CONTENT_DIR / "item_bank_v1.json")
+                blob = audio_store.find_blob(
+                    resolved.target.attempt_input.raw_audio_id)
+                capture_claim = attempt_claim = None
+                if resolved.stage == autopilot_orchestration.LEGACY_STAGE_ASR:
+                    if not _legacy_blob_matches(blob, resolved.target):
+                        worker_db.rollback()
+                        return
+                    capture_claim = _claim_legacy_recovery_capture(
+                        worker_db, resolved.target)
+                    if capture_claim is None:
+                        worker_db.rollback()
+                        return
+                elif (resolved.stage
+                        == autopilot_orchestration.LEGACY_STAGE_JUDGEMENT):
+                    # A judgement re-entry owes the same physical proof as the
+                    # ASR entry: without it a vanished recording would still
+                    # earn a fresh claim and go on to be judged.
+                    if not _legacy_blob_matches(blob, resolved.target):
+                        worker_db.rollback()
+                        return
+                    attempt_claim = _claim_legacy_recovery_attempt(
+                        worker_db, resolved.attempt_id)
+                    if attempt_claim is None:
+                        worker_db.rollback()
+                        return
+                    rebound = _rebind_legacy_stage(
+                        worker_db, session_id=session_id,
+                        expect_stage=(
+                            autopilot_orchestration.LEGACY_STAGE_JUDGEMENT),
+                        previous=resolved.target,
+                        expect_attempt_id=attempt_claim.attempt_id)
+                    if rebound is None:
+                        worker_db.rollback()
+                        return
+                    resolved = rebound
+            # Release every control lock before provider I/O, exactly as the
+            # modern worker does.
+            worker_db.rollback()
+
+            if resolved.stage == autopilot_orchestration.LEGACY_STAGE_ASR:
+                target = resolved.target
+                asr_result = _legacy_recovery_asr(target, blob, bank)
+                if asr_result is None:
+                    return
+                if not _legacy_recovery_fence_holds(
+                        worker_db, target=target, blob=blob,
+                        expect_stage=autopilot_orchestration.LEGACY_STAGE_ASR,
+                        claim_check=lambda s: evidence_ledger.confirm_capture_claim(
+                            s, capture_claim.capture_id,
+                            owner=capture_claim.owner,
+                            generation=capture_claim.generation)):
+                    return
+                attempt_claim = _commit_legacy_recovery_asr(
+                    worker_db, target=target, claim=capture_claim,
+                    asr_result=asr_result)
+                if attempt_claim is None:
+                    return
+                worker_db.rollback()
+                # Checkpoint 1 changed the evidence identity, so the judgement
+                # stage runs against a freshly frozen target — bound to the
+                # same capture, record command and Attempt as before.
+                rebound = _rebind_legacy_stage(
+                    worker_db, session_id=session_id,
+                    expect_stage=(
+                        autopilot_orchestration.LEGACY_STAGE_JUDGEMENT),
+                    previous=target,
+                    expect_attempt_id=attempt_claim.attempt_id)
+                worker_db.rollback()
+                if rebound is None:
+                    return
+                resolved = rebound
+
+            if resolved.stage == autopilot_orchestration.LEGACY_STAGE_JUDGEMENT:
+                target = resolved.target
+                attempt = worker_db.get(AttemptEvent, attempt_claim.attempt_id)
+                asr_text = attempt.asr_text
+                worker_db.rollback()
+                # Never open the second provider boundary after the scope
+                # changed hands: a late worker must not send patient text to a
+                # judge a committed governance action has already fenced out.
+                if not _legacy_recovery_fence_holds(
+                        worker_db, target=target, blob=blob,
+                        expect_stage=(
+                            autopilot_orchestration.LEGACY_STAGE_JUDGEMENT),
+                        claim_check=lambda s: evidence_ledger.confirm_attempt_claim(
+                            s, attempt_claim.attempt_id,
+                            owner=attempt_claim.owner,
+                            generation=attempt_claim.generation,
+                            stage="asr_completed")):
+                    return
+                judgement = _legal_legacy_judgement(
+                    _legacy_recovery_judgement(target, asr_text, bank))
+                if judgement is None:
+                    return
+                if not _commit_legacy_recovery_judgement(
+                        worker_db, target=target, claim=attempt_claim,
+                        judgement=judgement):
+                    return
+        _commit_legacy_recovery_pause(session_id)
+    except autopilot_orchestration.AutopilotOrchestrationError:
+        # Every legacy refusal is observation-only: the modern safe-pause path
+        # exists for provider/device failures inside a bound scope and must not
+        # be repurposed to write control facts against pre-protocol data.
+        return
+    except Exception:
+        return
 
 
 def _manual_interaction_payload(body: InteractionAppendIn) -> dict:

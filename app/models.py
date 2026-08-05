@@ -15,8 +15,9 @@ from datetime import date, datetime, time, timezone
 from typing import Optional
 
 from sqlalchemy import (
-    BigInteger, CheckConstraint, Column, ForeignKeyConstraint, Index,
-    UniqueConstraint, event as sa_event, inspect as sa_inspect,
+    BigInteger, CheckConstraint, Column, ForeignKey, ForeignKeyConstraint,
+    Index, Integer, UniqueConstraint, event as sa_event,
+    inspect as sa_inspect,
 )
 from sqlmodel import Field, SQLModel  # type: ignore
 
@@ -28,6 +29,85 @@ from .enums import (
 def _utc_now_naive() -> datetime:
     """Persist UTC in the project's timezone-naive database columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _hex64_sql(column: str) -> str:
+    """SQL for "this column really is 64 lowercase hex characters".
+
+    ``lower(x) = x`` alone accepts 64 ``g``s, so the character class is the
+    actual constraint; the length test bounds it.
+
+    Expressed by stripping every allowed digit and requiring an empty
+    remainder, because it has to compile on both SQLite and PostgreSQL:
+    ``GLOB`` is SQLite-only and is a syntax error on the deployment target,
+    while ``SIMILAR TO``/regex/``translate`` are not portable the other way.
+    The migration carries a byte-identical copy of this function on purpose —
+    it must never import from the application.
+    """
+    stripped = column
+    for digit in "0123456789abcdef":
+        stripped = f"replace({stripped}, '{digit}', '')"
+    return f"(length({column}) = 64 AND {stripped} = '')"
+
+
+# Explicit-repeat semantics are enabled only for rows created after the
+# protocol was approved.  Historical rows keep both columns NULL; the database
+# forbids filling exactly one of them, and no migration ever guesses a version
+# for a row that never used one.  Both branches are stated positively so a NULL
+# can never make the predicate itself evaluate to NULL and pass.
+REPEAT_PROTOCOL_BINDING_CHECK = (
+    "((repeat_protocol_version_id IS NULL AND "
+    "repeat_protocol_definition_digest IS NULL) OR "
+    "(repeat_protocol_version_id IS NOT NULL AND "
+    "repeat_protocol_definition_digest IS NOT NULL AND "
+    "length(trim(repeat_protocol_version_id)) > 0 AND "
+    + _hex64_sql("repeat_protocol_definition_digest") + "))"
+)
+
+# A NULL/NULL profile pair is the permanent representation of the canonical
+# full-source plan.  A populated pair is an explicit, immutable demo-profile
+# binding.  State both branches positively: SQLite treats a CHECK that
+# evaluates to NULL as passing, so relying on implication-style predicates
+# would admit half-populated or malformed evidence.
+AUTOPILOT_PROFILE_BINDING_CHECK = (
+    "((autopilot_profile_version_id IS NULL AND "
+    "autopilot_profile_definition_digest IS NULL) OR "
+    "(autopilot_profile_version_id IS NOT NULL AND "
+    "autopilot_profile_definition_digest IS NOT NULL AND "
+    "length(trim(autopilot_profile_version_id)) > 0 AND "
+    "autopilot_profile_version_id = trim(autopilot_profile_version_id) AND "
+    + _hex64_sql("autopilot_profile_definition_digest") + "))"
+)
+
+AUTOPILOT_PROFILE_SIMULATION_CHECK = (
+    "((autopilot_profile_version_id IS NULL AND "
+    "autopilot_profile_definition_digest IS NULL) OR "
+    "(autopilot_profile_version_id IS NOT NULL AND "
+    "autopilot_profile_definition_digest IS NOT NULL AND "
+    "is_simulation AND data_classification = 'simulation'))"
+)
+
+AUTOPILOT_PROFILE_SESSION_PLAN_LINK_CHECK = (
+    "((autopilot_profile_version_id IS NULL AND "
+    "autopilot_profile_definition_digest IS NULL) OR "
+    "(autopilot_profile_version_id IS NOT NULL AND "
+    "autopilot_profile_definition_digest IS NOT NULL AND "
+    "visit_plan_id IS NOT NULL))"
+)
+
+# The pair check above is satisfied by an empty pair, so on its own it lets a
+# fully-formed replay command carry no repeat binding at all.  A replay only
+# exists because the protocol authorised it, so any replay provenance column
+# forces a complete, well-formed binding.  Historical ordinary commands keep
+# all three provenance columns NULL and are untouched by this.
+REPLAY_REQUIRES_REPEAT_BINDING_CHECK = (
+    "((replay_source_command_id IS NULL AND replay_ordinal IS NULL AND "
+    "replay_source_payload_sha256 IS NULL) OR "
+    "(repeat_protocol_version_id IS NOT NULL AND "
+    "repeat_protocol_definition_digest IS NOT NULL AND "
+    "length(trim(repeat_protocol_version_id)) > 0 AND "
+    + _hex64_sql("repeat_protocol_definition_digest") + "))"
+)
 
 
 class Patient(SQLModel, table=True):
@@ -182,6 +262,15 @@ class VisitPlan(SQLModel, table=True):
             "lower(autopilot_protocol_definition_digest) = "
             "autopilot_protocol_definition_digest))",
             name="ck_visit_plan_definition_binding_complete"),
+        CheckConstraint(
+            REPEAT_PROTOCOL_BINDING_CHECK,
+            name="ck_visit_plan_repeat_binding_complete"),
+        CheckConstraint(
+            AUTOPILOT_PROFILE_BINDING_CHECK,
+            name="ck_visit_plan_autopilot_profile_binding_complete"),
+        CheckConstraint(
+            AUTOPILOT_PROFILE_SIMULATION_CHECK,
+            name="ck_visit_plan_autopilot_profile_simulation_only"),
     )
 
     plan_id: str = Field(primary_key=True)
@@ -201,6 +290,10 @@ class VisitPlan(SQLModel, table=True):
     item_bank_definition_digest: Optional[str] = None
     autopilot_protocol_version_id: Optional[str] = None
     autopilot_protocol_definition_digest: Optional[str] = None
+    autopilot_profile_version_id: Optional[str] = None
+    autopilot_profile_definition_digest: Optional[str] = None
+    repeat_protocol_version_id: Optional[str] = None
+    repeat_protocol_definition_digest: Optional[str] = None
     is_simulation: bool = False
     data_classification: str = "research"
     status: str = "draft"
@@ -272,6 +365,18 @@ class Session(SQLModel, table=True):
             "lower(autopilot_protocol_definition_digest) = "
             "autopilot_protocol_definition_digest))",
             name="ck_session_definition_binding_complete"),
+        CheckConstraint(
+            REPEAT_PROTOCOL_BINDING_CHECK,
+            name="ck_session_repeat_binding_complete"),
+        CheckConstraint(
+            AUTOPILOT_PROFILE_BINDING_CHECK,
+            name="ck_session_autopilot_profile_binding_complete"),
+        CheckConstraint(
+            AUTOPILOT_PROFILE_SIMULATION_CHECK,
+            name="ck_session_autopilot_profile_simulation_only"),
+        CheckConstraint(
+            AUTOPILOT_PROFILE_SESSION_PLAN_LINK_CHECK,
+            name="ck_session_autopilot_profile_requires_visit_plan"),
     )
 
     session_id: str = Field(primary_key=True)
@@ -290,6 +395,10 @@ class Session(SQLModel, table=True):
     item_bank_definition_digest: Optional[str] = None
     autopilot_protocol_version_id: Optional[str] = None
     autopilot_protocol_definition_digest: Optional[str] = None
+    autopilot_profile_version_id: Optional[str] = None
+    autopilot_profile_definition_digest: Optional[str] = None
+    repeat_protocol_version_id: Optional[str] = None
+    repeat_protocol_definition_digest: Optional[str] = None
     # 真实研究与模拟数据必须持久分流。默认 False，任何未显式标记的既有/新场次都按真实研究处理。
     is_simulation: bool = False
     # 新建行由服务端写 research/simulation；迁移时旧数据回填 legacy_unknown。
@@ -486,6 +595,8 @@ class AttemptCaptureProcessing(SQLModel, table=True):
                          name="uq_capture_processing_receipt_seq"),
         UniqueConstraint("final_attempt_id",
                          name="uq_capture_processing_final_attempt_id"),
+        UniqueConstraint("repeat_request_id",
+                         name="uq_capture_processing_repeat_request_id"),
         CheckConstraint("proof_attempt_seq >= 1",
                         name="ck_capture_processing_proof_seq_positive"),
         CheckConstraint("proof_prompt_level >= 0 AND proof_prompt_level <= 3",
@@ -496,17 +607,50 @@ class AttemptCaptureProcessing(SQLModel, table=True):
         CheckConstraint("processing_generation >= 0",
                         name="ck_capture_processing_generation_nonnegative"),
         CheckConstraint(
-            "disposition IS NULL OR disposition IN ('answer_candidate')",
+            "disposition IS NULL OR disposition IN "
+            "('answer_candidate','repeat_replayed','repeat_limit_paused')",
             name="ck_capture_processing_disposition"),
         CheckConstraint(
             "((processing_status = 'asr_completed' AND disposition IS NOT NULL) OR "
             "(processing_status != 'asr_completed' AND disposition IS NULL))",
             name="ck_capture_processing_disposition_matches_status"),
+        # Terminal outcomes are mutually exclusive at the database level: an
+        # answer candidate binds an Attempt and never a repeat request; a
+        # repeat disposition binds a repeat request and never an Attempt.
         CheckConstraint(
-            "((processing_status IN ('asr_completed','technical_failure') "
-            "AND final_attempt_id IS NOT NULL) OR "
-            "(processing_status = 'received' AND final_attempt_id IS NULL))",
+            "((processing_status = 'received' AND final_attempt_id IS NULL "
+            "AND repeat_request_id IS NULL) OR "
+            "(processing_status = 'technical_failure' "
+            "AND final_attempt_id IS NOT NULL AND repeat_request_id IS NULL) OR "
+            "(processing_status = 'asr_completed' "
+            "AND disposition IS NOT NULL AND disposition = 'answer_candidate' "
+            "AND final_attempt_id IS NOT NULL AND repeat_request_id IS NULL) OR "
+            "(processing_status = 'asr_completed' AND disposition IS NOT NULL "
+            "AND disposition IN ('repeat_replayed','repeat_limit_paused') "
+            "AND final_attempt_id IS NULL AND repeat_request_id IS NOT NULL))",
             name="ck_capture_processing_final_attempt_matches_status"),
+        CheckConstraint(
+            REPEAT_PROTOCOL_BINDING_CHECK,
+            name="ck_capture_processing_repeat_binding_complete"),
+        CheckConstraint(
+            "repeat_admission_semantics IN ('legacy_pre_repeat','repeat_bound')",
+            name="ck_capture_processing_admission_semantics"),
+        # The marker is what separates "admitted before the protocol existed"
+        # from "admitted under it".  A legacy row can never acquire a repeat
+        # binding, a repeat request or a repeat disposition; a bound row must
+        # carry a complete, well-formed binding.
+        CheckConstraint(
+            "((repeat_admission_semantics = 'legacy_pre_repeat' AND "
+            "repeat_protocol_version_id IS NULL AND "
+            "repeat_protocol_definition_digest IS NULL AND "
+            "repeat_request_id IS NULL AND "
+            "(disposition IS NULL OR disposition = 'answer_candidate')) OR "
+            "(repeat_admission_semantics = 'repeat_bound' AND "
+            "repeat_protocol_version_id IS NOT NULL AND "
+            "repeat_protocol_definition_digest IS NOT NULL AND "
+            "length(trim(repeat_protocol_version_id)) > 0 AND "
+            + _hex64_sql("repeat_protocol_definition_digest") + "))",
+            name="ck_capture_processing_admission_marker_binding"),
         CheckConstraint(
             "((processing_owner IS NULL AND processing_lease_expires_at IS NULL) OR "
             "(processing_owner IS NOT NULL AND processing_lease_expires_at IS NOT NULL))",
@@ -548,6 +692,29 @@ class AttemptCaptureProcessing(SQLModel, table=True):
     error_code: Optional[str] = None
     final_attempt_id: Optional[int] = Field(
         default=None, foreign_key="attemptevent.id", index=True)
+    # Written once at admission and never by a caller: rows admitted before the
+    # repeat protocol existed are backfilled ``legacy_pre_repeat`` by the
+    # migration, and every row the running service admits is ``repeat_bound``.
+    repeat_admission_semantics: str
+    # Copied unchanged from the record command at admission; a historical
+    # capture keeps NULL and its worker runs the pre-repeat answer flow.
+    repeat_protocol_version_id: Optional[str] = None
+    repeat_protocol_definition_digest: Optional[str] = None
+    # The reverse half of a genuine one-to-one: AutopilotRepeatRequest holds a
+    # unique foreign key back to this row, and this unique foreign key points at
+    # it.  The pair is mutually dependent, so the constraint is emitted with
+    # ``use_alter`` to keep table creation orderable.
+    repeat_request_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            "repeat_request_id",
+            Integer,
+            ForeignKey("autopilotrepeatrequest.id",
+                       name="fk_capture_processing_repeat_request",
+                       use_alter=True),
+            nullable=True,
+            index=True,
+        ))
     created_at: datetime = Field(default_factory=datetime.now)
     processed_at: Optional[datetime] = None
     is_simulation: bool = False
@@ -559,6 +726,120 @@ def _reject_attempt_capture_processing_orm_mutation(*_args) -> None:
     """生命周期只能走 fenced Core UPDATE；ORM 层一律拒绝改写或删除。"""
     raise RuntimeError(
         "AttemptCaptureProcessing 禁止 ORM 更新或删除，须走 evidence_ledger 的 fenced Core 事务")
+
+
+class AutopilotRepeatRequest(SQLModel, table=True):
+    """Append-only record of one patient request to hear the prompt again.
+
+    A repeat request is deliberately not an answer attempt: it consumes no
+    ``attempt_seq``, no cue and no prompt level, and it never produces an
+    :class:`AttemptEvent`.  Ordinal 1 issues a new TTS command carrying the
+    predecessor command's exact canonical ``payload_json``; the audio itself is
+    re-synthesized downstream.  Ordinal 2 in the same logical slot pauses for a
+    researcher instead of replaying again.
+
+    The patient's words are never persisted here.  Only the approved
+    ``phrase_key`` and the SHA-256 of the normalized string are kept, so the
+    ledger can be audited without holding a second copy of patient speech.
+    """
+    __table_args__ = (
+        UniqueConstraint("capture_processing_id",
+                         name="uq_repeat_request_capture_processing"),
+        UniqueConstraint("session_id", "item_id", "turn_seq", "attempt_seq",
+                         "prompt_level", "repeat_ordinal",
+                         name="uq_repeat_request_logical_slot_ordinal"),
+        UniqueConstraint("replay_command_id",
+                         name="uq_repeat_request_replay_command"),
+        UniqueConstraint("source_tts_command_id",
+                         name="uq_repeat_request_source_command"),
+        UniqueConstraint("session_id", "pause_control_event_seq",
+                         name="uq_repeat_request_pause_event"),
+        Index("ix_repeat_request_session_created", "session_id", "created_at"),
+        ForeignKeyConstraint(
+            ["record_command_id", "session_id"],
+            ["runtimecommand.id", "runtimecommand.session_id"],
+            name="fk_repeat_request_record_command_same_session"),
+        ForeignKeyConstraint(
+            ["source_tts_command_id", "session_id"],
+            ["runtimecommand.id", "runtimecommand.session_id"],
+            name="fk_repeat_request_source_command_same_session"),
+        ForeignKeyConstraint(
+            ["replay_command_id", "session_id"],
+            ["runtimecommand.id", "runtimecommand.session_id"],
+            name="fk_repeat_request_replay_command_same_session"),
+        ForeignKeyConstraint(
+            ["session_id", "pause_control_event_seq"],
+            ["autopilotcontrolevent.session_id",
+             "autopilotcontrolevent.event_seq"],
+            name="fk_repeat_request_pause_event_same_session"),
+        CheckConstraint("turn_seq >= 1", name="ck_repeat_request_turn_positive"),
+        CheckConstraint("attempt_seq >= 1",
+                        name="ck_repeat_request_attempt_positive"),
+        CheckConstraint("prompt_level >= 0 AND prompt_level <= 3",
+                        name="ck_repeat_request_prompt_level"),
+        CheckConstraint("repeat_ordinal IN (1, 2)",
+                        name="ck_repeat_request_ordinal"),
+        CheckConstraint("outcome IN ('replayed','limit_paused')",
+                        name="ck_repeat_request_outcome"),
+        CheckConstraint(
+            "((repeat_ordinal = 1 AND outcome = 'replayed' AND "
+            "replay_command_id IS NOT NULL AND "
+            "pause_control_event_seq IS NULL) OR "
+            "(repeat_ordinal = 2 AND outcome = 'limit_paused' AND "
+            "replay_command_id IS NULL AND "
+            "pause_control_event_seq IS NOT NULL))",
+            name="ck_repeat_request_ordinal_matches_outcome"),
+        CheckConstraint(
+            "pause_control_event_seq IS NULL OR pause_control_event_seq >= 1",
+            name="ck_repeat_request_pause_event_seq_positive"),
+        CheckConstraint(
+            _hex64_sql("source_payload_sha256"),
+            name="ck_repeat_request_source_payload_digest"),
+        CheckConstraint(
+            _hex64_sql("normalized_text_sha256"),
+            name="ck_repeat_request_normalized_text_digest"),
+        CheckConstraint(
+            "length(trim(repeat_protocol_version_id)) > 0 AND "
+            + _hex64_sql("repeat_protocol_definition_digest"),
+            name="ck_repeat_request_protocol_binding"),
+        CheckConstraint("length(trim(phrase_key)) > 0",
+                        name="ck_repeat_request_phrase_key"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    capture_processing_id: int = Field(
+        foreign_key="attemptcaptureprocessing.id", index=True)
+    session_id: str = Field(foreign_key="session.session_id", index=True)
+    item_id: str = Field(index=True)
+    turn_seq: int
+    attempt_seq: int
+    prompt_level: int
+    repeat_ordinal: int
+    outcome: str                            # replayed / limit_paused
+    record_command_id: int = Field(index=True)
+    raw_audio_id: str = Field(
+        foreign_key="audioassetrow.raw_audio_id", index=True)
+    source_tts_command_id: int
+    # SHA-256 of the source RuntimeCommand.payload_json UTF-8 bytes only.
+    # It is not a digest of any synthesized TTS audio, and binds no WAV.
+    source_payload_sha256: str
+    replay_command_id: Optional[int] = None
+    pause_control_event_seq: Optional[int] = None
+    asr_confidence: Optional[float] = None
+    asr_engine_version: Optional[str] = None
+    repeat_protocol_version_id: str
+    repeat_protocol_definition_digest: str
+    # 只存批准协议里的封闭短语键与规范化文本摘要，绝不存原始转写。
+    phrase_key: str
+    normalized_text_sha256: str
+    created_at: datetime = Field(default_factory=datetime.now)
+    is_simulation: bool = False
+
+
+@sa_event.listens_for(AutopilotRepeatRequest, "before_update")
+@sa_event.listens_for(AutopilotRepeatRequest, "before_delete")
+def _reject_autopilot_repeat_request_mutation(*_args) -> None:
+    raise RuntimeError("AutopilotRepeatRequest 是只追加账本，禁止更新或删除")
 
 
 class InteractionEvent(SQLModel, table=True):
@@ -1150,10 +1431,16 @@ class RuntimeCommand(SQLModel, table=True):
                          name="uq_runtime_command_predecessor"),
         UniqueConstraint("expected_raw_audio_id",
                          name="uq_runtime_command_expected_raw_audio"),
+        UniqueConstraint("replay_source_command_id",
+                         name="uq_runtime_command_replay_source"),
         ForeignKeyConstraint(
             ["predecessor_command_id", "session_id"],
             ["runtimecommand.id", "runtimecommand.session_id"],
             name="fk_runtime_command_predecessor_same_session"),
+        ForeignKeyConstraint(
+            ["replay_source_command_id", "session_id"],
+            ["runtimecommand.id", "runtimecommand.session_id"],
+            name="fk_runtime_command_replay_source_same_session"),
         Index("ix_runtime_command_session_state_lease",
               "session_id", "state", "lease_expires_at"),
         CheckConstraint("command_seq >= 1", name="ck_runtime_command_seq_positive"),
@@ -1214,6 +1501,24 @@ class RuntimeCommand(SQLModel, table=True):
             "autopilot_protocol_definition_digest AND "
             "length(trim(response_role)) > 0))",
             name="ck_runtime_command_definition_binding_complete"),
+        CheckConstraint(
+            REPEAT_PROTOCOL_BINDING_CHECK,
+            name="ck_runtime_command_repeat_binding_complete"),
+        CheckConstraint(
+            "((replay_source_command_id IS NULL AND replay_ordinal IS NULL AND "
+            "replay_source_payload_sha256 IS NULL) OR "
+            "(replay_source_command_id IS NOT NULL AND "
+            "replay_ordinal IS NOT NULL AND replay_ordinal = 1 AND "
+            "replay_source_payload_sha256 IS NOT NULL AND "
+            + _hex64_sql("replay_source_payload_sha256") + "))",
+            name="ck_runtime_command_replay_provenance_complete"),
+        CheckConstraint(
+            "(kind != 'record' OR (replay_source_command_id IS NULL AND "
+            "replay_ordinal IS NULL AND replay_source_payload_sha256 IS NULL))",
+            name="ck_runtime_command_record_never_replays"),
+        CheckConstraint(
+            REPLAY_REQUIRES_REPEAT_BINDING_CHECK,
+            name="ck_runtime_command_replay_requires_repeat_binding"),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -1233,6 +1538,18 @@ class RuntimeCommand(SQLModel, table=True):
     autopilot_protocol_version_id: Optional[str] = None
     autopilot_protocol_definition_digest: Optional[str] = None
     response_role: Optional[str] = None
+    # Copied unchanged from the session (and, for a record command, from its
+    # predecessor TTS) so a recovery worker resolves the exact historical
+    # repeat definition instead of whatever the deployment ships today.
+    repeat_protocol_version_id: Optional[str] = None
+    repeat_protocol_definition_digest: Optional[str] = None
+    # Server-side provenance for a replayed TTS.  The patient device still sees
+    # an ordinary, strictly validated question/cue command.
+    replay_source_command_id: Optional[int] = Field(default=None, index=True)
+    replay_ordinal: Optional[int] = None
+    # SHA-256 of the source RuntimeCommand.payload_json UTF-8 bytes only.
+    # It is not a digest of any synthesized TTS audio, and binds no WAV.
+    replay_source_payload_sha256: Optional[str] = None
     # Legacy compatibility identifier for the simulation-only sequential scope;
     # it still never implies that the whole research intervention completed.
     scope_key: str = "p0a_sim_first_single_v1"

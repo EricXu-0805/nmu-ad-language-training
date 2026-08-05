@@ -13,7 +13,8 @@ from sqlalchemy import event, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import autopilot_ledger, autopilot_orchestration, content, evidence_ledger
+from app import (autopilot_ledger, autopilot_orchestration, content,
+                 evidence_ledger, repeat_intent)
 from app.autopilot_contract import (
     AutopilotAckIn,
     RecordCommandPayload,
@@ -64,6 +65,7 @@ DEVICE_HASH = "b" * 64
 START_KEY = "start-p0a-service-0001"
 ACTOR_ID = "RESEARCHER-P0A"
 
+REPEAT_PROTOCOL = repeat_intent.active_protocol()
 BANK = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
 
 
@@ -151,6 +153,8 @@ def _seed_ready(
         autopilot_protocol_version_id=protocol["protocol_version_id"],
         autopilot_protocol_definition_digest=(
             content.autopilot_protocol_definition_digest(protocol)),
+        repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
+        repeat_protocol_definition_digest=REPEAT_PROTOCOL.definition_digest,
         is_simulation=True,
         data_classification="simulation",
     ))
@@ -277,6 +281,8 @@ def _seed_purpose_tts(
         autopilot_protocol_version_id=protocol["protocol_version_id"],
         autopilot_protocol_definition_digest=(
             content.autopilot_protocol_definition_digest(protocol)),
+        repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
+        repeat_protocol_definition_digest=REPEAT_PROTOCOL.definition_digest,
         response_role="命名",
         scope_key="p0a_sim_first_single_v1",
         control_generation=1,

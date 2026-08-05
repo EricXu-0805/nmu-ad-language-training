@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -25,11 +26,11 @@ from typing import Literal
 
 from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
                       model_serializer)
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
 from . import (autopilot_ledger, autopilot_positions, content, evidence_ledger,
-               patient_presentation, runtime)
+               patient_presentation, repeat_intent, runtime)
 from .autopilot_contract import (
     AutopilotAckIn,
     RecordCommandPayload,
@@ -42,8 +43,10 @@ from .enums import AnswerType, AudioStatus
 from .models import (
     AudioAssetRow,
     AudioCaptureReceipt,
+    AttemptCaptureProcessing,
     AttemptEvent,
     AutopilotControlEvent,
+    AutopilotRepeatRequest,
     InteractionEvent,
     ItemEvent,
     LiveState,
@@ -70,6 +73,64 @@ _DENIED_CONSENT = frozenset({
     "denied", "withdrawn", "refused", "declined", "rejected",
 })
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+# Closed identity of the explicit-repeat safe pause.  It is deliberately not a
+# technical failure code and must never be counted as one.
+REPEAT_PAUSE_SOURCE = "repeat_intent_protocol"
+REPEAT_LIMIT_REASON_CODE = "explicit_repeat_limit"
+# Closed identity of the one terminal action a pre-protocol capture may still
+# receive.  It *is* in _DRAINABLE_PAUSE_SOURCES, for one narrow reason: the
+# patient device must be able to close its own screen.  Draining never resumes
+# anything, and a researcher takeover afterwards flips the control plane to
+# manual — at which point every manual continuation entry is refused, because
+# _ensure_manual_plane_writable resolves the session's frozen repeat binding and
+# this session never froze one.  So the scope finishes its single outstanding
+# recording and then stops for good, without stranding the patient screen.
+LEGACY_REPEAT_RECOVERY_REASON_CODE = "legacy_repeat_recovery_complete"
+LEGACY_REPEAT_RECOVERY_SOURCE = "legacy_repeat_recovery"
+# The frozen P0a prompt-level -> cue-type mapping, uniform across every
+# approved single-element item.  A record command only ever exists for levels
+# 0..2 (level 3 tells the answer and never records), so this is the complete
+# contract, and stating it here keeps the provider-free terminal closure
+# independent of whatever the item bank file says today.
+LEGACY_CUE_TYPE_BY_PROMPT_LEVEL: dict[int, str | None] = {
+    0: None, 1: "语义", 2: "排除式",
+}
+# The exact operational judgement contract, as _classify_operational emits it.
+# Non-null/type checks alone would accept an invented answer type with an
+# invented score, so both branches are closed against their real output shape.
+LEGACY_JUDGEMENT_SCORE_BY_ANSWER_TYPE: dict[str, float] = {
+    "正确": 1.0,
+    "部分正确": 0.5,
+    "上位词或相关词": 0.5,
+    "偏题": 0.0,
+    "重复": 0.0,
+    "未识别": 0.0,
+    "沉默": 0.0,
+    "拒答": 0.0,
+}
+# rule_judge emits exactly these (answer_type, matched_on, needs_review) triples,
+# mapped to what ``contains_target`` can be alongside them.  ``None`` means the
+# branch genuinely leaves it free: a dialect synonym, a related term or a
+# substring match may or may not also contain the target, and constraining
+# those would need the current item bank, which the terminal readback must not
+# depend on.  A target/acceptable hit always contains it; silence never does.
+LEGACY_RULE_JUDGEMENTS: dict[tuple[str, str | None, bool], bool | None] = {
+    ("正确", "target", False): True,
+    ("正确", "acceptable", False): True,
+    ("正确", "dialect", True): None,
+    ("上位词或相关词", "upper", True): None,
+    ("部分正确", "substring", True): None,
+    ("未识别", None, True): None,
+    ("拒答", "refusal", True): None,
+    ("沉默", "silence", True): False,
+}
+# The Qwen judgement parser bounds a reason at 500 characters.
+LEGACY_MAX_JUDGE_REASON_CHARS = 500
+# 沉默/拒答 are interaction states produced only by the deterministic rules;
+# the LLM branch can never emit them.
+LEGACY_LLM_ANSWER_TYPES: frozenset[str] = frozenset({
+    "正确", "部分正确", "上位词或相关词", "偏题", "重复", "未识别",
+})
 _EXTERNAL_FENCE_SOURCES = frozenset({
     "patient_rec_failure",
     "session_abort",
@@ -84,6 +145,13 @@ _EXTERNAL_FENCE_ACTOR = {
 }
 _DRAINABLE_PAUSE_SOURCES = _EXTERNAL_FENCE_SOURCES | frozenset({
     "protocol_position_gap",
+    # An explicit-repeat limit pause is a protocol decision, not a technical
+    # failure; it still leaves a safely drainable paused scope behind.
+    REPEAT_PAUSE_SOURCE,
+    # Same shape for the legacy recovery stop: the patient device must still be
+    # able to close out its screen.  Draining ends a device command; it never
+    # resumes the scope, and resume itself stays refused for an unbound session.
+    LEGACY_REPEAT_RECOVERY_SOURCE,
 })
 
 
@@ -266,6 +334,16 @@ class ApplyDeviceAckResult(BaseModel):
     command: NextCommandProjection | None = None
 
 
+class RouteExplicitRepeatResult(BaseModel):
+    """One committed explicit-repeat decision; carries no patient transcript."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: Literal["replayed", "limit_paused"]
+    repeat_ordinal: int = Field(ge=1, le=2)
+    state_revision: int = Field(ge=0)
+
+
 @dataclass(frozen=True)
 class _DefinitionBinding:
     item_bank_version_id: str
@@ -427,6 +505,68 @@ def _require_session_definition_binding(
     return binding
 
 
+def session_repeat_protocol(
+    train_session: TrainSession,
+) -> repeat_intent.RepeatIntentProtocol:
+    """Resolve the exact repeat definition this session was started against.
+
+    A session predating the approved protocol carries no binding and is refused
+    outright: server-owned automation may not run a session whose repeat
+    semantics were never frozen, because a patient asking to hear the prompt
+    again would silently be scored as an answer.  Such a session needs a newly
+    created one, not a halfway opt-in.  The binding is always resolved through
+    the historical registry, never through today's active version.
+    """
+    version_id = train_session.repeat_protocol_version_id
+    digest = train_session.repeat_protocol_definition_digest
+    if version_id is None or digest is None:
+        _fail(
+            "autopilot_repeat_binding_missing",
+            "场次缺少冻结的重复请求协议绑定；旧场次必须新建后才能自动执行",
+        )
+    try:
+        return repeat_intent.protocol_for_binding(version_id, digest)
+    except content.FrozenContentUnavailable as exc:
+        raise AutopilotServiceError(
+            "autopilot_repeat_protocol_unavailable",
+            "场次绑定的重复请求协议已不可用或内容已变化",
+        ) from exc
+
+
+def _require_command_repeat_binding(
+    command: RuntimeCommand,
+    train_session: TrainSession,
+) -> None:
+    """Every issued command must carry the session's exact repeat binding.
+
+    A NULL, half-filled or drifted binding means the command cannot be
+    interpreted under the session's frozen repeat semantics, so it is rejected
+    before any projection, device action, ACK or capture admission rather than
+    silently falling back to the pre-repeat answer flow.
+    """
+    session_repeat_protocol(train_session)
+    if (command.repeat_protocol_version_id is None
+            or command.repeat_protocol_definition_digest is None
+            or command.repeat_protocol_version_id
+            != train_session.repeat_protocol_version_id
+            or command.repeat_protocol_definition_digest
+            != train_session.repeat_protocol_definition_digest):
+        _fail(
+            "autopilot_command_repeat_binding_mismatch",
+            "命令的重复请求协议绑定缺失或与场次不一致",
+        )
+
+
+def _command_repeat_binding_fields(
+    train_session: TrainSession,
+) -> dict[str, str | None]:
+    return {
+        "repeat_protocol_version_id": train_session.repeat_protocol_version_id,
+        "repeat_protocol_definition_digest": (
+            train_session.repeat_protocol_definition_digest),
+    }
+
+
 def _require_plan_session_binding(
     db: Session,
     train_session: TrainSession,
@@ -443,6 +583,10 @@ def _require_plan_session_binding(
         != train_session.autopilot_protocol_version_id
         or plan.autopilot_protocol_definition_digest
         != train_session.autopilot_protocol_definition_digest
+        or plan.repeat_protocol_version_id
+        != train_session.repeat_protocol_version_id
+        or plan.repeat_protocol_definition_digest
+        != train_session.repeat_protocol_definition_digest
     ):
         _fail(
             "autopilot_plan_session_binding_mismatch",
@@ -823,6 +967,12 @@ def _require_gate(
     # Definition identity is the first semantic fence after locating the row.
     # A same-version in-place edit can never inherit an old session or command.
     _require_session_definition_binding(train_session, bank, protocol)
+    # Stated here rather than inside the digest helper: content selection is a
+    # pure function of the frozen bank/protocol and is deliberately reusable by
+    # the pre-protocol recovery verifier, which has no repeat binding to check.
+    # Every modern write path reaches this gate or checks the command binding
+    # directly, so the enforcement point is unchanged.
+    session_repeat_protocol(train_session)
     _require_plan_session_binding(db, train_session)
     if train_session.is_simulation is not True:
         _fail("autopilot_simulation_required", "P0a 禁止用于真实研究场次")
@@ -1055,6 +1205,13 @@ def _project_command(
     expected_capability: PatientDeviceCapability | None = None,
 ) -> NextCommandProjection:
     _validate_command_identity(command, selected)
+    # Repeat semantics are part of command identity: a projection is the last
+    # point before the patient device acts on it, so an unbound or drifted
+    # command must fail here too, not only on the routes that issue commands.
+    owning_session = db.get(TrainSession, command.session_id)
+    if owning_session is None:
+        _fail("autopilot_command_invalid", "命令缺少所属场次")
+    _require_command_repeat_binding(command, owning_session)
     if command.state not in {"pending", "started"}:
         _fail("autopilot_command_not_open", "当前命令已不是可执行状态")
     if command.control_generation < 1 or command.runner_generation < 1:
@@ -1351,6 +1508,7 @@ def start_p0a(
         attempt_seq=1,
         prompt_level=0,
         **_command_definition_fields(gate.selected),
+        **_command_repeat_binding_fields(gate.train_session),
         scope_key=P0A_SCOPE_KEY,
         control_generation=control_generation,
         runner_generation=runner_generation,
@@ -2141,7 +2299,486 @@ def _researcher_pause_matches(
     )
 
 
+def legacy_expected_attempt_facts(
+    db: Session,
+    *,
+    record: RuntimeCommand,
+    capture: AttemptCaptureProcessing,
+    bank: content.ItemBank | None = None,
+    protocol: dict | None = None,
+) -> dict:
+    """The only authoritative shape a legacy Attempt for this capture may have.
+
+    Derived provider-free from immutable evidence alone — the record command,
+    its capture receipt and the frozen bank/protocol — so the full verifier, the
+    terminal pause probe, the pause stage and the drain matcher all close the
+    persisted Attempt against exactly the same facts.  Without a single source
+    here, ``response_role``/``cue_type``/``duration_seconds`` could be rewritten
+    after judgement and still yield a valid drain target.
+    """
+    resolved_bank = bank or _default_bank()
+    resolved_protocol = protocol or _default_protocol()
+    train_session = db.get(TrainSession, record.session_id)
+    if train_session is None:
+        _fail("autopilot_session_unavailable", "场次不存在或不可用于 P0a")
+    selected = _select_p0a_content(
+        train_session, resolved_bank, resolved_protocol,
+        item_id=record.item_id, turn_seq=record.turn_seq)
+    receipt = db.get(AudioCaptureReceipt, capture.receipt_server_seq)
+    if receipt is None:
+        _fail("autopilot_record_capture_invalid", "采集回执不存在")
+    cue_type: str | None = None
+    if record.prompt_level != 0:
+        if record.prompt_level not in {1, 2}:
+            _fail("autopilot_command_invalid", "P0a 录音命令提示等级非法")
+        rows = [row for row in resolved_bank.single_element
+                if row.get("item_id") == selected.item_id]
+        cues = rows[0].get("cues") if len(rows) == 1 else None
+        cue = cues.get(str(record.prompt_level)) if isinstance(cues, dict) else None
+        label = cue.get("cue_type") if isinstance(cue, dict) else None
+        if not isinstance(label, str) or not label.strip():
+            _fail("autopilot_content_incomplete", "冻结提示缺少 cue_type")
+        cue_type = label.strip()
+    return {
+        "item_id": record.item_id,
+        "turn_seq": record.turn_seq,
+        "response_role": selected.response_role,
+        "raw_audio_id": record.expected_raw_audio_id,
+        "prompt_level": record.prompt_level,
+        "cue_type": cue_type,
+        "duration_seconds": receipt.duration_seconds,
+    }
+
+
+def legacy_attempt_matches_expected_facts(
+    attempt: AttemptEvent, expected: dict,
+) -> bool:
+    """Field-by-field closure of a persisted Attempt against those facts."""
+    return all(getattr(attempt, name) == value
+               for name, value in expected.items())
+
+
+def legacy_attempt_closes_persisted_evidence(
+    db: Session,
+    *,
+    attempt: AttemptEvent,
+    record: RuntimeCommand,
+    capture: AttemptCaptureProcessing,
+) -> bool:
+    """Closure that depends on persisted evidence alone, never on today's files.
+
+    Used by every provider-free terminal path — the pause probe, the pause
+    stage and the drain matcher.  Those must stay correct after the item bank or
+    autopilot protocol on disk changes: an already-judged legacy scope has to
+    remain finishable, and a drain target already earned must not evaporate
+    because a content file moved.  The frozen P0a contract supplies the only
+    rule that is not a stored column: a record command exists for prompt levels
+    0..2 only, level 0 carries no cue and a cued level always names one.
+    """
+    receipt = db.get(AudioCaptureReceipt, capture.receipt_server_seq)
+    if (receipt is None
+            or record.prompt_level not in LEGACY_CUE_TYPE_BY_PROMPT_LEVEL):
+        return False
+    if not (record.response_role or "").strip():
+        return False
+    return all((
+        attempt.item_id == record.item_id,
+        attempt.turn_seq == record.turn_seq,
+        attempt.response_role == record.response_role,
+        attempt.raw_audio_id == record.expected_raw_audio_id,
+        attempt.prompt_level == record.prompt_level,
+        attempt.duration_seconds == receipt.duration_seconds,
+        attempt.cue_type
+        == LEGACY_CUE_TYPE_BY_PROMPT_LEVEL[record.prompt_level],
+    ))
+
+
+def legacy_asr_facts_are_legal(
+    *, text, confidence, engine_version, hotword_hit,
+) -> bool:
+    """The one closed ASR contract, shared by both sides of the commit.
+
+    Used before the first durable write *and* by every terminal readback, so a
+    transcript shape the prewrite gate would refuse can never be accepted later
+    just because it was persisted consistently across every row.
+    """
+    if not isinstance(text, str) or len(text) > 2000:
+        return False
+    if not isinstance(engine_version, str) or not engine_version.strip():
+        return False
+    if not isinstance(hotword_hit, bool):
+        return False
+    if confidence is None:
+        return True
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return False
+    return math.isfinite(confidence) and 0.0 <= float(confidence) <= 1.0
+
+
+def legacy_interactions_are_exact(
+    db: Session,
+    attempt: AttemptEvent,
+    *,
+    expect_judgement: bool,
+) -> bool:
+    """Exactly the interaction rows this legacy stage must have, in order.
+
+    A subset test over ``event_type`` would accept a duplicated, reordered,
+    rewritten or padded trail.  The ordered sequence is pinned, every row must
+    close onto the exact attempt, every payload must carry exactly its own key
+    set with the frozen constants this path always writes, and every variable
+    fact must agree with the attempt it describes.  The payload encoder only
+    rejects unknown keys, so it cannot be relied on to prove a key is present.
+    """
+    expected = ["attempt_received", "asr_completed"]
+    if expect_judgement:
+        expected.append("judgement_completed")
+    rows = list(db.exec(select(InteractionEvent).where(
+        InteractionEvent.session_id == attempt.session_id,
+        InteractionEvent.attempt_id == attempt.id,
+    ).order_by(InteractionEvent.event_seq)))
+    if [row.event_type for row in rows] != expected:
+        return False
+    for row in rows:
+        if (row.item_id != attempt.item_id
+                or row.turn_seq != attempt.turn_seq
+                or row.attempt_seq != attempt.attempt_seq
+                or row.is_simulation != attempt.is_simulation):
+            return False
+        try:
+            payload = json.loads(row.payload_json)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        try:
+            canonical = evidence_ledger.encode_event_payload(
+                row.event_type, payload)
+        except (TypeError, ValueError):
+            return False
+        if canonical != row.payload_json:
+            return False
+        if row.event_type == "attempt_received":
+            expected_keys = {"raw_audio_id", "prompt_level", "cue_type",
+                             "duration_seconds", "processing_status"}
+            facts = (
+                payload.get("raw_audio_id") == attempt.raw_audio_id,
+                payload.get("prompt_level") == attempt.prompt_level,
+                payload.get("cue_type") == attempt.cue_type,
+                payload.get("duration_seconds") == attempt.duration_seconds,
+                payload.get("processing_status") == "received",
+            )
+        elif row.event_type == "asr_completed":
+            expected_keys = {"asr_engine_version", "asr_confidence",
+                             "degraded", "hotword_hit"}
+            facts = (
+                payload.get("asr_engine_version") == attempt.asr_engine_version,
+                payload.get("asr_confidence") == attempt.asr_confidence,
+                payload.get("degraded") is False,
+                # The same contract the prewrite gate applies, so a synchronised
+                # forgery — an over-long transcript or an impossible confidence
+                # written consistently to every row — cannot be read back as
+                # valid terminal evidence.
+                legacy_asr_facts_are_legal(
+                    text=attempt.asr_text,
+                    confidence=attempt.asr_confidence,
+                    engine_version=attempt.asr_engine_version,
+                    hotword_hit=payload.get("hotword_hit"),
+                ),
+            )
+        else:
+            expected_keys = {"answer_type", "score", "needs_review",
+                             "judge_mode", "judge_engine_version", "matched_on",
+                             "contains_target", "truth_scope"}
+            facts = (
+                payload.get("answer_type") == attempt.operational_answer_type,
+                payload.get("score") == attempt.operational_score,
+                payload.get("needs_review") == attempt.operational_needs_review,
+                payload.get("judge_mode") == attempt.judge_mode,
+                payload.get("judge_engine_version")
+                == attempt.judge_engine_version,
+                payload.get("matched_on") == attempt.matched_on,
+                payload.get("contains_target") == attempt.contains_target,
+                payload.get("truth_scope") == "operational_only",
+            )
+        if set(payload) != expected_keys or not all(facts):
+            return False
+    return True
+
+
+def legacy_judgement_facts_are_legal(
+    *, answer_type, score, needs_review, judge_mode, judge_engine_version,
+    matched_on, judge_reason, judge_portrait_used, contains_target,
+) -> bool:
+    """The one closed judgement contract, shared by both sides of the commit.
+
+    Used before the first durable judgement write *and* by every terminal
+    readback, so a provider result that the readback would later refuse can
+    never be persisted in the first place — which would strand the Attempt as
+    completed-but-unclosable with no way to retry.
+    """
+    if (not isinstance(judge_portrait_used, bool) or judge_portrait_used is not False
+            or not isinstance(needs_review, bool)
+            or not isinstance(contains_target, bool)
+            or not isinstance(score, (int, float)) or isinstance(score, bool)
+            or not (judge_engine_version or "").strip()):
+        return False
+    expected_score = LEGACY_JUDGEMENT_SCORE_BY_ANSWER_TYPE.get(answer_type)
+    if expected_score is None:
+        return False
+    score = float(score)
+    if not math.isfinite(score) or score != expected_score:
+        return False
+    if judge_mode == "LLM辅助":
+        # Forbidden on both sides of the commit by the one shared validator, so
+        # this ambiguous version can never be persisted and then refused: a
+        # custom provider claiming to be the deterministic rule engine is
+        # rejected before the first durable write.
+        if (matched_on is not None
+                or judge_engine_version == "rule-1"
+                or answer_type not in LEGACY_LLM_ANSWER_TYPES):
+            return False
+        return judge_reason is None or (
+            isinstance(judge_reason, str) and bool(judge_reason.strip())
+            and len(judge_reason) <= LEGACY_MAX_JUDGE_REASON_CHARS)
+    if judge_mode == "规则确定式":
+        if judge_reason is not None or judge_engine_version != "rule-1":
+            return False
+        key = (answer_type, matched_on, needs_review)
+        if key not in LEGACY_RULE_JUDGEMENTS:
+            return False
+        expected_contains = LEGACY_RULE_JUDGEMENTS[key]
+        return expected_contains is None or contains_target is expected_contains
+    return False
+
+
+def legacy_judgement_result_is_legal(result: object) -> bool:
+    """Pre-commit gate over a freshly produced ``_classify_operational`` dict."""
+    if not isinstance(result, dict):
+        return False
+    # Exact equality, not a subset: an unexpected extra key means the dict did
+    # not come from ``_classify_operational`` at all, and a missing one means
+    # the branch that produced it is not the closed contract either.
+    exact_keys = {"answer_type", "ai_score", "needs_review", "judge_mode",
+                  "judge_engine_version", "matched_on", "judge_reason",
+                  "judge_portrait_used", "contains_target", "truth_scope"}
+    if set(result) != exact_keys:
+        return False
+    if result["truth_scope"] != "operational_only":
+        return False
+    return legacy_judgement_facts_are_legal(
+        answer_type=result["answer_type"],
+        score=result["ai_score"],
+        needs_review=result["needs_review"],
+        judge_mode=result["judge_mode"],
+        judge_engine_version=result["judge_engine_version"],
+        matched_on=result["matched_on"],
+        judge_reason=result["judge_reason"],
+        judge_portrait_used=result["judge_portrait_used"],
+        contains_target=result["contains_target"],
+    )
+
+
+def legacy_attempt_is_successfully_judged(
+    db: Session,
+    attempt: AttemptEvent,
+) -> bool:
+    """Only a completed, fully judged ordinary Attempt closes a legacy scope.
+
+    A ``technical_failure`` — or a ``completed`` row missing any judgement fact
+    or its required interaction trail — is emphatically not "recovery
+    complete": stamping that reason code over it would claim the recording was
+    resolved when it was not.
+    """
+    if (attempt.processing_status != "completed"
+            or attempt.error_code is not None
+            or attempt.asr_text is None
+            or not (attempt.asr_engine_version or "").strip()
+            or attempt.processed_at is None
+            or not (attempt.operational_answer_type or "").strip()
+            or not isinstance(attempt.operational_score, (int, float))
+            or isinstance(attempt.operational_score, bool)
+            or not isinstance(attempt.operational_needs_review, bool)
+            or not isinstance(attempt.contains_target, bool)
+            or not isinstance(attempt.judge_portrait_used, bool)
+            or not (attempt.judge_engine_version or "").strip()):
+        return False
+    if not legacy_judgement_facts_are_legal(
+            answer_type=attempt.operational_answer_type,
+            score=attempt.operational_score,
+            needs_review=attempt.operational_needs_review,
+            judge_mode=attempt.judge_mode,
+            judge_engine_version=attempt.judge_engine_version,
+            matched_on=attempt.matched_on,
+            judge_reason=attempt.judge_reason,
+            judge_portrait_used=attempt.judge_portrait_used,
+            contains_target=attempt.contains_target):
+        return False
+    return legacy_interactions_are_exact(db, attempt, expect_judgement=True)
+
+
+def legacy_session_repeat_poison_reason(
+    db: Session, *, session_id: str,
+) -> Literal[
+    "repeat_binding", "repeat_ledger", "bound_or_replayed_command"] | None:
+    """Read-only: why this session can no longer be a pre-protocol chain.
+
+    The legacy marker may only ever stand for "this whole session predates the
+    repeat protocol".  A persisted repeat binding on the session or its plan, a
+    repeat ledger row, or a single bound or replayed command anywhere in the
+    session each contradict that, so every legacy path — the full verifier, the
+    provider-free terminal pause and the drain matcher — has to refuse on
+    exactly the same facts rather than on three drifting subsets.
+
+    Deliberately free of provider, content, feature and device authority: a
+    terminal pause that is already owed must never be stranded by a toggle
+    flipped after the judgement committed.  Callers keep their own shape gates,
+    so a missing session or plan is not guessed at here.  Never flushes, never
+    mutates a row.
+    """
+    # Default autoflush would push a caller's uncommitted edit to the database
+    # on the first read below, which is a write this helper must never cause.
+    with db.no_autoflush:
+        train_session = db.get(TrainSession, session_id)
+        if train_session is not None:
+            if (train_session.repeat_protocol_version_id is not None
+                    or train_session.repeat_protocol_definition_digest
+                    is not None):
+                return "repeat_binding"
+            plan = (db.get(VisitPlan, train_session.visit_plan_id)
+                    if train_session.visit_plan_id else None)
+            if plan is not None and (
+                    plan.repeat_protocol_version_id is not None
+                    or plan.repeat_protocol_definition_digest is not None):
+                return "repeat_binding"
+        if db.exec(select(AutopilotRepeatRequest).where(
+                AutopilotRepeatRequest.session_id == session_id,
+        )).first() is not None:
+            return "repeat_ledger"
+        if db.exec(select(RuntimeCommand).where(
+            RuntimeCommand.session_id == session_id,
+            or_(
+                RuntimeCommand.repeat_protocol_version_id.is_not(None),
+                RuntimeCommand.repeat_protocol_definition_digest.is_not(None),
+                RuntimeCommand.replay_source_command_id.is_not(None),
+                RuntimeCommand.replay_ordinal.is_not(None),
+                RuntimeCommand.replay_source_payload_sha256.is_not(None),
+            ),
+        )).first() is not None:
+            return "bound_or_replayed_command"
+    return None
+
+
+def _legacy_recovery_pause_matches(
+    db: Session,
+    event: AutopilotControlEvent,
+    *,
+    state: SessionAutopilotState,
+    command: RuntimeCommand,
+) -> bool:
+    """Exact, database-aware proof of one legacy-recovery pause.
+
+    A drain target may only be derived from a control fact that is genuinely
+    closed.  Matching the payload's ``source``/``reason_code``/actor alone is far
+    too weak here: it would accept a pause stamped onto a command that never
+    recorded, onto a capture that is not the legacy one, or onto an Attempt that
+    failed.  Everything the pause claims is therefore re-proved from the rows.
+    """
+    shape = (
+        event.from_status == "processing_attempt",
+        event.to_status == "paused",
+        event.from_mode == "autonomous",
+        event.to_mode == "autonomous",
+        event.session_id == command.session_id,
+        event.command_id == command.id,
+        event.scope_key == command.scope_key,
+        event.control_generation == command.control_generation,
+        event.runner_generation == command.runner_generation,
+        event.payload_json == autopilot_ledger.encode_control_event_payload(
+            "pause", {
+                "reason_code": LEGACY_REPEAT_RECOVERY_REASON_CODE,
+                "source": LEGACY_REPEAT_RECOVERY_SOURCE,
+            }),
+        state.status == "paused",
+        state.last_error_code == LEGACY_REPEAT_RECOVERY_REASON_CODE,
+        command.kind == "record",
+        command.state == "succeeded",
+        command.expected_raw_audio_id is not None,
+    )
+    if not all(shape):
+        return False
+    # An already-paused legacy scope can still be poisoned afterwards; the drain
+    # target must close with the same facts the verifier refuses on.
+    if legacy_session_repeat_poison_reason(
+            db, session_id=command.session_id) is not None:
+        return False
+    captures = list(db.exec(select(AttemptCaptureProcessing).where(
+        AttemptCaptureProcessing.record_command_id == command.id)))
+    if len(captures) != 1:
+        return False
+    capture = captures[0]
+    capture_facts = (
+        capture.session_id == command.session_id,
+        capture.raw_audio_id == command.expected_raw_audio_id,
+        capture.repeat_admission_semantics
+        == evidence_ledger.LEGACY_PRE_REPEAT_ADMISSION,
+        capture.repeat_protocol_version_id is None,
+        capture.repeat_protocol_definition_digest is None,
+        capture.repeat_request_id is None,
+        capture.processing_status == "asr_completed",
+        capture.disposition == "answer_candidate",
+        capture.final_attempt_id is not None,
+        capture.error_code is None,
+        capture.processed_at is not None,
+        capture.record_command_id == command.id,
+        capture.predecessor_command_id == command.predecessor_command_id,
+        capture.item_id == command.item_id,
+        capture.turn_seq == command.turn_seq,
+        capture.proof_attempt_seq == command.attempt_seq,
+        capture.proof_prompt_level == command.prompt_level,
+        event.idempotency_key == legacy_repeat_recovery_event_key(
+            command.session_id, capture.id),
+    )
+    if not all(capture_facts):
+        return False
+    receipt = db.get(AudioCaptureReceipt, capture.receipt_server_seq)
+    attempt = db.get(AttemptEvent, capture.final_attempt_id)
+    if attempt is None or receipt is None:
+        return False
+    attempt_facts = (
+        attempt.session_id == capture.session_id,
+        attempt.raw_audio_id == capture.raw_audio_id,
+        attempt.item_id == capture.item_id,
+        attempt.turn_seq == capture.turn_seq,
+        attempt.attempt_seq == capture.proof_attempt_seq,
+        attempt.prompt_level == capture.proof_prompt_level,
+        attempt.is_simulation == capture.is_simulation,
+        attempt.duration_seconds == receipt.duration_seconds,
+        # The ASR facts were double-written in one transaction; a later edit to
+        # either copy must not still yield a drain target.
+        attempt.asr_engine_version == capture.asr_engine_version,
+        attempt.asr_confidence == capture.asr_confidence,
+        receipt.raw_audio_id == capture.raw_audio_id,
+        receipt.session_id == capture.session_id,
+        receipt.turn_key == command.turn_key,
+    )
+    if not all(attempt_facts):
+        return False
+    if not legacy_attempt_closes_persisted_evidence(
+            db, attempt=attempt, record=command, capture=capture):
+        return False
+    try:
+        # Historical proof only: a legitimate later drain/takeover must not
+        # invalidate it, but the issued chain identity is immutable and a
+        # rewritten record/predecessor pair must never earn a drain target.
+        autopilot_ledger.verify_immutable_record_capture(db, command)
+    except autopilot_ledger.AutopilotProofError:
+        return False
+    return legacy_attempt_is_successfully_judged(db, attempt)
+
+
 def _external_stop_pause_matches(
+    db: Session,
     event: AutopilotControlEvent,
     *,
     state: SessionAutopilotState,
@@ -2172,6 +2809,14 @@ def _external_stop_pause_matches(
         return event.actor_type == "system" and event.actor_id is None
     if payload["source"] == "protocol_position_gap":
         return event.actor_type == "system" and event.actor_id is None
+    if payload["source"] == REPEAT_PAUSE_SOURCE:
+        return (event.actor_type == "system" and event.actor_id is None
+                and event.reason_code == REPEAT_LIMIT_REASON_CODE)
+    if payload["source"] == LEGACY_REPEAT_RECOVERY_SOURCE:
+        return (event.actor_type == "system" and event.actor_id is None
+                and event.reason_code == LEGACY_REPEAT_RECOVERY_REASON_CODE
+                and _legacy_recovery_pause_matches(
+                    db, event, state=state, command=command))
     return payload["source"] == "session_abort" and event.actor_type == "researcher"
 
 
@@ -2225,7 +2870,7 @@ def get_drain_target(
         (state.status == "paused" and _researcher_pause_matches(
             latest, state=state, command=command))
         or (state.status == "paused" and _external_stop_pause_matches(
-            latest, state=state, command=command))
+            db, latest, state=state, command=command))
         or (state.status == "paused" and _drain_event_matches(
             latest, state=state, command=command, capability=capability))
         or _failure_proves_media_terminal(
@@ -2305,7 +2950,7 @@ def acknowledge_device_drain(
             or not (
                 _researcher_pause_matches(latest, state=state, command=command)
                 or _external_stop_pause_matches(
-                    latest, state=state, command=command)
+                    db, latest, state=state, command=command)
             )):
         _fail(
             "autopilot_drain_pause_mismatch",
@@ -2786,6 +3431,7 @@ def route_tts_ended(
     if state is None or tts is None or state.scope_key != P0A_SCOPE_KEY:
         _fail("autopilot_command_not_current", "TTS 命令不存在或不属于当前 P0a")
     _validate_command_identity(tts, gate.selected)
+    _require_command_repeat_binding(tts, gate.train_session)
     _require_same_issued_active_device(tts, gate.active_capability)
     try:
         tts_payload = TtsCommandPayload.model_validate_json(tts.payload_json)
@@ -2905,6 +3551,14 @@ def route_tts_ended(
             attempt_seq=tts.attempt_seq,
             prompt_level=tts.prompt_level,
             **_command_definition_fields(gate.selected),
+            # Inherit provenance from the predecessor TTS command bound to this
+            # recording — including a replayed one — instead of re-reading
+            # today's active version.  That binding rests on the device's
+            # canonical media-ended ACK for that command; it proves neither
+            # that a person heard anything nor any audio identity.
+            repeat_protocol_version_id=tts.repeat_protocol_version_id,
+            repeat_protocol_definition_digest=(
+                tts.repeat_protocol_definition_digest),
             scope_key=P0A_SCOPE_KEY,
             control_generation=tts.control_generation,
             runner_generation=tts.runner_generation,
@@ -2956,6 +3610,7 @@ def route_tts_ended(
             attempt_seq=1,
             prompt_level=0,
             **_command_definition_fields(next_selected),
+            **_command_repeat_binding_fields(gate.train_session),
             scope_key=P0A_SCOPE_KEY,
             control_generation=tts.control_generation,
             runner_generation=tts.runner_generation,
@@ -3813,6 +4468,7 @@ def route_completed_attempt(
         position_turn_seq=record.turn_seq,
     )
 
+    _require_command_repeat_binding(record, gate.train_session)
     _require_completed_operational_attempt(
         db, attempt=attempt, record=record, selected=gate.selected)
     decision = _attempt_route_decision(
@@ -3916,6 +4572,7 @@ def route_completed_attempt(
         attempt_seq=decision.attempt_seq,
         prompt_level=decision.prompt_level,
         **_command_definition_fields(gate.selected),
+        **_command_repeat_binding_fields(gate.train_session),
         scope_key=P0A_SCOPE_KEY,
         control_generation=claim.control_generation,
         runner_generation=claim.runner_generation,
@@ -3957,6 +4614,664 @@ def route_completed_attempt(
         replayed=False,
         state_revision=final_state.revision,
         command=projection,
+    )
+
+
+def repeat_replay_command_key(session_id: str, capture_id: int) -> str:
+    """Derive the replay command idempotency key from capture identity + ordinal."""
+    return _derived_key("cmd-repeat-replay", session_id, capture_id, 1)
+
+
+def repeat_limit_event_key(session_id: str, capture_id: int) -> str:
+    """Derive the limit-pause event idempotency key from capture identity."""
+    return _derived_key("repeat-limit", session_id, capture_id)
+
+
+def legacy_repeat_recovery_event_key(session_id: str, capture_id: int) -> str:
+    """Derive the legacy-recovery pause key from the exact capture identity."""
+    return _derived_key("legacy-repeat-recovery", session_id, capture_id)
+
+
+def _require_repeat_source_tts(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+    record: RuntimeCommand,
+    gate: _P0aGate,
+) -> RuntimeCommand:
+    """Prove the exact predecessor TTS command this recording answered.
+
+    Only the recording's own persisted predecessor qualifies, and only when it
+    is a succeeded question/cue TTS whose bound device submitted a canonical
+    ``tts_ended``/``media_ended`` ACK on the same device, generation and frozen
+    slot.  Nothing here is re-derived from today's item bank: the replay must
+    reproduce the historical command's canonical ``payload_json``.
+
+    That ACK is a device-submitted media fact.  It does not prove a person
+    heard anything, and it carries no audio identity: no WAV checksum, artifact
+    id or waveform binding exists on either side.
+    """
+    if (record.predecessor_command_id is None
+            or record.trigger_ack_idempotency_key is None):
+        _fail("autopilot_repeat_source_invalid", "录音命令缺少前置 TTS 溯源")
+    source = db.exec(select(RuntimeCommand).where(
+        RuntimeCommand.id == record.predecessor_command_id,
+        RuntimeCommand.session_id == record.session_id,
+    ).with_for_update()).first()
+    if source is None or source.kind != "tts" or source.state != "succeeded":
+        _fail("autopilot_repeat_source_invalid", "前置 TTS 命令不存在或未成功结束")
+    if (source.item_id != record.item_id
+            or source.turn_seq != record.turn_seq
+            or source.turn_key != record.turn_key
+            or source.attempt_seq != record.attempt_seq
+            or source.prompt_level != record.prompt_level
+            or source.scope_key != record.scope_key
+            or source.control_generation != record.control_generation
+            or source.runner_generation != record.runner_generation
+            or source.issued_capability_token_hash
+            != record.issued_capability_token_hash
+            or source.issued_device_id_hash != record.issued_device_id_hash):
+        _fail("autopilot_repeat_source_invalid", "前置 TTS 与录音命令不在同一冻结环节")
+    _validate_command_identity(source, gate.selected)
+    _require_command_repeat_binding(source, gate.train_session)
+    _require_same_issued_active_device(source, gate.active_capability)
+    _require_terminal_tts_ack(
+        db, state, source, record.trigger_ack_idempotency_key)
+    try:
+        payload = TtsCommandPayload.model_validate_json(source.payload_json)
+    except (TypeError, ValueError) as exc:
+        raise AutopilotServiceError(
+            "autopilot_repeat_source_invalid", "前置 TTS 载荷不符合封闭契约") from exc
+    if payload.purpose not in {"question", "cue"}:
+        _fail("autopilot_repeat_source_invalid", "只有提问或提示语音可以重播")
+    _validate_tts_semantics(source, payload, gate.selected)
+    return source
+
+
+def _repeat_slot_requests(
+    db: Session,
+    *,
+    session_id: str,
+    item_id: str,
+    turn_seq: int,
+    attempt_seq: int,
+    prompt_level: int,
+) -> list[AutopilotRepeatRequest]:
+    """Every repeat request already recorded for one logical attempt slot."""
+    return list(db.exec(select(AutopilotRepeatRequest).where(
+        AutopilotRepeatRequest.session_id == session_id,
+        AutopilotRepeatRequest.item_id == item_id,
+        AutopilotRepeatRequest.turn_seq == turn_seq,
+        AutopilotRepeatRequest.attempt_seq == attempt_seq,
+        AutopilotRepeatRequest.prompt_level == prompt_level,
+    ).order_by(AutopilotRepeatRequest.repeat_ordinal).with_for_update()))
+
+
+def route_explicit_repeat(
+    db: Session,
+    *,
+    session_id: str,
+    capture_claim: evidence_ledger.CaptureClaim,
+    match: repeat_intent.RepeatMatch,
+    asr_confidence: float | None = None,
+    asr_engine_version: str | None = None,
+    bank: content.ItemBank | None = None,
+    protocol: dict | None = None,
+    now: datetime | None = None,
+) -> RouteExplicitRepeatResult:
+    """Dispose one claimed capture as an explicit repeat request.
+
+    The first request in a logical slot issues a new TTS command whose
+    canonical ``payload_json`` is a byte-for-byte copy of the predecessor
+    command's ``payload_json`` — the same frozen ``speech_text``, not the same
+    audio.  A second request in the same slot stops
+    automation and waits for a researcher instead of replaying forever.  Either
+    way no AttemptEvent is created, ``attempt_seq``/cue/prompt level are left
+    untouched, and the triggering recording, receipt and ASR evidence survive.
+
+    This is a provider-free transaction participant: it flushes but never
+    commits, and the caller must roll back on :class:`AutopilotServiceError`.
+    """
+    observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
+    resolved_bank = bank or _default_bank()
+    resolved_protocol = protocol or _default_protocol()
+
+    state = db.exec(select(SessionAutopilotState).where(
+        SessionAutopilotState.session_id == session_id,
+    ).with_for_update()).first()
+    if state is None or state.scope_key != P0A_SCOPE_KEY:
+        _fail("autopilot_not_active", "当前场次没有 P0a 自动驾驶状态")
+    if (state.mode != "autonomous" or state.status != "processing_attempt"
+            or state.current_command_id is None):
+        _fail("autopilot_repeat_not_current", "重复请求已不是当前处理目标")
+
+    record = db.exec(select(RuntimeCommand).where(
+        RuntimeCommand.id == state.current_command_id,
+        RuntimeCommand.session_id == session_id,
+    ).with_for_update()).first()
+    if (record is None or record.kind != "record" or record.state != "succeeded"
+            or record.scope_key != state.scope_key
+            or record.control_generation != state.control_generation
+            or record.runner_generation != state.runner_generation):
+        _fail("autopilot_repeat_capture_invalid", "重复请求缺少已成功的当前录音命令")
+
+    capture = db.exec(select(AttemptCaptureProcessing).where(
+        AttemptCaptureProcessing.id == capture_claim.capture_id,
+    ).with_for_update()).first()
+    if (capture is None
+            or capture.session_id != session_id
+            or capture.record_command_id != record.id
+            or capture.predecessor_command_id != record.predecessor_command_id
+            or capture.raw_audio_id != record.expected_raw_audio_id
+            or capture.item_id != record.item_id
+            or capture.turn_seq != record.turn_seq
+            or capture.proof_attempt_seq != capture_claim.proof_attempt_seq
+            or capture.proof_prompt_level != capture_claim.proof_prompt_level
+            or capture.processing_status != "received"):
+        _fail("autopilot_repeat_capture_invalid", "重复请求采集处理行与当前录音命令不一致")
+    # The admission marker, not the mere presence of a binding, decides whether
+    # this row may take the repeat path at all.  Both the persisted row and the
+    # claim the worker has been holding across provider I/O must say
+    # ``repeat_bound`` and must agree with each other, so a capture admitted
+    # before the protocol existed can never be routed as a repeat request.
+    if (capture.repeat_admission_semantics
+            != evidence_ledger.REPEAT_BOUND_ADMISSION
+            or capture_claim.repeat_admission_semantics
+            != evidence_ledger.REPEAT_BOUND_ADMISSION
+            or capture.repeat_admission_semantics
+            != capture_claim.repeat_admission_semantics):
+        _fail(
+            "autopilot_repeat_admission_not_bound",
+            "采集未按重复请求协议准入，禁止走重播路径",
+        )
+    # A capture with no frozen binding predates the protocol; it must stay on
+    # the pre-repeat answer flow rather than opt in halfway through a session.
+    if (capture.repeat_protocol_version_id is None
+            or capture.repeat_protocol_definition_digest is None
+            or capture.repeat_protocol_version_id != match.protocol_version_id
+            or capture.repeat_protocol_definition_digest
+            != match.protocol_definition_digest
+            or capture.repeat_protocol_version_id
+            != capture_claim.repeat_protocol_version_id
+            or capture.repeat_protocol_definition_digest
+            != capture_claim.repeat_protocol_definition_digest):
+        _fail(
+            "autopilot_repeat_binding_missing",
+            "采集缺少冻结的重复请求协议绑定，禁止走重播路径",
+        )
+
+    gate = _require_gate(
+        db,
+        session_id,
+        bank=resolved_bank,
+        protocol=resolved_protocol,
+        now=observed_at,
+        position_item_id=record.item_id,
+        position_turn_seq=record.turn_seq,
+    )
+    _validate_command_identity(record, gate.selected)
+    _require_command_repeat_binding(record, gate.train_session)
+    if (gate.train_session.repeat_protocol_version_id
+            != capture.repeat_protocol_version_id
+            or gate.train_session.repeat_protocol_definition_digest
+            != capture.repeat_protocol_definition_digest):
+        _fail(
+            "autopilot_repeat_binding_missing",
+            "采集绑定的重复请求协议与场次不一致",
+        )
+
+    try:
+        proof = autopilot_ledger.verify_record_capture_for_attempt(db, record.id)
+    except autopilot_ledger.AutopilotProofError as exc:
+        raise AutopilotServiceError(
+            "autopilot_record_capture_invalid",
+            "重复请求路由前录音采集证据复核失败") from exc
+    if (proof.session_id != session_id
+            or proof.raw_audio_id != capture.raw_audio_id
+            or proof.item_id != capture.item_id
+            or proof.turn_seq != capture.turn_seq
+            or proof.attempt_seq != capture.proof_attempt_seq
+            or proof.prompt_level != capture.proof_prompt_level):
+        _fail("autopilot_repeat_capture_invalid", "重复请求与 capture proof 不精确匹配")
+
+    source = _require_repeat_source_tts(
+        db, state=state, record=record, gate=gate)
+    source_payload_sha256 = hashlib.sha256(
+        source.payload_json.encode("utf-8")).hexdigest()
+
+    if db.exec(select(AutopilotRepeatRequest).where(
+            AutopilotRepeatRequest.capture_processing_id == capture.id,
+    ).with_for_update()).first() is not None:
+        _fail(
+            "autopilot_repeat_idempotency_conflict",
+            "该采集已有重复请求账本，但采集本身仍未终态",
+        )
+
+    prior = _repeat_slot_requests(
+        db,
+        session_id=session_id,
+        item_id=capture.item_id,
+        turn_seq=capture.turn_seq,
+        attempt_seq=capture.proof_attempt_seq,
+        prompt_level=capture.proof_prompt_level,
+    )
+    if not prior:
+        ordinal = 1
+    elif (len(prior) == 1 and prior[0].repeat_ordinal == 1
+            and prior[0].outcome == "replayed"):
+        ordinal = 2
+    else:
+        _fail(
+            "autopilot_repeat_limit_exhausted",
+            "该环节的重复请求账本已达上限或状态不一致",
+        )
+
+    if ordinal == 1:
+        return _issue_repeat_replay(
+            db,
+            state=state,
+            gate=gate,
+            record=record,
+            source=source,
+            capture=capture,
+            capture_claim=capture_claim,
+            match=match,
+            source_payload_sha256=source_payload_sha256,
+            asr_confidence=asr_confidence,
+            asr_engine_version=asr_engine_version,
+            observed_at=observed_at,
+        )
+    return _pause_at_repeat_limit(
+        db,
+        state=state,
+        gate=gate,
+        record=record,
+        source=source,
+        capture=capture,
+        capture_claim=capture_claim,
+        match=match,
+        first_request=prior[0],
+        source_payload_sha256=source_payload_sha256,
+        asr_confidence=asr_confidence,
+        asr_engine_version=asr_engine_version,
+        observed_at=observed_at,
+    )
+
+
+def _repeat_request_row(
+    *,
+    capture: AttemptCaptureProcessing,
+    record: RuntimeCommand,
+    source: RuntimeCommand,
+    match: repeat_intent.RepeatMatch,
+    ordinal: int,
+    outcome: Literal["replayed", "limit_paused"],
+    source_payload_sha256: str,
+    replay_command_id: int | None,
+    pause_control_event_seq: int | None,
+    asr_confidence: float | None,
+    asr_engine_version: str | None,
+    observed_at: datetime,
+) -> AutopilotRepeatRequest:
+    return AutopilotRepeatRequest(
+        capture_processing_id=capture.id,
+        session_id=capture.session_id,
+        item_id=capture.item_id,
+        turn_seq=capture.turn_seq,
+        attempt_seq=capture.proof_attempt_seq,
+        prompt_level=capture.proof_prompt_level,
+        repeat_ordinal=ordinal,
+        outcome=outcome,
+        record_command_id=record.id,
+        raw_audio_id=capture.raw_audio_id,
+        source_tts_command_id=source.id,
+        source_payload_sha256=source_payload_sha256,
+        replay_command_id=replay_command_id,
+        pause_control_event_seq=pause_control_event_seq,
+        asr_confidence=asr_confidence,
+        asr_engine_version=asr_engine_version,
+        repeat_protocol_version_id=capture.repeat_protocol_version_id,
+        repeat_protocol_definition_digest=(
+            capture.repeat_protocol_definition_digest),
+        phrase_key=match.phrase_key,
+        normalized_text_sha256=match.normalized_text_sha256,
+        created_at=observed_at,
+        is_simulation=capture.is_simulation,
+    )
+
+
+def _terminalize_repeat_capture(
+    db: Session,
+    *,
+    capture: AttemptCaptureProcessing,
+    capture_claim: evidence_ledger.CaptureClaim,
+    request: AutopilotRepeatRequest,
+    disposition: Literal["repeat_replayed", "repeat_limit_paused"],
+    asr_confidence: float | None,
+    asr_engine_version: str | None,
+    observed_at: datetime,
+) -> None:
+    """Bind the capture to its repeat request; never to an AttemptEvent."""
+    if request.id is None:  # pragma: no cover - flush postcondition
+        _fail("autopilot_state_invalid", "重复请求账本未能持久化")
+    if not evidence_ledger.fenced_capture_update(
+        db,
+        capture_claim,
+        next_status="asr_completed",
+        values={
+            "asr_confidence": asr_confidence,
+            "asr_engine_version": asr_engine_version,
+            "disposition": disposition,
+            "processed_at": observed_at,
+            "repeat_request_id": request.id,
+        },
+    ):
+        _fail("autopilot_repeat_capture_cas_conflict", "重复请求采集终态 CAS 已失效")
+    db.expire(capture)
+
+
+def _issue_repeat_replay(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+    gate: _P0aGate,
+    record: RuntimeCommand,
+    source: RuntimeCommand,
+    capture: AttemptCaptureProcessing,
+    capture_claim: evidence_ledger.CaptureClaim,
+    match: repeat_intent.RepeatMatch,
+    source_payload_sha256: str,
+    asr_confidence: float | None,
+    asr_engine_version: str | None,
+    observed_at: datetime,
+) -> RouteExplicitRepeatResult:
+    """Replay command -> repeat ledger -> capture terminal -> state CAS."""
+    session_id = state.session_id
+    active_capability = _lock_active_attempt_route_device(
+        db,
+        session_id=session_id,
+        expected=gate.active_capability,
+        now=observed_at,
+    )
+    replay_key = repeat_replay_command_key(session_id, capture.id)
+    if _command_by_key(db, session_id, replay_key) is not None:
+        _fail(
+            "autopilot_repeat_idempotency_conflict",
+            "重播命令已存在但采集仍未终态",
+        )
+
+    owner = "repeat-replay-" + autopilot_ledger.new_lease_owner()
+    if not autopilot_ledger.try_recover_processing_attempt_state(
+        db,
+        session_id,
+        current_record_command_id=record.id,
+        owner=owner,
+        expected_revision=state.revision,
+        expected_control_generation=state.control_generation,
+        expected_runner_generation=state.runner_generation,
+        now=observed_at,
+    ):
+        _fail("autopilot_repeat_route_cas_conflict", "重复请求路由状态 CAS 已失效")
+    db.expire(state)
+    claimed_state = db.get(SessionAutopilotState, session_id)
+    if claimed_state is None:  # pragma: no cover - locked-row invariant
+        _fail("autopilot_state_invalid", "自动驾驶状态已消失")
+    try:
+        claim = autopilot_ledger.claim_from_autopilot_state(claimed_state)
+    except ValueError as exc:  # pragma: no cover - helper postcondition
+        raise AutopilotServiceError(
+            "autopilot_repeat_route_cas_conflict", "重复请求路由租约事实不完整") from exc
+
+    replay = RuntimeCommand(
+        idempotency_key=replay_key,
+        session_id=session_id,
+        command_seq=claimed_state.next_command_seq,
+        item_id=source.item_id,
+        turn_seq=source.turn_seq,
+        turn_key=source.turn_key,
+        attempt_seq=source.attempt_seq,
+        prompt_level=source.prompt_level,
+        item_bank_version_id=source.item_bank_version_id,
+        item_bank_definition_digest=source.item_bank_definition_digest,
+        autopilot_protocol_version_id=source.autopilot_protocol_version_id,
+        autopilot_protocol_definition_digest=(
+            source.autopilot_protocol_definition_digest),
+        response_role=source.response_role,
+        repeat_protocol_version_id=source.repeat_protocol_version_id,
+        repeat_protocol_definition_digest=(
+            source.repeat_protocol_definition_digest),
+        scope_key=P0A_SCOPE_KEY,
+        control_generation=claim.control_generation,
+        runner_generation=claim.runner_generation,
+        issued_capability_token_hash=active_capability.token_hash,
+        issued_device_id_hash=active_capability.device_id_hash,
+        issued_at=observed_at,
+        kind="tts",
+        state="pending",
+        # Byte-for-byte copy of the predecessor command's canonical
+        # payload_json.  Re-generating it from today's item bank could
+        # substitute another currently-valid line.  The audio itself is
+        # synthesized again downstream; nothing here binds WAV bytes.
+        payload_json=source.payload_json,
+        replay_source_command_id=source.id,
+        replay_ordinal=1,
+        replay_source_payload_sha256=source_payload_sha256,
+        created_at=observed_at,
+        updated_at=observed_at,
+    )
+    db.add(replay)
+    db.flush()
+    if replay.id is None:  # pragma: no cover - SQLAlchemy invariant
+        _fail("autopilot_state_invalid", "重播 TTS 命令未能持久化")
+    if (replay.payload_json != source.payload_json
+            or hashlib.sha256(replay.payload_json.encode("utf-8")).hexdigest()
+            != source_payload_sha256):
+        _fail("autopilot_repeat_replay_payload_invalid", "重播载荷不是源命令逐字节副本")
+
+    request = _repeat_request_row(
+        capture=capture,
+        record=record,
+        source=source,
+        match=match,
+        ordinal=1,
+        outcome="replayed",
+        source_payload_sha256=source_payload_sha256,
+        replay_command_id=replay.id,
+        pause_control_event_seq=None,
+        asr_confidence=asr_confidence,
+        asr_engine_version=asr_engine_version,
+        observed_at=observed_at,
+    )
+    db.add(request)
+    db.flush()
+
+    _terminalize_repeat_capture(
+        db,
+        capture=capture,
+        capture_claim=capture_claim,
+        request=request,
+        disposition="repeat_replayed",
+        asr_confidence=asr_confidence,
+        asr_engine_version=asr_engine_version,
+        observed_at=observed_at,
+    )
+
+    if not autopilot_ledger.fenced_autopilot_update(
+        db,
+        claim,
+        values={
+            "status": "waiting_tts",
+            "current_command_id": replay.id,
+            "next_command_seq": claimed_state.next_command_seq + 1,
+            "last_error_code": None,
+        },
+        release_lease=True,
+        now=observed_at,
+    ):
+        _fail("autopilot_repeat_route_cas_conflict", "重复请求发行 CAS 已失效")
+    db.flush()
+    db.expire(claimed_state)
+    final_state = db.get(SessionAutopilotState, session_id)
+    if final_state is None:  # pragma: no cover - locked-row invariant
+        _fail("autopilot_state_invalid", "自动驾驶状态已消失")
+    # The patient device must still see an ordinary, strictly validated command.
+    _project_command(
+        db, replay, gate.selected, expected_capability=active_capability)
+    return RouteExplicitRepeatResult(
+        outcome="replayed",
+        repeat_ordinal=1,
+        state_revision=final_state.revision,
+    )
+
+
+def _pause_at_repeat_limit(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+    gate: _P0aGate,
+    record: RuntimeCommand,
+    source: RuntimeCommand,
+    capture: AttemptCaptureProcessing,
+    capture_claim: evidence_ledger.CaptureClaim,
+    match: repeat_intent.RepeatMatch,
+    first_request: AutopilotRepeatRequest,
+    source_payload_sha256: str,
+    asr_confidence: float | None,
+    asr_engine_version: str | None,
+    observed_at: datetime,
+) -> RouteExplicitRepeatResult:
+    """Pause event -> ordinal 2 ledger -> capture terminal -> control CAS."""
+    session_id = state.session_id
+    # Same device fence as the replay path: a rotation committed by another
+    # process between the gate read and this transaction must lose here too,
+    # before any event, ledger row or state change is written.
+    _lock_active_attempt_route_device(
+        db,
+        session_id=session_id,
+        expected=gate.active_capability,
+        now=observed_at,
+    )
+    if (first_request.replay_command_id is None
+            or first_request.replay_command_id != source.id
+            or first_request.record_command_id == record.id
+            or first_request.capture_processing_id == capture.id):
+        _fail(
+            "autopilot_repeat_slot_history_invalid",
+            "第二次重复请求与已成功重播的账本事实不一致",
+        )
+    pause_key = repeat_limit_event_key(session_id, capture.id)
+    if db.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.idempotency_key == pause_key,
+    )).first() is not None:
+        _fail(
+            "autopilot_repeat_idempotency_conflict",
+            "重复请求上限暂停事实已存在但采集仍未终态",
+        )
+
+    event_seq = _next_control_event_seq(db, session_id)
+    event = AutopilotControlEvent(
+        idempotency_key=pause_key,
+        session_id=session_id,
+        event_seq=event_seq,
+        event_type="pause",
+        scope_key=state.scope_key,
+        control_generation=state.control_generation,
+        runner_generation=state.runner_generation,
+        command_id=record.id,
+        actor_type="system",
+        actor_id=None,
+        reason_code=REPEAT_LIMIT_REASON_CODE,
+        from_mode="autonomous",
+        to_mode="autonomous",
+        from_status="processing_attempt",
+        to_status="paused",
+        payload_json=autopilot_ledger.encode_control_event_payload(
+            "pause", {
+                "reason_code": REPEAT_LIMIT_REASON_CODE,
+                "source": REPEAT_PAUSE_SOURCE,
+            }),
+        created_at=observed_at,
+    )
+    db.add(event)
+    db.flush()
+
+    request = _repeat_request_row(
+        capture=capture,
+        record=record,
+        source=source,
+        match=match,
+        ordinal=2,
+        outcome="limit_paused",
+        source_payload_sha256=source_payload_sha256,
+        replay_command_id=None,
+        pause_control_event_seq=event.event_seq,
+        asr_confidence=asr_confidence,
+        asr_engine_version=asr_engine_version,
+        observed_at=observed_at,
+    )
+    db.add(request)
+    db.flush()
+    bound_event = db.exec(select(AutopilotControlEvent).where(
+        AutopilotControlEvent.session_id == request.session_id,
+        AutopilotControlEvent.event_seq == request.pause_control_event_seq,
+    )).first()
+    if (bound_event is None or bound_event.id != event.id
+            or bound_event.event_type != "pause"
+            or bound_event.command_id != record.id
+            or bound_event.reason_code != REPEAT_LIMIT_REASON_CODE
+            or bound_event.control_generation != state.control_generation
+            or bound_event.runner_generation != state.runner_generation):
+        _fail(
+            "autopilot_repeat_pause_binding_invalid",
+            "重复请求账本与暂停事实的双向指针不一致",
+        )
+
+    _terminalize_repeat_capture(
+        db,
+        capture=capture,
+        capture_claim=capture_claim,
+        request=request,
+        disposition="repeat_limit_paused",
+        asr_confidence=asr_confidence,
+        asr_engine_version=asr_engine_version,
+        observed_at=observed_at,
+    )
+
+    result = db.execute(
+        update(SessionAutopilotState)
+        .where(
+            SessionAutopilotState.session_id == session_id,
+            SessionAutopilotState.scope_key == state.scope_key,
+            SessionAutopilotState.mode == "autonomous",
+            SessionAutopilotState.status == "processing_attempt",
+            SessionAutopilotState.current_command_id == record.id,
+            SessionAutopilotState.control_generation == state.control_generation,
+            SessionAutopilotState.runner_generation == state.runner_generation,
+            SessionAutopilotState.revision == state.revision,
+        )
+        .values(
+            status="paused",
+            current_command_id=None,
+            revision=SessionAutopilotState.revision + 1,
+            last_error_code=REPEAT_LIMIT_REASON_CODE,
+            lease_owner=None,
+            lease_acquired_at=None,
+            lease_expires_at=None,
+            updated_at=observed_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        _fail("autopilot_repeat_route_cas_conflict", "重复请求上限暂停 CAS 已失效")
+    db.flush()
+    db.expire(state)
+    final_state = db.get(SessionAutopilotState, session_id)
+    if final_state is None:  # pragma: no cover - locked-row invariant
+        _fail("autopilot_state_invalid", "自动驾驶状态已消失")
+    return RouteExplicitRepeatResult(
+        outcome="limit_paused",
+        repeat_ordinal=2,
+        state_revision=final_state.revision,
     )
 
 
@@ -4181,6 +5496,7 @@ def apply_device_ack(
         turn_seq=command.turn_seq,
     )
     _validate_command_identity(command, replay_selected)
+    _require_command_repeat_binding(command, train_session)
 
     candidate = _ack_candidate(
         command=command,
@@ -4329,6 +5645,11 @@ def apply_device_ack(
         )
 
     if transition.effect == "process_attempt":
+        # Capture admission is the point where the frozen repeat binding is
+        # copied forward.  An unbound or drifted command must never reach it:
+        # a NULL copied into a capture would make a later "再说一遍" score as
+        # an answer under the legacy flow.
+        _require_command_repeat_binding(command, gate.train_session)
         state.status = "processing_attempt"
         state.current_command_id = command.id
         state.revision += 1
@@ -4358,6 +5679,9 @@ def apply_device_ack(
             turn_seq=proof.turn_seq,
             proof_attempt_seq=proof.attempt_seq,
             proof_prompt_level=proof.prompt_level,
+            repeat_protocol_version_id=command.repeat_protocol_version_id,
+            repeat_protocol_definition_digest=(
+                command.repeat_protocol_definition_digest),
             is_simulation=gate.train_session.is_simulation,
             now=observed_at,
         )

@@ -65,8 +65,16 @@ export function remainingAnswerWindowMs(
   return Math.max(0, answerWindowMs(maxDurationSeconds) - elapsedSinceStartMs);
 }
 
+/**
+ * 开麦前整段准备的绝对预算。这是 pre-start 窗口里**唯一**的一个数：prepare、
+ * 权限返回后的第二次服务端授权、等待真实 onstart 全部受它约束，也只武装一个
+ * 定时器。控制器不得再为 capture.started 另起一个超时——两个 owner 就是两条
+ * 互相竞争的截止时刻，谁先烧取决于调度，判定就不可复现了。
+ */
+export const PRE_START_BUDGET_MS = 20_000;
+
 export interface CaptureAdmissionDeadlinePorts {
-  /** 绝对截止时刻，与 now() 同一条单调时钟；由真实录音起点 + 作答窗口算出。 */
+  /** 绝对截止时刻，与 now() 同一条单调时钟。 */
   deadlineAt: number;
   /** 单调时钟读数（生产是 performance.now）。 */
   now(): number;
@@ -101,63 +109,99 @@ function failClosedBestEffort(
 }
 
 /**
- * 权限返回后的那次授权复核，与本次录音的截止时刻做**可取消的赛跑**。
+ * 一个已武装的绝对截止时刻，供整段 pre-start 共用。
  *
- * 光靠一个"到点 signalStop"的定时器不够：协程此刻还卡在授权请求的 await 上，
- * 没人去停麦。请求要是卡过截止时刻（甚至永不返回），麦会一直热着，等授权
- * 终于回来才 stop——那就真录满了几十秒，还会把这段必被拒的超限音频上传。
+ * `race` 可以调用任意多次，`setTimer` 只发生一次；`clear` 也只撤那一次。
+ */
+export interface CaptureDeadline {
+  readonly deadlineAt: number;
+  /**
+   * 按**绝对单调时钟**判定是否已过期，过期则就地判死并返回稳定错误。
+   * 判据不是"定时器烧没烧"：后台标签页被节流时，定时器可以晚到几秒才跑。
+   */
+  check(): AutopilotMediaError | null;
+  race<T>(operation: Promise<T>): Promise<T>;
+  clear(): void;
+}
+
+/**
+ * 武装本次采集唯一的那个 pre-start 定时器。
  *
- * 判据是**绝对截止时刻 + 单调时钟**，不是 Promise.race 谁先落地。race 只说明
- * 先后，不说明有没有过期：剩余窗口为 0 时一个已 resolved 的授权会稳赢
- * setTimeout(0)；定时器烧掉前一刻返回的授权同样已经越界。所以入口先核对一次、
- * 拿到结果之后再核对一次，两次都过不去就 fail closed。
+ * 判死时的次序是刻意的：先让 expiry 稳定 settle，再做 fail-closed 清理。反过来
+ * 做有两个坑——failClosed 会 abort 在途请求，那条 AbortError 可能抢先落地赢下
+ * race；failClosed 自己抛错更会让这个 promise 永远不 settle，请求又不返回时
+ * 整条采集就悬死了。
  *
  * 截止时刻赢的时候：立刻物理关麦、中止在途请求、拒绝这次采集（不产生
- * record_started/record_stopped，也不进持久化阶段）。授权按时返回才放行。
+ * record_started/record_stopped，也不进持久化阶段）。
  */
-export async function admitCaptureBeforeDeadline<T>(
-  authorization: Promise<T>,
-  ports: CaptureAdmissionDeadlinePorts,
-): Promise<T> {
-  // 被中止/被判死之后这条请求的结局已经没人消费；先挂一个吞掉的续延，免得
-  // 迟到的拒绝变成 unhandled rejection。
-  authorization.catch(() => {});
-  const remainingMs = ports.deadlineAt - ports.now();
-  if (remainingMs <= 0) {
-    const error = captureDeadlineError();
-    failClosedBestEffort(ports, error);
-    throw error;
-  }
+export function armCaptureDeadline(ports: CaptureAdmissionDeadlinePorts): CaptureDeadline {
   const expiry: { error: AutopilotMediaError | null } = { error: null };
   let handle: number | null = null;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    handle = ports.setTimer(() => {
-      const error = captureDeadlineError();
-      expiry.error = error;
-      // 先让 deadline 稳定 settle，再做 fail-closed 清理。反过来做有两个坑：
-      // failClosed 会 abort 在途请求，那条 AbortError 可能抢先落地赢下 race；
-      // failClosed 自己抛错更会让这个 promise 永远不 settle，授权又不返回时
-      // 整条采集就悬死了。
-      reject(error);
-      failClosedBestEffort(ports, error);
-    }, remainingMs);
-  });
-  try {
-    const value = await Promise.race([authorization, deadline]);
-    if (expiry.error !== null) throw expiry.error;
-    if (ports.now() >= ports.deadlineAt) {
-      const error = captureDeadlineError();
-      failClosedBestEffort(ports, error);
-      throw error;
-    }
-    return value;
-  } catch (error) {
-    // 被 abort 的授权抛出的 AbortError 可能先赢 race。只要截止时刻已经判死，
-    // 对外一律是 device_command_timeout，不让传输层错误盖掉真正的原因。
-    throw expiry.error ?? error;
-  } finally {
-    if (handle !== null) ports.clearTimer(handle);
-  }
+  let rejectExpiry: ((reason: unknown) => void) | null = null;
+  const expired = new Promise<never>((_resolve, reject) => { rejectExpiry = reject; });
+  // 没有任何一段 race 它的时候，这条拒绝也不能掀翻进程。
+  expired.catch(() => {});
+
+  const fire = (): AutopilotMediaError => {
+    if (expiry.error !== null) return expiry.error;
+    const error = captureDeadlineError();
+    expiry.error = error;
+    rejectExpiry?.(error);
+    failClosedBestEffort(ports, error);
+    return error;
+  };
+
+  const check = (): AutopilotMediaError | null => {
+    if (expiry.error !== null) return expiry.error;
+    return ports.now() >= ports.deadlineAt ? fire() : null;
+  };
+
+  const remainingMs = ports.deadlineAt - ports.now();
+  if (remainingMs <= 0) fire();
+  else handle = ports.setTimer(() => { fire(); }, remainingMs);
+
+  return {
+    deadlineAt: ports.deadlineAt,
+    check,
+    async race<T>(operation: Promise<T>): Promise<T> {
+      // 被中止/被判死之后这条请求的结局已经没人消费；先挂一个吞掉的续延，免得
+      // 迟到的拒绝变成 unhandled rejection。
+      operation.catch(() => {});
+      const before = check();
+      if (before) throw before;
+      try {
+        const value = await Promise.race([operation, expired]);
+        const after = check();
+        if (after) throw after;
+        return value;
+      } catch (error) {
+        // 被 abort 的请求抛出的 AbortError 可能先赢 race。只要截止时刻已经判死，
+        // 对外一律是 device_command_timeout，不让传输层错误盖掉真正的原因。
+        throw expiry.error ?? error;
+      }
+    },
+    clear() {
+      if (handle !== null) {
+        ports.clearTimer(handle);
+        handle = null;
+      }
+    },
+  };
+}
+
+/**
+ * 权限返回后的那次授权复核，与同一个 pre-start 截止时刻做**可取消的赛跑**。
+ *
+ * 光靠一个"到点 signalStop"的定时器不够：协程此刻还卡在授权请求的 await 上。
+ * 请求要是卡过截止时刻（甚至永不返回），设备准备状态会一直挂着，等授权终于
+ * 回来才收拾——所以由截止时刻直接判死并物理关麦。
+ */
+export function admitCaptureBeforeDeadline<T>(
+  authorization: Promise<T>,
+  deadline: CaptureDeadline,
+): Promise<T> {
+  return deadline.race(authorization);
 }
 
 /**

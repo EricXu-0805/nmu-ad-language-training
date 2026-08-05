@@ -50,15 +50,22 @@ TTS 两种模式（NMU_HARNESS_TTS_MODE）：
   任一项不满足即判失败，不得改判为通过。
   这只是把链路接到云上，**不等于真机验收本身**——真机结论由外部走查与证据注记判定。
 白名单红线在两种模式下不是同一回事，别混着说：
-- production：每一句上云文本都由生产 tts.speak 里那道 `eng.cloud and not
-  cloud_text_allowed(text) → 跳过` 拦着，红线真正在守。
-- synthetic：替身引擎 cloud=False，tts.speak 压根不会去查 allowlist——因为这条路径
+- production：每一句上云文本都由 tts 合成循环里那道 `eng.cloud and not
+  cloud_text_allowed(text) → 跳过` 拦着，红线真正在守；generic tts.speak 与
+  exact tts.speak_autopilot 共用这一份守卫，两条路都拦得住。
+- synthetic：替身引擎 cloud=False，合成循环压根不会去查 allowlist——因为这条路径
   上没有任何文本出网，红线无事可守。唯一仍无条件查 allowlist 的是 readiness 探针
   （provider_readiness 对固定探针话术的检查），两种模式都走。
 "harness 不新增任何文本"是独立成立的另一件事：合成题库是生产题库第一个已结构化
 位置的深拷贝，所以它的话术天然是生产 allowlist 的子集（测试里直接断言了这层包含）。
 
-浏览器验收到 tts_ended 后停在唯一 pending 的 record 命令即止，不开麦克风、不作答。
+浏览器验收当前走到哪一步(2026-07-31，synthetic 模式实测)：
+在隔离 localhost、真实 Chrome、synthetic 本地确定性 TTS/ASR、零 PHI、零云的条件下，
+已跑通"一次激活 → TTS 播放 → 自动开麦 → 约 14 秒自动停止 → 上传 → receipt/ACK"
+这条技术链;过程中没有点击"说完了可以点这里"那个可选提前结束按钮。
+这条记录**只**说明该技术链在上述条件下能跑通。它明确不是:不是 Qwen 音色验收
+(synthetic 引擎不是 Qwen)、不是目标双设备/真实内网环境、不是正式受试者、
+不是生产或研究 readiness 结论;也没有抓到"正在保存"过渡态的现场截图。
 
 harness 进程的每个响应都带 `X-NMU-Test-Harness: t5-one-position-v1`。**不改写 HTML
 正文**——重建响应会把重复的 Set-Cookie 合并掉，登录与设备配对会因此坏掉，一个视觉
@@ -577,6 +584,9 @@ def install(config: HarnessConfig):
     if config.tts_mode == "synthetic":
         tts._engine = None
         tts.get_engine = DeterministicHarnessTtsEngine
+        # exact 自动驾驶通道现在只认 Qwen，synthetic 验收必须显式注入同一个
+        # 确定性引擎；不注入的话 synthetic 场次会正确地 204 而不是出声。
+        tts.get_autopilot_engine = DeterministicHarnessTtsEngine
         asr.get_engine = DeterministicHarnessAsrEngine
     else:
         # 关掉 piper 降级层：云失败必须表现为明确降级，不能悄悄读仓库里的 onnx。

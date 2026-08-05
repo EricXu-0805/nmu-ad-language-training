@@ -26,9 +26,99 @@ function session(runtime_status: Session["runtime_status"], week_no = 2): Sessio
     item_bank_definition_digest: "1".repeat(64),
     autopilot_protocol_version_id: "autopilot-v1",
     autopilot_protocol_definition_digest: "2".repeat(64),
+    // Plan-linked, so the frozen repeat pair is complete, exactly as the
+    // backend serialises it; the strict reload parser requires both halves.
+    repeat_protocol_version_id: "repeat-intent-v1-20260730-proposal",
+    repeat_protocol_definition_digest: "3".repeat(64),
+    // Canonical full-source plan: the demo profile pair is explicitly absent,
+    // and the strict reload parser requires both keys to be present as null.
+    autopilot_profile_version_id: null,
+    autopilot_profile_definition_digest: null,
     runtime_status,
   };
 }
+
+const DEMO_PROFILE_VERSION = "week2-single20-demo-v1";
+const DEMO_PROFILE_DIGEST =
+  "a82bf3910e2e4f0f5a0b78eb3e4c9b8fc4d8a73f16bb570f118f1d5136311f34";
+
+// The key production actually reads.  The legacy `…:LOCAL-M0` key is deleted
+// on every load and never parsed, so seeding it would prove nothing.
+const CURRENT_CACHE_KEY = "nmu:console:state:local%3AM0";
+
+function withLocalStorage(store: Map<string, string>, run: () => void): void {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => { store.set(key, value); },
+      removeItem: (key: string) => { store.delete(key); },
+    },
+  });
+  try {
+    run();
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "localStorage", previous);
+    else Reflect.deleteProperty(globalThis, "localStorage");
+  }
+}
+
+/** The exact v2 envelope shape production writes and requires on read. */
+function envelope(sessionRow: unknown) {
+  return JSON.stringify({
+    version: 2,
+    identityScope: "local:M0",
+    state: {
+      area: "run", screen: "training", patientId: "P-1", session: sessionRow,
+    },
+  });
+}
+
+test("canonical cached session round-trips with both profile fields null", () => {
+  const store = new Map<string, string>();
+
+  withLocalStorage(store, () => {
+    persistConsoleState({
+      area: "run", screen: "training", patientId: "P-1",
+      session: session("active"),
+    });
+    assert.equal(store.has(CURRENT_CACHE_KEY), true);
+
+    const restored = loadConsoleState();
+    assert.equal(restored.screen, "training");
+    assert.equal(restored.session?.session_id, "S-1");
+    assert.equal(
+      Object.hasOwn(restored.session ?? {}, "autopilot_profile_version_id"), true);
+    assert.equal(
+      Object.hasOwn(restored.session ?? {}, "autopilot_profile_definition_digest"),
+      true);
+    assert.equal(restored.session?.autopilot_profile_version_id, null);
+    assert.equal(restored.session?.autopilot_profile_definition_digest, null);
+    assert.equal(store.has(CURRENT_CACHE_KEY), true);
+  });
+});
+
+test("a structurally valid paired-set cached session is discarded entirely", () => {
+  // Seeded directly rather than through persistConsoleState: that writer also
+  // validates, so a rejection there would prove the write path, not the read
+  // path this attack is aimed at.  Known version, valid lowercase 64-hex
+  // digest, plan-linked simulation row — shape-valid in every respect, yet
+  // D1A has no runtime able to execute it.
+  const store = new Map<string, string>([[
+    CURRENT_CACHE_KEY,
+    envelope({
+      ...session("active"),
+      autopilot_profile_version_id: DEMO_PROFILE_VERSION,
+      autopilot_profile_definition_digest: DEMO_PROFILE_DIGEST,
+    }),
+  ]]);
+
+  withLocalStorage(store, () => {
+    assert.deepEqual(loadConsoleState(), initialConsole);
+    assert.equal(store.has(CURRENT_CACHE_KEY), false);
+  });
+});
 
 test("terminal sessions enter wrapup while active sessions enter their live screen", () => {
   assert.equal(consoleReducer(initialConsole, { t: "sessionStarted", session: session("active") }).screen, "training");
@@ -170,6 +260,12 @@ test("malformed or forged workspace caches fail closed and are removed", () => {
       envelope({ ...validState, patientId: "P-OTHER" }),
       envelope({ ...validState, screen: "picker" }),
       envelope({ ...validState, session: { ...session("active"), runtime_status: "unknown" } }),
+      // Half a repeat binding is never a legacy shape: a cache carrying only
+      // one side must be discarded, not reloaded as a pre-protocol session.
+      envelope({ ...validState,
+        session: { ...session("active"), repeat_protocol_definition_digest: null } }),
+      envelope({ ...validState,
+        session: { ...session("active"), repeat_protocol_version_id: null } }),
     ];
     for (const payload of invalidPayloads) {
       store.set(key, payload);

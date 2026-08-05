@@ -1,6 +1,8 @@
 """Alembic acceptance checks for the independent assessment evidence domain."""
 from __future__ import annotations
 
+import logging
+
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -8,7 +10,7 @@ from sqlalchemy import create_engine, inspect, text
 
 
 PARENT = "e8a1c4b7d902"
-HEAD = "c7d4f9a1e603"
+HEAD = "e4a7c1d9b206"
 TABLES = {
     "assessmentevent",
     "assessmentinstance",
@@ -107,3 +109,21 @@ def test_assessment_migration_is_single_head_and_roundtrips_clean_sqlite(tmp_pat
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version")).scalar_one() == HEAD
+
+
+def test_upgrade_leaves_a_preexisting_app_logger_enabled(tmp_path):
+    """alembic.ini's fileConfig() used to default to
+    disable_existing_loggers=True, which silently disabled any app logger
+    already created before an in-process upgrade ran — masking caplog
+    assertions in tests that execute later in the same process. The
+    precondition below is asserted, not forced, so real ambient pollution
+    (from an earlier test) surfaces as a failure instead of being hidden.
+    """
+    target_logger = logging.getLogger("app.tts")
+    assert target_logger.disabled is False
+
+    db_path = tmp_path / "logger-state.sqlite"
+    config = _config(db_path)
+    command.upgrade(config, "head")
+
+    assert target_logger.disabled is False

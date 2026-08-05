@@ -6,6 +6,14 @@ import { createServer } from "vite";
 
 const COMMAND_KEY = "cmd-record-stage-0001";
 
+const IDENTITY = {
+  sessionId: "S-ONE",
+  commandKey: COMMAND_KEY,
+  ownerGeneration: 4,
+  captureGeneration: 2,
+};
+const LISTENING = { ...IDENTITY, phase: "listening" };
+
 function recordingView() {
   const command = {
     schema_version: 1,
@@ -42,6 +50,8 @@ function recordingView() {
     current: command,
     reason: null,
     assetReadiness: { requestKey: COMMAND_KEY, readiness: "ready" },
+    // 屏显与按钮由浏览器自己的 listening 驱动，不由服务器 runtime 驱动。
+    localCapturePhase: LISTENING,
     reportAssetReadiness: () => {},
     stopMediaNow: () => {},
     stopRecordingNow: () => {},
@@ -92,6 +102,7 @@ test("非录音阶段不出现这个可选按钮，也不出现它的提示", as
 
   const view = recordingView();
   view.runtime = { ...view.runtime, phase: "tts_playing" };
+  view.localCapturePhase = null;
   const markup = renderToStaticMarkup(React.createElement(PatientAutopilotStage, {
     autopilot: view,
     sessionId: "S-ONE",
@@ -103,4 +114,91 @@ test("非录音阶段不出现这个可选按钮，也不出现它的提示", as
   assert.doesNotMatch(markup, /说完了可以点这里/);
   assert.doesNotMatch(markup, /不点也可以，我们会自动继续/);
   assert.match(markup, /正在为您朗读/);
+});
+
+const PERSISTING = { ...IDENTITY, stopReason: "user_done", phase: "persisting" };
+
+async function stageMarkup(context, mutate) {
+  const vite = await createServer({
+    root: process.cwd(),
+    appType: "custom",
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  context.after(() => vite.close());
+  const { PatientAutopilotStage } = await vite.ssrLoadModule(
+    "/src/patient/PatientAutopilotStage.tsx",
+  );
+  const view = recordingView();
+  mutate(view);
+  return renderToStaticMarkup(React.createElement(PatientAutopilotStage, {
+    autopilot: view,
+    sessionId: "S-ONE",
+    activated: true,
+    ttsOn: true,
+    externallyPaused: false,
+  }));
+}
+
+test("物理收麦之后立刻改说正在保存，并收起可选按钮与提示", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    view.localCapturePhase = PERSISTING;
+  });
+
+  assert.match(markup, /已收音，正在保存，请稍候/);
+  // 麦克风已经关了，再说"正在听您说"就是在骗老人继续讲。
+  assert.doesNotMatch(markup, /正在听您说/);
+  assert.doesNotMatch(markup, /说完了可以点这里/);
+  assert.doesNotMatch(markup, /不点也可以，我们会自动继续/);
+});
+
+test("服务器 runtime 还没追上时也不许闪回监听态", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    view.localCapturePhase = PERSISTING;
+    view.runtime = { ...view.runtime, phase: "waiting_server_after_record" };
+  });
+
+  assert.match(markup, /已收音，正在保存，请稍候/);
+  assert.doesNotMatch(markup, /正在听您说/);
+  assert.doesNotMatch(markup, /说完了可以点这里/);
+});
+
+test("record_started 的网络 ACK 还没回来，屏幕已经在说正在听您说并给出按钮", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    // 服务器仍停在 waiting_recording：ACK 在途，runtime 尚未推进到 recording。
+    view.runtime = { ...view.runtime, phase: "waiting_recording" };
+    view.localCapturePhase = LISTENING;
+  });
+
+  assert.match(markup, /正在听您说/);
+  assert.match(markup, /说完了可以点这里/);
+  assert.match(markup, /不点也可以，我们会自动继续/);
+});
+
+test("旧场次或旧命令的本地事件一律不驱动屏显，也不给出按钮", async (context) => {
+  const staleSession = await stageMarkup(context, (view) => {
+    view.localCapturePhase = { ...LISTENING, sessionId: "S-OLD" };
+  });
+  assert.doesNotMatch(staleSession, /已收音，正在保存，请稍候/);
+  assert.doesNotMatch(staleSession, /正在听您说/);
+  assert.doesNotMatch(staleSession, /说完了可以点这里/);
+
+  const staleCommand = await stageMarkup(context, (view) => {
+    view.localCapturePhase = { ...PERSISTING, commandKey: "cmd-record-stage-0000" };
+  });
+  assert.doesNotMatch(staleCommand, /已收音，正在保存，请稍候/);
+  assert.doesNotMatch(staleCommand, /正在听您说/);
+  assert.doesNotMatch(staleCommand, /说完了可以点这里/);
+});
+
+test("生命周期清掉 listening 之后，服务器还停在 recording 也不残留按钮", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    // capture 已被 device_runtime_failed 丢弃，本地相位清空；
+    // 服务器 runtime 还没收到失败 ACK，仍然是 recording。
+    view.localCapturePhase = null;
+  });
+
+  assert.doesNotMatch(markup, /正在听您说/);
+  assert.doesNotMatch(markup, /说完了可以点这里/);
+  assert.doesNotMatch(markup, /不点也可以，我们会自动继续/);
 });

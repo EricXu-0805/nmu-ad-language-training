@@ -767,13 +767,14 @@ _CONTENT_CONTRACT_SCRIPT = """
 
     config = h.resolve_config(os.environ)
 
-    from app import autopilot_service, content
+    from app import autopilot_service, content, repeat_intent
     from app.models import Session as TrainSession
 
     production = content.load_item_bank(
         content.CONTENT_DIR / "item_bank_v1.json")
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
+    repeat_protocol = repeat_intent.active_protocol()
     synthetic = h.synthetic_single_position_bank(production)
 
     def _session(bank):
@@ -788,6 +789,8 @@ _CONTENT_CONTRACT_SCRIPT = """
             autopilot_protocol_version_id=protocol["protocol_version_id"],
             autopilot_protocol_definition_digest=(
                 content.autopilot_protocol_definition_digest(protocol)),
+            repeat_protocol_version_id=repeat_protocol.version_id,
+            repeat_protocol_definition_digest=repeat_protocol.definition_digest,
         )
 
     refusal = {}
@@ -1021,6 +1024,12 @@ _ENGINE_AND_MARKER_SCRIPT = """
 
     data, version, cached_first = tts.speak("小语来了")
     _, _, cached_second = tts.speak("小语来了")
+    # The exact autopilot route resolves its engine through a separate,
+    # Qwen-only entry point.  Distinct text keeps its cache entry separate, so
+    # a missing harness injection shows up as a degradation here rather than
+    # being masked by the generic call's cached bytes.
+    exact_data, exact_version, exact_first = tts.speak_autopilot("请说出这个词")
+    _, _, exact_second = tts.speak_autopilot("请说出这个词")
     written = sorted(p.name for p in config.tts_cache_dir.glob("*.wav"))
 
     engine = h.DeterministicHarnessAsrEngine()
@@ -1044,6 +1053,10 @@ _ENGINE_AND_MARKER_SCRIPT = """
         "version": version,
         "cached_first": cached_first,
         "cached_second": cached_second,
+        "exact_wav_ok": bool(exact_data) and exact_data.startswith(b"RIFF"),
+        "exact_version": exact_version,
+        "exact_cached_first": exact_first,
+        "exact_cached_second": exact_second,
         "cache_files": len(written),
         "cache_dir": str(tts.CACHE_DIR),
         "asr_boundary": engine.data_boundary,
@@ -1086,7 +1099,14 @@ def test_engine_substitutes_and_marker_boundaries(tmp_path):
     assert payload["wav_ok"] is True
     assert payload["version"] == "harness-synthetic/1"
     assert payload["cached_first"] is False and payload["cached_second"] is True
-    assert payload["cache_files"] == 1
+    # The exact autopilot entry point must be injected too, or synthetic
+    # acceptance would correctly degrade to 204 and play nothing.
+    assert payload["exact_wav_ok"] is True
+    assert payload["exact_version"] == "harness-synthetic/1"
+    assert payload["exact_cached_first"] is False
+    assert payload["exact_cached_second"] is True
+    # One cache entry per distinct text, both inside the temporary root.
+    assert payload["cache_files"] == 2
     assert payload["cache_dir"].startswith(str(root))
     assert not payload["cache_dir"].startswith(str(harness.PRODUCTION_DATA_DIR))
 

@@ -28,7 +28,6 @@ MAX_TTL_MINUTES = 120
 
 _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 _DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
-_LAST_SEEN_WRITE_INTERVAL = timedelta(minutes=1)
 _PAIR_LOCK = threading.RLock()
 
 
@@ -166,7 +165,16 @@ def resolve_capability(
 def resolve_capability_hash(
         s: Session, hashed_token: str | None,
         *, now: datetime | None = None) -> tuple[CapabilityResolution, PatientDeviceCapability | None]:
-    """Revalidate by persisted digest so long-running handlers never retain bearer text."""
+    """Resolve by persisted digest, read-only.
+
+    Never writes.  This runs inside the authentication middleware, before any
+    route has proved the bearer is even bound to the session it is addressing,
+    so a valid token pointed at the wrong session must not leave a trace in the
+    database.  ``last_seen_at`` used to be refreshed here; nothing reads it as
+    an authorization or liveness input, so the write was pure hidden side
+    effect and is gone.  Rate-limit identity is unchanged: it is derived from
+    ``device_id_hash``, not from this column.
+    """
     if (not isinstance(hashed_token, str) or len(hashed_token) != 64
             or any(ch not in "0123456789abcdef" for ch in hashed_token)):
         return CapabilityResolution.INVALID, None
@@ -180,11 +188,6 @@ def resolve_capability_hash(
         return CapabilityResolution.EXPIRED, row
     if row.recovery_only_at is not None:
         return CapabilityResolution.RECOVERY_ONLY, row
-    if (row.last_seen_at is None
-            or current - row.last_seen_at >= _LAST_SEEN_WRITE_INTERVAL):
-        row.last_seen_at = current
-        s.add(row)
-        s.commit()
     return CapabilityResolution.VALID, row
 
 

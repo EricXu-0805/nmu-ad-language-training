@@ -16,6 +16,7 @@ function receipt(overrides: Partial<VisitPlanReceipt>): VisitPlanReceipt {
     phase_type: "正式训练",
     event_line: "正式训练",
     item_bank_version_id: "v1",
+    autopilot_profile_version_id: null,
     is_simulation: true,
     data_classification: "simulation",
     status: "draft",

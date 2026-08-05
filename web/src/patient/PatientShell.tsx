@@ -19,6 +19,7 @@ import { PatientAutopilotStage } from "./PatientAutopilotStage";
 import { PatientStage } from "./PatientStage";
 import { parsePatientSessionPlan, type PatientSessionPlan } from "./patientPlan";
 import { RapportStage } from "./RapportStage";
+import { ttsToggleTitle } from "./ttsEngineLabel";
 import {
   clearTtsContext,
   currentVoiceName,
@@ -29,7 +30,7 @@ import {
   ttsEnabled,
 } from "./tts";
 import type { TtsPlaybackContextKey } from "./ttsContext";
-import { usePatientAutopilot } from "./usePatientAutopilot";
+import { usePatientAutopilot, type PatientAutopilotView } from "./usePatientAutopilot";
 
 // 老人端外壳:旧流程仍是只读游标显示器；只有服务器证明 P0a 活跃后，
 // 才互斥切换到独立的设备命令/ACK 运行器。
@@ -255,7 +256,8 @@ export function PatientShell() {
         setTtsOn(true);
       }
     }} />
-    <TtsToggle on={ttsOn} onChange={setTtsOn} sampleContextKey={ttsContextKey} />
+    <TtsToggle on={ttsOn} onChange={setTtsOn} sampleContextKey={ttsContextKey}
+      mode={autopilot.mode} />
     <PinPrompt />
   </>;
 }
@@ -278,10 +280,11 @@ function TapToStart({ tapped, onTap }: { tapped: boolean; onTap(): void }) {
 
 // 语音开关(设备本地设置,研究者代点):角落小钮,不进老人的视觉主线。
 // 点开即试读当前屏显文本——既给浏览器用户激活,也当场听到用的是哪个音色。
-function TtsToggle({ on, onChange, sampleContextKey }: {
+function TtsToggle({ on, onChange, sampleContextKey, mode }: {
   on: boolean;
   onChange(on: boolean): void;
   sampleContextKey: TtsPlaybackContextKey | null;
+  mode: PatientAutopilotView["mode"];
 }) {
   return (
     <button
@@ -289,7 +292,8 @@ function TtsToggle({ on, onChange, sampleContextKey }: {
       className="tts-toggle"
       aria-label={on ? "关闭语音朗读" : "开启语音朗读"}
       aria-pressed={on}
-      title={`语音${on ? "开" : "关"}${currentVoiceName() ? ` · 音色:${currentVoiceName()}` : " · 本机无中文语音"}`}
+      // 只有 legacy 平面才由本机音色出声，也只有它才可以读本机音色名。
+      title={ttsToggleTitle(on, mode, mode === "legacy" ? currentVoiceName() : null)}
       onClick={() => {
         const next = !on;
         setTtsEnabled(next);

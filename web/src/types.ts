@@ -58,6 +58,9 @@ export interface VisitPlanReceipt {
   phase_type: PhaseType;
   event_line: EventLine;
   item_bank_version_id: string;
+  // 服务端事实：null 表示 canonical 全量计划；非 null 只可能是已知的模拟演示
+  // profile 版本。摘要永不下发到账号端。
+  autopilot_profile_version_id: string | null;
   is_simulation: boolean;
   data_classification: "research" | "simulation";
   status: VisitPlanStatus;
@@ -225,6 +228,18 @@ export interface Session {
   item_bank_definition_digest?: string | null;
   autopilot_protocol_version_id?: string | null;
   autopilot_protocol_definition_digest?: string | null;
+  // 冻结的重复请求协议绑定，晚于上面三项才冻结：要么两项都为 null，要么两项
+  // 俱全。**新**由 VisitPlan 启动的场次必须俱全；但协议冻结之前就已启动的历史
+  // 场次即使挂着 visit_plan_id 也合法地两项为 null，服务端按 NULL == NULL 放行
+  // 它完成最后一次遗留恢复，因此恢复/列表读取不得把「有计划链接」等同于「有
+  // 重复绑定」。
+  repeat_protocol_version_id?: string | null;
+  repeat_protocol_definition_digest?: string | null;
+  // 模拟演示 profile 绑定：要么两项都为 null（canonical 全量计划），要么两项
+  // 俱全。类型沿用既有冻结事实的可选风格，但严格解析器仍要求两个 JSON 键
+  // 真实存在，缺键绝不默认成 null。
+  autopilot_profile_version_id?: string | null;
+  autopilot_profile_definition_digest?: string | null;
   // 旧后端不携带时按 active 兼容；终态场次只读，不可续做。
   runtime_status?: SessionRuntimeStatus;
   // 仅 journal 撤回墓碑投影携带:受试者/录音已撤回,本场内容读取已关闭。

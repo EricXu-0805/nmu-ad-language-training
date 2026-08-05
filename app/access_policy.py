@@ -397,6 +397,21 @@ def mutation_route_is_classified(method: str, path_template: str) -> bool:
     return any(rule.matches(method.upper(), sample_path) for rule in _ROUTE_RULES)
 
 
+def autopilot_next_session_id(method: str, path: str) -> str | None:
+    """The session id of an exact ``GET /sessions/{id}/autopilot/next``, else None.
+
+    Deliberately its own matcher rather than an entry in
+    :func:`device_recovery_candidate`: that list grants a recovery-only bearer
+    real route access, while this one only identifies the single route whose
+    authentication failure may still finish an already-durable terminal pause.
+    """
+    # GET only. A HEAD (or any other verb) must never reach a write path.
+    if method.upper() != "GET":
+        return None
+    matched = re.fullmatch(r"/sessions/([^/]+)/autopilot/next", path)
+    return matched.group(1) if matched is not None else None
+
+
 def device_recovery_candidate(method: str, path: str) -> bool:
     """Routes that may prove an already-persisted audio ACK after a session switch.
 

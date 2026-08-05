@@ -14,6 +14,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import asr, evidence_ledger, export, export_security, llm_judge
+from app import repeat_intent
 from app.db import get_session
 from app.enums import AnswerType
 from app.judging import PortraitLeakError
@@ -44,6 +45,10 @@ def client_db():
         yield TestClient(app), engine
     finally:
         app.dependency_overrides.clear()
+
+
+REPEAT_VERSION = repeat_intent.ACTIVE_REPEAT_INTENT_VERSION_ID
+REPEAT_DIGEST = repeat_intent.ACTIVE_REPEAT_INTENT_DEFINITION_DIGEST
 
 
 def _seed_session(client: TestClient, *, session_id: str = "S-AI",
@@ -452,6 +457,9 @@ def test_capture_processing_atomic_expired_takeover_and_generation_fence_on_sqli
             receipt_server_seq=1, raw_audio_id="race-capture-audio",
             session_id="S-CAPTURE-RACE", item_id="SE_锚", turn_seq=1,
             proof_attempt_seq=1, proof_prompt_level=0,
+            repeat_protocol_version_id=REPEAT_VERSION,
+            repeat_protocol_definition_digest=REPEAT_DIGEST,
+            repeat_admission_semantics="repeat_bound",
             processing_status="received",
             processing_owner="crashed", processing_lease_expires_at=expired_at,
             processing_claimed_at=expired_at - timedelta(seconds=10),
@@ -488,7 +496,10 @@ def test_capture_processing_atomic_expired_takeover_and_generation_fence_on_sqli
         stale_claim = evidence_ledger.CaptureClaim(
             capture_id=capture_id, owner="crashed", generation=7,
             proof_attempt_seq=1, proof_prompt_level=0,
-            lease_expires_at=expired_at)
+            lease_expires_at=expired_at,
+            repeat_protocol_version_id=REPEAT_VERSION,
+            repeat_protocol_definition_digest=REPEAT_DIGEST,
+            repeat_admission_semantics="repeat_bound")
         assert evidence_ledger.fenced_capture_update(
             session, stale_claim, next_status="asr_completed", values={
                 "asr_engine_version": "stale-asr",
@@ -529,6 +540,9 @@ def test_invalidate_capture_processing_claims_fences_in_flight_worker(tmp_path):
             receipt_server_seq=1, raw_audio_id="invalidate-capture-audio",
             session_id="S-CAPTURE-INVALIDATE", item_id="SE_锚", turn_seq=1,
             proof_attempt_seq=1, proof_prompt_level=0,
+            repeat_protocol_version_id=REPEAT_VERSION,
+            repeat_protocol_definition_digest=REPEAT_DIGEST,
+            repeat_admission_semantics="repeat_bound",
             processing_status="received",
             processing_owner="in-flight-worker",
             processing_lease_expires_at=datetime.now() + timedelta(seconds=60),
@@ -572,14 +586,20 @@ def test_ensure_capture_processing_is_idempotent_per_record_command(tmp_path):
             session, record_command_id=1, predecessor_command_id=2,
             receipt_server_seq=1, raw_audio_id="ensure-capture-audio",
             session_id="S-CAPTURE-ENSURE", item_id="SE_锚", turn_seq=1,
-            proof_attempt_seq=1, proof_prompt_level=0, is_simulation=True,
+            proof_attempt_seq=1, proof_prompt_level=0,
+            repeat_protocol_version_id=REPEAT_VERSION,
+            repeat_protocol_definition_digest=REPEAT_DIGEST,
+            is_simulation=True,
         )
         session.commit()
         second = evidence_ledger.ensure_capture_processing(
             session, record_command_id=1, predecessor_command_id=2,
             receipt_server_seq=1, raw_audio_id="ensure-capture-audio",
             session_id="S-CAPTURE-ENSURE", item_id="SE_锚", turn_seq=1,
-            proof_attempt_seq=1, proof_prompt_level=0, is_simulation=True,
+            proof_attempt_seq=1, proof_prompt_level=0,
+            repeat_protocol_version_id=REPEAT_VERSION,
+            repeat_protocol_definition_digest=REPEAT_DIGEST,
+            is_simulation=True,
         )
         session.commit()
         assert first.id == second.id
@@ -612,6 +632,9 @@ def test_ensure_capture_processing_integrity_error_only_rolls_back_its_own_savep
             receipt_server_seq=1, raw_audio_id="conflicting-audio-id",
             session_id="S-SAVEPOINT", item_id="SE_锚", turn_seq=1,
             proof_attempt_seq=1, proof_prompt_level=0,
+            repeat_protocol_version_id=REPEAT_VERSION,
+            repeat_protocol_definition_digest=REPEAT_DIGEST,
+            repeat_admission_semantics="repeat_bound",
             processing_status="received", is_simulation=True,
         ))
         session.commit()
@@ -634,7 +657,10 @@ def test_ensure_capture_processing_integrity_error_only_rolls_back_its_own_savep
                 session, record_command_id=1, predecessor_command_id=2,
                 receipt_server_seq=2, raw_audio_id="conflicting-audio-id",
                 session_id="S-SAVEPOINT", item_id="SE_锚", turn_seq=1,
-                proof_attempt_seq=1, proof_prompt_level=0, is_simulation=True,
+                proof_attempt_seq=1, proof_prompt_level=0,
+                repeat_protocol_version_id=REPEAT_VERSION,
+                repeat_protocol_definition_digest=REPEAT_DIGEST,
+                is_simulation=True,
             )
 
         # The outer transaction's own earlier write survives the failed

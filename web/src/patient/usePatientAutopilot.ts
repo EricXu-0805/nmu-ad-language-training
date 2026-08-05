@@ -33,6 +33,16 @@ import {
   fetchExactAutopilotDrainTarget,
 } from "./autopilotMediaTransport.ts";
 import { browserAutopilotMediaDependencies } from "./autopilotBrowserMediaDependencies.ts";
+import {
+  captureIdentityIsNewer,
+  sameCaptureIdentity,
+  type LocalAutopilotCaptureEvent,
+  type LocalAutopilotCapturePhase,
+} from "./autopilotCapturePresentation.ts";
+import {
+  AutopilotPageLifecycle,
+  browserAutopilotLifecycleHost,
+} from "./autopilotPageLifecycle.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
 import { stopSpeaking } from "./tts.ts";
 import {
@@ -73,11 +83,14 @@ interface ServerContext {
   current: NextCommandProjection | null;
   runtime: AutopilotRuntimeState;
   ownerLease: AutopilotOwnerLease;
+  ownerGeneration: number;
   controller: PatientAutopilotController | null;
   fence: AutopilotExecutionFence;
   drainedCommandKey: string | null;
   exitPromise: Promise<void> | null;
 }
+
+let nextAutopilotOwnerGeneration = 0;
 
 export interface PatientAutopilotView {
   mode: PatientAutopilotMode;
@@ -85,6 +98,8 @@ export interface PatientAutopilotView {
   current: NextCommandProjection | null;
   reason: string | null;
   assetReadiness: PatientAssetReadinessEvent | null;
+  /** Browser-only: bytes captured, still saving. Never a server phase. */
+  localCapturePhase: LocalAutopilotCapturePhase | null;
   reportAssetReadiness(event: PatientAssetReadinessEvent): void;
   stopMediaNow(): void;
   stopRecordingNow(): void;
@@ -140,10 +155,31 @@ export function usePatientAutopilot(input: {
   }
   const [wakeNonce, setWakeNonce] = useState(0);
   const controllerRef = useRef<PatientAutopilotController | null>(null);
+  const lifecycleRef = useRef<AutopilotPageLifecycle | null>(null);
   const serverContextRef = useRef<ServerContext | null>(null);
   const probeRetryAttempt = useRef(0);
   const probeRetryKey = useRef("");
   serverContextRef.current = server;
+  const [localCapturePhase, setLocalCapturePhase] =
+    useState<LocalAutopilotCapturePhase | null>(null);
+  const capturedSessionRef = useRef<string | null>(null);
+  capturedSessionRef.current = (input.sessionId as string | null) ?? null;
+
+  // A capture that finished after the screen already moved on must neither
+  // claim the new command nor clear it: a stale observer simply returns.
+  // `cleared` is stricter still — it only wipes the exact identity that put the
+  // phase there, so a dying old capture cannot blank a live new one.
+  const observeCapturePhase = useCallback((event: LocalAutopilotCaptureEvent) => {
+    if (event.sessionId !== capturedSessionRef.current) return;
+    setLocalCapturePhase((current) => {
+      if (event.phase === "cleared") {
+        return sameCaptureIdentity(current, event) ? null : current;
+      }
+      if (!captureIdentityIsNewer(event, current)) return current;
+      if (serverContextRef.current?.current?.command_key !== event.commandKey) return current;
+      return event;
+    });
+  }, []);
 
   const reportAssetReadiness = useCallback((event: PatientAssetReadinessEvent) => {
     // A stale image callback can arrive after React has projected a newer
@@ -193,6 +229,7 @@ export function usePatientAutopilot(input: {
   useEffect(() => {
     assetGateRef.current?.reset("场次已切换");
     setAssetReadiness(null);
+    setLocalCapturePhase(null);
     wakeCoordinatorRef.current?.reset();
   }, [input.sessionId]);
 
@@ -295,11 +332,13 @@ export function usePatientAutopilot(input: {
         const restored = await loadServerRuntime(sessionId, delivery, drained);
         if (cancelled) return;
         stopSpeaking();
+        nextAutopilotOwnerGeneration += 1;
         const context: ServerContext = {
           delivery,
           current: restored.current,
           runtime: restored.runtime,
           ownerLease,
+          ownerGeneration: nextAutopilotOwnerGeneration,
           controller: null,
           fence: new AutopilotExecutionFence(),
           drainedCommandKey: null,
@@ -349,7 +388,10 @@ export function usePatientAutopilot(input: {
       const controller = context?.controller ?? null;
       if (context && controller) {
         context.controller = null;
-        context.fence.registerControllerShutdown(controller.stopAndWait());
+        context.fence.registerControllerShutdown(
+          lifecycleRef.current?.aborted
+            ? controller.interruptRecordingForLifecycleAndWait()
+            : controller.stopAndWait());
       }
       const idle = context?.fence.waitForActiveStart() ?? Promise.resolve();
       void idle.finally(releaseOwner);
@@ -366,6 +408,35 @@ export function usePatientAutopilot(input: {
       setProbeEpoch((value) => value + 1);
     }
   }, [wakeNonce, visibleMode, probeKey, resolvedProbeKey]);
+
+  // 每个 owner generation 恰好装一次页面事件监听，owner 一换就按序摘掉。
+  // 摘监听本身不是失败：普通的 session/gate/所有权变化走各自的 shutdown。
+  useEffect(() => {
+    if (!server) return;
+    const lifecycle = new AutopilotPageLifecycle({
+      ownerGeneration: server.ownerGeneration,
+      host: browserAutopilotLifecycleHost(),
+      shutdown: () => {
+        stopSpeaking();
+        // 同步物理关麦发生在这一步的最前面；返回的 Promise 只是等 ACK 收敛。
+        void controllerRef.current?.interruptRecordingForLifecycleAndWait();
+      },
+    });
+    lifecycle.install();
+    lifecycleRef.current = lifecycle;
+    return () => {
+      lifecycle.uninstall();
+      if (lifecycleRef.current === lifecycle) lifecycleRef.current = null;
+    };
+  }, [server]);
+
+  // 只在 mount 上跑的 effect：它的 cleanup 与 StrictMode 探针当下无法区分，
+  // 所以只登记一个 teardown 候选并排一个 microtask；紧接着的第二次 setup
+  // 精确取消它。没有后继 setup 的那次才是真卸载，关麦上界一个 microtask。
+  useEffect(() => {
+    lifecycleRef.current?.cancelTeardown();
+    return () => { lifecycleRef.current?.requestTeardown(); };
+  }, []);
 
   const mediaAllowed = canRunPatientAutopilotMedia({
     serverOwned: visibleMode === "server",
@@ -448,7 +519,10 @@ export function usePatientAutopilot(input: {
         sessionId: input.sessionId as string,
         transport: autopilotHttpTransport,
         speech: new BrowserAutopilotSpeechExecutor(input.sessionId as string),
-        recording: new BrowserAutopilotRecordingExecutor(input.sessionId as string),
+        recording: new BrowserAutopilotRecordingExecutor(input.sessionId as string, {
+          ownerGeneration: context.ownerGeneration,
+          observe: observeCapturePhase,
+        }),
         ackDelivery: context.delivery,
         initialRuntime: restored.runtime,
         waitForPresentation: (command, signal) => (
@@ -462,8 +536,11 @@ export function usePatientAutopilot(input: {
       context.controller = controller;
       controllerRef.current = controller;
       const tick = async () => {
+        // pre-start 期间页面隐藏之后本窗口彻底停：重新可见不自动恢复、不自动重开麦。
+        if (lifecycleRef.current?.aborted) return;
         const runtime = await (controller as PatientAutopilotController).pollOnce();
-        if (cancelled || runtime.phase === "paused" || runtime.phase === "scope_completed") return;
+        if (cancelled || lifecycleRef.current?.aborted) return;
+        if (runtime.phase === "paused" || runtime.phase === "scope_completed") return;
         // 仍然走 setTimeout 而不是 queueMicrotask：卸载/暂停的取消路径靠这个
         // timer 句柄，换成微任务就没法在同一个清理里撤掉。
         timer = window.setTimeout(tick, autopilotNextTickDelayMs(runtime));
@@ -501,9 +578,15 @@ export function usePatientAutopilot(input: {
       if (!active) return;
       if (controllerRef.current === active) controllerRef.current = null;
       if (context.controller === active) context.controller = null;
-      context.fence.registerControllerShutdown(active.stopAndWait());
+      // pagehide 已经赢下的时候复用它那条 shutdown：再调一次 stopAndWait 会先把
+      // controller 的 stopped 置成 true，本该发出的 record_failed 就被吞了。
+      context.fence.registerControllerShutdown(
+        lifecycleRef.current?.aborted
+          ? active.interruptRecordingForLifecycleAndWait()
+          : active.stopAndWait());
     };
-  }, [mediaAllowed, server?.delivery, input.sessionId, probeKey, releaseServerToLegacy]);
+  }, [mediaAllowed, server?.delivery, input.sessionId, probeKey, releaseServerToLegacy,
+    observeCapturePhase]);
 
   // Releasing server ownership requires more than projecting "paused" onto the
   // screen.  Wait until the exact local controller has closed Audio/MediaRecorder,
@@ -599,6 +682,7 @@ export function usePatientAutopilot(input: {
       ? "自动流程需要显式开启语音后才能继续"
       : reason,
     assetReadiness,
+    localCapturePhase,
     reportAssetReadiness,
     stopMediaNow: () => controllerRef.current?.stop(),
     stopRecordingNow: () => controllerRef.current?.stopRecordingNow(),

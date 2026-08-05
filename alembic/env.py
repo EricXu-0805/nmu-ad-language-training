@@ -22,8 +22,11 @@ if not config.get_main_option("sqlalchemy.url"):
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
+# disable_existing_loggers=False: the default (True) silently disables any
+# logger a caller already created (e.g. app.tts at test-collection time),
+# breaking caplog assertions in tests that run after an in-process upgrade.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = SQLModel.metadata
 

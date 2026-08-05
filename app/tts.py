@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import enum
 import hashlib
 import io
 import ipaddress
 import json
+import logging
 import os
 import socket
 import stat
@@ -37,6 +39,45 @@ import wave
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit, urlunsplit
+
+logger = logging.getLogger("app.tts")
+
+
+class _QwenTtsFailureReason(enum.Enum):
+    """Closed set of reasons the exact Qwen path can degrade.
+
+    Deliberately an enum and never a free-form string: the whole point is that
+    a degradation can be diagnosed without any provider text, patient text,
+    credential, request id or audio ever reaching a log line.
+    """
+
+    API_KEY_MISSING = "api_key_missing"
+    PROVIDER_EXCEPTION = "provider_exception"
+    RESPONSE_AFTER_STOP = "response_after_stop"
+    RESPONSE_STATUS_INVALID = "response_status_invalid"
+    RESPONSE_ERROR_CODE = "response_error_code"
+    RESPONSE_OUTPUT_MISSING = "response_output_missing"
+    RESPONSE_AUDIO_MISSING = "response_audio_missing"
+    FINISH_REASON_INVALID = "finish_reason_invalid"
+    STREAM_NOT_FINISHED = "stream_not_finished"
+    STREAM_EMPTY = "stream_empty"
+    STREAM_CHUNK_INVALID = "stream_chunk_invalid"
+    STREAM_SIZE_EXCEEDED = "stream_size_exceeded"
+    WAV_HEADER_INVALID = "wav_header_invalid"
+    WAV_SENTINEL_INVALID = "wav_sentinel_invalid"
+    WAV_FORMAT_INVALID = "wav_format_invalid"
+    WAV_PAYLOAD_INVALID = "wav_payload_invalid"
+    WAV_VALIDATION_INVALID = "wav_validation_invalid"
+    UNEXPECTED_INTERNAL = "unexpected_internal"
+
+
+class _QwenTtsFailure(ValueError):
+    """Carries only the closed reason; its text is exactly the reason value."""
+
+    def __init__(self, reason: _QwenTtsFailureReason):
+        super().__init__(reason.value)
+        self.reason = reason
+
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CACHE_DIR = DATA_DIR / "tts-cache"
@@ -88,6 +129,112 @@ def _validated_inline_wav_base64(value: object) -> bytes:
     except (binascii.Error, ValueError) as exc:
         raise ValueError("云 TTS base64 非法") from exc
     return _validated_wav_bytes(decoded)
+
+
+# 官方 qwen3-tts 流式:首块带的是哨兵 size 的 RIFF 头(0x7fffffbf/0x7fffff9b),
+# 不是真实长度。收全之后必须按实际长度封口,否则 wave 读到的帧数是天文数字。
+# 只认这一种精确布局:PCM/单声道/24000Hz/16bit;别的布局一律拒,不做通用盲修。
+_STREAM_PCM_FORMAT = 1
+_STREAM_CHANNELS = 1
+_STREAM_SAMPLE_RATE = 24000
+_STREAM_BITS = 16
+_STREAM_BLOCK_ALIGN = 2
+_STREAM_BYTE_RATE = _STREAM_SAMPLE_RATE * _STREAM_BLOCK_ALIGN
+_STREAM_SENTINEL_RIFF_SIZE = 0x7FFFFFBF
+_STREAM_SENTINEL_DATA_SIZE = 0x7FFFFF9B
+_STREAM_HEADER_BYTES = 44
+# 真机实测:中间块的 finish_reason 不是 Python None,而是字面字符串 "null";
+# 只有最后一块才是 "stop"。把 "null" 当成终态会让每一次真实合成都失败。
+_STREAM_UNFINISHED = (None, "null")
+
+
+def _decoded_stream_chunk(value: object, accumulated: int) -> bytes:
+    """Strictly decode one streamed base64 chunk within the byte budget.
+
+    Bounded twice on purpose: the pre-decode ceiling stops a huge envelope from
+    being decoded at all, and the running total is checked before the buffer is
+    allowed to grow, so an over-long stream fails closed instead of after it has
+    already been accumulated.
+    """
+    if not isinstance(value, (str, bytes, bytearray)):
+        raise _QwenTtsFailure(_QwenTtsFailureReason.STREAM_CHUNK_INVALID)
+    remaining = _MAX_CLOUD_TTS_BYTES - accumulated
+    if remaining <= 0:
+        raise _QwenTtsFailure(_QwenTtsFailureReason.STREAM_SIZE_EXCEEDED)
+    # 上限按**剩余**预算算,不是全局预算:否则每一块单看都合规,却能靠块数把
+    # 总量顶穿,而且那些字节已经先被解码出来了。
+    if len(value) > 4 * ((remaining + 2) // 3):
+        raise _QwenTtsFailure(_QwenTtsFailureReason.STREAM_SIZE_EXCEEDED)
+    if isinstance(value, str):
+        try:
+            encoded = value.encode("ascii")
+        except UnicodeEncodeError:
+            raise _QwenTtsFailure(
+                _QwenTtsFailureReason.STREAM_CHUNK_INVALID) from None
+    else:
+        encoded = bytes(value)
+    try:
+        chunk = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise _QwenTtsFailure(
+            _QwenTtsFailureReason.STREAM_CHUNK_INVALID) from None
+    if not chunk:
+        raise _QwenTtsFailure(_QwenTtsFailureReason.STREAM_CHUNK_INVALID)
+    if accumulated + len(chunk) > _MAX_CLOUD_TTS_BYTES:
+        raise _QwenTtsFailure(_QwenTtsFailureReason.STREAM_SIZE_EXCEEDED)
+    return chunk
+
+
+def _sealed_streamed_wav(raw: bytes) -> bytes:
+    """Rewrite the two sentinel sizes with the real ones, or refuse the stream.
+
+    This accepts exactly one layout: the fixed 44-byte header this provider was
+    observed to stream — ``RIFF`` at 0, ``WAVE`` at 8, a 16-byte ``fmt `` at 12,
+    ``data`` at 36, PCM payload from 44 — carrying both official sentinel sizes.
+    A different codec, sample rate or channel count, an unaligned payload, a
+    truncated header, or any inserted chunk (``JUNK``/``LIST``) that would shift
+    ``data`` off 36 is refused rather than patched into something ``wave`` would
+    happily accept.  Only the two size fields are written; no audio byte moves.
+    """
+    if len(raw) <= _STREAM_HEADER_BYTES:
+        raise _QwenTtsFailure(_QwenTtsFailureReason.WAV_PAYLOAD_INVALID)
+    # 实测官方头固定 44 字节,没有任何前置 chunk。所以这里要求的是那一种精确布局,
+    # 而不是"某处有个 data 块"——放行 JUNK/LIST 之类的插入会让 data 偏移浮动,
+    # 那就不是我们观测过、并据此改写 size 的那条流了。
+    if (raw[0:4] != b"RIFF" or raw[8:12] != b"WAVE"
+            or raw[12:16] != b"fmt " or raw[36:40] != b"data"):
+        raise _QwenTtsFailure(_QwenTtsFailureReason.WAV_HEADER_INVALID)
+    if int.from_bytes(raw[16:20], "little") != 16:
+        raise _QwenTtsFailure(_QwenTtsFailureReason.WAV_FORMAT_INVALID)
+    # 只有官方流式那两个哨兵才允许被改写。一个 size 本来就自洽的 WAV 不是这条
+    # 路径的产物,盲目重写它等于把任意(可能是伪造的)容器改成"看起来合法"。
+    if int.from_bytes(raw[4:8], "little") != _STREAM_SENTINEL_RIFF_SIZE:
+        raise _QwenTtsFailure(_QwenTtsFailureReason.WAV_SENTINEL_INVALID)
+    if int.from_bytes(raw[40:44], "little") != _STREAM_SENTINEL_DATA_SIZE:
+        raise _QwenTtsFailure(_QwenTtsFailureReason.WAV_SENTINEL_INVALID)
+    (audio_format, channels, rate, byte_rate, block_align, bits) = (
+        int.from_bytes(raw[20:22], "little"),
+        int.from_bytes(raw[22:24], "little"),
+        int.from_bytes(raw[24:28], "little"),
+        int.from_bytes(raw[28:32], "little"),
+        int.from_bytes(raw[32:34], "little"),
+        int.from_bytes(raw[34:36], "little"),
+    )
+    if (audio_format != _STREAM_PCM_FORMAT
+            or channels != _STREAM_CHANNELS
+            or rate != _STREAM_SAMPLE_RATE
+            or byte_rate != _STREAM_BYTE_RATE
+            or block_align != _STREAM_BLOCK_ALIGN
+            or bits != _STREAM_BITS):
+        raise _QwenTtsFailure(_QwenTtsFailureReason.WAV_FORMAT_INVALID)
+    payload = len(raw) - _STREAM_HEADER_BYTES
+    if payload % _STREAM_BLOCK_ALIGN:
+        raise _QwenTtsFailure(_QwenTtsFailureReason.WAV_PAYLOAD_INVALID)
+    # 只动这两个 size 字段,PCM 一个字节都不碰。
+    sealed = bytearray(raw)
+    sealed[4:8] = (len(raw) - 8).to_bytes(4, "little")
+    sealed[40:44] = payload.to_bytes(4, "little")
+    return bytes(sealed)
 
 
 def _read_validated_wav_cache(path: Path) -> bytes:
@@ -278,36 +425,121 @@ class DashScopeQwenTtsEngine:
         return bool(os.environ.get("DASHSCOPE_API_KEY"))
 
     def synthesize(self, text: str) -> bytes | None:
-        if not self.available():
-            return None
-        audio = self._call(text)
-        if not isinstance(audio, dict):
-            return None
-        b64 = audio.get("data")
-        if b64:
+        """One official streaming call; the bytes arrive inline, never by URL.
+
+        The non-streaming form only hands back a temporary OSS URL, and the
+        SSRF guard on that download is deliberately strict.  Streaming removes
+        the download entirely, so the guard stays exactly as it is and there is
+        no second request: retrying non-streamed would bill twice and send the
+        same patient-facing text to the provider a second time.
+        """
+        try:
+            if not self.available():
+                raise _QwenTtsFailure(_QwenTtsFailureReason.API_KEY_MISSING)
+            raw = self._stream(text)
             try:
-                return _validated_inline_wav_base64(b64)
+                return _validated_wav_bytes(_sealed_streamed_wav(raw))
+            except _QwenTtsFailure:
+                raise
             except ValueError:
-                return None
-        url = audio.get("url")
-        if url and url.startswith(("http://", "https://")):
-            # 百炼 qwen3-tts 常只回 http:// 的 OSS 临时地址;OSS 查询串签名与 scheme 无关,
-            # 强制升 https 下载(不走明文),旧代码只认 https:// 会把成功结果整个丢弃。
+                raise _QwenTtsFailure(
+                    _QwenTtsFailureReason.WAV_VALIDATION_INVALID) from None
+        except _QwenTtsFailure as failure:
+            self._log_failure(failure.reason)
+            return None
+        except Exception:
+            self._log_failure(_QwenTtsFailureReason.UNEXPECTED_INTERNAL)
+            return None
+
+    @staticmethod
+    def _log_failure(reason: _QwenTtsFailureReason) -> None:
+        """One fixed line per degradation, carrying only the closed reason.
+
+        Never the synthesized text, the credential, a request id, the provider
+        message or response, a URL, base64 or audio bytes — and no traceback,
+        because an exception's own text can quote any of those.  A logging
+        backend that is itself broken must not change the outcome.
+        """
+        try:
+            logger.warning("qwen_tts_failed reason=%s", reason.value)
+        except Exception:
+            pass
+
+    def _stream(self, text: str) -> bytes:
+        buffer = bytearray()
+        finished = False
+        try:
+            responses = iter(self._call(text))
+        except _QwenTtsFailure:
+            raise
+        except Exception:
+            raise _QwenTtsFailure(
+                _QwenTtsFailureReason.PROVIDER_EXCEPTION) from None
+        for response in self._iterate(responses):
+            # 终态之后这条流就该结束了。多出来的任何一条(哪怕只是第二个空 stop)
+            # 都说明我们对这条流的理解和服务端不一致,不能挑着收下。
+            if finished:
+                raise _QwenTtsFailure(
+                    _QwenTtsFailureReason.RESPONSE_AFTER_STOP)
+            status = getattr(response, "status_code", None)
+            # SDK 的 streaming transport 给的是 http.HTTPStatus.OK(IntEnum),
+            # 所以按 int 子类收;但 bool 也是 int 子类,而 "200"/200.0 不是状态码。
+            if (not isinstance(status, int) or isinstance(status, bool)
+                    or status != 200):
+                raise _QwenTtsFailure(
+                    _QwenTtsFailureReason.RESPONSE_STATUS_INVALID)
+            if getattr(response, "code", None):
+                raise _QwenTtsFailure(_QwenTtsFailureReason.RESPONSE_ERROR_CODE)
+            out = getattr(response, "output", None)
+            if out is None:
+                raise _QwenTtsFailure(
+                    _QwenTtsFailureReason.RESPONSE_OUTPUT_MISSING)
+            audio = getattr(out, "audio", None)
+            chunk = audio.get("data") if isinstance(audio, dict) else None
+            reason = getattr(out, "finish_reason", None)
+            if reason not in _STREAM_UNFINISHED:
+                if reason != "stop":
+                    raise _QwenTtsFailure(
+                        _QwenTtsFailureReason.FINISH_REASON_INVALID)
+                finished = True
+            if chunk:
+                buffer += _decoded_stream_chunk(chunk, len(buffer))
+            elif not finished:
+                # 中间块既没有音频也没有终态:畸形,不当成"这块没数据"跳过。
+                raise _QwenTtsFailure(
+                    _QwenTtsFailureReason.RESPONSE_AUDIO_MISSING)
+        # URL 即使随终态一起回来也一律忽略:流式已经给过字节了。
+        if not finished:
+            raise _QwenTtsFailure(_QwenTtsFailureReason.STREAM_NOT_FINISHED)
+        if not buffer:
+            raise _QwenTtsFailure(_QwenTtsFailureReason.STREAM_EMPTY)
+        return bytes(buffer)
+
+    @staticmethod
+    def _iterate(responses):
+        """Yield provider responses, mapping transport faults to one reason.
+
+        A generator that raises mid-stream is a provider fault like any other;
+        the original exception is deliberately dropped rather than chained,
+        because its text can quote the request, the credential or the response.
+        """
+        while True:
             try:
-                return _download_dashscope_audio(url)
-            except (OSError, ValueError):
-                return None
-        return None
+                yield next(responses)
+            except StopIteration:
+                return
+            except _QwenTtsFailure:
+                raise
+            except Exception:
+                raise _QwenTtsFailure(
+                    _QwenTtsFailureReason.PROVIDER_EXCEPTION) from None
 
     def _call(self, text: str):
         from dashscope import MultiModalConversation
-        resp = MultiModalConversation.call(model=self._model, text=text, voice=self._voice,
-                                           language_type="Chinese", stream=False,
+        return MultiModalConversation.call(model=self._model, text=text, voice=self._voice,
+                                           language_type="Chinese", stream=True,
                                            speech_rate=self._rate,
                                            request_timeout=15)
-        out = getattr(resp, "output", None)
-        audio = getattr(out, "audio", None) if out is not None else None
-        return dict(audio) if audio else None
 
 
 def _env_float(name: str, default: float) -> float:
@@ -421,15 +653,12 @@ def _chain() -> list[TtsProvider]:
     return chain
 
 
-def speak(text: str) -> tuple[bytes | None, str, bool]:
-    """合成一句话。返回 (wav字节|None, 引擎版本, 是否缓存命中)。同句缓存复用。
-    任何一层(选引擎/读写缓存/合成)出错一律按降级处理(None→前端回退系统语音),
-    不 500——半配置状态不炸接口。"""
+def _synthesize_with(chain: list[TtsProvider], text: str) -> tuple[bytes | None, str, bool]:
+    """跑一条给定的引擎链:白名单、缓存读写、WAV 校验全部共用一份实现。
+
+    链由调用方决定,这里不追加任何降级层——通用链带本地 piper,自动驾驶链只有
+    Qwen。返回值语义与 speak 一致。"""
     last_version = NullTtsEngine.version
-    try:
-        chain = _chain()
-    except Exception:
-        return None, last_version, False
     for eng in chain:
         if isinstance(eng, NullTtsEngine):
             continue
@@ -462,3 +691,33 @@ def speak(text: str) -> tuple[bytes | None, str, bool]:
             pass                                            # 磁盘满/只读:合成已成功,照常返回
         return data, eng.version, False
     return None, last_version, False
+
+
+def speak(text: str) -> tuple[bytes | None, str, bool]:
+    """合成一句话。返回 (wav字节|None, 引擎版本, 是否缓存命中)。同句缓存复用。
+    任何一层(选引擎/读写缓存/合成)出错一律按降级处理(None→前端回退系统语音),
+    不 500——半配置状态不炸接口。"""
+    try:
+        chain = _chain()
+    except Exception:
+        return None, NullTtsEngine.version, False
+    return _synthesize_with(chain, text)
+
+
+def get_autopilot_engine() -> TtsProvider:
+    """server-owned exact 通道的唯一引擎解析口:永远只是 Qwen。
+
+    显式函数而不是内联构造,是因为 synthetic harness 必须有一个可替换的注入点;
+    生产默认这里绝不返回 piper/null/browser——老人独自面对屏幕时,一句忽然变成
+    另一个本地嗓音的提示语,对他来说和真的没有区别。缺 Key 时照样返回 Qwen 引擎
+    对象,好让降级证据诚实地记下"尝试过谁",而不是记一个从未运行的降级层。"""
+    return _cloud_engine("qwen-tts")
+
+
+def speak_autopilot(text: str) -> tuple[bytes | None, str, bool]:
+    """exact 自动驾驶话术:成功即 Qwen,失败即明确降级,中间没有第三种结果。"""
+    try:
+        chain = [get_autopilot_engine()]
+    except Exception:
+        return None, NullTtsEngine.version, False
+    return _synthesize_with(chain, text)
