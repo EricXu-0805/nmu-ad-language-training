@@ -1,0 +1,10 @@
+[Unit]
+Description=NMU backup chain health verdict (writes /opt/nmu/backups/health.state)
+
+[Service]
+Type=oneshot
+# 只用标准库,系统 python3 足够——不能依赖 /opt/nmu/venv,那正是备份链断过的地方。
+ExecStart=/usr/bin/python3 /opt/nmu/app/scripts/backup_health_check.py \
+    --backup-root /opt/nmu/backups \
+    --state-file /opt/nmu/backups/health.state
+Nice=10

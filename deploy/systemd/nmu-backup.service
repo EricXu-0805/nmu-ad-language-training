@@ -1,0 +1,11 @@
+[Unit]
+Description=NMU daily data backup (snapshot + rotate, truth in /opt/nmu/backups/backup.log)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/nmu/app/scripts/vps-backup-daily.sh
+# 不给这一行，脚本会回退到系统 python3——那个解释器没有 SQLAlchemy，
+# 数据库备份合同检查直接抛 ModuleNotFoundError。见 deploy/systemd/README.md。
+Environment=PYTHON_BIN=/opt/nmu/venv/bin/python
+Nice=10
+IOSchedulingClass=idle

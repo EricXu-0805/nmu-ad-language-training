@@ -1,0 +1,10 @@
+[Unit]
+Description=NMU daily backup 03:30 Asia/Shanghai (19:30 UTC)
+
+[Timer]
+OnCalendar=*-*-* 19:30:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

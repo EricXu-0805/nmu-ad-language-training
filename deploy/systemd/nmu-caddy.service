@@ -1,0 +1,14 @@
+[Unit]
+Description=Caddy TLS front for NMU platform (443 only, nginx:80 untouched)
+After=network-online.target
+[Service]
+User=nmu
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Environment=XDG_DATA_HOME=/opt/nmu/caddy/data
+Environment=XDG_CONFIG_HOME=/opt/nmu/caddy/config
+ExecStart=/usr/local/bin/caddy run --config /opt/nmu/caddy/Caddyfile
+Restart=always
+RestartSec=3
+MemoryMax=200M
+[Install]
+WantedBy=multi-user.target

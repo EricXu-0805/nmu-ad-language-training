@@ -1,0 +1,13 @@
+[Unit]
+Description=NMU dementia language training platform
+After=network-online.target
+[Service]
+User=nmu
+WorkingDirectory=/opt/nmu/app
+EnvironmentFile=/opt/nmu/app/.env
+ExecStart=/opt/nmu/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
+Restart=always
+RestartSec=3
+MemoryMax=500M
+[Install]
+WantedBy=multi-user.target
