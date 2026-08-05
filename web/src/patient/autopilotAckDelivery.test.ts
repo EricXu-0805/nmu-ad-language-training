@@ -9,6 +9,7 @@ import {
 import {
   createAutopilotAckCheckpoint,
   createAutopilotAckEnvelope,
+  fingerprintAutopilotCapability,
   nextAutopilotAckCheckpoint,
   type AutopilotAckCheckpoint,
   type AutopilotAckEnvelope,
@@ -495,11 +496,21 @@ class SettlementStore implements AutopilotAckStore {
   /** 迁移读场景：提交了，但落下的是不记 latch 的 schema v1 checkpoint。 */
   completeWritesLegacyV1 = false;
 
+  /**
+   * 落 checkpoint 之后的**单变量**扰动。
+   *
+   * complete-catch 的矩阵每一行只允许动一个字段，其余全部由
+   * `nextAutopilotAckCheckpoint(entry, 1)` 生成——手写整份字面量会让"其余字段是不是
+   * 也漂了"变得不可核对，那正是旧用例的毛病。
+   */
+  completeCheckpointMutate:
+    ((checkpoint: AutopilotAckCheckpoint) => AutopilotAckCheckpoint) | null = null;
+
   async complete(entry: AutopilotAckEnvelope): Promise<void> {
     this.events.push("complete");
     if (this.completeGate) await this.completeGate;
     if (this.completeOutcome !== "throw") {
-      this.checkpoint = this.completeWritesLegacyV1
+      const written = this.completeWritesLegacyV1
         ? deepClone({
           schemaVersion: 1,
           ownerKey: entry.ownerKey,
@@ -508,6 +519,9 @@ class SettlementStore implements AutopilotAckStore {
           updatedAtMs: 1,
         } as AutopilotAckCheckpoint)
         : deepClone(nextAutopilotAckCheckpoint(entry, 1));
+      this.checkpoint = this.completeCheckpointMutate
+        ? deepClone(this.completeCheckpointMutate(written))
+        : written;
       this.pending = null;
     }
     if (this.completeOutcome !== "ok") throw new Error("完成事务中止");
@@ -532,8 +546,11 @@ async function settlementHarness(options: {
   respond?: (ack: AutopilotAck) => unknown;
   transportGate?: Promise<void>;
   transportThrows?: boolean;
+  /** 在真构造器读初始 snapshot **之前**播种 store：起始 lastSeq/latch 只能这么来。 */
+  seed?: (store: SettlementStore) => void;
 } = {}): Promise<SettlementHarness> {
   const store = new SettlementStore();
+  options.seed?.(store);
   const state = { httpCalls: 0, keys: [] as string[] };
   const delivery = await DurableAutopilotAckDelivery.create({
     capability,
@@ -1244,7 +1261,10 @@ test("不可变错误：自有 explicit-undefined 键与额外键原样留在快
   assert.equal(snapshot.__extra__, 7);
   assert.equal(Object.hasOwn(snapshot, "__own_undefined__"), true);
   assert.equal(snapshot.__own_undefined__, undefined);
-  assert.equal(Object.hasOwn(snapshot, "response_path"), false);
+  // 原来这里断言 `hasOwn(snapshot, "response_path") === false`。那是恒真的：
+  // response_path 是 TTS payload 的可选键，不是顶层命令键，而这份快照来自 record
+  // 命令，任何实现都不会凭空长出它。换成"顶层键集逐字相等"——少一个自有 undefined
+  // 键、或多一个克隆过程中掺进来的键，这一行都会翻红。
   assert.deepEqual(Object.keys(snapshot).sort(), Object.keys(command).sort());
   assert.equal(Object.hasOwn(snapshotPayload, "__payload_undefined__"), true);
   assert.equal(snapshotPayload.__payload_undefined__, undefined);
@@ -1352,4 +1372,505 @@ test("不可变错误：两次失败是两个新实例，冻结之后仍各自�
   assert.equal(mine.delivery.ownsPersistenceError(foreign), false);
   assert.equal(theirs.delivery.ownsPersistenceError(foreign), true);
   assert.equal(theirs.delivery.ownsPersistenceError(first), false);
+});
+
+
+// ---------------- R8B：幂等键生成 seam 与单变量结算矩阵 ----------------
+
+const SESSION_ID = "S-ACK";
+
+/**
+ * 真 owner key，不是手写常量。
+ *
+ * 它是 capability 的指纹，不是 `"a".repeat(64)`。夹具若用手写值当"当前 owner"，
+ * 整份 checkpoint 会从第一个字段起就判负——那样每一行都因为同一个原因返回
+ * unknown，"只动一个变量"的结论一条都成立不了。
+ */
+let cachedOwnerKey: string | null = null;
+async function ownerKey(): Promise<string> {
+  cachedOwnerKey ??= await fingerprintAutopilotCapability(capability);
+  return cachedOwnerKey;
+}
+
+/** 比 question() 严格更新的命令：key/seq/两代都更大，足以解开 question() 的闩。 */
+function supersedingQuestion(): NextCommandProjection {
+  return {
+    ...question(),
+    command_key: "cmd-ack-delivery-question-0002",
+    command_seq: 2,
+    control_generation: 2,
+    runner_generation: 2,
+  };
+}
+
+/** 以某条命令为准的终态失败闩。失败类型必须跟命令种类对上，否则 checkpoint 解析拒收。 */
+function latchOn(command: NextCommandProjection) {
+  const facts = command.kind === "record"
+    ? { ack_type: "record_failed", error_code: "recording_runtime_failed" } as const
+    : { ack_type: "tts_failed", error_code: "audio_playback_failed" } as const;
+  return {
+    commandKey: command.command_key,
+    command,
+    ack: buildAutopilotAck(command, 0, `ack:${facts.ack_type}:1:seeded`, facts),
+  };
+}
+
+/** 当前语义下完全正确的 v2 checkpoint。每一行只允许覆写其中一个字段。 */
+function currentCheckpoint(owner: string, overrides: {
+  ownerKey?: string;
+  sessionId?: string;
+  lastDeviceEventSeq?: number;
+  latch?: ReturnType<typeof latchOn> | null;
+} = {}, seq = 0): AutopilotAckCheckpoint {
+  return deepClone(createAutopilotAckCheckpoint({
+    ownerKey: overrides.ownerKey ?? owner,
+    sessionId: overrides.sessionId ?? SESSION_ID,
+    lastDeviceEventSeq: overrides.lastDeviceEventSeq ?? seq,
+    latch: overrides.latch ?? null,
+    nowMs: 1,
+  }));
+}
+
+/**
+ * 播种一个"已锁存终态失败"的起始状态：lastSeq=1、latch 落在 question() 上。
+ *
+ * seq 只能是 1 不能是 0：`parseAutopilotAckCheckpoint` 强制
+ * `latch.ack.device_event_seq === lastDeviceEventSeq`，而失败 ACK 的
+ * device_event_seq 至少是 1。这条不变量顺带说明了一件事——
+ * `provesCurrentCheckpoint(null)` 里 `this.latch === null` 那一半**无法**被单独
+ * 触发：任何带 latch 的 delivery 都已经 lastSeq ≥ 1，前一个合取项先判负。它是
+ * 纵深防御而非活判据，所以本文件不给它造一行"只能靠伪造非法 checkpoint"的用例。
+ */
+function seedLatched(owner: string): (store: SettlementStore) => void {
+  return (store) => {
+    store.checkpoint = currentCheckpoint(owner, { latch: latchOn(question()) }, 1);
+  };
+}
+
+test("幂等键生成计数（K1 终态闩先于生成点）：闸拒绝时计数为 0", async () => {
+  // 已锁存终态失败、命令又证明不了新权威——这一格必须在生成点之前就挡住。
+  // 计数点若被挪到闸后面，这一行会翻红。
+  const harness = await settlementHarness({ seed: seedLatched(await ownerKey()) });
+
+  await assert.rejects(
+    () => harness.delivery.send(question(), 1, { ack_type: "tts_started" }),
+    /已锁存终态失败/);
+
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 0);
+  assert.equal(harness.httpCalls, 0);
+  assert.deepEqual(harness.store.events, []);
+});
+
+test("幂等键生成计数（K2 confirmed_empty 之后的唯一替换）：1 → 2，两个 staged key 不等，transport 全程 0", async () => {
+  const harness = await settlementHarness();
+  harness.store.stageOutcome = "throw";
+
+  const first = await caught(
+    () => harness.delivery.send(question(), 0, { ack_type: "tts_started" }));
+  ownedFailure(harness.delivery, first);
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+
+  const second = await caught(
+    () => harness.delivery.send(question(), 0, { ack_type: "tts_started" }));
+  ownedFailure(harness.delivery, second);
+
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 2);
+  assert.equal(harness.store.stagedEntries.length, 2);
+  assert.notEqual(
+    harness.store.stagedEntries[0].ack.idempotency_key,
+    harness.store.stagedEntries[1].ack.idempotency_key);
+  assert.equal(harness.httpCalls, 0);
+  assert.deepEqual(harness.keys, []);
+});
+
+test("幂等键生成计数（K3 粘滞 unknown 之后）：同页 send/drain 先抛粘滞错误，计数不变", async () => {
+  const harness = await settlementHarness();
+  harness.store.stageOutcome = "throw";
+  harness.store.snapshotThrows = true;
+
+  const sticky = await caught(
+    () => harness.delivery.send(question(), 0, { ack_type: "tts_started" }));
+  ownedFailure(harness.delivery, sticky);
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+
+  assert.equal(await caught(
+    () => harness.delivery.send(question(), 0, { ack_type: "tts_started" })), sticky);
+  assert.equal(await caught(() => harness.delivery.drainPending()), sticky);
+
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+});
+
+test("幂等键生成计数（K4 buildAutopilotAck 因非法 facts 抛错）：计数 +1 而 staged 0", async () => {
+  // 整个 seam 的存在理由。这个 key 生成了，却既没进 envelope 也没 staged、更没
+  // transport——在 store 与 transport 两个面上都不留痕，计数是它唯一的观察面。
+  const harness = await settlementHarness();
+
+  await assert.rejects(() => harness.delivery.send(startedRecord(), 0, {
+    ack_type: "record_stopped",
+    stop_reason: "user_done",
+    raw_audio_id: "raw-ack-delivery-record-0001",
+    receipt_server_seq: 9,
+    checksum: "not-a-sha256",
+    byte_count: 1024,
+    duration_seconds: 1.25,
+  }));
+
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+  assert.equal(harness.store.stagedEntries.length, 0);
+  assert.deepEqual(harness.store.events, []);
+  assert.equal(harness.httpCalls, 0);
+  assert.equal(harness.delivery.initialDeviceEventSeq, 0);
+});
+
+test("幂等键生成计数（K5 in-flight 时的并发 send）：被闸挡住，计数不变", async () => {
+  const harness = await settlementHarness();
+  harness.store.stageOutcome = "throw";
+  let release!: () => void;
+  harness.store.snapshotGate = new Promise<void>((resolve) => { release = resolve; });
+
+  const first = harness.delivery.send(question(), 0, { ack_type: "tts_started" });
+  first.catch(() => {});
+  for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+
+  await assert.rejects(
+    () => harness.delivery.send(question(), 0, { ack_type: "tts_started" }),
+    /禁止生成新事件序号/);
+
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+  release();
+  await assert.rejects(() => first);
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+});
+
+test("幂等键生成计数（K6 drainPending 重放）：重放不生成新 key，计数不变", async () => {
+  const harness = await settlementHarness();
+  harness.store.completeOutcome = "throw";
+
+  const failure = await caught(
+    () => harness.delivery.send(question(), 0, { ack_type: "tts_started" }));
+  ownedFailure(harness.delivery, failure);
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+  const firstKey = harness.keys[0];
+
+  harness.store.completeOutcome = "ok";
+  const drained = await harness.delivery.drainPending();
+
+  assert.equal(drained?.ack.idempotency_key, firstKey);
+  assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+  assert.deepEqual(harness.keys, [firstKey, firstKey]);
+});
+
+test("夹具自证：未经扰动的当前 checkpoint 必须被判成当前语义", async () => {
+  // 这条不测生产判据，测的是下面那张矩阵有没有资格叫"单变量"。基线本身若判负，
+  // 每一行都会因为同一个原因返回 unknown，"只动了 X 才失守"的结论一条都不成立。
+  const owner = await ownerKey();
+  const harness = await settlementHarness();
+  harness.store.stageOutcome = "throw";
+  harness.store.checkpoint = currentCheckpoint(owner);
+
+  const error = await caught(
+    () => harness.delivery.send(question(), 0, { ack_type: "tts_started" }));
+
+  assert.equal(ownedFailure(harness.delivery, error).outcome, "confirmed_empty");
+});
+
+interface StageRow {
+  name: string;
+  outcome: "unknown" | "confirmed_empty";
+  kills: string;
+  seed?: (owner: string) => (store: SettlementStore) => void;
+  arrange: (store: SettlementStore, owner: string) => void;
+  command?: () => NextCommandProjection;
+  lastSeq?: number;
+  /** 默认 throw（未提交）。exact pending 的那一行要用 commit-then-throw。 */
+  stageOutcome?: StoreOutcome;
+}
+
+const STAGE_ROWS: StageRow[] = [
+  {
+    name: "S5 只动 ownerKey",
+    outcome: "unknown",
+    kills: "把 owner 从当前语义判据里删掉",
+    arrange: (store, owner) => {
+      store.checkpoint = currentCheckpoint(owner, { ownerKey: "c".repeat(64) });
+    },
+  },
+  {
+    name: "S6 只动 sessionId",
+    outcome: "unknown",
+    kills: "只比 owner 不比 session，同一台设备换场次即被误判为当前",
+    arrange: (store, owner) => {
+      store.checkpoint = currentCheckpoint(owner, { sessionId: "S-OTHER" });
+    },
+  },
+  {
+    name: "S7 只动 lastDeviceEventSeq",
+    outcome: "unknown",
+    kills: "不比 seq，拿一个落在别的序号上的 checkpoint 当当前证明",
+    arrange: (store, owner) => {
+      store.checkpoint = currentCheckpoint(owner, { lastDeviceEventSeq: 5 });
+    },
+  },
+  {
+    name: "S8 只动 latch，owner/session/seq 全对",
+    outcome: "unknown",
+    kills: "把 latch 从当前语义判据里删掉",
+    seed: seedLatched,
+    arrange: (store, owner) => {
+      store.checkpoint = currentCheckpoint(
+        owner, { latch: latchOn(startedRecord()) }, 1);
+    },
+    command: supersedingQuestion,
+    lastSeq: 1,
+  },
+  {
+    name: "S9 v1 checkpoint，owner/session/seq 全对",
+    outcome: "confirmed_empty",
+    kills: "把 v1 checkpoint 一律判成不可证明的过严实现",
+    arrange: (store, owner) => {
+      // v1 不记 latch，checkpointTerminalFailureLatch 对它恒返回 null；本实例的
+      // latch 也是 null，所以它**能**证明当前语义。
+      store.checkpoint = deepClone({
+        schemaVersion: 1,
+        ownerKey: owner,
+        sessionId: SESSION_ID,
+        lastDeviceEventSeq: 0,
+        updatedAtMs: 1,
+      } as AutopilotAckCheckpoint);
+    },
+  },
+  {
+    name: "S11 pending 畸形",
+    outcome: "unknown",
+    kills: "让 envelope 解析异常穿透到调用方，而不是判 false",
+    arrange: (store, owner) => {
+      store.checkpoint = currentCheckpoint(owner);
+      store.pending = { not: "an envelope" } as unknown as AutopilotAckEnvelope;
+    },
+  },
+  {
+    name: "S12 checkpoint 为 null 而 lastSeq 已推进",
+    outcome: "unknown",
+    kills: "null-checkpoint 分支不看 lastSeq，把空存储当成当前证明",
+    seed: seedLatched,
+    arrange: (store) => { store.checkpoint = null; },
+    command: supersedingQuestion,
+    lastSeq: 1,
+  },
+  {
+    name: "S10 exact pending 但只动 latch",
+    outcome: "unknown",
+    kills: "以为 exact pending 就够，救得回一个不当前的 checkpoint",
+    seed: seedLatched,
+    stageOutcome: "commit-then-throw",
+    arrange: (store, owner) => {
+      store.checkpoint = currentCheckpoint(
+        owner, { latch: latchOn(startedRecord()) }, 1);
+    },
+    command: supersedingQuestion,
+    lastSeq: 1,
+  },
+];
+
+for (const row of STAGE_ROWS) {
+  test(`stage 结算（${row.name}）：零 HTTP、零 complete、零新 key，粘滞保留 exact identity`, async () => {
+    const owner = await ownerKey();
+    const harness = await settlementHarness({ seed: row.seed?.(owner) });
+    const beforeSeq = harness.delivery.initialDeviceEventSeq;
+    const beforeLatch = harness.delivery.terminalFailureLatch;
+    const beforeAuthority = harness.delivery.lastReceiptAuthority;
+    harness.store.stageOutcome = row.stageOutcome ?? "throw";
+    row.arrange(harness.store, owner);
+    const command = (row.command ?? question)();
+
+    const error = await caught(() => harness.delivery.send(
+      command, row.lastSeq ?? 0, { ack_type: "tts_started" }));
+
+    const failure = ownedFailure(harness.delivery, error);
+    assert.equal(failure.phase, "stage");
+    assert.equal(failure.outcome, row.outcome, `本行杀的是：${row.kills}`);
+    assert.equal(failure.identity.commandKey, command.command_key);
+    assert.equal(harness.httpCalls, 0);
+    assert.deepEqual(harness.keys, []);
+    assert.equal(harness.store.events.includes("complete"), false);
+    assert.equal(harness.delivery.initialDeviceEventSeq, beforeSeq);
+    assert.deepEqual(harness.delivery.terminalFailureLatch, beforeLatch);
+    assert.equal(harness.delivery.lastReceiptAuthority, beforeAuthority);
+    assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+
+    if (row.outcome === "unknown") {
+      // 粘滞：同页再 send/drain 一律返回同一条错误，且不再生成第二个 key。
+      assert.equal(harness.delivery.unresolvedSettlement, error);
+      assert.equal(await caught(() => harness.delivery.send(
+        command, row.lastSeq ?? 0, { ack_type: "tts_started" })), error);
+      assert.equal(await caught(() => harness.delivery.drainPending()), error);
+      assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+      assert.equal(harness.httpCalls, 0);
+    } else {
+      // confirmed_empty 是唯一能授权同 seq 替换的结果：闸松开，不粘滞。
+      assert.equal(harness.delivery.unresolvedSettlement, null);
+    }
+  });
+}
+
+// ---------------- R8B：complete-catch 单变量矩阵 ----------------
+
+type CompleteExpectation = "unknown" | "commit";
+
+interface CompleteRow {
+  name: string;
+  expect: CompleteExpectation;
+  kills: string;
+  /** 失败 ACK 的行要用 failureReceipt，否则严格收据解析先一步拒收。 */
+  failureAck?: boolean;
+  seed?: (owner: string) => (store: SettlementStore) => void;
+  completeOutcome?: StoreOutcome;
+  /** commit-then-throw 之后对已写入 checkpoint 的单变量扰动。 */
+  mutate?: (owner: string) => (checkpoint: AutopilotAckCheckpoint) => AutopilotAckCheckpoint;
+  /** completeOutcome=throw 的行自己摆 checkpoint。 */
+  arrange?: (store: SettlementStore, owner: string) => void;
+  command?: () => NextCommandProjection;
+  lastSeq?: number;
+}
+
+const COMPLETE_ROWS: CompleteRow[] = [
+  {
+    name: "C5 只动 ownerKey",
+    expect: "unknown",
+    kills: "把 owner 从完成证明里删掉",
+    mutate: () => (checkpoint) => ({ ...checkpoint, ownerKey: "c".repeat(64) }),
+  },
+  {
+    name: "C6 只动 sessionId",
+    expect: "unknown",
+    kills: "把 session 从完成证明里删掉",
+    mutate: () => (checkpoint) => ({ ...checkpoint, sessionId: "S-OTHER" }),
+  },
+  {
+    name: "C7 lastDeviceEventSeq 不等于本条 ACK 的 seq",
+    expect: "unknown",
+    kills: "用 this.lastSeq 而不是 entry.ack.device_event_seq 做完成证明",
+    mutate: () => (checkpoint) => ({ ...checkpoint, lastDeviceEventSeq: 0 }),
+  },
+  {
+    name: "C8 失败 ACK，只动 latch",
+    expect: "unknown",
+    kills: "把 latch 从完成证明里删掉",
+    failureAck: true,
+    mutate: () => (checkpoint) => ({
+      ...checkpoint, latch: latchOn(startedRecord()),
+    } as AutopilotAckCheckpoint),
+  },
+  {
+    name: "C10 非失败 ACK 完成后 checkpoint 却落了 latch",
+    expect: "unknown",
+    kills: "非失败 ACK 完成之后没有原子清掉旧 latch",
+    mutate: () => (checkpoint) => ({
+      ...checkpoint, latch: latchOn(question()),
+    } as AutopilotAckCheckpoint),
+  },
+  {
+    name: "C11 失败 ACK，checkpoint 的 latch 逐字等于该 entry 的 latch",
+    expect: "commit",
+    kills: "把逐字相等的完成证明也判负（正例对照，防止上面几行靠恒判负通过）",
+    failureAck: true,
+  },
+  {
+    name: "C9 exact pending 但只动 latch",
+    expect: "unknown",
+    kills: "以为 exact pending 就够，救得回一个不当前的 checkpoint",
+    seed: seedLatched,
+    completeOutcome: "throw",
+    arrange: (store, owner) => {
+      store.checkpoint = currentCheckpoint(
+        owner, { latch: latchOn(startedRecord()) }, 1);
+    },
+    command: supersedingQuestion,
+    lastSeq: 1,
+  },
+];
+
+for (const row of COMPLETE_ROWS) {
+  test(`complete 结算（${row.name}）：零第二条 HTTP、零新 key，seq/latch/权威按判据一步不多推`, async () => {
+    const owner = await ownerKey();
+    const harness = await settlementHarness({
+      seed: row.seed?.(owner),
+      respond: row.failureAck ? (ack) => failureReceipt(ack) : undefined,
+    });
+    const beforeSeq = harness.delivery.initialDeviceEventSeq;
+    const beforeLatch = harness.delivery.terminalFailureLatch;
+    harness.store.completeOutcome = row.completeOutcome ?? "commit-then-throw";
+    if (row.mutate) harness.store.completeCheckpointMutate = row.mutate(owner);
+    row.arrange?.(harness.store, owner);
+    const command = (row.command ?? question)();
+    const facts = row.failureAck
+      ? { ack_type: "tts_failed", error_code: "audio_playback_failed" } as const
+      : { ack_type: "tts_started" } as const;
+
+    if (row.expect === "commit") {
+      const ack = await harness.delivery.send(command, row.lastSeq ?? 0, facts);
+
+      assert.equal(harness.httpCalls, 1);
+      assert.deepEqual(harness.keys, [ack.idempotency_key]);
+      assert.equal(harness.delivery.initialDeviceEventSeq, beforeSeq + 1);
+      assert.equal(
+        harness.delivery.terminalFailureLatch?.ack.idempotency_key,
+        ack.idempotency_key);
+      assert.equal(harness.delivery.unresolvedSettlement, null);
+      assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+      return;
+    }
+
+    const error = await caught(
+      () => harness.delivery.send(command, row.lastSeq ?? 0, facts));
+
+    const failure = ownedFailure(harness.delivery, error);
+    assert.equal(failure.phase, "complete");
+    assert.equal(failure.outcome, "unknown", `本行杀的是：${row.kills}`);
+    assert.equal(harness.httpCalls, 1);
+    assert.equal(harness.keys.length, 1);
+    assert.equal(harness.delivery.initialDeviceEventSeq, beforeSeq);
+    assert.deepEqual(harness.delivery.terminalFailureLatch, beforeLatch);
+    assert.equal(harness.delivery.lastReceiptAuthority, null);
+    assert.equal(harness.delivery.unresolvedSettlement, error);
+    assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+
+    // 粘滞：同页 send/drain 零第二条 HTTP、零新 key。
+    assert.equal(await caught(() => harness.delivery.drainPending()), error);
+    assert.equal(await caught(
+      () => harness.delivery.send(command, row.lastSeq ?? 0, facts)), error);
+    assert.equal(harness.httpCalls, 1);
+    assert.equal(harness.delivery.generatedIdempotencyKeyCount, 1);
+  });
+}
+
+test("脱离克隆守卫：函数值抛 TypeError；原型为 null 的对象是被接受的 plain 授权对象", () => {
+  // W1C 留下的两条未覆盖分支。函数守卫排在 typeof !== "object" 的早退里，
+  // 原型为 null 那条则是 isPlainAuthorityObject 里 `proto === null` 的接受路径——
+  // 把它写成"只接受 Object.prototype"的实现会在第二段翻红。
+  const withFunction = directIdentity();
+  (withFunction.command as unknown as Record<string, unknown>).__fn__ = () => 1;
+
+  assert.throws(() => new AutopilotAckPersistenceError({
+    phase: "stage", outcome: "confirmed_empty", identity: withFunction,
+    message: "函数守卫",
+  }), /授权图不接受函数/);
+
+  const nullProto = Object.create(null) as Record<string, unknown>;
+  nullProto.marker = "无原型对象";
+  const accepted = directIdentity();
+  (accepted.command as unknown as Record<string, unknown>).__null_proto__ = nullProto;
+
+  const failure = new AutopilotAckPersistenceError({
+    phase: "stage", outcome: "confirmed_empty", identity: accepted,
+    message: "无原型对象守卫",
+  });
+
+  const snapshot = failure.identity.command as unknown as Record<string, unknown>;
+  const clone = snapshot.__null_proto__ as Record<string, unknown>;
+  assert.notEqual(clone, nullProto);
+  assert.equal(clone.marker, "无原型对象");
+  assert.equal(Object.isFrozen(clone), true);
+  assert.equal(Object.isFrozen(nullProto), false);
 });

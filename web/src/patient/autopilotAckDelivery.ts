@@ -190,6 +190,12 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
   private unresolved: AutopilotAckPersistenceError | null = null;
   // 本实例造出来的 typed 拒绝。归属证明不落在错误对象上，所以伪造不出来。
   private readonly ownedFailures = new WeakSet<AutopilotAckPersistenceError>();
+  // 纯观察面，不参与任何生产判据。生成了却没 staged、也没 transport 的幂等键，
+  // 在 store 的 staged 条目和 transport 收到的 ack 上都不留痕——"零新 key"那类
+  // 断言因此只证明了"零新 staged key"，杀不掉每次失败都偷偷多生成一个 UUID 的
+  // 实现。只暴露计数不暴露值：值已经能从 staged 条目读到，再留一份反而会在内存
+  // 里留住一个即使失败也不该被复用的 key。
+  private generatedKeyCount = 0;
   private receiptAuthority: AutopilotAckReceiptAuthority | null = null;
   private readonly ownerKey: string;
   private readonly sessionId: string;
@@ -252,6 +258,9 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
 
   /** Is an ACK currently between "envelope created" and "durably staged"? */
   get stagingInFlight(): boolean { return this.staging !== null; }
+
+  /** 本实例累计生成过多少个幂等键。只被测试读，不参与任何生产判据。 */
+  get generatedIdempotencyKeyCount(): number { return this.generatedKeyCount; }
 
   /** 未定型的持久化结果。非 null 时本页 send/drain 一律 fail closed。 */
   get unresolvedSettlement(): AutopilotAckPersistenceError | null {
@@ -413,10 +422,14 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
       throw new Error("已锁存终态失败，命令未证明严格新权威，拒绝发送");
     }
     const seq = this.lastSeq + 1;
+    const idempotencyKey = newIdempotencyKey(facts.ack_type, seq);
+    // 计数点必须紧跟生成、排在 buildAutopilotAck 之前：后者会因非法 facts 抛错，
+    // 而"生成了却没进 envelope"正是这个 seam 唯一看得见的地方。放到它之后就漏了。
+    this.generatedKeyCount += 1;
     const ack = buildAutopilotAck(
       command,
       this.lastSeq,
-      newIdempotencyKey(facts.ack_type, seq),
+      idempotencyKey,
       facts,
     );
     const entry = createAutopilotAckEnvelope({
