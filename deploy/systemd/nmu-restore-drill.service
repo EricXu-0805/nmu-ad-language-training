@@ -1,5 +1,6 @@
 [Unit]
 Description=NMU weekly restore drill on the newest snapshot (writes /opt/nmu/backups/restore-drill.state)
+OnFailure=nmu-alert@%N.service
 
 [Service]
 Type=oneshot

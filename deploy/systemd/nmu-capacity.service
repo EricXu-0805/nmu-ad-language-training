@@ -1,5 +1,6 @@
 [Unit]
 Description=NMU disk capacity and backup growth verdict (writes /opt/nmu/backups/capacity.state)
+OnFailure=nmu-alert@%N.service
 
 [Service]
 Type=oneshot

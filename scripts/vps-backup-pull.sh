@@ -357,8 +357,13 @@ if [ -n "${PREFLIGHT_EXTRA:-}" ]; then
   exit 2
 fi
 
-# 同一自然日最多保留 4 个新完成快照(每日 timer + 有限手工重试)。
-# 这使受损 VPS 无法在反复 pull 中用大量克隆名称耗尽本地盘。
+# 同一自然日的新完成快照数量有上限:每日 timer 一份之外,每次部署也各留一份
+# 前置快照,密集部署日 2026-08-06 实测到 9 份,原上限 4 把合法部署日整天判洪泛。
+# 上限仍然存在——受损 VPS 用大量克隆名称耗尽本地盘的路数照样被拦。
+MAX_DAILY_SNAPSHOTS="${NMU_BACKUP_MAX_DAILY_SNAPSHOTS:-12}"
+case "$MAX_DAILY_SNAPSHOTS" in
+  ''|*[!0-9]*) note "FAIL code=daily_flood_config_invalid"; exit 2 ;;
+esac
 for remote_stamp in "${REMOTE_STAMP_ARGS[@]}"; do
   [ ! -e "$DAILY/$remote_stamp" ] && [ ! -L "$DAILY/$remote_stamp" ] || continue
   stamp_day=${remote_stamp%%-*}
@@ -371,7 +376,7 @@ for remote_stamp in "${REMOTE_STAMP_ARGS[@]}"; do
       proposed_day=$((proposed_day + 1))
     fi
   done
-  if [ $((existing_day + proposed_day)) -gt 4 ]; then
+  if [ $((existing_day + proposed_day)) -gt "$MAX_DAILY_SNAPSHOTS" ]; then
     note "FAIL code=remote_snapshot_daily_flood day=$stamp_day"
     exit 2
   fi
@@ -746,8 +751,32 @@ mv "$REMOTE_LOG_STAGE" "$DEST/backup.log"
 CURRENT_STAGE=""
 CURRENT_STAMP=""
 
-# 完成存档不根据受损远端提供的名称自动删除。深历史修剪是受控本地
-# 运维动作；只自动清理 30 天前的明确失败隔离件。
+# 完成存档不根据受损远端提供的名称自动删除;只自动清理 30 天前的明确失败隔离件。
 find "$QUARANTINE" -mindepth 1 -maxdepth 1 -mtime +30 -exec rm -rf {} +
+
+# 2026-08-07 拍板的异地保留策略:daily 留最新 60 份(VPS 端留 14,这里是两个月
+# 深度),更深历史归 Time Machine。修剪只按本地严格日期命名选择 daily/ 里的目录;
+# conflicts/quarantine/legacy 是人工决策证据,永不自动删。
+RETAIN="${NMU_BACKUP_OFFSITE_RETAIN:-60}"
+case "$RETAIN" in ''|*[!0-9]*) note "FAIL code=retain_config_invalid"; exit 2 ;; esac
+[ "$RETAIN" -ge 1 ] || { note "FAIL code=retain_config_invalid"; exit 2; }
+find "$DAILY" -mindepth 1 -maxdepth 1 -type d -name "$SNAP_GLOB" -print \
+  | LC_ALL=C sort -r | awk -v keep="$RETAIN" 'NR > keep' \
+  | while IFS= read -r expired; do
+      rm -rf "$expired"
+      note "pruned snapshot=${expired##*/} retain=$RETAIN"
+    done
+
 count=$(find "$DAILY" -mindepth 1 -maxdepth 1 -type d -name "$SNAP_GLOB" | wc -l | tr -d ' ')
-note "ok snapshots=$count pulled=$pulled unchanged=$unchanged"
+
+# 软配额:超了不删数据(这次拉取本身是成功的),用专属退出码 3 交给包装层拉响
+# 告警,由人决定提配额还是降保留。
+QUOTA_MB="${NMU_BACKUP_OFFSITE_QUOTA_MB:-20480}"
+case "$QUOTA_MB" in ''|*[!0-9]*) note "FAIL code=quota_config_invalid"; exit 2 ;; esac
+USED_MB=$(du -sm "$DEST" 2>/dev/null | awk '{print $1}')
+case "$USED_MB" in ''|*[!0-9]*) note "FAIL code=offsite_du_probe_invalid"; exit 2 ;; esac
+if [ "$USED_MB" -gt "$QUOTA_MB" ]; then
+  note "ok snapshots=$count pulled=$pulled unchanged=$unchanged used_mb=$USED_MB quota_mb=$QUOTA_MB verdict=quota_exceeded"
+  exit 3
+fi
+note "ok snapshots=$count pulled=$pulled unchanged=$unchanged used_mb=$USED_MB"

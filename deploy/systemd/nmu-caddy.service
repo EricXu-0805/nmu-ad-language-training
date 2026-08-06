@@ -1,5 +1,6 @@
 [Unit]
 Description=Caddy TLS front for NMU platform (443 only, nginx:80 untouched)
+OnFailure=nmu-alert@%N.service
 After=network-online.target
 [Service]
 User=nmu

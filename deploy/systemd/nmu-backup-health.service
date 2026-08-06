@@ -1,5 +1,6 @@
 [Unit]
 Description=NMU backup chain health verdict (writes /opt/nmu/backups/health.state)
+OnFailure=nmu-alert@%N.service
 
 [Service]
 Type=oneshot

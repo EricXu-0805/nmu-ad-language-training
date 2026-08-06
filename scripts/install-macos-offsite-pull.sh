@@ -46,6 +46,7 @@ chmod 700 "$ROOT" "$ROOT/runtime" "$ROOT/runtime/scripts" "$ROOT/offsite"
 
 install -m 700 "$REPO/scripts/vps-backup-pull.sh" "$ROOT/runtime/scripts/vps-backup-pull.sh"
 install -m 600 "$REPO/scripts/verify_backup_snapshot.py" "$ROOT/runtime/scripts/verify_backup_snapshot.py"
+install -m 600 "$REPO/scripts/notify_ops.py" "$ROOT/runtime/scripts/notify_ops.py"
 
 # 校验器的 SUPPORTED_ALEMBIC_HEADS 是写死的，必须与生产同版本，否则每份快照
 # 都会被判成 legacy。把仓库当前的指纹留在运行时目录里，人工核对时一眼可比。
@@ -81,14 +82,31 @@ done < "$ROOT/config.env"
 
 cat > "$ROOT/run-pull.sh" <<EOF
 #!/bin/bash
-# launchd 入口。只做三件事：读配置、进运行时目录、跑拉取脚本。
+# launchd 入口:读配置、进运行时目录、跑拉取脚本;失败/超配额时把事实推到 Discord。
+# 告警是失败才响的——2026-07-17 起三周静默失败没人知道,就是缺这一步。
 set -euo pipefail
 umask 077
 set -a
 . '$ROOT/config.env'
 set +a
 cd '$ROOT/runtime'
-exec ./scripts/vps-backup-pull.sh
+rc=0
+./scripts/vps-backup-pull.sh || rc=\$?
+if [ "\$rc" -ne 0 ]; then
+  if [ -f '$ROOT/ops-webhook.env' ]; then
+    if [ "\$rc" -eq 3 ]; then
+      msg="异地备份卷超软配额(拉取本身成功)。看 $ROOT/offsite/pull.log 尾行,提配额或降保留。"
+    else
+      msg="异地备份拉取失败 rc=\$rc。pull.log 尾部:
+\$(tail -5 '$ROOT/offsite/pull.log' 2>/dev/null || echo '(pull.log 不可读)')"
+    fi
+    '$ROOT/venv/bin/python' ./scripts/notify_ops.py \\
+      --env-file '$ROOT/ops-webhook.env' --message "\$msg" || true
+  else
+    echo "ops-webhook.env 不存在,失败告警未发" >&2
+  fi
+fi
+exit "\$rc"
 EOF
 chmod 700 "$ROOT/run-pull.sh"
 

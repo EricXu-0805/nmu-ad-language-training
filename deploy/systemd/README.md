@@ -40,3 +40,16 @@ tail -3 /opt/nmu/backups/backup.log     # 运维真相在这里，不在 status 
   必须带 `Environment=PYTHON_BIN=/opt/nmu/venv/bin/python`。
 - 备份 timer 写的是 UTC。机器时区是 UTC，`OnCalendar=19:30` 等于上海 03:30。
   机器时区若改成 Asia/Shanghai，这一行要跟着改，否则备份会挪到中午。
+
+## 失败告警（2026-08-07 起）
+
+所有 `nmu-*.service`（含 `nmu.service`/`nmu-caddy.service` 本体）都带
+`OnFailure=nmu-alert@%N.service`：单元进入 failed 时,`nmu-alert@.service` 用系统
+python3 跑 `scripts/notify_ops.py --unit <单元名>`,把主机名 + journal 尾部推到
+Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,成功永远安静。
+
+- webhook 只存在 `/opt/nmu/ops-alert.env`(0600,一行 `NMU_OPS_WEBHOOK=…`),不进
+  仓库、不进单元正文;换频道=换这个文件,不动代码。
+- Mac 侧对应物:`install-macos-offsite-pull.sh` 生成的 `run-pull.sh` 在拉取失败
+  (或退出码 3=异地卷超软配额)时读 `~/Library/nmu-backup/ops-webhook.env` 发同款
+  告警;该文件不存在则只写 launchd 日志。

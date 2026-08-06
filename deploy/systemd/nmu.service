@@ -1,5 +1,6 @@
 [Unit]
 Description=NMU dementia language training platform
+OnFailure=nmu-alert@%N.service
 After=network-online.target
 [Service]
 User=nmu

@@ -1,5 +1,6 @@
 [Unit]
 Description=NMU daily data backup (snapshot + rotate, truth in /opt/nmu/backups/backup.log)
+OnFailure=nmu-alert@%N.service
 
 [Service]
 Type=oneshot

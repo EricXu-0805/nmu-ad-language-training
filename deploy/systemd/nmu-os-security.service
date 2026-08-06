@@ -1,5 +1,6 @@
 [Unit]
 Description=NMU OS security backlog check (writes /opt/nmu/backups/os-security.state + dpkg inventory)
+OnFailure=nmu-alert@%N.service
 
 [Service]
 Type=oneshot
