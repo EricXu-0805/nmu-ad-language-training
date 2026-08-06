@@ -785,16 +785,28 @@ export class PatientAutopilotController {
           initial, { ack_type: "record_started", ...observedStart.value });
       } catch (error) {
         // 唯一允许的替换分支，只包住这第一次 record_started 尝试。证明成立就发
-        // 那条同 seq 的生命周期失败并返回；否则原样抛回既有 fail-closed 路径。
+        // 那条同 seq 的生命周期失败并返回；否则不再原样重抛——异常会先撞上
+        // finally 的 `await capture.closed`，而活跃捕获没人 settle closed：外层
+        // catch 永远到不了，自动驾驶整个挂死，麦克风保持物理打开。收口只能在
+        // 这里做，且只能 interrupt（真实开录之后 cancel 会 signal stream_end，
+        // 把半段音频 stage 成一次有效作答）。生命周期已经收口过的捕获不再碰，
+        // 保持「恰好一次物理收口」。
         if (await this.replaceDiscardedStartedCandidate(
           capture, initial, observedStart.value, error)) return;
-        throw error;
+        this.discardedCapture = capture;
+        if (!this.lifecycleDispositionFor(capture)) capture.interrupt?.();
+        await capture.closed;
+        this.safePauseWithoutAck();
+        return;
       }
       // record_started 已被服务器接受，服务器自己那条 started command 就在回执
       // 权威里。先把它验实并经 reducer 采纳，再谈停止/生命周期——这一步之前
       // 绝不 await /next：刷新失败或永不返回都不该拖累一次已经录下来的作答。
+      // 采纳自身抛错（legacy /next 刷新失败、「录音 started revision 未确认」）
+      // 与权威不足同归下面这条收口路：原样抛出同样会死在 finally 的
+      // `await capture.closed` 上。
       const startedCommand = await this.adoptStartedRecordCommand(
-        initial, startedAck, observedStart.value.mime_type);
+        initial, startedAck, observedStart.value.mime_type).catch(() => null);
       if (!startedCommand) {
         // 权威不足（exact 重放、ACK 身份不符、key/revision/state/MIME 不对或不可变
         // 字段漂移）：本地不合成 revision，也不发终态/失败 ACK。

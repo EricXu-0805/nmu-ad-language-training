@@ -2040,13 +2040,14 @@ test("零替换（根本没有生命周期中断）：stage 证明为空也不�
   });
 
   assert.deepEqual(sends, []);
-  assert.equal(media.counters.interrupts, 0);
-  // 这条路的物理收口归 runRecording 的 finally 所有，不归 cancel()：typed 拒绝
-  // 从 try 里抛出时 finally 先 `await capture.closed` 并把 activeMedia 置空，
-  // 于是 runOnce 的 catch 拿到的 media 已经是 null，那一次 cancel 不会执行。
-  // 「普通 fail-closed 恰好一次 cancel」由未被改动的
+  // 113A 修订：替换拒绝后不再原样重抛（活跃捕获会死在 finally 的
+  // `await capture.closed` 上），物理收口就在拒绝节点做，且只能 interrupt。
+  // 没有生命周期判据的捕获在这里恰好收口一次；已收口的捕获上 interrupt
+  // 是无副作用探询。cancel 永远不出现——真实开录之后它会把半段音频
+  // stage 成一次有效作答。「普通 fail-closed 恰好一次 cancel」由未被改动的
   // 「普通非生命周期失败：物理 cancel 恰好一次，失败码照实上报」独立证明——
   // 那条路是 observedStop 失败分支里的 capture.cancel()，不是这一条。
+  assert.equal(media.counters.interrupts, 1);
   assert.equal(events.includes("record:cancel"), false);
   assertZeroSameSeqReplacement(ledger, media, state, { cancels: 0 });
 });
@@ -2083,6 +2084,142 @@ test("普通非生命周期失败：物理 cancel 恰好一次，失败码照实
   }
   assert.equal(state.phase, "paused");
   assert.equal(state.pause_reason, "record_failed");
+});
+
+// ---------------- 活跃捕获的物理收口（113A 修订：cancel 恰好一次 → interrupt 恰好一次） ----------------
+//
+// preSettled 夹具只证明"已收口的捕获不被 cancel"。这四条钉的是**活跃**捕获：
+// started 已成、stopped/closed 悬着、没有任何生命周期判据。异常若原样抛出，
+// 会先撞上 runRecording finally 的 `await capture.closed`——活跃捕获没人 settle
+// closed，pollOnce 永不落定，麦克风保持物理打开，屏幕停在训练态。神谕：
+// pollOnce 必须落定、恰好一次 interrupt、零 cancel（真实开录之后 cancel 会
+// signal stream_end，把半段音频 stage 成一次有效作答）、零终态/失败 ACK、安全暂停。
+
+/** 挂死回归表现为 5 秒后清晰的断言失败，而不是把整个测试进程吊住。 */
+async function settleOrWedge(
+  poll: Promise<AutopilotRuntimeState>,
+): Promise<AutopilotRuntimeState> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      poll,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(
+          new Error("pollOnce 挂死：物理收口从未发生，麦克风还开着")), 5_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("活跃捕获 + record_started 发送抛错（legacy 直连）：恰好一次 interrupt、零 cancel、安全暂停", async () => {
+  const events: string[] = [];
+  const media = interruptibleCapture(events);
+  let ackAttempts = 0;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-ACTIVE-ACK-THROW",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async () => { ackAttempts += 1; throw new Error("网络断了"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await settleOrWedge(controller.pollOnce());
+
+  assert.equal(ackAttempts, 1);
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "technical_failure");
+});
+
+test("活跃捕获 + 持久 delivery send 抛非持久化错：替换归属不成立，恰好一次 interrupt、零 cancel、安全暂停", async () => {
+  const events: string[] = [];
+  const media = interruptibleCapture(events);
+  let sendAttempts = 0;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-ACTIVE-DELIVERY-THROW",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    ackDelivery: {
+      initialDeviceEventSeq: 0,
+      lastReceiptAuthority: null,
+      // 序号断言、待恢复 ACK、终态闩、stage/complete 持久化失败都走这一类
+      // 非 AutopilotAckPersistenceError 的普通抛错。
+      send: async () => { sendAttempts += 1; throw new Error("待恢复 ACK 尚未排干"); },
+    },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await settleOrWedge(controller.pollOnce());
+
+  assert.equal(sendAttempts, 1);
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "technical_failure");
+});
+
+test("活跃捕获 + started 已确认后 legacy /next 刷新抛错：恰好一次 interrupt、零 cancel、零终态 ACK、安全暂停", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = interruptibleCapture(events);
+  let nextCalls = 0;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-ACTIVE-REFRESH-THROW",
+    transport: {
+      next: async () => {
+        nextCalls += 1;
+        if (nextCalls === 1) return recordCommand();
+        throw new Error("刷新失败");
+      },
+      ack: async (_sessionId, _commandKey, ack) => { acks.push(ack); return { accepted: true }; },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await settleOrWedge(controller.pollOnce());
+
+  // record_started 已被接受；刷新失败绝不能补发终态/失败 ACK，也绝不能挂死。
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started"]);
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.equal(state.phase, "paused");
+});
+
+test("活跃捕获 + legacy 刷新只回 pending 命令（started revision 未确认）：恰好一次 interrupt、零 cancel、安全暂停", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = interruptibleCapture(events);
+  const controller = new PatientAutopilotController({
+    sessionId: "S-ACTIVE-REVISION-UNCONFIRMED",
+    transport: {
+      // 两次都回同一条 pending 投影：startedRecordCommand 拿不到 started
+      // revision，只能抛「录音 started revision 未确认」。
+      next: async () => recordCommand(),
+      ack: async (_sessionId, _commandKey, ack) => { acks.push(ack); return { accepted: true }; },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await settleOrWedge(controller.pollOnce());
+
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started"]);
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.equal(state.phase, "paused");
 });
 
 // ---------------- G1：command 顶层字段逐个一字段变异 ----------------
