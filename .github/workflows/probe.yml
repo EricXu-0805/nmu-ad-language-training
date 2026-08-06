@@ -1,8 +1,0 @@
-# 临时诊断:push 事件为何不触发 ci.yml(dispatch 能跑)。定位后即删。
-name: probe
-on: push
-jobs:
-  probe:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo push-trigger-works
