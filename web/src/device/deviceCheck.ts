@@ -1,0 +1,354 @@
+/**
+ * 设备自检——把"这台平板/手机今天能不能用来做训练"变成一页可执行的判定。
+ *
+ * 审计 §11.5 的设备矩阵(目标手机/平板/麦克风/噪声/断网)只能在真机上验;
+ * 这个模块的职责是让那次验收有东西可跑:研究者到现场打开 /device-check,
+ * 几十秒拿到一份绿/黄/红清单和一段可复制进记录的文本。
+ *
+ * 判定逻辑与浏览器 API 完全解耦(全部经 DeviceCheckDependencies 注入),
+ * 阈值都是工程启发而非标准——各机型的 AGC 会把"安静"抬到不同电平,
+ * 所以每个阈值旁边写了它想抓住的具体故障,错了就照着改。
+ */
+
+export type CheckStatus = "pass" | "warn" | "fail";
+
+export interface CheckResult {
+  id: string;
+  title: string;
+  status: CheckStatus;
+  detail: string;
+}
+
+export interface MicrophoneInfo {
+  label: string;
+  sampleRate: number | null;
+  channelCount: number | null;
+  echoCancellation: boolean | null;
+  noiseSuppression: boolean | null;
+  autoGainControl: boolean | null;
+}
+
+export interface NoiseSample {
+  rmsDbfs: number;
+  peakDbfs: number;
+}
+
+export interface DeviceCheckDependencies {
+  secureContext: boolean;
+  userAgent: string;
+  screen: { width: number; height: number; pixelRatio: number };
+  mediaDevicesAvailable: boolean;
+  mediaRecorderAvailable: boolean;
+  isTypeSupported(mime: string): boolean;
+  /** getUserMedia + 读 track 设置;流由依赖方持有,供后续 sampleNoise 用。 */
+  acquireMicrophone(): Promise<MicrophoneInfo>;
+  /** 在已持有的麦克风流上采样 N 秒,返回 RMS/峰值(dBFS,≤0)。 */
+  sampleNoise(seconds: number): Promise<NoiseSample>;
+  releaseMicrophone(): void;
+  audioContextSampleRate(): number | null;
+  /** 必须在用户手势之后调;返回 resume 后的状态。 */
+  resumeAudio(): Promise<"running" | "suspended" | "unavailable">;
+  speechSynthesisVoices(): { total: number; chinese: number } | null;
+  fetchImpl(input: string, init?: RequestInit): Promise<{
+    ok: boolean; status: number; headers: { get(name: string): string | null };
+  }>;
+  now(): number;
+  storageEstimate(): Promise<{ quotaBytes: number | null; usageBytes: number | null }>;
+}
+
+// 生产录音链的真实口径(audio/recorder.ts):首选 audio/webm,不支持则交给浏览器
+// 默认容器。这里列出的候选只用于把"浏览器会给什么"写进报告。
+const RECORDER_CANDIDATES = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+  "audio/ogg;codecs=opus",
+  "audio/mp4",
+];
+
+export function checkRuntime(deps: DeviceCheckDependencies): CheckResult {
+  const id = "runtime";
+  const title = "运行环境";
+  if (!deps.secureContext) {
+    return { id, title, status: "fail",
+      detail: "页面不在安全上下文(HTTPS)里,浏览器会直接拒绝开麦克风。请用 https 地址访问。" };
+  }
+  if (!deps.mediaDevicesAvailable) {
+    return { id, title, status: "fail", detail: "此浏览器没有 mediaDevices,无法录音。换 Chrome/Edge/Safari 再试。" };
+  }
+  if (!deps.mediaRecorderAvailable) {
+    return { id, title, status: "fail", detail: "此浏览器没有 MediaRecorder,无法录音。换新版浏览器再试。" };
+  }
+  return { id, title, status: "pass", detail: "HTTPS + 录音 API 齐全" };
+}
+
+export function mapMicrophoneError(error: unknown): string {
+  const name = (error as { name?: string } | null)?.name ?? "";
+  switch (name) {
+    case "NotAllowedError":
+      return "麦克风权限被拒。到浏览器设置里允许本站使用麦克风,然后重新检查。";
+    case "NotFoundError":
+      return "找不到麦克风设备。确认设备有麦克风且未被系统禁用。";
+    case "NotReadableError":
+      return "麦克风被其它应用占用(微信通话/录音 App?),关掉它们再试。";
+    default:
+      return `开麦克风失败:${String((error as Error | null)?.message ?? error)}`;
+  }
+}
+
+export function checkRecorderCodec(deps: DeviceCheckDependencies): CheckResult {
+  const id = "codec";
+  const title = "录音编码";
+  const supported = RECORDER_CANDIDATES.filter((mime) => {
+    try { return deps.isTypeSupported(mime); } catch { return false; }
+  });
+  if (supported.some((mime) => mime.startsWith("audio/webm"))) {
+    return { id, title, status: "pass", detail: `与生产口径一致(audio/webm)。支持:${supported.join("、")}` };
+  }
+  if (supported.length > 0) {
+    return { id, title, status: "warn",
+      detail: `不支持 audio/webm,录音会落到浏览器默认容器(${supported.join("、")})。` +
+              "能用,但请在下面的录音回放里人工确认一次音质。" };
+  }
+  return { id, title, status: "fail", detail: "常见音频容器一个都不支持,录音大概率不可用。" };
+}
+
+export function classifySampleRate(rate: number | null): CheckResult {
+  const id = "sample-rate";
+  const title = "采样率";
+  if (rate === null) {
+    return { id, title, status: "warn", detail: "浏览器不报告采样率;以录音回放的听感为准。" };
+  }
+  if (rate < 16000) {
+    return { id, title, status: "fail",
+      detail: `${rate} Hz,低于云端转写要求的 16 kHz,识别质量会明显劣化。` };
+  }
+  if (rate < 32000) {
+    return { id, title, status: "warn", detail: `${rate} Hz,可用但偏低(常见设备是 44.1/48 kHz)。` };
+  }
+  return { id, title, status: "pass", detail: `${rate} Hz` };
+}
+
+/**
+ * 安静段判定。想抓的故障,按阈值从下往上:
+ *   峰值 < -70 dBFS —— 采到的几乎是数字静音:麦克风坏了/被系统静音/权限给了假流。
+ *   RMS  > -30 dBFS —— 环境明显嘈杂(空调机房/临街开窗),会污染转写。
+ *   RMS  > -45 dBFS —— 有些底噪,提醒关注但不拦。
+ */
+export function classifyNoiseFloor(sample: NoiseSample): CheckResult {
+  const id = "noise-floor";
+  const title = "环境噪声";
+  const rms = Math.round(sample.rmsDbfs);
+  if (sample.peakDbfs < -70) {
+    return { id, title, status: "fail",
+      detail: `电平几乎为零(峰值 ${Math.round(sample.peakDbfs)} dBFS)——` +
+              "麦克风可能被静音或损坏。检查系统音量面板里的输入设备。" };
+  }
+  if (sample.rmsDbfs > -30) {
+    return { id, title, status: "fail", detail: `环境明显嘈杂(RMS ${rms} dBFS),换安静房间。` };
+  }
+  if (sample.rmsDbfs > -45) {
+    return { id, title, status: "warn", detail: `有些底噪(RMS ${rms} dBFS),尽量关空调/关窗。` };
+  }
+  return { id, title, status: "pass", detail: `安静(RMS ${rms} dBFS)` };
+}
+
+/** 说话段判定:请研究者正常说一句话,峰值要能盖过 -35 dBFS,否则等于收不到人声。 */
+export function classifySpeechLevel(sample: NoiseSample): CheckResult {
+  const id = "speech-level";
+  const title = "人声拾取";
+  const peak = Math.round(sample.peakDbfs);
+  if (sample.peakDbfs > -35) {
+    return { id, title, status: "pass", detail: `人声清晰(峰值 ${peak} dBFS)` };
+  }
+  if (sample.peakDbfs > -50) {
+    return { id, title, status: "warn",
+      detail: `人声偏弱(峰值 ${peak} dBFS)。老人声音更小——让设备离受试者近一些。` };
+  }
+  return { id, title, status: "fail",
+    detail: `几乎没收到人声(峰值 ${peak} dBFS)。确认对着正确的麦克风说话。` };
+}
+
+export function classifyNetwork(status: number | null, latencyMs: number | null,
+                                clockSkewSeconds: number | null): CheckResult {
+  const id = "network";
+  const title = "服务器连通";
+  if (status === null || latencyMs === null) {
+    return { id, title, status: "fail", detail: "连不上服务器。检查网络,然后看右上角的联网指示。" };
+  }
+  if (status !== 200) {
+    return { id, title, status: "fail", detail: `服务器返回 ${status},平台可能不可用。` };
+  }
+  const skewNote = clockSkewSeconds !== null && Math.abs(clockSkewSeconds) > 120
+    ? `;设备时钟与服务器差 ${Math.round(Math.abs(clockSkewSeconds))} 秒,记录一律以服务器时间为准`
+    : "";
+  if (latencyMs > 1500) {
+    return { id, title, status: "warn", detail: `能连上但偏慢(${Math.round(latencyMs)} ms)${skewNote}` };
+  }
+  return { id, title, status: "pass", detail: `${Math.round(latencyMs)} ms${skewNote}` };
+}
+
+export function classifyStorage(quotaBytes: number | null, usageBytes: number | null): CheckResult {
+  const id = "storage";
+  const title = "本地存储";
+  if (quotaBytes === null) {
+    return { id, title, status: "warn", detail: "浏览器不报告存储配额;录音暂存空间未知。" };
+  }
+  const freeMb = Math.floor((quotaBytes - (usageBytes ?? 0)) / (1024 * 1024));
+  if (freeMb < 50) {
+    return { id, title, status: "fail",
+      detail: `可用仅 ${freeMb} MB——录音暂存(断网时兜底)会很快写满。清理浏览器存储。` };
+  }
+  if (freeMb < 200) {
+    return { id, title, status: "warn", detail: `可用 ${freeMb} MB,偏紧;留意长场次。` };
+  }
+  return { id, title, status: "pass", detail: `可用约 ${freeMb} MB` };
+}
+
+export function classifyScreen(screen: { width: number; height: number; pixelRatio: number }): CheckResult {
+  const id = "screen";
+  const title = "屏幕";
+  const shorter = Math.min(screen.width, screen.height);
+  const spec = `${screen.width}×${screen.height} @${screen.pixelRatio}x`;
+  if (shorter < 500) {
+    // 不判 fail:手机也能应急,但适老大字排版会挤。
+    return { id, title, status: "warn", detail: `${spec}——偏小(手机?),题图和大字排版会挤,建议平板。` };
+  }
+  return { id, title, status: "pass", detail: spec };
+}
+
+export function checkAudioOutput(state: "running" | "suspended" | "unavailable"): CheckResult {
+  const id = "audio-output";
+  const title = "音频播放";
+  if (state === "running") {
+    return { id, title, status: "pass", detail: "音频通路已激活(下面会放一声提示音,请人工确认听到)" };
+  }
+  if (state === "suspended") {
+    return { id, title, status: "fail",
+      detail: "音频上下文仍被浏览器挂起——自动播放策略没被手势解开,语音播报会没声。" };
+  }
+  return { id, title, status: "fail", detail: "此浏览器不支持 Web Audio,语音播报不可用。" };
+}
+
+export function checkFallbackVoice(voices: { total: number; chinese: number } | null): CheckResult {
+  const id = "fallback-voice";
+  const title = "兜底语音";
+  // 主路径是服务端合成;这里只验"断网/云故障时浏览器自己还能不能开口"。
+  if (voices === null || voices.total === 0) {
+    return { id, title, status: "warn", detail: "浏览器没有系统语音——断网时无兜底播报(主路径不受影响)。" };
+  }
+  if (voices.chinese === 0) {
+    return { id, title, status: "warn",
+      detail: `系统语音 ${voices.total} 个但没有中文——断网兜底会念不出中文。` };
+  }
+  return { id, title, status: "pass", detail: `中文系统语音 ${voices.chinese} 个` };
+}
+
+export interface MicrophoneOutcome {
+  result: CheckResult;
+  info: MicrophoneInfo | null;
+}
+
+export async function checkMicrophone(deps: DeviceCheckDependencies): Promise<MicrophoneOutcome> {
+  const id = "microphone";
+  const title = "麦克风";
+  try {
+    const info = await deps.acquireMicrophone();
+    const parts = [info.label || "默认设备"];
+    if (info.echoCancellation !== null) parts.push(`回声消除${info.echoCancellation ? "开" : "关"}`);
+    if (info.noiseSuppression !== null) parts.push(`降噪${info.noiseSuppression ? "开" : "关"}`);
+    if (info.autoGainControl !== null) parts.push(`自动增益${info.autoGainControl ? "开" : "关"}`);
+    return { result: { id, title, status: "pass", detail: parts.join(" · ") }, info };
+  } catch (error) {
+    return { result: { id, title, status: "fail", detail: mapMicrophoneError(error) }, info: null };
+  }
+}
+
+export type Verdict = "usable" | "usable-with-warnings" | "not-usable";
+
+export function summarize(results: CheckResult[]): Verdict {
+  if (results.some((r) => r.status === "fail")) return "not-usable";
+  if (results.some((r) => r.status === "warn")) return "usable-with-warnings";
+  return "usable";
+}
+
+/** 可复制进设备矩阵记录的纯文本报告。一行一个结论,机器和人都好读。 */
+export function formatReport(userAgent: string, results: CheckResult[],
+                             verdict: Verdict, finishedAtIso: string): string {
+  const label = { usable: "可用", "usable-with-warnings": "可用(有警告)", "not-usable": "不可用" }[verdict];
+  const mark = { pass: "✓", warn: "△", fail: "✗" };
+  const lines = [
+    `设备自检 ${finishedAtIso} → ${label}`,
+    `UA: ${userAgent}`,
+    ...results.map((r) => `${mark[r.status]} ${r.title}: ${r.detail}`),
+  ];
+  return lines.join("\n");
+}
+
+export interface AutoCheckRun {
+  results: CheckResult[];
+  micInfo: MicrophoneInfo | null;
+}
+
+/**
+ * 自动段编排:除了两段需要现场配合的电平采样(安静/说话)和人工确认的提示音,
+ * 其余检查一次跑完。任何一步自身抛错都落成该项 fail,绝不让整页白屏;
+ * 麦克风流的释放由调用方在整个流程(含噪声采样)结束后负责。
+ */
+export async function runAutoChecks(
+  deps: DeviceCheckDependencies,
+  onResult: (result: CheckResult) => void,
+): Promise<AutoCheckRun> {
+  const results: CheckResult[] = [];
+  const push = (result: CheckResult) => { results.push(result); onResult(result); };
+
+  const guarded = async (id: string, title: string, run: () => Promise<CheckResult> | CheckResult) => {
+    try {
+      push(await run());
+    } catch (error) {
+      push({ id, title, status: "fail", detail: `检查自身出错:${String(error)}` });
+    }
+  };
+
+  await guarded("runtime", "运行环境", () => checkRuntime(deps));
+
+  let micInfo: MicrophoneInfo | null = null;
+  if (results[0].status !== "fail") {
+    await guarded("microphone", "麦克风", async () => {
+      const outcome = await checkMicrophone(deps);
+      micInfo = outcome.info;
+      return outcome.result;
+    });
+  } else {
+    push({ id: "microphone", title: "麦克风", status: "fail", detail: "运行环境不满足,未尝试开麦。" });
+  }
+
+  await guarded("codec", "录音编码", () => checkRecorderCodec(deps));
+  await guarded("sample-rate", "采样率", () => {
+    const info = micInfo as MicrophoneInfo | null;
+    return classifySampleRate(info?.sampleRate ?? deps.audioContextSampleRate());
+  });
+  await guarded("audio-output", "音频播放", async () => checkAudioOutput(await deps.resumeAudio()));
+  await guarded("fallback-voice", "兜底语音", () => checkFallbackVoice(deps.speechSynthesisVoices()));
+  await guarded("network", "服务器连通", async () => {
+    const started = deps.now();
+    try {
+      const response = await deps.fetchImpl("/health", { cache: "no-store" });
+      const latency = deps.now() - started;
+      const dateHeader = response.headers.get("date");
+      // Date 头精度是整秒,往返再各吃掉一截;偏移小于几秒都当作零看待。
+      const skew = dateHeader
+        ? (new Date(dateHeader).getTime() - (started + latency / 2)) / 1000
+        : null;
+      return classifyNetwork(response.status, latency, skew);
+    } catch {
+      return classifyNetwork(null, null, null);
+    }
+  });
+  await guarded("storage", "本地存储", async () => {
+    const estimate = await deps.storageEstimate();
+    return classifyStorage(estimate.quotaBytes, estimate.usageBytes);
+  });
+  await guarded("screen", "屏幕", () => classifyScreen(deps.screen));
+
+  return { results, micInfo };
+}

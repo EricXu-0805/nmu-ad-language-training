@@ -160,7 +160,7 @@ def test_skipped_groups_do_not_fail_the_run(capsys):
     code = preflight.main([])
 
     assert code == 0
-    assert capsys.readouterr().out.count("[SKIP]") == 4
+    assert capsys.readouterr().out.count("[SKIP]") == 5
 
 
 def test_any_hard_failure_makes_the_run_nonzero(tmp_path, capsys):

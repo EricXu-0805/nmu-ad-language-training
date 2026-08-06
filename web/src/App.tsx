@@ -9,6 +9,9 @@ const ConsoleShell = lazy(async () => ({
 const PatientShell = lazy(async () => ({
   default: (await import("./patient/PatientShell")).PatientShell,
 }));
+const DeviceCheckScreen = lazy(async () => ({
+  default: (await import("./device/DeviceCheckScreen")).DeviceCheckScreen,
+}));
 
 // 两路由:/console 操作端 · /patient 老人端。零外链(硬约束3)。SPA fallback 由 main.py 提供,clean URL 可刷新。
 export default function App() {
@@ -28,6 +31,12 @@ export default function App() {
         <Route path="/patient" element={
           <Boundary variant="patient">
             <Suspense fallback={<PatientLoading />}><PatientShell /></Suspense>
+          </Boundary>
+        } />
+        {/* 现场准备用的设备自检:不登录、不碰任何受试者数据,只测这台机器本身。 */}
+        <Route path="/device-check" element={
+          <Boundary variant="console">
+            <Suspense fallback={<ConsoleLoading />}><DeviceCheckScreen /></Suspense>
           </Boundary>
         } />
         <Route path="*" element={<Navigate to="/" replace />} />
@@ -255,6 +264,7 @@ function Landing() {
       <p className="landing-note">
         一台设备即可完成全程：进入操作端建好场次，点「受试者画面」全屏切给受试者，研究者按住角落按钮返回。
         也支持双窗/双设备同步运行。
+        首次在新设备或新房间使用，先跑一遍<Link to="/device-check">设备自检</Link>（约 20 秒，测麦克风、噪声、网络与播放）。
       </p>
       <p className="landing-note">
         当前仅限模拟预演和受控技术验证，不得用于正式受试者采集。启用云服务后，固定话术、回答音频或回答文本会按所用能力发送至第三方云端；AI 实时判断不是正式研究评分。

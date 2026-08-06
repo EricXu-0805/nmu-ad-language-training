@@ -574,8 +574,15 @@ ssh root@<host> '/opt/nmu/venv/bin/python /opt/nmu/app/scripts/preflight_check.p
 - **底座镜像里的系统包没有本地扫描。** OSV 认不了 OCI digest。CI 的 `image`
   作业用 trivy 扫构建产物；本机没有等价步骤，所以 `ci_gate.sh` 通过**不代表**
   镜像干净。而且当前线上是裸机，镜像并不在服务路径上。
-- **裸机那台机器的操作系统包（apt）不在任何清单里。** SBOM 只覆盖应用依赖和
-  容器底座。
+- ~~裸机那台机器的操作系统包（apt）不在任何清单里。~~ 2026-08-06 起有两道：
+  `scripts/os_security_check.py` 拿 apt 自己的账判"安全更新积压 = 0"（preflight
+  `--os` 与部署门禁自动跑；每周二 05:50 上海时间 `nmu-os-security.timer` 落
+  `os-security.state` + dpkg 全量清单）。**故意不用 OSV 扫 dpkg**：实测打满补丁的
+  包只剩 0–2 条"Ubuntu 已知、按优先级不修"的记录，OSV 能给的可执行信号 ≈ apt 的
+  security 积压数，其余全是 Ubuntu 已分诊的噪声。可执行的数字直接问 apt 拿。
+  注意 `APT::Periodic::Unattended-Upgrade` 在这台机器上是 **0**（只刷列表不安装，
+  与 OpenClaw 2026-07-15 auto-update 事故后的"手动升级"方针一致）——所以补丁要靠
+  人应门禁的红灯去装，门禁只负责让积压藏不住。
 
 ### 12.5 裸机的 Python 是自己编的（2026-08-06）
 

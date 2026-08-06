@@ -1,0 +1,10 @@
+[Unit]
+Description=NMU OS security backlog check, Tuesday 05:50 Asia/Shanghai (Mon 21:50 UTC)
+
+[Timer]
+# 排在周一恢复演练(21:35 UTC)之后,错开机器最忙的窗口。
+OnCalendar=Mon *-*-* 21:50:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

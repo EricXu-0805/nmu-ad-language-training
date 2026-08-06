@@ -15,7 +15,7 @@ D2 走查那天真正只能靠人的，是麦克风、噪声、断网和老人�
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import sqlite3
@@ -136,6 +136,36 @@ def check_supply_chain(lock_path: Path, python_executable: str) -> Check:
                              f"{stats['expected_here']} 个包逐个对上，无锁外来客")
 
 
+def check_os_security(max_age_days: int = 3) -> Check:
+    """操作系统欠的安全补丁。2026-08-06 查出这台机器积了 93 个没人看。
+
+    只在装了 apt 的机器上有意义（生产裸机是 Ubuntu）；Mac 上跑会失败在
+    "查不动 apt"，所以这组默认关、由 --os 显式打开。
+    """
+    name = "OS 安全补丁"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "os_security_check", Path(__file__).resolve().parent / "os_security_check.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        pending = module.parse_simulation(module.run_simulation())
+    except (OSError, RuntimeError) as error:
+        return Check(name, False, f"查不动 apt：{error}")
+    age = module.lists_age(module.APT_LISTS, datetime.now())
+    failures, notes = module.evaluate(
+        pending, age, timedelta(days=max_age_days),
+        module.REBOOT_REQUIRED.exists())
+    if failures:
+        return Check(name, False, "；".join(failures + notes))
+    detail = "安全更新积压为 0"
+    if notes:
+        detail += "（" + "；".join(notes) + "）"
+    return Check(name, True, detail)
+
+
 def _default_fetch(url: str, timeout: float):
     context = ssl.create_default_context()
     request = urllib.request.Request(url, method="GET")
@@ -191,6 +221,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backup-root", type=Path, default=None)
     parser.add_argument("--lock", type=Path, default=None,
                         help="哈希锁；给了就把跑这个脚本的解释器和它对一遍账")
+    parser.add_argument("--os", action="store_true",
+                        help="查操作系统安全补丁积压（只在装了 apt 的机器上有意义）")
     parser.add_argument("--base-url", default=None, help="公网入口，例如 https://…")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -202,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
                   else Check("备份新鲜度", None, "未给 --backup-root"))
     checks.append(check_supply_chain(args.lock, sys.executable) if args.lock
                   else Check("依赖与哈希锁一致", None, "未给 --lock"))
+    checks.append(check_os_security() if args.os
+                  else Check("OS 安全补丁", None, "未给 --os"))
     if args.base_url:
         checks.extend(check_public_surface(args.base_url))
     else:

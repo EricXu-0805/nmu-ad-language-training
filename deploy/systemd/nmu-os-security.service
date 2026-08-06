@@ -1,0 +1,12 @@
+[Unit]
+Description=NMU OS security backlog check (writes /opt/nmu/backups/os-security.state + dpkg inventory)
+
+[Service]
+Type=oneshot
+# 只用标准库,系统 python3 足够。--json 的输出整份落 state 文件:
+# 判定口径与 preflight --os 完全同一份代码,这里只是把它变成每周留档。
+ExecStart=/bin/sh -c '/usr/bin/python3 /opt/nmu/app/scripts/os_security_check.py \
+    --json --inventory /opt/nmu/backups/os-packages.txt \
+    > /opt/nmu/backups/os-security.state 2>&1 || true'
+ExecStartPost=/bin/chmod 600 /opt/nmu/backups/os-security.state /opt/nmu/backups/os-packages.txt
+Nice=10
