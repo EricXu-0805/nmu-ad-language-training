@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ApiError } from "../apiResponse.ts";
 import type { DeviceCapabilityRecord } from "../security/deviceCapability.ts";
 import {
   AUTOPILOT_CONTROLLER_AUTHORITY_TEST_ONLY,
@@ -2220,6 +2221,225 @@ test("活跃捕获 + legacy 刷新只回 pending 命令（started revision 未�
   assert.equal(media.counters.interrupts, 1);
   assert.equal(media.counters.cancels, 0);
   assert.equal(state.phase, "paused");
+});
+
+// ---------------- runtime_inactive 409：安静暂停，绝不替 live 通道抢答结局 ----------------
+//
+// 走查实测(收据 139 §5)+对抗复审(收据 141):/next 的 autopilot_runtime_inactive
+// 分不清收尾完成、研究者暂停、中止、判分故障——服务端四处共用同码同文案。
+// 折算成 null 会在暂停/中止场景谎报「这一段完成了」,在等待相位造成无限 409
+// 轮询。修订后神谕:这枚 409 在任何"还在跑"的相位上一律 pause(runtime_released)
+// ——停止轮询、平静文案、结局由 live 会话通道呈现;已 paused/scope_completed
+// 不被它覆盖;任何其他错误码维持原判,一条都不放宽。
+
+function runtimeInactiveError(): ApiError {
+  return new ApiError(409, "P0a 要求显式 active 的场次运行状态", {
+    code: "autopilot_runtime_inactive",
+    message: "P0a 要求显式 active 的场次运行状态",
+  }, "nested-detail");
+}
+
+function feedbackCommand(state: "pending" | "started" = "pending"): NextCommandProjection {
+  return {
+    ...questionCommand(state),
+    command_key: "cmd-feedback-controller-0001",
+    payload: {
+      speech_key: "wk2.01.success",
+      speech_text: "说得真好，这就是胡萝卜。",
+      purpose: "feedback",
+    },
+  };
+}
+
+function instantSpeech(events: string[]): AutopilotSpeechExecutor {
+  return {
+    start: () => ({
+      started: Promise.resolve({ media_duration_ms: 600 }),
+      ended: Promise.resolve({ media_duration_ms: 600 }),
+      closed: Promise.resolve(),
+      cancel: () => { events.push("speech:cancel"); },
+    }),
+  };
+}
+
+function scriptedTransport(
+  responses: Array<() => unknown>,
+  acks: AutopilotAck[],
+): AutopilotTransport {
+  return {
+    next: async () => {
+      const step = responses.shift();
+      if (!step) throw new Error("测试命令队列已空");
+      return step();
+    },
+    ack: async (_sessionId, _commandKey, ack) => { acks.push(ack); return { accepted: true }; },
+  };
+}
+
+test("反馈 tts_ended 已接受后 /next 撞 runtime_inactive：安静暂停 runtime_released，零 cancel", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-CLOSEOUT-RACE",
+    transport: scriptedTransport([
+      () => feedbackCommand(),
+      () => feedbackCommand("started"),
+      () => { throw runtimeInactiveError(); },
+    ], acks),
+    speech: instantSpeech(events),
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await controller.pollOnce();
+
+  // 不许谎报完成:同一枚 409 也可能是研究者暂停或中止,结局归 live 通道。
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["tts_started", "tts_ended"]);
+  assert.equal(events.includes("speech:cancel"), false);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "runtime_released");
+});
+
+test("同一竞态但错误码不是 runtime_inactive：维持原判 technical_failure", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-CLOSEOUT-OTHER-CODE",
+    transport: scriptedTransport([
+      () => feedbackCommand(),
+      () => feedbackCommand("started"),
+      () => {
+        throw new ApiError(409, "当前场次没有运行中的 P0a", {
+          code: "autopilot_not_active", message: "当前场次没有运行中的 P0a",
+        }, "nested-detail");
+      },
+    ], acks),
+    speech: instantSpeech(events),
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await controller.pollOnce();
+
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "technical_failure");
+});
+
+test("问题 tts 后撞 runtime_inactive：同样安静暂停 runtime_released", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-CLOSEOUT-QUESTION",
+    transport: scriptedTransport([
+      () => questionCommand(),
+      () => questionCommand("started"),
+      () => { throw runtimeInactiveError(); },
+    ], acks),
+    speech: instantSpeech(events),
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await controller.pollOnce();
+
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "runtime_released");
+});
+
+test("record_stopped 已接受后 legacy 刷新撞 runtime_inactive：安静暂停，零 cancel，作答已保存", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-CLOSEOUT-AFTER-RECORD",
+    transport: scriptedTransport([
+      () => recordCommand(),
+      () => recordCommand("started"),
+      () => { throw runtimeInactiveError(); },
+    ], acks),
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => settledCapture(events) },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await controller.pollOnce();
+
+  // 终态 ACK 已被接受(作答保存不受影响);随后一律安静暂停——停止轮询,
+  // 不做无限 409 持稳,也不谎报完成。
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_stopped"]);
+  assert.equal(events.includes("record:cancel"), false);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "runtime_released");
+});
+
+test("tts started 刷新(中段)撞 runtime_inactive：播放由 closed 自然收口，暂停原因保持 runtime_released", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-MID-TTS-RELEASED",
+    transport: scriptedTransport([
+      () => feedbackCommand(),
+      () => { throw runtimeInactiveError(); },
+    ], acks),
+    speech: instantSpeech(events),
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await controller.pollOnce();
+
+  // started 权威未确认→抛「TTS started revision 未确认」;runSpeech 的 finally
+  // 先 `await playback.closed`(真实音频自然收口的边界)并把 activeMedia 置空,
+  // 所以外层 catch 不会、也不需要再 cancel。关键在:pause_reason 不得被外层
+  // catch 改写成 technical_failure,终态 ACK 一条不发。
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["tts_started"]);
+  assert.equal(events.includes("speech:cancel"), false);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "runtime_released");
+});
+
+test("legacy 采纳刷新撞 runtime_inactive 且捕获活跃：恰好一次 interrupt、零 cancel、runtime_released", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = interruptibleCapture(events);
+  const controller = new PatientAutopilotController({
+    sessionId: "S-MID-RECORD-RELEASED",
+    transport: scriptedTransport([
+      () => recordCommand(),
+      () => { throw runtimeInactiveError(); },
+    ], acks),
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await settleOrWedge(controller.pollOnce());
+
+  // 热麦克风收口不许因这枚 409 的新分类而失守:物理丢弃恰好一次、绝不 cancel
+  // (真实开录后 cancel 会把半段音频 stage 成有效作答)、零终态 ACK。
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started"]);
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "runtime_released");
+});
+
+test("首拍 /next 就撞 runtime_inactive(waiting_command)：安静暂停，不做无限 409 轮询", async () => {
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-WAITING-RELEASED",
+    transport: scriptedTransport([
+      () => { throw runtimeInactiveError(); },
+    ], acks),
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+  });
+
+  const state = await controller.pollOnce();
+
+  assert.deepEqual(acks, []);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "runtime_released");
 });
 
 // ---------------- G1：command 顶层字段逐个一字段变异 ----------------

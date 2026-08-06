@@ -1,4 +1,6 @@
+import { ApiError } from "../apiResponse.ts";
 import type { DeviceCapabilityRecord } from "../security/deviceCapability.ts";
+import { exactAutopilotApiCode } from "./autopilotProbePolicy.ts";
 import {
   buildAutopilotAck,
   type AutopilotAck,
@@ -636,7 +638,26 @@ export class PatientAutopilotController {
 
   private async refreshCommand(): Promise<void> {
     if (this.stopped) return;
-    const current = await this.transport.next(this.sessionId);
+    let current: unknown | null;
+    try {
+      current = await this.transport.next(this.sessionId);
+    } catch (error) {
+      // /next 的 autopilot_runtime_inactive(收据 139 §5 + 141 复审):它只证明
+      // 「本 runtime 世代不再发命令」,却分不清收尾完成、研究者暂停、中止、
+      // 判分故障——服务端四处共用同码同文案。所以绝不替 live 通道抢答结局
+      // (折算成 null 会在暂停/中止场景谎报"这一段完成了",在等待相位造成
+      // 无限 409 轮询):安静暂停、停止追问,结局展示交给会话通道(暂停条/
+      // 终屏/收尾)。任何其他错误码原样抛回,一条都不放宽。
+      if (!(error instanceof ApiError) || error.status !== 409
+          || exactAutopilotApiCode(error) !== "autopilot_runtime_inactive") {
+        throw error;
+      }
+      this.stateValue = autopilotRuntimeReducer(this.stateValue, {
+        type: "external_runtime_released",
+      });
+      this.emitState();
+      return;
+    }
     this.stateValue = autopilotRuntimeReducer(this.stateValue, {
       type: "server_command",
       command: current,

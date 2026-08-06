@@ -66,3 +66,17 @@ test("command_revision 不参与判据：仅 revision 不同、其余同 key 时
   const candidate = command({ command_revision: 9 });
   assert.equal(commandSupersedesTerminalLatch(latched, candidate), false);
 });
+
+test("external_runtime_released 不覆盖已有暂停与完成判定", async () => {
+  const { autopilotRuntimeReducer } = await import("./autopilotRuntime.ts");
+  const paused = {
+    phase: "paused", command: null, last_device_event_seq: 2, last_ack: null,
+    pause_reason: "technical_failure",
+  } as const;
+  assert.equal(autopilotRuntimeReducer(paused, { type: "external_runtime_released" }), paused);
+  const completed = {
+    phase: "scope_completed", command: null, last_device_event_seq: 6, last_ack: null,
+    pause_reason: null,
+  } as const;
+  assert.equal(autopilotRuntimeReducer(completed, { type: "external_runtime_released" }), completed);
+});

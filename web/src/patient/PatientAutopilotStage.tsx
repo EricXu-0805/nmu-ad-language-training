@@ -36,10 +36,14 @@ export function PatientAutopilotStage({
     );
   }
   if (autopilot.mode === "blocked") {
+    // blockedCalm:runtime 被服务器收走(收尾/暂停/中止)不是设备故障,平静档;
+    // 其余 blocked(设备绑定/状态不一致/图片失败)保持告警档。
     return (
       <Centered>
         <div className="target">我们先等一下</div>
-        <p className="question" role="alert">{autopilot.reason ?? "请研究者查看设备状态"}</p>
+        <p className="question" role={autopilot.blockedCalm ? "status" : "alert"}>
+          {autopilot.reason ?? "请研究者查看设备状态"}
+        </p>
       </Centered>
     );
   }
@@ -50,11 +54,14 @@ export function PatientAutopilotStage({
     return <Centered><div className="target">这一段完成了</div><p className="question">请稍候…</p></Centered>;
   }
   if (externallyPaused || runtime?.phase === "paused") {
+    // runtime_released:服务器收走了本 runtime 世代(收尾/暂停/中止),不是设备
+    // 故障——配平静文案,结局由 live 通道呈现;只有真正的设备侧判死才告警。
+    const calm = externallyPaused || runtime?.pause_reason === "runtime_released";
     return (
       <Centered>
         <div className="target">我们先休息一下</div>
-        <p className="question" role={externallyPaused ? "status" : "alert"}>
-          {externallyPaused ? "练习已暂停，请稍候" : "自动流程已安全停止，请研究者处置"}
+        <p className="question" role={calm ? "status" : "alert"}>
+          {calm ? "练习已暂停，请稍候" : "自动流程已安全停止，请研究者处置"}
         </p>
       </Centered>
     );

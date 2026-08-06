@@ -97,6 +97,8 @@ export interface PatientAutopilotView {
   runtime: AutopilotRuntimeState | null;
   current: NextCommandProjection | null;
   reason: string | null;
+  /** 仅 mode==="blocked" 时有意义:平静档(status)还是告警档(alert)。 */
+  blockedCalm: boolean;
   assetReadiness: PatientAssetReadinessEvent | null;
   /** Browser-only: bytes captured, still saving. Never a server phase. */
   localCapturePhase: LocalAutopilotCapturePhase | null;
@@ -114,7 +116,17 @@ function blockedReason(error: unknown): string {
   if (code === "autopilot_state_invalid" || code === "autopilot_command_invalid") {
     return "自动流程状态不一致，已安全停止";
   }
+  if (code === "autopilot_runtime_inactive") {
+    // 服务器收走了本 runtime 世代(收尾/暂停/中止),不是设备故障;与控制器的
+    // runtime_released 暂停同一档平静文案,结局由 live 会话通道呈现。
+    return "练习已暂停，请稍候";
+  }
   return "自动流程暂时无法确认，请研究者查看";
+}
+
+/** blocked 屏的紧急度:只有 runtime 被服务器收走这一族用平静档(role=status)。 */
+function blockedIsCalm(error: unknown): boolean {
+  return exactAutopilotApiCode(error) === "autopilot_runtime_inactive";
 }
 
 async function loadServerRuntime(
@@ -146,6 +158,9 @@ export function usePatientAutopilot(input: {
   const [resolvedProbeKey, setResolvedProbeKey] = useState("");
   const [server, setServer] = useState<ServerContext | null>(null);
   const [reason, setReason] = useState<string | null>(null);
+  // blocked 屏的紧急度:true=平静档(runtime 被服务器收走),false=告警档。
+  // 每个 setMode("blocked") 位点都必须显式定它,不许继承上一次的值。
+  const [blockedCalm, setBlockedCalm] = useState(false);
   const [assetReadiness, setAssetReadiness] = useState<PatientAssetReadinessEvent | null>(null);
   const assetGateRef = useRef<PatientAssetMediaGate | null>(null);
   if (assetGateRef.current === null) assetGateRef.current = new PatientAssetMediaGate();
@@ -191,6 +206,7 @@ export function usePatientAutopilot(input: {
     stopSpeaking();
     controllerRef.current?.stop();
     setMode("blocked");
+    setBlockedCalm(false);
     setReason("题目图片未能安全显示，已停止语音和录音，请研究者处置");
   }, []);
 
@@ -374,6 +390,7 @@ export function usePatientAutopilot(input: {
           setReason(failurePlan.retryExhausted
             ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
             : blockedReason(error));
+          setBlockedCalm(!failurePlan.retryExhausted && blockedIsCalm(error));
           setResolvedProbeKey(probeKey);
         }
       } finally {
@@ -482,6 +499,7 @@ export function usePatientAutopilot(input: {
             setReason(failurePlan.retryExhausted
               ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
               : blockedReason(error));
+            setBlockedCalm(!failurePlan.retryExhausted && blockedIsCalm(error));
           }
         }
         return;
@@ -569,6 +587,7 @@ export function usePatientAutopilot(input: {
         setReason(failurePlan.retryExhausted
           ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
           : blockedReason(error));
+        setBlockedCalm(!failurePlan.retryExhausted && blockedIsCalm(error));
       }
     });
     return () => {
@@ -657,6 +676,7 @@ export function usePatientAutopilot(input: {
         if (disposition === "blocked") {
           stopSpeaking();
           setMode("blocked");
+          setBlockedCalm(false);
           setReason("收麦证据与服务器状态不一致，已停止重试并等待研究者处置");
           return;
         }
@@ -681,6 +701,7 @@ export function usePatientAutopilot(input: {
     reason: visibleMode === "server" && !input.ttsOn
       ? "自动流程需要显式开启语音后才能继续"
       : reason,
+    blockedCalm,
     assetReadiness,
     localCapturePhase,
     reportAssetReadiness,

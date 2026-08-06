@@ -21,7 +21,11 @@ export type AutopilotPauseReason =
   | "inflight_command_recovery_required"
   | "technical_failure"
   | "tts_failed"
-  | "record_failed";
+  | "record_failed"
+  // /next 的 autopilot_runtime_inactive:本 runtime 世代不再发命令,但它分不清
+  // 收尾完成、研究者暂停、中止、判分故障(服务端四处共用同码)。安静暂停,
+  // 结局展示交给 live 会话通道;老人端配平静文案,不配「请研究者处置」告警。
+  | "runtime_released";
 
 export interface AutopilotRuntimeState {
   phase: AutopilotRuntimePhase;
@@ -34,7 +38,8 @@ export interface AutopilotRuntimeState {
 export type AutopilotRuntimeAction =
   | { type: "server_command"; command: unknown | null }
   | { type: "device_ack"; ack: unknown }
-  | { type: "technical_failure" };
+  | { type: "technical_failure" }
+  | { type: "external_runtime_released" };
 
 function pause(
   state: AutopilotRuntimeState,
@@ -389,6 +394,11 @@ export function autopilotRuntimeReducer(
     case "server_command": return reduceServerCommand(state, action.command);
     case "device_ack": return reduceDeviceAck(state, action.ack);
     case "technical_failure": return pause(state, "technical_failure");
+    case "external_runtime_released": {
+      // 已有的暂停/完成判定不被这枚 409 覆盖——它只在"还在跑"的相位上生效。
+      if (state.phase === "paused" || state.phase === "scope_completed") return state;
+      return pause(state, "runtime_released");
+    }
   }
 }
 

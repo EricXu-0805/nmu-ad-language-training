@@ -202,3 +202,59 @@ test("生命周期清掉 listening 之后，服务器还停在 recording 也不�
   assert.doesNotMatch(markup, /说完了可以点这里/);
   assert.doesNotMatch(markup, /不点也可以，我们会自动继续/);
 });
+
+test("runtime_released 暂停显示平静文案，绝不出现研究者处置告警", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    view.runtime = { ...view.runtime, phase: "paused", pause_reason: "runtime_released" };
+    view.localCapturePhase = null;
+  });
+
+  // 服务器收走 runtime(收尾/暂停/中止)不是设备故障;老人端只看到休息文案,
+  // 结局由 live 通道呈现。
+  assert.match(markup, /我们先休息一下/);
+  assert.match(markup, /练习已暂停，请稍候/);
+  assert.doesNotMatch(markup, /自动流程已安全停止/);
+  assert.doesNotMatch(markup, /请研究者处置/);
+  assert.match(markup, /role="status"/);
+});
+
+test("technical_failure 暂停维持告警档，不被平静档吞掉", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    view.runtime = { ...view.runtime, phase: "paused", pause_reason: "technical_failure" };
+    view.localCapturePhase = null;
+  });
+
+  assert.match(markup, /自动流程已安全停止，请研究者处置/);
+  assert.match(markup, /role="alert"/);
+});
+
+test("blocked 平静档(runtime 被服务器收走)：休息文案 + role=status，无研究者告警", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    view.mode = "blocked";
+    view.runtime = null;
+    view.current = null;
+    view.localCapturePhase = null;
+    view.reason = "练习已暂停，请稍候";
+    view.blockedCalm = true;
+  });
+
+  assert.match(markup, /我们先等一下/);
+  assert.match(markup, /练习已暂停，请稍候/);
+  assert.match(markup, /role="status"/);
+  assert.doesNotMatch(markup, /role="alert"/);
+  assert.doesNotMatch(markup, /请研究者/);
+});
+
+test("blocked 告警档(设备侧故障)维持 role=alert", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    view.mode = "blocked";
+    view.runtime = null;
+    view.current = null;
+    view.localCapturePhase = null;
+    view.reason = "自动流程已绑定其他设备，请研究者处置";
+    view.blockedCalm = false;
+  });
+
+  assert.match(markup, /role="alert"/);
+  assert.match(markup, /请研究者处置/);
+});
