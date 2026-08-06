@@ -1302,3 +1302,24 @@ def test_qwen_tts_stream_cache_hit_does_not_call_the_provider(monkeypatch, tmp_p
     assert (cached_first, cached_second) == (False, True)
     assert calls["n"] == 1
     assert eng.cache_params == "speech_rate=0.9"
+
+
+def test_qwen_tts_tolerates_explicit_empty_data_boundary_chunks(monkeypatch):
+    """2026-08-07 线上实测:qwen3-tts-flash 会在 stop 前发 data="" 的边界块
+    (键在、值空,finish_reason 仍是未完成)。带键而空=合法空块必须跳过;
+    连 data 键都没有的 silent_middle 仍按畸形拒绝(防 payload 位置漂移)。"""
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    eng = tts.DashScopeQwenTtsEngine("qwen3-tts-flash", "Serena", speech_rate=0.9)
+    first, second = _pcm(1, 400), _pcm(7, 600)
+    responses = [
+        _StreamResponse(data=base64.b64encode(_stream_header(first)).decode("ascii")),
+        _StreamResponse(data=""),                       # 中段边界块
+        _StreamResponse(data=base64.b64encode(second).decode("ascii")),
+        _StreamResponse(data="", finish_reason="stop"), # 终态也可能带空 data
+    ]
+    _install_stream(monkeypatch, responses)
+
+    audio = eng.synthesize("您好")
+
+    assert audio is not None
+    assert audio[44:] == first + second

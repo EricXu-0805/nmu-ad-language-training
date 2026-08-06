@@ -508,8 +508,10 @@ class DashScopeQwenTtsEngine:
                 finished = True
             if chunk:
                 buffer += _decoded_stream_chunk(chunk, len(buffer))
-            elif not finished:
-                # 中间块既没有音频也没有终态:畸形,不当成"这块没数据"跳过。
+            elif not finished and not (isinstance(audio, dict) and "data" in audio):
+                # 2026-08-07 线上实测:流会在 stop 前发显式 data="" 的边界块——
+                # 键在、值空是合法空块,跳过。连 data 键都没有才是畸形
+                # (防 payload 位置漂移的原判据不变)。
                 raise _QwenTtsFailure(
                     _QwenTtsFailureReason.RESPONSE_AUDIO_MISSING)
         # URL 即使随终态一起回来也一律忽略:流式已经给过字节了。
