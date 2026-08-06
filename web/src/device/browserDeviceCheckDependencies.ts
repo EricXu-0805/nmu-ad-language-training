@@ -154,7 +154,9 @@ export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDepend
     speechSynthesisVoices: () => voices,
 
     fetchImpl: (input, init) => fetch(input, init),
-    now: () => performance.now(),
+    // 必须是墙钟:时钟偏移拿它和服务器 Date 头相减。performance.now() 是页面
+    // 启动起的毫秒,真机上会把偏移报成整个 Unix 时间戳(≈56 年)。
+    now: () => Date.now(),
 
     async storageEstimate() {
       try {

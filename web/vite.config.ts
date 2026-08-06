@@ -22,7 +22,7 @@ const backend = 'http://127.0.0.1:8000'
 // 也不把任何答案定义复制进 Vite public/dist。
 const proxyOptions = { target: backend, changeOrigin: true }
 const prefixProxyPaths = [
-  '/health', '/auth', '/device', '/patients', '/sessions', '/cloud-processing',
+  '/health', '/auth', '/patients', '/sessions', '/cloud-processing',
   '/score', '/judge', '/audio', '/items', '/turns', '/asr', '/live', '/tts',
   '/audit', '/ai', '/visit-plans', '/assessment-events', '/assessment-instances',
   '/exports', '/governance',
@@ -37,6 +37,9 @@ const exactContentProxyPaths = [
 const proxy = Object.fromEntries(
   [
     ...prefixProxyPaths.map((path) => [path, proxyOptions]),
+    // '/device' 不能用普通前缀键:它会把前端路由 /device-check 一并吞给后端,
+    // dev 下整页空白(生产同源静态托管不经过这份代理,不受影响)。
+    ['^/device(?:[/?].*)?$', proxyOptions],
     // Vite treats ordinary proxy keys as prefixes.  Regex contexts keep an
     // invented suffix (or a historical JSON filename) out of the backend.
     ...exactContentProxyPaths.map((path) => [

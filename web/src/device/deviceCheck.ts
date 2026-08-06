@@ -52,6 +52,8 @@ export interface DeviceCheckDependencies {
   fetchImpl(input: string, init?: RequestInit): Promise<{
     ok: boolean; status: number; headers: { get(name: string): string | null };
   }>;
+  /** 墙钟 epoch 毫秒(Date.now 口径)。时钟偏移要和服务器 Date 头同量纲——
+   * 拿 performance.now() 来实现会把偏移算成整个 Unix 时间戳。 */
   now(): number;
   storageEstimate(): Promise<{ quotaBytes: number | null; usageBytes: number | null }>;
 }
