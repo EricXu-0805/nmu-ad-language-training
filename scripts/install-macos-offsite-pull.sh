@@ -96,6 +96,9 @@ if [ "\$rc" -ne 0 ]; then
   if [ -f '$ROOT/ops-webhook.env' ]; then
     if [ "\$rc" -eq 3 ]; then
       msg="异地备份卷超软配额(拉取本身成功)。看 $ROOT/offsite/pull.log 尾行,提配额或降保留。"
+    elif [ "\$rc" -eq 4 ]; then
+      msg="异地备份部分完成:有快照进了 legacy/conflicts 等人工处置,其余已归档。pull.log 尾部:
+\$(tail -5 '$ROOT/offsite/pull.log' 2>/dev/null || echo '(pull.log 不可读)')"
     else
       msg="异地备份拉取失败 rc=\$rc。pull.log 尾部:
 \$(tail -5 '$ROOT/offsite/pull.log' 2>/dev/null || echo '(pull.log 不可读)')"
@@ -157,10 +160,18 @@ job_state() {
 
 # 首轮要把远端十几份快照逐个校验、按 manifest 白名单二次 rsync，十分钟是常态。
 # 第一版只等两分钟就去读退出码，读到的是 "(never exited)"，于是把一次正在正常
-# 运行的拉取报成了失败。
+# 运行的拉取报成了失败。kickstart 到 launchd 状态翻成 running 也有延迟——
+# 第二版在翻转前就读了一次"不在跑"，跳过等待直接判失败。先等它真的启动。
 echo "等它跑完（首轮可能十几分钟）……"
+started=0
 waited=0
-while [ "$(job_state)" = "running" ] && [ "$waited" -lt 1800 ]; do
+while [ "$waited" -lt 1800 ]; do
+  state=$(job_state)
+  if [ "$state" = "running" ]; then
+    started=1
+  elif [ "$started" -eq 1 ] || [ "$waited" -ge 60 ]; then
+    break
+  fi
   sleep 10
   waited=$((waited + 10))
 done

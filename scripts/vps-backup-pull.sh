@@ -405,6 +405,10 @@ fi
 
 pulled=0
 unchanged=0
+# 单份快照的"证据已归档"类结局(legacy/conflict=3,既有证据待人工=5)不中止
+# 整体:一份坏快照不该挡住其余十几份的异地归档。硬故障(其他非零)照旧整体终止。
+pull_skipped=0
+pull_held=0
 expected_snapshot_facts() {
   local stamp="$1" index
   for index in "${!REMOTE_STAMP_ARGS[@]}"; do
@@ -470,12 +474,14 @@ pull_one_snapshot() {
     *) FAIL_CODE="remote_snapshot_name_invalid"; note "FAIL code=$FAIL_CODE"; return 1 ;;
   esac
 
+  # 返回 5=证据早已归档、仍等人工处置:首次归档那天已经告警过,之后每天
+  # 静默跳过本份、继续归档其余快照,不再重复拉响。
   for evidence_root in "$CONFLICTS" "$LEGACY"; do
     if [ -n "$(find "$evidence_root" -mindepth 1 -maxdepth 1 -type d \
         -name "$stamp.*" -print -quit)" ]; then
       FAIL_CODE="snapshot_unresolved_evidence"
       note "FAIL code=$FAIL_CODE snapshot=$stamp"
-      return 2
+      return 5
     fi
   done
   if [ -n "$(find "$QUARANTINE" -mindepth 1 -maxdepth 1 -type d \
@@ -483,7 +489,7 @@ pull_one_snapshot() {
          -o -name "$stamp.snapshot_publish_failed.*" \) -print -quit)" ]; then
     FAIL_CODE="snapshot_unresolved_evidence"
     note "FAIL code=$FAIL_CODE snapshot=$stamp"
-    return 2
+    return 5
   fi
 
   stage=$(mktemp -d "$INCOMING/$stamp.partial.XXXXXX")
@@ -662,7 +668,8 @@ PY
       CURRENT_STAGE=""
       CURRENT_STAMP=""
       note "FAIL code=legacy_snapshot_unvalidated snapshot=$stamp"
-      return 2
+      # 返回 3=本份证据已归档,继续其余快照;整体以 partial 收尾并告警一次。
+      return 3
     fi
     FAIL_CODE="snapshot_verify_failed"
     note "FAIL code=$FAIL_CODE snapshot=$stamp"
@@ -693,7 +700,8 @@ PY
       FAIL_CODE="existing_snapshot_invalid"
     fi
     note "FAIL code=$FAIL_CODE snapshot=$stamp rc=$compare_rc"
-    return 2
+    # 同为"证据已入 conflicts、等人工"的结局:不挡其余快照,partial 收尾告警。
+    return 3
   fi
 
   if ! "$PYTHON_BIN" -I "$GUARD" publish-vps "$stage" "$final" >/dev/null; then
@@ -708,7 +716,19 @@ PY
 
 while IFS= read -r stamp; do
   [ -z "$stamp" ] && continue
-  pull_one_snapshot "$stamp"
+  # </dev/null 必须有:循环体里的 rsync 会起 ssh,ssh 继承并吸干喂循环的
+  # stdin,第一份快照拉完 read 就 EOF——每日一份的节奏下永远发现不了,
+  # 2026-08-07 首次多份补拉时现形(远端 14 份只落地 1 份)。
+  snapshot_rc=0
+  pull_one_snapshot "$stamp" </dev/null || snapshot_rc=$?
+  case "$snapshot_rc" in
+    0) : ;;
+    3) pull_skipped=$((pull_skipped + 1)) ;;
+    5) pull_held=$((pull_held + 1)) ;;
+    # 硬故障(传输/校验器本身/清单畸形…)维持整体 fail-closed:EXIT trap 会把
+    # 当前 staging 按 FAIL_CODE 隔离成证据。
+    *) exit "$snapshot_rc" ;;
+  esac
 done < <(printf '%s\n' "$REMOTE_SNAPSHOTS" | LC_ALL=C sort -ru)
 
 # backup.log 是远端当前审计视图，可以替换；也必须先拉入临时文件再原子替换。
@@ -775,8 +795,15 @@ QUOTA_MB="${NMU_BACKUP_OFFSITE_QUOTA_MB:-20480}"
 case "$QUOTA_MB" in ''|*[!0-9]*) note "FAIL code=quota_config_invalid"; exit 2 ;; esac
 USED_MB=$(du -sm "$DEST" 2>/dev/null | awk '{print $1}')
 case "$USED_MB" in ''|*[!0-9]*) note "FAIL code=offsite_du_probe_invalid"; exit 2 ;; esac
+HELD_SUFFIX=""
+[ "$pull_held" -eq 0 ] || HELD_SUFFIX=" held=$pull_held"
+if [ "$pull_skipped" -gt 0 ]; then
+  # 本轮有新证据入 legacy/conflicts:其余快照照常归档了,但要人看一眼。
+  note "partial snapshots=$count pulled=$pulled unchanged=$unchanged skipped=$pull_skipped$HELD_SUFFIX used_mb=$USED_MB"
+  exit 4
+fi
 if [ "$USED_MB" -gt "$QUOTA_MB" ]; then
-  note "ok snapshots=$count pulled=$pulled unchanged=$unchanged used_mb=$USED_MB quota_mb=$QUOTA_MB verdict=quota_exceeded"
+  note "ok snapshots=$count pulled=$pulled unchanged=$unchanged$HELD_SUFFIX used_mb=$USED_MB quota_mb=$QUOTA_MB verdict=quota_exceeded"
   exit 3
 fi
-note "ok snapshots=$count pulled=$pulled unchanged=$unchanged used_mb=$USED_MB"
+note "ok snapshots=$count pulled=$pulled unchanged=$unchanged$HELD_SUFFIX used_mb=$USED_MB"
