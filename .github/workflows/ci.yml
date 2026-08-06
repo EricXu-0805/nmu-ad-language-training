@@ -9,6 +9,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
   schedule:
     # 每周一 02:00 UTC 重跑一次。依赖没动，OSV 里的世界会动——
     # 只在 push 时扫等于假设漏洞只在改代码时出现。
