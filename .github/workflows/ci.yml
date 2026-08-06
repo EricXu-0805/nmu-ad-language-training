@@ -27,9 +27,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.10 = 裸机生产机上的系统 Python；3.12 = 容器底座。
+        # 3.12 = 容器底座；3.14 = 裸机生产机上自编译的解释器。
         # 只验一个等于放任另一条路悄悄漂。
-        python: ["3.10", "3.12"]
+        python: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
@@ -70,7 +70,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
         with:
-          python-version: "3.10"
+          python-version: "3.12"
       - name: SBOM 必须与当前依赖一致
         run: python scripts/generate_sbom.py --check
       - name: OSV 漏洞扫描（未豁免的一条就红）

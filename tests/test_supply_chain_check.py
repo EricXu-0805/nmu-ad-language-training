@@ -138,9 +138,12 @@ def test_a_version_the_lock_does_not_allow_is_a_hard_failure():
 
 
 def test_same_name_two_versions_is_matched_by_set_membership():
-    """universal 锁按 marker 分叉出两条 websockets;两边都得算对上。
+    """universal 锁可以按 marker 把同一个包分叉成两条;两边都得算对上。
 
-    单值等号比会让 3.10 的机器看到 17.0.1、3.12 的机器看到 16.1.1，各误报一次。
+    下限还是 3.10 时,`websockets` 在锁里就是两条(16.1.1 `<3.11` / 17.0.1
+    `>=3.11`),单值等号比会让 3.10 的机器看到 17.0.1、3.12 的机器看到 16.1.1,
+    各误报一次。下限提到 3.12 之后现役锁里暂时没有分叉的包了——所以这条只能
+    用合成锁守,下一个按 Python 版本分叉的依赖进来时它就是唯一的防线。
     """
     entries, floor = sc.parse_lock(_lock(
         "websockets==16.1.1 ; python_full_version < '3.11' \\", "    --hash=sha256:a",

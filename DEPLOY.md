@@ -479,11 +479,15 @@ docker compose ps
 最后一行同理：tag 可以被移动，被移动之后没有任何本地信号，而这些 action 在 CI
 里拿得到仓库内容。它们不能比依赖松。
 
-**一份锁覆盖两条运行路径。** 锁按 `--python-version 3.10` 编译——裸机生产机是
-Ubuntu 22.04 的系统 Python 3.10.12，容器底座是 3.12。按 3.12 编译的锁在 3.10 上
-不成立（缺 `tomli`/`exceptiongroup`/`async-timeout` 三个垫片），反过来则可以。
-`--universal` 让同一个包能按 marker 分叉出两条（`websockets` 就有 16.1.1 和
-17.0.1 两条），这是正常的，不是重复。
+**一份锁覆盖两条运行路径。** 锁按 `--python-version 3.12` 编译——下限取两条路径里
+最低的那个：容器底座 `python:3.12-alpine`。裸机生产机是 `/opt/nmu/python3.14`
+（2026-08-06 自编译，见 §12.5）。
+
+下限不是装饰：按 3.12 编译的锁装到 3.10 上会缺 `tomli`/`exceptiongroup`/
+`async-timeout` 三个垫片，反过来则可以，所以 `supply_chain_check.py` 把
+"机器 Python 低于锁的下限"判成硬失败。`--universal` 允许同一个包按 marker 分叉出
+两条（下限还是 3.10 时 `websockets` 就是 16.1.1 / 17.0.1 两条）——那不是重复，
+对账必须按集合包含判。现役锁里暂时没有分叉的包，但机制还在。
 
 ### 12.2 三道自动门禁
 
@@ -520,10 +524,11 @@ scripts/ci_gate.sh
 scripts/generate_sbom.py
 
 # 4. 在生产旁边建新 venv——这一步不碰正在跑的服务
+#    解释器用 /opt/nmu/python3.14（自编译，见 §12.5），不是系统 python3
 scp requirements-deploy.lock.txt root@<host>:/opt/nmu/
 ssh root@<host> '
   rm -rf /opt/nmu/venv-new
-  python3 -m venv /opt/nmu/venv-new
+  /opt/nmu/python3.14/bin/python3 -m venv /opt/nmu/venv-new
   /opt/nmu/venv-new/bin/pip install --upgrade pip                 # 引导；老 pip 读不了新元数据
   /opt/nmu/venv-new/bin/pip install --require-hashes -r /opt/nmu/requirements-deploy.lock.txt
   /opt/nmu/venv-new/bin/pip uninstall --yes pip setuptools wheel  # 引导工具不属于审计过的集合
@@ -564,17 +569,63 @@ ssh root@<host> '/opt/nmu/venv/bin/python /opt/nmu/app/scripts/preflight_check.p
 
 ### 12.4 已知的、还没解决的
 
-- **⚠ CPython 3.10 官方支持 2026-10 到期。** 生产跑的就是它（Ubuntu 22.04 系统
-  Python）。到期后解释器本身不再收安全补丁，而它是整套依赖里最底下那一层。
-  三条路各有代价，需要拍板：① 加 deadsnakes PPA 装 3.12——最省事，但等于给
-  一台临床机器加一个第三方 APT 源；② 从源码编译 3.12 装到 `/opt`——不引入外部
-  源，但升级得自己维护；③ 改走容器路径（底座已经是 3.12）——最干净，但要重做
-  一遍部署与备份链路。
+- **自编译的解释器要自己盯安全更新**（§12.5）。这是用"不引入第三方 APT 源"换来的，
+  没有 apt 会替我们推 CPython 的安全修复。
 - **底座镜像里的系统包没有本地扫描。** OSV 认不了 OCI digest。CI 的 `image`
   作业用 trivy 扫构建产物；本机没有等价步骤，所以 `ci_gate.sh` 通过**不代表**
   镜像干净。而且当前线上是裸机，镜像并不在服务路径上。
 - **裸机那台机器的操作系统包（apt）不在任何清单里。** SBOM 只覆盖应用依赖和
   容器底座。
+
+### 12.5 裸机的 Python 是自己编的（2026-08-06）
+
+原来跑的是 Ubuntu 22.04 自带的 3.10.12，官方支持 2026-10 到期。选了从源码编译
+3.14.7 装到 `/opt/nmu/python3.14`，没有加 deadsnakes PPA——给一台跑真实受试者
+数据的机器增加一个第三方 APT 源，等于把每一次 apt 升级的信任面扩大到那个源的
+维护者；自己编译只需要信任 python.org 一家，而那一家本来就必须信。
+
+**代价写在前面：从此没有 apt 替我们打补丁。** CPython 出安全修复时，得有人重跑
+一遍下面的流程。这是这个选择的全部成本，不写下来就等于没选。
+
+- **怎么看有没有新版**：<https://www.python.org/downloads/> 的 3.14 分支，或
+  <https://mail.python.org/mailman3/lists/security-announce.python.org/>。
+  每次上线时 preflight 会打印当前解释器版本（`依赖与哈希锁一致: Python 3.14.7，…`），
+  那是最省事的提醒点。
+- **重跑的完整流程**（换个版本号即可）：
+
+```bash
+# 1. 下载 + 验签。3.14 起 python.org 不再发 GPG 签名(PEP 761)，改用 sigstore。
+#    --cert-identity 要去 https://www.python.org/downloads/metadata/sigstore/
+#    查当期 release manager，别照抄——3.14/3.15 是 hugo@python.org，更早的不是。
+curl -O https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tgz
+curl -O https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tgz.sigstore
+python -m sigstore verify identity --bundle Python-3.14.7.tgz.sigstore \
+    --cert-identity hugo@python.org \
+    --cert-oidc-issuer https://github.com/login/oauth Python-3.14.7.tgz
+
+# 2. 传上去，核对摘要一致后编译
+scp Python-3.14.7.tgz root@<host>:/opt/nmu/
+ssh root@<host> '
+  cd /opt/nmu/build && tar xzf /opt/nmu/Python-3.14.7.tgz && cd Python-3.14.7
+  ./configure --prefix=/opt/nmu/python3.14 --with-ensurepip=install
+  make -j2 && make install
+'
+
+# 3. 必须逐个确认起得来的模块——少一个 _sqlite3 或 _ssl，服务要到运行时才炸
+ssh root@<host> '/opt/nmu/python3.14/bin/python3 -c "
+import ssl, sqlite3, lzma, bz2, zlib, ctypes, readline, hashlib, decimal, uuid
+print(ssl.OPENSSL_VERSION)"'
+
+# 4. 然后照 §12.3 第 4 步往下走，用新解释器重建 venv
+```
+
+**故意不加 `--enable-optimizations`**：PGO 要在构建期跑一遍测试套件，LTO 链接吃
+内存，而这台机器是 2 核 1 GB（swap 545 MB）。少 10–20% 的解释器速度对这套负载
+（单 worker、几位老人、瓶颈在网络和云 TTS）没有意义，构建期 OOM 才有意义。
+
+编译工具链（`build-essential` 等，全部来自 Ubuntu 官方源，没有第三方 repo）留在
+机器上了，方便下次重编。要收掉：`apt-get remove --purge build-essential`——运行期
+库是独立的包，拆掉编译器不影响已经装好的解释器。
 
 ---
 

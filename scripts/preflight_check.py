@@ -130,7 +130,10 @@ def check_supply_chain(lock_path: Path, python_executable: str) -> Check:
         return Check(name, False,
                      f"{len(failures)} 处对不上（{summary}）；"
                      f"跑 scripts/supply_chain_check.py --python {python_executable} 看明细")
-    return Check(name, True, f"{stats['expected_here']} 个包逐个对上，无锁外来客")
+    # 把解释器版本一并报出来:裸机那台是自编译的,没有 apt 会替我们打补丁,
+    # 每次上线都看一眼它是几,是唯一不额外花钱的提醒。
+    return Check(name, True, f"Python {stats['python']}，"
+                             f"{stats['expected_here']} 个包逐个对上，无锁外来客")
 
 
 def _default_fetch(url: str, timeout: float):

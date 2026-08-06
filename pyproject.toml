@@ -2,11 +2,10 @@
 name = "nmu-language-training-platform"
 version = "0.0.1"
 description = "南医大 · 自有服务器持久化、可选云端 AI 增强的轻中度痴呆语言沟通训练研究平台"
-# 3.10 是裸机生产机上的系统 Python(Ubuntu 22.04),哈希锁也按它编译,
-# 全量后端在它上面跑绿。写 3.11 是句假话。
-# ⚠ CPython 3.10 官方支持 2026-10 到期,到期后解释器本身不再有安全补丁——
-#   这是当前最大的一处供应链风险,处置方案见 DEPLOY.md 供应链一节。
-requires-python = ">=3.10"
+# 下限 = 两条运行路径里最低的那个:容器底座 python:3.12-alpine。
+# 裸机生产机 2026-08-06 已从 Ubuntu 自带的 3.10.12 升到自编译的 3.14.7
+# (3.10 官方支持 2026-10 到期)。哈希锁按 3.12 编译,两条路径共用一份。
+requires-python = ">=3.12"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
