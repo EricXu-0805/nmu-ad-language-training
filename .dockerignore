@@ -12,6 +12,7 @@ data/
 .playwright-cli/
 项目综合审计_*/
 .git/
+.github/
 # Vite 会自动吸收 .env.production/.env.development 并可把 VITE_* 写入成品；
 # 根目录和任意子目录的环境文件都不得进构建上下文。
 .env

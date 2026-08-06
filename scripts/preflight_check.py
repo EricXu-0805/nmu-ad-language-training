@@ -102,6 +102,37 @@ def check_backup(backup_root: Path) -> Check:
     return Check(name, True, "最新快照在窗口内，且真的在盘上")
 
 
+def check_supply_chain(lock_path: Path, python_executable: str) -> Check:
+    """跑着这台机器的解释器，装的东西和哈希锁对不对得上。
+
+    2026-08-06 查出生产 venv 比锁多 20 个包、9 处版本漂移——没人审过，装的时候
+    也没有哈希被校验。锁只在安装那一刻起作用，之后靠这条守。
+    """
+    name = "依赖与哈希锁一致"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "supply_chain_check", Path(__file__).resolve().parent / "supply_chain_check.py")
+    assert spec is not None and spec.loader is not None
+    supply_chain = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(supply_chain)
+    try:
+        entries, floor = supply_chain.parse_lock(lock_path.read_text(encoding="utf-8"))
+        snapshot = supply_chain.probe(python_executable)
+    except (OSError, ValueError, RuntimeError) as error:
+        return Check(name, False, f"对不成账：{error}")
+    failures, _, stats = supply_chain.compare(entries, floor, snapshot)
+    if failures:
+        counts: dict[str, int] = {}
+        for failure in failures:
+            counts[failure.kind] = counts.get(failure.kind, 0) + 1
+        summary = "、".join(f"{kind} {count}" for kind, count in sorted(counts.items()))
+        return Check(name, False,
+                     f"{len(failures)} 处对不上（{summary}）；"
+                     f"跑 scripts/supply_chain_check.py --python {python_executable} 看明细")
+    return Check(name, True, f"{stats['expected_here']} 个包逐个对上，无锁外来客")
+
+
 def _default_fetch(url: str, timeout: float):
     context = ssl.create_default_context()
     request = urllib.request.Request(url, method="GET")
@@ -155,6 +186,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=None, help="要核对迁移头的 SQLite")
     parser.add_argument("--backup-root", type=Path, default=None)
+    parser.add_argument("--lock", type=Path, default=None,
+                        help="哈希锁；给了就把跑这个脚本的解释器和它对一遍账")
     parser.add_argument("--base-url", default=None, help="公网入口，例如 https://…")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -164,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
                   else Check("迁移头一致", None, "未给 --db"))
     checks.append(check_backup(args.backup_root) if args.backup_root
                   else Check("备份新鲜度", None, "未给 --backup-root"))
+    checks.append(check_supply_chain(args.lock, sys.executable) if args.lock
+                  else Check("依赖与哈希锁一致", None, "未给 --lock"))
     if args.base_url:
         checks.extend(check_public_surface(args.base_url))
     else:

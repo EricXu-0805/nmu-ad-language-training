@@ -3,6 +3,7 @@
 红线覆盖:白名单外文本永不出网;引擎失败恒降级;判分格式可疑一律回退规则。
 """
 import base64
+import importlib.util
 import json
 import logging
 from types import SimpleNamespace
@@ -135,6 +136,8 @@ def test_cloud_tts_error_degrades_not_500(cloud_tts, monkeypatch):
 
 @pytest.mark.skipif(not tts.DEFAULT_VOICE.exists(), reason="无本地 piper 模型")
 def test_cloud_tts_failure_falls_back_to_piper(monkeypatch, tmp_path):
+    if not tts.PiperTtsEngine(tts.DEFAULT_VOICE).available():
+        pytest.skip("本机没有可用的 piper(缺模型或缺包),验不了这条降级")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
     monkeypatch.setattr(tts, "CACHE_DIR", tmp_path / "tts-cache")
 
@@ -331,8 +334,12 @@ def test_inline_wav_base64_is_strict_and_bounded_before_and_after_decode(monkeyp
 
 
 def test_fallback_piper_singleton_reused(monkeypatch, tmp_path):
+    if importlib.util.find_spec("piper") is None:
+        # 单例只在引擎可用时成立:包没装时 available() 恒假,每次调用都会重建一个
+        # (便宜,且装上包后下一次即生效)。这条验的是可用状态下不逐句重载模型。
+        pytest.skip("本机没装 piper,验不了降级层单例")
     fake_model = tmp_path / "voice.onnx"
-    fake_model.write_bytes(b"onnx")                       # available() 只查存在,不加载
+    fake_model.write_bytes(b"onnx")                       # 模型不会被加载,内容无所谓
     monkeypatch.setenv("TTS_VOICE_PATH", str(fake_model))
     monkeypatch.setattr(tts, "_fallback_piper", None)
     a = tts._fallback_piper_engine()

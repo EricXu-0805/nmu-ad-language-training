@@ -1,0 +1,103 @@
+# 合并前的自动检查。真正的判据全在 scripts/ci_gate.sh 里，这里只负责在云上调它——
+# 同一套检查本地一条命令也能跑完，不会出现"只有 CI 知道怎么验"的情况。
+#
+# ⚠ 截至 2026-08-06 这个仓库还没 push 过 origin。在推上去之前，这个文件不会被
+#   执行一次。它不是"已经有 CI 了"的证据，只是推上去那天立刻生效的定义。
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # 每周一 02:00 UTC 重跑一次。依赖没动，OSV 里的世界会动——
+    # 只在 push 时扫等于假设漏洞只在改代码时出现。
+    - cron: "0 2 * * 1"
+
+permissions:
+  contents: read
+
+# 第三方 action 一律按 commit SHA 钉，tag 只作注释。理由和底座镜像钉 digest
+# 是同一条：tag 可以被移动，被移动之后没有任何本地信号。这些 action 在 CI 里
+# 拿得到仓库内容，是供应链的一部分，不能比依赖松。
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 = 裸机生产机上的系统 Python；3.12 = 容器底座。
+        # 只验一个等于放任另一条路悄悄漂。
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: 按哈希锁装运行期依赖
+        run: pip install --require-hashes -r requirements-deploy.lock.txt
+      - name: 装测试工具（不在运行期锁里，故单独一步）
+        run: pip install pytest ruff
+      - run: ruff check .
+      - run: python -m pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020   # v7.0.0
+        with:
+          # 必须 ≥23：测试用 node --test 直接跑 .ts，靠的是原生类型剥离。
+          # 镜像底座是 node 22，那一层只跑 vite build，不跑这些测试。
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: web
+      - run: npm run lint
+        working-directory: web
+      - run: npm run pretest
+        working-directory: web
+      - run: npm test
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with:
+          python-version: "3.10"
+      - name: SBOM 必须与当前依赖一致
+        run: python scripts/generate_sbom.py --check
+      - name: OSV 漏洞扫描（未豁免的一条就红）
+        run: python scripts/vuln_scan.py
+      - name: 锁自洽——干净环境按哈希装完要与锁逐个对上
+        run: |
+          python -m venv /tmp/locked
+          /tmp/locked/bin/pip install --require-hashes -r requirements-deploy.lock.txt
+          python scripts/supply_chain_check.py --python /tmp/locked/bin/python
+      - name: 归档 SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+  image:
+    # 镜像里的系统包 OSV 查不了(它认不了 OCI digest)，得在构建产物上扫。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - name: 构建镜像（底座 digest 已在 Dockerfile 里钉死）
+        run: docker build -t nmu-platform:ci .
+      - name: 扫镜像
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: nmu-platform:ci
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true

@@ -60,7 +60,7 @@ if [ "$MODE" = "rollback" ]; then
   remote "tar -xzf '$archive' -C /opt/nmu"
   remote "systemctl start nmu.service"
   echo "== 代码已回到存档版本。数据库仍在新头，若结构不兼容必须按 DEPLOY.md 8.1 处置。 =="
-  remote "$VENV_PY $APP_DIR/scripts/preflight_check.py --db $APP_DIR/data/app.db --backup-root $BACKUP_ROOT $preflight_url" || true
+  remote "$VENV_PY $APP_DIR/scripts/preflight_check.py --db $APP_DIR/data/app.db --backup-root $BACKUP_ROOT --lock $APP_DIR/requirements-deploy.lock.txt $preflight_url" || true
   exit 0
 fi
 
@@ -112,7 +112,7 @@ remote "printf 'commit = %s\narchive = %s\nsnapshot = %s\nprevious_head = %s\nat
 remote "chmod 600 $STATE_FILE"
 
 echo "== 7. 验收 =="
-if remote "$VENV_PY $APP_DIR/scripts/preflight_check.py --db $APP_DIR/data/app.db --backup-root $BACKUP_ROOT $preflight_url"; then
+if remote "$VENV_PY $APP_DIR/scripts/preflight_check.py --db $APP_DIR/data/app.db --backup-root $BACKUP_ROOT --lock $APP_DIR/requirements-deploy.lock.txt $preflight_url"; then
   # 变量后面紧跟全角标点必须加花括号：bash 在 UTF-8 locale 下会把那几个字节
   # 算进变量名，set -u 报一个查不出来的 unbound variable。
   echo "上线完成。commit ${head_commit}，回滚存档 ${archive}"

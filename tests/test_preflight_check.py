@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sqlite3
+import sys
 
 _SPEC = importlib.util.spec_from_file_location(
     "preflight_check",
@@ -118,11 +119,48 @@ def test_unreachable_host_is_one_failure_not_four():
     assert checks[0].ok is False
 
 
+def _lock(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "lock.txt"
+    path.write_text(
+        "#    uv pip compile --python-version 3.10 --generate-hashes\n" + body,
+        encoding="utf-8")
+    return path
+
+
+def test_supply_chain_group_passes_on_the_interpreter_that_runs_it(tmp_path):
+    """拿当前解释器真装着的东西当锁，就该对上——证明这条不是恒假。"""
+    import importlib.metadata as metadata
+
+    lines = []
+    for dist in metadata.distributions():
+        name = dist.metadata["Name"]
+        if name:
+            lines.append(f"{name}=={dist.version} \\\n    --hash=sha256:x\n")
+    check = preflight.check_supply_chain(_lock(tmp_path, "".join(lines)), sys.executable)
+
+    assert check.ok is True, check.detail
+
+
+def test_supply_chain_group_names_what_went_wrong(tmp_path):
+    check = preflight.check_supply_chain(
+        _lock(tmp_path, "alembic==1.18.5 \\\n    --hash=sha256:x\n"), sys.executable)
+
+    assert check.ok is False
+    assert "unlocked" in check.detail                       # 装了一堆锁里没有的
+    assert "supply_chain_check.py" in check.detail          # 告诉人去哪看明细
+
+
+def test_supply_chain_group_fails_loudly_when_it_cannot_look(tmp_path):
+    check = preflight.check_supply_chain(tmp_path / "no-such-lock.txt", sys.executable)
+
+    assert check.ok is False and "对不成账" in check.detail
+
+
 def test_skipped_groups_do_not_fail_the_run(capsys):
     code = preflight.main([])
 
     assert code == 0
-    assert capsys.readouterr().out.count("[SKIP]") == 3
+    assert capsys.readouterr().out.count("[SKIP]") == 4
 
 
 def test_any_hard_failure_makes_the_run_nonzero(tmp_path, capsys):

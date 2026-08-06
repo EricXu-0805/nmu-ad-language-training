@@ -462,16 +462,136 @@ docker compose ps
 
 ---
 
+## 12. 供应链
+
+### 12.1 钉住了什么，在哪儿
+
+| 层 | 钉法 | 文件 |
+|---|---|---|
+| 容器底座 | `FROM …@sha256:` 双镜像 digest；tag 只作可读注释 | `Dockerfile` |
+| 底座系统包 | `apk add bash=5.3.9-r1` 精确版本 | `Dockerfile` |
+| 运行期 Python | 全量传递锁 + 每个分发包 sha256，安装走 `--require-hashes` | `requirements-deploy.lock.txt` |
+| 前端 | `package-lock.json` v3，含每个包的 integrity；构建走 `npm ci` | `web/package-lock.json` |
+| 物料清单 | CycloneDX 1.6，确定性输出，入库 | `sbom.cdx.json` |
+| 漏洞豁免 | 必须写理由和到期日 | `security/vuln-waivers.json` |
+| CI 第三方 action | 按 commit SHA 钉，tag 只作注释 | `.github/workflows/ci.yml` |
+
+最后一行同理：tag 可以被移动，被移动之后没有任何本地信号，而这些 action 在 CI
+里拿得到仓库内容。它们不能比依赖松。
+
+**一份锁覆盖两条运行路径。** 锁按 `--python-version 3.10` 编译——裸机生产机是
+Ubuntu 22.04 的系统 Python 3.10.12，容器底座是 3.12。按 3.12 编译的锁在 3.10 上
+不成立（缺 `tomli`/`exceptiongroup`/`async-timeout` 三个垫片），反过来则可以。
+`--universal` 让同一个包能按 marker 分叉出两条（`websockets` 就有 16.1.1 和
+17.0.1 两条），这是正常的，不是重复。
+
+### 12.2 三道自动门禁
+
+```bash
+scripts/ci_gate.sh              # 全部：ruff / 后端 / 前端 / SBOM / 漏洞 / 锁自洽
+scripts/ci_gate.sh --offline    # 不出网(漏洞扫描改用存好的 OSV 应答)
+```
+
+- **锁 ↔ 运行环境**：`scripts/supply_chain_check.py --python <解释器>`。锁只在
+  安装那一刻起作用；这条守的是"安装之后有没有人手工往里加东西"。已接进
+  `preflight_check.py --lock …`，因此 `deploy_baremetal.sh` 的第 7 步会自动跑。
+- **SBOM ↔ 依赖**：`scripts/generate_sbom.py --check`。改了依赖没重出 SBOM 就红。
+  输出不带时间戳、serialNumber 由内容摘要推出，所以"无 diff"是个可靠判据。
+- **漏洞**：`scripts/vuln_scan.py` 打 OSV。只发包名和版本号（都是公开信息），
+  不发仓库内容、不发患者字段、不带凭据。查不通网络退 2 —— 查不动就是没查过，
+  不当作通过。
+
+### 12.3 升级依赖的顺序（别在部署机上 pip install）
+
+线上那套 venv 一旦被手工 `pip install` 过，锁就失去意义。2026-08-06 查出来的
+状态是：生产装了 71 个包，锁里只有 59 条，多出来的 20 个（`pytest`、
+`onnxruntime`、`protobuf`、`numpy`、Ubuntu 自带的 `setuptools 59.6.0`…）没人审过，
+装的时候也没有任何哈希被校验。正确做法是**重建**，不是增补：
+
+```bash
+# 1. 本地改直接依赖，重出锁
+uv pip compile requirements-deploy.txt --universal --python-version 3.10 \
+    --generate-hashes -o requirements-deploy.lock.txt
+
+# 2. 本地过完整门禁（含 3.10 与 3.12 两个解释器上的后端全量）
+scripts/ci_gate.sh
+
+# 3. 重出 SBOM 并提交
+scripts/generate_sbom.py
+
+# 4. 在生产旁边建新 venv——这一步不碰正在跑的服务
+scp requirements-deploy.lock.txt root@<host>:/opt/nmu/
+ssh root@<host> '
+  rm -rf /opt/nmu/venv-new
+  python3 -m venv /opt/nmu/venv-new
+  /opt/nmu/venv-new/bin/pip install --upgrade pip                 # 引导；老 pip 读不了新元数据
+  /opt/nmu/venv-new/bin/pip install --require-hashes -r /opt/nmu/requirements-deploy.lock.txt
+  /opt/nmu/venv-new/bin/pip uninstall --yes pip setuptools wheel  # 引导工具不属于审计过的集合
+'
+
+# 5. 验它：装的东西与锁逐个对上，且能 import 应用
+scripts/supply_chain_check.py --python /opt/nmu/venv-new/bin/python   # 需先取到该机快照
+ssh root@<host> 'cd /opt/nmu/app && /opt/nmu/venv-new/bin/python -c "import app.main"'
+
+# 6. 停服 → 换目录 → 改回 shebang → 起服
+ssh root@<host> '
+  systemctl stop nmu.service
+  mv /opt/nmu/venv /opt/nmu/venv-old-$(date +%Y%m%d-%H%M%S)
+  mv /opt/nmu/venv-new /opt/nmu/venv
+  sed -i "1s|/opt/nmu/venv-new/bin/|/opt/nmu/venv/bin/|" /opt/nmu/venv/bin/*
+  systemctl start nmu.service
+'
+
+# 7. 验收
+ssh root@<host> '/opt/nmu/venv/bin/python /opt/nmu/app/scripts/preflight_check.py \
+    --db /opt/nmu/app/data/app.db --backup-root /opt/nmu/backups \
+    --lock /opt/nmu/app/requirements-deploy.lock.txt --base-url https://<公网入口>'
+```
+
+**第 6 步那条 `sed` 不是多余的。** pip 生成的入口脚本（`alembic`、`uvicorn`、
+`dashscope`…）把解释器绝对路径写死在 shebang 里，改名之后它们全部指向一个不存在
+的目录。`nmu.service` 已经改成走 `python -m uvicorn` 来免疫这一类，但直接敲
+`/opt/nmu/venv/bin/alembic` 的人还是会撞上。
+
+回滚就是把 `venv-old-*` 换回去。旧目录留着，确认稳定再删。
+
+**故意不装的东西**：`piper-tts` 及其一串（`onnxruntime`/`numpy`/`protobuf`/
+`sympy`/`mpmath`/`flatbuffers`/`coloredlogs`/`humanfriendly`）。生产机上从来
+没有 `data/tts/*.onnx` 语音模型，piper 引擎的 `available()` 恒假，这八个包是
+纯粹的攻击面。真要本地兜底音色，得同时交付模型文件和 GPL 合规材料（见自检
+清单里那条），届时把 `piper-tts` 加进 `requirements-deploy.txt` 重出锁。
+`python-multipart` 同理：全仓库没有一处 `UploadFile`/`Form`/`File`。
+
+### 12.4 已知的、还没解决的
+
+- **⚠ CPython 3.10 官方支持 2026-10 到期。** 生产跑的就是它（Ubuntu 22.04 系统
+  Python）。到期后解释器本身不再收安全补丁，而它是整套依赖里最底下那一层。
+  三条路各有代价，需要拍板：① 加 deadsnakes PPA 装 3.12——最省事，但等于给
+  一台临床机器加一个第三方 APT 源；② 从源码编译 3.12 装到 `/opt`——不引入外部
+  源，但升级得自己维护；③ 改走容器路径（底座已经是 3.12）——最干净，但要重做
+  一遍部署与备份链路。
+- **底座镜像里的系统包没有本地扫描。** OSV 认不了 OCI digest。CI 的 `image`
+  作业用 trivy 扫构建产物；本机没有等价步骤，所以 `ci_gate.sh` 通过**不代表**
+  镜像干净。而且当前线上是裸机，镜像并不在服务路径上。
+- **裸机那台机器的操作系统包（apt）不在任何清单里。** SBOM 只覆盖应用依赖和
+  容器底座。
+
+---
+
 ## 部署自检清单
 
-下面这些里，迁移头、备份新鲜度、公网红线与受保护路由这四项可以先跑一条命令
-自动过一遍（不打任何供应商云 API，不花钱，不把文本发出去）：
+下面这些里，迁移头、备份新鲜度、依赖与哈希锁一致、公网红线与受保护路由这几项
+可以先跑一条命令自动过一遍（不打任何供应商云 API，不花钱，不把文本发出去）：
 
 ```bash
 .venv/bin/python scripts/preflight_check.py \
     --db data/app.db --backup-root /opt/nmu/backups \
+    --lock requirements-deploy.lock.txt \
     --base-url https://<公网入口>
 ```
+
+`--lock` 对的是**跑这个脚本的那个解释器**，所以要用目标机上的 venv 去执行它，
+不是在开发机上跑（开发机的 `.venv` 装着 pytest 之类锁外的东西，必然不一致）。
 
 任一项 FAIL 即非零退出。其余项目仍须人工核对。
 

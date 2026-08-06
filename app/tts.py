@@ -27,6 +27,7 @@ import base64
 import binascii
 import enum
 import hashlib
+import importlib.util
 import io
 import ipaddress
 import json
@@ -352,7 +353,10 @@ class PiperTtsEngine:
         self.version = f"piper/{voice_path.stem}"
 
     def available(self) -> bool:
-        return self._voice_path.exists()
+        # 光有模型文件不算可用:包没装时 synthesize 恒返回 None,而降级链会把
+        # last_version 记成 "piper/…",证据表里就多出一个从未运行的引擎。
+        # find_spec 不执行模块体,不会把 onnxruntime 拖进内存。
+        return self._voice_path.exists() and importlib.util.find_spec("piper") is not None
 
     def synthesize(self, text: str) -> bytes | None:
         if not self.available():

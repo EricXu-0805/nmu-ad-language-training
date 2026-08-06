@@ -1,0 +1,19 @@
+{
+  "_说明": [
+    "只有写进这里的漏洞 ID 才会被 scripts/vuln_scan.py 放行。",
+    "每条必须有 id / reason / expires。过期的按未豁免算——到期强制重看一次，",
+    "而不是让一条'当时不适用'的判断无限期躺在这里。",
+    "reason 要写成可证伪的技术判断：说清受影响的是哪个代码路径、我们为什么走不到那条路径。",
+    "写'风险低'不算理由。"
+  ],
+  "waivers": [
+    {
+      "id": "GHSA-qwww-vcr4-c8h2",
+      "package": "pkg:npm/react-router@7.18.1",
+      "expires": "2026-11-06",
+      "assessed": "2026-08-06",
+      "reason": "受影响的是 RSC 模式下 matchRSCServerRequest 的 server action 分支：请求在 400 返回之前就被执行，从而绕过 CSRF 校验。本应用是 Vite 单页前端，web/src 里对 react-router-dom 的全部使用是 BrowserRouter / Link / Navigate / Route / Routes / useLocation 六个声明式符号，没有 data router、没有 loader/action、没有 RSC 服务端，那条分支不可达。上游修复版本是 8.3.0——跨大版本，给一个不可达的路径做路由大升级，回归风险高于它消除的风险。",
+      "exit": "采用 react-router 8.x 时一并解除；或在到期日前复核一次'仍然没有 data router / RSC'这个前提是否还成立。"
+    }
+  ]
+}

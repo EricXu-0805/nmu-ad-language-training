@@ -1515,8 +1515,8 @@ def test_tts_speak_degraded_and_validation(client, monkeypatch):
 
 def test_tts_piper_synthesis_and_cache(client, tmp_path, monkeypatch):
     import app.tts as tts_mod
-    if not tts_mod.DEFAULT_VOICE.exists():
-        pytest.skip("本机无 piper 语音模型(部署机可选)")
+    if not tts_mod.PiperTtsEngine(tts_mod.DEFAULT_VOICE).available():
+        pytest.skip("本机没有可用的 piper(缺模型或缺包;部署机可选)")
     monkeypatch.delenv("TTS_ENGINE", raising=False)
     monkeypatch.setattr(tts_mod, "_engine", None)
     monkeypatch.setattr(tts_mod, "CACHE_DIR", tmp_path / "tts-cache")
@@ -1526,6 +1526,37 @@ def test_tts_piper_synthesis_and_cache(client, tmp_path, monkeypatch):
     r2 = client.post("/tts/speak", json={"text": "这是测试"})
     assert r2.headers["x-tts-cache"] == "hit" and r2.content == r.content  # 同句只合成一次
     monkeypatch.setattr(tts_mod, "_engine", None)
+
+
+def test_piper_model_without_piper_package_reports_null_not_piper(client, tmp_path, monkeypatch):
+    """有模型文件、没装 piper 包:引擎名要报 null,不能报 piper。
+
+    降级链把"最后尝试过的引擎"写进 X-Tts-Engine 和 TtsServeEvidence。
+    available() 若只看模型文件,一台没装包的机器会给每次 204 都盖上
+    "piper/…"的章——一个从未运行、也不可能运行的引擎。
+    """
+    import importlib.util
+
+    import app.tts as tts_mod
+
+    voice = tmp_path / "zh_CN-huayan-medium.onnx"
+    voice.write_bytes(b"not a real onnx model")     # 只要求存在,不会被加载
+    monkeypatch.setenv("TTS_VOICE_PATH", str(voice))
+    monkeypatch.delenv("TTS_ENGINE", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setattr(tts_mod, "_engine", None)
+    monkeypatch.setattr(tts_mod, "_fallback_piper", None)
+    monkeypatch.setattr(tts_mod, "CACHE_DIR", tmp_path / "tts-cache")
+
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **kw:
+                        None if name == "piper" else real_find_spec(name, *a, **kw))
+
+    assert not tts_mod.PiperTtsEngine(voice).available()
+    assert isinstance(tts_mod.get_engine(), tts_mod.NullTtsEngine)
+    r = client.post("/tts/speak", json={"text": "这是测试"})
+    assert r.status_code == 204
+    assert r.headers["x-tts-engine"] == tts_mod.NullTtsEngine.version
 
 
 def test_phase_aware_cue_intervention_flagged(client):

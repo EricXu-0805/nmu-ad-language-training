@@ -5,7 +5,10 @@ After=network-online.target
 User=nmu
 WorkingDirectory=/opt/nmu/app
 EnvironmentFile=/opt/nmu/app/.env
-ExecStart=/opt/nmu/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
+# 走 `python -m`，不走 venv/bin/uvicorn：pip 生成的入口脚本把解释器绝对路径写死在
+# shebang 里。按锁重建 venv 的标准做法是"在旁边建好再改名换上"，改名那一刻
+# shebang 就指向一个不存在的目录，服务起不来。`-m` 免疫这一类。
+ExecStart=/opt/nmu/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers
 Restart=always
 RestartSec=3
 MemoryMax=500M
