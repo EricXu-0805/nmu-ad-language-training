@@ -175,6 +175,9 @@ export interface WithdrawnAudioGovernanceRow {
   withdrawn: boolean;
   withdrawal_status: string | null;
   delete_gate_passed: boolean;
+  // 本地副本删除回执(收据 144):几台设备声称已删、最近一次时间;0/null=尚无确认。
+  local_copy_disposal_device_count: number;
+  local_copy_disposal_last_at: string | null;
 }
 
 // 账号认证(M1-D 公网部署)。绝不携带任何凭据,只表明该显示哪种门。

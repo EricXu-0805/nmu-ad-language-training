@@ -59,6 +59,16 @@ export function WithdrawnAudioGovernancePanel() {
                 <span><StatusPill tone={row.status === "deleted" ? "muted" : "warn"} size="sm">
                   {row.status === "deleted" ? "已物理删除" : "已隔离 · 保留字节"}
                 </StatusPill></span>
+                {row.local_copy_disposal_device_count > 0 ? (
+                  <span className="muted">
+                    本地副本删除回执 {row.local_copy_disposal_device_count} 台设备
+                    {row.local_copy_disposal_last_at
+                      ? ` · 最近 ${new Date(row.local_copy_disposal_last_at).toLocaleString()}`
+                      : ""}
+                  </span>
+                ) : (
+                  <span className="muted">尚无设备确认删除本地副本</span>
+                )}
               </div>
               <Button variant="danger" disabled={row.status === "deleted" || busy}
                 onClick={() => setTarget(row)}>逐条物理删除</Button>

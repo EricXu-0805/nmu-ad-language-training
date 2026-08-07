@@ -289,6 +289,9 @@ interface RequestOptions {
   allowRecovery?: boolean;
   noStore?: boolean;
   signal?: AbortSignal;
+  // best-effort 治理上报专用:失败不得触发配对/重认证 UI(开放本地模式下
+  // 删除回执的 401 是预期结果,绝不能在老人屏弹 PIN 弹窗)。
+  silentDeviceAuthFailure?: boolean;
 }
 
 function payloadSessionId(payload: object): string | undefined {
@@ -332,7 +335,7 @@ async function req<T>(method: string, path: string, body?: unknown,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     const text = await res.text();
-    if (!res.ok && opts?.device) {
+    if (!res.ok && opts?.device && !opts?.silentDeviceAuthFailure) {
       handleDeviceAuthorizationFailure(res.status, text, credential ?? undefined);
     }
     else if (!res.ok && res.status === 401 && !opts?.silent401) {
@@ -914,6 +917,14 @@ export const api = {
     audioReceipt: { serverSeq: number; rawAudioId: string; idempotent: boolean };
   }>("PUT", "/live/state", { kind: "audioSaved", payload }, DEFAULT_REQUEST_TIMEOUT_MS,
     { device: true, deviceSessionId: payloadSessionId(payload), allowRecovery: true }),
+  // 本地副本删除回执(收据 144):payload=410 detail 原样回显。best-effort,
+  // 调用方吞错;与 audioSaved 同走 allowRecovery(410 常到达于场次离开 LiveState 后)。
+  putAudioDisposalConfirmed: (payload: object) => req<{
+    code: string; rawAudioId: string; duplicate: boolean;
+  }>("PUT", "/live/state", { kind: "audioDisposalConfirmed", payload },
+    3_500,
+    { device: true, deviceSessionId: payloadSessionId(payload),
+      allowRecovery: true, silentDeviceAuthFailure: true }),
   // 老人端最小在场上报；服务端校验 session 与 screen，且只用服务器时间判在线。
   patientHeartbeat: (body: PatientHeartbeatRequest) =>
     req<PatientHeartbeatResponse>("POST", "/live/patient-heartbeat", body,

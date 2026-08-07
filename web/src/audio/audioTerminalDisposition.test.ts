@@ -136,6 +136,70 @@ test("terminal finalization discards without audioSaved broadcast or progress si
   assert.deepEqual(calls, ["put", "discard"]);
 });
 
+test("terminal disposal reports exactly once after local discard, echoing the disposition", async () => {
+  const { entry, saved, detail } = await fixture();
+  const calls: string[] = [];
+  const reported: unknown[] = [];
+  const outcome = await finalizeAudioSavedRequest(
+    { entry, blob, saved, broadcastSaved: true },
+    {
+      putAudioSaved: async () => { calls.push("put"); throw terminalError(410, detail); },
+      completeServerSaved: async () => { calls.push("complete"); },
+      discardTerminalOutbox: async () => { calls.push("discard"); },
+      broadcastAudioSaved: () => { calls.push("broadcast"); },
+      reportLocalCopyDisposal: async (disposition) => {
+        calls.push("report");
+        reported.push(disposition);
+      },
+    },
+  );
+
+  assert.equal(outcome.kind, "terminal-discarded");
+  // 删除先于上报;绝不广播、绝不 complete。
+  assert.deepEqual(calls, ["put", "discard", "report"]);
+  assert.equal(reported.length, 1);
+  assert.deepEqual(reported[0], outcome.kind === "terminal-discarded" ? outcome.disposition : null);
+});
+
+test("disposal report failure is swallowed: local deletion is the only fact that must hold", async () => {
+  const { entry, saved, detail } = await fixture();
+  const calls: string[] = [];
+  const outcome = await finalizeAudioSavedRequest(
+    { entry, blob, saved, broadcastSaved: true },
+    {
+      putAudioSaved: async () => { calls.push("put"); throw terminalError(410, detail); },
+      completeServerSaved: async () => { calls.push("complete"); },
+      discardTerminalOutbox: async () => { calls.push("discard"); },
+      broadcastAudioSaved: () => { calls.push("broadcast"); },
+      reportLocalCopyDisposal: async () => {
+        calls.push("report");
+        throw new Error("network down");
+      },
+    },
+  );
+
+  assert.equal(outcome.kind, "terminal-discarded");
+  assert.deepEqual(calls, ["put", "discard", "report"]);
+});
+
+test("server-saved path never emits a disposal report", async () => {
+  const { entry, saved } = await fixture();
+  const calls: string[] = [];
+  const outcome = await finalizeAudioSavedRequest(
+    { entry, blob, saved, broadcastSaved: false },
+    {
+      putAudioSaved: async () => ({ audioReceipt: { serverSeq: 1, rawAudioId: saved.rawAudioId, idempotent: true } }),
+      completeServerSaved: async () => { calls.push("complete"); },
+      discardTerminalOutbox: async () => { calls.push("discard"); },
+      broadcastAudioSaved: () => { calls.push("broadcast"); },
+      reportLocalCopyDisposal: async () => { calls.push("report"); },
+    },
+  );
+
+  assert.equal(outcome.kind, "server-saved");
+  assert.deepEqual(calls, ["complete"]);
+});
+
 test("foreign recovery can clear a real receipt without broadcasting into current UI", async () => {
   const { entry, saved } = await fixture();
   const calls: string[] = [];

@@ -27,7 +27,8 @@ KNOWN_ACCOUNT_ROLES = frozenset({"researcher", "data_steward", "admin"})
 DATA_GOVERNANCE_ROLES = frozenset({"data_steward", "admin"})
 TRAINING_OPERATION_ROLES = frozenset({"researcher", "admin"})
 ADMIN_ROLES = frozenset({"admin"})
-DEVICE_LIVE_WRITE_KINDS = frozenset({"audioSaved", "patientRec"})
+DEVICE_LIVE_WRITE_KINDS = frozenset(
+    {"audioSaved", "patientRec", "audioDisposalConfirmed"})
 
 
 @dataclass(frozen=True)

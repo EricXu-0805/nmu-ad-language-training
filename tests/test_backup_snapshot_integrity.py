@@ -1416,10 +1416,12 @@ def test_publish_parent_fsync_failure_rolls_back_to_staging(monkeypatch, tmp_pat
 
 
 # --------------------------------------------------------------------------
-# Autopilot plan profile head: e4a7c1d9b206 recovery-schema contract
+# Current head: f7c2e8a4d105 (audio local-copy disposal receipt) recovery
+# contract, plus the autopilot plan profile columns it builds on.
 # --------------------------------------------------------------------------
 
 
+DISPOSAL_HEAD = "f7c2e8a4d105"
 PROFILE_HEAD = "e4a7c1d9b206"
 PRE_PROFILE_HEAD = "d3f8b5c1a704"
 PROFILE_COLUMNS = (
@@ -1526,12 +1528,13 @@ def _drop_profile_column(
     return dependent
 
 
-def test_recovery_contract_pins_the_profile_head_only():
-    assert _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS == frozenset({PROFILE_HEAD})
+def test_recovery_contract_pins_the_current_head_only():
+    assert _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS == frozenset({DISPOSAL_HEAD})
+    assert PROFILE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert PRE_PROFILE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
 
 
-def test_recovery_fingerprint_literal_matches_a_fresh_profile_head(tmp_path):
+def test_recovery_fingerprint_literal_matches_a_fresh_current_head(tmp_path):
     """The constant is a hardcoded literal, recomputed here from a fresh head."""
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
@@ -1541,7 +1544,7 @@ def test_recovery_fingerprint_literal_matches_a_fresh_profile_head(tmp_path):
     try:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == PROFILE_HEAD
+        ).fetchone()[0] == DISPOSAL_HEAD
         computed = _GUARD_MODULE._schema_contract_fingerprint(connection)
     finally:
         connection.close()
@@ -1549,10 +1552,12 @@ def test_recovery_fingerprint_literal_matches_a_fresh_profile_head(tmp_path):
     assert computed == _GUARD_MODULE.CURRENT_RECOVERY_SCHEMA_SHA256
 
 
-def test_real_pre_profile_snapshot_is_rejected_as_unsupported_revision(tmp_path):
+@pytest.mark.parametrize("stale_head", [PRE_PROFILE_HEAD, PROFILE_HEAD])
+def test_real_stale_head_snapshot_is_rejected_as_unsupported_revision(
+        tmp_path, stale_head):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
-    _database_at(snapshot, PRE_PROFILE_HEAD)
+    _database_at(snapshot, stale_head)
     _manifest(snapshot)
 
     completed = _run("verify", snapshot)
@@ -1561,14 +1566,14 @@ def test_real_pre_profile_snapshot_is_rejected_as_unsupported_revision(tmp_path)
     assert "code=alembic_revision_unsupported" in completed.stderr
 
 
-def test_pre_profile_schema_with_forged_head_revision_is_rejected(tmp_path):
+def test_stale_schema_with_forged_head_revision_is_rejected(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
-    db_path = _database_at(snapshot, PRE_PROFILE_HEAD)
+    db_path = _database_at(snapshot, PROFILE_HEAD)
     connection = sqlite3.connect(db_path)
     try:
         connection.execute(
-            "UPDATE alembic_version SET version_num=?", (PROFILE_HEAD,))
+            "UPDATE alembic_version SET version_num=?", (DISPOSAL_HEAD,))
         connection.commit()
     finally:
         connection.close()
@@ -1677,7 +1682,7 @@ def test_wrong_recovery_fingerprint_is_rejected(monkeypatch, tmp_path):
     assert caught.value.code == "recovery_schema_incomplete"
 
 
-def test_fresh_profile_head_snapshot_still_passes_end_to_end(tmp_path):
+def test_fresh_current_head_snapshot_still_passes_end_to_end(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     audio = snapshot / "audio"
@@ -1698,6 +1703,6 @@ def test_fresh_profile_head_snapshot_still_passes_end_to_end(tmp_path):
     try:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == PROFILE_HEAD
+        ).fetchone()[0] == DISPOSAL_HEAD
     finally:
         connection.close()

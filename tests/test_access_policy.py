@@ -562,6 +562,14 @@ def test_named_account_and_role_allowlist_matrix(policy_client):
                     "containsDirectIdentifier": False,
                     "turnKey": "itm-0001#1", "sessionId": "S-POLICY",
                 }),
+                ("audioDisposalConfirmed", {
+                    "code": "audio_terminal_disposition", "schemaVersion": 1,
+                    "action": "discard_local_copy", "reason": "deleted",
+                    "rawAudioId": "account-must-not-report",
+                    "sessionId": "S-POLICY", "turnKey": "itm-0001#1",
+                    "byteCount": 1, "checksum": "0" * 64,
+                    "containsDirectIdentifier": False,
+                }),
             ):
                 denied_fact = client.put("/live/state", json={
                     "kind": kind, "payload": payload,

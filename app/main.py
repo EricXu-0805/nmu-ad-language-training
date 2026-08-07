@@ -51,7 +51,8 @@ from .enums import AudioStatus, ConsentType
 from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      AttemptCaptureProcessing,
                      AttemptEvent, AuditLog, AudioAssetRow,
-                     AudioCaptureReceipt, ExportBatch, InteractionEvent,
+                     AudioCaptureReceipt, AudioLocalCopyDisposalReceipt,
+                     ExportBatch, InteractionEvent,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
                      Patient, PatientDeviceCapability, PatientWithdrawalEvent,
                      RuntimeCommand, ScaleResult,
@@ -465,7 +466,7 @@ async def console_auth_guard(request: Request, call_next):
                 if live_kind in access_policy.DEVICE_LIVE_WRITE_KINDS:
                     detail_code = (
                         "audio_disposition_device_capability_required"
-                        if live_kind == "audioSaved"
+                        if live_kind in ("audioSaved", "audioDisposalConfirmed")
                         else "device_capability_required"
                     )
                     return JSONResponse(status_code=403, content={
@@ -575,7 +576,9 @@ async def console_auth_guard(request: Request, call_next):
             kind = payload.get("kind") if isinstance(payload, dict) else None
             if (kind in access_policy.DEVICE_LIVE_WRITE_KINDS
                     and (capability_status == device_capability.CapabilityResolution.VALID
-                         or kind == "audioSaved")):
+                         # 410 终态回执/删除回执必须在 RECOVERY_ONLY 下仍可达:
+                         # 场次离开 LiveState 后设备才收到 410 是常态。
+                         or kind in ("audioSaved", "audioDisposalConfirmed"))):
                 return await call_next(request)
         if capability_status == device_capability.CapabilityResolution.RECOVERY_ONLY:
             # Same narrow exception for a recovery-only bearer, which is the
@@ -1402,17 +1405,47 @@ def list_withdrawn_audio_governance(
         AudioAssetRow.session_id,
         AudioAssetRow.raw_audio_id,
     )))
+    # 本地副本删除回执聚合:哪些设备声称已删、最近一次何时。0 回执必须显式可见,
+    # 面板才能回答"这位受试者的录音副本是否已从所有设备清除"。
+    disposal_rows = list(s.exec(
+        select(
+            AudioLocalCopyDisposalReceipt.raw_audio_id,
+            func.count(AudioLocalCopyDisposalReceipt.id),
+            func.max(AudioLocalCopyDisposalReceipt.reported_at),
+        ).group_by(AudioLocalCopyDisposalReceipt.raw_audio_id)))
+    disposal_by_raw_id = {
+        raw_id: (int(count), latest)
+        for raw_id, count, latest in disposal_rows
+    }
+
+    def _disposal_projection(raw_id: str) -> tuple[int, str | None]:
+        # reported_at 库内是 naive-UTC;对外序列化必须带显式时区,
+        # 否则面板会把 UTC 当本地时间直显(北京差 8 小时)。
+        count, latest = disposal_by_raw_id.get(raw_id, (0, None))
+        if latest is None:
+            return count, None
+        if isinstance(latest, datetime):
+            return count, latest.replace(tzinfo=timezone.utc).isoformat()
+        return count, f"{latest}+00:00"
+
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Pragma"] = "no-cache"
-    return [{
-        "raw_audio_id": audio.raw_audio_id,
-        "session_id": audio.session_id,
-        "patient_id": sess.patient_id,
-        "status": audio.status,
-        "withdrawn": audio.withdrawn,
-        "withdrawal_status": audio.withdrawal_status,
-        "delete_gate_passed": audio.delete_gate_passed,
-    } for audio, sess in rows]
+    projected = []
+    for audio, sess in rows:
+        disposal_count, disposal_last_at = _disposal_projection(
+            audio.raw_audio_id)
+        projected.append({
+            "raw_audio_id": audio.raw_audio_id,
+            "session_id": audio.session_id,
+            "patient_id": sess.patient_id,
+            "status": audio.status,
+            "withdrawn": audio.withdrawn,
+            "withdrawal_status": audio.withdrawal_status,
+            "delete_gate_passed": audio.delete_gate_passed,
+            "local_copy_disposal_device_count": disposal_count,
+            "local_copy_disposal_last_at": disposal_last_at,
+        })
+    return projected
 
 
 class CloudProcessingExpectedState(BaseModel):
@@ -4217,12 +4250,35 @@ class LivePatientRecPayload(BaseModel):
         return self
 
 
+class LiveAudioDisposalConfirmedPayload(BaseModel):
+    """设备删除本地副本后的回执:410 audio_terminal_disposition detail 的原样回显。
+
+    严格封闭契约——字段集合、四个常量与 410 detail 完全一致;设备不得增删改任何
+    字段。服务端随后逐项与资产行比对,不一致即拒。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal["audio_terminal_disposition"]
+    schemaVersion: Literal[1]
+    action: Literal["discard_local_copy"]
+    reason: Literal["deleted", "withdrawn"]
+    rawAudioId: str = PydanticField(min_length=1, max_length=160,
+                                    pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
+    sessionId: str = PydanticField(min_length=1, max_length=128)
+    turnKey: str = PydanticField(min_length=1, max_length=200,
+                                 pattern=r"^[^\r\n\x00]+$")
+    byteCount: int = PydanticField(ge=1, le=audio_store.MAX_AUDIO_BLOB_BYTES)
+    checksum: str = PydanticField(pattern=r"^[0-9A-Fa-f]{64}$")
+    containsDirectIdentifier: bool
+
+
 _LIVE_PAYLOAD_MODELS = {
     "session": LiveSessionPayload,
     "cursor": RuntimeCursorIn,
     "rapportStep": LiveRapportPayload,
     "audioSaved": LiveAudioSavedPayload,
     "patientRec": LivePatientRecPayload,
+    "audioDisposalConfirmed": LiveAudioDisposalConfirmedPayload,
 }
 
 
@@ -4230,7 +4286,8 @@ class LiveIn(BaseModel):
     """实时写入边界：先按 kind 收紧 payload，再进入场次/计划语义校验。"""
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["session", "cursor", "rapportStep", "audioSaved", "patientRec"]
+    kind: Literal["session", "cursor", "rapportStep", "audioSaved", "patientRec",
+                  "audioDisposalConfirmed"]
     payload: dict
 
     @model_validator(mode="after")
@@ -4819,9 +4876,128 @@ def _restore_runtime_to_live(row: LiveState, state: SessionRuntimeState | None) 
         state.updated_at = datetime.now()
 
 
+def _apply_audio_disposal_confirmed(
+        body: "LiveIn", request: Request, s: DBSession) -> dict:
+    """kind=audioDisposalConfirmed:设备确认已物理删除本地副本的治理回执(收据 144)。
+
+    回执是治理信号,不是门禁:不触碰 LiveState/runtime,只在逐项核验 410 回显与
+    资产行一致后落一条只追加回执。同一 (raw_audio_id, 设备) 幂等;设备是不可信端,
+    回执只证明"该设备声称已删",价值在治理可见性。
+    """
+    payload = body.payload
+    session_id = payload["sessionId"]
+    # 与 audioSaved 恢复路径同款 confused-deputy 双防线:中间件已挡账号 cookie,
+    # 这里再挡一次,防止未来路由调整让账号路径漏进业务层。
+    if (auth.auth_active()
+            and getattr(request.state, "auth_kind", None) != "device_capability"):
+        raise HTTPException(403, detail={
+            "code": "audio_disposition_device_capability_required",
+            "message": "本地副本删除回执只能由精确绑定本场次的设备能力凭据上报",
+        })
+    _require_capability_bound_session(request, session_id, "上报本地副本删除回执")
+    with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
+        s.rollback()
+        s.expire_all()
+        _require_started_visit_plan_session(session_id, s)
+        # 410 常在场次离开 LiveState 后才到达设备,RECOVERY_ONLY 必须仍可上报;
+        # 已吊销/过期凭据照旧拒绝。
+        status, cap_row = device_capability.revalidate_active_for_write(
+            s, getattr(request.state, "device_capability_token_hash", None),
+            session_id)
+        if status not in {device_capability.CapabilityResolution.VALID,
+                          device_capability.CapabilityResolution.RECOVERY_ONLY}:
+            code = {
+                device_capability.CapabilityResolution.INVALID:
+                    "device_capability_invalid",
+                device_capability.CapabilityResolution.EXPIRED:
+                    "device_capability_expired",
+                device_capability.CapabilityResolution.REVOKED:
+                    "device_capability_revoked",
+            }[status]
+            raise HTTPException(401, detail={
+                "code": code, "message": "设备配对已失效，请由研究者重新配对"})
+        if cap_row is None:
+            raise HTTPException(403, detail={
+                "code": "audio_disposition_device_capability_required",
+                "message": "本地副本删除回执只能由精确绑定本场次的设备能力凭据上报",
+            })
+        asset = s.exec(select(AudioAssetRow).where(
+            AudioAssetRow.raw_audio_id == payload["rawAudioId"]
+        ).with_for_update()).first()
+        # 与 410 路径同口径:外域 id 与不存在 id 响应完全一致,不可枚举。
+        if asset is None or asset.session_id != session_id:
+            raise HTTPException(404, detail={
+                "code": "audio_disposition_unknown",
+                "message": "服务端没有该录音的登记事实，禁止删除本地副本",
+            })
+        sess = s.get(TrainSession, session_id)
+        if sess is None:
+            raise HTTPException(409, "音频关联场次不存在")
+        canonical_turn_key, _patient_ref = _canonicalize_patient_turn_input(
+            request, sess, payload["turnKey"],
+            legacy_exact_turn_key=(
+                asset.turn_key if asset.patient_turn_ref_version == 1 else None))
+        if asset.status == AudioStatus.deleted:
+            # 与 410 发放端 verify_terminal_disposition 逐字一致:deleted 而缺
+            # 删除闸门证据的行从未被授权过 410,其"删除回执"是协议违规,不落账。
+            if not asset.delete_gate_passed:
+                raise HTTPException(409, detail={
+                    "code": "audio_disposal_mismatch",
+                    "message": "录音标记 deleted 但缺少删除闸门证据，"
+                               "服务端从未授权该本地删除",
+                })
+            expected_reason = "deleted"
+        elif asset.withdrawn or bool((asset.withdrawal_status or "").strip()):
+            expected_reason = "withdrawn"
+        else:
+            raise HTTPException(409, detail={
+                "code": "audio_disposal_not_terminal",
+                "message": "录音仍是活跃研究事实，不存在可确认的终态删除",
+            })
+        checksum = payload["checksum"].lower()
+        if (asset.turn_key != canonical_turn_key
+                or payload["reason"] != expected_reason
+                or (asset.checksum or "").lower() != checksum
+                or asset.byte_count != payload["byteCount"]
+                or asset.contains_direct_identifier
+                != payload["containsDirectIdentifier"]):
+            raise HTTPException(409, detail={
+                "code": "audio_disposal_mismatch",
+                "message": "删除回执与服务端资产终态事实不一致，拒绝登记",
+            })
+        reporter = cap_row.device_id_hash
+        existing = s.exec(select(AudioLocalCopyDisposalReceipt).where(
+            AudioLocalCopyDisposalReceipt.raw_audio_id == payload["rawAudioId"],
+            AudioLocalCopyDisposalReceipt.reporter_device_id_hash == reporter,
+        )).first()
+        if existing is not None:
+            return {"code": "audio_disposal_recorded",
+                    "rawAudioId": payload["rawAudioId"], "duplicate": True}
+        s.add(AudioLocalCopyDisposalReceipt(
+            raw_audio_id=payload["rawAudioId"],
+            session_id=session_id,
+            turn_key=canonical_turn_key,
+            reason=expected_reason,
+            checksum=checksum,
+            byte_count=payload["byteCount"],
+            contains_direct_identifier=payload["containsDirectIdentifier"],
+            reporter_device_id_hash=reporter,
+        ))
+        s.commit()
+        _audit(s, request, "audio_local_copy_disposed",
+               f"设备确认删除本地录音副本 {payload['rawAudioId']}"
+               f"(reason={expected_reason},device={reporter[:12]})",
+               session_id=session_id)
+        return {"code": "audio_disposal_recorded",
+                "rawAudioId": payload["rawAudioId"], "duplicate": False}
+
+
 @app.put("/live/state")
 def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)):
     """写实时状态；服务端重签 wseq，并把游标同步到当前场次恢复行。"""
+    if body.kind == "audioDisposalConfirmed":
+        # 治理回执不写 LiveState 槽位,走独立只追加路径。
+        return _apply_audio_disposal_confirmed(body, request, s)
     slot = _LIVE_SLOT.get(body.kind)
     if not slot:
         raise HTTPException(422, f"未知 kind {body.kind!r}")

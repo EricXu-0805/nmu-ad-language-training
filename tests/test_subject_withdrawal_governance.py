@@ -579,6 +579,9 @@ def test_withdrawal_conflicts_permissions_tombstone_and_admin_delete(
         "withdrawn": True,
         "withdrawal_status": "isolated_by_subject_withdrawal",
         "delete_gate_passed": False,
+        # 0 回执必须显式为 0/None,面板据此如实显示"尚无设备确认删除"。
+        "local_copy_disposal_device_count": 0,
+        "local_copy_disposal_last_at": None,
     }]
 
     assert researcher.delete(
@@ -776,7 +779,7 @@ def test_withdrawal_migration_fresh_check_and_parent_roundtrip(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version")).scalar_one() == (
-                "e4a7c1d9b206")
+                "f7c2e8a4d105")
 
     command.downgrade(config, "f2b7d4e9a106")
     inspector = inspect(engine)

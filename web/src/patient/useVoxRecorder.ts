@@ -321,6 +321,9 @@ export function useVoxRecorder(opts: {
             try { bus.post({ type: "audioSaved", ...payload }); }
             catch { /* BroadcastChannel/localStorage hint is best effort */ }
           },
+          // 治理回执:本地删除已完成后如实上报;finalize 内部吞错,永不阻断终态。
+          reportLocalCopyDisposal: (disposition) =>
+            api.putAudioDisposalConfirmed(disposition).then(() => undefined),
         },
       );
       pending.blob = null;

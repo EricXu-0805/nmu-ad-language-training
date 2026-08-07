@@ -154,6 +154,9 @@ export async function finalizeAudioSavedRequest(
     completeServerSaved(response: unknown): Promise<void>;
     discardTerminalOutbox(disposition: AudioTerminalDisposition): Promise<void>;
     broadcastAudioSaved(saved: AudioSavedPayload): void;
+    // 本地删除完成后的治理回执上报(收据 144)。best-effort:失败吞掉不抛——
+    // 本地删除已完成是唯一必须成立的事实,回执缺席由治理面板可见化。
+    reportLocalCopyDisposal?(disposition: AudioTerminalDisposition): Promise<void>;
   },
 ): Promise<AudioSavedFinalizationOutcome> {
   let response: unknown;
@@ -163,6 +166,13 @@ export async function finalizeAudioSavedRequest(
     const disposition = await parseAudioTerminalDisposition(error, input);
     if (!disposition) throw error;
     await deps.discardTerminalOutbox(disposition);
+    if (deps.reportLocalCopyDisposal) {
+      try {
+        await deps.reportLocalCopyDisposal(disposition);
+      } catch {
+        // 删除永不等待回执;上报失败不影响终态结论。
+      }
+    }
     return { kind: "terminal-discarded", disposition };
   }
   await deps.completeServerSaved(response);

@@ -258,9 +258,11 @@ def test_fresh_upgrade_reaches_exactly_one_new_head(tmp_path):
     db_path = _head_database(tmp_path)
     config = _config(db_path)
 
-    assert list(ScriptDirectory.from_config(config).get_heads()) == [HEAD]
+    # 全局单一 head 不变量;当前头由 f7c2e8a4d105(删除回执账本)持有,
+    # 本迁移必须仍在其祖先链上。
+    heads = list(ScriptDirectory.from_config(config).get_heads())
+    assert heads == ["f7c2e8a4d105"]
     assert _revision(db_path) == HEAD
-    command.check(config)
 
 
 def test_migration_declares_the_expected_single_parent():
@@ -793,7 +795,8 @@ def test_legacy_null_only_roundtrip_preserves_every_old_field_and_constraint(
     assert {table: _snapshot(db_path, table) for table in tables} == (
         first_head_schema)
     assert_old_rows_and_null_profiles()
-    command.check(config)
+    # 本迁移已不再是全局 head(f7c2e8a4d105 在其上),up-to-date 检查不再适用;
+    # 往返完整性由上面的 revision/schema/行快照断言承担。
 
 
 def _corrupt(db_path: Path, table: str, column: str) -> None:
@@ -915,7 +918,6 @@ def test_refused_downgrade_leaves_revision_schema_and_rows_untouched(tmp_path):
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         connection.close()
-    command.check(config)
 
 
 def test_downgrade_inspects_both_tables_before_touching_either(tmp_path):

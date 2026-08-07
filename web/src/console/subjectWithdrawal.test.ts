@@ -41,7 +41,7 @@ test("unknown-result reconciliation accepts only the exact CAS transition", () =
   assert.equal(parsePatientWithdrawalReceipt(receipt, "P-001").event_id, "withdrawal-event");
   assert.throws(() => parsePatientWithdrawalReceipt({ ...receipt, answer_text: "不得出现" }));
   assert.throws(() => parsePatientWithdrawalReceipt({ ...receipt, governance_revision: 4 }));
-  const governance = parseWithdrawnAudioGovernanceRows([{
+  const baseRow = {
     raw_audio_id: "raw-one",
     session_id: "S-ONE",
     patient_id: "P-001",
@@ -49,9 +49,30 @@ test("unknown-result reconciliation accepts only the exact CAS transition", () =
     withdrawn: true,
     withdrawal_status: "isolated_by_subject_withdrawal",
     delete_gate_passed: false,
-  }]);
+    local_copy_disposal_device_count: 0,
+    local_copy_disposal_last_at: null,
+  };
+  const governance = parseWithdrawnAudioGovernanceRows([baseRow]);
   assert.equal(governance[0].session_id, "S-ONE");
+  assert.equal(governance[0].local_copy_disposal_device_count, 0);
   assert.throws(() => parseWithdrawnAudioGovernanceRows([
     governance[0], governance[0],
   ]));
+  const reported = parseWithdrawnAudioGovernanceRows([{
+    ...baseRow,
+    local_copy_disposal_device_count: 2,
+    local_copy_disposal_last_at: "2026-08-08T00:15:00",
+  }]);
+  assert.equal(reported[0].local_copy_disposal_device_count, 2);
+  // 缺字段、负数、半空组合(有计数没时间/有时间没计数)都必须拒绝。
+  const legacyShape = { ...baseRow } as Record<string, unknown>;
+  delete legacyShape.local_copy_disposal_device_count;
+  delete legacyShape.local_copy_disposal_last_at;
+  assert.throws(() => parseWithdrawnAudioGovernanceRows([legacyShape]));
+  assert.throws(() => parseWithdrawnAudioGovernanceRows([
+    { ...baseRow, local_copy_disposal_device_count: -1 }]));
+  assert.throws(() => parseWithdrawnAudioGovernanceRows([
+    { ...baseRow, local_copy_disposal_device_count: 1 }]));
+  assert.throws(() => parseWithdrawnAudioGovernanceRows([
+    { ...baseRow, local_copy_disposal_last_at: "2026-08-08T00:15:00" }]));
 });

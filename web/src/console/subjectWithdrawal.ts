@@ -68,6 +68,7 @@ export function parseWithdrawnAudioGovernanceRows(
   const exactKeys = [
     "raw_audio_id", "session_id", "patient_id", "status", "withdrawn",
     "withdrawal_status", "delete_gate_passed",
+    "local_copy_disposal_device_count", "local_copy_disposal_last_at",
   ].sort();
   const seen = new Set<string>();
   return value.map((candidate) => {
@@ -90,7 +91,16 @@ export function parseWithdrawnAudioGovernanceRows(
         || !(row.withdrawal_status === null
           || typeof row.withdrawal_status === "string")
         || (!row.withdrawn && !String(row.withdrawal_status ?? "").trim())
-        || typeof row.delete_gate_passed !== "boolean") {
+        || typeof row.delete_gate_passed !== "boolean"
+        || typeof row.local_copy_disposal_device_count !== "number"
+        || !Number.isInteger(row.local_copy_disposal_device_count)
+        || row.local_copy_disposal_device_count < 0
+        || !(row.local_copy_disposal_last_at === null
+          || typeof row.local_copy_disposal_last_at === "string")
+        // 有计数必有时间,零计数必无时间——半空组合是服务端事实不一致。
+        || ((row.local_copy_disposal_device_count > 0)
+          !== (typeof row.local_copy_disposal_last_at === "string"
+            && row.local_copy_disposal_last_at.length > 0))) {
       throw new Error("撤回录音治理行事实不一致");
     }
     seen.add(row.raw_audio_id);

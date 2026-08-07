@@ -1087,6 +1087,49 @@ def _reject_audio_capture_receipt_mutation(*_args) -> None:
     raise RuntimeError("AudioCaptureReceipt 是只追加证据，禁止更新或删除")
 
 
+class AudioLocalCopyDisposalReceipt(SQLModel, table=True):
+    """设备确认已物理删除本地音频副本的只追加治理回执(收据 144)。
+
+    回执是治理信号,不是门禁:删除永不等待回执,缺回执由治理面板可见化。
+    设备是不可信端,回执只证明"该设备声称已删";其值在于治理可见性与流程完备,
+    与审计链/锚定同一威胁模型口径。同一 (raw_audio_id, 设备) 幂等,不同设备各一条。
+    """
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_audio_id", "reporter_device_id_hash",
+            name="uq_audio_disposal_receipt_device"),
+        Index("ix_audio_disposal_receipt_session", "session_id", "reported_at"),
+        CheckConstraint(
+            "reason IN ('deleted','withdrawn')",
+            name="ck_audio_disposal_receipt_reason"),
+        CheckConstraint(
+            "length(checksum) = 64 AND lower(checksum) = checksum",
+            name="ck_audio_disposal_receipt_checksum"),
+        CheckConstraint(
+            "byte_count > 0", name="ck_audio_disposal_receipt_bytes_positive"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_audio_id: str = Field(foreign_key="audioassetrow.raw_audio_id", index=True)
+    session_id: str = Field(foreign_key="session.session_id", index=True)
+    turn_key: str
+    reason: str
+    checksum: str
+    byte_count: int = Field(sa_column=Column(BigInteger, nullable=False))
+    contains_direct_identifier: bool = False
+    # capability 行的 device_id_hash(本身已是哈希,非凭据);完整值保证幂等键精确,
+    # 展示侧只出前缀。
+    reporter_device_id_hash: str = Field(index=True)
+    reported_at: datetime = Field(default_factory=_utc_now_naive)
+
+
+@sa_event.listens_for(AudioLocalCopyDisposalReceipt, "before_update")
+@sa_event.listens_for(AudioLocalCopyDisposalReceipt, "before_delete")
+def _reject_audio_disposal_receipt_mutation(*_args) -> None:
+    """ORM 层阻止误改/误删；治理修复必须走独立、审计化迁移。"""
+    raise RuntimeError("AudioLocalCopyDisposalReceipt 是只追加证据，禁止更新或删除")
+
+
 class LiveState(SQLModel, table=True):
     """仪器实时状态(单行,id=1)——跨设备同步的服务端真值。
 
