@@ -16,7 +16,7 @@ const RECEIPT_KEYS = [
   "revision", "created_by", "created_at", "approved_by", "approved_at",
   "started_by", "started_at", "cancelled_by", "cancelled_at", "session_id",
 ] as const;
-const TODAY_KEYS = ["as_of_date", "plans"] as const;
+const TODAY_KEYS = ["as_of_date", "plans", "withheld_count"] as const;
 const SESSION_KEYS = [
   "session_id", "patient_id", "visit_plan_id", "session_sitting_no",
   "training_date", "week_no", "phase_type", "event_line", "trainer_id",
@@ -230,7 +230,9 @@ function queueCompare(left: VisitPlanReceipt, right: VisitPlanReceipt): number {
 
 export function parseVisitPlanToday(value: unknown): VisitPlanToday {
   const row = exactRecord(value, TODAY_KEYS);
-  if (!row || !validDate(row.as_of_date) || !Array.isArray(row.plans)) {
+  if (!row || !validDate(row.as_of_date) || !Array.isArray(row.plans)
+      || typeof row.withheld_count !== "number"
+      || !Number.isInteger(row.withheld_count) || row.withheld_count < 0) {
     throw new Error("今日训练队列响应格式无效");
   }
   const plans = row.plans.map((plan) => parseVisitPlanReceipt(plan));
@@ -244,7 +246,7 @@ export function parseVisitPlanToday(value: unknown): VisitPlanToday {
     }
     seen.add(plan.plan_id);
   }
-  return { as_of_date: row.as_of_date, plans };
+  return { as_of_date: row.as_of_date, plans, withheld_count: row.withheld_count };
 }
 
 export function parseVisitPlanList(value: unknown, patientId?: string): VisitPlanReceipt[] {

@@ -55,7 +55,10 @@ export function PatientStage({
           feedbackKey: cursor.fbKey,
           feedbackItemRef: cursor.fbKey ? item.item_ref : undefined,
           feedbackSeq: cursor.fbSeq,
-          wseq: cursor.wseq,
+          // ★不钉 wseq:示意录音 arm/停止只前进 wseq、不改呈现内容。钉了它,每次 arm
+          // 都会让已加载投影瞬间失配→mediaReady 掉一拍→录音器把刚 arm 的 recSeq
+          // 当热麦风险永久拉黑,远程收音从此永不启动(彩排实测)。内容正确性仍由
+          // item/turn/cue/feedback 字段逐项精确匹配兜底,旧转位响应照样被拒。
         }
       : null;
   const { presentation } = usePatientPresentation(presentationExpected);

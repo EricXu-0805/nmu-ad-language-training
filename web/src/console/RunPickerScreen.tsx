@@ -404,6 +404,13 @@ export function RunPickerScreen({
               只能由工作人员本人或合成数据演练；真实患者、老人和受试者不得进入。
             </Alert>
           )}
+          {today.withheld_count > 0 && (
+            <Alert tone="warn" title="部分已审核安排未通过门禁复验">
+              有 {today.withheld_count} 条已审核到期安排在读取时未通过受试者准入或题库门禁复验
+              （如已撤回、同意失效、题库或协议变化），已按 fail-closed 从今日队列隐藏。
+              请回到该受试者的训练安排页核对具体原因。
+            </Alert>
+          )}
           {visiblePlans.length === 0 && (
             <p className="muted">当前数据分区没有待开始安排。</p>
           )}

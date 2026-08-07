@@ -1364,7 +1364,8 @@ def today_queue(
     try:
         bank, _protocol, binding = _current_definition_bundle()
     except VisitPlanError:
-        return VisitPlanTodayOut(as_of_date=current_date, plans=[])
+        return VisitPlanTodayOut(
+            as_of_date=current_date, plans=[], withheld_count=len(rows))
     for plan in rows:
         patient = db.get(Patient, plan.patient_id)
         if patient is None:
@@ -1394,6 +1395,7 @@ def today_queue(
                 plan.is_simulation):
             continue
         admitted_rows.append(plan)
+    withheld_count = len(rows) - len(admitted_rows)
     rows = admitted_rows
     rows.sort(key=lambda plan: (
         plan.scheduled_date,
@@ -1414,6 +1416,7 @@ def today_queue(
             )
             for plan in rows
         ],
+        withheld_count=withheld_count,
     )
 
 

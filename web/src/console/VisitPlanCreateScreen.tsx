@@ -209,6 +209,9 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   const [phase, setPhase] = useState<PhaseType>("正式训练");
   const [patientSimulation, setPatientSimulation] = useState<boolean | null>(null);
   const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
+  // 服务端权威题库质控信号(ready_for_research);null=尚未核对成功,真实分区 fail-closed。
+  const [researchReady, setResearchReady] = useState<boolean | null>(null);
+  const [readinessError, setReadinessError] = useState<string | null>(null);
   const [plans, setPlans] = useState<VisitPlanReceipt[] | null>(null);
   const [historyState, setHistoryState] = useState<HistoryState>("loading");
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -266,6 +269,20 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
     });
     return () => { active = false; };
   }, [patientId]);
+
+  useEffect(() => {
+    let active = true;
+    setResearchReady(null);
+    setReadinessError(null);
+    api.itemBank().then((info) => {
+      if (active) setResearchReady(info.ready_for_research === true);
+    }).catch((error) => {
+      if (!active) return;
+      setReadinessError(errorText(error));
+      setResearchReady(null);
+    });
+    return () => { active = false; };
+  }, []);
 
   function stableKey(scope: string, fingerprint: string): string {
     return commandKeys.current?.acquire(scope, fingerprint)
@@ -360,7 +377,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   async function approve(plan: VisitPlanReceipt) {
     if (!canManage || busy || actionPlanId || historyState !== "fresh") return;
     const admission = assessVisitPlanProtocol(
-      plan.week_no, plan.phase_type, plan.event_line, plan.is_simulation,
+      plan.week_no, plan.phase_type, plan.event_line, plan.is_simulation, researchReady,
     );
     if (!admission.allowed) {
       toast(admission.reason ?? "当前协议组合未开放", "danger");
@@ -413,7 +430,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
 
   const eventLine = eventLineFor(weekNo, normalizePhase(weekNo));
   const currentAdmission = assessVisitPlanProtocol(
-    weekNo, normalizePhase(weekNo), eventLine, patientSimulation,
+    weekNo, normalizePhase(weekNo), eventLine, patientSimulation, researchReady,
   );
   const historyFresh = historyState === "fresh";
   const historyLocked = !historyFresh;
@@ -443,6 +460,11 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
       {patientLoadError && (
         <Alert tone="danger" title="受试者档案分区核对失败">
           {patientLoadError}。核对成功前不能保存或审核训练安排。
+        </Alert>
+      )}
+      {readinessError && patientSimulation === false && (
+        <Alert tone="danger" title="题库质控状态核对失败">
+          {readinessError}。真实研究安排在核对成功前保持关闭；专用模拟路径不受影响。
         </Alert>
       )}
 
@@ -499,9 +521,14 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
               {currentAdmission.reason}系统已在保存前禁用安排，不会等到审核或老人到场后才报错。
             </Alert>
           )}
-          {currentAdmission.allowed && (
+          {currentAdmission.allowed && patientSimulation === true && (
             <Alert tone="warn" title="仅限第 2 周专用模拟验收">
               这条路径只能使用合成数据与专用模拟档案，不得录入真实患者、老人或受试者数据。
+            </Alert>
+          )}
+          {currentAdmission.allowed && patientSimulation === false && (
+            <Alert tone="info" title="真实研究安排">
+              题库已通过真实研究冻结质控。审核与开场时服务端仍会逐项复验受试者准入、题库与协议绑定。
             </Alert>
           )}
           <div className="form-actions">
@@ -537,7 +564,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
           {plans?.map((plan) => {
             const status = statusMeta(plan.status);
             const admission = assessVisitPlanProtocol(
-              plan.week_no, plan.phase_type, plan.event_line, plan.is_simulation,
+              plan.week_no, plan.phase_type, plan.event_line, plan.is_simulation, researchReady,
             );
             return (
               <div className="visit-plan-row" key={plan.plan_id}>

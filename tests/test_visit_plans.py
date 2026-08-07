@@ -1813,11 +1813,14 @@ def test_start_revalidates_protocol_even_for_a_legacy_approved_plan(
 
     # The bedside queue must apply the same current protocol gate as start;
     # imported/stale approved rows are governance facts, not startable work.
+    # Withheld rows are hidden but counted, so the console can say "gate
+    # re-check withheld N plans" instead of pretending nothing is scheduled.
     queue = visit_clients.researcher.get("/visit-plans/today")
     assert queue.status_code == 200, queue.text
     assert created["plan_id"] not in {
         row["plan_id"] for row in queue.json()["plans"]
     }
+    assert queue.json()["withheld_count"] >= 1
 
     denied = _command(
         visit_clients.researcher,
@@ -2359,8 +2362,9 @@ def test_approve_today_queue_and_start_form_one_atomic_idempotent_vertical(
     assert today.status_code == 200, today.text
     assert today.headers["cache-control"] == "private, no-store"
     assert today.headers["pragma"] == "no-cache"
-    assert set(today.json()) == {"as_of_date", "plans"}
+    assert set(today.json()) == {"as_of_date", "plans", "withheld_count"}
     assert today.json()["as_of_date"] == TODAY.isoformat()
+    assert today.json()["withheld_count"] == 0
     assert today.json()["plans"] == [approved]
 
     started_response = _command(
@@ -3133,8 +3137,9 @@ def test_today_queue_contains_only_approved_today_or_overdue_plans(
     assert response.headers["cache-control"] == "private, no-store"
     assert response.headers["pragma"] == "no-cache"
     payload = response.json()
-    assert set(payload) == {"as_of_date", "plans"}
+    assert set(payload) == {"as_of_date", "plans", "withheld_count"}
     assert payload["as_of_date"] == TODAY.isoformat()
+    assert payload["withheld_count"] == 0
     assert {plan["plan_id"] for plan in payload["plans"]} == approved_ids
     assert all(plan["status"] == "approved" for plan in payload["plans"])
     assert all(date.fromisoformat(plan["scheduled_date"]) <= TODAY

@@ -7641,7 +7641,10 @@ def patient_current_asset(
                 "patient_asset_runtime_not_active",
                 "只有正在进行且未暂停的床旁场次可读取题图片",
             )
-        if not sess.is_simulation:
+        # 真实研究呈现由签字工件驱动:交付清单必须是 research_and_simulation
+        # scope 且携带可校验的来源转换权利+内容审批事实(patient_asset 契约层
+        # 逐项验证,任何异常 fail-closed 为未批准),代码里没有旁路。
+        if not sess.is_simulation and not patient_asset.research_release_approved():
             _patient_asset_conflict(
                 "patient_asset_research_release_blocked",
                 "当前私有图片交付清单仅允许模拟验证，"

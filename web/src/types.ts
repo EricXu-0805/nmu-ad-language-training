@@ -79,6 +79,8 @@ export interface VisitPlanReceipt {
 export interface VisitPlanToday {
   as_of_date: string;
   plans: VisitPlanReceipt[];
+  // 已审核到期但门禁复验未通过而被隐藏的条数(撤回/同意失效/内容漂移)。
+  withheld_count: number;
 }
 
 // 双要素固定 5 环节角色 + 各自锁分字段

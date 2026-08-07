@@ -37,6 +37,23 @@ _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_ASSET_DIMENSION = 8192
 _MAX_ASSET_PIXELS = 20_000_000
 
+# release_scope 与 purpose/status/审批事实严格配对;不在配对表里的组合一律拒绝。
+# 研究发布不是改一个字段:必须同时携带"来源转换权利"与"内容"两份可校验审批事实,
+# 且清单摘要变化会连带要求冻结题库重新绑定——签字工件本身就是门禁。
+_BASE_MANIFEST_KEYS = frozenset({
+    "manifest_schema_version", "manifest_version_id", "definition_sha256",
+    "image_id_contract_version",
+    "purpose", "release_scope", "research_release_status",
+    "media_type", "assets",
+})
+_SIMULATION_PURPOSE = "simulation_private_byte_allowlist_not_research_asset_definition"
+_SIMULATION_RELEASE_STATUS = (
+    "blocked_pending_source_transform_rights_and_content_approvals")
+_RESEARCH_PURPOSE = "research_and_simulation_byte_allowlist"
+_RESEARCH_RELEASE_STATUS = "approved_for_research_presentation"
+_RESEARCH_APPROVAL_KEYS = frozenset({"source_transform_rights", "content"})
+_APPROVED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 class PatientAssetError(RuntimeError):
     """资产定义或物理字节不可安全使用。"""
@@ -62,8 +79,49 @@ def _strict_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def _delivery_manifest(bank: ItemBank) -> dict[str, dict]:
-    """Load and self-verify the immutable opaque-id-to-byte-digest allowlist."""
+def _canonical_digest(definition: dict, *, exclude: frozenset[str]) -> str:
+    payload = {
+        key: value for key, value in definition.items()
+        if key not in exclude
+    }
+    try:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise PatientAssetError("图片交付清单无法规范化") from exc
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_research_release_approvals(definition: dict) -> None:
+    """研究发布审批事实:两份具名签署,scope 摘要必须钉住被批准的清单内容本身。"""
+    approvals = definition.get("research_release_approvals")
+    if (not isinstance(approvals, dict)
+            or set(approvals) != _RESEARCH_APPROVAL_KEYS):
+        raise PatientAssetError("图片交付清单研究审批事实不符合封闭契约")
+    expected_scope = _canonical_digest(
+        definition,
+        exclude=frozenset({"definition_sha256", "research_release_approvals"}))
+    for fact in approvals.values():
+        if not isinstance(fact, dict) or set(fact) != {
+            "approved_by", "approved_at", "scope_sha256",
+        }:
+            raise PatientAssetError("图片交付清单研究审批事实字段非法")
+        approved_by = fact.get("approved_by")
+        approved_at = fact.get("approved_at")
+        if (not isinstance(approved_by, str) or not approved_by.strip()
+                or not isinstance(approved_at, str)
+                or _APPROVED_AT_RE.fullmatch(approved_at) is None
+                or fact.get("scope_sha256") != expected_scope):
+            raise PatientAssetError("图片交付清单研究审批事实值非法")
+
+
+def _read_delivery_definition() -> dict:
+    """Load and self-verify the delivery manifest contract (no bank binding)."""
     try:
         raw = DELIVERY_MANIFEST_PATH.read_bytes()
     except OSError as exc:
@@ -76,44 +134,55 @@ def _delivery_manifest(bank: ItemBank) -> dict[str, dict]:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PatientAssetError("图片交付清单不是合法 JSON") from exc
-    if not isinstance(definition, dict) or set(definition) != {
-        "manifest_schema_version", "manifest_version_id", "definition_sha256",
-        "image_id_contract_version",
-        "purpose", "release_scope", "research_release_status",
-        "media_type", "assets",
-    }:
+    if not isinstance(definition, dict):
+        raise PatientAssetError("图片交付清单字段不符合封闭契约")
+    scope = definition.get("release_scope")
+    if scope == "simulation_only":
+        allowed_keys = _BASE_MANIFEST_KEYS
+        expected_purpose = _SIMULATION_PURPOSE
+        expected_status = _SIMULATION_RELEASE_STATUS
+    elif scope == "research_and_simulation":
+        allowed_keys = _BASE_MANIFEST_KEYS | {"research_release_approvals"}
+        expected_purpose = _RESEARCH_PURPOSE
+        expected_status = _RESEARCH_RELEASE_STATUS
+    else:
+        raise PatientAssetError("图片交付清单版本、范围或媒体类型非法")
+    if set(definition) != allowed_keys:
         raise PatientAssetError("图片交付清单字段不符合封闭契约")
     if (definition.get("manifest_schema_version") != "patient-asset-delivery.v1"
             or not isinstance(definition.get("manifest_version_id"), str)
             or not definition["manifest_version_id"].strip()
             or definition.get("image_id_contract_version")
             != IMAGE_ID_CONTRACT_VERSION
-            or definition.get("purpose")
-            != "simulation_private_byte_allowlist_not_research_asset_definition"
-            or definition.get("release_scope") != "simulation_only"
-            or definition.get("research_release_status")
-            != "blocked_pending_source_transform_rights_and_content_approvals"
+            or definition.get("purpose") != expected_purpose
+            or definition.get("research_release_status") != expected_status
             or definition.get("media_type") != "image/webp"):
         raise PatientAssetError("图片交付清单版本、范围或媒体类型非法")
+    if scope == "research_and_simulation":
+        _validate_research_release_approvals(definition)
     claimed_digest = definition.get("definition_sha256")
     if not isinstance(claimed_digest, str) or _HEX64_RE.fullmatch(claimed_digest) is None:
         raise PatientAssetError("图片交付清单定义摘要非法")
-    digest_payload = {
-        key: value for key, value in definition.items()
-        if key != "definition_sha256"
-    }
-    try:
-        canonical = json.dumps(
-            digest_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise PatientAssetError("图片交付清单无法规范化") from exc
-    if not hashlib.sha256(canonical).hexdigest() == claimed_digest:
+    if _canonical_digest(
+            definition,
+            exclude=frozenset({"definition_sha256"})) != claimed_digest:
         raise PatientAssetError("图片交付清单定义摘要不匹配")
+    return definition
+
+
+def research_release_approved() -> bool:
+    """当前图片交付清单是否已批准真实研究呈现;任何异常一律 False(fail-closed)。"""
+    try:
+        definition = _read_delivery_definition()
+    except PatientAssetError:
+        return False
+    return definition["release_scope"] == "research_and_simulation"
+
+
+def _delivery_manifest(bank: ItemBank) -> dict[str, dict]:
+    """Load and self-verify the immutable opaque-id-to-byte-digest allowlist."""
+    definition = _read_delivery_definition()
+    claimed_digest = definition["definition_sha256"]
 
     binding = bank.meta.get("patient_asset_delivery_manifest")
     if (not isinstance(binding, dict)

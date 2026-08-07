@@ -15,6 +15,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app import auth, content, db, patient_asset
 from app.main import app
 from app.models import (
+    Patient,
     PatientDeviceCapability,
     ResearchUser,
     RuntimeCommand,
@@ -607,6 +608,128 @@ def test_old_session_digest_rejects_simultaneously_rebound_delivery(
 
     assert response.status_code == 409
     assert _detail_code(response) == "patient_asset_definition_mismatch"
+
+
+def _research_approved_manifest() -> dict:
+    """由当前模拟清单派生一份"已批准真实研究呈现"的清单(测试专用签字工件)。"""
+    manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
+    manifest["manifest_version_id"] = "wk2-private-webp-research-test.1"
+    manifest["purpose"] = "research_and_simulation_byte_allowlist"
+    manifest["release_scope"] = "research_and_simulation"
+    manifest["research_release_status"] = "approved_for_research_presentation"
+    scope_payload = {key: value for key, value in manifest.items()
+                     if key not in {"definition_sha256", "research_release_approvals"}}
+    scope_digest = hashlib.sha256(json.dumps(
+        scope_payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    manifest["research_release_approvals"] = {
+        "source_transform_rights": {
+            "approved_by": "内容组测试签署人", "approved_at": "2026-08-07",
+            "scope_sha256": scope_digest},
+        "content": {
+            "approved_by": "PI测试签署人", "approved_at": "2026-08-07",
+            "scope_sha256": scope_digest},
+    }
+    manifest["definition_sha256"] = _canonical_manifest_digest(manifest)
+    return manifest
+
+
+def test_research_approved_manifest_serves_research_session(
+        asset_client, monkeypatch, tmp_path):
+    """签字工件(研究批准清单)到位后,真实研究场次零代码改动即可呈现题图。"""
+    client, _full_plan, capability = _seed_current_week2(
+        asset_client, monkeypatch)
+    manifest = _research_approved_manifest()
+    original_bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    rebound_bank = _rebind_delivery(original_bank, manifest)
+    manifest_path = tmp_path / "delivery-research.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(patient_asset, "DELIVERY_MANIFEST_PATH", manifest_path)
+    monkeypatch.setattr(content, "load_item_bank", lambda _path: rebound_bank)
+    with Session(client.test_engine) as session:
+        patient = session.get(Patient, "SIM-ASSET-001")
+        assert patient is not None
+        patient.is_simulation_subject = False
+        session.add(patient)
+        row = session.get(TrainSession, "S-ASSET-001")
+        assert row is not None
+        row.is_simulation = False
+        row.data_classification = "research"
+        row.item_bank_definition_digest = content.item_bank_definition_digest(
+            rebound_bank)
+        session.add(row)
+        session.commit()
+
+    expected = (PROJECT_ROOT / "content" / "patient_assets" / "wk2-01.webp").read_bytes()
+    response = client.get(
+        "/sessions/S-ASSET-001/patient-asset/current", headers=capability)
+
+    assert response.status_code == 200, response.text
+    assert response.content == expected
+
+
+def test_research_release_contract_is_fail_closed(tmp_path, monkeypatch):
+    approved = _research_approved_manifest()
+    simulation_original = json.loads(
+        patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
+    original_bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    manifest_path = tmp_path / "delivery.json"
+    monkeypatch.setattr(patient_asset, "DELIVERY_MANIFEST_PATH", manifest_path)
+
+    def install(manifest: dict):
+        bound = _rebind_delivery(original_bank, manifest)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        return bound
+
+    bank = install(deepcopy(approved))
+    assert patient_asset.research_release_approved() is True
+    assert patient_asset._delivery_manifest(bank)
+
+    bank = install(deepcopy(simulation_original))
+    assert patient_asset.research_release_approved() is False
+    assert patient_asset._delivery_manifest(bank)  # 模拟合同本身仍有效
+
+    broken = deepcopy(approved)
+    del broken["research_release_approvals"]
+    bank = install(broken)
+    assert patient_asset.research_release_approved() is False
+    with pytest.raises(patient_asset.PatientAssetError):
+        patient_asset._delivery_manifest(bank)
+
+    forged = deepcopy(approved)
+    forged["research_release_approvals"]["content"]["scope_sha256"] = "0" * 64
+    bank = install(forged)
+    assert patient_asset.research_release_approved() is False
+    with pytest.raises(patient_asset.PatientAssetError):
+        patient_asset._delivery_manifest(bank)
+
+    unsigned = deepcopy(approved)
+    unsigned["research_release_approvals"]["content"]["approved_by"] = "  "
+    bank = install(unsigned)
+    assert patient_asset.research_release_approved() is False
+
+    undated = deepcopy(approved)
+    undated["research_release_approvals"]["source_transform_rights"][
+        "approved_at"] = "上周"
+    bank = install(undated)
+    assert patient_asset.research_release_approved() is False
+
+    mismatched = deepcopy(approved)
+    mismatched["research_release_status"] = (
+        "blocked_pending_source_transform_rights_and_content_approvals")
+    bank = install(mismatched)
+    assert patient_asset.research_release_approved() is False
+
+    smuggled = deepcopy(simulation_original)
+    smuggled["research_release_approvals"] = deepcopy(
+        approved["research_release_approvals"])
+    bank = install(smuggled)
+    assert patient_asset.research_release_approved() is False
+    with pytest.raises(patient_asset.PatientAssetError):
+        patient_asset._delivery_manifest(bank)
 
 
 def test_simulation_only_delivery_rejects_research_classified_session(

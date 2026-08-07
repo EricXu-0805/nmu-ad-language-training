@@ -374,9 +374,13 @@ test("today parser accepts only due approved unique plans in server queue order"
   const second = {
     ...approved(PLAN_B), scheduled_date: "2026-07-19", scheduled_time: "08:00:00", queue_order: 2,
   };
-  const queue = { as_of_date: "2026-07-19", plans: [first, second] };
+  const queue = { as_of_date: "2026-07-19", plans: [first, second], withheld_count: 0 };
   assert.deepEqual(parseVisitPlanToday(queue), queue);
+  assert.equal(parseVisitPlanToday({ ...queue, withheld_count: 3 }).withheld_count, 3);
   assert.throws(() => parseVisitPlanToday({ ...queue, extra: true }));
+  assert.throws(() => parseVisitPlanToday({ ...queue, withheld_count: -1 }));
+  assert.throws(() => parseVisitPlanToday({ ...queue, withheld_count: 1.5 }));
+  assert.throws(() => parseVisitPlanToday({ as_of_date: "2026-07-19", plans: [first] }));
   assert.throws(() => parseVisitPlanToday({ ...queue, plans: [second, first] }));
   assert.throws(() => parseVisitPlanToday({ ...queue, plans: [first, first] }));
   assert.throws(() => parseVisitPlanToday({ ...queue, plans: [draft()] }));

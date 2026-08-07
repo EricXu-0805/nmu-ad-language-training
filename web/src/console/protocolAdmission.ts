@@ -17,17 +17,25 @@ function exactWeekTwoTraining(weekNo: number, phase: PhaseType, eventLine: Event
  * Browser mirror of the server's deliberately narrow P0 VisitPlan gate.
  * The server remains authoritative; this mirror prevents a researcher from
  * spending time on a plan that can only fail at review/start.
+ *
+ * researchReady 来自 GET /content/item-bank 的 ready_for_research(服务端权威
+ * 质控信号);null 表示尚未核对成功,真实分区必须 fail-closed 等待。
  */
 export function assessVisitPlanProtocol(
   weekNo: number,
   phase: PhaseType,
   eventLine: EventLine,
   isSimulation: boolean | null,
+  researchReady: boolean | null,
 ): ProtocolAdmissionDecision {
   if (exactWeekTwoTraining(weekNo, phase, eventLine)) {
     if (isSimulation === true) return { allowed: true, reason: null };
     if (isSimulation === null) {
       return { allowed: false, reason: "正在核对档案的研究/模拟分区，核对完成前不能保存或审核安排。" };
+    }
+    if (researchReady === true) return { allowed: true, reason: null };
+    if (researchReady === null) {
+      return { allowed: false, reason: "正在核对真实研究题库的质控状态，核对完成前不能保存或审核安排。" };
     }
     return {
       allowed: false,
@@ -47,12 +55,18 @@ export function assessVisitPlanProtocol(
 }
 
 export function bedsideProtocolRoute(session: Session): BedsideProtocolRoute {
+  // 场次能存在,说明 approve/start 已通过服务端分区+题库门禁(且 start 时会复验);
+  // 这里只判断该协议组合有没有已实现的床旁界面,不重复分区判定——否则合法的
+  // 真实研究场次会在开场成功后反而被前端挡在训练屏外。
+  if (exactWeekTwoTraining(session.week_no, session.phase_type, session.event_line)) {
+    return { screen: "training", reason: null };
+  }
   const decision = assessVisitPlanProtocol(
     session.week_no,
     session.phase_type,
     session.event_line,
     session.is_simulation,
+    null,
   );
-  if (decision.allowed) return { screen: "training", reason: null };
   return { screen: "unsupported", reason: decision.reason ?? "当前协议组合未开放。" };
 }

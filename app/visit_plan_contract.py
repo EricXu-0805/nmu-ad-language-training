@@ -97,3 +97,7 @@ class VisitPlanTodayOut(BaseModel):
 
     as_of_date: date
     plans: list[VisitPlanReceipt]
+    # 已审核到期、但读取时未通过门禁复验(撤回/同意失效/题库或协议漂移)而被
+    # 隐藏的安排条数。隐藏是正确的 fail-closed 行为;计数让床旁不再把
+    # "被拦下"误读成"没有安排"。
+    withheld_count: int = 0

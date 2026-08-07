@@ -355,7 +355,13 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
               <TriStateField label="是否已取得受试者本人赞同" value={p.assent_obtained} onChange={(v) => set("assent_obtained", v)} />
             )}
             <TriStateField label="是否允许研究录音" value={p.recording_allowed} onChange={(v) => set("recording_allowed", v)} />
+            <TriStateField label="是否同意去标识数据二次使用" value={p.secondary_use_allowed} onChange={(v) => set("secondary_use_allowed", v)} />
           </div>
+          {!p.is_simulation_subject && p.secondary_use_allowed !== true && (
+            <Alert tone="warn" title="去标识导出未授权">
+              二次使用授权未明确为“是”时，该受试者的数据不能进入去标识研究导出；训练本身不受影响。
+            </Alert>
+          )}
           {!p.is_simulation_subject && p.consent_status !== "已同意" && (
             <Alert tone="warn" title="真实研究场次尚未放行">
               知情同意状态必须明确为“已同意”；未确认、未同意或已撤回时只能保存档案，不能开始真实研究场次。

@@ -10,6 +10,7 @@ export const DUPLICATE_INTAKE_FIELD_LABELS: Partial<Record<keyof Patient, string
   proxy_consent: "代理同意",
   assent_obtained: "受试者本人赞同",
   recording_allowed: "录音授权",
+  secondary_use_allowed: "去标识数据二次使用授权",
   cloud_processing_allowed: "第三方云处理授权",
 };
 

@@ -301,6 +301,13 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
                       {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
                     </Button>
                   )}
+                  {quickDrillEnabled && classification === "research" && !r.withdrawal_status && (
+                    <Button variant="primary" disabled={quickDrillBusy !== null}
+                      title="系统推导下一项任务：回原场 → 开已审核到期安排；草稿审核与新建仍走规范多步流程，系统不代批"
+                      onClick={() => { void startNextTask(r.patient_id, false); }}>
+                      {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
+                    </Button>
+                  )}
               </span>
             </div>
             );

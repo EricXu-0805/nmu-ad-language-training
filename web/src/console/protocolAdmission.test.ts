@@ -20,28 +20,42 @@ function session(overrides: Partial<Session> = {}): Session {
 
 test("only the exact Week-2 simulation vertical is admitted in P0", () => {
   assert.deepEqual(
-    assessVisitPlanProtocol(2, "正式训练", "正式训练", true),
+    assessVisitPlanProtocol(2, "正式训练", "正式训练", true, false),
     { allowed: true, reason: null },
   );
-  const research = assessVisitPlanProtocol(2, "正式训练", "正式训练", false);
+  const research = assessVisitPlanProtocol(2, "正式训练", "正式训练", false, false);
   assert.equal(research.allowed, false);
   assert.match(research.reason ?? "", /ready_for_research=false/);
 });
 
+test("Week-2 research vertical follows the server readiness signal", () => {
+  assert.deepEqual(
+    assessVisitPlanProtocol(2, "正式训练", "正式训练", false, true),
+    { allowed: true, reason: null },
+  );
+  const checking = assessVisitPlanProtocol(2, "正式训练", "正式训练", false, null);
+  assert.equal(checking.allowed, false);
+  assert.match(checking.reason ?? "", /核对/);
+  // 模拟路径不依赖 readiness 信号:信号缺失/为假都不影响模拟验收。
+  assert.equal(assessVisitPlanProtocol(2, "正式训练", "正式训练", true, null).allowed, true);
+});
+
 test("Week-1 phases and Week 3-8 disclose their distinct missing contracts", () => {
-  const rapport = assessVisitPlanProtocol(1, "关系建立", "关系建立环节", true);
-  const baseline = assessVisitPlanProtocol(1, "基线测评", "基线测评窗", true);
-  const pretest = assessVisitPlanProtocol(1, "前测", "基线测评窗", true);
-  const weekThree = assessVisitPlanProtocol(3, "正式训练", "正式训练", true);
+  const rapport = assessVisitPlanProtocol(1, "关系建立", "关系建立环节", true, false);
+  const baseline = assessVisitPlanProtocol(1, "基线测评", "基线测评窗", true, false);
+  const pretest = assessVisitPlanProtocol(1, "前测", "基线测评窗", true, false);
+  const weekThree = assessVisitPlanProtocol(3, "正式训练", "正式训练", true, false);
   assert.match(rapport.reason ?? "", /关系建立/);
   assert.match(baseline.reason ?? "", /基线测评/);
   assert.match(pretest.reason ?? "", /前测/);
   assert.match(weekThree.reason ?? "", /冻结训练计划/);
 });
 
-test("bedside route uses week, phase, event line, and data boundary together", () => {
+test("bedside route trusts server admission for partition on existing sessions", () => {
   assert.equal(bedsideProtocolRoute(session()).screen, "training");
-  assert.equal(bedsideProtocolRoute(session({ is_simulation: false })).screen, "unsupported");
+  // 真实场次能存在,说明 approve/start 已通过服务端题库+分区门禁;
+  // 床旁路由只判断该协议组合有没有已实现的界面,不再重复分区判定。
+  assert.equal(bedsideProtocolRoute(session({ is_simulation: false })).screen, "training");
   const baseline = bedsideProtocolRoute(session({
     week_no: 1,
     phase_type: "基线测评",
