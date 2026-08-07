@@ -47,6 +47,7 @@ chmod 700 "$ROOT" "$ROOT/runtime" "$ROOT/runtime/scripts" "$ROOT/offsite"
 install -m 700 "$REPO/scripts/vps-backup-pull.sh" "$ROOT/runtime/scripts/vps-backup-pull.sh"
 install -m 600 "$REPO/scripts/verify_backup_snapshot.py" "$ROOT/runtime/scripts/verify_backup_snapshot.py"
 install -m 600 "$REPO/scripts/notify_ops.py" "$ROOT/runtime/scripts/notify_ops.py"
+install -m 600 "$REPO/scripts/audit_anchor_check.py" "$ROOT/runtime/scripts/audit_anchor_check.py"
 
 # 校验器的 SUPPORTED_ALEMBIC_HEADS 是写死的，必须与生产同版本，否则每份快照
 # 都会被判成 legacy。把仓库当前的指纹留在运行时目录里，人工核对时一眼可比。

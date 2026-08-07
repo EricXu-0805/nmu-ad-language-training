@@ -41,6 +41,8 @@ done
 cd "$(dirname "$0")/.."
 GUARD="scripts/verify_backup_snapshot.py"
 [ -f "$GUARD" ] || { echo "拒绝执行:缺少快照校验器" >&2; exit 69; }
+ANCHOR_CHECK="scripts/audit_anchor_check.py"
+[ -f "$ANCHOR_CHECK" ] || { echo "拒绝执行:缺少审计锚定校验器" >&2; exit 69; }
 if [ -n "${PYTHON_BIN:-}" ]; then
   [ -x "$PYTHON_BIN" ] || command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
     echo "拒绝执行:PYTHON_BIN 不可执行" >&2; exit 69;
@@ -684,6 +686,23 @@ PY
   rm -f -- "$CURRENT_ALLOWLIST" "$CURRENT_DATA_ALLOWLIST"
   CURRENT_ALLOWLIST=""
   CURRENT_DATA_ALLOWLIST=""
+
+  # 审计链异地锚定:重算快照内哈希链,并与本机追加账本对分叉/前缀改写/回退。
+  # VPS 上重算整条链+改锚点的"全权伪造",过不了这台机器已经记下的历史锚点。
+  # 篡改级(1)与读不出(2)同样按 conflict 处置留证据,fail-closed。
+  if ANCHOR_RESULT=$("$PYTHON_BIN" -I "$ANCHOR_CHECK" "$stage/app.db" \
+      --snapshot "$stamp" --anchors-log "$DEST/audit-anchors.log" --record 2>&1); then
+    :
+  else
+    compare_rc=$?
+    conflict=$(mktemp -d "$CONFLICTS/$stamp.$(date +%Y%m%d-%H%M%S).XXXXXX")
+    mv "$stage" "$conflict/audit-anchor"
+    CURRENT_STAGE=""
+    CURRENT_STAMP=""
+    FAIL_CODE="audit_anchor_check_failed"
+    note "FAIL code=$FAIL_CODE snapshot=$stamp rc=$compare_rc detail=$ANCHOR_RESULT"
+    return 3
+  fi
 
   if [ -e "$final" ] || [ -L "$final" ]; then
     if "$PYTHON_BIN" -I "$GUARD" compare-vps "$final" "$stage" >/dev/null 2>&1; then

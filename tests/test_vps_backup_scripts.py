@@ -109,6 +109,8 @@ def _pull_harness(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, str]]:
     (remote / "daily").mkdir(parents=True)
     shutil.copy2(ROOT / "scripts" / "vps-backup-pull.sh", scripts / "vps-backup-pull.sh")
     shutil.copy2(GUARD_SOURCE, scripts / "verify_backup_snapshot.py")
+    shutil.copy2(ROOT / "scripts" / "audit_anchor_check.py",
+                 scripts / "audit_anchor_check.py")
     transfer_log = tmp_path / "transfers.log"
     _make_executable(stubs / "ssh", r'''#!/usr/bin/env bash
 set -euo pipefail
@@ -286,6 +288,33 @@ def test_pull_new_replay_and_same_name_conflict_preserves_local(tmp_path):
     assert all(line.endswith("/backup.log") for line in new_transfers)
     assert stamp not in "".join(new_transfers)
     assert hashlib.sha256(local_audio.read_bytes()).hexdigest() == original_hash
+
+
+def test_pull_files_broken_audit_chain_snapshot_into_conflicts(tmp_path):
+    """伪造审计行+重写 manifest 让传输层全绿——唯一拦得住的就是锚定层。"""
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    snapshot = _create_remote_snapshot(remote, stamp, b"payload")
+    conn = sqlite3.connect(snapshot / "app.db")
+    conn.execute(
+        "INSERT INTO auditlog (ts,actor,action,summary,prev_hash,entry_hash)"
+        " VALUES ('2026-01-01 00:00:00','forger','score_lock','forged',?,?)",
+        ("f" * 64, "e" * 64))
+    conn.commit()
+    conn.close()
+    _write_manifest(snapshot)
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == 4          # partial:证据已归档并要求告警
+    log = (local / "pull.log").read_text()
+    assert "code=audit_anchor_check_failed" in log
+    assert "problem=chain_broken" in log
+    assert not list((local / "daily").iterdir())
+    assert any((local / "conflicts").iterdir())
+    # 锚点账不给被拒快照记账
+    anchors = local / "audit-anchors.log"
+    assert not anchors.exists() or stamp not in anchors.read_text()
 
 
 def test_pull_rejects_empty_remote_set(tmp_path):
