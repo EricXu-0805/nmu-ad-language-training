@@ -474,19 +474,24 @@ pull_one_snapshot() {
     *) FAIL_CODE="remote_snapshot_name_invalid"; note "FAIL code=$FAIL_CODE"; return 1 ;;
   esac
 
-  # 返回 5=证据早已归档、仍等人工处置:首次归档那天已经告警过,之后每天
-  # 静默跳过本份、继续归档其余快照,不再重复拉响。
-  for evidence_root in "$CONFLICTS" "$LEGACY"; do
-    if [ -n "$(find "$evidence_root" -mindepth 1 -maxdepth 1 -type d \
-        -name "$stamp.*" -print -quit)" ]; then
-      FAIL_CODE="snapshot_unresolved_evidence"
-      note "FAIL code=$FAIL_CODE snapshot=$stamp"
-      return 5
-    fi
-  done
+  # 未决证据按危险度分流:conflict/校验失败件(同名不同内容、验不过=潜在篡改)
+  # 返回 3——每天 partial 收尾+告警,直到有人清掉;legacy(良性历史件,首次归档
+  # 那天已经告警过)返回 5——静默跳过,不拿一份旧快照天天拉响。
+  if [ -n "$(find "$CONFLICTS" -mindepth 1 -maxdepth 1 -type d \
+      -name "$stamp.*" -print -quit)" ]; then
+    FAIL_CODE="snapshot_unresolved_evidence"
+    note "FAIL code=$FAIL_CODE snapshot=$stamp"
+    return 3
+  fi
   if [ -n "$(find "$QUARANTINE" -mindepth 1 -maxdepth 1 -type d \
       \( -name "$stamp.snapshot_verify_failed.*" \
          -o -name "$stamp.snapshot_publish_failed.*" \) -print -quit)" ]; then
+    FAIL_CODE="snapshot_unresolved_evidence"
+    note "FAIL code=$FAIL_CODE snapshot=$stamp"
+    return 3
+  fi
+  if [ -n "$(find "$LEGACY" -mindepth 1 -maxdepth 1 -type d \
+      -name "$stamp.*" -print -quit)" ]; then
     FAIL_CODE="snapshot_unresolved_evidence"
     note "FAIL code=$FAIL_CODE snapshot=$stamp"
     return 5

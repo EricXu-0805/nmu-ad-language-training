@@ -279,7 +279,12 @@ def test_pull_new_replay_and_same_name_conflict_preserves_local(tmp_path):
     transfer_count = len(Path(env["TRANSFER_LOG"]).read_text().splitlines())
     unresolved = _run_pull(project, env)
     assert unresolved.returncode != 0
-    assert len(Path(env["TRANSFER_LOG"]).read_text().splitlines()) == transfer_count
+    # 2026-08-07 语义:未决 conflict 不再中止整个 run(其余快照照常归档、每天
+    # partial+告警),但这一份一个字节都不许再拉——唯一允许的新传输是
+    # backup.log 审计视图刷新。
+    new_transfers = Path(env["TRANSFER_LOG"]).read_text().splitlines()[transfer_count:]
+    assert all(line.endswith("/backup.log") for line in new_transfers)
+    assert stamp not in "".join(new_transfers)
     assert hashlib.sha256(local_audio.read_bytes()).hexdigest() == original_hash
 
 
@@ -626,9 +631,12 @@ if [ "${FAIL_COMMAND:-}" = cp ]; then
 fi
 exec /bin/cp "$@"
 ''')
-    _make_executable(stubs / "sha256sum", r'''#!/usr/bin/env bash
-if [ "${FAIL_COMMAND:-}" = sha256sum ]; then exit 92; fi
-exec /sbin/sha256sum "$@"
+    # 真实二进制路径按当前系统解析:macOS 在 /sbin,Ubuntu(CI)在 /usr/bin,
+    # 写死任一边都会在另一边 No such file or directory。
+    real_sha256sum = shutil.which("sha256sum") or "/usr/bin/sha256sum"
+    _make_executable(stubs / "sha256sum", f'''#!/usr/bin/env bash
+if [ "${{FAIL_COMMAND:-}}" = sha256sum ]; then exit 92; fi
+exec {real_sha256sum} "$@"
 ''')
     _make_executable(stubs / "chmod", r'''#!/usr/bin/env bash
 if [ "${FAIL_COMMAND:-}" = chmod ] && [[ "$*" == *".partial."* ]]; then exit 93; fi

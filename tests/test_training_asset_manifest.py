@@ -22,6 +22,13 @@ MANIFEST_PATH = ROOT / "content" / "training_asset_manifest_v1.json"
 ITEM_BANK_PATH = ROOT / "content" / "item_bank_v1.json"
 PROTOCOL_PATH = ROOT / "content" / "autopilot_protocol_v1.json"
 
+# 图片源材料有意不入库(敏感研究材料,只在本地/机构机器上)。仓库里只有
+# manifest;真源树缺席的环境(CI)对这几条无从验证,只能如实跳过——
+# 这不是放宽:凡有源树的机器照跑全量。
+requires_real_source_tree = pytest.mark.skipif(
+    not generator.DEFAULT_SOURCE_ROOT.is_dir(),
+    reason="图片源树不在此机器上(不入库),无从对照 manifest")
+
 
 def _load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -234,6 +241,7 @@ def test_known_visual_leaks_and_mapping_conflicts_are_open_findings():
             assert finding["finding_id"] in assets[image_id]["review_finding_ids"]
 
 
+@requires_real_source_tree
 def test_manifest_covers_every_regular_source_file_exactly_once():
     manifest = _load(MANIFEST_PATH)
     source_paths = {
@@ -262,6 +270,7 @@ def test_manifest_records_exact_duplicate_identity_without_merging_slots():
     assert len({asset["source"]["sha256"] for asset in assets.values()}) == 149
 
 
+@requires_real_source_tree
 def test_manifest_json_has_no_duplicate_keys_and_matches_generator_bytes():
     raw = MANIFEST_PATH.read_text(encoding="utf-8")
     parsed = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
@@ -306,6 +315,7 @@ def test_source_reader_rejects_symlinks(tmp_path: Path):
         generator._read_regular_file_no_follow(link)
 
 
+@requires_real_source_tree
 def test_png_validator_rejects_truncation_after_validating_real_source():
     manifest = _load(MANIFEST_PATH)
     first = manifest["assets"][0]["source"]
