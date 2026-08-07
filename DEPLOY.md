@@ -636,6 +636,65 @@ print(ssl.OPENSSL_VERSION)"'
 
 ---
 
+## 13. 迁往医院内网（收真实数据前必做）
+
+代码里零硬编码公网 IP/域名（`89.208.253.119`/`sslip.io` 只出现在文档），前端同源
+相对路径、无 CDN、CSP `connect-src 'self'`——迁移的全部工作量在配置、数据搬运和
+出网依赖的替代上。以下清单来自 2026-08-07 的逐文件可移植性盘点。
+
+### 13.1 出网白名单
+
+- **保留云 AI**：`dashscope.aliyuncs.com:443`（HTTPS；备选 CosyVoice 音色额外走
+  同域名 wss）。SDK 端点可用 `DASHSCOPE_HTTP_BASE_URL` / `DASHSCOPE_WEBSOCKET_BASE_URL`
+  覆盖。非流式 OSS 下载分支只接受 `*.aliyuncs.com`:443，且**解析到非公网 IP 直接
+  拒绝**（`app/tts.py` 的 fail-closed 守卫）——不要用内网 DNS 把阿里域指向代理。
+- **全离线配置**（合规降级，不是故障态）：TTS=本地 Piper（`data/tts/*.onnx` 要带走）
+  再降浏览器语音；ASR=人工转写；判分=规则/rubric。要**显式**设
+  `TTS_ENGINE`/`ASR_ENGINE`/`LLM_JUDGE`，不要靠删 Key 凭感觉（见 §7）。
+- **可选出网**：`discord.com`（运维告警；不通则所有 `OnFailure=` 告警变哑，需换成
+  医院认可的内网告警出口——**未定，医院侧待办**）；`api.osv.dev`（漏扫有
+  `--offline security/osv-response.json` 全离线路径）；apt 源（`os_security_check`
+  无源可用会如实 FAIL，挂内网镜像或用 `--simulate-file`）。
+
+### 13.2 带走什么（容易漏的）
+
+- 代码 + 已构建 `web/dist` + 整个 venv（照 §12.3：别在目标机 pip install，旁路建好
+  搬运；解释器照 §12.5 或用发行版 3.12，锁两者都支持）。
+- `data/` 全目录：`app.db`、`audio/`、`tts/`（Piper 音色）、
+  **`tts-cache/`——不在常规备份内！丢了 222 句预合成话术要重新计费合成**、
+  `exports/`、`controlled-audio-exports/`。
+- `.env`（按 13.3 逐项改）、`Caddyfile`、`deploy/systemd/*`（路径写死 `/opt/nmu`、
+  `User=nmu`，目标机保持同构最省事）。
+
+### 13.3 必改配置清单
+
+- `.env`：`TRUSTED_HOSTS=<内网主机名或 IP>`（精确匹配，不吃通配符）、
+  `SITE_ADDRESS=https://<同>`；`SESSION_COOKIE_SECURE=1` 保持——**内网也必须 TLS，
+  否则 cookie 发不出去，且患者端麦克风（getUserMedia 要求安全上下文）直接不可用**。
+- `Caddyfile`：取消 `# tls internal` 注释（内网无 ACME）；操作台与患者平板的浏览器
+  都要信任内部 CA，这一步要写进装机 SOP。
+- systemd timer 的 `OnCalendar` 全部按 UTC 写；目标机时区若是 Asia/Shanghai，逐个换算。
+- 备份链：本机四个 timer（backup/health/capacity/restore-drill）内网照常；
+  **Mac 异地拉取（ssh 进公网 VPS）必断**——异地副本与 `audit-anchors.log` 异地锚定
+  账本都要换到医院认可的、与主机不同故障域的位置，否则审计链外部锚定退化为摆设。
+
+### 13.4 迁移后验收
+
+- `scripts/preflight_check.py --base-url https://<内网地址>`（自签证书会拦
+  public-surface 检查，先在信任内部 CA 的机器上跑）+ `--os`（有内网 apt 源时）。
+- 跑一遍 `harness/research_rehearsal_harness`（隔离 root，不碰生产库）：零模拟开关
+  下真实档案 create→approve→开场→出图→录音→转写全链，等于把「收人链路」在内网机
+  上重新点火验证一次。
+- 保留云 AI 时由管理员执行 §7.1 合成检查。
+
+### 13.5 医院 Key 切换与个人 Key 退役
+
+按 §7 换 Key 流程执行后，**必须在百炼控制台吊销个人旧 Key**：历史每日快照里的
+`.env` 副本都含旧 Key 明文（异地拉取机上另有多达 60 份），吊销后这些副本才无害化；
+不吊销等于把有效凭据留在多台机器的备份里。
+
+---
+
 ## 部署自检清单
 
 下面这些里，迁移头、备份新鲜度、依赖与哈希锁一致、公网红线与受保护路由这几项
