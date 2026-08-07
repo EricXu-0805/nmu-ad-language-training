@@ -25,7 +25,6 @@ import hashlib
 from pathlib import Path
 import re
 import sqlite3
-import sys
 
 GENESIS = "0" * 64
 ANCHOR_LINE = re.compile(

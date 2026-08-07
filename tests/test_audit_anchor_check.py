@@ -61,7 +61,8 @@ def test_tampered_middle_row_is_chain_broken(tmp_path):
     conn = sqlite3.connect(db)
     conn.execute("UPDATE auditlog SET summary='forged' WHERE id="
                  "(SELECT id FROM auditlog ORDER BY id LIMIT 1 OFFSET 1)")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     done = _run(str(db), "--snapshot", "20260101-000000")
     assert done.returncode == 1
     assert "problem=chain_broken" in done.stdout
@@ -74,7 +75,8 @@ def test_deleted_tail_is_truncated(tmp_path):
     conn = sqlite3.connect(db)
     conn.execute("DELETE FROM auditlog WHERE id="
                  "(SELECT MAX(id) FROM auditlog)")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     done = _run(str(db), "--snapshot", "20260101-000000")
     assert done.returncode == 1
     assert "problem=truncated" in done.stdout
@@ -85,7 +87,8 @@ def test_anchor_behind_ledger_is_flagged(tmp_path):
     _make_chain(db, 3)
     conn = sqlite3.connect(db)
     conn.execute("UPDATE auditanchor SET count=2 WHERE id=1")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     done = _run(str(db), "--snapshot", "20260101-000000")
     assert done.returncode == 1
     assert "problem=anchor_behind" in done.stdout
