@@ -5,7 +5,9 @@ import json
 import pytest
 
 from app import assessment_bundles, assessment_workflow_policy, content
-from tests.test_assessment_api import assessment_clients  # noqa: F401
+from tests.test_assessment_api import (  # noqa: F401
+    assessment_clients as _api_assessment_clients,
+)
 from tests.test_assessment_bundles import _package
 
 
@@ -123,8 +125,13 @@ def test_training_isolation_refuses_overlapping_naming_words():
             (dirty,), content.CONTENT_DIR)
 
 
-def test_http_create_enforces_the_frozen_schedule_window(  # noqa: F811
-        tmp_path, monkeypatch, assessment_clients):
+@pytest.fixture
+def api_clients(_api_assessment_clients):  # noqa: F811
+    return _api_assessment_clients
+
+
+def test_http_create_enforces_the_frozen_schedule_window(
+        tmp_path, monkeypatch, api_clients):
     """HTTP 面:政策文件存在时 create 逐命令过冻结排期窗(409 带政策 code)。"""
     from datetime import timedelta
 
@@ -137,7 +144,7 @@ def test_http_create_enforces_the_frozen_schedule_window(  # noqa: F811
     }))
     monkeypatch.setattr(content, "CONTENT_DIR", staged)
 
-    denied = assessment_clients.researcher.post(
+    denied = api_clients.researcher.post(
         "/patients/SIM-ASSESSMENT-API/assessment-events",
         json={
             "timepoint": "pretest",
@@ -149,7 +156,7 @@ def test_http_create_enforces_the_frozen_schedule_window(  # noqa: F811
     assert denied.json()["detail"]["code"] == (
         "assessment_workflow_policy_schedule_violation")
 
-    allowed = assessment_clients.researcher.post(
+    allowed = api_clients.researcher.post(
         "/patients/SIM-ASSESSMENT-API/assessment-events",
         json={
             "timepoint": "pretest",
