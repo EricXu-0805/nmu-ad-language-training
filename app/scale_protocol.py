@@ -614,6 +614,58 @@ def evaluate_scale_protocol_manifest(
     return result
 
 
+SCALE_PROTOCOL_MANIFEST_FILE: Final = "scale_protocol_manifest.json"
+
+
+def _load_manifest() -> dict:
+    """Load the PI-frozen manifest file; absent = today's all-None constant.
+
+    收据 150 S2:manifest 是 PI 冻结事实的载体。文件不存在=尚未交付(现状,
+    非错误);文件存在但结构不合法=部署缺陷,fail-closed 成 503(路径无泄漏),
+    绝不静默回落空 manifest 把缺陷藏进 awaiting_pi_definition。
+    字段级派生仍全部由 evaluate_scale_protocol_manifest 重算——文件里声称的
+    readiness/status/blocker 一律被覆盖,声称不了任何放行。
+    """
+    from .content import CONTENT_DIR, FrozenContentUnavailable
+
+    path = CONTENT_DIR / SCALE_PROTOCOL_MANIFEST_FILE
+    if not path.exists():
+        return _MANIFEST
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("manifest must be a JSON object")
+        categories = data.get("categories")
+        if (not isinstance(categories, list) or len(categories) != 2
+                or {row.get("category_key") for row in categories
+                    if isinstance(row, dict)} != {
+                        "untrained_standardized_naming",
+                        "functional_communication"}):
+            raise ValueError("manifest must contain the two frozen categories")
+        workflow_policy = data.get("workflow_policy")
+        if workflow_policy is not None and not isinstance(workflow_policy, dict):
+            raise ValueError("workflow_policy must be an object when present")
+    except (OSError, TypeError, ValueError) as exc:
+        raise FrozenContentUnavailable(f"量表协议 manifest 不可用:{exc}") from exc
+    merged = deepcopy(_MANIFEST)
+    for field in ("definition_bundle_id", "definition_bundle_digest"):
+        if field in data:
+            merged[field] = data[field]
+    merged_categories = {row["category_key"]: row for row in merged["categories"]}
+    for supplied in categories:
+        target = merged_categories[supplied["category_key"]]
+        for field, value in supplied.items():
+            if field in target:
+                target[field] = value
+        # required/scoring_ready 等派生位由 evaluator 覆盖,不吃文件声称。
+        target["required"] = True
+    if workflow_policy is not None:
+        for field, value in workflow_policy.items():
+            if field in merged["workflow_policy"]:
+                merged["workflow_policy"][field] = value
+    return merged
+
+
 def scale_protocol_readiness() -> dict:
     """Return the current manifest with all readiness facts derived afresh."""
     from .assessment_definitions import AssessmentDefinitionError, current_bundle
@@ -623,6 +675,6 @@ def scale_protocol_readiness() -> dict:
     except AssessmentDefinitionError:
         installed = ()
     return evaluate_scale_protocol_manifest(
-        _MANIFEST,
+        _load_manifest(),
         registered_definition_bundles=installed,
     )
