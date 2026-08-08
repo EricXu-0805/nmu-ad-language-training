@@ -770,6 +770,29 @@ export const api = {
       },
     ), assessmentReceiptExpectation(event));
   },
+  issueAssessmentRecordingAuthorization: async (
+    event: AssessmentEvent,
+    instance: AssessmentInstance,
+    itemKey: string,
+    readiness: FormalAssessmentMutationReadiness,
+  ): Promise<{ authorizedArtifactDigest: string; itemRevision: number }> => {
+    assertFormalAssessmentMutationReady(readiness, "response");
+    requireAssessmentInstanceTarget(event, instance);
+    const raw = await req<unknown>(
+      "POST",
+      `/assessment-instances/${encodeURIComponent(instance.instance_id)}/recording-authorizations`,
+      { item_key: itemKey },
+    );
+    const row = raw as Record<string, unknown>;
+    const digest = row?.authorized_artifact_digest;
+    const revision = row?.item_revision;
+    if (typeof digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(digest)
+        || typeof revision !== "number" || !Number.isInteger(revision) || revision < 1
+        || row?.item_key !== itemKey) {
+      throw new ApiError(0, "服务端录音授权回执格式无效");
+    }
+    return { authorizedArtifactDigest: digest, itemRevision: revision };
+  },
   completeAssessmentInstance: async (
     event: AssessmentEvent,
     instance: AssessmentInstance,

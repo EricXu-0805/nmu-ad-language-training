@@ -3,7 +3,8 @@ import { api, ApiError } from "../api";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
-import type { AssessmentEventsToday } from "../types";
+import type { AssessmentEvent, AssessmentEventsToday, ScaleProtocolReadiness } from "../types";
+import { AssessmentExecutionDrawer } from "./AssessmentExecutionDrawer";
 import {
   assessmentCategoryLabel,
   assessmentInstanceStatusLabel,
@@ -28,6 +29,8 @@ export function AssessmentQueuePanel() {
   const [assessmentError, setAssessmentError] = useState<string | null>(null);
   const [assessmentLoading, setAssessmentLoading] = useState(false);
   const [classificationFilter, setClassificationFilter] = useState<DataClassification>("research");
+  const [readiness, setReadiness] = useState<ScaleProtocolReadiness | null>(null);
+  const [executionEvent, setExecutionEvent] = useState<AssessmentEvent | null>(null);
   const assessmentRequest = useRef(0);
 
   const loadAssessmentQueue = useCallback(async () => {
@@ -52,6 +55,16 @@ export function AssessmentQueuePanel() {
     void loadAssessmentQueue();
     return () => { assessmentRequest.current += 1; };
   }, [loadAssessmentQueue]);
+
+  useEffect(() => {
+    let active = true;
+    api.scaleProtocol()
+      .then((next) => { if (active) setReadiness(next); })
+      .catch(() => { if (active) setReadiness(null); });
+    return () => { active = false; };
+  }, []);
+
+  const executionOpen = readiness?.ready_for_research === true;
 
   const view = assessmentQueueView(assessmentToday, assessmentError);
   const classified = view.kind === "ready"
@@ -84,10 +97,23 @@ export function AssessmentQueuePanel() {
         </Button>
       </div>
 
-      <Alert tone="warn" title="只读排班投影·不代表量表已可运营">
-        正式定义、授权制品与工作流政策通过全链路批准前，这里只显示服务端待办；
-        不提供开始、作答、评分、延期或收尾操作，也不展示结局得分。
-      </Alert>
+      {!executionOpen && (
+        <Alert tone="warn" title="只读排班投影·量表尚未全链就绪">
+          正式定义、授权制品与工作流政策通过全链路批准前，这里只显示服务端待办；
+          就绪(ready_for_research)后每行出现「打开执行」入口。
+        </Alert>
+      )}
+      {executionOpen && executionEvent && (
+        <AssessmentExecutionDrawer
+          event={executionEvent}
+          readiness={readiness}
+          onReceipt={(next) => {
+            setExecutionEvent(next);
+            void loadAssessmentQueue();
+          }}
+          onDismiss={() => setExecutionEvent(null)}
+        />
+      )}
 
       {view.kind === "loading" && (
         <StatusPill tone="muted">正在读取今日正式评估待办…</StatusPill>
@@ -151,7 +177,13 @@ export function AssessmentQueuePanel() {
                       </span>
                       <span className="muted">{status.nextStep}</span>
                     </div>
-                    <StatusPill tone={status.tone}>{status.statusLabel}</StatusPill>
+                    <div className="col" style={{ gap: 6, alignItems: "flex-end" }}>
+                      <StatusPill tone={status.tone}>{status.statusLabel}</StatusPill>
+                      {executionOpen && (
+                        <Button size="sm"
+                          onClick={() => setExecutionEvent(event)}>打开执行</Button>
+                      )}
+                    </div>
                   </div>
                   <div className="row wrap" aria-label="两类正式评估实例状态">
                     {event.instances.map((instance) => (
