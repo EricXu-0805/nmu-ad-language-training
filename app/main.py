@@ -32,7 +32,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.responses import Response as PlainResponse
 
 from . import (access_policy, assessment_bundles, assessment_contract,
-               assessment_definitions, assessment_service, asr,
+               assessment_definitions, assessment_service,
+               assessment_workflow_policy, asr,
                audio_capture, audio_gate, audio_store, audit, auth,
                autopilot_contract, autopilot_orchestration,
                autopilot_positions, autopilot_service,
@@ -83,8 +84,10 @@ def _install_assessment_bundles_at_startup() -> None:
     if assessment_definitions.registered_bundles():
         return
     try:
-        bundles, active_id, _raw = assessment_bundles.load_bundle_packages(
-            content.CONTENT_DIR)
+        bundles, active_id, raw_packages = (
+            assessment_bundles.load_bundle_packages(content.CONTENT_DIR))
+        assessment_bundles.assert_training_isolation(
+            raw_packages, content.CONTENT_DIR)
         assessment_definitions.install_production_bundles(
             bundles, active_bundle_id=active_id)
     except (content.FrozenContentUnavailable,
@@ -114,6 +117,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="南医大 · AI 语言沟通训练系统", version="0.0.1", lifespan=lifespan)
+
+
+@app.exception_handler(assessment_workflow_policy.WorkflowPolicyViolation)
+async def _workflow_policy_violation_response(
+        _request: Request, exc: assessment_workflow_policy.WorkflowPolicyViolation):
+    """冻结工作流政策拒绝的命令统一 409;code/message 不含路径或内容细节。"""
+    return JSONResponse(
+        status_code=409,
+        content={"detail": {"code": exc.code, "message": exc.message}},
+    )
 
 
 @app.exception_handler(content.FrozenContentUnavailable)
@@ -2223,7 +2236,12 @@ def create_assessment_event(
     s.expire_all()
     try:
         with governance_lock.subject_fence(s, patient_id):
-            _require_assessment_write_readiness()
+            readiness = _require_assessment_write_readiness()
+            policy = _enforced_workflow_policy(readiness)
+            if policy is not None:
+                policy.enforce_create(
+                    timepoint=body.timepoint,
+                    scheduled_date=body.scheduled_date)
             result = assessment_service.create_event(
                 s,
                 patient_id=patient_id,
@@ -2354,6 +2372,31 @@ def _assessment_instance_mutation_preflight(
     s.rollback()
     s.expire_all()
     return patient_id, event_id, actor_id, actor_role
+
+
+def _enforced_workflow_policy(
+        readiness: dict,
+) -> "assessment_workflow_policy.FrozenWorkflowPolicy | None":
+    """载入冻结工作流政策并核对 manifest 绑定(收据 150 S4)。
+
+    文件缺失且 manifest 政策面未完备=尚未交付(就绪门本来就关);manifest 政策
+    完备却没有可执行政策文件=部署缺陷,fail-closed 拒绝命令——enforcement
+    翻真后不允许「有批准事实、无可执行规则」的空转状态。
+    """
+    policy = assessment_workflow_policy.load_workflow_policy(content.CONTENT_DIR)
+    manifest_policy = readiness.get("workflow_policy") or {}
+    if policy is None:
+        # manifest 里真有冻结政策摘要却没有可执行政策文件=部署缺陷,拒绝命令;
+        # (测试夹具只 monkeypatch 就绪位、不带 manifest 政策块,不落此分支。)
+        if manifest_policy.get("workflow_policy_digest"):
+            raise HTTPException(status_code=409, detail={
+                "code": "assessment_workflow_policy_file_missing",
+                "message": "manifest 政策事实已冻结,但缺少可执行政策文件",
+            })
+        return None
+    if manifest_policy.get("workflow_policy_digest"):
+        policy.assert_manifest_binding(manifest_policy)
+    return policy
 
 
 def _assessment_artifact_authorizer(
@@ -2537,7 +2580,13 @@ def approve_assessment_deferral(
             _assessment_authorize_instance(
                 s, request, instance_id,
                 action="批准正式评估延期", mutation=True)
-            _require_assessment_write_readiness()
+            readiness = _require_assessment_write_readiness()
+            policy = _enforced_workflow_policy(readiness)
+            if policy is not None:
+                policy.enforce_deferral(
+                    actor_role=actor_role,
+                    today=visit_plan_service._research_today(),
+                    deferred_until=body.deferred_until)
             result = assessment_service.approve_deferral(
                 s, event_id=event_id, instance_id=instance_id, body=body,
                 actor_id=actor_id, actor_role=actor_role)

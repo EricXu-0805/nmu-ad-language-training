@@ -34,9 +34,15 @@ WORKFLOW_CONTRACT_IMPLEMENTED: Final = True
 # definition_artifacts_match additionally requires the installed bundle to
 # match the manifest field-by-field.
 DEFINITION_ARTIFACT_ENFORCEMENT_IMPLEMENTED: Final = True
-# The frozen scheduling/assignment/deferral/closeout policy runtime is not
-# implemented yet (收据 150 S4); readiness stays closed until it exists.
-WORKFLOW_POLICY_ENFORCEMENT_IMPLEMENTED: Final = False
+# Workflow-policy enforcement is implemented (收据 150 S4): the frozen policy
+# file compiles through a closed-set interpreter (unknown rule kinds refuse),
+# every rule digest is recomputed from the interpreted bytes and must match
+# the PI manifest, and commands are checked per-execution — create against the
+# timepoint schedule window, deferral against authority + bounded horizon,
+# while closeout/assignment/reschedule kinds pin exactly the semantics the
+# service state machine structurally enforces.  Readiness still requires the
+# PI-supplied manifest facts and policy file; code alone opens nothing.
+WORKFLOW_POLICY_ENFORCEMENT_IMPLEMENTED: Final = True
 
 _FORMAL_RESULT_CONTRACT_BLOCKER: Final = {
     "code": "platform.formal_result_contract.not_ready",

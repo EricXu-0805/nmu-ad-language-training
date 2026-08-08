@@ -357,6 +357,35 @@ def naming_words(data: dict) -> frozenset[str]:
     return frozenset(words)
 
 
+def assert_training_isolation(
+    raw_packages: tuple[dict, ...], content_dir: str | Path,
+) -> None:
+    """量表一(未训练词命名测验)词表必须与全部训练周词表不相交(采集单 #11)。
+
+    「未训练词」是该结局的效度前提:训练过的词混进测验=结局污染。训练索引
+    坏档时同样拒绝安装量表包(fail-closed,不在盲区里放行)。
+    """
+    from . import content as content_module
+
+    week_files = content_module.load_item_bank_index(content_dir)
+    training_words: set[str] = set()
+    for week in sorted(week_files):
+        bank = content_module.load_item_bank_for_week(week, content_dir)
+        for item in (*bank.single_element, *bank.double_element):
+            for word in (item.get("target_word"), item.get("left_word"),
+                         item.get("right_word")):
+                if word:
+                    training_words.add(str(word).strip())
+            for word in item.get("acceptable_expressions") or []:
+                if word:
+                    training_words.add(str(word).strip())
+    for data in raw_packages:
+        overlap = naming_words(data) & training_words
+        if overlap:
+            raise FrozenContentUnavailable(
+                f"量表一词表与训练词表相交({len(overlap)} 词),违反未训练词前提")
+
+
 def load_bundle_packages(
     content_dir: str | Path,
 ) -> tuple[tuple[RegisteredAssessmentBundle, ...], str, tuple[dict, ...]]:

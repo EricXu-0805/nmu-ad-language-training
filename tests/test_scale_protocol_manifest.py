@@ -22,7 +22,8 @@ def test_absent_manifest_keeps_the_all_none_baseline(tmp_path, monkeypatch):
     assert readiness["ready_for_research"] is False
     codes = {issue["code"] for issue in readiness["blocking_issues"]}
     assert "platform.definition_artifact_enforcement.not_ready" not in codes
-    assert "platform.workflow_policy_enforcement.not_ready" in codes
+    assert "platform.workflow_policy_enforcement.not_ready" not in codes
+    assert "platform.definition_artifacts.not_ready" in codes
 
 
 def test_supplied_facts_surface_but_never_claim_readiness(tmp_path, monkeypatch):

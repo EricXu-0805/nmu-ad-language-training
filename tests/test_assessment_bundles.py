@@ -5,6 +5,8 @@ import pytest
 
 from app import assessment_bundles, assessment_definitions, content
 
+_REAL_CONTENT_DIR = content.CONTENT_DIR
+
 
 @pytest.fixture(autouse=True)
 def _isolate_registry():
@@ -70,6 +72,13 @@ def _package(bundle_id: str = "formal-two-outcomes-v1", *, approved=False):
 
 
 def _stage(tmp_path, packages: dict[str, dict], active: str):
+    import shutil
+
+    # 启动安装链含「量表一与训练词表不相交」检查(收据 150 S4),该检查对
+    # 训练索引 fail-closed;临时内容目录须带真实训练索引+题库。
+    for name in (content.ITEM_BANK_INDEX_FILE, "item_bank_v1.json"):
+        if not (tmp_path / name).exists():
+            shutil.copy(_REAL_CONTENT_DIR / name, tmp_path)
     base = tmp_path / assessment_bundles.ASSESSMENT_BUNDLE_DIR
     base.mkdir(parents=True)
     entries = []
