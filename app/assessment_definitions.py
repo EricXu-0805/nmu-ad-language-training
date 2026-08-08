@@ -366,6 +366,48 @@ def current_bundle(bundle_id: str | None = None) -> RegisteredAssessmentBundle:
         return bundle
 
 
+def install_production_bundles(
+    bundles: tuple[RegisteredAssessmentBundle, ...],
+    *,
+    active_bundle_id: str,
+) -> None:
+    """Permanently install loader-verified production bundles (startup path).
+
+    与 pytest 安装器不同:接受包内声明的 formal_research_approved(该事实由
+    PI 制品供给且被 bundle_digest 覆盖),且为持久安装。每个 bundle 在此再次
+    整体校验;归档版本一并安装,在途事件按冻结 bundle_id 解析(rollover 语义)。
+    仅允许对空注册表安装——生产进程启动恰好一次,拒绝运行中静默换表。
+    """
+    if not bundles:
+        _fail(
+            "assessment_production_registry_empty",
+            "production install requires at least one bundle",
+        )
+    by_id: dict[str, RegisteredAssessmentBundle] = {}
+    for selected in bundles:
+        validate_registered_bundle(selected)
+        if selected.snapshot.bundle_id in by_id:
+            _fail(
+                "assessment_bundle_duplicate",
+                "assessment definition bundle ids must be unique",
+            )
+        by_id[selected.snapshot.bundle_id] = selected
+    if active_bundle_id not in by_id:
+        _fail(
+            "assessment_bundle_selection_invalid",
+            "active assessment definition bundle is not registered",
+        )
+    global _ACTIVE_BUNDLE_ID
+    with _REGISTRY_LOCK:
+        if _BUNDLES:
+            _fail(
+                "assessment_registry_already_installed",
+                "assessment definition registry is already installed",
+            )
+        _BUNDLES.update(by_id)
+        _ACTIVE_BUNDLE_ID = active_bundle_id
+
+
 @contextmanager
 def install_synthetic_bundle_for_testing(
     bundle: RegisteredAssessmentBundle | None = None,

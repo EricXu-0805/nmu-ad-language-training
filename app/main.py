@@ -10,6 +10,7 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager
 import hashlib
 import ipaddress
 import json as _json
+import logging
 import math
 import secrets
 import threading
@@ -31,7 +32,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from fastapi.responses import Response as PlainResponse
 
-from . import (access_policy, assessment_contract, assessment_service, asr,
+from . import (access_policy, assessment_bundles, assessment_contract,
+               assessment_definitions, assessment_service, asr,
                audio_capture, audio_gate, audio_store, audit, auth,
                autopilot_contract, autopilot_orchestration,
                autopilot_positions, autopilot_service,
@@ -66,6 +68,31 @@ from .models import Session as TrainSession
 from fastapi import Response
 
 
+def _install_assessment_bundles_at_startup() -> None:
+    """装载 content/assessment_definitions/ 下的正式量表定义包(收据 150 S1)。
+
+    索引缺失=生产尚无注册包(现状,不是错误)。索引存在但装载失败=内容缺陷:
+    评估域保持空注册表逐请求 fail-closed(assessment_definitions_not_ready),
+    训练域不受牵连;缺陷大声记日志,由部署检查而非静默吞掉。
+    已安装(如测试进程内多次建 app)时跳过,不覆盖。
+    """
+    index_path = (content.CONTENT_DIR / assessment_bundles.ASSESSMENT_BUNDLE_DIR
+                  / assessment_bundles.ASSESSMENT_BUNDLE_INDEX_FILE)
+    if not index_path.exists():
+        return
+    if assessment_definitions.registered_bundles():
+        return
+    try:
+        bundles, active_id, _raw = assessment_bundles.load_bundle_packages(
+            content.CONTENT_DIR)
+        assessment_definitions.install_production_bundles(
+            bundles, active_bundle_id=active_id)
+    except (content.FrozenContentUnavailable,
+            assessment_definitions.AssessmentDefinitionError) as exc:
+        logging.getLogger("nmu.assessment").error(
+            "正式量表定义包装载失败,评估域保持 fail-closed:%s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db(db.engine)
@@ -73,6 +100,7 @@ async def lifespan(app: FastAPI):
     device_capability.ttl_minutes()
     provider_readiness.ttl_minutes()
     asr.cleanup_scratch()   # 清扫上次进程异常终止残留的云转写临时音频副本
+    _install_assessment_bundles_at_startup()
     with DBSession(db.engine) as _s:
         auth.cleanup_expired_sessions(_s)          # 清掉过期会话
         _has_users = auth.has_any_user(_s)
