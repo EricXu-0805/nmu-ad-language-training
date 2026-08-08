@@ -22,10 +22,14 @@ from app import content, tts  # noqa: E402
 
 
 def collect_lines() -> list[str]:
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
     proto = content.load_autopilot_protocol(content.CONTENT_DIR / "autopilot_protocol_v1.json")
-    return sorted(content.tts_allowlist(bank, script, proto))
+    lines: set[str] = set()
+    # 预合成缓存覆盖索引里的全部训练周,新周登记后重跑本脚本即可获得同等缓冲。
+    for week in sorted(content.load_item_bank_index()):
+        bank = content.load_item_bank_for_week(week)
+        lines |= content.tts_allowlist(bank, script, proto)
+    return sorted(lines)
 
 
 def _billing_chars(text: str) -> int:

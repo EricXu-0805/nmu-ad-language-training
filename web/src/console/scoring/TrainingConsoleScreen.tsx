@@ -76,7 +76,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   session: Session; hasNamedAccount: boolean; onWrapup: () => void; onExit?: () => void; onItemEventChange?: (id: number | null) => void;
 }) {
   const toast = useToast();
-  const { bundle } = useItemBankBundle();
+  const { bundle } = useItemBankBundle(session.week_no);
   const { journal, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer } = useSessionJournal(session.session_id);
   const {
     postSession,

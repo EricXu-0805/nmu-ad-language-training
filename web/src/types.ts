@@ -855,6 +855,13 @@ export interface ItemBankInfo {
   version_id: string;
   qc_status?: "draft" | "reviewed" | "frozen" | string;
   ready_for_research?: boolean;
+  // 逐周结构化状态:题库索引已登记且可解析的训练周,及其质控投影。
+  structured_training_weeks?: number[];
+  training_week_content?: Record<string, {
+    item_bank_version_id: string;
+    qc_status: string;
+    ready_for_research: boolean;
+  }>;
   // 是否所有开放回答环节均已有冻结、可机判的 operational rubric。
   // 缺省必须按未就绪处理，不能把“题库可加载”误写成“自动驾驶安全可用”。
   operational_autopilot_ready?: boolean;

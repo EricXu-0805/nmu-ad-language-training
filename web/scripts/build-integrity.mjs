@@ -321,11 +321,19 @@ function leakedLiteralInText(text, literals) {
   });
 }
 
+function indexedBankFiles(contentRoot) {
+  // 答案泄漏扫描必须覆盖索引里的每一个训练周数据包,不能停在第 2 周;
+  // 索引缺失/坏档时扫描器直接抛错(fail-closed),不得静默缩小语料。
+  const index = JSON.parse(
+    readFileSync(resolve(contentRoot, "item_bank_index.json"), "utf8"));
+  return index.banks.map((entry) => resolve(contentRoot, entry.file));
+}
+
 export function assertNoSensitiveContentInDist({
   distRoot = resolve(DEFAULT_WEB_ROOT, "dist"),
   contentRoot = DEFAULT_CONTENT_ROOT,
   contentFiles = [
-    resolve(contentRoot, "item_bank_v1.json"),
+    ...indexedBankFiles(contentRoot),
     resolve(contentRoot, "week1_script.json"),
     resolve(contentRoot, "autopilot_protocol_v1.json"),
   ],

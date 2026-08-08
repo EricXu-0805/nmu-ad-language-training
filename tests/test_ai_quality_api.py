@@ -1479,6 +1479,13 @@ def test_frozen_content_failure_uses_path_free_service_error(
     def fail_content(_path):
         raise content.FrozenContentUnavailable(secret_path)
 
+    # 题库按周惰性装载:先落一个场次,坏内容才会真的被触达。
+    with Session(quality_env.engine) as session:
+        _seed_patient(session, "P-FROZEN", simulation=True)
+        _seed_session(
+            session, "S-FROZEN", "P-FROZEN", trainer_id="RESEARCH-A",
+            simulation=True, week_no=2)
+        session.commit()
     monkeypatch.setattr(content, "load_item_bank", fail_content)
     response = _quality(_client("admin"))
     assert response.status_code == 503

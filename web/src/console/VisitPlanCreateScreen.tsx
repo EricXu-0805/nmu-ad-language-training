@@ -14,7 +14,7 @@ import type {
 } from "../types";
 import { LatestVisitPlanHistoryRequest, PendingVisitPlanCommandKeys } from "../visitPlans";
 import { DataBoundaryBadge } from "./DataBoundaryFilter";
-import { assessVisitPlanProtocol } from "./protocolAdmission";
+import { assessVisitPlanProtocol, type TrainingContentStatus } from "./protocolAdmission";
 
 const WEEK_ONE_PHASES = ["关系建立", "基线测评", "前测"] as const;
 const CANCEL_REASONS: VisitPlanCancelReason[] = [
@@ -209,8 +209,8 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   const [phase, setPhase] = useState<PhaseType>("正式训练");
   const [patientSimulation, setPatientSimulation] = useState<boolean | null>(null);
   const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
-  // 服务端权威题库质控信号(ready_for_research);null=尚未核对成功,真实分区 fail-closed。
-  const [researchReady, setResearchReady] = useState<boolean | null>(null);
+  // 服务端权威逐周题库信号(structured/ready_for_research);null=尚未核对成功,fail-closed。
+  const [contentStatus, setContentStatus] = useState<TrainingContentStatus | null>(null);
   const [readinessError, setReadinessError] = useState<string | null>(null);
   const [plans, setPlans] = useState<VisitPlanReceipt[] | null>(null);
   const [historyState, setHistoryState] = useState<HistoryState>("loading");
@@ -272,14 +272,22 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
 
   useEffect(() => {
     let active = true;
-    setResearchReady(null);
+    setContentStatus(null);
     setReadinessError(null);
     api.itemBank().then((info) => {
-      if (active) setResearchReady(info.ready_for_research === true);
+      if (!active) return;
+      const weekContent = info.training_week_content ?? {};
+      const structuredWeeks = Object.keys(weekContent)
+        .map(Number).filter(Number.isInteger).sort((a, b) => a - b);
+      setContentStatus({
+        structuredWeeks,
+        researchReadyWeeks: structuredWeeks.filter(
+          (week) => weekContent[String(week)]?.ready_for_research === true),
+      });
     }).catch((error) => {
       if (!active) return;
       setReadinessError(errorText(error));
-      setResearchReady(null);
+      setContentStatus(null);
     });
     return () => { active = false; };
   }, []);
@@ -337,7 +345,8 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   async function create(approveImmediately: boolean) {
     if (!canManage || busy || actionPlanId || historyState !== "fresh") return;
     if (!scheduledDate) { toast("请选择训练日期", "warn"); return; }
-    if (!currentAdmission.allowed) {
+    // 草稿镜像服务端 create(只验蓝图事件线);「保存并审核」镜像 approve 门禁。
+    if (approveImmediately ? !currentAdmission.allowed : !currentAdmission.draftAllowed) {
       toast(currentAdmission.reason ?? "当前协议组合未开放", "danger");
       return;
     }
@@ -377,7 +386,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   async function approve(plan: VisitPlanReceipt) {
     if (!canManage || busy || actionPlanId || historyState !== "fresh") return;
     const admission = assessVisitPlanProtocol(
-      plan.week_no, plan.phase_type, plan.event_line, plan.is_simulation, researchReady,
+      plan.week_no, plan.phase_type, plan.event_line, plan.is_simulation, contentStatus,
     );
     if (!admission.allowed) {
       toast(admission.reason ?? "当前协议组合未开放", "danger");
@@ -430,7 +439,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
 
   const eventLine = eventLineFor(weekNo, normalizePhase(weekNo));
   const currentAdmission = assessVisitPlanProtocol(
-    weekNo, normalizePhase(weekNo), eventLine, patientSimulation, researchReady,
+    weekNo, normalizePhase(weekNo), eventLine, patientSimulation, contentStatus,
   );
   const historyFresh = historyState === "fresh";
   const historyLocked = !historyFresh;
@@ -462,9 +471,9 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
           {patientLoadError}。核对成功前不能保存或审核训练安排。
         </Alert>
       )}
-      {readinessError && patientSimulation === false && (
-        <Alert tone="danger" title="题库质控状态核对失败">
-          {readinessError}。真实研究安排在核对成功前保持关闭；专用模拟路径不受影响。
+      {readinessError && (
+        <Alert tone="danger" title="题库结构化/质控状态核对失败">
+          {readinessError}。核对成功前所有分区的安排都不能审核；排期草稿仍可保存。
         </Alert>
       )}
 
@@ -516,13 +525,18 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
               <TextInput value={eventLine} readOnly aria-readonly />
             </Field>
           </div>
-          {!currentAdmission.allowed && (
+          {!currentAdmission.allowed && !currentAdmission.draftAllowed && (
             <Alert tone="danger" title="当前协议组合尚不能安排">
               {currentAdmission.reason}系统已在保存前禁用安排，不会等到审核或老人到场后才报错。
             </Alert>
           )}
+          {!currentAdmission.allowed && currentAdmission.draftAllowed && (
+            <Alert tone="warn" title="只能先保存排期草稿">
+              {currentAdmission.reason}草稿不占用审核结论；条件满足后再在下方列表审核。
+            </Alert>
+          )}
           {currentAdmission.allowed && patientSimulation === true && (
-            <Alert tone="warn" title="仅限第 2 周专用模拟验收">
+            <Alert tone="warn" title="专用模拟验收路径">
               这条路径只能使用合成数据与专用模拟档案，不得录入真实患者、老人或受试者数据。
             </Alert>
           )}
@@ -532,8 +546,8 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
             </Alert>
           )}
           <div className="form-actions">
-            <p className="muted grow">只有已实现独立完成合同且通过数据分区门禁的组合才能保存；“保存并审核通过”会进入对应日期的训练队列。</p>
-            <Button disabled={!canManage || mutationBusy || historyLocked || !currentAdmission.allowed} onClick={() => { void create(false); }}>
+            <p className="muted grow">蓝图内的组合都可留排期草稿；“保存并审核通过”只对已实现独立完成合同且通过数据分区门禁的组合开放。</p>
+            <Button disabled={!canManage || mutationBusy || historyLocked || !currentAdmission.draftAllowed} onClick={() => { void create(false); }}>
               {busy ? "正在保存…" : "保存草稿"}
             </Button>
             <Button variant="primary" disabled={!canManage || mutationBusy || historyLocked || !currentAdmission.allowed} onClick={() => { void create(true); }}>
@@ -564,7 +578,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
           {plans?.map((plan) => {
             const status = statusMeta(plan.status);
             const admission = assessVisitPlanProtocol(
-              plan.week_no, plan.phase_type, plan.event_line, plan.is_simulation, researchReady,
+              plan.week_no, plan.phase_type, plan.event_line, plan.is_simulation, contentStatus,
             );
             return (
               <div className="visit-plan-row" key={plan.plan_id}>

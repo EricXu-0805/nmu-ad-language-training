@@ -97,8 +97,25 @@ def _protocol_slot_key(body: VisitPlanCreateIn) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _load_bank() -> content.ItemBank:
-    return content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+def _bank_week_for(week_no: int) -> int:
+    """周 1 关系建立不消耗题库，版本绑定锚定平台默认题库（周 2）。"""
+    return week_no if week_no >= 2 else content.RAPPORT_ANCHOR_WEEK
+
+
+def _load_bank(week_no: int, *, allow_draft_anchor: bool = False) -> content.ItemBank:
+    """Load the bank for one plan's week; the per-week bank is its frozen 训练计划.
+
+    ``allow_draft_anchor`` keeps the deliberate draft/approve split: scheduling
+    facts for a not-yet-structured week may still be drafted (anchored to the
+    platform default bank), but approve/start never falls back — the missing
+    week surfaces as the honest content blocker.
+    """
+    try:
+        return content.load_item_bank_for_week(_bank_week_for(week_no))
+    except content.TrainingWeekContentUnavailable as exc:
+        if allow_draft_anchor:
+            return content.load_item_bank_for_week(content.RAPPORT_ANCHOR_WEEK)
+        _fail(409, "visit_plan_content_unavailable", str(exc))
 
 
 def _load_protocol() -> dict:
@@ -221,7 +238,10 @@ def _resolved_request_profile(version_id: str | None):
     """
     if version_id is None:
         return None, None, None
-    bank, protocol, binding = _current_definition_bundle()
+    # Demo plan profiles are Week-2-typed by schema literal; resolve them
+    # against the Week-2 canonical bundle, then the profile context assert
+    # rejects any non-Week-2 request explicitly.
+    bank, protocol, binding = _current_definition_bundle(2)
     try:
         definition = autopilot_plan_profiles.resolve_requested_definition(
             version_id, bank=bank, protocol=protocol)
@@ -392,8 +412,9 @@ class _DefinitionBinding:
 
 
 def _current_definition_bundle(
+    week_no: int, *, allow_draft_anchor: bool = False,
 ) -> tuple[content.ItemBank, dict, _DefinitionBinding]:
-    bank = _load_bank()
+    bank = _load_bank(week_no, allow_draft_anchor=allow_draft_anchor)
     protocol = _load_protocol()
     protocol_issues = content.validate_autopilot_protocol(protocol)
     if protocol_issues:
@@ -433,7 +454,8 @@ def _assert_plan_definition_binding(
         _fail(
             409,
             "visit_plan_content_version_mismatch",
-            "训练安排绑定的题库版本与当前版本不一致",
+            "训练安排绑定的题库版本与当前版本不一致，须取消后按当前题库重建安排"
+            "（未结构化周的早期草稿锚定平台默认题库，该周材料登记后出现此提示属预期）",
         )
     if plan.item_bank_definition_digest != binding.item_bank_definition_digest:
         _fail(
@@ -734,7 +756,7 @@ def _existing_command(
         # current canonical bundle here would re-impose today's active
         # bank/protocol on a legitimately older demo binding.
         if _plan_profile_pair(plan) == (None, None):
-            _bank, _protocol, binding = _current_definition_bundle()
+            _bank, _protocol, binding = _current_definition_bundle(plan.week_no)
             _assert_plan_definition_binding(plan, binding)
         if command_type == "start":
             linked = _linked_session(db, plan.plan_id)
@@ -861,7 +883,8 @@ def create_plan(
             event_line=body.event_line,
         )
     else:
-        bank, _protocol, binding = _current_definition_bundle()
+        bank, _protocol, binding = _current_definition_bundle(
+            body.week_no, allow_draft_anchor=True)
     # Only now, with locked identity, subject, context and the final persisted
     # bundle all fixed, may an idempotent replay return success.
     replay = _existing_command(
@@ -1009,7 +1032,7 @@ def _revalidate_admission(db: Session, plan: VisitPlan) -> Patient:
             "visit_plan_protocol_unavailable",
             "；".join(operational_issues),
         )
-    bank, _protocol, binding = _current_definition_bundle()
+    bank, _protocol, binding = _current_definition_bundle(plan.week_no)
     _assert_plan_definition_binding(plan, binding)
     content_issues = session_admission.content_admission_issues(
         bank,
@@ -1361,11 +1384,23 @@ def today_queue(
     # row locks; this read filter is defence in depth and avoids touching the
     # append-only scheduling fact during the withdrawal transaction.
     admitted_rows: list[VisitPlan] = []
-    try:
-        bank, _protocol, binding = _current_definition_bundle()
-    except VisitPlanError:
-        return VisitPlanTodayOut(
-            as_of_date=current_date, plans=[], withheld_count=len(rows))
+    # 各周题库独立冻结：逐周解析一次并缓存；该周不可解析(未登记/损坏)时,
+    # 该周全部安排按防御性隐藏计入 withheld,不让坏内容进入床旁队列。
+    bundles_by_week: dict[
+        int, tuple[content.ItemBank, _DefinitionBinding] | None] = {}
+
+    def _bundle_for(week_no: int) -> tuple[content.ItemBank, _DefinitionBinding] | None:
+        key = _bank_week_for(week_no)
+        if key not in bundles_by_week:
+            try:
+                bank, _protocol, binding = _current_definition_bundle(key)
+                bundles_by_week[key] = (bank, binding)
+            except (VisitPlanError, content.FrozenContentUnavailable):
+                # 未登记或坏档都只隔离该周(withheld 计数),不让单周内容故障
+                # 以 503 掀翻整张床旁队列。approve/start 对坏档仍整体 503。
+                bundles_by_week[key] = None
+        return bundles_by_week[key]
+
     for plan in rows:
         patient = db.get(Patient, plan.patient_id)
         if patient is None:
@@ -1379,6 +1414,10 @@ def today_queue(
         if session_admission.visit_plan_operational_issues(
                 plan.week_no, plan.phase_type, plan.event_line):
             continue
+        bundle = _bundle_for(plan.week_no)
+        if bundle is None:
+            continue
+        bank, binding = bundle
         try:
             _assert_plan_definition_binding(plan, binding)
         except VisitPlanError:

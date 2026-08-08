@@ -605,7 +605,7 @@ def resolve_registered_binding(
 
 
 def _default_bank() -> content.ItemBank:
-    return content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    return content.load_item_bank_for_week(2)
 
 
 def _default_protocol() -> dict:

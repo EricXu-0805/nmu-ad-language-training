@@ -10,8 +10,8 @@ import { localToday, runQuickDrill, type QuickDrillClient } from "./quickDrill.t
 //   ④ 都没有 → 建新安排(create→approve→start 逐步走账本;协议槽位含 sitting,
 //      同人再次训练自动用下一个 sitting,不复用已占槽位)。
 // 任何一步被服务端拒绝(内容未冻结/未授权/探针过期…)都原样抛给调用方展示,
-// 不静默换路。当前唯一可开场垂直=第2周正式训练;真实研究档案会在审核关被
-// ready_for_research 门禁如实拦下。
+// 不静默换路。可开场垂直=第2-8周正式训练(逐周由服务端题库索引/质控裁决)与
+// 第1周关系建立;真实研究档案会在审核关被 ready_for_research 门禁如实拦下。
 
 export interface NextTaskClient extends QuickDrillClient {
   listPatientVisitPlans(patientId: string): Promise<VisitPlanReceipt[]>;
@@ -33,9 +33,12 @@ export interface NextTaskOptions {
 const OPEN_RUNTIME_STATUSES = new Set(["active", "paused", "intervention_completed"]);
 
 function inRunnableVertical(plan: VisitPlanReceipt): boolean {
-  return plan.week_no === 2
+  return (plan.week_no >= 2 && plan.week_no <= 8
     && plan.phase_type === "正式训练"
-    && plan.event_line === "正式训练";
+    && plan.event_line === "正式训练")
+    || (plan.week_no === 1
+      && plan.phase_type === "关系建立"
+      && plan.event_line === "关系建立环节");
 }
 
 export function pickOpenSession(sessions: Session[]): Session | null {

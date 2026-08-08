@@ -448,6 +448,25 @@ class _Week1ScriptSchema(_FrozenContentSchema):
             raise ValueError("section keys must be globally unique")
         return value
 
+    @field_validator("sections")
+    @classmethod
+    def _completion_contract_structure(
+        cls, value: list[_Week1SectionSchema]
+    ) -> list[_Week1SectionSchema]:
+        # 完成合同的结构前提在装载时就钉死:末节必须是机器人道别台词,
+        # 自我介绍节(直接身份红线的载体)必须存在。否则真实受试者会在
+        # 准入放行后被完成门禁永久卡死(rapport_script_invalid)。
+        last = value[-1]
+        if last.speaker != "机器人" or not (last.line or "").strip():
+            raise ValueError(
+                "last section must be the robot farewell line "
+                "(week-1 completion contract anchors it)")
+        if not any(section.key == "自我介绍" for section in value):
+            raise ValueError(
+                "自我介绍 section is required "
+                "(direct-identifier red line anchors it)")
+        return value
+
 
 class _Cue1SuccessSchema(_FrozenContentSchema):
     unknown: str = Field(min_length=1)
@@ -610,6 +629,87 @@ def load_item_bank(path: str | Path) -> ItemBank:
         raise
     except (OSError, TypeError, ValueError) as exc:
         raise FrozenContentUnavailable(str(exc)) from exc
+
+
+class TrainingWeekContentUnavailable(FrozenContentUnavailable):
+    """The requested training week has no registered structured bank yet."""
+
+    def __init__(self, week_no: int, message: str):
+        super().__init__(message)
+        self.week_no = week_no
+
+
+# 第 1 周关系建立不消耗训练题库；其场次/安排的题库版本绑定锚定平台默认题库
+# （周 2 数据包），仅作为内容一致性锚点，不参与关系建立呈现。
+RAPPORT_ANCHOR_WEEK = 2
+
+ITEM_BANK_INDEX_FILE = "item_bank_index.json"
+
+
+class _ItemBankIndexEntrySchema(_FrozenContentSchema):
+    week_no: int = Field(ge=2, le=8)
+    file: str = Field(min_length=1)
+
+    @field_validator("file")
+    @classmethod
+    def _plain_file_name(cls, value: str) -> str:
+        if "/" in value or "\\" in value or value.startswith("."):
+            raise ValueError("index file entries must be plain content file names")
+        return value
+
+
+class _ItemBankIndexSchema(_FrozenContentSchema):
+    schema_version: Literal["item-bank-index.v1"]
+    note: str | None = None
+    banks: list[_ItemBankIndexEntrySchema] = Field(min_length=1)
+
+    @field_validator("banks")
+    @classmethod
+    def _weeks_are_unique(
+        cls, value: list[_ItemBankIndexEntrySchema]
+    ) -> list[_ItemBankIndexEntrySchema]:
+        weeks = [entry.week_no for entry in value]
+        if len(set(weeks)) != len(weeks):
+            raise ValueError("index weeks must be unique")
+        return value
+
+
+def load_item_bank_index(content_dir: str | Path | None = None) -> dict[int, str]:
+    """Return the frozen week→bank-file map; fail-closed on any defect."""
+    base = Path(content_dir) if content_dir is not None else CONTENT_DIR
+    try:
+        data = _load_strict_json_object(
+            base / ITEM_BANK_INDEX_FILE, label="题库索引")
+        index = _ItemBankIndexSchema.model_validate(data)
+    except FrozenContentUnavailable:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise FrozenContentUnavailable(f"题库索引不可用：{exc}") from exc
+    return {entry.week_no: entry.file for entry in index.banks}
+
+
+def load_item_bank_for_week(
+    week_no: int, content_dir: str | Path | None = None
+) -> ItemBank:
+    """Load the structured bank registered for one training week.
+
+    每个训练周的「冻结训练计划」载体就是该周的题库数据包文件本身：内容团队
+    交付某周材料并在索引登记后，该周即可被解析；未登记的周 fail-closed。
+    """
+    base = Path(content_dir) if content_dir is not None else CONTENT_DIR
+    week_files = load_item_bank_index(base)
+    file_name = week_files.get(week_no)
+    if file_name is None:
+        raise TrainingWeekContentUnavailable(
+            week_no, f"第{week_no}周材料尚未结构化并校对：题库索引未登记该周")
+    bank = load_item_bank(base / file_name)
+    declared_week = bank.meta.get("training_week_no")
+    if declared_week != week_no or week_no not in bank.supported_training_weeks:
+        raise FrozenContentUnavailable(
+            f"题库索引第{week_no}周条目与数据包声明周次不一致"
+            f"（training_week_no={declared_week}，"
+            f"supported={list(bank.supported_training_weeks)}）")
+    return bank
 
 
 def load_week1_script(path: str | Path) -> dict:

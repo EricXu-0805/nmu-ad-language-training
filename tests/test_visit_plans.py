@@ -583,11 +583,11 @@ def test_demo_create_reads_the_bundle_exactly_twice(visit_clients,
     real = visit_plan_service._current_definition_bundle
     reads = {"n": 0}
 
-    def counted():
+    def counted(*args, **kwargs):
         reads["n"] += 1
         if reads["n"] > 2:
             raise AssertionError("third canonical bundle read")
-        return real()
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(
         visit_plan_service, "_current_definition_bundle", counted)
@@ -609,9 +609,9 @@ def test_canonical_create_reads_the_bundle_exactly_once(visit_clients,
     real = visit_plan_service._current_definition_bundle
     reads = {"n": 0}
 
-    def counted():
+    def counted(*args, **kwargs):
         reads["n"] += 1
-        return real()
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(
         visit_plan_service, "_current_definition_bundle", counted)
@@ -1739,26 +1739,23 @@ def test_started_plan_list_conceals_session_binding_from_non_owner(
     assert all(row["started_by"] is None for row in today_rows)
 
 
-@pytest.mark.parametrize(("patient_id", "overrides", "reason"), [
-    (
-        "P-VISIT-08",
-        {"week_no": 1, "phase_type": "关系建立", "event_line": "关系建立环节"},
-        "独立完成合同",
-    ),
+@pytest.mark.parametrize(("patient_id", "overrides", "code", "reason"), [
     (
         "P-VISIT-09",
         {"week_no": 1, "phase_type": "前测", "event_line": "基线测评窗"},
-        "前测",
+        "visit_plan_protocol_unavailable",
+        "正式量表评估事件工作流",
     ),
     (
         "P-VISIT-10",
         {"week_no": 3, "phase_type": "正式训练", "event_line": "正式训练"},
-        "冻结训练计划",
+        "visit_plan_content_unavailable",
+        "第3周材料尚未结构化",
     ),
 ])
 def test_unsupported_protocol_may_be_drafted_but_cannot_be_approved(
         visit_clients: VisitClients, patient_id: str,
-        overrides: dict, reason: str):
+        overrides: dict, code: str, reason: str):
     created = _create(
         visit_clients.researcher,
         patient_id,
@@ -1775,7 +1772,7 @@ def test_unsupported_protocol_may_be_drafted_but_cannot_be_approved(
     )
 
     assert denied.status_code == 409, denied.text
-    assert denied.json()["detail"]["code"] == "visit_plan_protocol_unavailable"
+    assert denied.json()["detail"]["code"] == code
     assert reason in denied.json()["detail"]["message"]
     with Session(visit_clients.engine) as session:
         plan = session.get(VisitPlan, created["plan_id"])
@@ -1783,6 +1780,43 @@ def test_unsupported_protocol_may_be_drafted_but_cannot_be_approved(
         assert plan.status == "draft"
         assert plan.revision == 1
         assert _linked_session_for_test(session, created["plan_id"]) is None
+
+
+def test_week1_rapport_plan_approves_and_starts_a_rapport_session(
+        visit_clients: VisitClients):
+    """签字即通同款:关系建立有了独立完成合同后,准入闸门放行整条直线。"""
+    created = _create(
+        visit_clients.researcher,
+        "P-VISIT-08",
+        "create-week1-rapport-01",
+        week_no=1,
+        phase_type="关系建立",
+        event_line="关系建立环节",
+    )
+    approved = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        "approve",
+        key="approve-week1-rapport-01",
+        expected_revision=created["revision"],
+    )
+    assert approved.status_code == 200, approved.text
+    started = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        "start",
+        key="start-week1-rapport-01",
+        expected_revision=approved.json()["revision"],
+    )
+    assert started.status_code == 200, started.text
+    with Session(visit_clients.engine) as session:
+        linked = _linked_session_for_test(session, created["plan_id"])
+        assert linked is not None
+        assert linked.week_no == 1
+        assert getattr(linked.phase_type, "value", linked.phase_type) == "关系建立"
+        assert getattr(linked.event_line, "value", linked.event_line) == "关系建立环节"
+        # 关系建立不消耗题库,但版本绑定锚定平台默认题库保持内容一致性。
+        assert linked.item_bank_version_id == BANK.version_id
 
 
 def _linked_session_for_test(session: Session, plan_id: str) -> TrainSession | None:
@@ -1831,7 +1865,7 @@ def test_start_revalidates_protocol_even_for_a_legacy_approved_plan(
     )
 
     assert denied.status_code == 409, denied.text
-    assert denied.json()["detail"]["code"] == "visit_plan_protocol_unavailable"
+    assert denied.json()["detail"]["code"] == "visit_plan_content_unavailable"
     with Session(visit_clients.engine) as session:
         assert _linked_session_for_test(session, created["plan_id"]) is None
 
@@ -3971,3 +4005,63 @@ def test_visit_plan_command_ledger_rejects_orm_update_and_delete(
         command = session.get(VisitPlanCommand, command_id)
         assert command is not None
         assert command.request_hash == original_hash
+
+
+def test_week3_unlocks_with_content_files_alone(
+        visit_clients: VisitClients, monkeypatch, tmp_path):
+    """零代码开闸证明(收据 148 D2):把第 3 周数据包放进内容目录并登记索引,
+    不改任何代码,第 3 周模拟安排即可 create→approve→start 全链走通。"""
+    import shutil
+
+    staged = tmp_path / "content-unlock"
+    shutil.copytree(content.CONTENT_DIR, staged)
+    bank_data = json.loads(
+        (staged / "item_bank_v1.json").read_text(encoding="utf-8"))
+    bank_data["item_bank_version_id"] = "wk3-synth-v1"
+    bank_data["training_week_no"] = 3
+    bank_data["supported_training_weeks"] = [3]
+    (staged / "item_bank_wk3_synth.json").write_text(
+        json.dumps(bank_data, ensure_ascii=False), encoding="utf-8")
+    index = json.loads(
+        (staged / content.ITEM_BANK_INDEX_FILE).read_text(encoding="utf-8"))
+    index["banks"].append({"week_no": 3, "file": "item_bank_wk3_synth.json"})
+    (staged / content.ITEM_BANK_INDEX_FILE).write_text(
+        json.dumps(index, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(content, "CONTENT_DIR", staged)
+
+    created = _create(
+        visit_clients.researcher,
+        "P-VISIT-10",
+        "create-week3-unlock-01",
+        week_no=3,
+        phase_type="正式训练",
+        event_line="正式训练",
+    )
+    assert created["item_bank_version_id"] == "wk3-synth-v1"
+    approved = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key="approve-week3-unlock-01",
+        expected_revision=created["revision"])
+    assert approved.status_code == 200, approved.text
+    started = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key="start-week3-unlock-01",
+        expected_revision=approved.json()["revision"])
+    assert started.status_code == 200, started.text
+    with Session(visit_clients.engine) as session:
+        linked = _linked_session_for_test(session, created["plan_id"])
+        assert linked is not None
+        assert linked.week_no == 3
+        assert linked.item_bank_version_id == "wk3-synth-v1"
+
+    # 未登记的第 4 周仍被内容闸门如实拒绝。
+    still_blocked = _create(
+        visit_clients.researcher, "P-VISIT-09", "create-week4-blocked-01",
+        week_no=4, phase_type="正式训练", event_line="正式训练")
+    denied = _command(
+        visit_clients.researcher, still_blocked["plan_id"], "approve",
+        key="approve-week4-blocked-01",
+        expected_revision=still_blocked["revision"])
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "visit_plan_content_unavailable"
+    assert "第4周材料尚未结构化" in denied.json()["detail"]["message"]

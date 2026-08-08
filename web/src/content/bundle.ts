@@ -79,7 +79,7 @@ export type FbKey =
   | "self" | "cued1_unknown" | "cued1_close" | "cued1_silence"
   | "cued2" | "namefix_l" | "namefix_r";
 
-let bankCache: ItemBankBundle | null = null;
+const bankCacheByWeek = new Map<number, ItemBankBundle>();
 let scriptCache: Week1Script | null = null;
 let protocolCache: AutopilotProtocol | null = null;
 
@@ -93,15 +93,23 @@ async function fetchJson<T>(url: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-export function useItemBankBundle(): { bundle: ItemBankBundle | null; error: string | null } {
-  const [bundle, setBundle] = useState<ItemBankBundle | null>(bankCache);
+export function useItemBankBundle(week: number = 2): { bundle: ItemBankBundle | null; error: string | null } {
+  const [bundle, setBundle] = useState<ItemBankBundle | null>(bankCacheByWeek.get(week) ?? null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    if (bankCache) return;
-    fetchJson<ItemBankBundle>("/content/item-bank-bundle")
-      .then((b) => { bankCache = b; setBundle(b); })
-      .catch((e) => setError(String(e)));
-  }, []);
+    const cached = bankCacheByWeek.get(week) ?? null;
+    setBundle(cached);
+    setError(null);
+    if (cached) return;
+    let active = true;
+    fetchJson<ItemBankBundle>(`/content/item-bank-bundle?week=${week}`)
+      .then((b) => {
+        bankCacheByWeek.set(week, b);
+        if (active) setBundle(b);
+      })
+      .catch((e) => { if (active) setError(String(e)); });
+    return () => { active = false; };
+  }, [week]);
   return { bundle, error };
 }
 

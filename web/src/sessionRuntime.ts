@@ -144,6 +144,23 @@ function parseAssessment(
 ): void {
   const countKey = kind === "intervention" ? "completed_attempt_turns" : "locked_turns";
   const row = record(value);
+  if (row?.protocol === "rapport") {
+    // 第 1 周关系建立成功回执:停在道别、录音收回、全部录音通过核验、零阻断。
+    if (!exactKeys(row, [
+      "ready", "protocol", "at_farewell", "recording_idle",
+      "audio_total", "audio_verified", "issues",
+    ])
+        || row.ready !== true
+        || row.at_farewell !== true
+        || row.recording_idle !== true
+        || !nonNegativeInteger(row.audio_total)
+        || !nonNegativeInteger(row.audio_verified)
+        || row.audio_verified !== row.audio_total
+        || !Array.isArray(row.issues) || row.issues.length !== 0) {
+      throw new Error("服务端关系建立完成门禁响应与成功状态矛盾");
+    }
+    return;
+  }
   const keys = [
     "ready", "expected_turns", "matched_turns", countKey, "audio_evidenced_turns", "issues",
   ];

@@ -16,6 +16,7 @@ import {
   type WrapupMode,
 } from "../sessionLifecycle";
 import { useAudioSaved } from "../sync/useCursorWriter";
+import { useWeek1Script } from "../content/bundle";
 import type {
   AudioAsset,
   ExportResult,
@@ -222,11 +223,25 @@ export function SessionWrapupScreen({
   const audioIds = Object.keys(journal.audios);
   const untouched = (plan?.items ?? []).filter((item) => !journal.itemEvents[item.item_id]);
   const completionPct = totalTurns > 0 ? Math.round((lockedTurns / totalTurns) * 100) : null;
+  // 第 1 周关系建立:本地只镜像「停在道别节」;道别节键取冻结脚本最后一节。
+  const { script: week1Script, error: week1ScriptError } = useWeek1Script();
+  const farewellKey = week1Script?.sections.length
+    ? week1Script.sections[week1Script.sections.length - 1].key
+    : null;
+  const rapportStep = currentRuntime?.rapportStep ?? null;
+  const rapportStatus = session.week_no !== 1 ? undefined
+    : (farewellKey && rapportStep
+      ? {
+        atFarewell: rapportStep.sectionKey === farewellKey
+          && (rapportStep.questionIdx ?? 0) === 0,
+      }
+      : null);
   const interventionGate = localInterventionCompletionGate({
     journalReady,
     planReady,
     weekNo: session.week_no,
     totalTurns,
+    rapport: rapportStatus,
   });
   const completionGate = localCompletionGate({
     journalReady,
@@ -234,6 +249,7 @@ export function SessionWrapupScreen({
     weekNo: session.week_no,
     lockedTurns,
     totalTurns,
+    rapport: rapportStatus,
   });
   const exportAllowed = currentRuntime != null && !runtimeControl.error && canExportCompletedSession({
     status: currentRuntime.status,
@@ -473,8 +489,13 @@ export function SessionWrapupScreen({
       )}
 
       {session.week_no === 1 && (
-        <Alert tone="warn" title="第 1 周关系建立完成口径尚未实现">
-          关系建立须独立核对脚本步骤、录音与退出条件；当前不会用空训练计划宣布床旁结束或最终完成。
+        <Alert tone="info" title="第 1 周关系建立独立完成口径">
+          本场按关系建立合同收口：停在道别节、收回录音、录音红线核验、零评分行；不按训练计划核对环节。
+        </Alert>
+      )}
+      {session.week_no === 1 && week1ScriptError && (
+        <Alert tone="danger" title="第 1 周脚本核对失败">
+          {week1ScriptError}。道别位置无法本地核对，完成入口保持关闭；请刷新页面重试。
         </Alert>
       )}
 
@@ -736,6 +757,14 @@ function CompletionFailureAlert({ failure, bedside }: { failure: CompletionFailu
       <p>{failure.message}</p>
       {failure.assessment && (
         <>
+          {failure.assessment.protocol === "rapport" ? (
+            <p>
+              服务器核对：{failure.assessment.atFarewell ? "已停在道别节" : "未停在道别节"}，
+              录音指令{failure.assessment.recordingIdle ? "已收回" : "未收回"}，
+              录音 {failure.assessment.audioTotal ?? "—"} 段中
+              {failure.assessment.audioVerified ?? "—"} 段通过核验。
+            </p>
+          ) : (
           <p>
             服务器核对：计划 {failure.assessment.expectedTurns ?? "—"} 个环节，
             匹配 {failure.assessment.matchedTurns ?? "—"} 个，
@@ -743,6 +772,7 @@ function CompletionFailureAlert({ failure, bedside }: { failure: CompletionFailu
             录音证据 {failure.assessment.audioEvidencedTurns ?? "—"} 个，
             人工锁定 {failure.assessment.lockedTurns ?? "—"} 个。
           </p>
+          )}
           {failure.assessment.issues.length > 0 && (
             <details>
               <summary style={{ cursor: "pointer", fontWeight: 600 }}>

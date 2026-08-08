@@ -447,8 +447,16 @@ def _suppressed_payload(
 def _plans_for_sessions(
     sessions: Sequence[TrainSession],
 ) -> tuple[dict[str, runtime.SessionPlan], set[str]]:
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
-    bank_digest = content.item_bank_definition_digest(bank)
+    banks_by_week: dict[int, tuple[content.ItemBank, str]] = {}
+
+    def _bank_for_week(week_no: int) -> tuple[content.ItemBank, str]:
+        key = week_no if week_no >= 2 else content.RAPPORT_ANCHOR_WEEK
+        if key not in banks_by_week:
+            bank = content.load_item_bank_for_week(key)
+            banks_by_week[key] = (
+                bank, content.item_bank_definition_digest(bank))
+        return banks_by_week[key]
+
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     if content.validate_autopilot_protocol(protocol):
@@ -459,6 +467,12 @@ def _plans_for_sessions(
     invalid: set[str] = set()
     expected_turns = 0
     for row in sessions:
+        try:
+            bank, bank_digest = _bank_for_week(row.week_no)
+        except content.TrainingWeekContentUnavailable:
+            # 该周未登记结构化题库:场次按证据无效计,不拖垮整个看板。
+            invalid.add(row.session_id)
+            continue
         if (
             row.item_bank_version_id != bank.version_id
             or row.item_bank_definition_digest != bank_digest

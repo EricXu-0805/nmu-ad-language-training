@@ -32,26 +32,67 @@ test("intervention completion waits for evidence loading but not human score loc
   }).canRequest, true);
 });
 
-test("intervention completion keeps empty and week-one plans closed", () => {
+test("intervention completion keeps empty plans closed for training weeks", () => {
   const common = { journalReady: true, planReady: true };
-  assert.equal(localInterventionCompletionGate({
-    ...common, weekNo: 1, totalTurns: 0,
-  }).canRequest, false);
   assert.equal(localInterventionCompletionGate({
     ...common, weekNo: 3, totalTurns: 0,
   }).canRequest, false);
 });
 
-test("week one cannot be falsely completed from an empty scoring plan", () => {
-  const gate = localCompletionGate({
-    journalReady: true,
-    planReady: true,
-    weekNo: 1,
-    lockedTurns: 0,
-    totalTurns: 0,
+test("week one follows the rapport farewell gate, never the empty scoring plan", () => {
+  const common = {
+    journalReady: true, planReady: true, weekNo: 1, lockedTurns: 0, totalTurns: 0,
+  };
+  // 位置未核对 → fail-closed。
+  const unknown = localCompletionGate({ ...common, rapport: null });
+  assert.equal(unknown.canRequest, false);
+  assert.match(unknown.label, /关系建立位置/);
+  assert.equal(localInterventionCompletionGate({
+    journalReady: true, planReady: true, weekNo: 1, totalTurns: 0, rapport: null,
+  }).canRequest, false);
+  // 未停在道别节 → 指路道别/中止,不放行。
+  const early = localCompletionGate({ ...common, rapport: { atFarewell: false } });
+  assert.equal(early.canRequest, false);
+  assert.match(early.label, /道别/);
+  assert.match(early.detail, /中止/);
+  // 停在道别节 → 可请求;服务端仍是权威。
+  const ready = localCompletionGate({ ...common, rapport: { atFarewell: true } });
+  assert.equal(ready.canRequest, true);
+  assert.match(ready.detail, /道别位置/);
+  assert.equal(localInterventionCompletionGate({
+    journalReady: true, planReady: true, weekNo: 1, totalTurns: 0,
+    rapport: { atFarewell: true },
+  }).canRequest, true);
+  // 记录未加载完成时仍先等加载。
+  assert.equal(localCompletionGate({
+    ...common, journalReady: false, rapport: { atFarewell: true },
+  }).canRequest, false);
+});
+
+test("rapport rejection surfaces the rapport-shaped server assessment", () => {
+  const failure = parseCompletionFailure({
+    detailData: {
+      message: "床旁干预结束门禁未通过；保持当前位置，不切换受试者",
+      assessment: {
+        ready: false,
+        protocol: "rapport",
+        at_farewell: false,
+        recording_idle: true,
+        audio_total: 3,
+        audio_verified: 3,
+        issues: [{
+          code: "rapport_not_at_farewell",
+          detail: "关系建立须停在道别节才能结束；请先播报道别话术",
+        }],
+      },
+    },
   });
-  assert.equal(gate.canRequest, false);
-  assert.match(gate.label, /关系建立/);
+  assert.equal(failure.assessment?.protocol, "rapport");
+  assert.equal(failure.assessment?.atFarewell, false);
+  assert.equal(failure.assessment?.recordingIdle, true);
+  assert.equal(failure.assessment?.audioTotal, 3);
+  assert.equal(failure.assessment?.audioVerified, 3);
+  assert.equal(failure.assessment?.issues[0]?.code, "rapport_not_at_farewell");
 });
 
 test("completion requires a positive plan and an exact locked-turn count", () => {

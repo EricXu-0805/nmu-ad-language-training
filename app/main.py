@@ -2512,7 +2512,12 @@ def create_session(sess: TrainSession, s: DBSession = Depends(get_session)):
     )
     if not allowed_context:
         raise HTTPException(422, "week_no / phase_type / event_line 组合不符合已定事件线")
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    bank_week = (sess.week_no if sess.week_no >= 2
+                 else content.RAPPORT_ANCHOR_WEEK)
+    try:
+        bank = content.load_item_bank_for_week(bank_week)
+    except content.TrainingWeekContentUnavailable as exc:
+        raise HTTPException(409, str(exc))
     if sess.item_bank_version_id != bank.version_id:
         raise HTTPException(409, f"场次版本 {sess.item_bank_version_id} 与当前题库 {bank.version_id} 不符")
     readiness = content.content_readiness(bank)
@@ -2602,10 +2607,12 @@ def _content_bundle_response(request: Request, payload: dict) -> Response:
     "/content/item-bank-bundle", methods=["GET", "HEAD"],
     include_in_schema=False,
 )
-def get_item_bank_bundle(request: Request):
+def get_item_bank_bundle(request: Request, week: int = 2):
     _require_staff_content_bundle_access(request)
+    if not 2 <= week <= 8:
+        raise HTTPException(422, "week 必须在 2..8")
     try:
-        bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+        bank = content.load_item_bank_for_week(week)
         if content.validate_item_bank(bank)["errors"]:
             _content_bundle_unavailable()
     except HTTPException:
@@ -2652,7 +2659,9 @@ def get_autopilot_protocol_bundle(request: Request):
 
 @app.get("/content/item-bank")
 def get_item_bank():
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    # 就绪探针保持第 2 周语义(P0a 自动化验收探针);逐周结构化状态由
+    # structured_training_weeks / training_week_content 字段另行发布。
+    bank = content.load_item_bank_for_week(2)
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     readiness = content.content_readiness(bank)
@@ -2735,6 +2744,21 @@ def get_item_bank():
                 "code": exc.code,
                 "context": exc.context,
             }
+    # 逐周结构化状态:索引登记且可解析的周才进清单;坏周 fail-closed 不出现。
+    week_files = content.load_item_bank_index()
+    training_week_content: dict[str, dict[str, object]] = {}
+    for wk in sorted(week_files):
+        try:
+            week_bank = bank if wk == 2 else content.load_item_bank_for_week(wk)
+            week_readiness = (readiness if wk == 2
+                              else content.content_readiness(week_bank))
+        except ValueError:
+            continue
+        training_week_content[str(wk)] = {
+            "item_bank_version_id": week_bank.version_id,
+            "qc_status": week_bank.qc_status,
+            "ready_for_research": week_readiness["ready_for_research"],
+        }
     return {
         "version_id": bank.version_id,
         "item_bank_definition_digest": item_bank_digest,
@@ -2747,6 +2771,9 @@ def get_item_bank():
         "double_count": len(bank.double_element),
         "multi_count": len(bank.multi_element),
         "supported_training_weeks": list(bank.supported_training_weeks),
+        "structured_training_weeks": sorted(
+            int(week) for week in training_week_content),
+        "training_week_content": training_week_content,
         "qc_status": bank.qc_status,
         "ready_for_research": readiness["ready_for_research"],
         "operational_autopilot_ready": (
@@ -5816,7 +5843,58 @@ def _verified_audio_ids_for_session(
     }
 
 
-def _assess_session_completion(sess: TrainSession, s: DBSession) -> tuple[runtime.SessionPlan, session_completion.CompletionAssessment]:
+def _assess_rapport_completion(
+        sess: TrainSession, s: DBSession,
+) -> tuple[runtime.SessionPlan, session_completion.RapportCompletionAssessment]:
+    """第 1 周关系建立的独立完成口径；床旁结束与最终完成共用同一证据判定。"""
+    plan = _session_plan_for_runtime(sess)
+    script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
+    state = s.exec(select(SessionRuntimeState).where(
+        SessionRuntimeState.session_id == sess.session_id)).first()
+    live = s.exec(select(LiveState).where(LiveState.id == 1)).first()
+    live_is_current = live is not None and _live_session_id(live) == sess.session_id
+    rapport_position = (_json_load(state.rapport_json) if state else None) or (
+        _json_load(live.rapport_json) if live_is_current and live else None)
+    # 耐久快照恒为 idle(_safe_rapport)；实时录音指令真值只在 live 槽仍属本场次时可读。
+    live_rapport = _json_load(live.rapport_json) if live_is_current and live else None
+    live_recording_state = (live_rapport or {}).get("recording")
+    # 老人端麦克风真值回报:设备报告仍在采集时,即使指令面已 idle 也不得收口。
+    live_patient_rec = (
+        _json_load(live.patient_rec_json) if live_is_current and live else None)
+    patient_rec_active = bool(
+        isinstance(live_patient_rec, dict)
+        and live_patient_rec.get("active") is True
+        and _payload_session_id(live_patient_rec) in (None, sess.session_id)
+    )
+    audios = list(s.exec(select(AudioAssetRow).where(
+        AudioAssetRow.session_id == sess.session_id)))
+    scoring_item_count = len(list(s.exec(select(ItemEvent.id).where(
+        ItemEvent.session_id == sess.session_id))))
+    attempt_count = len(list(s.exec(select(AttemptEvent.id).where(
+        AttemptEvent.session_id == sess.session_id))))
+    verified_audio_ids = _verified_audio_ids_for_session(sess, audios, s)
+    return plan, session_completion.assess_rapport_completion(
+        script,
+        rapport_position,
+        live_recording_state,
+        audios,
+        scoring_item_count,
+        session_id=sess.session_id,
+        is_simulation=sess.is_simulation,
+        data_classification=sess.data_classification,
+        blob_exists=lambda raw_audio_id: raw_audio_id in verified_audio_ids,
+        attempt_count=attempt_count,
+        patient_rec_active=patient_rec_active,
+        recording_truth_readable=live_is_current,
+    )
+
+
+def _assess_session_completion(sess: TrainSession, s: DBSession) -> tuple[
+        runtime.SessionPlan,
+        session_completion.CompletionAssessment
+        | session_completion.RapportCompletionAssessment]:
+    if sess.week_no == 1:
+        return _assess_rapport_completion(sess, s)
     plan = _session_plan_for_runtime(sess)
     items = list(s.exec(select(ItemEvent).where(ItemEvent.session_id == sess.session_id)))
     item_ids = [item.id for item in items if item.id is not None]
@@ -5838,7 +5916,12 @@ def _assess_session_completion(sess: TrainSession, s: DBSession) -> tuple[runtim
 
 def _assess_intervention_completion(
         sess: TrainSession, s: DBSession,
-) -> tuple[runtime.SessionPlan, session_completion.InterventionCompletionAssessment]:
+) -> tuple[
+        runtime.SessionPlan,
+        session_completion.InterventionCompletionAssessment
+        | session_completion.RapportCompletionAssessment]:
+    if sess.week_no == 1:
+        return _assess_rapport_completion(sess, s)
     plan = _session_plan_for_runtime(sess)
     items = list(s.exec(select(ItemEvent).where(ItemEvent.session_id == sess.session_id)))
     item_ids = [item.id for item in items if item.id is not None]
@@ -5865,7 +5948,8 @@ _OUTCOME_SUMMARY_GENERATOR_VERSION = "server-authoritative-closeout.v1"
 def _ensure_session_outcome_summary(
         sess: TrainSession,
         plan: runtime.SessionPlan,
-        assessment: session_completion.InterventionCompletionAssessment,
+        assessment: (session_completion.InterventionCompletionAssessment
+                     | session_completion.RapportCompletionAssessment),
         s: DBSession) -> SessionOutcomeSummary:
     """Persist the one immutable, text-free operational snapshot atomically."""
     if not assessment.ready:
@@ -6655,9 +6739,16 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
 # ---------------- M3 ASR(可插拔;默认 auto:有 Key 走云端 qwen3-asr,无则降级人工)----------------
 @app.get("/asr/hotwords")
 def asr_hotwords():
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
-    hw = asr.build_hotwords(bank, script)
+    # 热词并全部已结构化训练周:同一识别引擎服务所有周,词表取并集去重保序。
+    hw: list[str] = []
+    seen: set[str] = set()
+    for index, week in enumerate(sorted(content.load_item_bank_index())):
+        bank = content.load_item_bank_for_week(week)
+        for word in asr.build_hotwords(bank, script if index == 0 else None):
+            if word not in seen:
+                seen.add(word)
+                hw.append(word)
     return {"engine": asr.get_engine().version, "count": len(hw), "hotwords": hw}
 
 
@@ -7105,7 +7196,12 @@ def tts_speak_get_disabled():
 
 # ---------------- R 会话编排 + 逐环节录音/判分/锁分 ----------------
 def _load_bank_for_session(sess: TrainSession) -> content.ItemBank:
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    bank_week = (sess.week_no if sess.week_no >= 2
+                 else content.RAPPORT_ANCHOR_WEEK)
+    try:
+        bank = content.load_item_bank_for_week(bank_week)
+    except content.TrainingWeekContentUnavailable as exc:
+        raise HTTPException(409, str(exc))
     if sess.item_bank_version_id and bank.version_id != sess.item_bank_version_id:
         raise HTTPException(409, f"场次绑版本 {sess.item_bank_version_id} 与题库 {bank.version_id} 不符")
     return bank
@@ -8276,7 +8372,7 @@ def _classify_operational(*, item_id: str, response_role: str,
                           llm_engine: object | None = None,
                           cloud_llm_allowed: bool = False) -> dict:
     """可复用的自动驾判类：只产运行决策证据，不写 TurnEvent 研究真值。"""
-    bank = bank or content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    bank = bank or content.load_item_bank_for_week(2)
     found = _task_type_for_bank_item(bank, item_id)
     if not found:
         raise HTTPException(404, f"题库无此题:{item_id}")
@@ -11186,8 +11282,7 @@ def _run_legacy_repeat_recovery_worker(session_id: str) -> None:
                 resolved = (
                     autopilot_orchestration.verify_legacy_pre_repeat_recovery(
                         worker_db, session_id=session_id))
-                bank = content.load_item_bank(
-                    content.CONTENT_DIR / "item_bank_v1.json")
+                bank = content.load_item_bank_for_week(2)
                 blob = audio_store.find_blob(
                     resolved.target.attempt_input.raw_audio_id)
                 capture_claim = attempt_claim = None

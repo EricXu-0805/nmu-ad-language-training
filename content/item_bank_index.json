@@ -1,0 +1,7 @@
+{
+  "schema_version": "item-bank-index.v1",
+  "note": "训练周题库索引：每个训练周(2..8)一份结构化题库数据包。内容团队交付某周材料后，放入 content/ 并在此登记该周条目，运行时即可解析该周（真实研究仍受 qc_status=frozen 与零告警门禁约束）。未登记的周次一律 fail-closed。",
+  "banks": [
+    {"week_no": 2, "file": "item_bank_v1.json"}
+  ]
+}

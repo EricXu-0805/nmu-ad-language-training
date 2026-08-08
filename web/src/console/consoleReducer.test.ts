@@ -122,7 +122,7 @@ test("a structurally valid paired-set cached session is discarded entirely", () 
 
 test("terminal sessions enter wrapup while active sessions enter their live screen", () => {
   assert.equal(consoleReducer(initialConsole, { t: "sessionStarted", session: session("active") }).screen, "training");
-  assert.equal(consoleReducer(initialConsole, { t: "sessionStarted", session: session("paused", 1) }).screen, "unsupported");
+  assert.equal(consoleReducer(initialConsole, { t: "sessionStarted", session: session("paused", 1) }).screen, "relationship");
   assert.equal(consoleReducer(initialConsole, { t: "sessionStarted", session: session("intervention_completed") }).screen, "wrapup");
   assert.equal(consoleReducer(initialConsole, { t: "sessionStarted", session: session("completed") }).screen, "wrapup");
 });

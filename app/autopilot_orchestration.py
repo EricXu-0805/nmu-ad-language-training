@@ -246,7 +246,7 @@ def derive_authoritative_attempt_input(
         autopilot_service._utc_naive(now)  # noqa: SLF001 - sibling domain clock
         if now is not None else autopilot_service._utc_now_naive()  # noqa: SLF001
     )
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    bank = content.load_item_bank_for_week(2)
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     _state, record = _lock_pending_command(db, session_id=session_id)
@@ -831,7 +831,7 @@ def verify_legacy_pre_repeat_recovery(
     # Frozen content identity is recomputed from the deployed definitions and
     # compared to every stored binding; comparing the stored rows only to each
     # other would accept a chain frozen against content that no longer exists.
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    bank = content.load_item_bank_for_week(2)
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     live_content = {

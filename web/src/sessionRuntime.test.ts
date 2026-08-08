@@ -142,3 +142,51 @@ test("runtime parser validates successful lifecycle assessment receipts before d
     },
   }), SID), /成功状态矛盾/);
 });
+
+test("runtime parser accepts the week-1 rapport success receipt and stays strict", () => {
+  const rapportSuccess = {
+    ready: true,
+    protocol: "rapport",
+    at_farewell: true,
+    recording_idle: true,
+    audio_total: 3,
+    audio_verified: 3,
+    issues: [],
+  };
+  const intervention = parseSessionRuntimeState(runtime({
+    status: "intervention_completed",
+    revision: 2,
+    interventionCompletedAt: "2026-07-19T01:02:00",
+    interventionEndedBy: "R-1",
+    interventionAssessment: rapportSuccess,
+  }), SID);
+  assert.equal(intervention.status, "intervention_completed");
+
+  const completed = parseSessionRuntimeState(runtime({
+    status: "completed",
+    revision: 3,
+    interventionCompletedAt: "2026-07-19T01:02:00",
+    interventionEndedBy: "R-1",
+    completedAt: "2026-07-19T01:03:00",
+    endedBy: "R-2",
+    endReason: "completion_gate_passed",
+    completionAssessment: rapportSuccess,
+  }), SID);
+  assert.equal(completed.status, "completed");
+
+  // ready=true 却未停道别/未收麦/核验数不齐 → 拒绝。
+  for (const broken of [
+    { ...rapportSuccess, at_farewell: false },
+    { ...rapportSuccess, recording_idle: false },
+    { ...rapportSuccess, audio_verified: 2 },
+    { ...rapportSuccess, issues: [{ code: "x", detail: "y", item_id: null, turn_seq: null, response_role: null }] },
+  ]) {
+    assert.throws(() => parseSessionRuntimeState(runtime({
+      status: "intervention_completed",
+      revision: 2,
+      interventionCompletedAt: "2026-07-19T01:02:00",
+      interventionEndedBy: "R-1",
+      interventionAssessment: broken,
+    }), SID), /关系建立完成门禁响应与成功状态矛盾/);
+  }
+});

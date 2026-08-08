@@ -1,9 +1,15 @@
+/** 第 1 周关系建立的本地门禁输入;null=位置尚未核对成功(fail-closed)。 */
+export interface RapportGateStatus {
+  atFarewell: boolean;
+}
+
 export interface LocalCompletionGateInput {
   journalReady: boolean;
   planReady: boolean;
   weekNo: number;
   lockedTurns: number;
   totalTurns: number;
+  rapport?: RapportGateStatus | null;
 }
 
 export interface LocalCompletionGate {
@@ -17,6 +23,31 @@ export interface LocalInterventionCompletionGateInput {
   planReady: boolean;
   weekNo: number;
   totalTurns: number;
+  rapport?: RapportGateStatus | null;
+}
+
+// 服务端仍是权威:这里只镜像「停在道别节」这一个可见事实;录音指令收回与
+// 音频/评分行核验由服务端完成判定(rapport_* issue)如实回显。
+function rapportGate(rapport: RapportGateStatus | null | undefined): LocalCompletionGate {
+  if (!rapport) {
+    return {
+      canRequest: false,
+      label: "正在核对关系建立位置",
+      detail: "第 1 周须先核对服务端关系建立位置与冻结脚本，才能请求结束。",
+    };
+  }
+  if (!rapport.atFarewell) {
+    return {
+      canRequest: false,
+      label: "须先播报道别话术",
+      detail: "关系建立须停在道别节才能结束本场；提前结束请使用中止流程。",
+    };
+  }
+  return {
+    canRequest: true,
+    label: "可请求服务器完成核验",
+    detail: "服务器会核对道别位置、录音指令收回、录音红线标记与零评分行后才宣布结束。",
+  };
 }
 
 export interface CompletionIssueView {
@@ -29,11 +60,16 @@ export interface CompletionIssueView {
 
 export interface CompletionAssessmentView {
   ready: boolean;
+  protocol?: "rapport";
   expectedTurns?: number;
   matchedTurns?: number;
   lockedTurns?: number;
   completedAttemptTurns?: number;
   audioEvidencedTurns?: number;
+  atFarewell?: boolean;
+  recordingIdle?: boolean;
+  audioTotal?: number;
+  audioVerified?: number;
   issues: CompletionIssueView[];
 }
 
@@ -74,6 +110,7 @@ export function localCompletionGate({
   weekNo,
   lockedTurns,
   totalTurns,
+  rapport,
 }: LocalCompletionGateInput): LocalCompletionGate {
   if (!journalReady || !planReady) {
     return {
@@ -83,11 +120,7 @@ export function localCompletionGate({
     };
   }
   if (weekNo === 1) {
-    return {
-      canRequest: false,
-      label: "关系建立完成口径待实现",
-      detail: "第 1 周不能按空训练计划自动完成；须先实现关系建立脚本、录音与退出条件的独立完成口径。",
-    };
+    return rapportGate(rapport);
   }
   if (totalTurns <= 0) {
     return {
@@ -122,6 +155,7 @@ export function localInterventionCompletionGate({
   planReady,
   weekNo,
   totalTurns,
+  rapport,
 }: LocalInterventionCompletionGateInput): LocalCompletionGate {
   if (!journalReady || !planReady) {
     return {
@@ -131,11 +165,7 @@ export function localInterventionCompletionGate({
     };
   }
   if (weekNo === 1) {
-    return {
-      canRequest: false,
-      label: "关系建立结束口径待实现",
-      detail: "第 1 周须先建立独立的脚本步骤、录音与退出条件，不能用空训练计划宣布结束。",
-    };
+    return rapportGate(rapport);
   }
   if (totalTurns <= 0) {
     return {
@@ -175,15 +205,21 @@ function parseAssessment(value: unknown): CompletionAssessmentView | undefined {
   const hasAssessmentShape = "ready" in assessment
     || "expected_turns" in assessment
     || "locked_turns" in assessment
+    || "at_farewell" in assessment
     || "issues" in assessment;
   if (!hasAssessmentShape) return undefined;
   return {
     ready: assessment.ready === true,
+    protocol: assessment.protocol === "rapport" ? "rapport" : undefined,
     expectedTurns: finiteNumber(assessment.expected_turns),
     matchedTurns: finiteNumber(assessment.matched_turns),
     lockedTurns: finiteNumber(assessment.locked_turns),
     completedAttemptTurns: finiteNumber(assessment.completed_attempt_turns),
     audioEvidencedTurns: finiteNumber(assessment.audio_evidenced_turns),
+    atFarewell: typeof assessment.at_farewell === "boolean" ? assessment.at_farewell : undefined,
+    recordingIdle: typeof assessment.recording_idle === "boolean" ? assessment.recording_idle : undefined,
+    audioTotal: finiteNumber(assessment.audio_total),
+    audioVerified: finiteNumber(assessment.audio_verified),
     issues,
   };
 }

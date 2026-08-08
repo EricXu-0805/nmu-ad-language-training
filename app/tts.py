@@ -615,18 +615,34 @@ def cloud_text_allowed(text: str) -> bool:
     """红线守卫:白名单加载失败/文本不在集合 → False(fail-closed,云端一个字都不发)。"""
     global _allow_cache
     from . import content
-    paths = [content.CONTENT_DIR / "item_bank_v1.json",
-             content.CONTENT_DIR / "week1_script.json",
-             content.CONTENT_DIR / "autopilot_protocol_v1.json"]
     try:
         with _allow_lock:
-            stats = [p.stat() for p in paths]
-            key = tuple(x for st in stats for x in (st.st_mtime_ns, st.st_size))
+            week_files = content.load_item_bank_index()
+            paths = [content.CONTENT_DIR / content.ITEM_BANK_INDEX_FILE,
+                     content.CONTENT_DIR / "week1_script.json",
+                     content.CONTENT_DIR / "autopilot_protocol_v1.json"]
+            paths += [content.CONTENT_DIR / week_files[week]
+                      for week in sorted(week_files)]
+            key = tuple(
+                (str(p), st.st_mtime_ns, st.st_size) if (st := (
+                    p.stat() if p.exists() else None)) is not None
+                else (str(p), None, None)
+                for p in paths
+            )
             if _allow_cache is None or _allow_cache[0] != key:
-                bank = content.load_item_bank(paths[0])
                 wk = json.loads(paths[1].read_text(encoding="utf-8"))
                 proto = json.loads(paths[2].read_text(encoding="utf-8"))
-                _allow_cache = (key, content.tts_allowlist(bank, wk, proto))
+                allowed: frozenset[str] = frozenset()
+                # 白名单=全部已结构化训练周的并集:同一云引擎服务所有周。
+                # 单周坏档只让该周文本落回本地引擎(正集合缩小=fail-closed),
+                # 不把索引里一条坏登记放大成全项目云语音静默瘫痪。
+                for week in sorted(week_files):
+                    try:
+                        bank = content.load_item_bank_for_week(week)
+                    except ValueError:
+                        continue
+                    allowed |= content.tts_allowlist(bank, wk, proto)
+                _allow_cache = (key, allowed)
             return text.strip() in _allow_cache[1]
     except Exception:
         return False

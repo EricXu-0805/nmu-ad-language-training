@@ -65,22 +65,26 @@ def visit_plan_operational_issues(
     independently completable software contract.  Draft scheduling facts may
     still be retained, but no such plan may be approved or started.
 
-    P0 currently admits only the exact Week-2 formal-training vertical.  Its
-    real-research admission remains subject to the separate content readiness
-    gate; this helper must never turn a simulation acceptance path into a
-    research bypass.
+    Admitted bedside contracts: Week-1 relationship building (frozen script
+    driver + rapport completion contract) and Weeks 2-8 formal training (one
+    shared engine; per-week availability is decided by the separate content
+    gate, whose frozen per-week bank is the "训练计划" artifact).  The Week-1
+    baseline window is refused permanently here by design: standardized
+    pre-tests run in the formal assessment-event domain, which owns its own
+    scheduling, slot fencing and mutual exclusion — a parallel training
+    session would duplicate that state.  Real-research admission always
+    remains subject to the content readiness gate; this helper must never
+    turn a simulation acceptance path into a research bypass.
     """
     phase = getattr(phase_type, "value", phase_type)
     event = getattr(event_line, "value", event_line)
-    if week_no == 2 and phase == "正式训练" and event == "正式训练":
+    if 2 <= week_no <= 8 and phase == "正式训练" and event == "正式训练":
         return []
     if week_no == 1 and phase == "关系建立" and event == "关系建立环节":
-        return ["第1周关系建立尚未冻结独立完成合同，禁止审核或开场"]
+        return []
     if (week_no == 1 and phase in {"基线测评", "前测"}
             and event == "基线测评窗"):
-        return [f"第1周{phase}尚未冻结独立完成合同，禁止审核或开场"]
-    if 3 <= week_no <= 8 and phase == "正式训练" and event == "正式训练":
-        return [f"第{week_no}周尚无冻结训练计划和独立完成合同，禁止审核或开场"]
+        return [f"第1周{phase}走正式量表评估事件工作流，不建训练场次"]
     return ["week_no / phase_type / event_line 组合没有可执行的床旁协议合同"]
 
 
