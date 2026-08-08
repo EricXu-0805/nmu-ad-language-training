@@ -10,7 +10,6 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager
 import hashlib
 import ipaddress
 import json as _json
-import logging
 import math
 import secrets
 import threading
@@ -89,11 +88,11 @@ def _install_assessment_bundles_at_startup() -> None:
             bundles, active_bundle_id=active_id)
     except (content.FrozenContentUnavailable,
             assessment_definitions.AssessmentDefinitionError):
-        # 隐私契约:异常文本不得进运行输出(可能携带路径/内容片段)。
-        # 具体缺陷由部署检查对索引/包文件直接复验诊断。
-        logging.getLogger("nmu.assessment").error(
-            "正式量表定义包装载失败,评估域保持 fail-closed"
-            "(用部署检查复验 content/assessment_definitions/)")
+        # 运行输出隐私契约把输出钉死在两个咽喉点,启动钩子不得新增日志。
+        # 装载失败的可见面=注册表保持空(scale-protocol 就绪端点如实显示
+        # definitions_not_ready)+部署检查对 content/assessment_definitions/
+        # 直接复验;评估域逐请求 fail-closed,训练域不受牵连。
+        return
 
 
 @asynccontextmanager
