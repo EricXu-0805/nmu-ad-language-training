@@ -88,9 +88,12 @@ def _install_assessment_bundles_at_startup() -> None:
         assessment_definitions.install_production_bundles(
             bundles, active_bundle_id=active_id)
     except (content.FrozenContentUnavailable,
-            assessment_definitions.AssessmentDefinitionError) as exc:
+            assessment_definitions.AssessmentDefinitionError):
+        # 隐私契约:异常文本不得进运行输出(可能携带路径/内容片段)。
+        # 具体缺陷由部署检查对索引/包文件直接复验诊断。
         logging.getLogger("nmu.assessment").error(
-            "正式量表定义包装载失败,评估域保持 fail-closed:%s", exc)
+            "正式量表定义包装载失败,评估域保持 fail-closed"
+            "(用部署检查复验 content/assessment_definitions/)")
 
 
 @asynccontextmanager
