@@ -166,3 +166,43 @@ def test_http_create_enforces_the_frozen_schedule_window(
         },
     )
     assert allowed.status_code == 200, allowed.text
+
+
+def test_http_policy_binds_execution_to_the_assigned_assessor(
+        tmp_path, monkeypatch, api_clients):
+    """审查 P2:冻结政策 assigned_assessor_only 在场时,管理员也不得代办执行命令。"""
+    staged = tmp_path / "content-actor-binding"
+    staged.mkdir()
+    _write_policy(staged, _policy_data())
+    monkeypatch.setattr(content, "CONTENT_DIR", staged)
+
+    receipt = api_clients.researcher.post(
+        "/patients/SIM-ASSESSMENT-API/assessment-events",
+        json={
+            "timepoint": "posttest",
+            "scheduled_date": date.today().isoformat(),
+            "idempotency_key": "policy-actor-create-0001",
+        },
+    )
+    assert receipt.status_code == 200, receipt.text
+    event = receipt.json()
+
+    denied = api_clients.admin.post(
+        f"/assessment-events/{event['event_id']}/start",
+        json={
+            "expected_event_revision": event["revision"],
+            "idempotency_key": "policy-actor-start-admin-0001",
+        },
+    )
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == (
+        "assessment_workflow_policy_assessor_mismatch")
+
+    started = api_clients.researcher.post(
+        f"/assessment-events/{event['event_id']}/start",
+        json={
+            "expected_event_revision": event["revision"],
+            "idempotency_key": "policy-actor-start-own-0001",
+        },
+    )
+    assert started.status_code == 200, started.text

@@ -90,6 +90,13 @@ class _ItemSpec(_FrozenModel):
     word: str | None = Field(default=None, min_length=1, max_length=64)
 
 
+class _LicenseArtifact(_FrozenModel):
+    """授权文件的内容寻址记录(文件本体离线保存,哈希随包被 content_sha256 钉住)。"""
+
+    name: str = Field(min_length=1, max_length=200)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class _DefinitionPackage(_FrozenModel):
     definition_id: str = Field(min_length=1, max_length=200)
     category_key: Literal[
@@ -106,6 +113,7 @@ class _DefinitionPackage(_FrozenModel):
     score_direction: Literal["higher_is_better", "lower_is_better"]
     permissions: _PermissionSpec
     items: tuple[_ItemSpec, ...] = Field(min_length=1)
+    license_artifacts: tuple[_LicenseArtifact, ...] = ()
 
     @field_validator("items")
     @classmethod
@@ -114,6 +122,18 @@ class _DefinitionPackage(_FrozenModel):
         if len(set(keys)) != len(keys):
             raise ValueError("item keys must be unique")
         return value
+
+    @model_validator(mode="after")
+    def _naming_items_carry_words(self):
+        # 未训练词隔离检查的输入不允许缺席:量表一每题必须带词,
+        # 否则「清空词表」会让隔离检查空转通过(审查 P1)。
+        if self.category_key == "untrained_standardized_naming":
+            missing = [item.item_key for item in self.items if not item.word]
+            if missing:
+                raise ValueError(
+                    "untrained naming items must each carry a word: "
+                    + ",".join(missing[:5]))
+        return self
 
     @field_validator("administration_protocol")
     @classmethod
@@ -144,6 +164,9 @@ class _BundlePackage(_FrozenModel):
 class _BundleIndexEntry(_FrozenModel):
     bundle_id: str = Field(min_length=1, max_length=200)
     file: str = Field(min_length=1)
+    # 包文件字节级钉:词表等语义载荷不进注册表摘要(wire 契约禁携词),
+    # 由索引对整包字节内容寻址;改包必须同步改索引,单文件静默漂移不可能。
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("file")
     @classmethod
@@ -261,7 +284,12 @@ def _compile_definition(
             raise _definition_error(
                 "assessment_response_invalid",
                 "declarative response must be numeric")
-        numeric = float(value)
+        try:
+            numeric = float(value)
+        except (OverflowError, ValueError):
+            raise _definition_error(
+                "assessment_response_invalid",
+                "declarative response is outside representable range") from None
         if (numeric != numeric or numeric in (float("inf"), float("-inf"))
                 or numeric < schema.minimum or numeric > schema.maximum
                 or (allowed_values is not None
@@ -307,7 +335,10 @@ def _definition_error(code: str, message: str):
 
 def compile_bundle_package(data: dict) -> RegisteredAssessmentBundle:
     """Compile one package into a registry bundle; every digest recomputed."""
-    package = _BundlePackage.model_validate(data)
+    try:
+        package = _BundlePackage.model_validate(data)
+    except (TypeError, ValueError) as exc:
+        raise FrozenContentUnavailable(f"量表定义包结构不合法:{exc}") from exc
     compiled = tuple(
         _compile_definition(row)
         for row in sorted(package.definitions, key=lambda r: r.category_key)
@@ -390,6 +421,8 @@ def load_bundle_packages(
     content_dir: str | Path,
 ) -> tuple[tuple[RegisteredAssessmentBundle, ...], str, tuple[dict, ...]]:
     """Load every indexed bundle package; returns (bundles, active_id, raw)."""
+    import hashlib
+
     base = Path(content_dir) / ASSESSMENT_BUNDLE_DIR
     index_path = base / ASSESSMENT_BUNDLE_INDEX_FILE
     try:
@@ -398,8 +431,11 @@ def load_bundle_packages(
         bundles: list[RegisteredAssessmentBundle] = []
         raw_packages: list[dict] = []
         for entry in index.bundles:
-            data = json.loads(
-                (base / entry.file).read_text(encoding="utf-8"))
+            raw_bytes = (base / entry.file).read_bytes()
+            if hashlib.sha256(raw_bytes).hexdigest() != entry.content_sha256:
+                raise ValueError(
+                    f"索引条目 {entry.bundle_id} 的包文件字节与登记哈希不一致")
+            data = json.loads(raw_bytes.decode("utf-8"))
             bundle = compile_bundle_package(data)
             if bundle.snapshot.bundle_id != entry.bundle_id:
                 raise ValueError(
@@ -408,6 +444,6 @@ def load_bundle_packages(
             raw_packages.append(data)
     except FrozenContentUnavailable:
         raise
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, RecursionError) as exc:
         raise FrozenContentUnavailable(f"量表定义包不可用:{exc}") from exc
     return tuple(bundles), index.active_bundle_id, tuple(raw_packages)

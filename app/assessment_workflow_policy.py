@@ -46,6 +46,18 @@ class _ScheduleRule(_FrozenModel):
             raise ValueError("not_after must not precede not_before")
         return value
 
+    # unrestricted 带窗口字段=作者笔误(想写 date_range),死字段永不执行,
+    # 会让政策看起来有窗而实际无窗——装载即拒(审查 P3)。
+    def model_post_init(self, _context) -> None:
+        if self.kind == "unrestricted" and (
+                self.not_before is not None or self.not_after is not None):
+            raise ValueError(
+                "unrestricted schedule rule must not carry window fields")
+        if self.kind == "date_range" and (
+                self.not_before is None and self.not_after is None):
+            raise ValueError(
+                "date_range schedule rule requires at least one bound")
+
 
 class _DeferralRule(_FrozenModel):
     kind: Literal["admin_bounded"]
@@ -153,6 +165,19 @@ class FrozenWorkflowPolicy:
                 "assessment_workflow_policy_schedule_violation",
                 "排期晚于冻结政策允许的窗口")
 
+    def enforce_actor_binding(
+            self, *, actor_id: str, assigned_assessor_id: str) -> None:
+        """assigned_assessor_only:执行命令必须出自被分配评估员本人。
+
+        服务状态机允许管理员代办;冻结政策声明的语义更严,政策在场时以政策为准
+        (声明=执行,审查 P2)。延期批准不在此列——那由 deferral_authority 规则管。
+        """
+        if (self.policy.assessor_assignment_rule.kind == "assigned_assessor_only"
+                and actor_id != assigned_assessor_id):
+            raise WorkflowPolicyViolation(
+                "assessment_workflow_policy_assessor_mismatch",
+                "冻结政策要求由被分配评估员本人执行本命令")
+
     def enforce_deferral(self, *, actor_role: str, today: date,
                          deferred_until: date) -> None:
         rule = self.policy.deferral_authority_rule
@@ -174,5 +199,5 @@ def load_workflow_policy(content_dir: str | Path) -> FrozenWorkflowPolicy | None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return FrozenWorkflowPolicy(_PolicyFile.model_validate(data))
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, RecursionError) as exc:
         raise FrozenContentUnavailable(f"冻结工作流政策不可用:{exc}") from exc

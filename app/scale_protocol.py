@@ -656,7 +656,7 @@ def _load_manifest() -> dict:
         workflow_policy = data.get("workflow_policy")
         if workflow_policy is not None and not isinstance(workflow_policy, dict):
             raise ValueError("workflow_policy must be an object when present")
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, RecursionError) as exc:
         raise FrozenContentUnavailable(f"量表协议 manifest 不可用:{exc}") from exc
     merged = deepcopy(_MANIFEST)
     for field in ("definition_bundle_id", "definition_bundle_digest"):
@@ -678,14 +678,52 @@ def _load_manifest() -> dict:
 
 
 def scale_protocol_readiness() -> dict:
-    """Return the current manifest with all readiness facts derived afresh."""
+    """Return the current manifest with all readiness facts derived afresh.
+
+    就绪面额外核对「可执行政策文件存在且与 manifest 绑定」:manifest 政策事实
+    完备而政策文件缺失/不一致时,治理面板绝不显示 ready(否则会出现「面板放行、
+    每条命令 409」的自相矛盾——审查 P2)。
+    """
     from .assessment_definitions import AssessmentDefinitionError, current_bundle
 
     try:
         installed = (current_bundle().snapshot,)
     except AssessmentDefinitionError:
         installed = ()
-    return evaluate_scale_protocol_manifest(
+    result = evaluate_scale_protocol_manifest(
         _load_manifest(),
         registered_definition_bundles=installed,
     )
+    manifest_policy = result.get("workflow_policy") or {}
+    if manifest_policy.get("workflow_policy_digest"):
+        from .assessment_workflow_policy import (
+            WorkflowPolicyViolation,
+            load_workflow_policy,
+        )
+        from .content import CONTENT_DIR
+
+        executable_bound = False
+        try:
+            policy = load_workflow_policy(CONTENT_DIR)
+            if policy is not None:
+                policy.assert_manifest_binding(manifest_policy)
+                executable_bound = True
+        except WorkflowPolicyViolation:
+            executable_bound = False
+        if not executable_bound:
+            result["workflow_policy_ready"] = False
+            result["workflow_ready"] = False
+            result["ready_for_research"] = False
+            result["instance_creation_enabled"] = False
+            result["automatic_scoring_enabled"] = False
+            if result["status"] == "ready_for_research":
+                result["status"] = "awaiting_workflow_policy"
+            result["blocking_issues"].append({
+                "code": "workflow_policy.executable_file.not_ready",
+                "category_key": "workflow_policy",
+                "field": "executable_file",
+                "message": (
+                    "正式评估工作流:可执行政策文件缺失或与 manifest 冻结事实不一致。"
+                ),
+            })
+    return result

@@ -2294,7 +2294,8 @@ def start_assessment_event(
         with governance_lock.subject_actor_fence(s, patient_id, assigned_id):
             _assessment_authorize_event(
                 s, request, event_id, action="启动正式评估事件", mutation=True)
-            _require_assessment_write_readiness()
+            _enforce_policy_actor_binding(
+                s, _require_assessment_write_readiness(), event_id, actor_id)
             try:
                 visit_plan_service.assert_patient_ready_for_new_work(
                     s,
@@ -2399,6 +2400,19 @@ def _enforced_workflow_policy(
     return policy
 
 
+def _enforce_policy_actor_binding(
+        s: DBSession, readiness: dict, event_id: str, actor_id: str) -> None:
+    """冻结政策在场时,执行类命令按 assigned_assessor_only 严格绑定本人。"""
+    policy = _enforced_workflow_policy(readiness)
+    if policy is None:
+        return
+    event = s.get(AssessmentEvent, event_id)
+    if event is not None:
+        policy.enforce_actor_binding(
+            actor_id=actor_id,
+            assigned_assessor_id=event.assigned_assessor_id)
+
+
 def _assessment_artifact_authorizer(
         db: DBSession, event, instance, item_key: str,
         item_revision: int, digest: str) -> bool:
@@ -2414,7 +2428,8 @@ def _assessment_artifact_authorizer(
             or row.item_key != item_key
             or row.item_revision != item_revision):
         return False
-    row.consumed_at = datetime.now()
+    # DB 约定=naive-UTC;本地墙钟会让消费时刻与同事务响应行差 8 小时。
+    row.consumed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db.add(row)
     db.flush()
     return True
@@ -2439,12 +2454,14 @@ def issue_assessment_recording_authorization(
             instance, event, _aid, _arole = _assessment_authorize_instance(
                 s, request, instance_id,
                 action="签发逐题录音授权", mutation=True)
-            _require_assessment_write_readiness()
+            readiness_recording = _require_assessment_write_readiness()
             if event.status != "in_progress" or instance.status != "in_progress":
                 raise HTTPException(status_code=409, detail={
                     "code": "assessment_state_invalid",
                     "message": "只有进行中的评估实例可以签发录音授权",
                 })
+            _enforce_policy_actor_binding(
+                s, readiness_recording, event_id, actor_id)
             registered = assessment_service.registered_definition_for(
                 s, event, instance)
             frozen_keys = {item.item_key for item in registered.snapshot.items}
@@ -2508,7 +2525,8 @@ def submit_assessment_response(
             _assessment_authorize_instance(
                 s, request, instance_id,
                 action="保存正式评估条目响应", mutation=True)
-            _require_assessment_write_readiness()
+            _enforce_policy_actor_binding(
+                s, _require_assessment_write_readiness(), event_id, actor_id)
             result = assessment_service.submit_response(
                 s, event_id=event_id, instance_id=instance_id,
                 item_key=item_key, body=body,
@@ -2543,7 +2561,9 @@ def complete_assessment_instance(
             _assessment_authorize_instance(
                 s, request, instance_id,
                 action="完成正式评估实例计分", mutation=True)
-            _require_assessment_write_readiness(scoring=True)
+            _enforce_policy_actor_binding(
+                s, _require_assessment_write_readiness(scoring=True),
+                event_id, actor_id)
             result = assessment_service.complete_instance(
                 s, event_id=event_id, instance_id=instance_id, body=body,
                 actor_id=actor_id, actor_role=actor_role)
@@ -2620,7 +2640,8 @@ def close_assessment_event(
             _assessment_authorize_event(
                 s, request, event_id,
                 action="保存正式评估收尾并关闭事件", mutation=True)
-            _require_assessment_write_readiness()
+            _enforce_policy_actor_binding(
+                s, _require_assessment_write_readiness(), event_id, actor_id)
             result = assessment_service.close_event(
                 s, event_id=event_id, body=body,
                 actor_id=actor_id, actor_role=actor_role)

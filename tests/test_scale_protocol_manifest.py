@@ -85,3 +85,51 @@ def test_workflow_policy_facts_merge_into_the_policy_block(tmp_path, monkeypatch
         "formal-workflow-v1")
     assert "unknown_policy_field" not in readiness["workflow_policy"]
     assert readiness["workflow_policy_ready"] is False
+
+
+def test_ready_requires_the_executable_policy_file_bound(tmp_path, monkeypatch):
+    """审查 P2:manifest 政策事实完备而可执行政策文件缺失/不一致时,就绪面
+    绝不显示 ready——面板放行与命令 409 不允许自相矛盾。"""
+    import json as _json
+
+    from app import assessment_workflow_policy
+    from tests.test_assessment_workflow_policy import _policy_data
+
+    monkeypatch.setattr(content, "CONTENT_DIR", tmp_path)
+    policy_path = (
+        tmp_path / assessment_workflow_policy.ASSESSMENT_WORKFLOW_POLICY_FILE)
+    policy_path.write_text(
+        _json.dumps(_policy_data(), ensure_ascii=False), encoding="utf-8")
+    policy = assessment_workflow_policy.load_workflow_policy(tmp_path)
+    _write_manifest(tmp_path, {
+        "categories": [
+            _category("untrained_standardized_naming"),
+            _category("functional_communication"),
+        ],
+        "workflow_policy": {
+            "workflow_policy_id": policy.policy.workflow_policy_id,
+            "workflow_policy_version": policy.policy.workflow_policy_version,
+            "workflow_policy_digest": policy.workflow_policy_digest,
+            **policy.rule_digests,
+        },
+    })
+    bound = scale_protocol.scale_protocol_readiness()
+    codes = {issue["code"] for issue in bound["blocking_issues"]}
+    assert "workflow_policy.executable_file.not_ready" not in codes
+
+    # 文件被改(digest 漂移)→ 就绪面出阻断且政策面强制不 ready。
+    drifted = _json.loads(policy_path.read_text(encoding="utf-8"))
+    drifted["deferral_authority_rule"]["max_deferral_days"] = 30
+    policy_path.write_text(
+        _json.dumps(drifted, ensure_ascii=False), encoding="utf-8")
+    mismatch = scale_protocol.scale_protocol_readiness()
+    codes = {issue["code"] for issue in mismatch["blocking_issues"]}
+    assert "workflow_policy.executable_file.not_ready" in codes
+    assert mismatch["workflow_policy_ready"] is False
+    assert mismatch["ready_for_research"] is False
+
+    # 文件整个缺失同拒。
+    policy_path.unlink()
+    missing = scale_protocol.scale_protocol_readiness()
+    codes = {issue["code"] for issue in missing["blocking_issues"]}
+    assert "workflow_policy.executable_file.not_ready" in codes

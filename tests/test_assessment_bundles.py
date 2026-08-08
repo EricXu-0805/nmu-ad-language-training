@@ -79,13 +79,19 @@ def _stage(tmp_path, packages: dict[str, dict], active: str):
     for name in (content.ITEM_BANK_INDEX_FILE, "item_bank_v1.json"):
         if not (tmp_path / name).exists():
             shutil.copy(_REAL_CONTENT_DIR / name, tmp_path)
+    import hashlib
+
     base = tmp_path / assessment_bundles.ASSESSMENT_BUNDLE_DIR
     base.mkdir(parents=True)
     entries = []
     for file_name, data in packages.items():
-        (base / file_name).write_text(
-            json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        entries.append({"bundle_id": data["bundle_id"], "file": file_name})
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        (base / file_name).write_bytes(raw)
+        entries.append({
+            "bundle_id": data["bundle_id"],
+            "file": file_name,
+            "content_sha256": hashlib.sha256(raw).hexdigest(),
+        })
     (base / assessment_bundles.ASSESSMENT_BUNDLE_INDEX_FILE).write_text(
         json.dumps({
             "schema_version": "assessment-bundle-index.v1",
@@ -217,3 +223,28 @@ def test_startup_hook_installs_or_degrades_without_bricking(tmp_path, monkeypatc
                            encoding="utf-8")
     _install_assessment_bundles_at_startup()
     assert assessment_definitions.registered_bundles() == ()
+
+
+def test_word_tamper_and_wordless_naming_fail_closed(tmp_path):
+    """审查 P1 双钉:量表一每题必须带词;包字节被改(如清词)即撞索引哈希。"""
+    wordless = _package("formal-wordless-v1")
+    for definition in wordless["definitions"]:
+        if definition["category_key"] == "untrained_standardized_naming":
+            for item in definition["items"]:
+                item.pop("word", None)
+    with pytest.raises(content.FrozenContentUnavailable, match="word"):
+        assessment_bundles.compile_bundle_package(wordless)
+
+    staged = _stage(tmp_path, {"bundle_v1.json": _package("formal-v1")},
+                    active="formal-v1")
+    bundle_path = (staged / assessment_bundles.ASSESSMENT_BUNDLE_DIR
+                   / "bundle_v1.json")
+    data = json.loads(bundle_path.read_text(encoding="utf-8"))
+    for definition in data["definitions"]:
+        for item in definition["items"]:
+            if "word" in item:
+                item["word"] = "改词"
+    bundle_path.write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(content.FrozenContentUnavailable, match="登记哈希"):
+        assessment_bundles.load_bundle_packages(staged)
