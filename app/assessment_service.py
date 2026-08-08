@@ -347,6 +347,25 @@ def _assert_instance_revision(
         _fail(409, "assessment_instance_revision_conflict", "assessment instance revision changed")
 
 
+def registered_definition_for(
+    db: Session,
+    event: AssessmentEvent,
+    instance: AssessmentInstance,
+) -> assessment_definitions.RegisteredAssessmentDefinition:
+    """Public read of the instance's frozen registered definition (收据 150 S3)."""
+    del db  # 与 authorizer 回调同形参风格;解析只依赖注册表与冻结绑定。
+    return _registered_definition(event, instance)
+
+
+def latest_item_revision(db: Session, *, instance_id: str, item_key: str) -> int:
+    """Current highest item revision; the next write binds latest+1."""
+    latest = db.exec(select(func.max(AssessmentItemResponse.item_revision)).where(
+        AssessmentItemResponse.instance_id == instance_id,
+        AssessmentItemResponse.item_key == item_key,
+    )).one()
+    return int(latest or 0)
+
+
 def _registered_definition(
     event: AssessmentEvent,
     instance: AssessmentInstance,

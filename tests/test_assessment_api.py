@@ -419,3 +419,160 @@ def test_consent_refusal_seals_queue_reads_and_idempotent_mutation_replay(
     assert replay.json()["detail"]["code"] == (
         "subject_withdrawn_content_unavailable")
     assert "instances" not in replay.text
+
+
+def test_recording_authorization_issue_consume_and_reuse_fences(
+        assessment_clients):
+    """逐题录音授权收据(收据 150 S3):签发→消费恰好一次,五元组绑定。"""
+    clients = assessment_clients
+    receipt = _create(clients.researcher, key="api-rec-auth-create-0001")
+    event_id = receipt["event_id"]
+    started = clients.researcher.post(
+        f"/assessment-events/{event_id}/start",
+        json={
+            "expected_event_revision": receipt["revision"],
+            "idempotency_key": "api-rec-auth-start-0001",
+        },
+    )
+    assert started.status_code == 200, started.text
+    receipt = started.json()
+    naming = _instance(receipt, "untrained_standardized_naming")
+    instance_id = naming["instance_id"]
+
+    issued = clients.researcher.post(
+        f"/assessment-instances/{instance_id}/recording-authorizations",
+        json={"item_key": "naming_01"},
+    )
+    assert issued.status_code == 200, issued.text
+    grant = issued.json()
+    assert grant["item_key"] == "naming_01"
+    assert grant["item_revision"] == 1
+    digest = grant["authorized_artifact_digest"]
+    assert digest.startswith("sha256:") and len(digest) == 71
+
+    # 冻结定义外的条目拒签。
+    unknown = clients.researcher.post(
+        f"/assessment-instances/{instance_id}/recording-authorizations",
+        json={"item_key": "naming_99"},
+    )
+    assert unknown.status_code == 409
+    assert unknown.json()["detail"]["code"] == "assessment_item_unknown"
+
+    # 消费:携带收据的响应落库。
+    response = clients.researcher.put(
+        f"/assessment-instances/{instance_id}/responses/naming_01",
+        json={
+            "response": {"value": 1, "authorized_artifact_digest": digest},
+            "expected_event_revision": receipt["revision"],
+            "expected_instance_revision": naming["revision"],
+            "expected_item_revision": 0,
+            "idempotency_key": "api-rec-auth-response-0001",
+        },
+    )
+    assert response.status_code == 200, response.text
+    receipt = response.json()
+    naming = _instance(receipt, "untrained_standardized_naming")
+
+    with Session(clients.engine) as session:
+        from app.models import AssessmentRecordingAuthorization
+
+        row = session.exec(select(AssessmentRecordingAuthorization).where(
+            AssessmentRecordingAuthorization.authorization_digest == digest,
+        )).one()
+        assert row.consumed_at is not None
+        assert row.item_revision == 1
+
+    # 已消费收据在新修订上复用 → 拒绝(authorizer 消费面)。
+    reuse = clients.researcher.put(
+        f"/assessment-instances/{instance_id}/responses/naming_01",
+        json={
+            "response": {"value": 2, "authorized_artifact_digest": digest},
+            "expected_event_revision": receipt["revision"],
+            "expected_instance_revision": naming["revision"],
+            "expected_item_revision": 1,
+            "idempotency_key": "api-rec-auth-response-0002",
+        },
+    )
+    assert reuse.status_code == 409
+    assert reuse.json()["detail"]["code"] == "assessment_artifact_not_authorized"
+
+
+def test_recording_authorization_binds_item_and_revision_context(
+        assessment_clients):
+    """收据钉发签时的 item/revision:错题或修订前进后一律作废,须重签。"""
+    clients = assessment_clients
+    receipt = _create(clients.researcher, key="api-rec-auth2-create-0001")
+    event_id = receipt["event_id"]
+    started = clients.researcher.post(
+        f"/assessment-events/{event_id}/start",
+        json={
+            "expected_event_revision": receipt["revision"],
+            "idempotency_key": "api-rec-auth2-start-0001",
+        },
+    )
+    assert started.status_code == 200, started.text
+    receipt = started.json()
+    naming = _instance(receipt, "untrained_standardized_naming")
+    instance_id = naming["instance_id"]
+
+    issued = clients.researcher.post(
+        f"/assessment-instances/{instance_id}/recording-authorizations",
+        json={"item_key": "naming_01"},
+    )
+    assert issued.status_code == 200, issued.text
+    digest = issued.json()["authorized_artifact_digest"]
+
+    # 用在另一条目 → 拒绝。
+    wrong_item = clients.researcher.put(
+        f"/assessment-instances/{instance_id}/responses/naming_02",
+        json={
+            "response": {"value": 1, "authorized_artifact_digest": digest},
+            "expected_event_revision": receipt["revision"],
+            "expected_instance_revision": naming["revision"],
+            "expected_item_revision": 0,
+            "idempotency_key": "api-rec-auth2-response-0001",
+        },
+    )
+    assert wrong_item.status_code == 409
+    assert wrong_item.json()["detail"]["code"] == (
+        "assessment_artifact_not_authorized")
+
+    # 无收据的普通响应把修订推进到 1 → 发签时绑定的 revision=1 已被占用,作废。
+    plain = clients.researcher.put(
+        f"/assessment-instances/{instance_id}/responses/naming_01",
+        json={
+            "response": {"value": 0},
+            "expected_event_revision": receipt["revision"],
+            "expected_instance_revision": naming["revision"],
+            "expected_item_revision": 0,
+            "idempotency_key": "api-rec-auth2-response-0002",
+        },
+    )
+    assert plain.status_code == 200, plain.text
+    receipt = plain.json()
+    naming = _instance(receipt, "untrained_standardized_naming")
+    stale = clients.researcher.put(
+        f"/assessment-instances/{instance_id}/responses/naming_01",
+        json={
+            "response": {"value": 1, "authorized_artifact_digest": digest},
+            "expected_event_revision": receipt["revision"],
+            "expected_instance_revision": naming["revision"],
+            "expected_item_revision": 1,
+            "idempotency_key": "api-rec-auth2-response-0003",
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "assessment_artifact_not_authorized"
+
+    # 消费未发生:收据仍未消费,行不可删不可改(只追加账本)。
+    with Session(clients.engine) as session:
+        from app.models import AssessmentRecordingAuthorization
+
+        row = session.exec(select(AssessmentRecordingAuthorization).where(
+            AssessmentRecordingAuthorization.authorization_digest == digest,
+        )).one()
+        assert row.consumed_at is None
+        row.item_key = "naming_03"
+        with pytest.raises(RuntimeError, match="禁止更新"):
+            session.commit()
+        session.rollback()

@@ -50,6 +50,7 @@ from .auth import COOKIE_NAME, CSRF_COOKIE_NAME
 from .db import get_session, init_db
 from .enums import AudioStatus, ConsentType
 from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
+                     AssessmentRecordingAuthorization,
                      AttemptCaptureProcessing,
                      AttemptEvent, AuditLog, AudioAssetRow,
                      AudioCaptureReceipt, AudioLocalCopyDisposalReceipt,
@@ -2355,6 +2356,99 @@ def _assessment_instance_mutation_preflight(
     return patient_id, event_id, actor_id, actor_role
 
 
+def _assessment_artifact_authorizer(
+        db: DBSession, event, instance, item_key: str,
+        item_revision: int, digest: str) -> bool:
+    """逐题录音授权收据核销:五元组绑定+未消费,消费与响应同事务(收据 150 S3)。"""
+    row = db.exec(select(AssessmentRecordingAuthorization).where(
+        AssessmentRecordingAuthorization.authorization_digest == digest,
+    ).with_for_update()).first()
+    if row is None or row.consumed_at is not None:
+        return False
+    if (row.event_id != event.event_id
+            or row.instance_id != instance.instance_id
+            or row.patient_id != event.patient_id
+            or row.item_key != item_key
+            or row.item_revision != item_revision):
+        return False
+    row.consumed_at = datetime.now()
+    db.add(row)
+    db.flush()
+    return True
+
+
+class IssueRecordingAuthorizationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_key: str = PydanticField(min_length=1, max_length=200)
+
+
+@app.post("/assessment-instances/{instance_id}/recording-authorizations")
+def issue_assessment_recording_authorization(
+        instance_id: str, body: IssueRecordingAuthorizationIn,
+        request: Request, s: DBSession = Depends(get_session)):
+    """签发一次性逐题录音授权收据;绑定当前 item_revision,越期即作废须重签。"""
+    patient_id, event_id, actor_id, _actor_role = (
+        _assessment_instance_mutation_preflight(
+            instance_id, request, s, "签发逐题录音授权"))
+    try:
+        with governance_lock.subject_fence(s, patient_id):
+            instance, event, _aid, _arole = _assessment_authorize_instance(
+                s, request, instance_id,
+                action="签发逐题录音授权", mutation=True)
+            _require_assessment_write_readiness()
+            if event.status != "in_progress" or instance.status != "in_progress":
+                raise HTTPException(status_code=409, detail={
+                    "code": "assessment_state_invalid",
+                    "message": "只有进行中的评估实例可以签发录音授权",
+                })
+            registered = assessment_service.registered_definition_for(
+                s, event, instance)
+            frozen_keys = {item.item_key for item in registered.snapshot.items}
+            if body.item_key not in frozen_keys:
+                raise HTTPException(status_code=409, detail={
+                    "code": "assessment_item_unknown",
+                    "message": "条目不在冻结定义内,拒绝签发录音授权",
+                })
+            latest_revision = assessment_service.latest_item_revision(
+                s, instance_id=instance_id, item_key=body.item_key)
+            item_revision = latest_revision + 1
+            authorization_id = f"ara_{secrets.token_hex(12)}"
+            digest = "sha256:" + hashlib.sha256("\x00".join((
+                event.patient_id, event_id, instance_id, body.item_key,
+                str(item_revision), secrets.token_hex(16),
+            )).encode("utf-8")).hexdigest()
+            row = AssessmentRecordingAuthorization(
+                authorization_id=authorization_id,
+                event_id=event_id,
+                instance_id=instance_id,
+                patient_id=event.patient_id,
+                item_key=body.item_key,
+                item_revision=item_revision,
+                authorization_digest=digest,
+                issued_by=actor_id,
+            )
+            s.add(row)
+            s.commit()
+    except assessment_service.AssessmentServiceError as exc:
+        s.rollback()
+        _raise_assessment_error(exc)
+    except IntegrityError as exc:
+        _assessment_integrity_conflict(s, exc)
+    _audit(
+        s, request, "assessment_recording_authorization",
+        f"event={event_id} instance={instance_id} item={body.item_key} "
+        f"revision={item_revision}",
+        patient_id=patient_id,
+    )
+    return {
+        "authorization_id": authorization_id,
+        "authorized_artifact_digest": digest,
+        "item_key": body.item_key,
+        "item_revision": item_revision,
+    }
+
+
 @app.put(
     "/assessment-instances/{instance_id}/responses/{item_key}",
     response_model=assessment_contract.AssessmentEventOut,
@@ -2375,7 +2469,8 @@ def submit_assessment_response(
             result = assessment_service.submit_response(
                 s, event_id=event_id, instance_id=instance_id,
                 item_key=item_key, body=body,
-                actor_id=actor_id, actor_role=actor_role)
+                actor_id=actor_id, actor_role=actor_role,
+                artifact_authorizer=_assessment_artifact_authorizer)
             s.commit()
     except assessment_service.AssessmentServiceError as exc:
         s.rollback()

@@ -186,7 +186,7 @@ def test_scale_protocol_v4_is_explicitly_fail_closed_across_independent_gates():
     assert status["schema_version"] == "scale-protocol-readiness.v4"
     assert status["status"] == "awaiting_pi_definition"
     assert status["definition_ready"] is False
-    assert status["definition_artifact_enforcement_ready"] is False
+    assert status["definition_artifact_enforcement_ready"] is True
     assert status["definition_artifacts_ready"] is False
     assert status["formal_result_contract_ready"] is True
     assert status["workflow_policy_ready"] is False
@@ -280,7 +280,7 @@ def test_claimed_ready_flags_are_ignored_when_required_facts_are_missing():
 
     assert evaluated["status"] == "awaiting_pi_definition"
     assert evaluated["definition_ready"] is False
-    assert evaluated["definition_artifact_enforcement_ready"] is False
+    assert evaluated["definition_artifact_enforcement_ready"] is True
     assert evaluated["definition_artifacts_ready"] is False
     assert evaluated["formal_result_contract_ready"] is True
     assert evaluated["workflow_policy_ready"] is False
@@ -315,7 +315,8 @@ def test_every_missing_manifest_fact_has_a_category_and_field_blocker():
         assert (key, "copyright_approval") in blocker_pairs
     assert ("platform", "formal_result_contract") not in blocker_pairs
     assert ("platform", "workflow_contract") not in blocker_pairs
-    assert ("platform", "definition_artifact_enforcement") in blocker_pairs
+    # S1+S3 已实现字节复核+逐题录音授权收据:该层默认就绪,不再出阻断。
+    assert ("platform", "definition_artifact_enforcement") not in blocker_pairs
     assert ("platform", "workflow_policy_enforcement") in blocker_pairs
     assert ("platform", "definition_artifacts") in blocker_pairs
     assert ("workflow_policy", "deferral_authority_rule_digest") in blocker_pairs
@@ -330,7 +331,7 @@ def test_complete_definition_facts_do_not_claim_policy_artifacts_or_platform_lay
 
     assert evaluated["status"] == "awaiting_workflow_policy"
     assert evaluated["definition_ready"] is True
-    assert evaluated["definition_artifact_enforcement_ready"] is False
+    assert evaluated["definition_artifact_enforcement_ready"] is True
     assert evaluated["definition_artifacts_ready"] is False
     assert evaluated["formal_result_contract_ready"] is True
     assert evaluated["workflow_policy_ready"] is False
@@ -346,7 +347,8 @@ def test_complete_definition_facts_do_not_claim_policy_artifacts_or_platform_lay
     assert "platform.definition_artifacts.not_ready" in blocker_codes
     assert "platform.formal_result_contract.not_ready" not in blocker_codes
     assert "platform.workflow_contract.not_ready" not in blocker_codes
-    assert "platform.definition_artifact_enforcement.not_ready" in blocker_codes
+    assert ("platform.definition_artifact_enforcement.not_ready"
+            not in blocker_codes)
     assert "platform.workflow_policy_enforcement.not_ready" in blocker_codes
     assert "workflow_policy.closeout_rule_digest.not_ready" in blocker_codes
 
@@ -379,11 +381,15 @@ def test_claimed_digests_cannot_replace_runtime_artifact_and_policy_enforcement(
     _bind_manifest_to_bundle(manifest, bundle)
     _complete_workflow_policy(manifest)
 
+    # 参数化保留原语义:enforcement 层未实现时,声称摘要+完整 manifest 依然
+    # 打不开任何一层——该守卫作为 evaluator 契约永久成立。
     evaluated = evaluate_scale_protocol_manifest(
         manifest,
         registered_definition_bundles=(bundle,),
         formal_result_contract_implemented=True,
         workflow_contract_implemented=True,
+        definition_artifact_enforcement_implemented=False,
+        workflow_policy_enforcement_implemented=False,
     )
 
     assert evaluated["status"] == "awaiting_platform_implementation"
@@ -400,6 +406,19 @@ def test_claimed_digests_cannot_replace_runtime_artifact_and_policy_enforcement(
         "platform.workflow_policy_enforcement.not_ready",
         "platform.definition_artifacts.not_ready",
     } <= {issue["code"] for issue in evaluated["blocking_issues"]}
+
+    # 当前默认(S1 字节复核+S3 授权收据已落地):制品层就绪,但工作流政策
+    # 运行时(S4)未实现,ready_for_research 仍关。
+    current_default = evaluate_scale_protocol_manifest(
+        manifest,
+        registered_definition_bundles=(bundle,),
+        formal_result_contract_implemented=True,
+        workflow_contract_implemented=True,
+    )
+    assert current_default["definition_artifact_enforcement_ready"] is True
+    assert current_default["definition_artifacts_ready"] is True
+    assert current_default["workflow_policy_enforcement_ready"] is False
+    assert current_default["ready_for_research"] is False
 
 
 def test_v4_only_opens_after_policy_exact_artifacts_and_code_layers_match():

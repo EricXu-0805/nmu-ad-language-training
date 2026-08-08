@@ -1416,11 +1416,12 @@ def test_publish_parent_fsync_failure_rolls_back_to_staging(monkeypatch, tmp_pat
 
 
 # --------------------------------------------------------------------------
-# Current head: f7c2e8a4d105 (audio local-copy disposal receipt) recovery
-# contract, plus the autopilot plan profile columns it builds on.
+# Current head: b8e5f2a91c07 (assessment recording authorization) recovery
+# contract, plus the disposal-receipt/profile layers it builds on.
 # --------------------------------------------------------------------------
 
 
+REC_AUTH_HEAD = "b8e5f2a91c07"
 DISPOSAL_HEAD = "f7c2e8a4d105"
 PROFILE_HEAD = "e4a7c1d9b206"
 PRE_PROFILE_HEAD = "d3f8b5c1a704"
@@ -1529,7 +1530,8 @@ def _drop_profile_column(
 
 
 def test_recovery_contract_pins_the_current_head_only():
-    assert _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS == frozenset({DISPOSAL_HEAD})
+    assert _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS == frozenset({REC_AUTH_HEAD})
+    assert DISPOSAL_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert PROFILE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert PRE_PROFILE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
 
@@ -1544,7 +1546,7 @@ def test_recovery_fingerprint_literal_matches_a_fresh_current_head(tmp_path):
     try:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == DISPOSAL_HEAD
+        ).fetchone()[0] == REC_AUTH_HEAD
         computed = _GUARD_MODULE._schema_contract_fingerprint(connection)
     finally:
         connection.close()
@@ -1552,7 +1554,7 @@ def test_recovery_fingerprint_literal_matches_a_fresh_current_head(tmp_path):
     assert computed == _GUARD_MODULE.CURRENT_RECOVERY_SCHEMA_SHA256
 
 
-@pytest.mark.parametrize("stale_head", [PRE_PROFILE_HEAD, PROFILE_HEAD])
+@pytest.mark.parametrize("stale_head", [PRE_PROFILE_HEAD, PROFILE_HEAD, DISPOSAL_HEAD])
 def test_real_stale_head_snapshot_is_rejected_as_unsupported_revision(
         tmp_path, stale_head):
     snapshot = tmp_path / "snapshot"
@@ -1569,11 +1571,11 @@ def test_real_stale_head_snapshot_is_rejected_as_unsupported_revision(
 def test_stale_schema_with_forged_head_revision_is_rejected(tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
-    db_path = _database_at(snapshot, PROFILE_HEAD)
+    db_path = _database_at(snapshot, DISPOSAL_HEAD)
     connection = sqlite3.connect(db_path)
     try:
         connection.execute(
-            "UPDATE alembic_version SET version_num=?", (DISPOSAL_HEAD,))
+            "UPDATE alembic_version SET version_num=?", (REC_AUTH_HEAD,))
         connection.commit()
     finally:
         connection.close()
@@ -1703,6 +1705,6 @@ def test_fresh_current_head_snapshot_still_passes_end_to_end(tmp_path):
     try:
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == DISPOSAL_HEAD
+        ).fetchone()[0] == REC_AUTH_HEAD
     finally:
         connection.close()

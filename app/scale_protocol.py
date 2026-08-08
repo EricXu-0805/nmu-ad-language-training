@@ -24,13 +24,18 @@ SCALE_PROTOCOL_SCHEMA_VERSION: Final = "scale-protocol-readiness.v4"
 # Code-release facts.  A manifest or HTTP client can never promote these.
 FORMAL_RESULT_CONTRACT_IMPLEMENTED: Final = True
 WORKFLOW_CONTRACT_IMPLEMENTED: Final = True
-# The generic state machine and evidence tables are implemented, but a future
-# licensed runtime must additionally prove that its item/protocol/scorer bytes
-# were content-addressed and that the frozen scheduling/assignment/deferral/
-# closeout policy is actually executed.  Presence of claimed digests in a
-# manifest is not that proof.  These stay false until those server-side
-# adapters exist and have independent release evidence.
-DEFINITION_ARTIFACT_ENFORCEMENT_IMPLEMENTED: Final = False
+# Definition-artifact enforcement is implemented (收据 150 S1+S3): the
+# production bundle loader recomputes every item/protocol/schema/scorer digest
+# from the exact bytes it interprets (assessment_bundles.compile_bundle_package
+# refuses any drift), and per-item recordings require a server-issued,
+# context-bound, single-consumption authorization receipt
+# (AssessmentRecordingAuthorization + the wired artifact_authorizer).
+# Claimed digests in a manifest still prove nothing by themselves —
+# definition_artifacts_match additionally requires the installed bundle to
+# match the manifest field-by-field.
+DEFINITION_ARTIFACT_ENFORCEMENT_IMPLEMENTED: Final = True
+# The frozen scheduling/assignment/deferral/closeout policy runtime is not
+# implemented yet (收据 150 S4); readiness stays closed until it exists.
 WORKFLOW_POLICY_ENFORCEMENT_IMPLEMENTED: Final = False
 
 _FORMAL_RESULT_CONTRACT_BLOCKER: Final = {

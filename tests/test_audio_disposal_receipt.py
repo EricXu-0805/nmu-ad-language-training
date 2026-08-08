@@ -442,8 +442,9 @@ def test_migration_downgrade_refuses_when_receipts_exist(tmp_path):
     with pytest.raises((RuntimeError, CommandError)):
         command.downgrade(config, "e4a7c1d9b206")
 
-    # 拒绝必须发生在任何 DDL 之前(SQLite 非事务 DDL,顺序 load-bearing):
-    # 版本未回退、表仍在、回执行原样。
+    # 拒绝必须发生在回执迁移自身任何 DDL 之前(SQLite 非事务 DDL,顺序
+    # load-bearing):降级从当前头合法走过其上的空证据迁移后,停在拒绝的
+    # f7c2e8a4d105;回执表仍在、回执行原样,绝不下穿。
     connection = sqlite3.connect(db_path)
     try:
         assert connection.execute(

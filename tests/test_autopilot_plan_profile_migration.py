@@ -258,10 +258,10 @@ def test_fresh_upgrade_reaches_exactly_one_new_head(tmp_path):
     db_path = _head_database(tmp_path)
     config = _config(db_path)
 
-    # 全局单一 head 不变量;当前头由 f7c2e8a4d105(删除回执账本)持有,
+    # 全局单一 head 不变量;当前头由 b8e5f2a91c07(删除回执账本)持有,
     # 本迁移必须仍在其祖先链上。
     heads = list(ScriptDirectory.from_config(config).get_heads())
-    assert heads == ["f7c2e8a4d105"]
+    assert heads == ["b8e5f2a91c07"]
     assert _revision(db_path) == HEAD
 
 
@@ -795,7 +795,7 @@ def test_legacy_null_only_roundtrip_preserves_every_old_field_and_constraint(
     assert {table: _snapshot(db_path, table) for table in tables} == (
         first_head_schema)
     assert_old_rows_and_null_profiles()
-    # 本迁移已不再是全局 head(f7c2e8a4d105 在其上),up-to-date 检查不再适用;
+    # 本迁移已不再是全局 head(b8e5f2a91c07 在其上),up-to-date 检查不再适用;
     # 往返完整性由上面的 revision/schema/行快照断言承担。
 
 

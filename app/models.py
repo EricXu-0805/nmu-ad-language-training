@@ -1130,6 +1130,67 @@ def _reject_audio_disposal_receipt_mutation(*_args) -> None:
     raise RuntimeError("AudioLocalCopyDisposalReceipt 是只追加证据，禁止更新或删除")
 
 
+class AssessmentRecordingAuthorization(SQLModel, table=True):
+    """逐题录音授权收据(收据 150 S3):服务端签发、上下文绑定、一次性消费。
+
+    绑定 patient/event/instance/item/item_revision 五元组;授权摘要不可猜测、
+    不可跨上下文复用。消费(consumed_at 落值)与响应写入同事务;响应表上的
+    authorized_artifact_digest 全局 UNIQUE 作第二道复用фence。除消费落值外
+    只追加——不得更新其余字段,不得删除。
+    """
+    __table_args__ = (
+        UniqueConstraint(
+            "authorization_digest",
+            name="uq_assessment_rec_auth_digest"),
+        Index(
+            "ix_assessment_rec_auth_instance", "instance_id", "item_key"),
+        CheckConstraint(
+            "length(authorization_digest) = 71",
+            name="ck_assessment_rec_auth_digest_length"),
+        CheckConstraint(
+            "item_revision >= 1",
+            name="ck_assessment_rec_auth_revision_positive"),
+    )
+
+    authorization_id: str = Field(primary_key=True)
+    event_id: str = Field(
+        foreign_key="assessmentevent.event_id", index=True)
+    instance_id: str = Field(
+        foreign_key="assessmentinstance.instance_id", index=True)
+    patient_id: str = Field(foreign_key="patient.patient_id", index=True)
+    item_key: str
+    item_revision: int
+    authorization_digest: str
+    issued_by: str
+    issued_at: datetime = Field(default_factory=_utc_now_naive)
+    consumed_at: Optional[datetime] = None
+
+
+@sa_event.listens_for(AssessmentRecordingAuthorization, "before_update")
+def _restrict_assessment_rec_auth_update(_mapper, _connection, target) -> None:
+    """唯一允许的更新=消费落值;其余字段不可变。"""
+    from sqlalchemy import inspect as _sa_inspect
+
+    state = _sa_inspect(target)
+    for attr in state.attrs:
+        if attr.key == "consumed_at":
+            history = attr.history
+            if history.has_changes():
+                deleted = history.deleted[0] if history.deleted else None
+                if deleted is not None:
+                    raise RuntimeError(
+                        "AssessmentRecordingAuthorization 消费事实不可改写")
+            continue
+        if attr.history.has_changes():
+            raise RuntimeError(
+                "AssessmentRecordingAuthorization 除消费落值外禁止更新")
+
+
+@sa_event.listens_for(AssessmentRecordingAuthorization, "before_delete")
+def _reject_assessment_rec_auth_delete(*_args) -> None:
+    raise RuntimeError("AssessmentRecordingAuthorization 是只追加证据，禁止删除")
+
+
 class LiveState(SQLModel, table=True):
     """仪器实时状态(单行,id=1)——跨设备同步的服务端真值。
 

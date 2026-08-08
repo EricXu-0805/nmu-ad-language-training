@@ -18,7 +18,7 @@ from app.models import ResearchUser
 from scripts import manage_users
 
 
-HEAD = "f7c2e8a4d105"
+HEAD = "b8e5f2a91c07"
 PREVIOUS_HEAD = "d8f2a6c9e104"
 
 
