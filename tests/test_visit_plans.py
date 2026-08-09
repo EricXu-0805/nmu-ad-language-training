@@ -129,6 +129,10 @@ def _login(username: str) -> TestClient:
 
 @pytest.fixture
 def visit_clients(monkeypatch, tmp_path) -> VisitClients:
+    # TODAY is selected during collection; freeze the app-facing research day
+    # so one test scenario remains coherent across 00:00 Asia/Shanghai.
+    monkeypatch.setattr(
+        visit_plan_service, "_research_today", lambda: TODAY)
     # File-backed SQLite gives concurrent HTTP requests independent connections;
     # StaticPool shares one DB-API cursor and can fabricate driver-level races.
     engine = create_engine(
