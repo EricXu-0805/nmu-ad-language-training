@@ -1408,3 +1408,55 @@ test("作答窗口定时器端口同步抛错：started 仍以 exact MIME 结算
   for (const row of run.devices.tracks) assert.equal(row.stopped, 1);
   assert.equal(run.held.releases, 1);
 });
+
+// ---------------- 安全中断 vs cancel：字节链上的对照 ----------------
+//
+// 控制器那边的"半段音频不得变成有效作答"最终要落到这两条上：interrupt() 之后一个
+// 字节都不进 outbox / 服务器，cancel() 之后整条持久化链照跑完。上面那条既有测试
+// 中断在续延恢复之前；这里补的是**已经进入 listening、作答窗口已武装、缓冲里已经
+// 有字节**的那一刻——真正的断线 / 暂停 / 床旁安全停就发生在这个窗口里。
+
+test("listening 中的安全中断：物理丢弃缓冲字节，零 stage / 零上传，stopped 落生命周期失败", async (context) => {
+  const run = await captureAtRealOnstart(context, { ownerGeneration: 41 });
+  run.device.fireStart();
+  assert.deepEqual(await run.capture.started, { mime_type: "audio/webm" });
+  assert.equal(run.events.at(-1)?.phase, "listening");
+  run.device.pushData(4);                       // 半段话已经在录音机缓冲里
+  run.clock.set(run.clock.now() + 2_000);
+
+  const disposition = run.capture.interrupt();
+
+  assert.equal(disposition, "after_start");
+  const stopError = await run.capture.stopped.then(() => null, (e: unknown) => e);
+  assert.equal((stopError as AutopilotMediaError).errorCode, "device_runtime_failed");
+  await run.capture.closed;
+
+  assert.deepEqual(run.uploadCalls, []);        // outbox / createAudio / PUT / audioSaved 全 0
+  assert.equal(run.events.some((event) => event.phase === "persisting"), false);
+  assert.equal(run.events.at(-1)?.phase, "cleared");
+  assert.equal(run.device.stops, 1);
+  for (const row of run.devices.tracks) assert.equal(row.stopped, 1);
+  assert.equal(run.held.releases, 1);
+});
+
+test("对照：真实开录后的 cancel() 就是一次成功停止——半段字节照旧 stage、上传、拿到 audioSaved", async (context) => {
+  const run = await captureAtRealOnstart(context, { ownerGeneration: 42 });
+  run.device.fireStart();
+  await run.capture.started;
+  run.device.pushData(4);
+  run.clock.set(run.clock.now() + 2_000);
+
+  run.capture.cancel();
+  await flushMicrotasks();
+  run.device.fireStop();
+
+  const facts = await run.capture.stopped;
+  await run.capture.closed;
+
+  // 这就是控制器绝不能拿 cancel() 当安全收尾的理由：屏幕说"已清空"，服务器那边
+  // 却已经存下了一次被强制中断的作答。
+  assert.equal(facts.stop_reason, "stream_end");
+  assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
+  assert.equal(run.events.some((event) => event.phase === "persisting"), false);
+  assert.equal(run.events.at(-1)?.phase, "cleared");
+});

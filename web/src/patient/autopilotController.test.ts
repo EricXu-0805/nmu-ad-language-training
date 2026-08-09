@@ -3020,3 +3020,416 @@ test("零替换（真 delivery 的 WeakSet 认领成立、但候选 entry.ownerK
   assert.equal(media.counters.interrupts, 1);
   assertZeroSameSeqReplacement(ledger, media, state, { cancels: 0 });
 });
+
+// ---------------- 普通安全收尾：断线 / 关闭 TTS / 暂停 / 床旁安全停 / 媒体 gate ----------------
+//
+// 154 §4 A1 的事实链：页面生命周期已经有专用的物理丢弃路径，但断线、关闭 TTS、
+// 会话暂停、床旁 safetyStop、媒体 gate 撤销与普通 effect cleanup 仍走
+// stopAndWait() → stop() → activeMedia.cancel()。真实开录之后 cancel() 会 signal
+// stream_end：那条捕获照旧 stage、上传、拿到 audioSaved 收据，一次被强制中断的半段
+// 话就成了有效作答；stop() 又先把 controller 标成 stopped，本该发出的那条失败回执
+// 反而被吞掉。神谕：同一同步调用栈内物理关麦并丢弃字节，最多沿既有 exact-once
+// 失败链收敛；user_done / max_duration 照旧保存。
+
+/**
+ * 生产 `cancel()` 的语义替身。
+ *
+ * 真实开录之后 cancel() 就是一次成功停止：signal stream_end → stage → upload →
+ * audioSaved → stopped 带着完整收据落地。所以"半段音频没有被保存"这条断言看的是
+ * `persisted` 这条字节链，而不是 ACK 计数——服务器那边的作答在 audioSaved 就已经
+ * 存在，之后 controller 发不发 record_stopped 都晚了。字节链本身（cancel 真的持久化、
+ * interrupt 真的一个字节都不上传）由 autopilotRecordingExecutor.test.ts 的两条
+ * 对照测试证明，这里只钉控制器选哪一条路。
+ */
+function halfRecordingCapture(events: string[], options: {
+  disposition?: "before_start" | "after_start";
+  startedReal?: boolean;
+  manualClosed?: boolean;
+} = {}) {
+  const disposition = options.disposition ?? "after_start";
+  const startedReal = options.startedReal ?? true;
+  const persisted: string[] = [];
+  const counters = { interrupts: 0, cancels: 0 };
+  const discarded = new AutopilotMediaError(
+    "device_runtime_failed", "页面已离开前台，本次录音已被丢弃");
+  let resolveStarted!: (value: { mime_type: AutopilotMimeType }) => void;
+  let rejectStarted!: (error: unknown) => void;
+  let settleStopped!: (facts: Awaited<AutopilotRecordingCaptureStopped>) => void;
+  let rejectStopped!: (error: unknown) => void;
+  let resolveClosed!: () => void;
+  const started = new Promise<{ mime_type: AutopilotMimeType }>((resolve, reject) => {
+    resolveStarted = resolve;
+    rejectStarted = reject;
+  });
+  const stopped = new Promise<Awaited<AutopilotRecordingCaptureStopped>>(
+    (resolve, reject) => {
+      settleStopped = resolve;
+      rejectStopped = reject;
+    });
+  const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+  stopped.catch(() => {});
+  if (startedReal) resolveStarted({ mime_type: "audio/webm" });
+  const settleClosed = () => { if (!options.manualClosed) resolveClosed(); };
+  return {
+    persisted,
+    counters,
+    releaseClosed: () => { resolveClosed(); },
+    capture: {
+      started,
+      stopped,
+      closed,
+      locallyStarted: startedReal,
+      interrupt: () => {
+        counters.interrupts += 1;
+        events.push("record:mic-physically-stopped");
+        if (!startedReal) rejectStarted(discarded);
+        rejectStopped(discarded);
+        settleClosed();
+        return disposition;
+      },
+      cancel: () => {
+        counters.cancels += 1;
+        events.push("record:cancel");
+        if (!startedReal) {
+          rejectStarted(new DOMException("录音命令已取消", "AbortError"));
+          rejectStopped(new DOMException("录音命令已取消", "AbortError"));
+          settleClosed();
+          return;
+        }
+        // 真实开录之后的 cancel = signal stream_end：半段字节走完整持久化链。
+        persisted.push("stage", "upload", "audio_saved");
+        settleStopped({
+          stop_reason: "stream_end",
+          raw_audio_id: "raw-controller-issued-0001",
+          receipt_server_seq: 12,
+          checksum: CHECKSUM,
+          byte_count: 1_024,
+          duration_seconds: 1.2,
+        });
+        settleClosed();
+      },
+    },
+  };
+}
+
+/**
+ * 推进到"真实开录已成、record_started 已被服务器确认并采纳"的那一瞬间。
+ *
+ * 只等 `acks.length` 是不够的：那条 ACK 被 push 进数组时 sendAck 的 reducer 还没跑，
+ * 中断落在那条缝里测的就不是"已有权威 started 之后"这个前提了。判据取控制器自己
+ * 推进过的序号，再多空转几拍让采纳落定。
+ */
+async function pumpToConfirmedStart(
+  controller: PatientAutopilotController,
+  acks: AutopilotAck[],
+  startSeq = 2,
+): Promise<void> {
+  for (let turn = 0; turn < 80
+    && !(acks.length > 0 && controller.state.last_device_event_seq > startSeq);
+    turn += 1) {
+    await Promise.resolve();
+  }
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started"]);
+  assert.notEqual(controller.state.phase, "paused", "中断前必须停在真实录音中");
+}
+
+test("真实开录后普通清理(stopAndWait)：物理丢弃恰好一次、零 cancel、零字节持久化，只补唯一那条失败回执", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = halfRecordingCapture(events);
+  const authority = durableAuthorityDelivery(events, acks);
+  const controller = new PatientAutopilotController({
+    sessionId: "S-SAFE-CLEANUP",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    ackDelivery: authority.delivery,
+    idempotencyKey: fixedAckKey,
+  });
+
+  const polling = controller.pollOnce();
+  await pumpToConfirmedStart(controller, acks);
+  const shutdown = controller.stopAndWait();
+  const state = await settleOrWedge(polling);
+  await shutdown;
+
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.deepEqual(media.persisted, []);          // 半段字节零 stage / 零上传 / 零 audioSaved
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_failed"]);
+  const failed = acks[1];
+  if (failed?.ack_type === "record_failed") {
+    assert.equal(failed.error_code, "device_runtime_failed");
+    // 失败绑在服务器自己签发的 started revision 上，客户端不合成。
+    assert.equal(failed.command_revision, 1);
+  }
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "record_failed");
+});
+
+test("暂停收尾：麦克风同步关掉，失败回执排在 closed 之后；shutdown 未收口前不得放行 drain", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = halfRecordingCapture(events, { manualClosed: true });
+  const authority = durableAuthorityDelivery(events, acks);
+  let nextCalls = 0;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-SAFE-PAUSE",
+    transport: {
+      next: async () => { nextCalls += 1; return recordCommand(); },
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    ackDelivery: authority.delivery,
+    idempotencyKey: fixedAckKey,
+  });
+
+  const polling = controller.pollOnce();
+  await pumpToConfirmedStart(controller, acks);
+  let shutdownSettled = false;
+  const shutdown = controller.stopAndWait().then(() => { shutdownSettled = true; });
+  for (let turn = 0; turn < 50; turn += 1) await Promise.resolve();
+
+  // 物理关麦已经发生，但这条捕获的 closed 还没收口：drain 依赖的这条 shutdown 绝不
+  // 能提前放行，失败回执也还没发。
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.deepEqual(media.persisted, []);
+  assert.equal(shutdownSettled, false);
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started"]);
+
+  media.releaseClosed();
+  const state = await settleOrWedge(polling);
+  await shutdown;
+
+  assert.equal(shutdownSettled, true);
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_failed"]);
+  assert.deepEqual(media.persisted, []);
+  assert.equal(state.phase, "paused");
+
+  // drain 就是在这条 shutdown 收口之后才放行的：那一刻控制器必须真的已经停住，
+  // 而不是"差一个微任务"。再 poll 一次不许碰 transport，也不许出现第二条 ACK。
+  const settledNextCalls = nextCalls;
+  await controller.pollOnce();
+  assert.equal(nextCalls, settledNextCalls);
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_failed"]);
+});
+
+test("床旁安全停(stop / stopMediaNow)：同一同步调用栈内物理关麦，半段字节零 stage、零上传", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = halfRecordingCapture(events);
+  const authority = durableAuthorityDelivery(events, acks);
+  const controller = new PatientAutopilotController({
+    sessionId: "S-SAFETY-STOP",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    ackDelivery: authority.delivery,
+    idempotencyKey: fixedAckKey,
+  });
+
+  const polling = controller.pollOnce();
+  await pumpToConfirmedStart(controller, acks);
+  controller.stop();
+  // 这三条断言与 stop() 之间没有任何 await：物理收口必须发生在同一个同步调用栈里，
+  // 不许等 React 下一帧、不许等网络。
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.deepEqual(media.persisted, []);
+
+  const state = await settleOrWedge(polling);
+  await controller.stopAndWait();
+
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_failed"]);
+  assert.deepEqual(media.persisted, []);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "record_failed");
+});
+
+test("开录前普通清理：零 started/stopped/failed，零字节，服务器命令仍留给重新激活的页面", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = halfRecordingCapture(events, {
+    disposition: "before_start", startedReal: false,
+  });
+  const authority = durableAuthorityDelivery(events, acks);
+  const controller = new PatientAutopilotController({
+    sessionId: "S-SAFE-BEFORE-START",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: {
+      start: () => {
+        events.push("record:start");
+        return media.capture;
+      },
+    },
+    ackDelivery: authority.delivery,
+    idempotencyKey: fixedAckKey,
+  });
+
+  const polling = controller.pollOnce();
+  for (let turn = 0; turn < 50 && !events.includes("record:start"); turn += 1) {
+    await Promise.resolve();
+  }
+  assert.ok(events.includes("record:start"), "capture 必须已经交给控制器");
+  const shutdown = controller.stopAndWait();
+  const state = await settleOrWedge(polling);
+  await shutdown;
+
+  assert.deepEqual(acks, []);                     // 零 started、零 stopped、零 failed
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.deepEqual(media.persisted, []);
+  assert.equal(state.last_device_event_seq, 2);   // ackDelivery 的起点，一次都没推进
+});
+
+test("重复安全收尾(断线 + 安全停 + 暂停 + 生命周期)：exact-once 物理收口、零第二条 ACK", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = halfRecordingCapture(events);
+  const authority = durableAuthorityDelivery(events, acks);
+  const controller = new PatientAutopilotController({
+    sessionId: "S-SAFE-REPEAT",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    ackDelivery: authority.delivery,
+    idempotencyKey: fixedAckKey,
+  });
+
+  const polling = controller.pollOnce();
+  await pumpToConfirmedStart(controller, acks);
+  const first = controller.stopAndWait();
+  controller.stop();
+  const second = controller.stopAndWait();
+  // 生命周期事件与普通安全收尾必须收敛到同一条 shutdown，不许各起一条。
+  const lifecycle = controller.interruptRecordingForLifecycleAndWait();
+  const state = await settleOrWedge(polling);
+  await Promise.all([first, second, lifecycle]);
+  controller.stop();
+
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.deepEqual(media.persisted, []);
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_failed"]);
+  assert.equal(state.phase, "paused");
+});
+
+test("普通安全收尾撞上已经 claim 的成功停止：join 原成功链，照常 record_stopped，零 cancel", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  let interrupts = 0;
+  // 成功停止已经同步 claim 了这条捕获（物理收麦在跑、持久化还没回来），此刻才来的
+  // 安全收尾只能 join：既不回滚已经保存的作答，也不改判成失败。
+  let settleStopped!: (facts: Awaited<AutopilotRecordingCaptureStopped>) => void;
+  let resolveClosed!: () => void;
+  const capture = {
+    started: Promise.resolve({ mime_type: "audio/webm" as const }),
+    stopped: new Promise<Awaited<AutopilotRecordingCaptureStopped>>((resolve) => {
+      settleStopped = resolve;
+    }),
+    closed: new Promise<void>((resolve) => { resolveClosed = resolve; }),
+    locallyStarted: true,
+    interrupt: () => { interrupts += 1; return "too_late" as const; },
+    cancel: () => { events.push("record:cancel"); },
+  };
+  const authority = durableAuthorityDelivery(events, acks);
+  const controller = new PatientAutopilotController({
+    sessionId: "S-SAFE-TOO-LATE",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => capture },
+    ackDelivery: authority.delivery,
+    idempotencyKey: fixedAckKey,
+  });
+
+  const polling = controller.pollOnce();
+  await pumpToConfirmedStart(controller, acks);
+  const shutdown = controller.stopAndWait();
+  assert.equal(interrupts, 1);
+  // 中断之后那条持久化链才回来：它必须照旧走完。
+  settleStopped({
+    stop_reason: "user_done",
+    raw_audio_id: "raw-controller-issued-0001",
+    receipt_server_seq: 12,
+    checksum: CHECKSUM,
+    byte_count: 1_024,
+    duration_seconds: 2.5,
+  });
+  resolveClosed();
+  const state = await settleOrWedge(polling);
+  await shutdown;
+
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_stopped"]);
+  assert.equal(interrupts, 1);
+  assert.equal(events.includes("record:cancel"), false);
+  assert.equal(state.phase, "waiting_server_after_record");
+});
+
+for (const success of [
+  { name: "user_done", stopReason: "user_done" as const },
+  { name: "max_duration", stopReason: "max_duration" as const },
+]) {
+  test(`${success.name} 正常收口：零中断、零 cancel，照常 record_stopped 保存作答`, async () => {
+    const events: string[] = [];
+    const acks: AutopilotAck[] = [];
+    let interrupts = 0;
+    const authority = durableAuthorityDelivery(events, acks);
+    const controller = new PatientAutopilotController({
+      sessionId: `S-SUCCESS-${success.name}`,
+      transport: {
+        next: async () => recordCommand(),
+        ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+      },
+      speech: { start: () => { throw new Error("不应播放"); } },
+      recording: {
+        start: () => ({
+          ...settledCapture(events, {
+            stopped: Promise.resolve({
+              stop_reason: success.stopReason,
+              raw_audio_id: "raw-controller-issued-0001",
+              receipt_server_seq: 12,
+              checksum: CHECKSUM,
+              byte_count: 1_024,
+              duration_seconds: 2.5,
+            }) as unknown as Promise<never>,
+          }),
+          interrupt: () => { interrupts += 1; return "after_start" as const; },
+        }),
+      },
+      ackDelivery: authority.delivery,
+      idempotencyKey: fixedAckKey,
+    });
+
+    const state = await settleOrWedge(controller.pollOnce());
+
+    assert.equal(interrupts, 0);
+    assert.equal(events.includes("record:cancel"), false);
+    assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_stopped"]);
+    const terminal = acks[1];
+    if (terminal?.ack_type === "record_stopped") {
+      assert.equal(terminal.stop_reason, success.stopReason);
+      assert.equal(terminal.byte_count, 1_024);
+      assert.equal(terminal.command_revision, 1);
+    }
+    assert.equal(state.phase, "waiting_server_after_record");
+  });
+}

@@ -463,7 +463,20 @@ export class PatientAutopilotController {
 
   get state(): AutopilotRuntimeState { return this.stateValue; }
 
+  /**
+   * 普通安全收尾：断线、关闭 TTS、会话暂停、床旁 safetyStop、媒体 gate 撤销。
+   *
+   * 活跃录音只能同步物理丢弃，一次都不许落到 `cancel()`——真实开录之后它会 signal
+   * `stream_end`，那条捕获照旧 stage、上传、拿到 audioSaved 收据，一次被强制中断的
+   * 半段话就成了有效作答。收敛成哪一条终态、`stopped` 什么时候置位，全交给同一条
+   * 可重入 shutdown：在这里提前置位会让 sendAck 拒发这条捕获仅欠的那一条
+   * record_failed，字节没了、服务器却什么都不知道。
+   */
   stop(): void {
+    if (this.discardableRecording()) {
+      void this.safeShutdownAndWait();
+      return;
+    }
     this.stopped = true;
     this.presentationAbort.abort(new DOMException("自动驾驶媒体已停止", "AbortError"));
     this.activeMedia?.cancel();
@@ -483,6 +496,10 @@ export class PatientAutopilotController {
    * after this promise settles, so the next tab cannot overlap speech or ACKs.
    */
   async stopAndWait(): Promise<void> {
+    // 活跃录音直接 join 那一条 shutdown，而不是先 stop() 再各自等两个 promise：
+    // 调用方（drain / owner lease 释放）等到的必须是"收敛真的完成了"，不能是
+    // 差一个微任务的巧合。
+    if (this.discardableRecording()) return this.safeShutdownAndWait();
     const running = this.inFlight;
     const media = this.activeMedia;
     this.stop();
@@ -490,6 +507,20 @@ export class PatientAutopilotController {
     if (running) pending.push(running);
     if (media) pending.push(media.closed);
     if (pending.length > 0) await Promise.allSettled(pending);
+  }
+
+  /**
+   * 能被同步物理丢弃的那条活跃录音。
+   *
+   * `activeRecording` 是真实开录之后才有的；pre-start 期间那条捕获只在
+   * `activeMedia` 上，而它同样要被物理丢弃。判据是"真的暴露了 `interrupt()`"：
+   * TTS 播放没有这个方法，旧的无 interrupt 录音适配器也没有，两者都照旧走
+   * `stop()` 里那条 cancel 路径，本单元不改它们的结局。
+   */
+  private discardableRecording(): AutopilotRecordingCapture | null {
+    const capture = this.activeRecording
+      ?? (this.activeMedia as AutopilotRecordingCapture | null);
+    return capture !== null && capture.interrupt !== undefined ? capture : null;
   }
 
   /**
@@ -507,7 +538,7 @@ export class PatientAutopilotController {
   }
 
   /**
-   * Page lifecycle said the microphone must close now.
+   * 页面生命周期或普通安全收尾判定：麦克风现在就得关。
    *
    * Physical teardown is synchronous and happens first; everything after it only
    * decides which ACK, if any, this capture still owes the server. `stopped` is
@@ -544,11 +575,21 @@ export class PatientAutopilotController {
   }
 
   /**
-   * The only lifecycle shutdown path. Repeated pagehide/freeze/unmount events
-   * reuse this one promise instead of each starting their own teardown, and it
-   * never routes through `stopAndWait()`, whose first act is to set `stopped`.
+   * 页面生命周期入口（pagehide / freeze / 卸载）。它与普通安全收尾共用下面那一条
+   * shutdown：重复事件、两种来源混着来，都只收口一次。
    */
   interruptRecordingForLifecycleAndWait(): Promise<void> {
+    return this.safeShutdownAndWait();
+  }
+
+  /**
+   * The only shutdown path that may touch a live recording. Repeated
+   * pagehide/freeze/unmount events and ordinary safety teardown (disconnect,
+   * pause, bedside safetyStop, media gate revocation, runner cleanup) all reuse
+   * this one promise instead of each starting their own, and it never routes
+   * through the plain `stop()` branch, whose first act is to set `stopped`.
+   */
+  private safeShutdownAndWait(): Promise<void> {
     if (this.lifecycleShutdown) return this.lifecycleShutdown;
     const capture = this.activeRecording ?? (this.activeMedia as AutopilotRecordingCapture | null);
     this.handleRecordingLifecycleInterruption();
