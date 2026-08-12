@@ -479,9 +479,8 @@ docker compose ps
 最后一行同理：tag 可以被移动，被移动之后没有任何本地信号，而这些 action 在 CI
 里拿得到仓库内容。它们不能比依赖松。
 
-**一份锁覆盖两条运行路径。** 锁按 `--python-version 3.12` 编译——下限取两条路径里
-最低的那个：容器底座 `python:3.12-alpine`。裸机生产机是 `/opt/nmu/python3.14`
-（2026-08-06 自编译，见 §12.5）。
+**锁以当前不可变镜像的 Python 3.12 为运行下限。** 历史裸机解释器不再是支持的发布
+路径，也不能反过来决定新镜像的依赖口径。
 
 下限不是装饰：按 3.12 编译的锁装到 3.10 上会缺 `tomli`/`exceptiongroup`/
 `async-timeout` 三个垫片，反过来则可以，所以 `supply_chain_check.py` 把
@@ -498,141 +497,33 @@ scripts/ci_gate.sh --offline    # 不出网(漏洞扫描改用存好的 OSV 应�
 
 - **锁 ↔ 运行环境**：`scripts/supply_chain_check.py --python <解释器>`。锁只在
   安装那一刻起作用；这条守的是"安装之后有没有人手工往里加东西"。已接进
-  `preflight_check.py --lock …`，因此 `deploy_baremetal.sh` 的第 7 步会自动跑。
+  `preflight_check.py --lock …`。历史 `deploy_baremetal.sh` 已硬停用，不再存在可执行的
+  rsync 发布或裸机回滚路径；不可以该历史脚本的输出充当当前发布证据。
 - **SBOM ↔ 依赖**：`scripts/generate_sbom.py --check`。改了依赖没重出 SBOM 就红。
   输出不带时间戳、serialNumber 由内容摘要推出，所以"无 diff"是个可靠判据。
 - **漏洞**：`scripts/vuln_scan.py` 打 OSV。只发包名和版本号（都是公开信息），
   不发仓库内容、不发患者字段、不带凭据。查不通网络退 2 —— 查不动就是没查过，
   不当作通过。
 
-### 12.3 升级依赖的顺序（别在部署机上 pip install）
+### 12.3 依赖升级只进入不可变镜像
 
-线上那套 venv 一旦被手工 `pip install` 过，锁就失去意义。2026-08-06 查出来的
-状态是：生产装了 71 个包，锁里只有 59 条，多出来的 20 个（`pytest`、
-`onnxruntime`、`protobuf`、`numpy`、Ubuntu 自带的 `setuptools 59.6.0`…）没人审过，
-装的时候也没有任何哈希被校验。正确做法是**重建**，不是增补：
+当前唯一发布形态是第 3、8、9 章定义的“受审查镜像 + 显式候选数据卷”。依赖升级必须在
+受控构建环境重出锁、SBOM、镜像和安全扫描结果，再以镜像 digest 进入候选环境。生产机上
+不得手工 `pip install`、新建或替换 venv、源码编译 Python、现场 build、rsync 源码、直接
+改 shebang 或用 systemd 切换一套未绑定镜像的解释器。
 
-```bash
-# 1. 本地改直接依赖，重出锁
-uv pip compile requirements-deploy.txt --universal --python-version 3.10 \
-    --generate-hashes -o requirements-deploy.lock.txt
-
-# 2. 本地过完整门禁（含 3.10 与 3.12 两个解释器上的后端全量）
-scripts/ci_gate.sh
-
-# 3. 重出 SBOM 并提交
-scripts/generate_sbom.py
-
-# 4. 在生产旁边建新 venv——这一步不碰正在跑的服务
-#    解释器用 /opt/nmu/python3.14（自编译，见 §12.5），不是系统 python3
-scp requirements-deploy.lock.txt root@<host>:/opt/nmu/
-ssh root@<host> '
-  rm -rf /opt/nmu/venv-new
-  /opt/nmu/python3.14/bin/python3 -m venv /opt/nmu/venv-new
-  /opt/nmu/venv-new/bin/pip install --upgrade pip                 # 引导；老 pip 读不了新元数据
-  /opt/nmu/venv-new/bin/pip install --require-hashes -r /opt/nmu/requirements-deploy.lock.txt
-  /opt/nmu/venv-new/bin/pip uninstall --yes pip setuptools wheel  # 引导工具不属于审计过的集合
-'
-
-# 5. 验它：装的东西与锁逐个对上，且能 import 应用
-scripts/supply_chain_check.py --python /opt/nmu/venv-new/bin/python   # 需先取到该机快照
-ssh root@<host> 'cd /opt/nmu/app && /opt/nmu/venv-new/bin/python -c "import app.main"'
-
-# 6. 停服 → 换目录 → 改回 shebang → 起服
-ssh root@<host> '
-  systemctl stop nmu.service
-  mv /opt/nmu/venv /opt/nmu/venv-old-$(date +%Y%m%d-%H%M%S)
-  mv /opt/nmu/venv-new /opt/nmu/venv
-  sed -i "1s|/opt/nmu/venv-new/bin/|/opt/nmu/venv/bin/|" /opt/nmu/venv/bin/*
-  systemctl start nmu.service
-'
-
-# 7. 验收
-ssh root@<host> '/opt/nmu/venv/bin/python /opt/nmu/app/scripts/preflight_check.py \
-    --db /opt/nmu/app/data/app.db --backup-root /opt/nmu/backups \
-    --lock /opt/nmu/app/requirements-deploy.lock.txt --base-url https://<公网入口>'
-```
-
-**第 6 步那条 `sed` 不是多余的。** pip 生成的入口脚本（`alembic`、`uvicorn`、
-`dashscope`…）把解释器绝对路径写死在 shebang 里，改名之后它们全部指向一个不存在
-的目录。`nmu.service` 已经改成走 `python -m uvicorn` 来免疫这一类，但直接敲
-`/opt/nmu/venv/bin/alembic` 的人还是会撞上。
-
-回滚就是把 `venv-old-*` 换回去。旧目录留着，确认稳定再删。
-
-**故意不装的东西**：`piper-tts` 及其一串（`onnxruntime`/`numpy`/`protobuf`/
-`sympy`/`mpmath`/`flatbuffers`/`coloredlogs`/`humanfriendly`）。生产机上从来
-没有 `data/tts/*.onnx` 语音模型，piper 引擎的 `available()` 恒假，这八个包是
-纯粹的攻击面。真要本地兜底音色，得同时交付模型文件和 GPL 合规材料（见自检
-清单里那条），届时把 `piper-tts` 加进 `requirements-deploy.txt` 重出锁。
-`python-multipart` 同理：全仓库没有一处 `UploadFile`/`Form`/`File`。
+2026-08-06 的裸机 venv 和自编译 Python 记录只作为历史事故背景保存于版本历史，不再
+提供可复制执行的命令。`scripts/deploy_baremetal.sh` 也只剩不可绕过的停用 stub。
 
 ### 12.4 已知的、还没解决的
 
-- **自编译的解释器要自己盯安全更新**（§12.5）。这是用"不引入第三方 APT 源"换来的，
-  没有 apt 会替我们推 CPython 的安全修复。
-- **底座镜像里的系统包没有本地扫描。** OSV 认不了 OCI digest。CI 的 `image`
-  作业用 trivy 扫构建产物；本机没有等价步骤，所以 `ci_gate.sh` 通过**不代表**
-  镜像干净。而且当前线上是裸机，镜像并不在服务路径上。
-- ~~裸机那台机器的操作系统包（apt）不在任何清单里。~~ 2026-08-06 起有两道：
-  `scripts/os_security_check.py` 拿 apt 自己的账判"安全更新积压 = 0"（preflight
-  `--os` 与部署门禁自动跑；每周二 05:50 上海时间 `nmu-os-security.timer` 落
-  `os-security.state` + dpkg 全量清单）。**故意不用 OSV 扫 dpkg**：实测打满补丁的
-  包只剩 0–2 条"Ubuntu 已知、按优先级不修"的记录，OSV 能给的可执行信号 ≈ apt 的
-  security 积压数，其余全是 Ubuntu 已分诊的噪声。可执行的数字直接问 apt 拿。
-  注意 `APT::Periodic::Unattended-Upgrade` 在这台机器上是 **0**（只刷列表不安装，
-  与 OpenClaw 2026-07-15 auto-update 事故后的"手动升级"方针一致）——所以补丁要靠
-  人应门禁的红灯去装，门禁只负责让积压藏不住。
-
-### 12.5 裸机的 Python 是自己编的（2026-08-06）
-
-原来跑的是 Ubuntu 22.04 自带的 3.10.12，官方支持 2026-10 到期。选了从源码编译
-3.14.7 装到 `/opt/nmu/python3.14`，没有加 deadsnakes PPA——给一台跑真实受试者
-数据的机器增加一个第三方 APT 源，等于把每一次 apt 升级的信任面扩大到那个源的
-维护者；自己编译只需要信任 python.org 一家，而那一家本来就必须信。
-
-**代价写在前面：从此没有 apt 替我们打补丁。** CPython 出安全修复时，得有人重跑
-一遍下面的流程。这是这个选择的全部成本，不写下来就等于没选。
-
-- **怎么看有没有新版**：<https://www.python.org/downloads/> 的 3.14 分支，或
-  <https://mail.python.org/mailman3/lists/security-announce.python.org/>。
-  每次上线时 preflight 会打印当前解释器版本（`依赖与哈希锁一致: Python 3.14.7，…`），
-  那是最省事的提醒点。
-- **重跑的完整流程**（换个版本号即可）：
-
-```bash
-# 1. 下载 + 验签。3.14 起 python.org 不再发 GPG 签名(PEP 761)，改用 sigstore。
-#    --cert-identity 要去 https://www.python.org/downloads/metadata/sigstore/
-#    查当期 release manager，别照抄——3.14/3.15 是 hugo@python.org，更早的不是。
-curl -O https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tgz
-curl -O https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tgz.sigstore
-python -m sigstore verify identity --bundle Python-3.14.7.tgz.sigstore \
-    --cert-identity hugo@python.org \
-    --cert-oidc-issuer https://github.com/login/oauth Python-3.14.7.tgz
-
-# 2. 传上去，核对摘要一致后编译
-scp Python-3.14.7.tgz root@<host>:/opt/nmu/
-ssh root@<host> '
-  cd /opt/nmu/build && tar xzf /opt/nmu/Python-3.14.7.tgz && cd Python-3.14.7
-  ./configure --prefix=/opt/nmu/python3.14 --with-ensurepip=install
-  make -j2 && make install
-'
-
-# 3. 必须逐个确认起得来的模块——少一个 _sqlite3 或 _ssl，服务要到运行时才炸
-ssh root@<host> '/opt/nmu/python3.14/bin/python3 -c "
-import ssl, sqlite3, lzma, bz2, zlib, ctypes, readline, hashlib, decimal, uuid
-print(ssl.OPENSSL_VERSION)"'
-
-# 4. 然后照 §12.3 第 4 步往下走，用新解释器重建 venv
-```
-
-**故意不加 `--enable-optimizations`**：PGO 要在构建期跑一遍测试套件，LTO 链接吃
-内存，而这台机器是 2 核 1 GB（swap 545 MB）。少 10–20% 的解释器速度对这套负载
-（单 worker、几位老人、瓶颈在网络和云 TTS）没有意义，构建期 OOM 才有意义。
-
-编译工具链（`build-essential` 等，全部来自 Ubuntu 官方源，没有第三方 repo）留在
-机器上了，方便下次重编。要收掉：`apt-get remove --purge build-essential`——运行期
-库是独立的包，拆掉编译器不影响已经装好的解释器。
+- **底座镜像里的系统包没有完整本地扫描。** CI 的 `image` 作业用 trivy 扫构建产物；
+  本机门禁通过不代表候选镜像已经完成扫描，更不代表养老院发布获批。
+- **具名外部批准验证器尚未冻结。** `preflight_check.py --release` 目前会验证自动检查和
+  证据字节绑定，但必定在“正式发布批准”处失败；在养老院、PI、伦理/隐私、法规和运维
+  的证据类型、签发主体和校验规则确定前，不得把该失败改成通过。
+- **真实目标环境的含数据恢复和回退证据仍缺失。** 本地合成备份检查不能替代第 8、9 章
+  的候选卷恢复、停写切换和回退演练。
 
 ---
 
@@ -648,8 +539,10 @@ print(ssl.OPENSSL_VERSION)"'
   同域名 wss）。SDK 端点可用 `DASHSCOPE_HTTP_BASE_URL` / `DASHSCOPE_WEBSOCKET_BASE_URL`
   覆盖。非流式 OSS 下载分支只接受 `*.aliyuncs.com`:443，且**解析到非公网 IP 直接
   拒绝**（`app/tts.py` 的 fail-closed 守卫）——不要用内网 DNS 把阿里域指向代理。
-- **全离线配置**（合规降级，不是故障态）：TTS=本地 Piper（`data/tts/*.onnx` 要带走）
-  再降浏览器语音；ASR=人工转写；判分=规则/rubric。要**显式**设
+- **全离线配置**（合规降级，不是故障态）：TTS=本地 Piper；模型必须随受审查镜像
+  或独立签名制品进入，逐字绑定摘要和许可材料，禁止手搬 `data/tts` 绕过供应链门禁；
+  generic/manual 才可再降浏览器语音，exact/autopilot 仍须按其严格合同暂停；ASR=人工
+  转写；判分=规则/rubric。要**显式**设
   `TTS_ENGINE`/`ASR_ENGINE`/`LLM_JUDGE`，不要靠删 Key 凭感觉（见 §7）。
 - **可选出网**：`discord.com`（运维告警；不通则所有 `OnFailure=` 告警变哑，需换成
   医院认可的内网告警出口——**未定，医院侧待办**）；`api.osv.dev`（漏扫有
@@ -658,13 +551,15 @@ print(ssl.OPENSSL_VERSION)"'
 
 ### 13.2 带走什么（容易漏的）
 
-- 代码 + 已构建 `web/dist` + 整个 venv（照 §12.3：别在目标机 pip install，旁路建好
-  搬运；解释器照 §12.5 或用发行版 3.12，锁两者都支持）。
-- `data/` 全目录：`app.db`、`audio/`、`tts/`（Piper 音色）、
-  **`tts-cache/`——不在常规备份内！丢了 222 句预合成话术要重新计费合成**、
-  `exports/`、`controlled-audio-exports/`。
-- `.env`（按 13.3 逐项改）、`Caddyfile`、`deploy/systemd/*`（路径写死 `/opt/nmu`、
-  `User=nmu`，目标机保持同构最省事）。
+- 已审查且按 digest 锁定的 OCI 镜像；若内网不能访问镜像仓库，只能搬运该精确镜像的
+  离线 OCI 包及其摘要、签名/来源和扫描证据，导入后重新核对 image ID。
+- 第 8 章验证通过的备份快照。目标机预建新的 external 候选卷，再按恢复 SOP 一次性重建
+  `app.db`、`audio/`、导出目录和其他受控持久数据；不得把正在使用的 `data/` 目录逐文件
+  搬过去或覆盖候选卷。TTS 缓存缺失时按批准的提供商/离线模型重新生成，不把旧缓存当作
+  可绕过来源和合规门禁的发布必需品。
+- 受审查的 `docker-compose.yml`、`Caddyfile` 和本院环境配置模板。密钥通过院方受控渠道
+  重新签发，不能从历史 `.env` 或备份中复制个人 Key。宿主调度、备份和告警配置必须按
+  目标环境另行审查，不搬运旧 `deploy/systemd/*` 作为默认答案。
 
 ### 13.3 必改配置清单
 
@@ -673,15 +568,16 @@ print(ssl.OPENSSL_VERSION)"'
   否则 cookie 发不出去，且患者端麦克风（getUserMedia 要求安全上下文）直接不可用**。
 - `Caddyfile`：取消 `# tls internal` 注释（内网无 ACME）；操作台与患者平板的浏览器
   都要信任内部 CA，这一步要写进装机 SOP。
-- systemd timer 的 `OnCalendar` 全部按 UTC 写；目标机时区若是 Asia/Shanghai，逐个换算。
-- 备份链：本机四个 timer（backup/health/capacity/restore-drill）内网照常；
+- 宿主调度器的时区、身份、最小权限和失败告警按医院环境重新冻结，不照搬历史 timer。
+- 备份链：backup/health/capacity/restore-drill 四类任务必须在院内重新布置并实演；
   **Mac 异地拉取（ssh 进公网 VPS）必断**——异地副本与 `audit-anchors.log` 异地锚定
   账本都要换到医院认可的、与主机不同故障域的位置，否则审计链外部锚定退化为摆设。
 
 ### 13.4 迁移后验收
 
-- `scripts/preflight_check.py --base-url https://<内网地址>`（自签证书会拦
-  public-surface 检查，先在信任内部 CA 的机器上跑）+ `--os`（有内网 apt 源时）。
+- 候选容器专用的只读预检执行器尚未进入镜像，当前 `--release` 也会固定停在外部批准门。
+  在这两项实现并绑定镜像 digest、候选卷和内网地址前，迁移验收保持 NO-GO；不得改用
+  目标机 venv、源码目录或历史裸机脚本绕过。
 - 跑一遍 `harness/research_rehearsal_harness`（隔离 root，不碰生产库）：零模拟开关
   下真实档案 create→approve→开场→出图→录音→转写全链，等于把「收人链路」在内网机
   上重新点火验证一次。
@@ -697,20 +593,11 @@ print(ssl.OPENSSL_VERSION)"'
 
 ## 部署自检清单
 
-下面这些里，迁移头、备份新鲜度、依赖与哈希锁一致、公网红线与受保护路由这几项
-可以先跑一条命令自动过一遍（不打任何供应商云 API，不花钱，不把文本发出去）：
-
-```bash
-.venv/bin/python scripts/preflight_check.py \
-    --db data/app.db --backup-root /opt/nmu/backups \
-    --lock requirements-deploy.lock.txt \
-    --base-url https://<公网入口>
-```
-
-`--lock` 对的是**跑这个脚本的那个解释器**，所以要用目标机上的 venv 去执行它，
-不是在开发机上跑（开发机的 `.venv` 装着 pytest 之类锁外的东西，必然不一致）。
-
-任一项 FAIL 即非零退出。其余项目仍须人工核对。
+下面项目中有一部分已有本地自动检查，但当前镜像还没有候选容器专用只读预检执行器，
+正式批准验证器也没有冻结。因此这里不再给目标机 venv/源码命令；任何人都不能用本机
+`preflight_check.py` 的绿色结果代替目标镜像、候选卷、真机或院方批准。正式自动入口完成后，
+它必须绑定同一个镜像 digest、数据库迁移头、候选卷、访问地址和发布证据索引；任一项
+FAIL 或 SKIP 都非零退出。
 
 - [ ] 仓库私有；`.env` 已 `chmod 600` 且未入库
 - [ ] Compose project 精确为 `nmu-platform`；命令和运行环境均无 `-p` / `COMPOSE_PROJECT_NAME` 覆盖；现场旧 project/卷已先盘点，没有因身份漂移新建空卷

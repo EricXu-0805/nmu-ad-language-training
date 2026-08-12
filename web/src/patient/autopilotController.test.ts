@@ -3255,6 +3255,37 @@ test("床旁安全停(stop / stopMediaNow)：同一同步调用栈内物理关�
   assert.equal(state.pause_reason, "record_failed");
 });
 
+test("老人主动暂停：同步丢弃半段字节，不伪造 record_failed 技术故障", async () => {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const media = halfRecordingCapture(events);
+  const authority = durableAuthorityDelivery(events, acks);
+  const controller = new PatientAutopilotController({
+    sessionId: "S-PATIENT-PAUSE",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    ackDelivery: authority.delivery,
+    idempotencyKey: fixedAckKey,
+  });
+
+  const polling = controller.pollOnce();
+  await pumpToConfirmedStart(controller, acks);
+  controller.stopForPatientPause();
+  // pointerdown 同步栈的红线断言。
+  assert.equal(media.counters.interrupts, 1);
+  assert.equal(media.counters.cancels, 0);
+  assert.deepEqual(media.persisted, []);
+
+  const state = await settleOrWedge(polling);
+  assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started"]);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "runtime_released");
+});
+
 test("开录前普通清理：零 started/stopped/failed，零字节，服务器命令仍留给重新激活的页面", async () => {
   const events: string[] = [];
   const acks: AutopilotAck[] = [];

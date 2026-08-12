@@ -166,6 +166,7 @@ export function useVoxRecorder(opts: {
   const startingRef = useRef(false);
   const activePermit = useRef<StartPermit | null>(null);
   const activeKind = useRef<StartKind | null>(null);
+  const patientPauseDiscardRequested = useRef(false);
 
   // 这项 effect 必须排在所有启动 effect 前：StrictMode 第二次 setup 时先恢复 mounted 真值。
   useEffect(() => {
@@ -648,7 +649,7 @@ export function useVoxRecorder(opts: {
         // 麦已关；若已经得到 blob，pendingSave 与 IndexedDB 副本均保留，允许重试同一段录音。
         recRef.current.discardActive();
         postInactive(meta.turnKey, meta.sessionId);
-        if (mountedRef.current) setSaveError(true);
+        if (mountedRef.current && !patientPauseDiscardRequested.current) setSaveError(true);
       } finally {
         armedMeta.current = null;
         activeKind.current = null;
@@ -712,6 +713,32 @@ export function useVoxRecorder(opts: {
     if (mountedRef.current) setStarting(false);
   }, []);
 
+  /**
+   * 老人主动点击暂停：同一同步调用栈里撤掉许可、关麦、丢弃当前字节。
+   * 这不是远程 idle/stopped 边沿，不能经 stopAndSave 生成一段
+   * 被强制中断的“有效作答”。已在此前完成的 durable outbox 不动。
+   */
+  const discardForPatientPause = useCallback(() => {
+    patientPauseDiscardRequested.current = true;
+    const meta = armedMeta.current;
+    blockedRemote.current = { recSeq: latest.current.recSeq };
+    setRemoteCommandBlocked(true);
+    clearRecordingLimit();
+    invalidateStart();
+    // force 同时覆盖 MediaRecorder 已进入 stopping 但尚未产生 blob
+    // 的窄窗；Recorder 会清 chunks、拒绝 stop Promise 并关所有 track。
+    recRef.current.discardActive({ force: true });
+    armedMeta.current = null;
+    activeKind.current = null;
+    if (mountedRef.current) {
+      setRecActive(false);
+      setStarting(false);
+      setMicError(false);
+      setSaveError(false);
+    }
+    if (meta) postInactive(meta.turnKey, meta.sessionId);
+  }, [clearRecordingLimit, invalidateStart, postInactive]);
+
   const permitIsCurrent = useCallback((permit: StartPermit): boolean => {
     const now = latest.current;
     if (!mountedRef.current || permit.generation !== startGeneration.current || !now.connectionReady || now.suspended || now.stopRequested) return false;
@@ -757,6 +784,7 @@ export function useVoxRecorder(opts: {
     const now = latest.current;
     if (!mountedRef.current || !deviceLease.current || !outboxReady.current || !now.connectionReady
         || recRef.current.active || savingRef.current || pendingSave.current || startingRef.current) return;
+    patientPauseDiscardRequested.current = false;
 
     // 新许可接管旧的 getUserMedia 单飞。旧流晚到会在 Recorder 内按代际立即关 track；
     // 新许可若复用了旧 promise，待其安全退场后最多再发起一次新的 getUserMedia。
@@ -977,7 +1005,7 @@ export function useVoxRecorder(opts: {
   }, []);
 
   return {
-    stopAndSave, startNow, retrySave, saving, canRetry, recActive, micError,
+    stopAndSave, discardForPatientPause, startNow, retrySave, saving, canRetry, recActive, micError,
     saveError, starting, remoteCommandBlocked, blockReason,
   };
 }

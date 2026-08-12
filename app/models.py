@@ -855,7 +855,8 @@ class InteractionEvent(SQLModel, table=True):
         CheckConstraint(
             "event_type IN ('attempt_received','asr_completed','asr_failed',"
             "'judgement_completed','judgement_failed','cue_selected',"
-            "'feedback_selected','technical_pause','researcher_takeover')",
+            "'feedback_selected','technical_pause','researcher_takeover',"
+            "'patient_requested_pause')",
             name="ck_interaction_event_type"),
     )
 
@@ -989,6 +990,55 @@ class TechnicalPauseReceipt(SQLModel, table=True):
 @sa_event.listens_for(TechnicalPauseReceipt, "before_delete")
 def _reject_technical_pause_receipt_mutation(*_args) -> None:
     raise RuntimeError("TechnicalPauseReceipt 是只追加幂等回执")
+
+
+class PatientPauseReceipt(SQLModel, table=True):
+    """Durable exact-replay receipt for one patient-requested safety pause.
+
+    Only digests of the browser request id and device capability are retained;
+    neither bearer is copied into the database.  The linked InteractionEvent
+    remains the append-only clinical/operational fact.
+    """
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "idempotency_key_sha256",
+            name="uq_patient_pause_session_idempotency"),
+        UniqueConstraint(
+            "interaction_event_id",
+            name="uq_patient_pause_interaction_event"),
+        CheckConstraint(
+            _hex64_sql("idempotency_key_sha256"),
+            name="ck_patient_pause_idempotency_hash"),
+        CheckConstraint(
+            _hex64_sql("request_hash"),
+            name="ck_patient_pause_request_hash"),
+        CheckConstraint(
+            _hex64_sql("capability_token_hash"),
+            name="ck_patient_pause_capability_hash"),
+        CheckConstraint(
+            "runtime_revision >= 1",
+            name="ck_patient_pause_runtime_revision_positive"),
+        CheckConstraint(
+            "live_seq >= 1",
+            name="ck_patient_pause_live_seq_positive"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: str = Field(foreign_key="session.session_id", index=True)
+    interaction_event_id: int = Field(
+        foreign_key="interactionevent.id", index=True)
+    idempotency_key_sha256: str = Field(index=True)
+    request_hash: str
+    capability_token_hash: str
+    runtime_revision: int
+    live_seq: int
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+@sa_event.listens_for(PatientPauseReceipt, "before_update")
+@sa_event.listens_for(PatientPauseReceipt, "before_delete")
+def _reject_patient_pause_receipt_mutation(*_args) -> None:
+    raise RuntimeError("PatientPauseReceipt 是只追加幂等回执")
 
 
 class Week1Profile(SQLModel, table=True):

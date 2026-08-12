@@ -20,6 +20,7 @@ export function RapportStage({
   connectionReady = true,
   sessionPaused = false,
   sessionTerminal = false,
+  registerImmediateDiscard,
 }: {
   rapportStep?: RapportMsg;
   sessionId: string;
@@ -27,6 +28,7 @@ export function RapportStage({
   connectionReady?: boolean;
   sessionPaused?: boolean;
   sessionTerminal?: boolean;
+  registerImmediateDiscard?: (handler: (() => void) | null) => void;
 }) {
   const presentationExpected: RapportPresentationExpectation | null =
     rapportStep && !sessionTerminal
@@ -69,7 +71,7 @@ export function RapportStage({
 
   const recording = rapportStep?.recording ?? "idle";
   const {
-    stopAndSave, retrySave, saving, canRetry, recActive, micError, saveError,
+    stopAndSave, discardForPatientPause, retrySave, saving, canRetry, recActive, micError, saveError,
     starting, remoteCommandBlocked, blockReason,
   } = useVoxRecorder({
     sessionId,
@@ -82,6 +84,10 @@ export function RapportStage({
     suspended: sessionPaused || sessionTerminal || !contentReady,
     stopRequested: isPaused || sessionTerminal || !contentReady,
   });
+  useLayoutEffect(() => {
+    registerImmediateDiscard?.(discardForPatientPause);
+    return () => registerImmediateDiscard?.(null);
+  }, [discardForPatientPause, registerImmediateDiscard]);
   const blockCopy = blockReason ? audioRecorderBlockCopy(blockReason) : null;
 
   if (sessionTerminal) {

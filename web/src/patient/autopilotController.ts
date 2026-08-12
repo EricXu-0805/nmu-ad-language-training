@@ -427,6 +427,7 @@ export class PatientAutopilotController {
   // 权威不足时被物理丢弃的那条捕获：外层 catch 绝不能再去 cancel 它。
   private discardedCapture: AutopilotRecordingCapture | null = null;
   private stopped = false;
+  private patientPauseRequested = false;
 
   constructor(options: PatientAutopilotControllerOptions) {
     this.sessionId = options.sessionId;
@@ -487,6 +488,33 @@ export class PatientAutopilotController {
         type: "technical_failure",
       });
     }
+    this.emitState();
+  }
+
+  /**
+   * Patient-origin pause is authoritative on its dedicated server route, not a
+   * synthetic media failure ACK.  Tear down bytes synchronously, fence every
+   * later ACK continuation, and show a calm externally-released local state.
+   */
+  stopForPatientPause(): void {
+    if (this.patientPauseRequested) return;
+    this.patientPauseRequested = true;
+    this.stopped = true;
+    this.presentationAbort.abort(
+      new DOMException("老人已请求暂停", "AbortError"));
+    const capture = this.discardableRecording();
+    if (capture) {
+      // Mark ownership before interrupt(): runOnce's catch must never fall back
+      // to cancel(), whose post-start meaning is "save this fragment".
+      this.discardedCapture = capture;
+      capture.interrupt?.();
+    } else {
+      this.activeMedia?.cancel();
+      this.activeMedia = null;
+    }
+    this.stateValue = autopilotRuntimeReducer(this.stateValue, {
+      type: "external_runtime_released",
+    });
     this.emitState();
   }
 
@@ -769,6 +797,10 @@ export class PatientAutopilotController {
     try {
       const observedStart = await startedOutcome;
       if (!observedStart.ok) {
+        if (this.patientPauseRequested) {
+          await playback.closed;
+          return;
+        }
         playback.cancel();
         await playback.closed;
         await this.mediaFailure("tts", observedStart.error instanceof MediaDeadlineError
@@ -825,6 +857,10 @@ export class PatientAutopilotController {
     try {
       const observedStart = await startedOutcome;
       if (!observedStart.ok) {
+        if (this.patientPauseRequested) {
+          await capture.closed;
+          return;
+        }
         // 生命周期已经同步物理关麦。原子 start fact 落地之后，能走到这里的只有
         // before_start（零字节、零 ACK：那条服务器命令仍然 pending，留给重新激活
         // 的页面自己核对）；too_late/already_interrupted 与 started 拒绝同时成立
@@ -846,6 +882,10 @@ export class PatientAutopilotController {
         startedAck = await this.sendAck(
           initial, { ack_type: "record_started", ...observedStart.value });
       } catch (error) {
+        if (this.patientPauseRequested) {
+          await capture.closed;
+          return;
+        }
         // 唯一允许的替换分支，只包住这第一次 record_started 尝试。证明成立就发
         // 那条同 seq 的生命周期失败并返回；否则不再原样重抛——异常会先撞上
         // finally 的 `await capture.closed`，而活跃捕获没人 settle closed：外层
@@ -888,6 +928,10 @@ export class PatientAutopilotController {
 
       const observedStop = await stoppedOutcome;
       if (!observedStop.ok) {
+        if (this.patientPauseRequested) {
+          await capture.closed;
+          return;
+        }
         // 判据必须 exact。旧写法在这里做 truthiness，把 too_late 一起拖进
         // device_runtime_failed：一次真实的上传/持久化失败被改标成生命周期失败，
         // 服务器看到的就是假的。

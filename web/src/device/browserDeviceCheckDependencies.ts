@@ -57,6 +57,18 @@ export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDepend
     },
     mediaDevicesAvailable: typeof navigator.mediaDevices?.getUserMedia === "function",
     mediaRecorderAvailable: typeof window.MediaRecorder === "function",
+    webLocksAvailable: typeof navigator.locks?.request === "function",
+    indexedDbAvailable: typeof window.indexedDB?.open === "function",
+    broadcastChannelAvailable: typeof window.BroadcastChannel === "function",
+    blobUrlAvailable: typeof URL.createObjectURL === "function" && typeof URL.revokeObjectURL === "function",
+    currentBuildId: __BUILD_ID__,
+    async fetchDeployedBuildId(): Promise<string | null> {
+      const response = await fetch("/build-id.txt", {
+        cache: "no-store",
+        credentials: "same-origin",
+      });
+      return response.ok ? response.text() : null;
+    },
 
     isTypeSupported: (mime) => window.MediaRecorder?.isTypeSupported?.(mime) ?? false,
 

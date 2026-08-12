@@ -85,9 +85,9 @@ VPS_CONFIG_FILES = frozenset({
     "nmu-backup.service",
     "nmu-backup.timer",
 })
-SUPPORTED_ALEMBIC_HEADS = frozenset({"b8e5f2a91c07"})
+SUPPORTED_ALEMBIC_HEADS = frozenset({"a9d2e6f4c108"})
 CURRENT_RECOVERY_SCHEMA_SHA256 = (
-    "659595f02d8486ad314f9d9ed4742968d19506fecc85885dd992884a744e028b"
+    "04cca6f638542ac54765900c09f3a8a009aa3a703a53034a9a9378ca95d83697"
 )
 REQUIRED_APPLICATION_TABLES = frozenset({
     "abnormalevent",
@@ -117,6 +117,7 @@ REQUIRED_APPLICATION_TABLES = frozenset({
     "livestate",
     "patient",
     "patientdevicecapability",
+    "patientpausereceipt",
     "patientwithdrawalevent",
     "providerreadinessprobe",
     "researchuser",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import sqlite3
 import sys
@@ -161,6 +163,110 @@ def test_skipped_groups_do_not_fail_the_run(capsys):
 
     assert code == 0
     assert capsys.readouterr().out.count("[SKIP]") == 5
+
+
+def test_require_all_and_release_fail_when_any_group_is_skipped(capsys):
+    assert preflight.main(["--require-all"]) == 1
+    assert capsys.readouterr().out.count("[SKIP]") == 5
+    assert preflight.main(["--release"]) == 1
+    assert capsys.readouterr().out.count("[SKIP]") == 5
+
+
+def _all_pass_args(tmp_path: Path) -> list[str]:
+    return [
+        "--db", str(tmp_path / "app.db"),
+        "--backup-root", str(tmp_path / "backups"),
+        "--lock", str(tmp_path / "requirements.lock"),
+        "--os",
+        "--base-url", "https://example.invalid",
+    ]
+
+
+def _make_all_automatic_groups_pass(monkeypatch) -> None:
+    monkeypatch.setattr(
+        preflight, "check_migration_head",
+        lambda _path: preflight.Check("迁移头一致", True, "head"))
+    monkeypatch.setattr(
+        preflight, "check_backup",
+        lambda _path: preflight.Check("备份新鲜度", True, "fresh"))
+    monkeypatch.setattr(
+        preflight, "check_supply_chain",
+        lambda _path, _python: preflight.Check("依赖与哈希锁一致", True, "locked"))
+    monkeypatch.setattr(
+        preflight, "check_os_security",
+        lambda: preflight.Check("OS 安全补丁", True, "current"))
+    monkeypatch.setattr(
+        preflight, "check_public_surface",
+        lambda _url: [preflight.Check("公网表面", True, "closed")])
+
+
+def test_require_all_needs_no_release_evidence_index(tmp_path, monkeypatch):
+    _make_all_automatic_groups_pass(monkeypatch)
+
+    assert preflight.main([*_all_pass_args(tmp_path), "--require-all"]) == 0
+
+
+def test_release_fails_without_evidence_even_when_every_automatic_group_passes(
+        tmp_path, monkeypatch, capsys):
+    _make_all_automatic_groups_pass(monkeypatch)
+
+    code = preflight.main([
+        *_all_pass_args(tmp_path),
+        "--release", "--release-id", "a" * 64,
+    ])
+
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "[FAIL] 发布证据精确绑定" in output
+    assert "--evidence-index" in output
+
+
+def test_release_binds_exact_bytes_but_cannot_replace_external_approval(
+        tmp_path, monkeypatch, capsys):
+    _make_all_automatic_groups_pass(monkeypatch)
+    release_id = "a" * 64
+    receipt = tmp_path / "receipt.json"
+    receipt_bytes = (json.dumps({
+        "schema_version": "nmu.synthetic-test-receipt.v1",
+        "release_id": release_id,
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    receipt.write_bytes(receipt_bytes)
+    index = tmp_path / "evidence-index.json"
+    index.write_text(json.dumps({
+        "schema_version": "nmu.release-evidence-index.v1",
+        "release_id": release_id,
+        "entries": [{
+            "kind": "synthetic-check",
+            "path": "receipt.json",
+            "sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+        }],
+    }), encoding="utf-8")
+
+    code = preflight.main([
+        *_all_pass_args(tmp_path), "--release",
+        "--release-id", release_id,
+        "--evidence-index", str(index),
+    ])
+
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "[PASS] 发布证据精确绑定" in output
+    assert "不代表外部审批有效" in output
+    assert "[FAIL] 正式发布批准" in output
+    assert "不能替代这些批准" in output
+
+
+def test_evidence_arguments_without_release_are_never_silently_ignored(
+        tmp_path, capsys):
+    code = preflight.main([
+        "--evidence-index", str(tmp_path / "missing.json"),
+        "--release-id", "a" * 64,
+    ])
+
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "[FAIL] 发布证据参数" in output
+    assert "不能静默忽略" in output
 
 
 def test_any_hard_failure_makes_the_run_nonzero(tmp_path, capsys):

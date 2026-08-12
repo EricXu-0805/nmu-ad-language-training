@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   checkAudioOutput,
+  checkBuildBinding,
+  checkBrowserSafetyFoundation,
   checkFallbackVoice,
   checkMicrophone,
   checkRecorderCodec,
   checkRuntime,
+  classifySpeakerConfirmation,
   classifyNetwork,
   classifyNoiseFloor,
   classifySampleRate,
@@ -27,6 +30,12 @@ function deps(overrides: Partial<DeviceCheckDependencies> = {}): DeviceCheckDepe
     screen: { width: 1280, height: 800, pixelRatio: 2 },
     mediaDevicesAvailable: true,
     mediaRecorderAvailable: true,
+    webLocksAvailable: true,
+    indexedDbAvailable: true,
+    broadcastChannelAvailable: true,
+    blobUrlAvailable: true,
+    currentBuildId: "12345678901234567890",
+    fetchDeployedBuildId: async () => "12345678901234567890\n",
     isTypeSupported: (mime) => mime.startsWith("audio/webm"),
     acquireMicrophone: async () => ({
       label: "内置麦克风", sampleRate: 48000, channelCount: 1,
@@ -58,6 +67,28 @@ test("insecure context fails before anything touches the microphone", () => {
 test("missing MediaRecorder is fail, complete runtime is pass", () => {
   assert.equal(checkRuntime(deps({ mediaRecorderAvailable: false })).status, "fail");
   assert.equal(checkRuntime(deps()).status, "pass");
+});
+
+test("required persistence APIs fail closed while BroadcastChannel safely degrades", () => {
+  assert.equal(checkBrowserSafetyFoundation(deps()).status, "pass");
+  for (const missing of [
+    "webLocksAvailable", "indexedDbAvailable", "blobUrlAvailable",
+  ] as const) {
+    const result = checkBrowserSafetyFoundation(deps({ [missing]: false }));
+    assert.equal(result.status, "fail");
+  }
+  const degraded = checkBrowserSafetyFoundation(deps({ broadcastChannelAvailable: false }));
+  assert.equal(degraded.status, "warn");
+  assert.match(degraded.detail, /localStorage.*服务器轮询/);
+});
+
+test("build binding accepts only the exact deployed production build", async () => {
+  assert.equal((await checkBuildBinding(deps())).status, "pass");
+  assert.equal((await checkBuildBinding(deps({ currentBuildId: "dev" }))).status, "fail");
+  assert.equal((await checkBuildBinding(deps({ fetchDeployedBuildId: async () => null }))).status, "fail");
+  assert.equal((await checkBuildBinding(deps({
+    fetchDeployedBuildId: async () => "999999999999",
+  }))).status, "fail");
 });
 
 // ---------------- 麦克风 ----------------
@@ -180,19 +211,35 @@ function mk(status: CheckResult["status"]): CheckResult {
   return { id: "x", title: "X", status, detail: "d" };
 }
 
-test("verdict: any fail dominates, then any warn, else usable", () => {
-  assert.equal(summarize([mk("pass"), mk("fail"), mk("warn")]), "not-usable");
-  assert.equal(summarize([mk("pass"), mk("warn")]), "usable-with-warnings");
-  assert.equal(summarize([mk("pass"), mk("pass")]), "usable");
+test("verdict is incomplete unless every required result exists exactly once", () => {
+  assert.equal(summarize([]), "incomplete");
+  assert.equal(summarize([mk("pass"), mk("pass")]), "incomplete");
+  const complete = [
+    "runtime", "build-binding", "browser-safety", "microphone", "codec", "sample-rate",
+    "audio-output", "fallback-voice", "network", "storage", "screen",
+    "noise-floor", "speech-level", "speaker",
+  ].map((id) => ({ id, title: id, status: "pass", detail: "ok" } as CheckResult));
+  assert.equal(summarize(complete), "basic-pass");
+  assert.equal(summarize(complete.map((row, i) => i === 1 ? { ...row, status: "warn" } : row)),
+    "basic-pass-with-warnings");
+  assert.equal(summarize(complete.map((row, i) => i === 2 ? { ...row, status: "fail" } : row)),
+    "basic-fail");
+  assert.equal(summarize([...complete, complete[0]]), "incomplete");
+});
+
+test("speaker cannot pass unless playback succeeded and a person heard it", () => {
+  assert.equal(classifySpeakerConfirmation(true, true).status, "pass");
+  assert.equal(classifySpeakerConfirmation(true, false).status, "fail");
+  assert.equal(classifySpeakerConfirmation(false, true).status, "fail");
 });
 
 test("the report is one conclusion per line and carries the user agent", () => {
   const report = formatReport("TestUA/1.0", [
     { id: "a", title: "麦克风", status: "pass", detail: "内置" },
     { id: "b", title: "网络", status: "fail", detail: "连不上" },
-  ], "not-usable", "2026-08-06T21:00:00+08:00");
+  ], "basic-fail", "2026-08-06T21:00:00+08:00");
   const lines = report.split("\n");
-  assert.match(lines[0], /不可用/);
+  assert.match(lines[0], /基础检查不通过/);
   assert.equal(lines[1], "UA: TestUA/1.0");
   assert.equal(lines[2], "✓ 麦克风: 内置");
   assert.equal(lines[3], "✗ 网络: 连不上");
@@ -203,9 +250,9 @@ test("the report is one conclusion per line and carries the user agent", () => {
 test("auto checks run in a stable order and stream results as they land", async () => {
   const seen: string[] = [];
   const run = await runAutoChecks(deps(), (r) => seen.push(r.id));
-  assert.deepEqual(seen, ["runtime", "microphone", "codec", "sample-rate",
+  assert.deepEqual(seen, ["runtime", "build-binding", "browser-safety", "microphone", "codec", "sample-rate",
     "audio-output", "fallback-voice", "network", "storage", "screen"]);
-  assert.equal(run.results.length, 9);
+  assert.equal(run.results.length, 11);
   assert.ok(run.results.every((r) => r.status === "pass"), JSON.stringify(run.results));
   assert.equal(run.micInfo?.label, "内置麦克风");
 });
@@ -229,7 +276,7 @@ test("a throwing dependency becomes that check's fail, not a crash", async () =>
   const storage = run.results.find((r) => r.id === "storage");
   assert.equal(storage?.status, "fail");
   assert.match(storage!.detail, /quota exploded/);
-  assert.equal(run.results.length, 9, "其余检查照常跑完");
+  assert.equal(run.results.length, 11, "其余检查照常跑完");
 });
 
 test("sample rate falls back to the audio context when the track hides it", async () => {

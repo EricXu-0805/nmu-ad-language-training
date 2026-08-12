@@ -110,6 +110,10 @@ _ROUTE_RULES = (
            label="回执当前自动驾驶收麦状态"),
     _route({"POST"}, r"/sessions/[^/]+/recording-authorization", AccessKind.DEVICE,
            roles=TRAINING_OPERATION_ROLES, label="检查当次录音授权"),
+    # 老人端安全停只接受当前配对 capability。路由处理器还会
+    # 硬拒绝具名账号，避免 DEVICE 双用认证层变成混淆代理。
+    _route({"POST"}, r"/sessions/[^/]+/patient-pause", AccessKind.DEVICE,
+           roles=TRAINING_OPERATION_ROLES, label="老人端暂停练习"),
     _route({"POST"}, r"/audio", AccessKind.DEVICE,
            roles=TRAINING_OPERATION_ROLES, label="登记当次录音"),
     _route({"PUT"}, r"/audio/[^/]+/blob", AccessKind.DEVICE,

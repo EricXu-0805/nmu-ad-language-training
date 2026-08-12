@@ -300,6 +300,32 @@ test("成功停止已同步调用之后，dispose 只 join：不清 chunks、不
   assert.equal(recorder.state, "disposed");          // dispose 诉求在收口后才完成
 });
 
+test("老人主动暂停可强制丢弃 stopping 窄窗：同步关 track，零 Recording 结果", async (context) => {
+  const tracks = [track(), track()];
+  const doubles = installBrowserDoubles({
+    tracks, nowMs: 1_000, manualEvents: true,
+  });
+  context.after(() => doubles.restore());
+
+  const recorder = new Recorder();
+  await recorder.prepare();
+  const device = doubles.recorders[0] as FakeRecorder;
+  const started = recorder.startPrepared();
+  device.fireStart();
+  await started;
+
+  doubles.setNow(2_000);
+  const stopping = recorder.stop();
+  recorder.discardActive({ force: true });
+  // 与 discardActive 之间没有 await：物理 track 已全部关闭。
+  assert.deepEqual(tracks.map((row) => row.stopped), [1, 1]);
+  assert.equal(recorder.state, "idle");
+  await assert.rejects(stopping, /强制取消/);
+  device.fireStop();
+  assert.equal(recorder.startedAtMs, null);
+  assert.equal(recorder.mimeType, null);
+});
+
 test("legacy start() 仍是一次调用完成开麦，外部语义不变", async (context) => {
   const doubles = installBrowserDoubles({ tracks: [track()], nowMs: 0 });
   context.after(() => doubles.restore());

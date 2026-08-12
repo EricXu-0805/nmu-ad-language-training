@@ -143,7 +143,12 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 }
 
 /* ---------- 老人端:一屏一任务、超大、高对比、零压力 ---------- */
-:root[data-scale="patient"] { --fs-root: 34px; --touch: 96px; }
+:root[data-scale="patient"] {
+  --fs-root: 34px;
+  --touch: 96px;
+  /* Fixed pause control: button content + bottom inset + a clear visual gap. */
+  --patient-pause-dock-space: calc(168px + env(safe-area-inset-bottom));
+}
 :root[data-scale="patient"] body {
   font-size: var(--fs-lg); line-height: 1.35;
   background: linear-gradient(180deg, #FBF9F4 0%, #F1EDE2 100%); min-height: 100vh;
@@ -173,7 +178,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
    题图源像素小,由 ImagePane 按视口放大;这里只管纵向分区。
    注意:不给 body 设全局 overflow:hidden——关系建立屏等文档流布局超视口时要能滚动。 */
 .patient-stage {
-  height: 100dvh; padding: 2dvh 3vw 3dvh;
+  height: 100dvh; padding: 2dvh 3vw var(--patient-pause-dock-space);
   display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
   gap: 1.6dvh; text-align: center;
   overflow-y: auto; /* 超长线索极端情况允许内部滚动,不裁字 */
@@ -211,6 +216,52 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   box-shadow: var(--shadow-sm); opacity: 0.9; z-index: var(--z-floating);
 }
 .tts-toggle:hover { opacity: 1; }
+
+/* 老人自己的安全暂停：一直在主视线下方，比“点一下开始”和
+   断线提示更高，因为断网/未激活时也必须能立即物理关麦。PIN 对话仍在其上。 */
+.patient-pause-button {
+  position: fixed;
+  left: 50%;
+  bottom: max(18px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: calc(var(--z-overlay) + 20);
+  width: min(88vw, 620px);
+  min-height: 104px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 14px 28px;
+  border: 3px solid #8b2f2f;
+  border-radius: 28px;
+  background: #fff7f2;
+  color: #6f2020;
+  box-shadow: 0 10px 28px rgba(71, 25, 25, 0.22);
+  font: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.patient-pause-button span {
+  font-size: clamp(28px, 5vw, 42px);
+  font-weight: var(--weight-bold);
+  line-height: 1.2;
+}
+.patient-pause-button small {
+  font-size: clamp(17px, 2.6vw, 23px);
+  line-height: 1.35;
+}
+.patient-pause-button.is-latched {
+  border-color: var(--c-warn);
+  background: var(--c-warn-bg);
+  color: var(--c-fg);
+  cursor: default;
+  opacity: 1;
+}
+.patient-pause-button:focus-visible {
+  outline: 5px solid var(--c-primary);
+  outline-offset: 4px;
+}
 
 /* 老人端点击式启动:明确的可点落点,替代"先摸一下屏幕"的隐性要求 */
 .tap-overlay {
@@ -904,7 +955,10 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   :root[data-scale="patient"] { --fs-root: 22px; --touch: 76px; }
   :root[data-scale="patient"] .mic { width: 84px; height: 84px; }
   :root[data-scale="patient"] .cue-slot { min-height: calc(var(--fs-root) * 1.2); }
-  .patient-stage { gap: 0.6dvh; padding: 1.2dvh 2vw 1.5dvh; }
+  .patient-stage {
+    gap: 0.6dvh;
+    padding: 1.2dvh 2vw var(--patient-pause-dock-space);
+  }
   .patient-stage-body { gap: 0.7dvh; overflow-x: hidden; overflow-y: auto; }
   .patient-stage .stage-image { min-height: 20dvh; }
   .patient-stage .stage-image[data-compact="true"] { min-height: 17dvh; }

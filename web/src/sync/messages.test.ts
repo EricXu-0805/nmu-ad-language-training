@@ -30,15 +30,23 @@ const patientRecFailure = {
 const safetyStop = {
   type: "safetyStop", sessionId: "S-1",
 };
+const patientPauseStop = {
+  type: "patientPauseStop", sessionId: "S-1",
+  idempotencyKey: "patient_pause:0123456789abcdef0123456789abcdef",
+};
 
 test("every SyncMsg variant passes a strict runtime schema", () => {
-  for (const message of [session, cursor, rapport, audioSaved, patientRec, safetyStop]) {
+  for (const message of [
+    session, cursor, rapport, audioSaved, patientRec, safetyStop, patientPauseStop,
+  ]) {
     assert.deepEqual(parseSyncMsg(message), message);
   }
 });
 
 test("every SyncMsg variant rejects extra properties", () => {
-  for (const message of [session, cursor, rapport, audioSaved, patientRec, safetyStop]) {
+  for (const message of [
+    session, cursor, rapport, audioSaved, patientRec, safetyStop, patientPauseStop,
+  ]) {
     assert.equal(parseSyncMsg({ ...message, injected: "field" }), null);
   }
 });
@@ -48,6 +56,14 @@ test("safetyStop is a closed session-bound reduction-only bus signal", () => {
   assert.equal(parseSyncMsg({ ...safetyStop, sessionId: "S-1\nother" }), null);
   // It is intentionally absent from server live-state payloads.
   assert.equal(parseSyncPayload("cursor", safetyStop), null);
+});
+
+test("patientPauseStop is exact-session, non-secret, and strictly shaped", () => {
+  assert.deepEqual(parseSyncMsg(patientPauseStop), patientPauseStop);
+  assert.equal(parseSyncMsg({
+    ...patientPauseStop, idempotencyKey: "patient_pause:not-hex",
+  }), null);
+  assert.equal(parseSyncMsg({ ...patientPauseStop, capability: "secret" }), null);
 });
 
 test("control characters, oversized identifiers and invalid sequence numbers fail closed", () => {

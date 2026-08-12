@@ -79,6 +79,9 @@ export function clearResearchBrowserState(
 ): number {
   // IndexedDB 音频恢复库刻意不在此函数作用域。未取得服务端上传回执的录音
   // 必须继续保留；退出只清 Web Storage 中的身份、游标、日志与文本缓存。
+  // nmu:patient-pause:v1 也刻意不清：它只含不透明场次号/幂等键/时间，
+  // 无 capability、PIN、音频、回答或患者资料，且 24 小时后只能 fail-closed 等工作人员。
+  // 账号退出不得把离线的老人停止意图一起删掉。
   return clearSensitiveResearchState(local) + clearSensitiveResearchState(session);
 }
 

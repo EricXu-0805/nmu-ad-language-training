@@ -65,6 +65,10 @@ import {
 import { qualityDashboardRequestPath } from "./console/quality/qualityDashboardRequestPolicy";
 import { parseSessionAiUsage, type SessionAiUsageContract } from "./console/sessionAiUsageContract";
 import type { CursorMsg } from "./sync/messages";
+import {
+  parsePatientPauseReceipt,
+  type PatientPauseReceipt,
+} from "./patient/patientPause";
 
 export { ApiError } from "./apiResponse";
 
@@ -608,6 +612,12 @@ export const api = {
   pauseSession: async (sid: string): Promise<SessionRuntimeState> =>
     parseSessionRuntimeState(await req<unknown>(
       "POST", `/sessions/${encodeURIComponent(sid)}/pause`,
+    ), sid),
+  patientPause: async (sid: string, idempotencyKey: string): Promise<PatientPauseReceipt> =>
+    parsePatientPauseReceipt(await req<unknown>(
+      "POST", `/sessions/${encodeURIComponent(sid)}/patient-pause`,
+      { idempotency_key: idempotencyKey }, DEFAULT_REQUEST_TIMEOUT_MS,
+      { device: true, deviceSessionId: sid, noStore: true },
     ), sid),
   resumeSession: async (sid: string): Promise<SessionRuntimeState> =>
     parseSessionRuntimeState(await req<unknown>(

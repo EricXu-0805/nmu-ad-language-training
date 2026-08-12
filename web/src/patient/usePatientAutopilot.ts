@@ -105,6 +105,7 @@ export interface PatientAutopilotView {
   localCapturePhase: LocalAutopilotCapturePhase | null;
   reportAssetReadiness(event: PatientAssetReadinessEvent): void;
   stopMediaNow(): void;
+  stopForPatientPauseNow(): void;
   stopRecordingNow(): void;
 }
 
@@ -708,6 +709,7 @@ export function usePatientAutopilot(input: {
     localCapturePhase,
     reportAssetReadiness,
     stopMediaNow: () => controllerRef.current?.stop(),
+    stopForPatientPauseNow: () => controllerRef.current?.stopForPatientPause(),
     stopRecordingNow: () => controllerRef.current?.stopRecordingNow(),
   };
 }

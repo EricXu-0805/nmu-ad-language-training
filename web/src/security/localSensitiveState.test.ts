@@ -55,6 +55,7 @@ test("logout clears local and session research state without touching pending au
   const session = new MemoryStorage();
   local.setItem("nmu:console:state", "patient P-1");
   local.setItem("nmu:journal:S-1", "transcript cache");
+  local.setItem("nmu:patient-pause:v1", "opaque reduction-only intent");
   session.setItem("nmu:pin", "secret");
   session.setItem("nmu:device-capability:v1", "short-lived bearer");
   // IndexedDB is a separate store and is intentionally not an argument to this cleanup.
@@ -63,6 +64,7 @@ test("logout clears local and session research state without touching pending au
   assert.equal(clearResearchBrowserState(local, session), 4);
   assert.equal(local.has("nmu:console:state"), false);
   assert.equal(local.has("nmu:journal:S-1"), false);
+  assert.equal(local.has("nmu:patient-pause:v1"), true);
   assert.equal(session.has("nmu:pin"), false);
   assert.equal(session.has("nmu:device-capability:v1"), false);
   assert.equal(pendingIndexedDbAudio.get("A-1"), "unconfirmed-audio");

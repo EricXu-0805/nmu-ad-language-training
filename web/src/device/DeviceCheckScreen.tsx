@@ -1,5 +1,6 @@
 /**
- * 设备自检页(/device-check)。研究者到现场先跑这一页,再开场次。
+ * 设备基础检查页(/device-check)。它只记录基础技术状况，
+ * 不能判定设备已可用于训练或养老院。
  * 判定全在 deviceCheck.ts;这里只是状态机:自动检查 → 安静采样 →
  * 请说话 → 提示音人工确认 → 汇总 + 可复制的记录文本。
  */
@@ -7,6 +8,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   classifyNoiseFloor,
+  classifySpeakerConfirmation,
   classifySpeechLevel,
   formatReport,
   runAutoChecks,
@@ -21,9 +23,10 @@ type Stage = "idle" | "auto" | "quiet" | "speech" | "beep" | "done";
 const STATUS_MARK = { pass: "✓", warn: "△", fail: "✗" } as const;
 const STATUS_COLOR = { pass: "#2e7d32", warn: "#b26a00", fail: "#c62828" } as const;
 const VERDICT_LABEL: Record<Verdict, string> = {
-  usable: "✓ 这台设备可以用于训练",
-  "usable-with-warnings": "△ 可以用,但注意上面的警告项",
-  "not-usable": "✗ 先解决红色项,再用这台设备",
+  "basic-pass": "✓ 基础检查通过，还需目标设备验收",
+  "basic-pass-with-warnings": "△ 基础检查有警告，不得直接投入使用",
+  "basic-fail": "✗ 基础检查不通过，不得使用这台设备",
+  incomplete: "✗ 检查未完成，不得使用这台设备",
 };
 
 export function DeviceCheckScreen() {
@@ -33,6 +36,7 @@ export function DeviceCheckScreen() {
   const [online, setOnline] = useState(navigator.onLine);
   const [copied, setCopied] = useState(false);
   const [beepPlayed, setBeepPlayed] = useState(false);
+  const [finishedAt, setFinishedAt] = useState<string | null>(null);
   const running = useRef(false);
 
   useEffect(() => {
@@ -57,6 +61,7 @@ export function DeviceCheckScreen() {
     setResults([]);
     setCopied(false);
     setBeepPlayed(false);
+    setFinishedAt(null);
     setStage("auto");
     try {
       const auto = await runAutoChecks(deps, push);
@@ -78,24 +83,22 @@ export function DeviceCheckScreen() {
         push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: "麦克风不可用,未采样。" });
         push({ id: "speech-level", title: "人声拾取", status: "fail", detail: "麦克风不可用,未采样。" });
       }
-      deps.releaseMicrophone();
       setStage("beep");
       setBeepPlayed(deps.playBeep());
     } finally {
-      running.current = false;
+      try { deps.releaseMicrophone(); }
+      finally { running.current = false; }
     }
   };
 
   const confirmBeep = (heard: boolean) => {
-    push(heard
-      ? { id: "speaker", title: "扬声器", status: "pass", detail: "人工确认听到了提示音" }
-      : { id: "speaker", title: "扬声器", status: "fail",
-          detail: "没听到提示音——检查系统音量/静音开关,语音播报会没声。" });
+    push(classifySpeakerConfirmation(beepPlayed, heard));
+    setFinishedAt(new Date().toISOString());
     setStage("done");
   };
 
   const verdict = summarize(results);
-  const report = formatReport(navigator.userAgent, results, verdict, new Date().toISOString());
+  const report = formatReport(navigator.userAgent, results, verdict, finishedAt ?? "未完成");
 
   const copy = () => {
     navigator.clipboard?.writeText(report).then(() => setCopied(true)).catch(() => {
@@ -106,11 +109,12 @@ export function DeviceCheckScreen() {
   return (
     <main className="page-shell narrow">
       <div className="page-header-block">
-        <div className="page-kicker">现场准备 · 不涉及任何受试者数据</div>
-        <h2 className="page-title">设备自检</h2>
+        <div className="page-kicker">现场准备 · 由工作人员测试</div>
+        <h2 className="page-title">设备基础检查</h2>
         <p className="page-description">
           训练开始前,用受试者将要使用的这台设备打开本页,在训练房间里跑一遍。
           约需 20 秒,期间会请你保持安静、说一句话、听一声提示音。
+          请务必由工作人员说测试句；声音只做瞬时电平采样，不保存、不上传。
         </p>
       </div>
 
@@ -140,7 +144,8 @@ export function DeviceCheckScreen() {
             {beepPlayed ? "刚才有一声提示音,你听到了吗?" : "提示音播放失败,视为没听到。"}
           </p>
           <div className="form-actions">
-            <button type="button" style={primaryBtn} onClick={() => confirmBeep(true)}>听到了</button>
+            <button type="button" style={primaryBtn} disabled={!beepPlayed}
+              onClick={() => confirmBeep(true)}>听到了</button>
             <button type="button" style={plainBtn} onClick={() => confirmBeep(false)}>没听到</button>
           </div>
         </div>
@@ -163,8 +168,12 @@ export function DeviceCheckScreen() {
       {stage === "done" && (
         <div>
           <p style={{ fontWeight: 700, fontSize: 18, color: STATUS_COLOR[
-            verdict === "usable" ? "pass" : verdict === "usable-with-warnings" ? "warn" : "fail"] }}>
+            verdict === "basic-pass" ? "pass" : verdict === "basic-pass-with-warnings" ? "warn" : "fail"] }}>
             {VERDICT_LABEL[verdict]}
+          </p>
+          <p className="muted">
+            本页只是基础技术检查，不代表已通过真实麦克风、真实扬声器、目标房间、
+            断网关麦或养老院现场验收。浏览器、系统或设备更新后必须重新检查。
           </p>
           <p className="muted">
             断网演练(人工):关掉 Wi-Fi → 顶部指示变红、训练页会提示网络中断且录音落本地暂存;

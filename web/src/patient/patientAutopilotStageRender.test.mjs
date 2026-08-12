@@ -54,6 +54,7 @@ function recordingView() {
     localCapturePhase: LISTENING,
     reportAssetReadiness: () => {},
     stopMediaNow: () => {},
+    stopForPatientPauseNow: () => {},
     stopRecordingNow: () => {},
   };
 }

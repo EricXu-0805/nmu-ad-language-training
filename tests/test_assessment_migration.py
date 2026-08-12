@@ -10,7 +10,8 @@ from sqlalchemy import create_engine, inspect, text
 
 
 PARENT = "e8a1c4b7d902"
-HEAD = "b8e5f2a91c07"
+HEAD = "a9d2e6f4c108"
+RECORDING_AUTH_REVISION = "b8e5f2a91c07"
 TABLES = {
     "assessmentevent",
     "assessmentinstance",
@@ -130,7 +131,7 @@ def test_upgrade_leaves_a_preexisting_app_logger_enabled(tmp_path):
 
 
 def test_recording_authorization_downgrade_refuses_with_evidence(tmp_path):
-    """b8e5f2a91c07 降级 fail-closed:已有授权收据即拒,且拒绝后分毫未动。"""
+    """b8e5f2a91c07 fail-closed 留在授权证据尚可解释的修订。"""
     db_path = tmp_path / "rec-auth.db"
     config = _config(db_path)
     command.upgrade(config, HEAD)
@@ -194,7 +195,8 @@ def test_recording_authorization_downgrade_refuses_with_evidence(tmp_path):
         command.downgrade(config, "f7c2e8a4d105")
     with engine.begin() as connection:
         assert connection.execute(text(
-            "SELECT version_num FROM alembic_version")).scalar() == HEAD
+            "SELECT version_num FROM alembic_version")).scalar() == (
+                RECORDING_AUTH_REVISION)
         assert connection.execute(text(
             "SELECT count(*) FROM assessmentrecordingauthorization"
         )).scalar() == 1

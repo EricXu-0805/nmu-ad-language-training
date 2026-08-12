@@ -44,6 +44,7 @@ PATIENT_REC_FAILURE_CODES = frozenset({
     "recording_authorization_failed",
 })
 _PATIENT_REC_FAILURE_ID_RE = re.compile(PATIENT_REC_FAILURE_ID_PATTERN)
+_LOWERCASE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -568,6 +569,9 @@ EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # idempotency and continue to carry only error_code.
     "technical_pause": frozenset({"error_code", "failure_id"}),
     "researcher_takeover": frozenset({"reason_code"}),
+    # 老人主动要求休息是独立安全事实，不是技术故障，
+    # 也不是中止或退出研究。账本只保留不可逆请求摘要。
+    "patient_requested_pause": frozenset({"request_id_sha256"}),
 }
 
 MANUAL_EVENT_TYPES = frozenset({
@@ -643,6 +647,14 @@ def validate_event_payload(event_type: str, payload: dict[str, Any]) -> dict[str
     unknown = set(payload) - allowed
     if unknown:
         raise ValueError(f"{event_type} payload 含未授权字段 {sorted(unknown)}")
+    if event_type == "patient_requested_pause":
+        request_id_sha256 = payload.get("request_id_sha256")
+        if (set(payload) != {"request_id_sha256"}
+                or not isinstance(request_id_sha256, str)
+                or _LOWERCASE_SHA256_RE.fullmatch(request_id_sha256) is None):
+            raise ValueError(
+                "patient_requested_pause.request_id_sha256 "
+                "必须是唯一的小写 SHA-256 摘要")
     clean: dict[str, Any] = {}
     for key, value in payload.items():
         if value is None:

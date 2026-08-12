@@ -57,7 +57,8 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      AudioCaptureReceipt, AudioLocalCopyDisposalReceipt,
                      ExportBatch, InteractionEvent,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
-                     Patient, PatientDeviceCapability, PatientWithdrawalEvent,
+                     Patient, PatientDeviceCapability, PatientPauseReceipt,
+                     PatientWithdrawalEvent,
                      RuntimeCommand, ScaleResult,
                      SessionAutopilotState,
                      SessionCloseoutReport, SessionOutcomeSummary,
@@ -8969,6 +8970,15 @@ class TechnicalPauseIn(BaseModel):
     attempt_id: int | None = PydanticField(default=None, ge=1)
 
 
+class PatientPauseIn(BaseModel):
+    """Opaque retry identity for the patient's one-way safety pause."""
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = PydanticField(
+        min_length=16, max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,199}$")
+
+
 def _technical_pause_request_hash(
         session_id: str, body: TechnicalPauseIn) -> str:
     return evidence_ledger.technical_pause_request_hash(
@@ -11877,6 +11887,223 @@ def append_interaction_presentation(
             })
     return _interaction_presentation_receipt_payload(
         receipt, event, idempotent=False)
+
+
+def _patient_pause_request_hash(session_id: str) -> str:
+    return evidence_ledger.technical_pause_request_hash(
+        session_id, {"reason_code": "patient_requested_pause"})
+
+
+def _patient_pause_receipt_payload(
+        receipt: PatientPauseReceipt, event: InteractionEvent,
+        state: SessionRuntimeState, live: LiveState,
+        *, idempotent: bool) -> dict:
+    try:
+        event_payload = evidence_ledger.validate_stored_payload(
+            event.event_type, event.payload_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "patient_pause_receipt_corrupt",
+            "message": "老人暂停回执的只追加证据已损坏",
+        }) from exc
+    session_projection = _json_load(live.session_json)
+    if (event.id != receipt.interaction_event_id
+            or event.session_id != receipt.session_id
+            or event.event_type != "patient_requested_pause"
+            or event_payload.get("request_id_sha256")
+            != receipt.idempotency_key_sha256
+            or state.session_id != receipt.session_id
+            or state.status != "paused"
+            or state.revision != receipt.runtime_revision
+            or _live_session_id(live) != receipt.session_id
+            or live.seq != receipt.live_seq
+            or not session_projection
+            or session_projection.get("paused") is not True):
+        raise HTTPException(status_code=409, detail={
+            "code": "patient_pause_replay_superseded",
+            "message": "该老人暂停回执已被后续恢复、结束或切场取代",
+        })
+    return {
+        "sessionId": receipt.session_id,
+        "status": "paused",
+        "runtimeRevision": receipt.runtime_revision,
+        "liveSeq": receipt.live_seq,
+        "eventSeq": event.event_seq,
+        "idempotent": idempotent,
+    }
+
+
+def _patient_pause_replay(
+        s: DBSession, *, session_id: str, idempotency_key_sha256: str,
+        request_hash: str, capability_token_hash: str,
+        live: LiveState) -> dict | None:
+    receipt = s.exec(select(PatientPauseReceipt).where(
+        PatientPauseReceipt.session_id == session_id,
+        PatientPauseReceipt.idempotency_key_sha256 == idempotency_key_sha256,
+    ).with_for_update()).first()
+    if receipt is None:
+        return None
+    if receipt.request_hash != request_hash:
+        raise HTTPException(status_code=409, detail={
+            "code": "patient_pause_idempotency_conflict",
+            "message": "同一老人暂停标识已绑定另一请求",
+        })
+    if receipt.capability_token_hash != capability_token_hash:
+        raise HTTPException(status_code=409, detail={
+            "code": "patient_pause_device_changed",
+            "message": "该暂停回执属于之前的配对设备，不得由新设备重放",
+        })
+    event = s.get(InteractionEvent, receipt.interaction_event_id)
+    state = s.exec(select(SessionRuntimeState).where(
+        SessionRuntimeState.session_id == session_id,
+    ).with_for_update()).first()
+    if event is None or state is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "patient_pause_receipt_corrupt",
+            "message": "老人暂停回执缺少对应证据或运行状态",
+        })
+    return _patient_pause_receipt_payload(
+        receipt, event, state, live, idempotent=True)
+
+
+@app.post("/sessions/{session_id}/patient-pause")
+def commit_patient_pause(
+        session_id: str, body: PatientPauseIn, request: Request,
+        response: Response, s: DBSession = Depends(get_session)):
+    """Immediately and durably pause the current bedside session.
+
+    This route is deliberately capability-only and one-way.  It cannot resume,
+    abort, complete, or withdraw a subject.  A fresh request fences autonomous
+    and manual processing, appends the patient fact, and pauses runtime/live in
+    one transaction; an exact retry only reads that transaction's receipt.
+    """
+    capability_token_hash = _require_device_capability_token_hash(
+        request, "暂停练习")
+    _require_capability_bound_session(
+        request, session_id, "暂停练习")
+    _reject_recovery_only_new_write(request)
+
+    # Resolve only the already-proved bound session, then reset the transaction
+    # before acquiring its subject-wide governance fence.
+    preflight_session = s.get(TrainSession, session_id)
+    if preflight_session is None:
+        raise HTTPException(404, "场次不存在")
+    patient_id = preflight_session.patient_id
+    s.rollback()
+    s.expire_all()
+
+    idempotency_key_sha256 = hashlib.sha256(
+        body.idempotency_key.encode("utf-8")).hexdigest()
+    request_hash = _patient_pause_request_hash(session_id)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+
+    with (governance_lock.subject_fence(s, patient_id),
+          _LIVE_WRITE_LOCK,
+          device_capability.serialized_mutation()):
+        sess = s.exec(select(TrainSession).where(
+            TrainSession.session_id == session_id,
+        ).with_for_update()).first()
+        if sess is None or sess.patient_id != patient_id:
+            raise HTTPException(404, "场次不存在")
+        _require_capability_bound_session(
+            request, session_id, "暂停练习")
+        _require_started_visit_plan_session(session_id, s, sess=sess)
+        live = _live_row_for_update(s)
+        if live is None:
+            raise HTTPException(status_code=409, detail={
+                "code": "patient_pause_live_state_missing",
+                "message": "当前床旁场次状态不完整，已保持本机停止",
+            })
+        _require_capability_current_live(
+            request, s, "暂停练习", live_row=live)
+        _require_capability_active_for_write(request, s, session_id)
+
+        replay = _patient_pause_replay(
+            s,
+            session_id=session_id,
+            idempotency_key_sha256=idempotency_key_sha256,
+            request_hash=request_hash,
+            capability_token_hash=capability_token_hash,
+            live=live,
+        )
+        if replay is not None:
+            s.rollback()
+            return replay
+
+        preflight_state = s.get(SessionRuntimeState, session_id)
+        if preflight_state is None or preflight_state.status != "active":
+            status = preflight_state.status if preflight_state is not None else "missing"
+            raise HTTPException(status_code=409, detail={
+                "code": "patient_pause_runtime_inactive",
+                "message": f"场次状态为 {status}；不得追加新的老人暂停事实",
+            })
+
+        try:
+            staged_autopilot_pause = (
+                autopilot_service.fence_autonomous_scope_for_external_stop(
+                    s,
+                    session_id=session_id,
+                    reason_code="patient_requested_pause",
+                    source="patient_requested_pause",
+                    actor_type="device",
+                    capability_token_hash=capability_token_hash,
+                    idempotency_token=idempotency_key_sha256,
+                )
+            )
+            if not staged_autopilot_pause:
+                # A manual path can still have ASR/judgement or pre-attempt
+                # capture work in flight.  Revoke both generations before the
+                # pause fact becomes visible.
+                evidence_ledger.invalidate_processing_claims(
+                    s, session_id=session_id)
+                evidence_ledger.invalidate_capture_processing_claims(
+                    s, session_id=session_id)
+
+            state = _runtime_row_for_update(session_id, s)
+            if state.status != "active":
+                raise HTTPException(status_code=409, detail={
+                    "code": "patient_pause_runtime_changed",
+                    "message": "场次运行状态已变化；未追加老人暂停事实",
+                })
+            _lock_evidence_session(session_id, s)
+            event = _append_interaction(
+                s, sess, "patient_requested_pause",
+                {"request_id_sha256": idempotency_key_sha256},
+            )
+            state = _pause_runtime_in_transaction(session_id, s)
+            # This projection says only that the microphone is no longer live;
+            # it never claims the interrupted fragment was saved or uploaded.
+            live.patient_rec_json = None
+            s.add(live)
+            receipt = PatientPauseReceipt(
+                session_id=session_id,
+                interaction_event_id=event.id,
+                idempotency_key_sha256=idempotency_key_sha256,
+                request_hash=request_hash,
+                capability_token_hash=capability_token_hash,
+                runtime_revision=state.revision,
+                live_seq=live.seq,
+            )
+            s.add(receipt)
+            s.commit()
+            s.refresh(event)
+            s.refresh(state)
+            s.refresh(live)
+            s.refresh(receipt)
+        except autopilot_service.AutopilotServiceError as exc:
+            _autopilot_write_failure(s, exc)
+        except IntegrityError as exc:
+            s.rollback()
+            raise HTTPException(status_code=409, detail={
+                "code": "patient_pause_concurrent_conflict",
+                "message": "老人暂停并发冲突；本机已保持停止，将继续重试",
+            }) from exc
+        except Exception:
+            s.rollback()
+            raise
+    return _patient_pause_receipt_payload(
+        receipt, event, state, live, idempotent=False)
 
 
 @app.post("/sessions/{session_id}/technical-pause")

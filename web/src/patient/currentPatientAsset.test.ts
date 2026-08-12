@@ -97,9 +97,20 @@ test("decode failure revokes the object URL and never returns a ready asset", as
 
 test("one finite deadline covers decode and revokes the object URL fail closed", async () => {
   const revoked: string[] = [];
+  const response = imageResponse();
+  Object.defineProperty(response, "blob", {
+    value: async () => new Blob(
+      [new Uint8Array([1, 2, 3, 4])],
+      { type: "image/webp" },
+    ),
+  });
   await assert.rejects(
     loadCurrentPatientAsset("S-ONE", new AbortController().signal, dependencies({
       requestTimeoutMs: 10,
+      // Keep the pre-decode path in the microtask queue. Native Response.blob()
+      // may be delayed behind the 10 ms timer when the whole suite is busy,
+      // which would test "timeout before URL creation" instead of decode cleanup.
+      fetchImpl: async () => response,
       createObjectUrl: () => "blob:decode-timeout",
       revokeObjectUrl: (url) => { revoked.push(url); },
       decodeImage: async () => new Promise(() => {}),

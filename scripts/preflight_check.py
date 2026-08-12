@@ -5,12 +5,16 @@ D2 走查那天真正只能靠人的，是麦克风、噪声、断网和老人�
 迁移头对不对、备份新不新、公网红线还在不在、受保护路由是不是真的要登录——
 都不该等到人坐在设备前面才发现。
 
-三组检查各自可跳过，任一硬失败即非零退出：
+五组自动检查各自可跳过，任一硬失败即非零退出：
   数据库   代码的 alembic 头与库里的头是否一致（只读，一条 SELECT）
   备份     复用 backup_health_check 的判据
+  依赖     已安装依赖与带哈希锁是否一致
+  操作系统 显式启用时核对安全更新和重启状态
   公网     /health 200、四条红线 404、五个安全头齐、受保护路由 401
 
 不打任何供应商的云 API：那要花钱、要把文本发出去，得由人明确发起。
+``--release`` 另加证据字节绑定；外部类型验证与具名批准者
+合同冻结前，它始终拒绝正式发布。
 """
 from __future__ import annotations
 
@@ -25,6 +29,8 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts import release_evidence
 
 REDLINE_PATHS = ("/content/item_bank_v1.json", "/openapi.json", "/docs", "/redoc")
 PROTECTED_PATHS = ("/patients", "/sessions", "/items", "/ai/provider-readiness")
@@ -215,6 +221,38 @@ def check_public_surface(base_url: str, fetch=_default_fetch, timeout: float = 1
     return checks
 
 
+def check_release_evidence(
+        evidence_index: Path | None, release_id: str | None) -> Check:
+    """Bind this release run to exact receipt bytes without judging approvals."""
+    name = "发布证据精确绑定"
+    if evidence_index is None or release_id is None:
+        return Check(
+            name, False,
+            "--release 必须同时给 --evidence-index 和 --release-id")
+    try:
+        binding = release_evidence.verify_evidence_index(
+            evidence_index, release_id)
+    except release_evidence.ReleaseEvidenceError as error:
+        return Check(name, False, f"code={error.code}")
+    return Check(
+        name,
+        True,
+        f"{binding['receipt_count']} 份 JSON 回执已逐字节绑定；"
+        f"index_sha256={binding['index_sha256']}；"
+        "只证明字节归属同一 release，不代表外部审批有效",
+    )
+
+
+def check_release_authorization_policy() -> Check:
+    """Keep direct-use release fail-closed until external authorities are bound."""
+    return Check(
+        "正式发布批准",
+        False,
+        "尚未冻结具名养老院、PI、伦理/隐私、法规和运维批准的类型专属验证器；"
+        "证据字节绑定不能替代这些批准",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=None, help="要核对迁移头的 SQLite")
@@ -225,9 +263,30 @@ def main(argv: list[str] | None = None) -> int:
                         help="查操作系统安全补丁积压（只在装了 apt 的机器上有意义）")
     parser.add_argument("--base-url", default=None, help="公网入口，例如 https://…")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--require-all", action="store_true",
+        help="严格门禁：任何未提供/未执行的检查也判失败")
+    parser.add_argument(
+        "--release", action="store_true",
+        help=("正式发布预检：包含 --require-all 和证据字节绑定；"
+              "外部批准验证器冻结前始终拒绝正式发布"))
+    parser.add_argument(
+        "--evidence-index", type=Path, default=None,
+        help="--release 使用的 nmu.release-evidence-index.v1 JSON")
+    parser.add_argument(
+        "--release-id", default=None,
+        help="--release 期望的 64 位小写 hex release id")
     args = parser.parse_args(argv)
 
     checks: list[Check] = []
+    evidence_args_present = (
+        args.evidence_index is not None or args.release_id is not None)
+    if evidence_args_present and not args.release:
+        checks.append(Check(
+            "发布证据参数",
+            False,
+            "--evidence-index/--release-id 只能与 --release 同时使用，不能静默忽略",
+        ))
     checks.append(check_migration_head(args.db) if args.db
                   else Check("迁移头一致", None, "未给 --db"))
     checks.append(check_backup(args.backup_root) if args.backup_root
@@ -240,6 +299,10 @@ def main(argv: list[str] | None = None) -> int:
         checks.extend(check_public_surface(args.base_url))
     else:
         checks.append(Check("公网表面", None, "未给 --base-url"))
+    if args.release:
+        checks.append(check_release_evidence(
+            args.evidence_index, args.release_id))
+        checks.append(check_release_authorization_policy())
 
     if args.json:
         print(json.dumps(
@@ -249,7 +312,10 @@ def main(argv: list[str] | None = None) -> int:
         for check in checks:
             print(check.line())
 
-    return 1 if any(check.ok is False for check in checks) else 0
+    strict = args.require_all or args.release
+    failed = any(check.ok is False for check in checks)
+    skipped = any(check.ok is None for check in checks)
+    return 1 if failed or (strict and skipped) else 0
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ from app.models import (
     LiveState,
     Patient,
     PatientDeviceCapability,
+    PatientPauseReceipt,
     ProviderReadinessProbe,
     ResearchUser,
     RuntimeCommand,
@@ -423,6 +424,245 @@ def _all_keys(value) -> set[str]:
     if isinstance(value, list):
         return {key for child in value for key in _all_keys(child)}
     return set()
+
+
+PATIENT_PAUSE_KEY = "patient_pause:0123456789abcdef0123456789abcdef"
+
+
+def _patient_pause(clients: ApiClients, key: str = PATIENT_PAUSE_KEY):
+    return clients.device.post(
+        f"/sessions/{SESSION_ID}/patient-pause",
+        headers=clients.device_headers,
+        json={"idempotency_key": key},
+    )
+
+
+def test_patient_pause_is_capability_only_current_live_and_exactly_idempotent(
+        api_clients: ApiClients, monkeypatch):
+    """Account/anonymous/cross-session principals never reach the safety write."""
+    account = api_clients.account.post(
+        f"/sessions/{SESSION_ID}/patient-pause",
+        json={"idempotency_key": PATIENT_PAUSE_KEY},
+    )
+    assert account.status_code == 403
+    assert account.json()["detail"]["code"] == "device_capability_required"
+    anonymous = api_clients.anonymous.post(
+        f"/sessions/{SESSION_ID}/patient-pause",
+        json={"idempotency_key": PATIENT_PAUSE_KEY},
+    )
+    assert anonymous.status_code == 401
+    cross_session = api_clients.device.post(
+        f"/sessions/{OTHER_SESSION_ID}/patient-pause",
+        headers=api_clients.device_headers,
+        json={"idempotency_key": PATIENT_PAUSE_KEY},
+    )
+    assert cross_session.status_code == 409
+    assert cross_session.json()["detail"]["code"] == "device_session_mismatch"
+
+    invalidated: list[str] = []
+    real_processing = evidence_ledger.invalidate_processing_claims
+    real_capture = evidence_ledger.invalidate_capture_processing_claims
+
+    def track_processing(*args, **kwargs):
+        invalidated.append("processing")
+        return real_processing(*args, **kwargs)
+
+    def track_capture(*args, **kwargs):
+        invalidated.append("capture")
+        return real_capture(*args, **kwargs)
+
+    monkeypatch.setattr(
+        evidence_ledger, "invalidate_processing_claims", track_processing)
+    monkeypatch.setattr(
+        evidence_ledger, "invalidate_capture_processing_claims", track_capture)
+    with Session(api_clients.engine) as session:
+        live = session.get(LiveState, 1)
+        assert live is not None
+        live.patient_rec_json = json.dumps({
+            "active": True,
+            "turnKey": "opaque-current-turn",
+            "sessionId": SESSION_ID,
+        })
+        session.add(live)
+        session.commit()
+
+    first = _patient_pause(api_clients)
+    assert first.status_code == 200, first.text
+    assert first.json() == {
+        "sessionId": SESSION_ID,
+        "status": "paused",
+        "runtimeRevision": 1,
+        "liveSeq": 2,
+        "eventSeq": 1,
+        "idempotent": False,
+    }
+    assert invalidated == ["processing", "capture"]
+
+    replay = _patient_pause(api_clients)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {**first.json(), "idempotent": True}
+    assert invalidated == ["processing", "capture"]
+    different_key = _patient_pause(
+        api_clients, "patient_pause:11111111111111111111111111111111")
+    assert different_key.status_code == 409
+    assert different_key.json()["detail"]["code"] == "patient_pause_runtime_inactive"
+
+    with Session(api_clients.engine) as session:
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        live = session.get(LiveState, 1)
+        events = list(session.exec(select(InteractionEvent).where(
+            InteractionEvent.session_id == SESSION_ID)))
+        receipts = list(session.exec(select(PatientPauseReceipt).where(
+            PatientPauseReceipt.session_id == SESSION_ID)))
+        patient = session.get(Patient, PATIENT_ID)
+        train_session = session.get(TrainSession, SESSION_ID)
+        assert runtime_state is not None
+        assert (runtime_state.status, runtime_state.revision) == ("paused", 1)
+        assert live is not None and live.patient_rec_json is None
+        assert json.loads(live.session_json or "{}")["paused"] is True
+        assert [event.event_type for event in events] == ["patient_requested_pause"]
+        assert json.loads(events[0].payload_json) == {
+            "request_id_sha256": hashlib.sha256(
+                PATIENT_PAUSE_KEY.encode("utf-8")).hexdigest(),
+        }
+        assert len(receipts) == 1
+        assert patient is not None and not (patient.withdrawal_status or "").strip()
+        assert train_session is not None
+        assert train_session.session_id == SESSION_ID  # pause never aborts/deletes the visit
+
+
+def test_patient_pause_concurrent_exact_retry_commits_one_fact(
+        api_clients: ApiClients):
+    barrier = threading.Barrier(2)
+
+    def submit():
+        barrier.wait(timeout=5)
+        with TestClient(app) as device:
+            return device.post(
+                f"/sessions/{SESSION_ID}/patient-pause",
+                headers=api_clients.device_headers,
+                json={"idempotency_key": PATIENT_PAUSE_KEY},
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _index: submit(), range(2)))
+    assert [response.status_code for response in responses] == [200, 200]
+    assert sorted(response.json()["idempotent"] for response in responses) == [False, True]
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(InteractionEvent).where(
+            InteractionEvent.event_type == "patient_requested_pause")))) == 1
+        assert len(list(session.exec(select(PatientPauseReceipt)))) == 1
+
+
+def test_patient_pause_old_receipt_cannot_authorize_a_later_pause_epoch(
+        api_clients: ApiClients):
+    first = _patient_pause(api_clients)
+    assert first.status_code == 200, first.text
+
+    resumed = api_clients.account.post(f"/sessions/{SESSION_ID}/resume")
+    assert resumed.status_code == 200, resumed.text
+    second_key = "patient_pause:22222222222222222222222222222222"
+    second = _patient_pause(api_clients, second_key)
+    assert second.status_code == 200, second.text
+
+    obsolete = _patient_pause(api_clients)
+    assert obsolete.status_code == 409
+    assert obsolete.json()["detail"]["code"] == "patient_pause_replay_superseded"
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(InteractionEvent).where(
+            InteractionEvent.event_type == "patient_requested_pause")))) == 2
+        assert len(list(session.exec(select(PatientPauseReceipt)))) == 2
+
+
+@pytest.mark.parametrize("payload", [
+    {},
+    {"request_id_sha256": None},
+    {"request_id_sha256": "A" * 64},
+    {"request_id_sha256": "a" * 63},
+])
+def test_patient_pause_ledger_requires_one_lowercase_sha256(payload):
+    with pytest.raises(ValueError, match="request_id_sha256"):
+        evidence_ledger.validate_event_payload("patient_requested_pause", payload)
+    assert evidence_ledger.validate_event_payload(
+        "patient_requested_pause", {"request_id_sha256": "a" * 64}) == {
+            "request_id_sha256": "a" * 64,
+        }
+
+
+def test_patient_pause_fences_autopilot_without_forging_technical_failure(
+        api_clients: ApiClients, monkeypatch):
+    _enable_p0a(monkeypatch)
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+
+    paused = _patient_pause(api_clients)
+    assert paused.status_code == 200, paused.text
+    with Session(api_clients.engine) as session:
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        assert control is not None
+        assert control.status == "paused"
+        assert control.current_command_id is None
+        assert control.last_error_code == "patient_requested_pause"
+        events = list(session.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == SESSION_ID).order_by(
+                AutopilotControlEvent.event_seq)))
+        assert [event.event_type for event in events] == ["start", "pause"]
+        assert json.loads(events[-1].payload_json) == {
+            "reason_code": "patient_requested_pause",
+            "source": "patient_requested_pause",
+        }
+        interactions = list(session.exec(select(InteractionEvent).where(
+            InteractionEvent.session_id == SESSION_ID)))
+        assert [event.event_type for event in interactions] == [
+            "patient_requested_pause"]
+
+
+def test_patient_pause_rolls_back_fence_event_receipt_and_runtime_together(
+        api_clients: ApiClients, monkeypatch):
+    _enable_p0a(monkeypatch)
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+    before_live = _device_live(api_clients)
+
+    def fail_after_fence(*_args, **_kwargs):
+        raise RuntimeError("patient-pause-rollback-sentinel")
+
+    monkeypatch.setattr(
+        main_module, "_pause_runtime_in_transaction", fail_after_fence)
+    with pytest.raises(RuntimeError, match="patient-pause-rollback-sentinel"):
+        _patient_pause(api_clients)
+
+    with Session(api_clients.engine) as session:
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert control is not None and control.status == "waiting_tts"
+        assert control.current_command_id is not None
+        assert runtime_state is not None
+        assert (runtime_state.status, runtime_state.revision) == ("active", 0)
+        assert list(session.exec(select(InteractionEvent).where(
+            InteractionEvent.event_type == "patient_requested_pause"))) == []
+        assert list(session.exec(select(PatientPauseReceipt))) == []
+        controls = list(session.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == SESSION_ID).order_by(
+                AutopilotControlEvent.event_seq)))
+        assert [event.event_type for event in controls] == ["start"]
+    assert _device_live(api_clients) == before_live
+
+
+def test_patient_pause_recovery_only_capability_is_rejected_before_handler(
+        api_clients: ApiClients):
+    token = api_clients.device_headers["X-Device-Capability"]
+    token_hash = device_capability.token_hash(token)
+    with Session(api_clients.engine) as session:
+        capability = session.get(PatientDeviceCapability, token_hash)
+        assert capability is not None
+        capability.recovery_only_at = datetime.now()
+        capability.active_session_key = None
+        session.add(capability)
+        session.commit()
+    denied = _patient_pause(api_clients)
+    assert denied.status_code == 401
+    assert denied.json()["code"] == "device_capability_recovery_only"
 
 
 def test_disabled_start_rolls_back_and_returns_stable_conflict(

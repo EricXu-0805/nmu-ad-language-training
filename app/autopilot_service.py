@@ -133,12 +133,14 @@ LEGACY_LLM_ANSWER_TYPES: frozenset[str] = frozenset({
 })
 _EXTERNAL_FENCE_SOURCES = frozenset({
     "patient_rec_failure",
+    "patient_requested_pause",
     "session_abort",
     "cloud_processing_consent_revoked",
     "subject_withdrawal",
 })
 _EXTERNAL_FENCE_ACTOR = {
     "patient_rec_failure": "device",
+    "patient_requested_pause": "device",
     "session_abort": "researcher",
     "cloud_processing_consent_revoked": "system",
     "subject_withdrawal": "researcher",
@@ -1901,6 +1903,7 @@ def fence_autonomous_scope_for_external_stop(
     reason_code: str,
     source: Literal[
         "patient_rec_failure",
+        "patient_requested_pause",
         "session_abort",
         "cloud_processing_consent_revoked",
         "subject_withdrawal",
@@ -1939,7 +1942,9 @@ def fence_autonomous_scope_for_external_stop(
     if actor_type == "device":
         if not capability_token_hash:
             _fail("autopilot_input_invalid", "设备停止缺少当前能力摘要")
-        if expected_item_id is None or idempotency_token is None:
+        if idempotency_token is None:
+            _fail("autopilot_input_invalid", "设备停止缺少幂等标识")
+        if source == "patient_rec_failure" and expected_item_id is None:
             _fail("autopilot_input_invalid", "设备停止缺少当前协议位置或失败幂等标识")
     elif capability_token_hash is not None:
         _fail("autopilot_input_invalid", "非设备停止不得携带设备能力")
@@ -1947,7 +1952,10 @@ def fence_autonomous_scope_for_external_stop(
         _fail("autopilot_input_invalid", "中止场次或研究撤回必须绑定具名研究者")
     if source == "cloud_processing_consent_revoked" and actor_id is not None:
         _fail("autopilot_input_invalid", "云处理撤回必须记为系统治理事实")
-    if source != "patient_rec_failure" and (
+    if source == "patient_requested_pause" and (
+            expected_item_id is not None or expected_turn_seq is not None):
+        _fail("autopilot_input_invalid", "老人主动暂停不得伪造当前题位故障")
+    if source not in {"patient_rec_failure", "patient_requested_pause"} and (
             expected_item_id is not None or expected_turn_seq is not None
             or idempotency_token is not None):
         _fail("autopilot_input_invalid", "非设备停止不得携带设备位置事实")
@@ -2804,6 +2812,8 @@ def _external_stop_pause_matches(
             or payload.get("source") not in _DRAINABLE_PAUSE_SOURCES):
         return False
     if payload["source"] == "patient_rec_failure":
+        return event.actor_type == "device" and bool(event.actor_id)
+    if payload["source"] == "patient_requested_pause":
         return event.actor_type == "device" and bool(event.actor_id)
     if payload["source"] == "cloud_processing_consent_revoked":
         return event.actor_type == "system" and event.actor_id is None

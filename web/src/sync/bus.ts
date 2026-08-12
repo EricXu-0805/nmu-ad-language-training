@@ -13,6 +13,7 @@ const CHANNEL = "nmu-session";
 const K_SESSION = "nmu:session";
 const K_CURSOR = "nmu:cursor";
 const K_RAPPORT = "nmu:rapport";
+const K_REDUCTION = "nmu:reduction-signal";
 
 export interface BusSnapshot {
   session?: SessionMsg;
@@ -40,6 +41,24 @@ class SessionBus {
   // BroadcastChannel 不把消息回投给发出它的同一个实例,而单机一条流(受试者画面
   // 与操作端同页叠层)靠这条总线双向即时送达 cursor/patientRec——故本页订阅者另行直投。
   private local = new Set<(msg: SyncMsg) => void>();
+  private reductionNonce = 0;
+
+  constructor() {
+    if (typeof window === "undefined") return;
+    window.addEventListener("storage", (event) => {
+      if (this.ch !== null || event.key !== K_REDUCTION || !event.newValue) return;
+      try {
+        const envelope = JSON.parse(event.newValue) as unknown;
+        if (envelope === null || typeof envelope !== "object" || Array.isArray(envelope)) return;
+        const row = envelope as Record<string, unknown>;
+        if (Object.keys(row).length !== 2 || !Object.hasOwn(row, "nonce")
+            || !Object.hasOwn(row, "message") || typeof row.nonce !== "string") return;
+        const parsed = parseSyncMsg(row.message);
+        if (parsed?.type !== "safetyStop" && parsed?.type !== "patientPauseStop") return;
+        this.local.forEach((handler) => handler(parsed));
+      } catch { /* malformed or blocked storage remains fail-closed */ }
+    });
+  }
 
   post(msg: SyncMsg): void {
     // 即使发件方是本地 TypeScript，也在跨窗边界再做一次 runtime 校验。
@@ -50,7 +69,17 @@ class SessionBus {
     if (safe.type === "session") localStorage.setItem(K_SESSION, JSON.stringify(safe));
     else if (safe.type === "cursor") localStorage.setItem(K_CURSOR, JSON.stringify(safe));
     else if (safe.type === "rapportStep") localStorage.setItem(K_RAPPORT, JSON.stringify(safe));
-    this.ch?.postMessage(safe);
+    if (this.ch) {
+      this.ch.postMessage(safe);
+    } else if (safe.type === "safetyStop" || safe.type === "patientPauseStop") {
+      // BroadcastChannel 不可用时，localStorage 只做瞬时唤醒。不保留减权信号，
+      // 避免研究者明确恢复后旧消息又停一次；服务端投影仍是唯一真值。
+      try {
+        const nonce = `${Date.now()}-${this.reductionNonce += 1}`;
+        localStorage.setItem(K_REDUCTION, JSON.stringify({ nonce, message: safe }));
+        localStorage.removeItem(K_REDUCTION);
+      } catch { /* sender still performs its synchronous local stop below */ }
+    }
     // 微任务投递:订阅方 setState 不在发送方调用栈里重入。
     queueMicrotask(() => this.local.forEach((h) => h(safe)));
   }

@@ -27,6 +27,7 @@ export function PatientStage({
   connectionReady = true,
   sessionPaused = false,
   sessionTerminal = false,
+  registerImmediateDiscard,
 }: {
   plan: PatientSessionPlan | null;
   cursor?: CursorMsg;
@@ -35,6 +36,7 @@ export function PatientStage({
   connectionReady?: boolean;
   sessionPaused?: boolean;
   sessionTerminal?: boolean;
+  registerImmediateDiscard?: (handler: (() => void) | null) => void;
 }) {
   const item = plan && cursor ? plan.items[cursor.itemIdx] : undefined;
   const planTurn = item && cursor ? item.turns[cursor.turnIdx] : undefined;
@@ -80,7 +82,7 @@ export function PatientStage({
   const suspended = !connectionReady || isPaused || sessionTerminal || !mediaReady;
 
   const {
-    stopAndSave, startNow, retrySave, saving, canRetry, recActive, micError,
+    stopAndSave, discardForPatientPause, startNow, retrySave, saving, canRetry, recActive, micError,
     saveError, starting, remoteCommandBlocked, blockReason,
   } = useVoxRecorder({
     sessionId, recording: cursor?.recording, recSeq: cursor?.recSeq, commandSeq: cursor?.wseq,
@@ -88,6 +90,10 @@ export function PatientStage({
     selfStartAllowed: mediaReady && cursor?.selfStart === true && !isPaused && !sessionTerminal && cursor?.screen !== "thanks" && cursor?.screen !== "done",
     stopRequested: sessionTerminal || isPaused || !mediaReady || cursor?.screen === "thanks" || cursor?.screen === "done",
   });
+  useLayoutEffect(() => {
+    registerImmediateDiscard?.(discardForPatientPause);
+    return () => registerImmediateDiscard?.(null);
+  }, [discardForPatientPause, registerImmediateDiscard]);
   const blockCopy = blockReason ? audioRecorderBlockCopy(blockReason) : null;
 
   const spotlight: Spotlight = role.startsWith("左") ? "left" : role.startsWith("右") ? "right" : role === "关系识别" ? "both" : "none";

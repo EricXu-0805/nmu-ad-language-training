@@ -41,6 +41,9 @@ export type SyncMsg =
   // 仅用于同机/同源老人端的减权安全信号：不持久化、不带业务游标，也绝不代表
   // 服务端已经暂停。操作端先靠它立刻停媒体，再由 /pause 的权威投影收口。
   | { type: "safetyStop"; sessionId: string }
+  // 老人端自己按下暂停。和 safetyStop 分开，因为它必须在每个标签页
+  // 丢弃尚未完成的录音，不得沿用人工暂停的保存语义。幂等键不是凭据。
+  | { type: "patientPauseStop"; sessionId: string; idempotencyKey: string }
   // recSeq:每次 arm 递增。armed→armed 重发(老人自停后再示意)靠它触发老人端 effect;无它则依赖值不变、麦克风永不重开。
   // selfStart:操作端按录音资格(recording_allowed)判定后下发——老人端只有收到 true 才显示
   // "点这里,开始回答"自助开录按钮。缺省/false 一律不显示(fail-closed:合规闸门不被老人端绕过)。
@@ -58,13 +61,15 @@ export type CursorMsg = Extract<SyncMsg, { type: "cursor" }>;
 export type RapportMsg = Extract<SyncMsg, { type: "rapportStep" }>;
 export type AudioSavedMsg = Extract<SyncMsg, { type: "audioSaved" }>;
 export type SafetyStopMsg = Extract<SyncMsg, { type: "safetyStop" }>;
+export type PatientPauseStopMsg = Extract<SyncMsg, { type: "patientPauseStop" }>;
 
-type SyncType = Exclude<SyncMsg["type"], "safetyStop">;
+type SyncType = Exclude<SyncMsg["type"], "safetyStop" | "patientPauseStop">;
 type UnknownRecord = Record<string, unknown>;
 
 const CONTROL_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 const SAFE_AUDIO_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
 const SAFE_FAILURE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PATIENT_PAUSE_IDEMPOTENCY_KEY = /^patient_pause:[0-9a-f]{32}$/;
 const SESSION_STATUSES = [
   "active", "paused", "intervention_completed", "completed", "aborted", "failed",
 ] as const satisfies readonly SessionRuntimeStatus[];
@@ -156,6 +161,23 @@ function parseSafetyStop(value: unknown, withType: boolean): SafetyStopMsg | nul
       || (withType && row.type !== "safetyStop")
       || !boundedText(row.sessionId, 128)) return null;
   return { type: "safetyStop", sessionId: row.sessionId };
+}
+
+function parsePatientPauseStop(
+  value: unknown,
+  withType: boolean,
+): PatientPauseStopMsg | null {
+  const row = record(value);
+  if (!row || !exactKeys(row, ["sessionId", "idempotencyKey"], [], withType)
+      || (withType && row.type !== "patientPauseStop")
+      || !boundedText(row.sessionId, 128)
+      || typeof row.idempotencyKey !== "string"
+      || !PATIENT_PAUSE_IDEMPOTENCY_KEY.test(row.idempotencyKey)) return null;
+  return {
+    type: "patientPauseStop",
+    sessionId: row.sessionId,
+    idempotencyKey: row.idempotencyKey,
+  };
 }
 
 function parseCursor(value: unknown, withType: boolean): CursorMsg | null {
@@ -286,6 +308,7 @@ export function parseSyncMsg(value: unknown): SyncMsg | null {
   switch (row.type) {
     case "session": return parseSession(row, true);
     case "safetyStop": return parseSafetyStop(row, true);
+    case "patientPauseStop": return parsePatientPauseStop(row, true);
     case "cursor": return parseCursor(row, true);
     case "rapportStep": return parseRapport(row, true);
     case "audioSaved": return parseAudioSaved(row, true);
