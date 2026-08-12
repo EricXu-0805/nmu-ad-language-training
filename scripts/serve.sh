@@ -17,6 +17,33 @@ set -euo pipefail
 umask 077
 cd "$(dirname "$0")/.."
 
+usage() {
+  cat <<'EOF'
+用法：
+  ./scripts/serve.sh                 本机双窗口
+  DEMO20=1 ./scripts/serve.sh        本机 20 题合成模拟入口
+  INTRANET=1 ./scripts/serve.sh      内网双设备技术验证
+
+选项：
+  -h, --help                         只显示本说明，不迁移数据库、不启动服务
+EOF
+}
+
+if [ "$#" -gt 0 ]; then
+  case "$1" in
+    -h|--help)
+      [ "$#" -eq 1 ] || { echo "✗ --help 后不能再带其他参数" >&2; exit 64; }
+      usage
+      exit 0
+      ;;
+    *)
+      echo "✗ 不支持的参数：$1" >&2
+      usage >&2
+      exit 64
+      ;;
+  esac
+fi
+
 PY=./.venv/bin/python
 [ -x "$PY" ] || { echo "缺 .venv,先: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt"; exit 1; }
 

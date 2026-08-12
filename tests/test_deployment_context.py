@@ -249,6 +249,36 @@ def test_local_demo20_launcher_is_explicit_and_loopback_only():
     assert "app.main:app --host 127.0.0.1 --port 8000" in launcher
 
 
+def test_local_launcher_help_is_read_only_and_unknown_arguments_fail_closed():
+    launcher_path = ROOT / "scripts" / "serve.sh"
+    launcher = launcher_path.read_text(encoding="utf-8")
+    help_gate = launcher.index('if [ "$#" -gt 0 ]; then')
+    assert help_gate < launcher.index("PY=./.venv/bin/python")
+    assert help_gate < launcher.index("alembic upgrade head")
+    assert help_gate < launcher.index("run_server()")
+
+    help_result = subprocess.run(
+        ["bash", str(launcher_path), "--help"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert help_result.returncode == 0
+    assert "不迁移数据库、不启动服务" in help_result.stdout
+    assert help_result.stderr == ""
+
+    unknown_result = subprocess.run(
+        ["bash", str(launcher_path), "--unknown"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert unknown_result.returncode == 64
+    assert "不支持的参数" in unknown_result.stderr
+
+
 def test_answer_bearing_content_is_absent_from_web_static_roots():
     package = (ROOT / "web" / "package.json").read_text(encoding="utf-8")
     vite = (ROOT / "web" / "vite.config.ts").read_text(encoding="utf-8")
