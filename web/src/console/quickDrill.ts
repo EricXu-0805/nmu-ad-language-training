@@ -4,6 +4,7 @@ import type {
   VisitPlanMutationRequest,
   VisitPlanReceipt,
 } from "../types";
+import { WEEK2_SINGLE20_DEMO_PROFILE_VERSION } from "../autopilot/demoProfile.ts";
 
 // 快速演练:把研究规范流程的「建档 → 创建安排 → 审核 → 原子开场」四步,对**模拟档案**折叠成一键。
 // ★关键不变量:不新增、不绕过任何服务端门禁——依旧逐步调用 /visit-plans 的 create/approve/start,
@@ -54,6 +55,7 @@ export async function runQuickDrill(
     week_no: QUICK_DRILL_WEEK,
     phase_type: QUICK_DRILL_PHASE,
     event_line: QUICK_DRILL_EVENT,
+    autopilot_profile_version_id: WEEK2_SINGLE20_DEMO_PROFILE_VERSION,
   });
   const approved = await client.approveVisitPlan(created.plan_id, {
     idempotency_key: `qd-approve-${keySeed}`,

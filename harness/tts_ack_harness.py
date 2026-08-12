@@ -1,14 +1,16 @@
-"""HARNESS ONLY —— 真实浏览器 TTS started/ended ACK 黄金链的本地回环合成验收入口。
+"""HARNESS ONLY —— exact demo20 TTS started/ended ACK 的本地回环验收入口。
 
 **这不是生产入口，永远不得用于真实受试者或公网部署。**
 默认的 `app.main` 完全不受影响：本模块不被 app.* 任何模块导入，只有显式运行
 `python -m harness.tts_ack_harness` 才可能生效；所有重定向与注入都只作用于本进程。
 
-它解决的唯一工程缺口：当前 shipped Week 2 内容有 60 个未结构化题位，
-`/autopilot/start` 因此固定返回 autopilot_plan_not_fully_supported（这条门禁必须保留）。
-既有 FIRST_ONLY_BANK 只活在 pytest monkeypatch 里，真实 FastAPI + 浏览器没有安全注入口。
-本入口在临时 root 内注入一个"整计划真的可执行"的单位置合成题库，让浏览器可以走完
-生产 /console、/patient、生产 autopilot/TTS/ACK 状态机。
+它解决的唯一工程缺口：当前 canonical Week 2 源协议仍有 60 个交付缺口，
+`/autopilot/start` 对默认整计划必须继续返回
+`autopilot_plan_not_fully_supported`。本入口不再替换或裁剪 canonical 题库；
+它在临时 root 内用生产 VisitPlan create→approve→start 账本，精确绑定
+`week2-single20-demo-v1`，让浏览器在不放宽任何门禁的前提下走生产
+/console、/patient 与 autopilot/TTS/ACK 状态机。这 20 题只是模拟演练范围，
+不代表源协议 80 个环节已完成。
 
 它明确不做的事：不代发 ACK、不伪造 Audio 事件、不新增诊断端点、不改任何生产文件。
 最终 ACK / RuntimeCommand / TtsServeEvidence 由验收者只读查临时 SQLite。
@@ -56,20 +58,19 @@ TTS 两种模式（NMU_HARNESS_TTS_MODE）：
 - synthetic：替身引擎 cloud=False，合成循环压根不会去查 allowlist——因为这条路径
   上没有任何文本出网，红线无事可守。唯一仍无条件查 allowlist 的是 readiness 探针
   （provider_readiness 对固定探针话术的检查），两种模式都走。
-"harness 不新增任何文本"是独立成立的另一件事：合成题库是生产题库第一个已结构化
-位置的深拷贝，所以它的话术天然是生产 allowlist 的子集（测试里直接断言了这层包含）。
+"harness 不新增任何训练文本"是独立成立的另一件事：demo20 profile
+只按不可变位置清单选择 canonical 题库里已冻结的 20 题，所有话术仍由生产
+allowlist 与行级内容合同审核。
 
-浏览器验收当前走到哪一步(2026-07-31，synthetic 模式实测)：
-在隔离 localhost、真实 Chrome、synthetic 本地确定性 TTS/ASR、零 PHI、零云的条件下，
-已跑通"一次激活 → TTS 播放 → 自动开麦 → 约 14 秒自动停止 → 上传 → receipt/ACK"
-这条技术链;过程中没有点击"说完了可以点这里"那个可选提前结束按钮。
-这条记录**只**说明该技术链在上述条件下能跑通。它明确不是:不是 Qwen 音色验收
-(synthetic 引擎不是 Qwen)、不是目标双设备/真实内网环境、不是正式受试者、
-不是生产或研究 readiness 结论;也没有抓到"正在保存"过渡态的现场截图。
+当前可自动复现的证据是：新建临时库、生产 VisitPlan 三步账本、exact demo20
+解析为 20 个位置，且生产 `/autopilot/start` 只签发第一条 TTS。升级后的
+20 题全流程真实浏览器证据必须用新 marker 重跑；2026-07-31 的旧单题记录
+不能当作当前 demo20 验收。
 
-harness 进程的每个响应都带 `X-NMU-Test-Harness: t5-one-position-v1`。**不改写 HTML
+harness 进程的每个响应都带
+`X-NMU-Test-Harness: demo20-profile-tts-ack-v1`。**不改写 HTML
 正文**——重建响应会把重复的 Set-Cookie 合并掉，登录与设备配对会因此坏掉，一个视觉
-横幅不值得这个协议风险。截图上的"单位置合成验收、非正式内容"标识由外部证据注记承担。
+横幅不值得这个协议风险。截图上的"20 题本机模拟、非正式研究"标识由外部证据注记承担。
 """
 from __future__ import annotations
 
@@ -91,7 +92,7 @@ PLATFORM_ROOT = Path(__file__).resolve().parent.parent
 PRODUCTION_DATA_DIR = PLATFORM_ROOT / "data"
 
 MARKER_HEADER = "X-NMU-Test-Harness"
-MARKER_VALUE = "t5-one-position-v1"
+MARKER_VALUE = "demo20-profile-tts-ack-v1"
 
 ROOT_ENV = "NMU_HARNESS_ROOT"
 TTS_CACHE_ENV = "NMU_HARNESS_TTS_CACHE_DIR"
@@ -104,6 +105,7 @@ HARNESS_PATIENT_ID = "SYN-T5-P001"
 DEFAULT_ACTOR = "syn-t5-admin"
 TTS_MODES = ("synthetic", "production")
 CANONICAL_BANK_PATH = PLATFORM_ROOT / "content" / "item_bank_v1.json"
+DEMO_PROFILE_VERSION = "week2-single20-demo-v1"
 _PIN_RE = re.compile(r"[0-9]{6,32}")
 
 
@@ -314,33 +316,8 @@ def resolve_config(env: Mapping[str, str] | None = None) -> HarnessConfig:
 
 
 # ----------------------------------------------------------------------------
-# 合成内容与合成 TTS
+# 合成 TTS（训练内容仍为 canonical + exact profile）
 # ----------------------------------------------------------------------------
-def synthetic_single_position_bank(bank):
-    """复用生产题库第一个已结构化位置的真实合同语义，收敛成单位置整计划。
-
-    深拷贝，绝不改 content/item_bank_v1.json；话术全部来自现有生产 allowlist，
-    没有任何新造的测试文本可以借此绕过白名单红线。
-    """
-    from copy import deepcopy
-
-    if not bank.single_element:
-        raise HarnessConfigError("生产题库没有可复用的已结构化单元素位置")
-    first = deepcopy(bank.single_element[0])
-    meta = deepcopy(bank.meta)
-    meta["source_protocol_position_count"] = 1
-    meta["source_unstructured_positions"] = []
-    from dataclasses import replace as _replace
-
-    return _replace(
-        bank,
-        single_element=[first],
-        double_element=[],
-        multi_element=[],
-        meta=meta,
-    )
-
-
 def deterministic_wav(text: str) -> bytes:
     """同一句话永远得到同一段非零 WAV；确定性、可复现、离线。"""
     digest = hashlib.sha256(text.encode("utf-8")).digest()
@@ -554,7 +531,11 @@ def _pre_app_import_guard(config: HarnessConfig) -> None:
 
 
 def install(config: HarnessConfig):
-    """导入生产 app 后，把存储与内容注入点重定向到临时 root，返回生产 FastAPI app。"""
+    """导入生产 app 后，只重定向可变存储与本地引擎。
+
+    canonical 题库 loader 保持生产原样；demo20 范围只能由 seed()
+    经生产 VisitPlan 账本绑定，不允许再用进程级题库替身进入。
+    """
     # main() 已经先过一遍；这一次是保护"直接调用 install()"的路径。
     _pre_app_import_guard(config)
 
@@ -564,7 +545,7 @@ def install(config: HarnessConfig):
 
     _assert_imported_engine_binding(config, db)
 
-    from app import asr, audio_store, content, export, tts
+    from app import asr, audio_store, export, tts
     from app.main import app
 
     for directory in (config.audio_dir, config.tts_cache_dir, config.asr_scratch_dir,
@@ -576,10 +557,6 @@ def install(config: HarnessConfig):
     asr.SCRATCH_DIR = config.asr_scratch_dir
     export.EXPORT_DIR = config.export_dir
     export.CONTROLLED_AUDIO_DIR = config.controlled_export_dir
-
-    original_loader = content.load_item_bank
-    bank = synthetic_single_position_bank(original_loader(CANONICAL_BANK_PATH))
-    content.load_item_bank = canonical_bank_loader(original_loader, bank)
 
     if config.tts_mode == "synthetic":
         tts._engine = None
@@ -633,7 +610,7 @@ def migrate(config: HarnessConfig) -> None:
 
 
 def seed(config: HarnessConfig) -> dict[str, str]:
-    """建临时 admin + 模拟受试者，并用生产 create→approve→start 原子建场。"""
+    """建临时 admin + 模拟受试者，并用生产账本建 exact demo20 场。"""
     # 直接调用 seed() 的路径同样要过闸，不能靠"调用者一定先调过 install"。
     _pre_app_import_guard(config)
 
@@ -645,8 +622,8 @@ def seed(config: HarnessConfig) -> dict[str, str]:
 
     from sqlmodel import Session, select
 
-    from app import auth, visit_plan_service
-    from app.models import Patient, ResearchUser
+    from app import auth, autopilot_plan_profiles, visit_plan_service
+    from app.models import Patient, ResearchUser, VisitPlan
     from app.models import Session as TrainSession
     from app.visit_plan_contract import VisitPlanCreateIn, VisitPlanMutationIn
 
@@ -673,7 +650,26 @@ def seed(config: HarnessConfig) -> dict[str, str]:
             TrainSession.patient_id == HARNESS_PATIENT_ID,
         )).first()
         if existing is not None:
-            return {"session_id": existing.session_id, "reused": "1"}
+            if existing.autopilot_profile_version_id != DEMO_PROFILE_VERSION:
+                raise HarnessConfigError(
+                    "harness root 内已有非 exact demo20 场次，拒绝静默复用")
+            existing_plan = (
+                session.get(VisitPlan, existing.visit_plan_id)
+                if existing.visit_plan_id is not None else None)
+            if existing_plan is None:
+                raise HarnessConfigError("exact demo20 场次缺少 VisitPlan 账本")
+            visit_plan_service.assert_started_profile_command_chain(
+                session, existing_plan, existing)
+            return {
+                "session_id": existing.session_id,
+                "plan_id": existing.visit_plan_id or "",
+                "profile_version_id": existing.autopilot_profile_version_id,
+                "reused": "1",
+            }
+
+        if (autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_VERSION
+                != DEMO_PROFILE_VERSION):
+            raise HarnessConfigError("demo20 profile 版本常量与生产 registry 不一致")
 
         suffix = hashlib.sha256(
             f"{config.root}|{display_id}".encode()).hexdigest()[:16]
@@ -686,6 +682,7 @@ def seed(config: HarnessConfig) -> dict[str, str]:
                 week_no=2,
                 phase_type="正式训练",
                 event_line="正式训练",
+                autopilot_profile_version_id=DEMO_PROFILE_VERSION,
             ),
             actor_id=display_id,
         )
@@ -706,16 +703,36 @@ def seed(config: HarnessConfig) -> dict[str, str]:
         started = session.exec(select(TrainSession).where(
             TrainSession.visit_plan_id == plan_id,
         )).first()
-        return {"session_id": started.session_id, "plan_id": plan_id, "reused": "0"}
+        if started is None:
+            raise HarnessConfigError("VisitPlan 开场后未生成 exact demo20 场次")
+        started_plan = session.get(VisitPlan, plan_id)
+        if started_plan is None:
+            raise HarnessConfigError("VisitPlan 开场后账本丢失")
+        visit_plan_service.assert_started_profile_command_chain(
+            session, started_plan, started)
+        return {
+            "session_id": started.session_id,
+            "plan_id": plan_id,
+            "profile_version_id": started.autopilot_profile_version_id or "",
+            "reused": "0",
+        }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="harness.tts_ack_harness",
-        description="HARNESS ONLY —— 单位置合成验收入口，禁止用于生产。")
-    parser.add_argument("--migrate-and-seed", action="store_true")
-    parser.add_argument("--serve", action="store_true")
-    parser.add_argument("--port", type=int, default=8811)
+        description=(
+            "HARNESS ONLY —— exact 20 题本机模拟 TTS/ACK 验收入口；"
+            "canonical 题库不会被替换，禁止用于生产。"))
+    parser.add_argument(
+        "--migrate-and-seed", action="store_true",
+        help="迁移临时库，并用生产账本建立 week2-single20-demo-v1 场次")
+    parser.add_argument(
+        "--serve", action="store_true",
+        help="仅在 127.0.0.1 启动 exact demo20 验收服务")
+    parser.add_argument(
+        "--port", type=int, default=8811,
+        help="本机回环端口（默认 8811）")
     args = parser.parse_args(argv)
     if not (args.migrate_and_seed or args.serve):
         parser.error("必须显式选择 --migrate-and-seed 或 --serve")

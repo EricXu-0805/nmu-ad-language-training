@@ -6,6 +6,7 @@ import {
   identityCanExportResearchData,
   identityCanOperateTraining,
   identityCanPhysicallyDeleteAudio,
+  identityIsCaregiverOperator,
   isUnauthenticatedResponse,
   parseAuthConfig,
   parseAuthIdentity,
@@ -31,12 +32,18 @@ test("data governance and irreversible audio deletion remain separate roles", ()
   const researcher = { display_id: "R1", role: "researcher", username: "r" };
   const steward = { display_id: "D1", role: "data_steward", username: "d" };
   const admin = { display_id: "A1", role: "admin", username: "a" };
+  const caregiver = { display_id: "C1", role: "caregiver_operator", username: "c" };
   assert.equal(identityCanOperateTraining(researcher), true);
   assert.equal(identityCanOperateTraining(steward), false);
   assert.equal(identityCanExportResearchData(steward), true);
   assert.equal(identityCanPhysicallyDeleteAudio(steward), false);
   assert.equal(identityCanExportResearchData(admin), true);
   assert.equal(identityCanPhysicallyDeleteAudio(admin), true);
+  assert.equal(identityIsCaregiverOperator(caregiver), true);
+  assert.equal(identityCanOperateTraining(caregiver), false);
+  assert.equal(identityCanExportResearchData(caregiver), false);
+  assert.equal(identityCanPhysicallyDeleteAudio(caregiver), false);
+  assert.equal(identityIsCaregiverOperator(researcher), false);
 });
 
 test("only an explicit 401 means login; network and parse failures stay errors", () => {

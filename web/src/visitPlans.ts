@@ -6,6 +6,10 @@ import type {
   VisitPlanReceipt,
   VisitPlanToday,
 } from "./types.ts";
+import {
+  WEEK2_SINGLE20_DEMO_PROFILE_DIGEST,
+  WEEK2_SINGLE20_DEMO_PROFILE_VERSION,
+} from "./autopilot/demoProfile.ts";
 
 type UnknownRecord = Record<string, unknown>;
 const RECEIPT_KEYS = [
@@ -31,11 +35,8 @@ const SESSION_KEYS = [
  * literally; this is deliberately not an "active version" pointer, because a
  * governance read of an old demo draft must not follow a moving target.
  */
-const KNOWN_PROFILE_VERSIONS = ["week2-single20-demo-v1"] as const;
-
-function knownProfileVersion(value: unknown): value is string {
-  return typeof value === "string"
-    && (KNOWN_PROFILE_VERSIONS as readonly string[]).includes(value);
+function knownProfileVersion(value: unknown): value is typeof WEEK2_SINGLE20_DEMO_PROFILE_VERSION {
+  return value === WEEK2_SINGLE20_DEMO_PROFILE_VERSION;
 }
 const RECOVERY_SESSION_KEYS = [...SESSION_KEYS, "runtime_status"] as const;
 const PLAN_ID = /^vp_[A-Za-z0-9_-]{24}$/;
@@ -164,17 +165,18 @@ export function parseVisitPlanReceipt(
         : revision === (hasApproved ? 3 : 2) && !hasStarted && hasCancelled && row.session_id === null;
   if (!stateValid) throw new Error("训练安排状态、版本与审计事实矛盾");
 
-  // A demo profile is readable for governance only as a draft, or as a
-  // cancelled row that came from either a draft or an approved plan.  D1A's
-  // server fails approved/started demo rows closed, so a receipt in those
-  // states can only be tampered or corrupted evidence and is never projected
-  // as actionable canonical work.
+  // D1B accepts the immutable demo version through its full coherent lifecycle,
+  // but only for the exact simulation-only Week-2 formal-training context.
+  // Unknown versions and any attempt to attach the demo to research remain
+  // fail-closed.
   const profileVersion = row.autopilot_profile_version_id as string | null;
   if (profileVersion !== null
       && (!knownProfileVersion(profileVersion)
         || row.is_simulation !== true
         || row.data_classification !== "simulation"
-        || (status !== "draft" && status !== "cancelled"))) {
+        || weekNo !== 2
+        || phase !== "正式训练"
+        || eventLine !== "正式训练")) {
     throw new Error("训练安排的模拟演示计划绑定不可接受");
   }
 
@@ -340,7 +342,7 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
   const profileBindingComplete = typeof row?.autopilot_profile_version_id === "string"
     && knownProfileVersion(row.autopilot_profile_version_id)
     && typeof row.autopilot_profile_definition_digest === "string"
-    && SHA256.test(row.autopilot_profile_definition_digest);
+    && row.autopilot_profile_definition_digest === WEEK2_SINGLE20_DEMO_PROFILE_DIGEST;
   if (!row
       || typeof row.session_id !== "string" || !PATIENT_ID.test(row.session_id)
       || typeof row.patient_id !== "string" || !PATIENT_ID.test(row.patient_id)
@@ -369,7 +371,10 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
       // disabled.
       || (profileBindingComplete && (row.visit_plan_id === null
         || row.is_simulation !== true
-        || row.data_classification !== "simulation"))
+        || row.data_classification !== "simulation"
+        || row.week_no !== 2
+        || row.phase_type !== "正式训练"
+        || row.event_line !== "正式训练"))
       || typeof row.is_simulation !== "boolean"
       || (row.data_classification !== "research"
         && row.data_classification !== "simulation"
@@ -384,15 +389,6 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
   const phase = row.phase_type as PhaseType;
   const eventLine = row.event_line as EventLine;
   if (!validContext(weekNo, phase, eventLine)) throw new Error("训练场次周次与事件线矛盾");
-  // Shape validity is not runtime authority.  No D1B consumer resolves a
-  // Session-frozen demo profile yet, and the server's own admission gate still
-  // refuses even a perfectly consistent Plan/Session pair, so every complete
-  // pair is rejected here — including the exact known version with a valid
-  // digest.  The reason is that D1A runtime is disabled, not that the row is
-  // malformed; malformed shapes were already refused above.
-  if (!profileBindingAbsent) {
-    throw new Error("当前版本尚未开放模拟演示计划的床旁运行，已阻止进入");
-  }
   return {
     session_id: row.session_id,
     patient_id: row.patient_id,
@@ -449,8 +445,8 @@ export function parseStartedVisitSession(
       || session.item_bank_version_id !== startedReceipt.item_bank_version_id
       || session.is_simulation !== startedReceipt.is_simulation
       || session.data_classification !== startedReceipt.data_classification
-      // Both sides are null for every D1A started fact; comparing them keeps a
-      // future paired-set Session from being bound to a canonical receipt.
+      // Both paired-null and exact demo starts must retain the same frozen
+      // version on the VisitPlan and Session projections.
       || (session.autopilot_profile_version_id ?? null)
         !== startedReceipt.autopilot_profile_version_id
       || session.trainer_id !== startedReceipt.started_by

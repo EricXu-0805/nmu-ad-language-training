@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""研究者账号管理 CLI（无自助注册，账号由管理员在服务器上开）。
+"""工作人员账号管理 CLI（无自助注册，账号由管理员在服务器上开）。
 
 用法（在 platform/ 目录下）：
   ./.venv/bin/python scripts/manage_users.py create study-admin --role admin
@@ -145,7 +145,9 @@ def main() -> None:
     c = sub.add_parser("create", help="新建账号")
     c.add_argument("username")
     c.add_argument("--display-id", default=None, help="落到锁分/量表的审计身份，默认同用户名")
-    c.add_argument("--role", choices=["researcher", "data_steward", "admin"],
+    c.add_argument(
+        "--role",
+        choices=["researcher", "data_steward", "admin", "caregiver_operator"],
                    default="researcher")
     c.add_argument("--password-stdin", action="store_true", help="从 stdin 读密码（自动化用）")
 

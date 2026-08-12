@@ -36,7 +36,9 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                assessment_workflow_policy, asr,
                audio_capture, audio_gate, audio_store, audit, auth,
                autopilot_contract, autopilot_orchestration,
+               autopilot_plan_profiles,
                autopilot_positions, autopilot_service,
+               caregiver_contract, caregiver_service,
                cloud_processing, content, db, export_security, governance_lock,
                device_capability, evidence_ledger, export, http_security, judging,
                ai_quality_service, llm_judge, rule_judge, runtime, scoring,
@@ -55,7 +57,7 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      AttemptCaptureProcessing,
                      AttemptEvent, AuditLog, AudioAssetRow,
                      AudioCaptureReceipt, AudioLocalCopyDisposalReceipt,
-                     ExportBatch, InteractionEvent,
+                     CaregiverHelpRequest, ExportBatch, InteractionEvent,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
                      Patient, PatientDeviceCapability, PatientPauseReceipt,
                      PatientWithdrawalEvent,
@@ -254,7 +256,7 @@ def _require_session_operator(
         return "LOCAL-M0"
     actor = _require_account_identity(
         request, action,
-        roles={"researcher", "data_steward", "admin"},
+        roles={"researcher", "data_steward", "admin", "caregiver_operator"},
         allow_local_m0=True,
     )
     role = getattr(request.state, "actor_role", None)
@@ -267,7 +269,7 @@ def _require_session_operator(
             })
         return actor
     assigned = (sess.trainer_id or "").strip()
-    if role == "researcher" and assigned != actor:
+    if role in {"researcher", "caregiver_operator"} and assigned != actor:
         # Deliberately conceal existence on both read and write paths.  The
         # caller may select a resource-specific generic detail so a foreign
         # item/turn is indistinguishable from that resource genuinely missing.
@@ -1743,6 +1745,38 @@ def _require_started_visit_plan_session(
         raw = getattr(value, "value", value)
         return str(raw)
 
+    profile_binding_valid = True
+    if (
+        resolved.autopilot_profile_version_id is not None
+        or resolved.autopilot_profile_definition_digest is not None
+    ):
+        try:
+            profile_resolution = autopilot_plan_profiles.resolve_for_session(
+                resolved)
+            autopilot_plan_profiles.assert_plan_session_profile_binding(
+                plan, resolved)
+            visit_plan_service.assert_started_profile_command_chain(
+                s, plan, resolved)
+            profile_binding_valid = (
+                profile_resolution.completion_scope == "demo_plan_only"
+                and profile_resolution.simulation_only is True
+                and profile_resolution.resolved_position_count == 20
+                and profile_resolution.resolved_position_content_ready is True
+                and profile_resolution.parent_item_bank_version_id
+                == resolved.item_bank_version_id
+                and profile_resolution.parent_item_bank_definition_digest
+                == resolved.item_bank_definition_digest
+                and profile_resolution.parent_autopilot_protocol_version_id
+                == resolved.autopilot_protocol_version_id
+                and profile_resolution.parent_autopilot_protocol_definition_digest
+                == resolved.autopilot_protocol_definition_digest
+            )
+        except (
+            autopilot_plan_profiles.PlanProfileError,
+            visit_plan_service.VisitPlanError,
+        ):
+            profile_binding_valid = False
+
     binding_matches = (
         plan.patient_id == resolved.patient_id
         # A due plan may legitimately be started late; start_plan records the
@@ -1774,14 +1808,7 @@ def _require_started_visit_plan_session(
         == resolved.autopilot_profile_version_id
         and plan.autopilot_profile_definition_digest
         == resolved.autopilot_profile_definition_digest
-        # Temporary D1A gate: no runtime, worker, ACK or completion consumer
-        # resolves a demo profile yet, so even a Plan/Session pair that matches
-        # perfectly stays out of bedside control.  Remove this clause only once
-        # every D1B consumer reads the same Session-frozen resolver.
-        and plan.autopilot_profile_version_id is None
-        and plan.autopilot_profile_definition_digest is None
-        and resolved.autopilot_profile_version_id is None
-        and resolved.autopilot_profile_definition_digest is None
+        and profile_binding_valid
         and plan.is_simulation == resolved.is_simulation
         and plan.data_classification == resolved.data_classification
         and bool((plan.protocol_slot_key or "").strip())
@@ -1914,10 +1941,12 @@ def _mutate_visit_plan(
         request: Request,
         action: Literal["approve", "start"],
         s: DBSession,
+        allowed_roles: set[str] | None = None,
+        require_caregiver_operational_demo20: bool = False,
 ) -> visit_plan_contract.VisitPlanReceipt:
     actor_id = _require_account_identity(
         request, f"{'审批' if action == 'approve' else '启动'}训练安排",
-        roles={"researcher", "admin"}, allow_local_m0=True)
+        roles=allowed_roles or {"researcher", "admin"}, allow_local_m0=True)
     with _VISIT_PLAN_WRITE_LOCK:
         s.rollback()
         s.expire_all()
@@ -1939,8 +1968,16 @@ def _mutate_visit_plan(
                 else governance_lock.subject_fence(s, patient_id)
             )
             with fence:
-                result = operation(
-                    s, plan_id=plan_id, body=body, actor_id=actor_id)
+                operation_kwargs = {
+                    "plan_id": plan_id,
+                    "body": body,
+                    "actor_id": actor_id,
+                }
+                if action == "start":
+                    operation_kwargs[
+                        "require_caregiver_operational_demo20"
+                    ] = require_caregiver_operational_demo20
+                result = operation(s, **operation_kwargs)
                 s.commit()
         except visit_plan_service.VisitPlanError as exc:
             s.rollback()
@@ -1976,6 +2013,81 @@ def start_visit_plan(
         request: Request, s: DBSession = Depends(get_session)):
     return _mutate_visit_plan(
         plan_id=plan_id, body=body, request=request, action="start", s=s)
+
+
+def _raise_caregiver_error(exc: caregiver_service.CaregiverServiceError) -> NoReturn:
+    raise HTTPException(status_code=exc.status_code, detail={
+        "code": exc.code,
+        "message": exc.message,
+    }) from exc
+
+
+@app.get(
+    "/caregiver/today",
+    response_model=caregiver_contract.CaregiverTodayOut,
+)
+def caregiver_today(
+        request: Request, response: Response,
+        s: DBSession = Depends(get_session)):
+    actor_id = _require_account_identity(
+        request, "读取今日照护工作台",
+        roles={"caregiver_operator"})
+    try:
+        queue = visit_plan_service.today_queue(
+            s,
+            viewer_actor_id=actor_id,
+            viewer_role="caregiver_operator",
+            require_caregiver_operational_demo20=True,
+        )
+        current = caregiver_service.current_session_for_actor(
+            s, actor_id=actor_id)
+    except visit_plan_service.VisitPlanError as exc:
+        s.rollback()
+        _raise_visit_plan_error(exc)
+    except caregiver_service.CaregiverServiceError as exc:
+        s.rollback()
+        _raise_caregiver_error(exc)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    return caregiver_contract.CaregiverTodayOut(
+        as_of_date=queue.as_of_date,
+        plans=[caregiver_service.plan_projection(plan) for plan in queue.plans],
+        withheld_count=queue.withheld_count,
+        current_session=(
+            caregiver_service.session_summary(*current)
+            if current is not None else None
+        ),
+    )
+
+
+@app.post(
+    "/caregiver/visit-plans/{plan_id}/start",
+    response_model=caregiver_contract.CaregiverStartOut,
+)
+def caregiver_start_visit_plan(
+        plan_id: str, body: visit_plan_contract.VisitPlanMutationIn,
+        request: Request, s: DBSession = Depends(get_session)):
+    result = _mutate_visit_plan(
+        plan_id=plan_id,
+        body=body,
+        request=request,
+        action="start",
+        s=s,
+        allowed_roles={"caregiver_operator"},
+        require_caregiver_operational_demo20=True,
+    )
+    if result.session_id is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "caregiver_started_session_missing",
+            "message": "已启动安排没有场次回执，请停止操作并联系管理员",
+        })
+    session = _load_session_for_operator(
+        request, result.session_id, s, "读取新启动的床旁场次")
+    runtime_state = s.get(SessionRuntimeState, session.session_id)
+    return caregiver_contract.CaregiverStartOut(
+        plan_id=result.plan_id,
+        session=caregiver_service.session_summary(session, runtime_state),
+    )
 
 
 @app.post(
@@ -4769,6 +4881,24 @@ def _runtime_payload(session_id: str, row: SessionRuntimeState | None) -> dict:
     }
 
 
+def _session_control_payload(
+        request: Request,
+        session_id: str,
+        row: SessionRuntimeState | None) -> dict:
+    """照护员复用控制动作时只返回结果，不带运行游标或关系建立步骤。"""
+    if getattr(request.state, "actor_role", None) != "caregiver_operator":
+        return _runtime_payload(session_id, row)
+    return {
+        "session_id": session_id,
+        "runtime_status": row.status if row else "active",
+        "runtime_revision": row.revision if row else 0,
+        "end_reason": (
+            _abort_public_reason(row.end_reason)
+            if row and row.status == "aborted" else row.end_reason if row else None
+        ),
+    }
+
+
 def _safe_cursor(payload: dict) -> dict:
     """恢复时绝不自动重开麦克风，也不携带在途音频指针。"""
     safe = dict(payload)
@@ -4791,10 +4921,117 @@ def _safe_rapport(payload: dict) -> dict:
 def _session_plan_for_runtime(sess: TrainSession) -> runtime.SessionPlan:
     bank = _load_bank_for_session(sess)
     event = sess.event_line.value if hasattr(sess.event_line, "value") else str(sess.event_line)
+    if (
+        sess.autopilot_profile_version_id is not None
+        or sess.autopilot_profile_definition_digest is not None
+    ):
+        try:
+            protocol = content.load_autopilot_protocol(
+                content.CONTENT_DIR / "autopilot_protocol_v1.json")
+            return autopilot_plan_profiles.resolve_for_session(
+                sess, bank=bank, protocol=protocol).session_plan
+        except autopilot_plan_profiles.PlanProfileError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": exc.code,
+                "message": exc.message,
+            }) from exc
     try:
         return runtime.build_session_plan(bank, sess.week_no, event)
     except ValueError as e:
         raise HTTPException(409, str(e))
+
+
+def _session_plan_for_account_projection(
+    sess: TrainSession,
+    *,
+    max_items: int | None,
+) -> tuple[runtime.SessionPlan, dict[str, object]]:
+    """Resolve plan bytes and UI scope facts from one content snapshot."""
+    bank = _load_bank_for_session(sess)
+    event = str(getattr(sess.event_line, "value", sess.event_line))
+    version_id = sess.autopilot_profile_version_id
+    definition_digest = sess.autopilot_profile_definition_digest
+
+    if version_id is None and definition_digest is None:
+        try:
+            full_plan = runtime.build_session_plan(bank, sess.week_no, event)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        resolved = None
+    else:
+        protocol = content.load_autopilot_protocol(
+            content.CONTENT_DIR / "autopilot_protocol_v1.json")
+        try:
+            resolved = autopilot_plan_profiles.resolve_for_session(
+                sess, bank=bank, protocol=protocol)
+        except autopilot_plan_profiles.PlanProfileError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": exc.code,
+                "message": exc.message,
+            }) from exc
+        full_plan = resolved.session_plan
+
+    plan = full_plan
+    if max_items is not None:
+        plan = runtime.SessionPlan(
+            full_plan.item_bank_version_id,
+            full_plan.week_no,
+            full_plan.event_line,
+            full_plan.items[:max_items],
+        )
+    is_full_projection = (
+        len(plan.items) == len(full_plan.items)
+        and plan.total_turns() == full_plan.total_turns()
+    )
+
+    if resolved is not None:
+        if not is_full_projection:
+            raise HTTPException(status_code=409, detail={
+                "code": "plan_profile_projection_incomplete",
+                "message": "自动演示计划必须作为完整 20 题投影读取",
+            })
+        return plan, {
+            "autopilot_profile_version_id": resolved.profile_version_id,
+            "completion_scope": resolved.completion_scope,
+            "resolved_position_count": resolved.resolved_position_count,
+            "unsupported_position_count": resolved.unsupported_position_count,
+            "operational_autopilot_ready": (
+                resolved.resolved_position_content_ready
+                and resolved.unsupported_position_count == 0
+            ),
+        }
+
+    if sess.week_no == 2 and event == "正式训练":
+        protocol = content.load_autopilot_protocol(
+            content.CONTENT_DIR / "autopilot_protocol_v1.json")
+        try:
+            canonical = autopilot_plan_profiles.resolve_for_session(
+                sess, bank=bank, protocol=protocol)
+        except autopilot_plan_profiles.PlanProfileError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": exc.code,
+                "message": exc.message,
+            }) from exc
+        return plan, {
+            "autopilot_profile_version_id": None,
+            "completion_scope": "canonical_full_source",
+            "resolved_position_count": plan.total_turns(),
+            "unsupported_position_count": canonical.unsupported_position_count,
+            "operational_autopilot_ready": (
+                is_full_projection
+                and canonical.resolved_position_content_ready
+                and canonical.unsupported_position_count == 0
+            ),
+        }
+
+    # Non-P0a plans remain readable, but an empty plan never means autonomous.
+    return plan, {
+        "autopilot_profile_version_id": None,
+        "completion_scope": "canonical_full_source",
+        "resolved_position_count": plan.total_turns(),
+        "unsupported_position_count": 0,
+        "operational_autopilot_ready": False,
+    }
 
 
 def _validate_session_handshake(sess: TrainSession, payload: dict) -> None:
@@ -5669,6 +5906,203 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
     return result
 
 
+def _caregiver_activation_payload(sess: TrainSession) -> dict:
+    event_line = (
+        sess.event_line.value
+        if hasattr(sess.event_line, "value") else str(sess.event_line)
+    )
+    return {
+        "sessionId": sess.session_id,
+        "weekNo": sess.week_no,
+        "eventLine": event_line,
+        "mode": "rapport" if sess.week_no == 1 else "task",
+        "itemBankVersionId": sess.item_bank_version_id,
+    }
+
+
+@app.put(
+    "/caregiver/sessions/{session_id}/activation",
+    response_model=caregiver_contract.CaregiverActivationOut,
+)
+def caregiver_activate_session(
+        session_id: str, request: Request,
+        s: DBSession = Depends(get_session)):
+    _require_account_identity(
+        request, "激活床旁场次", roles={"caregiver_operator"})
+    sess = _load_session_for_operator(
+        request, session_id, s, "激活床旁场次", mutation=True)
+    _require_started_visit_plan_session(session_id, s, sess=sess)
+    expected = _caregiver_activation_payload(sess)
+    with _LIVE_WRITE_LOCK:
+        row = _live_row_for_update(s)
+        current = _json_load(row.session_json) if row is not None else None
+        idempotent = bool(
+            row is not None
+            and all(current.get(key) == value for key, value in expected.items())
+        ) if current is not None else False
+        if idempotent:
+            runtime_state = _runtime_row_for_update(session_id, s)
+            if runtime_state.status not in _MUTABLE_RUNTIME_STATUSES:
+                raise HTTPException(status_code=409, detail={
+                    "code": "caregiver_activation_session_closed",
+                    "message": "场次已结束，不能再激活床旁练习",
+                })
+            live_wseq = _wseq_from(current)
+            if live_wseq is None or row.seq < 1:
+                raise HTTPException(status_code=409, detail={
+                    "code": "caregiver_activation_state_invalid",
+                    "message": "床旁场次激活回执不完整，请停止操作并联系管理员",
+                })
+            result = {"seq": row.seq, "wseq": live_wseq}
+            runtime_status = runtime_state.status
+            runtime_revision = runtime_state.revision
+            s.rollback()
+        else:
+            result = live_put(
+                LiveIn(kind="session", payload=expected), request, s)
+            runtime_state = s.get(SessionRuntimeState, session_id)
+            runtime_status = runtime_state.status if runtime_state else "active"
+            runtime_revision = runtime_state.revision if runtime_state else 0
+    return caregiver_contract.CaregiverActivationOut(
+        session_id=session_id,
+        runtime_status=runtime_status,
+        runtime_revision=runtime_revision,
+        live_seq=result["seq"],
+        live_wseq=result["wseq"],
+        idempotent=idempotent,
+    )
+
+
+@app.get(
+    "/caregiver/sessions/{session_id}/status",
+    response_model=caregiver_contract.CaregiverStatusOut,
+)
+def caregiver_session_status(
+        session_id: str, request: Request, response: Response,
+        s: DBSession = Depends(get_session)):
+    _require_account_identity(
+        request, "查看床旁场次状态", roles={"caregiver_operator"})
+    sess = _load_session_for_operator(
+        request, session_id, s, "查看床旁场次状态")
+    _require_started_visit_plan_session(session_id, s, sess=sess)
+    runtime_state = s.get(SessionRuntimeState, session_id)
+    live = s.get(LiveState, 1)
+    is_current = _live_session_id(live) == session_id
+    presence = _presence_payload(live) if is_current else {
+        "screen": None,
+        "last_seen_at": None,
+        "online": False,
+    }
+    try:
+        autopilot = autopilot_service.get_autopilot_status(
+            s, session_id=session_id)
+    except autopilot_service.AutopilotServiceError as exc:
+        s.rollback()
+        _raise_autopilot_http_error(exc)
+    summary = caregiver_service.session_summary(sess, runtime_state)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    return caregiver_contract.CaregiverStatusOut(
+        **summary.model_dump(),
+        active_bedside_session=is_current,
+        patient_presence=caregiver_contract.CaregiverPresenceOut(
+            online=presence["online"],
+            screen=presence["screen"],
+            last_seen_at=presence["last_seen_at"],
+        ),
+        autopilot=autopilot,
+    )
+
+
+@app.post(
+    "/caregiver/sessions/{session_id}/help-requests",
+    response_model=caregiver_contract.CaregiverHelpRequestOut,
+)
+def caregiver_request_help(
+        session_id: str,
+        body: caregiver_contract.CaregiverHelpRequestIn,
+        request: Request,
+        s: DBSession = Depends(get_session)):
+    actor_id = _require_account_identity(
+        request, "暂停并呼叫其他工作人员", roles={"caregiver_operator"})
+    patient_id = _preauthorize_session_subject_fence(
+        request, session_id, s, "暂停并呼叫其他工作人员")
+    with (governance_lock.subject_fence(s, patient_id),
+          _LIVE_WRITE_LOCK,
+          device_capability.serialized_mutation()):
+        sess = s.exec(select(TrainSession).where(
+            TrainSession.session_id == session_id,
+        ).with_for_update()).first()
+        if sess is None:
+            raise HTTPException(404, "场次不存在")
+        _require_session_operator(
+            request, sess, s, "暂停并呼叫其他工作人员", mutation=True)
+        _require_started_visit_plan_session(session_id, s, sess=sess)
+        _live_row_for_update(s)
+        try:
+            existing = caregiver_service.existing_help_request(
+                s,
+                session_id=session_id,
+                actor_id=actor_id,
+                reason_code=body.reason_code,
+                idempotency_key=body.idempotency_key,
+            )
+            if existing is not None:
+                result = caregiver_service.help_projection(
+                    existing, idempotent=True)
+                s.rollback()
+                return result
+
+            preflight = s.get(SessionRuntimeState, session_id)
+            preflight_status = preflight.status if preflight is not None else "active"
+            if preflight_status not in {"active", "paused"}:
+                raise HTTPException(status_code=409, detail={
+                    "code": "caregiver_help_session_not_open",
+                    "message": "场次已不在床旁进行中，不能新增呼叫",
+                })
+            if preflight_status == "active":
+                autopilot_service.pause_autonomous_scope_for_researcher(
+                    s, session_id=session_id, actor_id=actor_id)
+            if preflight is not None:
+                s.expire(preflight)
+            state = _runtime_row_for_update(session_id, s)
+            if state.status not in {"active", "paused"}:
+                raise HTTPException(status_code=409, detail={
+                    "code": "caregiver_help_session_not_open",
+                    "message": "场次已不在床旁进行中，不能新增呼叫",
+                })
+            if state.status == "active":
+                state = _pause_runtime_in_transaction(session_id, s)
+            row = caregiver_service.append_help_request(
+                s,
+                session_id=session_id,
+                actor_id=actor_id,
+                reason_code=body.reason_code,
+                idempotency_key=body.idempotency_key,
+                runtime_revision=state.revision,
+            )
+            s.commit()
+            s.refresh(row)
+        except caregiver_service.CaregiverServiceError as exc:
+            s.rollback()
+            _raise_caregiver_error(exc)
+        except autopilot_service.AutopilotServiceError as exc:
+            _autopilot_write_failure(s, exc)
+        except IntegrityError as exc:
+            s.rollback()
+            raise HTTPException(status_code=409, detail={
+                "code": "caregiver_help_concurrency_conflict",
+                "message": "呼叫状态已被其他操作更新，请刷新后重试",
+            }) from exc
+    _audit(
+        s, request, "caregiver_help_request",
+        f"reason_code={body.reason_code} runtime_revision={row.runtime_revision}",
+        patient_id=sess.patient_id,
+        session_id=session_id,
+    )
+    return caregiver_service.help_projection(row, idempotent=False)
+
+
 def _autopilot_wake_projection(
         s: DBSession, live_session_id: str | None) -> dict | None:
     """跨设备的服务器所有权唤醒：证明床旁必须重探测一次，仅此而已。
@@ -5831,7 +6265,7 @@ def put_session_runtime_cursor(session_id: str, body: RuntimeCursorIn,
         s.add(state)
         s.commit()
         s.refresh(state)
-    return _runtime_payload(session_id, state)
+    return _session_control_payload(request, session_id, state)
 
 
 def _pause_runtime_in_transaction(session_id: str, s: DBSession) -> SessionRuntimeState:
@@ -5924,7 +6358,7 @@ def pause_session(session_id: str, request: Request,
             _autopilot_write_failure(s, exc)
         except IntegrityError as exc:
             _autopilot_integrity_conflict(s, exc)
-    return _runtime_payload(session_id, state)
+    return _session_control_payload(request, session_id, state)
 
 
 @app.post("/sessions/{session_id}/resume")
@@ -6382,9 +6816,10 @@ def finish_intervention(session_id: str, request: Request,
             SessionRuntimeState.session_id == session_id,
         ).with_for_update()).first()
         if existing is not None and existing.status in {"intervention_completed", "completed"}:
-            result = _runtime_payload(session_id, existing)
-            result["outcomeSummaryAvailable"] = (
-                s.get(SessionOutcomeSummary, session_id) is not None)
+            result = _session_control_payload(request, session_id, existing)
+            if getattr(request.state, "actor_role", None) != "caregiver_operator":
+                result["outcomeSummaryAvailable"] = (
+                    s.get(SessionOutcomeSummary, session_id) is not None)
             s.rollback()
             return result
         if existing is not None and existing.status in _TERMINAL_RUNTIME_STATUSES:
@@ -6395,6 +6830,11 @@ def finish_intervention(session_id: str, request: Request,
 
         plan, assessment = _assess_intervention_completion(sess, s)
         if not assessment.ready:
+            if getattr(request.state, "actor_role", None) == "caregiver_operator":
+                raise HTTPException(status_code=409, detail={
+                    "code": "caregiver_finish_not_ready",
+                    "message": "系统还没有确认本次已按计划做完；请根据现场情况选择其他结束原因，或联系负责人",
+                })
             raise HTTPException(status_code=409, detail={
                 "message": "床旁干预结束门禁未通过；保持当前位置，不切换受试者",
                 "assessment": assessment.to_dict(),
@@ -6426,8 +6866,9 @@ def finish_intervention(session_id: str, request: Request,
         f"AI完成={assessment.completed_attempt_turns} 录音证据={assessment.audio_evidenced_turns}",
         patient_id=sess.patient_id, session_id=session_id,
     )
-    result = _runtime_payload(session_id, state)
-    result["interventionAssessment"] = assessment.to_dict()
+    result = _session_control_payload(request, session_id, state)
+    if getattr(request.state, "actor_role", None) != "caregiver_operator":
+        result["interventionAssessment"] = assessment.to_dict()
     return result
 
 
@@ -6834,7 +7275,7 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
     actor_id = _require_account_identity(
         request,
         "中止场次",
-        roles={"researcher", "admin"},
+        roles={"researcher", "admin", "caregiver_operator"},
         allow_local_m0=True,
     )
     reason_code = body.reason_code
@@ -6844,6 +7285,12 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
     assert operation_facts is not None
     patient_id = _preauthorize_session_subject_fence(
         request, session_id, s, "中止场次")
+    if (getattr(request.state, "actor_role", None) == "caregiver_operator"
+            and reason_code == "researcher_decision"):
+        raise HTTPException(status_code=403, detail={
+            "code": "caregiver_abort_reason_forbidden",
+            "message": "照护员只能选择参与者不愿继续、临床安全或设备故障",
+        })
     with governance_lock.subject_fence(s, patient_id), _LIVE_WRITE_LOCK:
         # Session is the always-present authority row. Lock it first so two
         # workers cannot both observe a missing/runtime revision and insert or
@@ -6864,7 +7311,7 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
             expected_revision=body.expected_revision,
         )
         if decision == "replay":
-            result = _runtime_payload(session_id, preflight)
+            result = _session_control_payload(request, session_id, preflight)
             s.rollback()
             return result
 
@@ -6898,7 +7345,7 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
                 expected_revision=body.expected_revision,
             )
             if locked_decision == "replay":
-                result = _runtime_payload(session_id, state)
+                result = _session_control_payload(request, session_id, state)
                 s.rollback()
                 return result
         except autopilot_service.AutopilotServiceError as exc:
@@ -6929,7 +7376,7 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
     _audit(s, request, "session_abort",
            f"中止场次 reason_code={reason_code} label={_ABORT_REASON_LABELS[reason_code]}",
            patient_id=sess.patient_id, session_id=session_id)
-    return _runtime_payload(session_id, state)
+    return _session_control_payload(request, session_id, state)
 
 
 # ---------------- M3 ASR(可插拔;默认 auto:有 Key 走云端 qwen3-asr,无则降级人工)----------------
@@ -7568,7 +8015,8 @@ def autopilot_start(
         s: DBSession = Depends(get_session)):
     """具名研究者只能启动显式开关下的模拟 P0a 窄范围。"""
     actor_id = _require_account_identity(
-        request, "启动自动驾驶", roles={"researcher", "admin"},
+        request, "启动自动驾驶",
+        roles={"researcher", "admin", "caregiver_operator"},
         allow_local_m0=True)
     patient_id = _preauthorize_session_subject_fence(
         request, session_id, s, "启动自动驾驶")
@@ -7585,6 +8033,15 @@ def autopilot_start(
             raise HTTPException(404, "场次不存在")
         _require_session_operator(
             request, sess, s, "启动自动驾驶", mutation=True)
+        if getattr(request.state, "actor_role", None) == "caregiver_operator":
+            try:
+                autopilot_plan_profiles.resolve_exact_runnable_demo20(sess)
+            except autopilot_plan_profiles.PlanProfileError as exc:
+                s.rollback()
+                raise HTTPException(status_code=409, detail={
+                    "code": "caregiver_session_not_operational_demo20",
+                    "message": "当前场次不是可开始的 20 题本机模拟练习；仍可暂停、呼叫帮助或安全结束",
+                }) from exc
         _require_started_visit_plan_session(session_id, s, sess=sess)
         live = _live_row_for_update(s)
         _runtime_row_for_update(session_id, s)
@@ -7718,7 +8175,8 @@ def autopilot_takeover(
         s: DBSession = Depends(get_session)):
     """Atomically release server ownership after durable media-stop evidence."""
     actor_id = _require_account_identity(
-        request, "显式接管自动驾驶", roles={"researcher", "admin"},
+        request, "显式接管自动驾驶",
+        roles={"researcher", "admin", "caregiver_operator"},
         allow_local_m0=True)
     patient_id = _preauthorize_session_subject_fence(
         request,
@@ -7994,14 +8452,9 @@ def _resolved_session_plan(
         raise HTTPException(409, f"请求 event_line={event_line!r} 与场次已持久化事件线 {persisted_event_line!r} 不符")
     if max_items is not None and max_items < 0:
         raise HTTPException(422, "max_items 不得小于 0")
-    bank = _load_bank_for_session(sess)
-    try:
-        plan = runtime.build_session_plan(bank, sess.week_no, persisted_event_line, max_items)
-    except ValueError as e:
-        # 数据约束违反是 422；未结构化/未校对的周次是当前资源状态冲突，fail-closed。
-        status = 422 if "1..8" in str(e) else 409
-        raise HTTPException(status, str(e))
-    return sess, plan
+    plan, scope = _session_plan_for_account_projection(
+        sess, max_items=max_items)
+    return sess, plan, scope
 
 
 def _patient_plan_projection(plan):
@@ -8033,7 +8486,7 @@ def patient_session_plan(
         week_no: int | None = None, event_line: str | None = None,
         s: DBSession = Depends(get_session)):
     """专用老人端投影：即使开放本地模式也永不返回 canonical 答案。"""
-    _sess, plan = _resolved_session_plan(
+    _sess, plan, _scope = _resolved_session_plan(
         session_id, request=request, action="读取老人端训练计划",
         week_no=week_no, event_line=event_line,
         max_items=None, s=s,
@@ -8223,7 +8676,7 @@ def patient_current_asset(
 @app.get("/sessions/{session_id}/plan")
 def session_plan(session_id: str, request: Request, week_no: int | None = None, event_line: str | None = None,
                  max_items: int | None = None, s: DBSession = Depends(get_session)):
-    _sess, plan = _resolved_session_plan(
+    _sess, plan, scope = _resolved_session_plan(
         session_id, request=request, action="读取或恢复场次冻结计划",
         week_no=week_no, event_line=event_line,
         max_items=max_items, s=s,
@@ -8239,6 +8692,7 @@ def session_plan(session_id: str, request: Request, week_no: int | None = None, 
     return {"item_bank_version_id": plan.item_bank_version_id, "week_no": plan.week_no,
             "event_line": plan.event_line, "total_items": len(plan.items),
             "total_turns": plan.total_turns(),
+            **scope,
             "items": [{"item_id": it.item_id, "task_type": it.task_type, "image_id": it.image_id,
                        "presentation_order": it.presentation_order,
                        "display": it.display,

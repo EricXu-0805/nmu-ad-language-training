@@ -36,6 +36,9 @@ export interface VisitPlanCreateRequest {
   week_no: number;
   phase_type: PhaseType;
   event_line: EventLine;
+  // 只有显式模拟档案的第 2 周正式训练才携带该字面量。
+  // 真人和其他周次必须省略，不由浏览器选择其他版本。
+  autopilot_profile_version_id?: "week2-single20-demo-v1";
 }
 
 export interface VisitPlanMutationRequest {
@@ -189,7 +192,7 @@ export interface AuthConfig {
 
 export interface AuthIdentity {
   display_id: string;         // 落到锁分/量表的审计身份
-  role: string;               // researcher / admin / data_steward
+  role: string;               // researcher / admin / data_steward / caregiver_operator
   username: string;
 }
 
@@ -314,6 +317,11 @@ export interface SessionPlan {
   item_bank_version_id: string;
   week_no: number;
   event_line: string;
+  autopilot_profile_version_id: "week2-single20-demo-v1" | null;
+  completion_scope: "canonical_full_source" | "demo_plan_only";
+  resolved_position_count: number;
+  unsupported_position_count: number;
+  operational_autopilot_ready: boolean;
   total_items: number;
   total_turns: number;
   items: PlanItem[];

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Literal, NoReturn
 
@@ -30,6 +31,9 @@ _PROFILE_REGISTRY: dict[str, tuple[Path, str]] = {
         WEEK2_SINGLE20_DEMO_DIGEST,
     ),
 }
+_TRUE_VALUES = frozenset({"1", "true", "yes"})
+SIMULATION_DATA_ENV = "ALLOW_SIMULATION_DATA"
+P0A_FEATURE_ENV = "ENABLE_AUTOPILOT_P0A_SIMULATION"
 
 
 class PlanProfileError(ValueError):
@@ -651,6 +655,91 @@ def resolve_for_session(
         phase_type=getattr(session, "phase_type"),
         event_line=getattr(session, "event_line"),
     )
+
+
+def demo20_runtime_enabled() -> bool:
+    """Whether this process explicitly permits the local synthetic demo.
+
+    This is the single deployment-switch predicate for the D1B profile.  It
+    intentionally requires both the synthetic-data boundary and the P0a
+    autonomous-runtime switch; neither switch is sufficient on its own.
+    """
+    return all(
+        os.environ.get(name, "").strip().lower() in _TRUE_VALUES
+        for name in (SIMULATION_DATA_ENV, P0A_FEATURE_ENV)
+    )
+
+
+def resolve_exact_runnable_demo20(
+    row: object,
+    *,
+    bank: content.ItemBank | None = None,
+    protocol: dict | None = None,
+    require_runtime_enabled: bool = True,
+) -> ResolvedAutopilotPlan:
+    """Resolve the one exact, runnable caregiver-facing D1B contract.
+
+    The function accepts either a VisitPlan or Session-like persisted row and
+    validates the complete immutable profile pair, simulation/classification
+    boundary, current canonical parents and exact 20-position completion
+    contract.  Callers performing an operational read or start also leave
+    ``require_runtime_enabled`` at its default so the same resolution rechecks
+    both deployment switches.  Historical/safety projections may set it false
+    to describe an already-created row after the switches are removed; that
+    never makes the row operational.
+    """
+    version, digest = _binding_pair(row)
+    if (
+        version != WEEK2_SINGLE20_DEMO_VERSION
+        or digest != WEEK2_SINGLE20_DEMO_DIGEST
+    ):
+        _fail(
+            "plan_profile_not_exact_demo20",
+            "当前安排或场次不是精确 20 题本机模拟演示计划",
+        )
+    if getattr(row, "is_simulation", None) is not True:
+        _fail(
+            "plan_profile_simulation_required",
+            "20 题本机演示只能用于显式 simulation 场次",
+        )
+    if getattr(row, "data_classification", None) != "simulation":
+        _fail(
+            "plan_profile_classification_invalid",
+            "20 题本机演示必须明确归类为 simulation",
+        )
+    if require_runtime_enabled and not demo20_runtime_enabled():
+        _fail(
+            "plan_profile_runtime_not_enabled",
+            "20 题本机模拟演示当前未显式开启",
+        )
+
+    resolved_bank = _default_bank() if bank is None else bank
+    resolved_protocol = _default_protocol() if protocol is None else protocol
+    resolved = resolve_bound_profile(
+        version,
+        digest,
+        bank=resolved_bank,
+        protocol=resolved_protocol,
+        is_simulation=True,
+        week_no=getattr(row, "week_no"),
+        phase_type=getattr(row, "phase_type"),
+        event_line=getattr(row, "event_line"),
+    )
+    if (
+        resolved.profile_version_id != WEEK2_SINGLE20_DEMO_VERSION
+        or resolved.profile_definition_digest != WEEK2_SINGLE20_DEMO_DIGEST
+        or resolved.simulation_only is not True
+        or resolved.completion_scope != "demo_plan_only"
+        or resolved.resolved_position_count != 20
+        or resolved.resolved_position_content_ready is not True
+        or resolved.unsupported_position_count != 0
+        or len(resolved.positions) != 20
+    ):
+        _fail(
+            "plan_profile_not_exact_demo20",
+            "20 题本机模拟演示计划没有解析为完整可运行范围",
+        )
+    return resolved
 
 
 def _binding_pair(row: object) -> tuple[str | None, str | None]:

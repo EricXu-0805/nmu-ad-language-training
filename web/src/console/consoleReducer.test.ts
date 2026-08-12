@@ -99,18 +99,36 @@ test("canonical cached session round-trips with both profile fields null", () =>
   });
 });
 
-test("a structurally valid paired-set cached session is discarded entirely", () => {
+test("the exact D1B paired-set cached session restores without losing its frozen facts", () => {
   // Seeded directly rather than through persistConsoleState: that writer also
   // validates, so a rejection there would prove the write path, not the read
   // path this attack is aimed at.  Known version, valid lowercase 64-hex
-  // digest, plan-linked simulation row — shape-valid in every respect, yet
-  // D1A has no runtime able to execute it.
+  // digest and plan-linked simulation row: this is the exact D1B runtime shape.
   const store = new Map<string, string>([[
     CURRENT_CACHE_KEY,
     envelope({
       ...session("active"),
       autopilot_profile_version_id: DEMO_PROFILE_VERSION,
       autopilot_profile_definition_digest: DEMO_PROFILE_DIGEST,
+    }),
+  ]]);
+
+  withLocalStorage(store, () => {
+    const restored = loadConsoleState();
+    assert.equal(restored.screen, "training");
+    assert.equal(restored.session?.autopilot_profile_version_id, DEMO_PROFILE_VERSION);
+    assert.equal(restored.session?.autopilot_profile_definition_digest, DEMO_PROFILE_DIGEST);
+    assert.equal(store.has(CURRENT_CACHE_KEY), true);
+  });
+});
+
+test("a drifted paired-set cached session is discarded entirely", () => {
+  const store = new Map<string, string>([[
+    CURRENT_CACHE_KEY,
+    envelope({
+      ...session("active"),
+      autopilot_profile_version_id: DEMO_PROFILE_VERSION,
+      autopilot_profile_definition_digest: "0".repeat(64),
     }),
   ]]);
 

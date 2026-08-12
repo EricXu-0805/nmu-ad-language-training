@@ -1,4 +1,4 @@
-"""T5a：单位置合成验收 harness 的隔离契约与生产门禁复用证据。
+"""Exact demo20 TTS/ACK harness 的隔离契约与生产门禁复用证据。
 
 **本文件模块顶层只允许 stdlib / pytest / harness.tts_ack_harness。**
 不得 import fastapi、sqlmodel 或任何 app.*：导入 app.db 会在导入期就绑定引擎，
@@ -232,8 +232,9 @@ def test_resolved_config_never_exposes_secrets(tmp_path):
     assert PIN not in printed
 
 
-def test_only_the_canonical_bank_path_is_replaced(tmp_path):
-    """canonical loader 的作用域是纯路径判定，不需要真实题库对象。"""
+def test_generic_loader_wrapper_remains_path_scoped_for_research_rehearsal(
+        tmp_path):
+    """The shared rehearsal helper stays scoped; demo20 install never calls it."""
     seen: list[object] = []
     loader = harness.canonical_bank_loader(
         lambda path: seen.append(path) or "ORIGINAL", "SYNTHETIC")
@@ -245,6 +246,21 @@ def test_only_the_canonical_bank_path_is_replaced(tmp_path):
     other = tmp_path / "item_bank_errata.json"
     assert loader(other) == "ORIGINAL"
     assert seen == [other]
+
+
+def test_cli_help_names_exact_demo20_and_canonical_boundary():
+    result = subprocess.run(
+        [sys.executable, "-m", "harness.tts_ack_harness", "--help"],
+        capture_output=True,
+        text=True,
+        cwd=str(harness.PLATFORM_ROOT),
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "exact 20 题本机模拟" in result.stdout
+    assert harness.DEMO_PROFILE_VERSION in result.stdout
+    assert "canonical 题库不会被替换" in result.stdout
+    assert "单位置合成验收" not in result.stdout
 
 
 def test_deterministic_wav_is_stable_and_non_empty():
@@ -683,7 +699,8 @@ _INSPECTOR_SCRIPT = """
     config = h.resolve_config(os.environ)
     h.install(config)
 
-    from app import audio_store, content, db, provider_readiness, tts
+    from app import (audio_store, autopilot_plan_profiles, content, db,
+                     provider_readiness, tts)
     from app.models import Patient, VisitPlan
     from app.models import Session as TrainSession
     import sqlalchemy
@@ -692,11 +709,20 @@ _INSPECTOR_SCRIPT = """
     bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     with Session(db.engine) as session:
         patients = [p.patient_id for p in session.exec(select(Patient))]
-        plans = [(p.status, p.patient_id) for p in session.exec(select(VisitPlan))]
+        plans = [
+            (p.status, p.patient_id, p.autopilot_profile_version_id)
+            for p in session.exec(select(VisitPlan))
+        ]
         sessions = [
-            (s.session_id, s.patient_id, s.week_no, s.visit_plan_id)
+            (s.session_id, s.patient_id, s.week_no, s.visit_plan_id,
+             s.autopilot_profile_version_id)
             for s in session.exec(select(TrainSession))
         ]
+        train = session.exec(select(TrainSession)).one()
+        protocol = content.load_autopilot_protocol(
+            content.CONTENT_DIR / "autopilot_protocol_v1.json")
+        resolved = autopilot_plan_profiles.resolve_for_session(
+            train, bank=bank, protocol=protocol)
     print(json.dumps({
         "engine_url": str(db.engine.url),
         "tables": sorted(sqlalchemy.inspect(db.engine).get_table_names()),
@@ -706,6 +732,11 @@ _INSPECTOR_SCRIPT = """
         "positions": len(bank.single_element),
         "source_count": bank.meta["source_protocol_position_count"],
         "unstructured": bank.meta["source_unstructured_positions"],
+        "loader_module": content.load_item_bank.__module__,
+        "resolved_profile": resolved.profile_version_id,
+        "resolved_positions": resolved.resolved_position_count,
+        "unsupported_positions": resolved.unsupported_position_count,
+        "completion_scope": resolved.completion_scope,
         "tts_ready": probe.tts.success,
         "tts_failure": probe.tts.failure_code,
         "asr_ready": probe.asr.success,
@@ -744,14 +775,24 @@ def test_real_cli_migrates_and_seeds_then_inspector_reads_temp_db(tmp_path):
     # 合成受试者 + 已 started 的 VisitPlan + 原子建出的场次。
     assert payload["patients"] == [harness.HARNESS_PATIENT_ID]
     # JSON 往返之后元组变成列表，断言按列表写。
-    assert payload["plans"] == [["started", harness.HARNESS_PATIENT_ID]]
+    assert payload["plans"] == [[
+        "started", harness.HARNESS_PATIENT_ID, harness.DEMO_PROFILE_VERSION]]
     assert len(payload["sessions"]) == 1
-    session_id, patient_id, week_no, plan_id = payload["sessions"][0]
+    session_id, patient_id, week_no, plan_id, profile_version = (
+        payload["sessions"][0])
     assert patient_id == harness.HARNESS_PATIENT_ID
     assert week_no == 2 and plan_id is not None and session_id
-    # canonical 题库在 harness 进程里就是单位置。
-    assert payload["positions"] == 1
-    assert payload["source_count"] == 1 and payload["unstructured"] == []
+    assert profile_version == harness.DEMO_PROFILE_VERSION
+    # install 不再换 canonical loader：题库仍保留完整源清单和 60 缺口。
+    assert payload["loader_module"] == "app.content"
+    assert payload["positions"] == 20
+    assert payload["source_count"] == 80
+    assert len(payload["unstructured"]) == 10
+    # 可执行范围来自不可变 profile，而不是裁题库。
+    assert payload["resolved_profile"] == harness.DEMO_PROFILE_VERSION
+    assert payload["resolved_positions"] == 20
+    assert payload["unsupported_positions"] == 0
+    assert payload["completion_scope"] == "demo_plan_only"
     # readiness 合成探针真的跑通了 TTS→ASR，而不是被绕过或塞了一行 ready。
     assert payload["tts_ready"] is True, payload["tts_failure"]
     assert payload["asr_ready"] is True, payload["asr_failure"]
@@ -759,7 +800,7 @@ def test_real_cli_migrates_and_seeds_then_inspector_reads_temp_db(tmp_path):
 
 
 # ==========================================================================
-# D. 隔离子进程：内容契约 + 生产 60 缺口门禁 + allowlist 子集
+# D. 隔离子进程：canonical 60 缺口仍拒绝 + exact demo20 解析为 20
 # ==========================================================================
 _CONTENT_CONTRACT_SCRIPT = """
     import json, os
@@ -767,7 +808,8 @@ _CONTENT_CONTRACT_SCRIPT = """
 
     config = h.resolve_config(os.environ)
 
-    from app import autopilot_service, content, repeat_intent
+    from app import (autopilot_plan_profiles, autopilot_service, content,
+                     repeat_intent)
     from app.models import Session as TrainSession
 
     production = content.load_item_bank(
@@ -775,67 +817,75 @@ _CONTENT_CONTRACT_SCRIPT = """
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     repeat_protocol = repeat_intent.active_protocol()
-    synthetic = h.synthetic_single_position_bank(production)
-
-    def _session(bank):
+    def _session(*, demo20):
         return TrainSession(
             session_id="S-HARNESS-CONTRACT",
             patient_id=h.HARNESS_PATIENT_ID,
+            is_simulation=True,
             week_no=2,
             phase_type="正式训练",
             event_line="正式训练",
-            item_bank_version_id=bank.version_id,
-            item_bank_definition_digest=content.item_bank_definition_digest(bank),
+            item_bank_version_id=production.version_id,
+            item_bank_definition_digest=(
+                content.item_bank_definition_digest(production)),
             autopilot_protocol_version_id=protocol["protocol_version_id"],
             autopilot_protocol_definition_digest=(
                 content.autopilot_protocol_definition_digest(protocol)),
             repeat_protocol_version_id=repeat_protocol.version_id,
             repeat_protocol_definition_digest=repeat_protocol.definition_digest,
+            autopilot_profile_version_id=(
+                h.DEMO_PROFILE_VERSION if demo20 else None),
+            autopilot_profile_definition_digest=(
+                autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_DIGEST
+                if demo20 else None),
         )
+
+    canonical_session = _session(demo20=False)
+    demo_session = _session(demo20=True)
+    canonical_resolution = autopilot_plan_profiles.resolve_for_session(
+        canonical_session, bank=production, protocol=protocol)
+    demo_resolution = autopilot_plan_profiles.resolve_for_session(
+        demo_session, bank=production, protocol=protocol)
 
     refusal = {}
     try:
         autopilot_service._require_entire_plan_supported(
-            _session(production), production, protocol)
+            canonical_session, production, protocol)
     except autopilot_service.AutopilotServiceError as exc:
         refusal = {"code": exc.code, "context": exc.context}
 
-    synthetic_gate_error = None
+    demo_gate_error = None
     try:
         autopilot_service._require_entire_plan_supported(
-            _session(synthetic), synthetic, protocol)
+            demo_session, production, protocol)
     except autopilot_service.AutopilotServiceError as exc:
-        synthetic_gate_error = exc.code
+        demo_gate_error = exc.code
 
-    week1 = json.loads(
-        (content.CONTENT_DIR / "week1_script.json").read_text(encoding="utf-8"))
-    protocol_raw = json.loads(
-        (content.CONTENT_DIR / "autopilot_protocol_v1.json").read_text(
-            encoding="utf-8"))
-
-    digest_once = content.item_bank_definition_digest(synthetic)
+    digest_once = content.item_bank_definition_digest(production)
     digest_twice = content.item_bank_definition_digest(
-        h.synthetic_single_position_bank(production))
+        content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json"))
+    canonical_ids = {row["item_id"] for row in production.single_element}
 
     print(json.dumps({
         "production_refusal": refusal,
         "production_positions": len(production.single_element),
         "production_source_count": production.meta[
             "source_protocol_position_count"],
-        "synthetic_gate_error": synthetic_gate_error,
-        "synthetic_positions": len(synthetic.single_element),
-        "synthetic_double": len(synthetic.double_element),
-        "synthetic_multi": len(synthetic.multi_element),
-        "synthetic_source_count": synthetic.meta[
-            "source_protocol_position_count"],
-        "synthetic_unstructured": synthetic.meta["source_unstructured_positions"],
+        "canonical_resolved_positions": (
+            canonical_resolution.resolved_position_count),
+        "canonical_unsupported_positions": (
+            canonical_resolution.unsupported_position_count),
+        "canonical_completion_scope": canonical_resolution.completion_scope,
+        "demo_gate_error": demo_gate_error,
+        "demo_profile": demo_resolution.profile_version_id,
+        "demo_positions": demo_resolution.resolved_position_count,
+        "demo_unsupported": demo_resolution.unsupported_position_count,
+        "demo_completion_scope": demo_resolution.completion_scope,
+        "demo_items_are_canonical": all(
+            item.item_id in canonical_ids
+            for item in demo_resolution.session_plan.items),
         "digest_stable": digest_once == digest_twice,
-        "digest_differs": digest_once != content.item_bank_definition_digest(
-            production),
-        "validation_errors": content.validate_item_bank(synthetic)["errors"],
-        "allowlist_subset": content.tts_allowlist(
-            synthetic, week1, protocol_raw) <= content.tts_allowlist(
-                production, week1, protocol_raw),
+        "validation_errors": content.validate_item_bank(production)["errors"],
     }))
 """
 
@@ -849,25 +899,27 @@ def test_content_contract_and_production_gate(tmp_path):
         "autopilot_plan_not_fully_supported")
     assert payload["production_refusal"]["context"][
         "unsupported_position_count"] == 60
-    assert payload["production_positions"] > 1
-    assert payload["production_source_count"] != 1
+    assert payload["production_positions"] == 20
+    assert payload["production_source_count"] == 80
+    assert payload["canonical_resolved_positions"] == 70
+    assert payload["canonical_unsupported_positions"] == 60
+    assert payload["canonical_completion_scope"] == "canonical_full_source"
 
-    # 合成题库恰好一个位置，整计划核验真实通过。
-    assert payload["synthetic_gate_error"] is None
-    assert payload["synthetic_positions"] == 1
-    assert payload["synthetic_double"] == 0 and payload["synthetic_multi"] == 0
-    assert payload["synthetic_source_count"] == 1
-    assert payload["synthetic_unstructured"] == []
+    # 同一份 canonical 题库只经 exact profile 选位，20 位置完整通过。
+    assert payload["demo_gate_error"] is None
+    assert payload["demo_profile"] == harness.DEMO_PROFILE_VERSION
+    assert payload["demo_positions"] == 20
+    assert payload["demo_unsupported"] == 0
+    assert payload["demo_completion_scope"] == "demo_plan_only"
+    assert payload["demo_items_are_canonical"] is True
 
-    assert payload["digest_stable"] is True and payload["digest_differs"] is True
+    assert payload["digest_stable"] is True
     assert payload["validation_errors"] == []
-    # 上云话术仍然只可能是生产 allowlist 的子集，harness 没有新造任何文本。
-    assert payload["allowlist_subset"] is True
 
 
 # ==========================================================================
-# E. 隔离子进程：生产 start gate 只签发一条首条 TTS；
-#    换回生产题库触发冻结内容防漂移拒绝（digest 不一致，不是 60 缺口那条）
+# E. 隔离子进程：真实 VisitPlan demo20 账本经生产 start gate
+#    只签发 profile 第一个位置的一条 TTS。
 # ==========================================================================
 _START_GATE_SCRIPT = """
     import json, os
@@ -881,18 +933,12 @@ _START_GATE_SCRIPT = """
     config = h.resolve_config(os.environ)
     h.migrate(config)
 
-    # install() 之后 canonical 路径就只返回合成题库了；生产题库必须先取好，
-    # 后面才能用它证明"换回生产内容仍被同一道门禁拦下"。
-    from app import content as _content
-    production_bank = _content.load_item_bank(
-        _content.CONTENT_DIR / "item_bank_v1.json")
-
     app = h.install(config)
     seeded = h.seed(config)
     session_id = seeded["session_id"]
 
-    from app import (auth, autopilot_orchestration, content, db,
-                     provider_readiness)
+    from app import (auth, autopilot_orchestration, autopilot_plan_profiles,
+                     content, db, provider_readiness)
     from app.models import LiveState, PatientDeviceCapability, RuntimeCommand
     from app.models import Session as TrainSession
 
@@ -906,6 +952,10 @@ _START_GATE_SCRIPT = """
 
     with Session(db.engine) as session:
         train = session.get(TrainSession, session_id)
+        resolved = autopilot_plan_profiles.resolve_for_session(
+            train, bank=bank, protocol=content.load_autopilot_protocol(
+                content.CONTENT_DIR / "autopilot_protocol_v1.json"))
+        expected_first = resolved.positions[0]
         session.add(LiveState(
             id=1,
             seq=1,
@@ -947,17 +997,7 @@ _START_GATE_SCRIPT = """
             json={"idempotency_key": "harness-start-0001", "expected_revision": 0})
         with Session(db.engine) as session:
             after_start = [
-                (c.kind, c.session_id) for c in session.exec(select(RuntimeCommand))]
-
-        # 换回生产题库：场次冻结的是合成 digest，definition binding 会先于整计划
-        # 核验触发，这里取的是"冻结内容一旦漂移就拒绝"的证据。
-        content.load_item_bank = lambda _path: production_bank
-        refused = account.post(
-            f"/sessions/{session_id}/autopilot/start",
-            json={"idempotency_key": "harness-start-0002", "expected_revision": 0})
-        with Session(db.engine) as session:
-            after_refusal = [
-                (c.kind, c.session_id)
+                (c.kind, c.session_id, c.item_id, c.turn_seq)
                 for c in session.exec(select(RuntimeCommand))]
 
     print(json.dumps({
@@ -970,11 +1010,13 @@ _START_GATE_SCRIPT = """
         "start_status": started.status_code,
         "start_body": started.json() if started.status_code != 200 else None,
         "commands_after_start": after_start,
-        "refused_status": refused.status_code,
-        "refused_detail": refused.json().get("detail"),
-        "commands_after_refusal": after_refusal,
+        "profile_version": resolved.profile_version_id,
+        "resolved_positions": resolved.resolved_position_count,
+        "completion_scope": resolved.completion_scope,
+        "expected_first": [expected_first.item_id, expected_first.turn_seq],
         "marker_header": marker_header,
         "bank_positions": len(bank.single_element),
+        "bank_source_count": bank.meta["source_protocol_position_count"],
     }))
 """
 
@@ -990,21 +1032,17 @@ def test_start_gate_issues_exactly_one_first_tts_command(tmp_path):
 
     # 走的是生产 start gate，不是直接造命令。
     assert payload["start_status"] == 200, payload["start_body"]
-    assert payload["commands_after_start"] == [["tts", payload["session_id"]]]
-
-    # 这一层是**冻结内容防漂移**，不是 60 缺口门禁：场次是在合成题库下建的，
-    # 冻结的 digest 就是合成 digest；把 canonical 路径换回生产题库之后，_require_gate
-    # 的 definition binding 先于整计划核验触发，必然停在 digest 不一致这条。
-    # 正式生产题库的 60 缺口证据在 D 段用 _require_entire_plan_supported 直取，
-    # 两层证据各自成立，不要混称。
-    assert payload["refused_status"] == 409
-    detail = payload["refused_detail"]
-    assert detail["code"] == "autopilot_content_digest_mismatch"
-    assert payload["commands_after_refusal"] == payload["commands_after_start"]
+    expected_item, expected_turn = payload["expected_first"]
+    assert payload["commands_after_start"] == [[
+        "tts", payload["session_id"], expected_item, expected_turn]]
+    assert payload["profile_version"] == harness.DEMO_PROFILE_VERSION
+    assert payload["resolved_positions"] == 20
+    assert payload["completion_scope"] == "demo_plan_only"
 
     # harness-only 标记头在生产路由上生效。
     assert payload["marker_header"] == harness.MARKER_VALUE
-    assert payload["bank_positions"] == 1
+    assert payload["bank_positions"] == 20
+    assert payload["bank_source_count"] == 80
 
 
 # ==========================================================================

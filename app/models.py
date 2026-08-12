@@ -1041,6 +1041,47 @@ def _reject_patient_pause_receipt_mutation(*_args) -> None:
     raise RuntimeError("PatientPauseReceipt 是只追加幂等回执")
 
 
+class CaregiverHelpRequest(SQLModel, table=True):
+    """照护员呼叫其他工作人员的只追加回执。
+
+    这不是老人端安全暂停：它只接受具名 caregiver_operator 账号，
+    不存自由文本，也不复用 PatientPauseReceipt 的设备 capability 证据。
+    """
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "idempotency_key_sha256",
+            name="uq_caregiver_help_session_idempotency"),
+        CheckConstraint(
+            _hex64_sql("idempotency_key_sha256"),
+            name="ck_caregiver_help_idempotency_hash"),
+        CheckConstraint(
+            _hex64_sql("request_hash"),
+            name="ck_caregiver_help_request_hash"),
+        CheckConstraint(
+            "reason_code IN ('participant_distress','participant_request',"
+            "'clinical_concern','technical_failure','other_staff_needed')",
+            name="ck_caregiver_help_reason_closed"),
+        CheckConstraint(
+            "runtime_revision >= 0",
+            name="ck_caregiver_help_runtime_revision_nonnegative"),
+    )
+
+    request_id: str = Field(primary_key=True)
+    session_id: str = Field(foreign_key="session.session_id", index=True)
+    actor_id: str = Field(index=True)
+    reason_code: str
+    idempotency_key_sha256: str = Field(index=True)
+    request_hash: str
+    runtime_revision: int
+    created_at: datetime = Field(default_factory=_utc_now_naive)
+
+
+@sa_event.listens_for(CaregiverHelpRequest, "before_update")
+@sa_event.listens_for(CaregiverHelpRequest, "before_delete")
+def _reject_caregiver_help_request_mutation(*_args) -> None:
+    raise RuntimeError("CaregiverHelpRequest 是只追加床旁呼叫回执")
+
+
 class Week1Profile(SQLModel, table=True):
     """★ 第1周画像——独立命名空间。判分链不得 join。只喂交互侧。"""
     patient_id: str = Field(primary_key=True, foreign_key="patient.patient_id")
@@ -1512,7 +1553,7 @@ class ResearchUser(SQLModel, table=True):
     username: str = Field(primary_key=True)
     display_id: str                               # 审计身份（谁锁的分/谁评的量表）
     password_hash: str
-    role: str = "researcher"                       # researcher / data_steward / admin
+    role: str = "researcher"                       # researcher / data_steward / admin / caregiver_operator
     disabled: bool = False                          # 停用即时生效（会话校验时否决）
     created_at: Optional[datetime] = None
     last_login_at: Optional[datetime] = None

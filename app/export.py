@@ -28,7 +28,8 @@ from sqlalchemy import or_
 from sqlmodel import Session as DBSession
 from sqlmodel import select
 
-from . import (audio_gate, audio_store, evidence_ledger, export_security,
+from . import (audio_gate, audio_store, autopilot_plan_profiles,
+               evidence_ledger, export_security,
                repeat_evidence,
                governance_lock, scoring)
 from .enums import AudioStatus
@@ -1258,12 +1259,24 @@ def export_session_bundle(
             raw_audio_id, deidentification_config)
 
     # --- session 表 ---
+    profile_definition = autopilot_plan_profiles.resolve_registered_binding(
+        sess.autopilot_profile_version_id,
+        sess.autopilot_profile_definition_digest,
+    )
+    completion_scope = (
+        profile_definition.completion_scope
+        if profile_definition is not None
+        else "canonical_full_source"
+    )
     session_sheet = [{**session_cols(), "week_no": sess.week_no,
                       "is_simulation": sess.is_simulation,
                       "data_classification": sess.data_classification,
                       "phase_type": _v(sess.phase_type), "event_line": _v(sess.event_line),
                       "session_sitting_no": sess.session_sitting_no,
                       "item_bank_version_id": sess.item_bank_version_id,
+                      "autopilot_profile_version_id": (
+                          sess.autopilot_profile_version_id),
+                      "completion_scope": completion_scope,
                       "pseudonym_version": export_security.PSEUDONYM_VERSION,
                       "pseudonym_key_id": deidentification_config.key_id,
                       "dementia_severity": getattr(patient, "dementia_severity", None),

@@ -21,8 +21,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, update
 from sqlmodel import Session, select
 
-from . import (autopilot_ledger, autopilot_positions, autopilot_service, content,
-               evidence_ledger, runtime)
+from . import (autopilot_ledger, autopilot_plan_profiles, autopilot_positions,
+               autopilot_service, content, evidence_ledger, runtime)
 from .autopilot_contract import TtsCommandPayload
 from .enums import AudioStatus
 from .models import (
@@ -96,12 +96,20 @@ def _frozen_attempt_context(
     train_session: TrainSession,
     record: RuntimeCommand,
     bank: content.ItemBank,
+    protocol: dict,
 ) -> tuple[str, str | None]:
     event_line = getattr(train_session.event_line, "value", train_session.event_line)
     try:
-        plan = runtime.build_session_plan(
-            bank, train_session.week_no, str(event_line))
-    except ValueError as exc:
+        if (
+            train_session.autopilot_profile_version_id is not None
+            or train_session.autopilot_profile_definition_digest is not None
+        ):
+            plan = autopilot_plan_profiles.resolve_for_session(
+                train_session, bank=bank, protocol=protocol).session_plan
+        else:
+            plan = runtime.build_session_plan(
+                bank, train_session.week_no, str(event_line))
+    except (ValueError, autopilot_plan_profiles.PlanProfileError) as exc:
         raise AutopilotOrchestrationError(
             "autopilot_attempt_plan_invalid", "P0a 冻结计划不可用") from exc
     positions = autopilot_positions.plan_positions(plan)
@@ -284,7 +292,7 @@ def derive_authoritative_attempt_input(
         _fail("autopilot_attempt_sequence_invalid", "capture attempt_seq 与提示序列不单调")
 
     response_role, cue_type = _frozen_attempt_context(
-        gate.train_session, record, bank)
+        gate.train_session, record, bank, protocol)
     derived = AuthoritativeAttemptInput(
         item_id=proof.item_id,
         turn_seq=proof.turn_seq,
@@ -975,7 +983,8 @@ def verify_legacy_pre_repeat_recovery(
             item_id=record.item_id, turn_seq=record.turn_seq)
     except autopilot_service.AutopilotServiceError as exc:
         raise AutopilotOrchestrationError(exc.code, exc.message) from exc
-    response_role, cue_type = _frozen_attempt_context(train_session, record, bank)
+    response_role, cue_type = _frozen_attempt_context(
+        train_session, record, bank, protocol)
     if (record.response_role != response_role
             or selected.response_role != response_role
             or selected.item_id != record.item_id

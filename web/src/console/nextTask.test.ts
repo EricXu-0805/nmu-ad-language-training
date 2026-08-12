@@ -120,6 +120,7 @@ test("next task creates a new plan on the next free sitting, never reusing occup
   // 已开训的 sitting 1 仍占槽,取消的 sitting 9 不占;下一个自由槽位 = 2。
   assert.equal(rec.create[0].session_sitting_no, 2);
   assert.equal(rec.create[0].week_no, 2);
+  assert.equal(rec.create[0].autopilot_profile_version_id, "week2-single20-demo-v1");
 });
 
 test("next task surfaces the server block instead of silently switching paths", async () => {

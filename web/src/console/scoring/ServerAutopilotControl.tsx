@@ -29,6 +29,7 @@ import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import type { Session } from "../../types";
+import { hasExactWeek2Single20Profile } from "../../autopilot/demoProfile.ts";
 
 export function ServerAutopilotControl({
   session,
@@ -60,6 +61,8 @@ export function ServerAutopilotControl({
   const completePlanBlocked = !completePlanAllowsAutopilotStart(
     operationalAutopilotReady,
   );
+  const exactDemoProfile = hasExactWeek2Single20Profile(session);
+  const resolvedPlanLabel = exactDemoProfile ? "20 题模拟计划" : "完整冻结计划";
   const isSimulation = session.is_simulation === true
     && session.data_classification === "simulation";
   const startInFlight = useRef(false);
@@ -392,8 +395,8 @@ export function ServerAutopilotControl({
                       : serverFailed ? "服务器失败·人工入口已锁定"
                       : uncertain ? "等待权威状态核实"
                 : completePlanBlocked ? operationalAutopilotReady === null
-                  ? "正在核对完整冻结计划"
-                  : "完整冻结计划仍有自动协议缺口"
+                  ? `正在核对${resolvedPlanLabel}`
+                  : `${resolvedPlanLabel}仍有自动协议缺口`
                 : providerBlocked ? providerReadiness === null
                   ? "正在核对 AI 服务实测"
                   : "AI 服务实测未通过或已过期"

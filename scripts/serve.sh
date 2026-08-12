@@ -6,6 +6,9 @@
 # 单机模式(默认):  ./scripts/serve.sh
 #   → 127.0.0.1:8000,同机开两窗 /console + /patient(localhost 即 secure context,麦克风可用)
 #
+# 本机 20 题模拟演示: DEMO20=1 ./scripts/serve.sh
+#   → 仅回环地址；显式开启合成数据 + P0a 模拟自动流程，不放开真人训练。
+#
 # 内网双设备模式:   INTRANET=1 ./scripts/serve.sh
 #   → 0.0.0.0:8443 + 自签 TLS。平板浏览器麦克风(getUserMedia)只在 https 下开放,
 #     故内网模式必须带证书;首次访问浏览器会警告自签证书,人工信任一次即可。
@@ -16,6 +19,20 @@ cd "$(dirname "$0")/.."
 
 PY=./.venv/bin/python
 [ -x "$PY" ] || { echo "缺 .venv,先: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt"; exit 1; }
+
+case "${DEMO20:-0}" in
+  0|1) ;;
+  *) echo "✗ DEMO20 只能是 0 或 1"; exit 1 ;;
+esac
+if [ "${DEMO20:-0}" = "1" ]; then
+  if [ "${INTRANET:-0}" = "1" ]; then
+    echo "✗ DEMO20 仅允许本机回环演示，不能与 INTRANET=1 同时使用"
+    exit 1
+  fi
+  export ALLOW_SIMULATION_DATA=1
+  export ENABLE_AUTOPILOT_P0A_SIMULATION=1
+  echo "✓ 已启用本机 20 题合成模拟演示（非真人、非正式研究）"
+fi
 
 # 回环开发脚本本身就是显式的模拟环境入口；公网/内网双设备模式仍默认关闭，
 # 必须由部署者在环境中主动设置，避免浏览器请求自行把真实数据降格为模拟。

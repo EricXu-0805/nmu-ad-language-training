@@ -13,8 +13,9 @@ from sqlalchemy import event, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import (autopilot_ledger, autopilot_orchestration, content,
-                 evidence_ledger, repeat_intent)
+from app import (autopilot_ledger, autopilot_orchestration,
+                 autopilot_plan_profiles, content, evidence_ledger,
+                 repeat_intent)
 from app.autopilot_contract import (
     AutopilotAckIn,
     RecordCommandPayload,
@@ -54,6 +55,7 @@ from app.models import (
     SessionAutopilotState,
     SessionRuntimeState,
     TurnEvent,
+    VisitPlan,
 )
 
 
@@ -189,6 +191,56 @@ def _seed_ready(
     db.commit()
 
 
+def _bind_exact_demo20_profile(db: Session) -> TrainSession:
+    train_session = db.get(TrainSession, SESSION_ID)
+    assert train_session is not None
+    plan_id = "VP-P0A-SERVICE-DEMO20"
+    db.add(VisitPlan(
+        plan_id=plan_id,
+        protocol_slot_key="c" * 64,
+        patient_id=train_session.patient_id,
+        scheduled_date=NOW.date(),
+        scheduled_time=NOW.time(),
+        session_sitting_no=train_session.session_sitting_no,
+        week_no=train_session.week_no,
+        phase_type=train_session.phase_type,
+        event_line=train_session.event_line,
+        item_bank_version_id=train_session.item_bank_version_id,
+        item_bank_definition_digest=train_session.item_bank_definition_digest,
+        autopilot_protocol_version_id=(
+            train_session.autopilot_protocol_version_id),
+        autopilot_protocol_definition_digest=(
+            train_session.autopilot_protocol_definition_digest),
+        repeat_protocol_version_id=train_session.repeat_protocol_version_id,
+        repeat_protocol_definition_digest=(
+            train_session.repeat_protocol_definition_digest),
+        autopilot_profile_version_id=(
+            autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_VERSION),
+        autopilot_profile_definition_digest=(
+            autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_DIGEST),
+        is_simulation=True,
+        data_classification="simulation",
+        status="started",
+        revision=3,
+        created_by=ACTOR_ID,
+        created_at=NOW,
+        updated_at=NOW,
+        approved_by=ACTOR_ID,
+        approved_at=NOW,
+        started_by=ACTOR_ID,
+        started_at=NOW,
+    ))
+    db.commit()
+    train_session.visit_plan_id = plan_id
+    train_session.autopilot_profile_version_id = (
+        autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_VERSION)
+    train_session.autopilot_profile_definition_digest = (
+        autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_DIGEST)
+    db.add(train_session)
+    db.commit()
+    return train_session
+
+
 def _start(db: Session, *, bank: content.ItemBank = FIRST_ONLY_BANK):
     return start_p0a(
         db,
@@ -253,8 +305,9 @@ def _seed_purpose_tts(
     start_source: str = "test_seed",
     bank: content.ItemBank = FIRST_ONLY_BANK,
     protocol: dict = PROTOCOL,
+    item_index: int = 0,
 ) -> RuntimeCommand:
-    item = BANK.single_element[0]
+    item = bank.single_element[item_index]
     payload_fields = {
         "speech_key": f"p0a.{purpose}.1",
         "speech_text": speech_override or _speech_for(
@@ -686,6 +739,72 @@ def test_start_is_idempotent_and_uses_raw_bank_initial_prompt(
             "success_line", "acceptable_expressions",
             "issued_capability_token_hash", "issued_device_id_hash", "issued_at",
         })
+
+
+def test_exact_demo20_starts_at_first_profile_position(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=BANK)
+        train_session = _bind_exact_demo20_profile(db)
+
+        resolution = autopilot_plan_profiles.resolve_for_session(
+            train_session, bank=BANK, protocol=PROTOCOL)
+        assert resolution.completion_scope == "demo_plan_only"
+        assert resolution.resolved_position_count == 20
+        assert resolution.unsupported_position_count == 0
+
+        started = _start(db, bank=BANK)
+        db.commit()
+        assert started.status == "waiting_tts"
+        assert started.command is not None
+        assert started.command.item_ref == "itm-0001"
+        issued = _current_tts(db)
+        assert issued.item_id == resolution.plan.items[0].item_id
+        assert issued.turn_seq == 1
+
+
+def test_exact_demo20_completes_after_its_twentieth_position(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=BANK)
+        train_session = _bind_exact_demo20_profile(db)
+        resolution = autopilot_plan_profiles.resolve_for_session(
+            train_session, bank=BANK, protocol=PROTOCOL)
+        last_item = resolution.plan.items[-1]
+        last_index, last_raw = next(
+            (index, row)
+            for index, row in enumerate(BANK.single_element)
+            if row["item_id"] == last_item.item_id
+        )
+        command = _seed_purpose_tts(
+            db,
+            purpose="feedback",
+            prompt_level=0,
+            attempt_seq=1,
+            speech_override=last_raw["success_line"],
+            bank=BANK,
+            item_index=last_index,
+        )
+        ack_key = _complete_tts(db, command)
+
+        routed = route_tts_ended(
+            db,
+            session_id=SESSION_ID,
+            command_key=command.idempotency_key,
+            ack_idempotency_key=ack_key,
+            bank=BANK,
+            protocol=PROTOCOL,
+            now=NOW,
+        )
+        db.commit()
+        assert routed.status == "scope_completed"
+        assert routed.command is None
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        assert state.status == "scope_completed"
+        assert state.current_command_id is None
 
 
 def test_session_and_issued_command_fail_closed_on_definition_drift(

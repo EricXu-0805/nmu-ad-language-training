@@ -72,6 +72,10 @@ test("quick drill orchestrates create→approve→start on the only startable si
   assert.equal(rec.create[0].week_no, 2);
   assert.equal(rec.create[0].phase_type, "正式训练");
   assert.equal(rec.create[0].event_line, "正式训练");
+  assert.equal(
+    rec.create[0].autopilot_profile_version_id,
+    "week2-single20-demo-v1",
+  );
   assert.match(rec.create[0].idempotency_key, /^qd-create-seed01$/);
 
   // 修订号严格串联:approve 用 create 的 revision,start 用 approve 的 revision。

@@ -28,6 +28,7 @@ from . import (
     audio_capture,
     audio_store,
     autopilot_ledger,
+    autopilot_plan_profiles,
     content,
     evidence_ledger,
     runtime,
@@ -482,9 +483,17 @@ def _plans_for_sessions(
             invalid.add(row.session_id)
             continue
         try:
-            plan = runtime.build_session_plan(
-                bank, row.week_no, _enum_value(row.event_line))
-        except (TypeError, ValueError):
+            if (
+                row.autopilot_profile_version_id is not None
+                or row.autopilot_profile_definition_digest is not None
+            ):
+                plan = autopilot_plan_profiles.resolve_for_session(
+                    row, bank=bank, protocol=protocol).session_plan
+            else:
+                plan = runtime.build_session_plan(
+                    bank, row.week_no, _enum_value(row.event_line))
+        except (TypeError, ValueError,
+                autopilot_plan_profiles.PlanProfileError):
             invalid.add(row.session_id)
             continue
         expected_turns += plan.total_turns()

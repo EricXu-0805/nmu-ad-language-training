@@ -118,12 +118,28 @@ const DEMO_VERSION = "week2-single20-demo-v1";
 const DEMO_DIGEST =
   "a82bf3910e2e4f0f5a0b78eb3e4c9b8fc4d8a73f16bb570f118f1d5136311f34";
 
-/** A demo draft: the only profile state D1A's server can actually produce. */
+/** The immutable simulation-only D1B demo lifecycle. */
 function demoDraft(planId = PLAN_A) {
   return { ...draft(planId), autopilot_profile_version_id: DEMO_VERSION };
 }
 
-test("governance accepts the exact known demo draft and both cancelled shapes", () => {
+function demoApproved(planId = PLAN_A) {
+  return { ...approved(planId), autopilot_profile_version_id: DEMO_VERSION };
+}
+
+function demoStarted() {
+  return { ...started(), autopilot_profile_version_id: DEMO_VERSION };
+}
+
+function demoStartedSession() {
+  return {
+    ...startedSession(),
+    autopilot_profile_version_id: DEMO_VERSION,
+    autopilot_profile_definition_digest: DEMO_DIGEST,
+  };
+}
+
+test("exact simulation demo receipt is accepted through its coherent lifecycle", () => {
   const fromDraft = {
     ...demoDraft(), status: "cancelled", revision: 2,
     cancelled_by: "ACTOR-researcher", cancelled_at: "2026-07-19T01:03:00",
@@ -134,14 +150,16 @@ test("governance accepts the exact known demo draft and both cancelled shapes", 
     approved_by: "ACTOR-reviewer", approved_at: "2026-07-19T01:01:00",
     cancelled_by: "ACTOR-researcher", cancelled_at: "2026-07-19T01:03:00",
   };
-  for (const receipt of [demoDraft(), fromDraft, fromApproved]) {
+  for (const receipt of [
+    demoDraft(), demoApproved(), demoStarted(), fromDraft, fromApproved,
+  ]) {
     const parsed = parseVisitPlanReceipt(receipt);
     assert.deepEqual(parsed, receipt);
     assert.equal(parsed.autopilot_profile_version_id, DEMO_VERSION);
   }
 });
 
-test("profile receipts are refused outside the exact known governance shape", () => {
+test("profile receipts reject unknown versions, real data, and wrong contexts", () => {
   const invalid = [
     // Missing key, and a leaked digest key, both break the exact key set.
     (() => {
@@ -159,16 +177,10 @@ test("profile receipts are refused outside the exact known governance shape", ()
     { ...draft(), autopilot_profile_version_id: "week2-single20-demo-v2" },
     // A demo scope is simulation-only.
     { ...demoDraft(), is_simulation: false, data_classification: "research" },
-    // D1A's server fails these closed; the browser must not resurrect them.
+    { ...demoDraft(), week_no: 3 },
     {
-      ...demoDraft(), status: "approved", revision: 2,
-      approved_by: "ACTOR-reviewer", approved_at: "2026-07-19T01:01:00",
-    },
-    {
-      ...demoDraft(), status: "started", revision: 3,
-      approved_by: "ACTOR-reviewer", approved_at: "2026-07-19T01:01:00",
-      started_by: "ACTOR-researcher", started_at: "2026-07-19T01:02:00",
-      session_id: SESSION_A,
+      ...demoDraft(), week_no: 1, phase_type: "关系建立",
+      event_line: "关系建立环节",
     },
     // A cancelled row may never carry started facts.  Coherent in revision and
     // approval history so the started pair is the only remaining defect.
@@ -183,26 +195,21 @@ test("profile receipts are refused outside the exact known governance shape", ()
 });
 
 test("profile version is frozen across approve identity and start reconciliation", () => {
-  const approvedReceipt = parseVisitPlanReceipt(approved());
-  const startedReceipt = parseVisitPlanReceipt(started());
+  const approvedReceipt = parseVisitPlanReceipt(demoApproved());
+  const startedReceipt = parseVisitPlanReceipt(demoStarted());
   assert.equal(reconcileStartedVisitPlan(approvedReceipt, startedReceipt),
     startedReceipt);
   assert.equal(
-    isSameApprovedVisitPlan(approvedReceipt, parseVisitPlanReceipt(approved())),
+    isSameApprovedVisitPlan(approvedReceipt, parseVisitPlanReceipt(demoApproved())),
     true);
 
-  // Constructed from already-parsed receipts on purpose: the wire parser can
-  // never emit an approved or started demo receipt, so drifting a parsed one is
-  // the only way to prove the frozen-fact list actually covers this key.
   assert.throws(() => reconcileStartedVisitPlan(approvedReceipt, {
-    ...startedReceipt, autopilot_profile_version_id: DEMO_VERSION,
+    ...startedReceipt, autopilot_profile_version_id: null,
   }));
   assert.equal(isSameApprovedVisitPlan(approvedReceipt, {
-    ...approvedReceipt, autopilot_profile_version_id: DEMO_VERSION,
+    ...approvedReceipt, autopilot_profile_version_id: null,
   }), false);
 });
-
-const RUNTIME_DISABLED = /尚未开放模拟演示计划的床旁运行/;
 
 test("every paired-null projection keeps both profile keys present and null", () => {
   const receipt = parseVisitPlanReceipt(started());
@@ -223,13 +230,9 @@ test("every paired-null projection keeps both profile keys present and null", ()
   }
 });
 
-test("every session profile pair other than absent is refused by the shared parser", () => {
-  const receipt = parseVisitPlanReceipt(started());
-  const complete = {
-    ...startedSession(),
-    autopilot_profile_version_id: DEMO_VERSION,
-    autopilot_profile_definition_digest: DEMO_DIGEST,
-  };
+test("only the exact frozen demo session pair is accepted by the shared parser", () => {
+  const receipt = parseVisitPlanReceipt(demoStarted());
+  const complete = demoStartedSession();
   const invalid = [
     // Missing keys are never defaulted to null.
     (() => {
@@ -247,41 +250,34 @@ test("every session profile pair other than absent is refused by the shared pars
     { ...complete, autopilot_profile_version_id: "week2-single20-demo-v2" },
     { ...complete, autopilot_profile_version_id: "" },
     { ...complete, autopilot_profile_definition_digest: DEMO_DIGEST.toUpperCase() },
+    { ...complete, autopilot_profile_definition_digest: "a".repeat(64) },
     { ...complete, autopilot_profile_definition_digest: "a".repeat(63) },
     { ...complete, autopilot_profile_definition_digest: "not-hex" },
-    // A complete pair still needs a plan link and simulation classification.
+    // A complete pair still needs the plan link, exact context and simulation classification.
     { ...complete, visit_plan_id: null },
     { ...complete, is_simulation: false, data_classification: "research" },
     { ...complete, data_classification: "legacy_unknown" },
+    { ...complete, week_no: 3 },
   ];
   for (const session of invalid) {
     assert.throws(() => parseStartedVisitSession(session, receipt));
-    // Also driven straight through the shared parser: a receipt-binding
-    // mismatch in parseStartedVisitSession would otherwise be enough to make
-    // these green without the profile rules existing at all.
     assert.throws(() => parsePatientSessionList(
       [{ ...session, runtime_status: "paused" }], "P-VISIT-01"));
   }
 
-  // Fully valid in shape, link and classification.  Matched against the
-  // dedicated runtime-disabled error so an earlier shape gate cannot be the
-  // reason either call throws.
-  assert.throws(() => parseStartedVisitSession(complete, receipt), RUNTIME_DISABLED);
-  assert.throws(() => parsePatientSessionList(
-    [{ ...complete, runtime_status: "paused" }], "P-VISIT-01"), RUNTIME_DISABLED);
+  assert.deepEqual(parseStartedVisitSession(complete, receipt), complete);
+  assert.deepEqual(parsePatientSessionList(
+    [{ ...complete, runtime_status: "paused" }], "P-VISIT-01"),
+  [{ ...complete, runtime_status: "paused" }]);
 });
 
 test("started session profile version is compared against the started receipt", () => {
-  // The Session is canonical paired-null and passes every shape gate; only the
-  // receipt's profile version is drifted, so deleting the Session-versus-
-  // receipt comparison is the single change that makes this pass.
-  const receipt = parseVisitPlanReceipt(started());
-  const driftedReceipt = {
-    ...receipt, autopilot_profile_version_id: DEMO_VERSION,
-  };
-  assert.deepEqual(
-    parseStartedVisitSession(startedSession(), receipt), startedSession());
-  assert.throws(() => parseStartedVisitSession(startedSession(), driftedReceipt));
+  const canonicalReceipt = parseVisitPlanReceipt(started());
+  const demoReceipt = parseVisitPlanReceipt(demoStarted());
+  assert.deepEqual(parseStartedVisitSession(startedSession(), canonicalReceipt), startedSession());
+  assert.deepEqual(parseStartedVisitSession(demoStartedSession(), demoReceipt), demoStartedSession());
+  assert.throws(() => parseStartedVisitSession(startedSession(), demoReceipt));
+  assert.throws(() => parseStartedVisitSession(demoStartedSession(), canonicalReceipt));
 });
 
 test("pre-repeat plan-linked history recovers, but a new start must be complete", () => {

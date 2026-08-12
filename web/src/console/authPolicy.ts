@@ -64,6 +64,12 @@ export function identityCanOperateTraining(identity: AuthIdentity | null): boole
   return identity === null || identity.role === "researcher" || identity.role === "admin";
 }
 
+export function identityIsCaregiverOperator(
+  identity: AuthIdentity | null,
+): identity is AuthIdentity & { role: "caregiver_operator" } {
+  return identity?.role === "caregiver_operator";
+}
+
 export function identityCanExportResearchData(identity: AuthIdentity | null): boolean {
   return identity?.role === "data_steward" || identity?.role === "admin";
 }

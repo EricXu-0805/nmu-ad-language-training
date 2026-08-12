@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import (
-    auth, autopilot_plan_profiles, content, db, repeat_intent,
+    auth, autopilot_plan_profiles, content, db, provider_readiness, repeat_intent,
     visit_plan_service,
 )
 from app.main import app
@@ -36,6 +36,7 @@ from app.models import (
     LiveState,
     Patient,
     PatientDeviceCapability,
+    ProviderReadinessProbe,
     ResearchUser,
     RuntimeCommand,
     RuntimeCommandAck,
@@ -246,11 +247,12 @@ def _command(
 
 
 # --------------------------------------------------------------------------
-# D1A autopilot demo profile: draft-only binding contract
+# D1B autopilot demo profile: exact 20-position simulation contract
 #
-# This release freezes the 20-item simulation demo at the draft stage.  Nothing
-# here may approve, start, run or complete a demo scope; the canonical plan
-# must keep behaving exactly as it did before the profile columns existed.
+# The profile can approve/start only while both explicit local-simulation gates
+# are enabled. Removing either gate blocks new work but must not tombstone an
+# authentic historical receipt or prevent safe governance/closeout. The
+# canonical plan keeps its full-source behaviour.
 # --------------------------------------------------------------------------
 
 
@@ -755,6 +757,326 @@ def test_demo_approved_start_is_refused_with_zero_writes(visit_clients):
     assert row.status == "approved"
 
 
+def test_demo_profile_create_approve_start_and_flags_off_governance(
+        visit_clients, monkeypatch):
+    """The exact local demo can start, while later flag removal is non-destructive."""
+    monkeypatch.setenv("ENABLE_AUTOPILOT_P0A_SIMULATION", "1")
+    created = _create(
+        visit_clients.researcher,
+        "P-VISIT-10",
+        "create-d1b-positive-01",
+        autopilot_profile_version_id=DEMO_VERSION,
+    )
+    approved = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        "approve",
+        key="approve-d1b-positive-1",
+        expected_revision=created["revision"],
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "approved"
+    started = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        "start",
+        key="start-d1b-positive-001",
+        expected_revision=approved.json()["revision"],
+    )
+    assert started.status_code == 200, started.text
+    receipt = started.json()
+    assert receipt["status"] == "started"
+    assert receipt["autopilot_profile_version_id"] == DEMO_VERSION
+    assert receipt["session_id"]
+
+    plan_projection = visit_clients.researcher.get(
+        f"/sessions/{receipt['session_id']}/plan")
+    assert plan_projection.status_code == 200, plan_projection.text
+    projected = plan_projection.json()
+    assert projected["autopilot_profile_version_id"] == DEMO_VERSION
+    assert projected["completion_scope"] == "demo_plan_only"
+    assert projected["resolved_position_count"] == 20
+    assert projected["unsupported_position_count"] == 0
+    assert projected["operational_autopilot_ready"] is True
+    assert projected["total_items"] == 20
+
+    with Session(visit_clients.engine) as session:
+        plan = session.get(VisitPlan, created["plan_id"])
+        train_session = session.get(TrainSession, receipt["session_id"])
+        assert plan is not None and train_session is not None
+        assert train_session.autopilot_profile_version_id == DEMO_VERSION
+        assert train_session.autopilot_profile_definition_digest == DEMO_DIGEST
+        visit_plan_service.assert_started_profile_command_chain(
+            session, plan, train_session)
+
+    # Removing the mutation gate blocks future demo work but does not erase or
+    # strand the already-started historical fact.
+    monkeypatch.delenv("ENABLE_AUTOPILOT_P0A_SIMULATION", raising=False)
+    listing = visit_clients.researcher.get(
+        "/visit-plans", params={"patient_id": "P-VISIT-10"})
+    assert listing.status_code == 200, listing.text
+    row = next(item for item in listing.json()
+               if item["plan_id"] == created["plan_id"])
+    assert row["status"] == "started"
+    assert row["session_id"] == receipt["session_id"]
+
+
+def test_demo_profile_real_http_start_reaches_the_first_tts(
+        visit_clients, monkeypatch):
+    """Prove the real ledger, runtime admission, device and provider chain.
+
+    The service-layer boundary tests cover position 20. This HTTP test refuses
+    the direct-session test escape and starts from a genuine profile-bound
+    VisitPlan command ledger instead of constructing a Session by hand.
+    """
+    monkeypatch.setenv("ENABLE_AUTOPILOT_P0A_SIMULATION", "1")
+    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.delenv("NMU_TEST_ALLOW_DIRECT_SESSION_CREATE", raising=False)
+    created = _create(
+        visit_clients.researcher,
+        "P-VISIT-11",
+        "create-d1b-http-start",
+        autopilot_profile_version_id=DEMO_VERSION,
+    )
+    approved = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        "approve",
+        key="approve-d1b-http-start",
+        expected_revision=created["revision"],
+    )
+    assert approved.status_code == 200, approved.text
+    started = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        "start",
+        key="start-d1b-http-start",
+        expected_revision=approved.json()["revision"],
+    )
+    assert started.status_code == 200, started.text
+    session_id = started.json()["session_id"]
+
+    checked_at = datetime.now()
+    readiness_config = provider_readiness.capture_configuration()
+    monkeypatch.setattr(
+        provider_readiness,
+        "capture_configuration",
+        lambda **_kwargs: readiness_config,
+    )
+    with Session(visit_clients.engine) as session:
+        session.add(LiveState(
+            id=1,
+            seq=1,
+            session_json=json.dumps({
+                "sessionId": session_id,
+                "weekNo": 2,
+                "eventLine": "正式训练",
+                "mode": "task",
+                "itemBankVersionId": BANK.version_id,
+            }, ensure_ascii=False),
+            updated_at=checked_at,
+        ))
+        session.add(ProviderReadinessProbe(
+            probe_id="prb_demo20_real_http_start",
+            schema_version=provider_readiness.SCHEMA_VERSION,
+            runtime_contract=provider_readiness.RUNTIME_CONTRACT,
+            config_fingerprint=readiness_config.fingerprint,
+            tts_engine_version=readiness_config.tts_engine_version,
+            asr_engine_version=readiness_config.asr_engine_version,
+            llm_engine_version=readiness_config.llm_engine_version,
+            tts_required=True,
+            tts_success=True,
+            asr_required=True,
+            asr_success=True,
+            llm_required=False,
+            llm_configured=readiness_config.llm_configured,
+            llm_success=readiness_config.llm_configured,
+            llm_failure_code=(
+                None if readiness_config.llm_configured
+                else "llm_not_required_not_configured"
+            ),
+            required_capabilities_ready=True,
+            all_configured_capabilities_ready=True,
+            checked_at=checked_at,
+            expires_at=checked_at + timedelta(hours=1),
+            actor_display_id="ACTOR-visit-researcher",
+        ))
+        session.commit()
+
+    device = TestClient(app)
+    try:
+        paired = device.post(
+            "/device/pair",
+            headers={"X-Console-Pin": "246810"},
+            json={"deviceId": "demo20-http-device-0001"},
+        )
+        assert paired.status_code == 200, paired.text
+        capability_headers = {
+            "X-Device-Capability": paired.json()["capability"],
+        }
+        ownership = visit_clients.researcher.post(
+            f"/sessions/{session_id}/autopilot/start",
+            json={
+                "idempotency_key": "autopilot-demo20-http-start",
+                "expected_revision": 0,
+            },
+        )
+        assert ownership.status_code == 200, ownership.text
+        assert ownership.json()["status"] == "waiting_tts"
+
+        next_command = device.get(
+            f"/sessions/{session_id}/autopilot/next",
+            headers=capability_headers,
+        )
+        assert next_command.status_code == 200, next_command.text
+        command = next_command.json()
+        assert command["kind"] == "tts"
+        assert command["item_ref"] == "itm-0001"
+        assert command["turn_seq"] == 1
+        assert command["attempt_seq"] == 1
+        assert command["prompt_level"] == 0
+
+        # Runtime switches gate new autonomous ownership, not safety actions
+        # needed to govern an already-started historical demo session.
+        monkeypatch.delenv(
+            "ENABLE_AUTOPILOT_P0A_SIMULATION", raising=False)
+        paused = visit_clients.researcher.post(
+            f"/sessions/{session_id}/pause")
+        assert paused.status_code == 200, paused.text
+        assert paused.json()["status"] == "paused"
+    finally:
+        device.close()
+
+
+@pytest.mark.parametrize(
+    "source_mode,target_version,target_digest,stage",
+    [
+        ("canonical", DEMO_VERSION, DEMO_DIGEST, "approve"),
+        ("demo", None, None, "approve"),
+        ("canonical", DEMO_VERSION, DEMO_DIGEST, "start"),
+        ("demo", None, None, "start"),
+    ],
+)
+def test_profile_mode_cannot_change_between_create_approve_and_start(
+        visit_clients, monkeypatch, source_mode, target_version,
+        target_digest, stage):
+    """A mutable Plan pair can never rewrite the append-only creation mode."""
+    monkeypatch.setenv("ENABLE_AUTOPILOT_P0A_SIMULATION", "1")
+    create_overrides = (
+        {"autopilot_profile_version_id": DEMO_VERSION}
+        if source_mode == "demo" else {}
+    )
+    created = _create(
+        visit_clients.researcher,
+        "P-VISIT-11",
+        f"create-mode-{source_mode[:3]}-{stage[:3]}",
+        **create_overrides,
+    )
+    expected_revision = created["revision"]
+    if stage == "start":
+        approved = _command(
+            visit_clients.researcher,
+            created["plan_id"],
+            "approve",
+            key=f"approve-mode-{source_mode[:3]}-{stage[:3]}",
+            expected_revision=expected_revision,
+        )
+        assert approved.status_code == 200, approved.text
+        expected_revision = approved.json()["revision"]
+
+    _force_profile_pair(
+        visit_clients.engine,
+        created["plan_id"],
+        target_version,
+        target_digest,
+    )
+    before = _write_counts(visit_clients.engine)
+    refused = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        stage,
+        key=f"{stage}-after-mode-change-{source_mode[:3]}",
+        expected_revision=expected_revision,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert _detail_code(refused) == "visit_plan_state_invalid"
+    assert _write_counts(visit_clients.engine) == before
+
+
+def test_demo_approve_requires_allow_simulation_even_when_p0a_flag_is_on(
+        visit_clients, monkeypatch):
+    created = _create(
+        visit_clients.researcher,
+        "P-VISIT-12",
+        "create-demo-missing-allow",
+        autopilot_profile_version_id=DEMO_VERSION,
+    )
+    monkeypatch.setenv("ENABLE_AUTOPILOT_P0A_SIMULATION", "1")
+    monkeypatch.delenv("ALLOW_SIMULATION_DATA", raising=False)
+    before = _write_counts(visit_clients.engine)
+
+    refused = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        "approve",
+        key="approve-demo-missing-allow",
+        expected_revision=created["revision"],
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert _detail_code(refused) == "visit_plan_profile_runtime_not_enabled"
+    assert _write_counts(visit_clients.engine) == before
+
+
+@pytest.mark.parametrize(
+    "source_mode,target_version,target_digest",
+    [
+        ("canonical", DEMO_VERSION, DEMO_DIGEST),
+        ("demo", None, None),
+    ],
+)
+def test_profile_mode_drifted_draft_can_still_be_cancelled_safely(
+        visit_clients, source_mode, target_version, target_digest):
+    """Integrity drift blocks new work but may not strand the active slot."""
+    create_overrides = (
+        {"autopilot_profile_version_id": DEMO_VERSION}
+        if source_mode == "demo" else {}
+    )
+    created = _create(
+        visit_clients.researcher,
+        "P-VISIT-12",
+        f"create-cancel-drift-{source_mode[:3]}",
+        **create_overrides,
+    )
+    _force_profile_pair(
+        visit_clients.engine,
+        created["plan_id"],
+        target_version,
+        target_digest,
+    )
+
+    cancelled = _command(
+        visit_clients.researcher,
+        created["plan_id"],
+        "cancel",
+        key=f"cancel-drifted-{source_mode[:3]}",
+        expected_revision=created["revision"],
+        reason_code="protocol_correction",
+    )
+
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["session_id"] is None
+    with Session(visit_clients.engine) as session:
+        row = session.get(VisitPlan, created["plan_id"])
+        assert row is not None
+        assert row.protocol_slot_key is None
+        assert session.exec(select(TrainSession).where(
+            TrainSession.visit_plan_id == created["plan_id"]
+        )).first() is None
+
+
 def _paired_set_mutation_hash(
         action: str, plan_id: str, key: str, expected_revision: int) -> str:
     """Independently rebuild the authoritative paired-set mutation hash.
@@ -860,9 +1182,9 @@ def _seed_paired_set_history(
 
 
 @pytest.mark.parametrize("action", ["approve", "start"])
-def test_exact_paired_set_history_reaches_the_stable_runtime_error(
+def test_exact_paired_set_history_replays_after_runtime_gate_is_removed(
         visit_clients, action):
-    """A fully consistent demo ledger is refused only after it is validated."""
+    """A fully consistent historical receipt remains readable fail-safely."""
     created = _create(
         visit_clients.researcher, "P-VISIT-10", f"create-hist-{action}-01",
         autopilot_profile_version_id=DEMO_VERSION)
@@ -872,24 +1194,26 @@ def test_exact_paired_set_history_reaches_the_stable_runtime_error(
         visit_clients.engine, created["plan_id"], action, key, revision)
     before = _write_counts(visit_clients.engine)
 
-    refused = _command(
+    replayed = _command(
         visit_clients.researcher, created["plan_id"], action, key=key,
         expected_revision=revision + 1 if action == "start" else revision)
 
-    assert refused.status_code == 409, refused.text
-    assert _detail_code(refused) == "visit_plan_profile_runtime_not_enabled"
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["status"] == (
+        "started" if action == "start" else "approved")
+    assert replayed.json()["revision"] == (
+        revision + 2 if action == "start" else revision + 1)
     assert _write_counts(visit_clients.engine) == before
 
 
 @pytest.mark.parametrize("action", ["approve", "start"])
-def test_paired_set_replay_survives_a_future_active_bank_and_protocol(
+def test_paired_set_replay_uses_frozen_registry_after_active_content_moves(
         visit_clients, monkeypatch, action):
     """A historical demo row resolves from the registry, never from today.
 
     Every current-content loader is made fatal after the row exists, so the
     replay can only succeed by reading the immutable registered definition and
-    the Plan's own frozen parents.  It must still end at the runtime gate,
-    after its identity, ledger and Plan/Session facts have all passed.
+    the Plan's own frozen parents.
     """
     created = _create(
         visit_clients.researcher, "P-VISIT-12", f"create-future-{action[:3]}",
@@ -915,14 +1239,15 @@ def test_paired_set_replay_survives_a_future_active_bank_and_protocol(
         autopilot_plan_profiles, "resolve_for_visit_plan", boom)
     before = _write_counts(visit_clients.engine)
 
-    refused = _command(
+    replayed = _command(
         visit_clients.researcher, created["plan_id"], action, key=key,
         expected_revision=(
             created["revision"] + 1 if action == "start"
             else created["revision"]))
 
-    assert refused.status_code == 409, refused.text
-    assert _detail_code(refused) == "visit_plan_profile_runtime_not_enabled"
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["status"] == (
+        "started" if action == "start" else "approved")
     assert _write_counts(visit_clients.engine) == before
 
 
@@ -979,7 +1304,7 @@ def test_today_queue_fails_closed_on_an_anomalous_demo_row(visit_clients):
     queue = visit_clients.researcher.get("/visit-plans/today")
 
     assert queue.status_code == 409, queue.text
-    assert _detail_code(queue) == "visit_plan_profile_runtime_not_enabled"
+    assert _detail_code(queue) == "visit_plan_state_invalid"
 
 
 @pytest.mark.parametrize("status", ["approved", "started"])
@@ -996,7 +1321,7 @@ def test_patient_listing_fails_closed_for_both_runtime_statuses(
         "/visit-plans", params={"patient_id": "P-VISIT-07"})
 
     assert listing.status_code == 409, listing.text
-    assert _detail_code(listing) == "visit_plan_profile_runtime_not_enabled"
+    assert _detail_code(listing) == "visit_plan_state_invalid"
 
 
 def test_patient_listing_fails_closed_on_an_anomalous_demo_row(visit_clients):
@@ -1011,7 +1336,7 @@ def test_patient_listing_fails_closed_on_an_anomalous_demo_row(visit_clients):
         "/visit-plans", params={"patient_id": "P-VISIT-11"})
 
     assert listing.status_code == 409, listing.text
-    assert _detail_code(listing) == "visit_plan_profile_runtime_not_enabled"
+    assert _detail_code(listing) == "visit_plan_state_invalid"
 
 
 def test_demo_draft_listing_stays_governable(visit_clients):
@@ -1482,14 +1807,14 @@ def test_tampered_canonical_plan_reports_integrity_before_the_runtime_gate(
 
 
 @pytest.mark.parametrize("action", ["approve", "start"])
-def test_demo_create_key_replay_fails_closed_once_the_plan_is_runtime(
+def test_demo_create_key_replay_returns_the_original_draft_receipt(
         visit_clients, action):
     """Only a pair-consistent whole row reaches the current-status gate.
 
     The create command is genuinely produced by the demo create path, so its
     hash and pair are authentic; the approve/start chain is then seeded around
-    it.  Replaying the original demo body must fail closed on the Plan's
-    current status rather than hand back its old draft receipt.
+    it. Replaying the original create key returns the exact historical create
+    receipt; it never projects the later state into that old response.
     """
     key = f"create-demo-now-{action[:3]}"
     created = _create(
@@ -1499,11 +1824,15 @@ def test_demo_create_key_replay_fails_closed_once_the_plan_is_runtime(
         visit_clients.engine, created["plan_id"], action,
         f"cmd-demo-now-{action[:3]}", created["revision"])
 
+    before = _write_counts(visit_clients.engine)
     replayed = visit_clients.researcher.post("/visit-plans", json=_plan_body(
         "P-VISIT-05", key, autopilot_profile_version_id=DEMO_VERSION))
 
-    assert replayed.status_code == 409, replayed.text
-    assert _detail_code(replayed) == "visit_plan_profile_runtime_not_enabled"
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["status"] == "draft"
+    assert replayed.json()["revision"] == created["revision"]
+    assert replayed.json()["session_id"] is None
+    assert _write_counts(visit_clients.engine) == before
 
 
 def test_withdrawn_early_return_still_detects_an_anomalous_demo_row(
@@ -1526,7 +1855,7 @@ def test_withdrawn_early_return_still_detects_an_anomalous_demo_row(
         "/visit-plans", params={"patient_id": "P-VISIT-06"})
 
     assert listing.status_code == 409, listing.text
-    assert _detail_code(listing) == "visit_plan_profile_runtime_not_enabled"
+    assert _detail_code(listing) == "visit_plan_state_invalid"
 
 
 def test_withdrawn_early_return_is_unchanged_without_an_anomaly(visit_clients):
@@ -1869,7 +2198,10 @@ def test_start_revalidates_protocol_even_for_a_legacy_approved_plan(
     )
 
     assert denied.status_code == 409, denied.text
-    assert denied.json()["detail"]["code"] == "visit_plan_content_unavailable"
+    # A hand-imported status without its append-only approve command is now
+    # rejected at the earlier integrity boundary. A genuinely approved Week-3
+    # history is covered separately by the content-unavailable tests.
+    assert denied.json()["detail"]["code"] == "visit_plan_state_invalid"
     with Session(visit_clients.engine) as session:
         assert _linked_session_for_test(session, created["plan_id"]) is None
 

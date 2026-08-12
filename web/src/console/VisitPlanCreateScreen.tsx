@@ -15,6 +15,7 @@ import type {
 import { LatestVisitPlanHistoryRequest, PendingVisitPlanCommandKeys } from "../visitPlans";
 import { DataBoundaryBadge } from "./DataBoundaryFilter";
 import { assessVisitPlanProtocol, type TrainingContentStatus } from "./protocolAdmission";
+import { demoProfileVersionForVisitPlan } from "../autopilot/demoProfile.ts";
 
 const WEEK_ONE_PHASES = ["关系建立", "基线测评", "前测"] as const;
 const CANCEL_REASONS: VisitPlanCancelReason[] = [
@@ -322,6 +323,10 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
 
   function createCommand(): { body: VisitPlanCreateRequest; fingerprint: string; key: string } {
     const normalizedPhase = normalizePhase(weekNo);
+    const eventLine = eventLineFor(weekNo, normalizedPhase);
+    const profileVersion = demoProfileVersionForVisitPlan(
+      patientSimulation, weekNo, normalizedPhase, eventLine,
+    );
     const facts = {
       patient_id: patientId,
       scheduled_date: scheduledDate,
@@ -332,7 +337,10 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
       session_sitting_no: sittingNo,
       week_no: weekNo,
       phase_type: normalizedPhase,
-      event_line: eventLineFor(weekNo, normalizedPhase),
+      event_line: eventLine,
+      ...(profileVersion === undefined
+        ? {}
+        : { autopilot_profile_version_id: profileVersion }),
     } satisfies Omit<VisitPlanCreateRequest, "idempotency_key">;
     const fingerprint = JSON.stringify(facts);
     const key = stableKey("create", fingerprint);
@@ -536,8 +544,12 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
             </Alert>
           )}
           {currentAdmission.allowed && patientSimulation === true && (
-            <Alert tone="warn" title="专用模拟验收路径">
-              这条路径只能使用合成数据与专用模拟档案，不得录入真实患者、老人或受试者数据。
+            <Alert tone="warn" title={weekNo === 2
+              ? "20 题完整模拟演练"
+              : "专用模拟验收路径"}>
+              {weekNo === 2
+                ? "系统会自动绑定已核对的第 2 周 20 题模拟方案，从开场到结束均按这 20 题运行。请只使用专用模拟档案。"
+                : "当前周次没有绑定 20 题演练方案，将保持普通模拟计划。请只使用专用模拟档案。"}
             </Alert>
           )}
           {currentAdmission.allowed && patientSimulation === false && (

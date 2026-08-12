@@ -44,6 +44,10 @@ import {
 } from "./observerConsoleModel.ts";
 import { deriveOwnershipTransition, runManualResyncTransaction } from "./observerResync.ts";
 import type { AutopilotConsoleState } from "../../autopilot/startControl";
+import {
+  hasExactWeek2Single20Profile,
+  operationalAutopilotReadyForSession,
+} from "../../autopilot/demoProfile.ts";
 import { assertPortraitFree, isRelationRole } from "./vm";
 
 const AUTOPILOT_FAILURE_KINDS = new Set<AutopilotFailureKind>([
@@ -76,6 +80,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   session: Session; hasNamedAccount: boolean; onWrapup: () => void; onExit?: () => void; onItemEventChange?: (id: number | null) => void;
 }) {
   const toast = useToast();
+  const exactDemoProfile = hasExactWeek2Single20Profile(session);
   const { bundle } = useItemBankBundle(session.week_no);
   const { journal, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer } = useSessionJournal(session.session_id);
   const {
@@ -384,30 +389,47 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
         if (p.item_bank_version_id !== bank.version_id) {
           throw new Error(`题库版本不一致:计划=${p.item_bank_version_id} 后端=${bank.version_id}`);
         }
-        const operationalReady = bank.operational_autopilot_ready === true;
+        // The account plan response is the runtime authority for the resolved
+        // scope.  A paired-null session still reports canonical whole-source
+        // readiness, while the exact demo profile reports only its frozen 20
+        // positions.  The item-bank-wide 60 gaps therefore cannot mask a
+        // valid demo projection.
+        const operationalReady = operationalAutopilotReadyForSession(session, p);
         setOperationalAutopilotReady(operationalReady);
-        // New servers expose the same complete-plan scan used by runtime
-        // admission.  Old responses fall back to the smaller rubric list, but
-        // readiness remains fail-closed because only an explicit true enables
-        // the control.
-        const structuredGaps = bank.unsupported_operational_positions
-          ?? bank.unsupported_operational_rubrics
-          ?? [];
-        const unstructuredGaps = (bank.source_unstructured_positions ?? []).map(
-          (row) => `未结构化多要素：${row.source_position_key}:${row.response_role}`,
-        );
-        setUnsupportedOperationalPositions([...structuredGaps, ...unstructuredGaps]);
-        const counts = bank.unsupported_operational_position_counts_by_code ?? {};
-        setOperationalGapSummary({
-          rubric: counts.operational_rubric_unavailable ?? 0,
-          protocol: counts.operational_protocol_unavailable ?? 0,
-          sourceField: counts.source_field_unavailable ?? 0,
-          unstructured: bank.source_unstructured_position_count ?? unstructuredGaps.length,
-          sourceTotal: bank.source_protocol_position_count ?? p.items.reduce(
-            (total, item) => total + item.turns.length,
-            0,
-          ),
-        });
+        // Canonical gap details remain useful operator-facing explanation;
+        // readiness itself has already been decided by the strict, resolved
+        // plan projection above.
+        if (exactDemoProfile) {
+          setUnsupportedOperationalPositions(operationalReady
+            ? []
+            : ["场次冻结的 20 题方案与服务器运行计划不一致"]);
+          setOperationalGapSummary({
+            rubric: 0,
+            protocol: 0,
+            sourceField: operationalReady ? 0 : 1,
+            unstructured: 0,
+            sourceTotal: 20,
+          });
+        } else {
+          const structuredGaps = bank.unsupported_operational_positions
+            ?? bank.unsupported_operational_rubrics
+            ?? [];
+          const unstructuredGaps = (bank.source_unstructured_positions ?? []).map(
+            (row) => `未结构化多要素：${row.source_position_key}:${row.response_role}`,
+          );
+          setUnsupportedOperationalPositions([...structuredGaps, ...unstructuredGaps]);
+          const counts = bank.unsupported_operational_position_counts_by_code ?? {};
+          setOperationalGapSummary({
+            rubric: counts.operational_rubric_unavailable ?? 0,
+            protocol: counts.operational_protocol_unavailable ?? 0,
+            sourceField: counts.source_field_unavailable ?? 0,
+            unstructured: bank.source_unstructured_position_count ?? unstructuredGaps.length,
+            sourceTotal: bank.source_protocol_position_count ?? p.items.reduce(
+              (total, item) => total + item.turns.length,
+              0,
+            ),
+          });
+        }
         if (!operationalReady) {
           autoPilotRef.current = false;
           setAutoPilot(false);
@@ -416,7 +438,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
         setPlan(p);
       })
       .catch((e) => setErr(String(e)));
-  }, [session, resetSession, retryNonce]);
+  }, [exactDemoProfile, session, resetSession, retryNonce]);
 
   useEffect(() => {
     let cancelled = false;
@@ -521,6 +543,13 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   // 周期重查服务端完整录音授权：不只看 recording_allowed，同意撤回、
   // 真实/模拟准入与运行时状态任一变化都必须收回已开的自助麦克风。
   useEffect(() => {
+    // 服务端已接管、终态或人工面板尚未安全恢复时，通用录音
+    // 授权不仅不会被使用，后端也必然 fail-closed。在任何请求/定时器
+    // 之前停止这条人工轮询；明确释放并完成重同步后依赖变化会自动重启。
+    if (manualInteractionBlocked) {
+      setRecStatus("denied");
+      return;
+    }
     let cancelled = false;
     let inFlight = false;
     const check = (foreground: boolean) => {
@@ -539,7 +568,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     check(true);
     const timer = window.setInterval(() => check(false), 5_000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [session.session_id, retryNonce]);
+  }, [manualInteractionBlocked, retryNonce, session.session_id]);
 
   const item: PlanItem | undefined = plan?.items[itemIdx];
   const planTurn: PlanTurn | undefined = item?.turns[turnIdx];
@@ -665,7 +694,9 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   // (控制台整页被强杀属残余风险:无人可发收回;README 已注明换人前先核对老人端画面。)
   const withdrawRef = useRef<() => void>(() => {});
   withdrawRef.current = () => {
-    if (!planTurn) return;
+    // 服务端接管时的老人端收麦由自动命令链负责；终态也已在
+    // 同一服务端事务投影 thanks。此时卸载旧人工页不得再写一次旧游标。
+    if (!planTurn || ownershipRef.current.owned || terminal) return;
     postCursor({ screen: "thanks", itemIdx, turnIdx, responseRole: planTurn.response_role,
                  cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: false });
   };
@@ -1775,13 +1806,19 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
         )}
 
         {operationalAutopilotReady === false && (
-          <Alert tone="warn" title="完整场次自动化尚未获内容放行">
-            源脚本本周共有 {operationalGapSummary.sourceTotal || "待核"} 个训练环节；其中
-            {operationalGapSummary.protocol > 0 && ` ${operationalGapSummary.protocol} 个已有判定目标但缺自动交互协议，`}
-            {operationalGapSummary.rubric > 0 && ` ${operationalGapSummary.rubric} 个开放回答缺评分边界，`}
-            {operationalGapSummary.sourceField > 0 && ` ${operationalGapSummary.sourceField} 个缺源字段，`}
-            {operationalGapSummary.unstructured > 0 && ` ${operationalGapSummary.unstructured} 个多要素环节尚未结构化，`}
-            均不会由 AI 猜测补齐。浏览器本地自动推进保持关闭，不能宣称全场或真实研究自动化已开放。
+          <Alert tone="warn" title={exactDemoProfile
+            ? "20 题模拟计划核对未通过"
+            : "完整场次自动化尚未获内容放行"}>
+            {exactDemoProfile ? (
+              <>服务器返回的 20 题运行计划与本场冻结方案不一致，系统已停止自动启动。请刷新后重试；若仍然出现，请退出当前场次并联系管理员。</>
+            ) : (
+              <>源脚本本周共有 {operationalGapSummary.sourceTotal || "待核"} 个训练环节；其中
+                {operationalGapSummary.protocol > 0 && ` ${operationalGapSummary.protocol} 个已有判定目标但缺自动交互协议，`}
+                {operationalGapSummary.rubric > 0 && ` ${operationalGapSummary.rubric} 个开放回答缺评分边界，`}
+                {operationalGapSummary.sourceField > 0 && ` ${operationalGapSummary.sourceField} 个缺源字段，`}
+                {operationalGapSummary.unstructured > 0 && ` ${operationalGapSummary.unstructured} 个多要素环节尚未结构化，`}
+                均不会由 AI 猜测补齐。浏览器本地自动推进保持关闭，不能宣称全场或真实研究自动化已开放。</>
+            )}
             {unsupportedOperationalPositions.length > 0 && (
               <details style={{ marginTop: 8 }}>
                 <summary>查看源脚本的 {unsupportedOperationalPositions.length} 个交付缺口</summary>

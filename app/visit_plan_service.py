@@ -86,15 +86,32 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_urlsafe(18)}"
 
 
-def _protocol_slot_key(body: VisitPlanCreateIn) -> str:
+def _protocol_slot_key_for_values(
+    *,
+    patient_id: str,
+    session_sitting_no: int,
+    week_no: int,
+    phase_type: object,
+    event_line: object,
+) -> str:
     canonical = "\x00".join((
-        body.patient_id,
-        str(body.session_sitting_no),
-        str(body.week_no),
-        _enum_value(body.phase_type),
-        _enum_value(body.event_line),
+        patient_id,
+        str(session_sitting_no),
+        str(week_no),
+        _enum_value(phase_type),
+        _enum_value(event_line),
     ))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _protocol_slot_key(body: VisitPlanCreateIn) -> str:
+    return _protocol_slot_key_for_values(
+        patient_id=body.patient_id,
+        session_sitting_no=body.session_sitting_no,
+        week_no=body.week_no,
+        phase_type=body.phase_type,
+        event_line=body.event_line,
+    )
 
 
 def _bank_week_for(week_no: int) -> int:
@@ -340,22 +357,60 @@ def _profile_runtime_not_enabled() -> NoReturn:
     )
 
 
+def _profile_runtime_enabled() -> bool:
+    """Return whether the explicitly simulation-only demo may run now.
+
+    Creating a draft remains possible without either switch.  Approve/start
+    requires the same two deployment-owned switches as P0a itself, so a demo
+    plan can never become an actionable bedside session in an ordinary or
+    research process by accident.
+    """
+    return autopilot_plan_profiles.demo20_runtime_enabled()
+
+
 def _assert_profile_mutation_allowed(plan: VisitPlan) -> None:
-    """No approve/start path may transition a demo draft in this release."""
-    if _plan_profile_pair(plan) != (None, None):
+    """Allow a bound demo only in an explicitly enabled simulation process."""
+    if (
+        _plan_profile_pair(plan) != (None, None)
+        and not _profile_runtime_enabled()
+    ):
         _profile_runtime_not_enabled()
+
+
+def _assert_caregiver_operational_demo20(
+    plan: VisitPlan,
+    *,
+    bank: content.ItemBank,
+    protocol: dict,
+) -> autopilot_plan_profiles.ResolvedAutopilotPlan:
+    """Collapse every D1B mismatch into one bedside-safe refusal.
+
+    The core resolver remains the sole semantic authority.  The caregiver API
+    intentionally does not reveal whether a hidden plan was canonical, had a
+    malformed profile binding, drifted content, or merely lost a deployment
+    switch.
+    """
+    try:
+        return autopilot_plan_profiles.resolve_exact_runnable_demo20(
+            plan, bank=bank, protocol=protocol)
+    except autopilot_plan_profiles.PlanProfileError:
+        _fail(
+            409,
+            "caregiver_plan_not_operational_demo20",
+            "这项安排当前不是可开始的 20 题本机模拟练习，请刷新今日工作台",
+        )
 
 
 def _assert_profile_projectable(plan: VisitPlan, status: str) -> None:
-    """A demo scope must never surface as an actionable canonical plan.
+    """Validate the stored pair without turning feature flags into a tombstone.
 
-    Draft and cancelled rows stay governable and expose only the stored,
-    non-sensitive version, so a lost definition can still be cancelled.
+    Feature switches gate new approve/start and new autonomous ownership.  An
+    already-approved or started demo must remain readable, abortable and
+    closeable after a restart with the switches removed.
     """
-    if _plan_profile_pair(plan) != (None, None) and status in {
-        "approved", "started",
-    }:
-        _profile_runtime_not_enabled()
+    pair = _plan_profile_pair(plan)
+    if pair != (None, None) and status in {"approved", "started"}:
+        _assert_bound_profile_identity(plan)
 
 
 def _assert_plan_profile_matches_request(
@@ -535,13 +590,208 @@ def _assert_session_copies_plan_binding(
         )
 
 
+def assert_started_profile_command_chain(
+    db: Session,
+    plan: VisitPlan,
+    train_session: TrainSession,
+) -> None:
+    """Prove a paired-set runtime came from profile-bound create/approve/start.
+
+    Matching mutable Plan/Session columns are not sufficient: without this
+    append-only ledger proof a canonical history could be edited into the
+    shorter simulation profile after it had already started.
+    """
+    profile_pair = _plan_profile_pair(plan)
+    if profile_pair == (None, None):
+        return
+    _assert_bound_profile_identity(plan)
+    _assert_session_copies_plan_binding(plan, train_session)
+    commands = _assert_plan_operational_integrity(db, plan)
+    if [row.command_type for row in commands] != ["create", "approve", "start"]:
+        _fail(409, "visit_plan_profile_ledger_mismatch",
+              "20 题模拟计划缺少完整的创建、审核与开场账本")
+    create, approve, start = commands
+    if (
+        tuple(row.event_seq for row in commands) != (1, 2, 3)
+        or tuple(row.expected_revision for row in commands) != (0, 1, 2)
+        or tuple(row.resulting_revision for row in commands) != (1, 2, 3)
+        or plan.status != "started"
+        or plan.revision != 3
+        or create.actor_id != plan.created_by
+        or create.created_at != plan.created_at
+        or approve.actor_id != plan.approved_by
+        or approve.created_at != plan.approved_at
+        or start.actor_id != plan.started_by
+        or start.created_at != plan.started_at
+    ):
+        _fail(409, "visit_plan_profile_ledger_mismatch",
+              "20 题模拟计划的命令账本与安排事实不一致")
+
+
 def _linked_session(db: Session, plan_id: str) -> TrainSession | None:
     return db.exec(select(TrainSession).where(
         TrainSession.visit_plan_id == plan_id,
     )).first()
 
 
+def _assert_plan_command_chain_state(
+    db: Session,
+    plan: VisitPlan,
+) -> list[VisitPlanCommand]:
+    """Prove the mutable plan projection matches its append-only commands.
+
+    Feature flags may be removed after a demo started, but that must not make a
+    hand-edited ``status`` or actor/timestamp tuple look like an authentic
+    historical plan.  This check deliberately validates the generic command
+    state for canonical and profile plans alike; the stricter profile runtime
+    check below additionally recomputes the profile-bound request hashes.
+    """
+    commands = list(db.exec(
+        select(VisitPlanCommand)
+        .where(VisitPlanCommand.plan_id == plan.plan_id)
+        .order_by(VisitPlanCommand.event_seq)
+    ))
+    if not commands:
+        _fail(409, "visit_plan_state_invalid", "训练安排缺少命令账本")
+
+    status = ""
+    prior_revision = 0
+    approved: VisitPlanCommand | None = None
+    started: VisitPlanCommand | None = None
+    cancelled: VisitPlanCommand | None = None
+    for index, command in enumerate(commands, start=1):
+        if (
+            command.event_seq != index
+            or command.expected_revision != prior_revision
+            or command.resulting_revision != prior_revision + 1
+        ):
+            _fail(409, "visit_plan_state_invalid", "训练安排命令序列不连续")
+        if index == 1:
+            if command.command_type != "create":
+                _fail(409, "visit_plan_state_invalid", "训练安排首个命令不是 create")
+            status = "draft"
+        elif status == "draft" and command.command_type == "approve":
+            status = "approved"
+            approved = command
+        elif status in {"draft", "approved"} and command.command_type == "cancel":
+            status = "cancelled"
+            cancelled = command
+        elif status == "approved" and command.command_type == "start":
+            status = "started"
+            started = command
+        else:
+            _fail(409, "visit_plan_state_invalid", "训练安排命令转移不合法")
+        prior_revision = command.resulting_revision
+
+    created = commands[0]
+    if (
+        plan.status != status
+        or plan.revision != prior_revision
+        or plan.created_by != created.actor_id
+        or plan.created_at != created.created_at
+        or plan.approved_by != (approved.actor_id if approved else None)
+        or plan.approved_at != (approved.created_at if approved else None)
+        or plan.started_by != (started.actor_id if started else None)
+        or plan.started_at != (started.created_at if started else None)
+        or plan.cancelled_by != (cancelled.actor_id if cancelled else None)
+        or plan.cancelled_at != (cancelled.created_at if cancelled else None)
+    ):
+        _fail(409, "visit_plan_state_invalid", "训练安排与命令账本不一致")
+    return commands
+
+
+def _plan_repeat_hash_fields(plan: VisitPlan) -> dict[str, str]:
+    version_id = plan.repeat_protocol_version_id
+    digest = plan.repeat_protocol_definition_digest
+    if version_id is None and digest is None:
+        # Keep byte-exact projection for plans created before repeat binding
+        # existed. They remain readable/cancellable; admission still refuses
+        # them through ``_assert_plan_repeat_binding``.
+        return {}
+    if version_id is None or digest is None:
+        _fail(409, "visit_plan_state_invalid", "训练安排的重复请求协议绑定不完整")
+    return {
+        "repeat_protocol_version_id": version_id,
+        "repeat_protocol_definition_digest": digest,
+    }
+
+
+def _assert_non_cancelled_command_hashes(
+    plan: VisitPlan,
+    commands: list[VisitPlanCommand],
+) -> None:
+    """Bind the mutable Plan projection back to append-only commands.
+
+    This runs for canonical and demo plans alike. Changing a plan's profile
+    pair in either direction therefore cannot turn an old create command into
+    a new plan mode before approve/start notices it.
+    """
+    if plan.status == "cancelled":
+        return
+    expected_slot_key = _protocol_slot_key_for_values(
+        patient_id=plan.patient_id,
+        session_sitting_no=plan.session_sitting_no,
+        week_no=plan.week_no,
+        phase_type=plan.phase_type,
+        event_line=plan.event_line,
+    )
+    if plan.protocol_slot_key != expected_slot_key:
+        _fail(409, "visit_plan_state_invalid", "训练安排的协议槽位与创建事实不一致")
+    if plan.updated_at != commands[-1].created_at:
+        _fail(409, "visit_plan_state_invalid", "训练安排的更新时间与最后命令不一致")
+
+    repeat_fields = _plan_repeat_hash_fields(plan)
+    profile_fields = _profile_binding_hash_fields(*_plan_profile_pair(plan))
+    expected_hashes: list[str] = []
+    observed_hashes: list[str] = []
+    for command in commands:
+        if command.command_type not in {"create", "approve", "start"}:
+            continue
+        if command.reason_code is not None:
+            _fail(409, "visit_plan_state_invalid", "创建、审核或开场命令不应携带取消原因")
+        if command.command_type == "create":
+            expected_hash = _request_hash("create", {
+                "idempotency_key": command.idempotency_key,
+                "patient_id": plan.patient_id,
+                "scheduled_date": plan.scheduled_date,
+                "scheduled_time": plan.scheduled_time,
+                "queue_order": plan.queue_order,
+                "session_sitting_no": plan.session_sitting_no,
+                "week_no": plan.week_no,
+                "phase_type": plan.phase_type,
+                "event_line": plan.event_line,
+                **repeat_fields,
+                **profile_fields,
+            })
+        else:
+            expected_hash = _request_hash(command.command_type, {
+                "plan_id": plan.plan_id,
+                "idempotency_key": command.idempotency_key,
+                "expected_revision": command.expected_revision,
+                **repeat_fields,
+                **profile_fields,
+            })
+        expected_hashes.append(expected_hash)
+        observed_hashes.append(command.request_hash)
+    if observed_hashes != expected_hashes:
+        _fail(
+            409,
+            "visit_plan_state_invalid",
+            "训练安排的命令摘要与当前计划模式不一致",
+        )
+
+
+def _assert_plan_operational_integrity(
+    db: Session,
+    plan: VisitPlan,
+) -> list[VisitPlanCommand]:
+    commands = _assert_plan_command_chain_state(db, plan)
+    _assert_non_cancelled_command_hashes(plan, commands)
+    return commands
+
+
 def receipt_for(db: Session, plan: VisitPlan) -> VisitPlanReceipt:
+    _assert_plan_operational_integrity(db, plan)
     _assert_profile_projectable(plan, plan.status)
     linked = _linked_session(db, plan.plan_id)
     if plan.status == "started" and linked is None:
@@ -652,6 +902,7 @@ def _receipt_for_command(
         _fail(409, "visit_plan_state_invalid", "幂等命令未出现在训练安排账本中")
     if plan.revision != prior_revision or plan.status != status:
         _fail(409, "visit_plan_state_invalid", "训练安排与命令账本不一致")
+    _assert_non_cancelled_command_hashes(plan, commands)
     # The ledger chain and current-state consistency are now proven, so these
     # two gates refuse only what is genuinely a demo runtime projection.  The
     # current status is checked as well as the historical one: replaying a
@@ -1010,12 +1261,24 @@ def _assert_revision_and_status(
         _fail(409, "visit_plan_transition_invalid", f"当前 {plan.status} 状态不允许该动作")
 
 
-def _revalidate_admission(db: Session, plan: VisitPlan) -> Patient:
+def _revalidate_admission(
+    db: Session,
+    plan: VisitPlan,
+    *,
+    require_caregiver_operational_demo20: bool = False,
+) -> Patient:
     patient = db.exec(select(Patient).where(
         Patient.patient_id == plan.patient_id,
     ).with_for_update()).first()
     if patient is None:
         _fail(409, "visit_plan_patient_missing", "训练安排关联档案已不可用")
+    bundle: tuple[content.ItemBank, dict, _DefinitionBinding] | None = None
+    if require_caregiver_operational_demo20:
+        bundle = _current_definition_bundle(plan.week_no)
+        caregiver_bank, caregiver_protocol, caregiver_binding = bundle
+        _assert_plan_definition_binding(plan, caregiver_binding)
+        _assert_caregiver_operational_demo20(
+            plan, bank=caregiver_bank, protocol=caregiver_protocol)
     patient_issues = session_admission.patient_admission_issues(
         patient, is_simulation=plan.is_simulation)
     if patient_issues:
@@ -1032,7 +1295,9 @@ def _revalidate_admission(db: Session, plan: VisitPlan) -> Patient:
             "visit_plan_protocol_unavailable",
             "；".join(operational_issues),
         )
-    bank, _protocol, binding = _current_definition_bundle(plan.week_no)
+    if bundle is None:
+        bundle = _current_definition_bundle(plan.week_no)
+    bank, protocol, binding = bundle
     _assert_plan_definition_binding(plan, binding)
     content_issues = session_admission.content_admission_issues(
         bank,
@@ -1079,6 +1344,7 @@ def approve_plan(
     _assert_revision_and_status(
         plan, expected_revision=body.expected_revision,
         expected_status={"draft"})
+    _assert_plan_operational_integrity(db, plan)
     # Refused only after the ledger, the stored pair, its parents and the
     # revision/status CAS are all proven, so a wrong hash, actor, command type
     # or revision reports its own error instead of hiding behind this one.
@@ -1276,6 +1542,7 @@ def start_plan(
     plan_id: str,
     body: VisitPlanMutationIn,
     actor_id: str,
+    require_caregiver_operational_demo20: bool = False,
     now: datetime | None = None,
 ) -> VisitPlanReceipt:
     observed_at = now or _now()
@@ -1297,10 +1564,17 @@ def start_plan(
     _assert_revision_and_status(
         plan, expected_revision=body.expected_revision,
         expected_status={"approved"})
+    _assert_plan_operational_integrity(db, plan)
     # Still before any Session, SessionRuntimeState, transition or command
     # write, but only after the ledger and CAS have had their say.
-    _assert_profile_mutation_allowed(plan)
-    _revalidate_admission(db, plan)
+    if not require_caregiver_operational_demo20:
+        _assert_profile_mutation_allowed(plan)
+    _revalidate_admission(
+        db,
+        plan,
+        require_caregiver_operational_demo20=(
+            require_caregiver_operational_demo20),
+    )
     actual_training_date = _research_today()
     if plan.scheduled_date > actual_training_date:
         _fail(409, "visit_plan_not_due", "未到安排日期，不能提前开场")
@@ -1365,7 +1639,14 @@ def today_queue(
     as_of_date: date | None = None,
     viewer_actor_id: str | None = None,
     viewer_role: str | None = None,
+    require_caregiver_operational_demo20: bool = False,
 ) -> VisitPlanTodayOut:
+    if require_caregiver_operational_demo20 and viewer_role != "caregiver_operator":
+        _fail(
+            500,
+            "caregiver_queue_scope_invalid",
+            "照护员可运行队列只能用于照护员视图",
+        )
     current_date = as_of_date or _research_today()
     rows = list(db.exec(select(VisitPlan).where(
         VisitPlan.status == "approved",
@@ -1387,14 +1668,16 @@ def today_queue(
     # 各周题库独立冻结：逐周解析一次并缓存；该周不可解析(未登记/损坏)时,
     # 该周全部安排按防御性隐藏计入 withheld,不让坏内容进入床旁队列。
     bundles_by_week: dict[
-        int, tuple[content.ItemBank, _DefinitionBinding] | None] = {}
+        int, tuple[content.ItemBank, dict, _DefinitionBinding] | None] = {}
 
-    def _bundle_for(week_no: int) -> tuple[content.ItemBank, _DefinitionBinding] | None:
+    def _bundle_for(
+        week_no: int,
+    ) -> tuple[content.ItemBank, dict, _DefinitionBinding] | None:
         key = _bank_week_for(week_no)
         if key not in bundles_by_week:
             try:
-                bank, _protocol, binding = _current_definition_bundle(key)
-                bundles_by_week[key] = (bank, binding)
+                bank, protocol, binding = _current_definition_bundle(key)
+                bundles_by_week[key] = (bank, protocol, binding)
             except (VisitPlanError, content.FrozenContentUnavailable):
                 # 未登记或坏档都只隔离该周(withheld 计数),不让单周内容故障
                 # 以 503 掀翻整张床旁队列。approve/start 对坏档仍整体 503。
@@ -1417,7 +1700,7 @@ def today_queue(
         bundle = _bundle_for(plan.week_no)
         if bundle is None:
             continue
-        bank, binding = bundle
+        bank, protocol, binding = bundle
         try:
             _assert_plan_definition_binding(plan, binding)
         except VisitPlanError:
@@ -1433,6 +1716,12 @@ def today_queue(
         if plan.data_classification != session_admission.expected_classification(
                 plan.is_simulation):
             continue
+        if require_caregiver_operational_demo20:
+            try:
+                _assert_caregiver_operational_demo20(
+                    plan, bank=bank, protocol=protocol)
+            except VisitPlanError:
+                continue
         admitted_rows.append(plan)
     withheld_count = len(rows) - len(admitted_rows)
     rows = admitted_rows
@@ -1482,6 +1771,7 @@ def list_for_patient(
     # list.  The empty-list behaviour itself is unchanged when nothing is
     # anomalous.
     for plan in rows:
+        _assert_plan_operational_integrity(db, plan)
         _assert_profile_projectable(plan, plan.status)
     if ((patient.withdrawal_status or "").strip()
             and not include_withdrawn):

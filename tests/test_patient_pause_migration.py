@@ -13,7 +13,8 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 
-HEAD = "a9d2e6f4c108"
+HEAD = "b3e7c5a9d214"
+PATIENT_PAUSE_HEAD = "a9d2e6f4c108"
 PARENT = "b8e5f2a91c07"
 
 
@@ -51,7 +52,17 @@ def test_patient_pause_downgrade_refuses_to_erase_append_only_evidence(tmp_path)
     db_path = tmp_path / "patient-pause-evidence.sqlite"
     config = _config(db_path)
     command.upgrade(config, "head")
+    # Reach the patient-pause revision first.  The newer caregiver migration
+    # is allowed to downgrade normally and must not be mistaken for part of
+    # the patient-pause guard's atomicity contract.
+    command.downgrade(config, PATIENT_PAUSE_HEAD)
     engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT version_num FROM alembic_version"
+        )).scalar_one() == PATIENT_PAUSE_HEAD
+    tables_before = set(inspect(engine).get_table_names())
+    assert "patientpausereceipt" in tables_before
     with engine.begin() as connection:
         # The migration guard intentionally checks the durable evidence table
         # before any DDL.  A minimal synthetic row is enough to prove that it
@@ -69,9 +80,12 @@ def test_patient_pause_downgrade_refuses_to_erase_append_only_evidence(tmp_path)
 
     with engine.connect() as connection:
         assert connection.execute(text(
-            "SELECT version_num FROM alembic_version")).scalar_one() == HEAD
+            "SELECT version_num FROM alembic_version"
+        )).scalar_one() == PATIENT_PAUSE_HEAD
         assert connection.execute(text(
             "SELECT count(*) FROM patientpausereceipt")).scalar_one() == 1
+    # The a9 -> b8 guard runs before its first DDL statement.
+    assert set(inspect(engine).get_table_names()) == tables_before
 
 
 def test_patient_pause_downgrade_also_refuses_an_orphaned_pause_event(tmp_path):
@@ -79,7 +93,14 @@ def test_patient_pause_downgrade_also_refuses_an_orphaned_pause_event(tmp_path):
     db_path = tmp_path / "patient-pause-event-only.sqlite"
     config = _config(db_path)
     command.upgrade(config, "head")
+    command.downgrade(config, PATIENT_PAUSE_HEAD)
     engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT version_num FROM alembic_version"
+        )).scalar_one() == PATIENT_PAUSE_HEAD
+    tables_before = set(inspect(engine).get_table_names())
+    assert "patientpausereceipt" in tables_before
     with engine.begin() as connection:
         connection.execute(text("PRAGMA foreign_keys=OFF"))
         connection.execute(text(
@@ -93,7 +114,9 @@ def test_patient_pause_downgrade_also_refuses_an_orphaned_pause_event(tmp_path):
 
     with engine.connect() as connection:
         assert connection.execute(text(
-            "SELECT version_num FROM alembic_version")).scalar_one() == HEAD
+            "SELECT version_num FROM alembic_version"
+        )).scalar_one() == PATIENT_PAUSE_HEAD
         assert connection.execute(text(
             "SELECT count(*) FROM interactionevent WHERE "
             "event_type='patient_requested_pause'")).scalar_one() == 1
+    assert set(inspect(engine).get_table_names()) == tables_before

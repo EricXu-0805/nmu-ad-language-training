@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { PATIENT_VIEW_EVENT, PATIENT_VIEW_EXIT_EVENT } from "../sync/messages";
 import { api, ApiError } from "../api";
 import { Alert } from "../components/Alert";
@@ -31,6 +31,7 @@ import {
   identityCanExportResearchData,
   identityCanOperateTraining,
   identityCanPhysicallyDeleteAudio,
+  identityIsCaregiverOperator,
   shouldMountConsoleWorkspace,
 } from "./authPolicy";
 import { makeSessionSafeToExit } from "./sessionExitSafety";
@@ -45,6 +46,11 @@ const AREA_TABS: { key: ConsoleArea; label: string; hint: string }[] = [
   { key: "run", label: "训练台", hint: "今日已审核安排一键开训" },
   { key: "analyze", label: "分析后台", hint: "回看 AI 判定与录音" },
 ];
+
+const CaregiverWorkspaceEntry = lazy(async () => {
+  const module = await import("../caregiver/CaregiverWorkspaceEntry");
+  return { default: module.CaregiverWorkspaceEntry };
+});
 
 export function ConsoleShell() {
   const auth = useConsoleAuth();
@@ -71,6 +77,21 @@ export function ConsoleShell() {
     return <LoginScreen onLoggedIn={auth.refresh} />;
   }
   if (!shouldMountConsoleWorkspace(auth.mode)) return null;
+  if (identityIsCaregiverOperator(auth.identity)) {
+    return (
+      <Suspense fallback={(
+        <main className="login-shell">
+          <div className="login-card"><p className="muted">正在打开照护员操作台…</p></div>
+        </main>
+      )}>
+        <CaregiverWorkspaceEntry
+          key={auth.identity.username}
+          identity={auth.identity}
+          onLogout={auth.logout}
+        />
+      </Suspense>
+    );
+  }
   return (
     <ConsoleWorkspace
       key={auth.identity?.username ?? "LOCAL-M0"}

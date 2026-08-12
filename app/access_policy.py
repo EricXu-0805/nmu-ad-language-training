@@ -24,8 +24,11 @@ class AccessKind(str, Enum):
 
 
 KNOWN_ACCOUNT_ROLES = frozenset({"researcher", "data_steward", "admin"})
+CAREGIVER_ROLES = frozenset({"caregiver_operator"})
+NAMED_ACCOUNT_ROLES = KNOWN_ACCOUNT_ROLES | CAREGIVER_ROLES
 DATA_GOVERNANCE_ROLES = frozenset({"data_steward", "admin"})
 TRAINING_OPERATION_ROLES = frozenset({"researcher", "admin"})
+CAREGIVER_SESSION_CONTROL_ROLES = TRAINING_OPERATION_ROLES | CAREGIVER_ROLES
 ADMIN_ROLES = frozenset({"admin"})
 DEVICE_LIVE_WRITE_KINDS = frozenset(
     {"audioSaved", "patientRec", "audioDisposalConfirmed"})
@@ -58,7 +61,8 @@ def _route(methods: set[str], pattern: str, kind: AccessKind, *,
 _ROUTE_RULES = (
     # 公开路径：登录簇自管认证。TTS 即使云端有白名单，本地引擎仍会消耗
     # CPU/磁盘缓存，因此只开放给已配对老人端设备或具名账号。
-    _route({"POST"}, r"/auth/logout", AccessKind.ACCOUNT, label="退出研究账号"),
+    _route({"POST"}, r"/auth/logout", AccessKind.ACCOUNT,
+           roles=NAMED_ACCOUNT_ROLES, label="退出工作人员账号"),
     _route({"POST"}, r"/auth/login", AccessKind.PUBLIC, label="登录研究账号"),
     _route({"GET", "HEAD"}, r"/auth/(?:config|me)", AccessKind.PUBLIC, label="读取认证状态"),
     _route({"GET", "HEAD"}, r"/health", AccessKind.PUBLIC, label="读取健康状态"),
@@ -140,9 +144,23 @@ _ROUTE_RULES = (
     _route({"POST"}, r"/ai/provider-readiness/probe", AccessKind.ACCOUNT,
            roles=ADMIN_ROLES, label="执行 AI 服务合成检查"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/start", AccessKind.ACCOUNT,
-           roles=TRAINING_OPERATION_ROLES, label="启动限定自动驾驶范围"),
+           roles=CAREGIVER_SESSION_CONTROL_ROLES, label="启动限定自动驾驶范围"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/takeover", AccessKind.ACCOUNT,
-           roles=TRAINING_OPERATION_ROLES, label="显式接管自动驾驶"),
+           roles=CAREGIVER_SESSION_CONTROL_ROLES, label="显式接管自动驾驶"),
+
+    # 照护员只进入独立工作台窄路径。通用训练、内容、评分、音频、
+    # 收尾与导出路由下方原有角色集合继续拒绝，不把新角色混入
+    # TRAINING_OPERATION_ROLES。场次对象的本人 owner 核验仍在处理器内完成。
+    _route({"GET", "HEAD"}, r"/caregiver/today", AccessKind.ACCOUNT,
+           roles=CAREGIVER_ROLES, label="读取今日照护工作台"),
+    _route({"POST"}, r"/caregiver/visit-plans/[^/]+/start", AccessKind.ACCOUNT,
+           roles=CAREGIVER_ROLES, label="启动已审核床旁安排"),
+    _route({"PUT"}, r"/caregiver/sessions/[^/]+/activation", AccessKind.ACCOUNT,
+           roles=CAREGIVER_ROLES, label="激活本人床旁场次"),
+    _route({"GET", "HEAD"}, r"/caregiver/sessions/[^/]+/status", AccessKind.ACCOUNT,
+           roles=CAREGIVER_ROLES, label="查看本人床旁状态"),
+    _route({"POST"}, r"/caregiver/sessions/[^/]+/help-requests", AccessKind.ACCOUNT,
+           roles=CAREGIVER_ROLES, label="暂停并呼叫其他工作人员"),
 
     # 训练安排是测试前的具名账号工作流。数据管理员可读取溯源，
     # 但不能建立、审批、启动或取消临床训练安排。
@@ -207,9 +225,12 @@ _ROUTE_RULES = (
            roles=TRAINING_OPERATION_ROLES, label="建立训练场次"),
     _route({"PUT"}, r"/sessions/[^/]+/runtime/cursor", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="写入训练进度"),
-    _route({"POST"}, r"/sessions/[^/]+/(?:pause|resume|finish-intervention|complete|abort)",
+    _route({"POST"}, r"/sessions/[^/]+/(?:pause|finish-intervention|abort)",
+           AccessKind.ACCOUNT, roles=CAREGIVER_SESSION_CONTROL_ROLES,
+           label="暂停或闭表结束床旁场次"),
+    _route({"POST"}, r"/sessions/[^/]+/(?:resume|complete)",
            AccessKind.ACCOUNT, roles=TRAINING_OPERATION_ROLES,
-           label="变更训练场次状态"),
+           label="恢复或完成研究场次"),
     _route({"PUT"}, r"/sessions/[^/]+/closeout", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="保存现场收尾记录"),
     _route({"POST"},
@@ -256,6 +277,7 @@ _API_ROOTS = frozenset({
     "visit-plans",
     "ai", "quality", "exports", "governance", "assessment-events",
     "assessment-instances",
+    "caregiver",
 })
 
 # These roots are permanently reserved for server-controlled APIs.  Static SPA

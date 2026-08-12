@@ -4,7 +4,7 @@ import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { Field, TextInput } from "../components/Field";
 
-// console 账号登录门(公网部署)。仅研究者操作端用;老人端从不走账号,只用 PIN 保底。
+// console 账号登录门(公网部署)。工作人员操作端用;老人端从不走账号,只用 PIN 保底。
 // 登录成功 → onLoggedIn() 触发上层重新评估身份并进入工作台。
 export function LoginScreen({ onLoggedIn }: { onLoggedIn: () => void | Promise<void> }) {
   const [username, setUsername] = useState("");
@@ -32,9 +32,9 @@ export function LoginScreen({ onLoggedIn }: { onLoggedIn: () => void | Promise<v
     <main className="login-shell">
       <form className="login-card" onSubmit={submit}>
         <div className="login-brand" aria-hidden>语</div>
-        <div className="page-kicker">南京医科大学 · 研究者操作端</div>
+        <div className="page-kicker">南京医科大学 · 工作人员操作端</div>
         <h1 className="login-title">登录</h1>
-        <p className="muted">用研究者账号登录。账号由管理员在服务器上开通；老人端无需登录。</p>
+        <p className="muted">请用管理员为您开通的工作人员账号登录。老人画面无需登录。</p>
         {err && <Alert tone="danger" title="无法登录">{err}</Alert>}
         <Field label="用户名">
           <TextInput value={username} onChange={(e) => setUsername(e.target.value)}

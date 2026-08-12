@@ -410,6 +410,8 @@ export function SessionWrapupScreen({
         : mode === "review" && !closeoutReadyForLeave ? "warn"
         : !runtimeConfirmed || !mode || !journalReady || !planReady ? "muted"
           : primaryGate.canRequest ? "ok" : "warn";
+  const isDemo20 = session.is_simulation
+    && session.autopilot_profile_version_id === "week2-single20-demo-v1";
 
   return (
     <div className="page-shell page-shell--medium">
@@ -452,6 +454,12 @@ export function SessionWrapupScreen({
           )}
         </div>
       </header>
+
+      {isDemo20 && (
+        <Alert tone="info" title="本次完成的是 20 题本机模拟演练">
+          这份结果只代表本次 20 题模拟计划已走完，不代表第 2 周源协议 80 个环节已全部完成，也不是真人训练结果。
+        </Alert>
+      )}
 
       {runtimeControl.error && (
         <Alert tone="danger" title="无法核对服务器场次状态"

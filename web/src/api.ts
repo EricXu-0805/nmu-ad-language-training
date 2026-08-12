@@ -3,7 +3,7 @@
 import type {
   AbnormalEvent, AttemptProcessRequest, AttemptProcessResult, AudioAsset, AudioCaptureReceipt, AuditEntry, AuditVerify, AuthConfig, AuthIdentity, ExportResult, InteractionAppendRequest, InteractionEvent, ItemBankInfo, ItemEvent,
   CloudProcessingPolicy, LiveStateResponse, Patient, PatientHeartbeatRequest, PatientHeartbeatResponse,
-  PatientSummary, ScaleResult, ScoreReconstruction, Session, SessionPlan, SessionRuntimeState, SessionRuntimeStatus, TurnEvent,
+  PatientSummary, ScaleResult, ScoreReconstruction, Session, SessionRuntimeState, SessionRuntimeStatus, TurnEvent,
   WithdrawalReasonCode,
   VisitPlanCancelRequest, VisitPlanCreateRequest, VisitPlanMutationRequest, VisitPlanReceipt, VisitPlanToday,
   AssessmentCancelRequest, AssessmentCloseRequest, AssessmentDeferralRequest,
@@ -11,6 +11,7 @@ import type {
   AssessmentInstance, AssessmentInstanceMutationRequest, AssessmentItemResponseRequest,
   AssessmentStartRequest,
 } from "./types";
+import { parseAccountSessionPlan } from "./sessionPlan.ts";
 import { ApiError, apiNetworkError, decodeJsonApiResponse } from "./apiResponse";
 import {
   createDeviceCapabilityStore,
@@ -520,6 +521,9 @@ export const api = {
       week_no: body.week_no,
       phase_type: body.phase_type,
       event_line: body.event_line,
+      ...(body.autopilot_profile_version_id === undefined
+        ? {}
+        : { autopilot_profile_version_id: body.autopilot_profile_version_id }),
     }), { patientId: body.patient_id }),
   listTodayVisitPlans: async (): Promise<VisitPlanToday> =>
     parseVisitPlanToday(await req<unknown>(
@@ -877,9 +881,10 @@ export const api = {
                 opts?: { device?: boolean }) => {
     const q = new URLSearchParams({ week_no: String(weekNo), event_line: eventLine });
     if (maxItems != null) q.set("max_items", String(maxItems));
-    return req<SessionPlan>("GET", `/sessions/${encodeURIComponent(sid)}/plan?${q}`,
+    return req<unknown>("GET", `/sessions/${encodeURIComponent(sid)}/plan?${q}`,
       undefined, DEFAULT_REQUEST_TIMEOUT_MS,
-      opts?.device ? { ...opts, deviceSessionId: sid } : opts);
+      opts?.device ? { ...opts, deviceSessionId: sid } : opts)
+      .then(parseAccountSessionPlan);
   },
 
   // 逐环节采集

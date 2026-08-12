@@ -29,8 +29,9 @@ from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
 from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
-from . import (autopilot_ledger, autopilot_positions, content, evidence_ledger,
-               patient_presentation, repeat_intent, runtime)
+from . import (autopilot_ledger, autopilot_plan_profiles, autopilot_positions,
+               content, evidence_ledger, patient_presentation, repeat_intent,
+               runtime)
 from .autopilot_contract import (
     AutopilotAckIn,
     RecordCommandPayload,
@@ -355,6 +356,20 @@ class _DefinitionBinding:
 
 
 @dataclass(frozen=True)
+class _ResolvedSessionTraversal:
+    """The exact ordered plan used by one session in this process.
+
+    Paired-null sessions intentionally keep the historical caller-provided bank
+    behaviour used by isolated fixtures.  Only a paired-set profile needs the
+    stricter canonical-parent/profile registry validation.
+    """
+
+    session_plan: runtime.SessionPlan
+    positions: tuple[autopilot_positions.ProtocolPosition, ...]
+    completion_scope: Literal["canonical_full_source", "demo_plan_only"]
+
+
+@dataclass(frozen=True)
 class _P0aContent:
     item_bank_version_id: str
     item_bank_definition_digest: str
@@ -507,6 +522,41 @@ def _require_session_definition_binding(
     return binding
 
 
+def _resolved_profile_plan(
+    train_session: TrainSession,
+    bank: content.ItemBank,
+    protocol: dict,
+) -> _ResolvedSessionTraversal:
+    """Resolve the one session-frozen traversal used by every P0a consumer."""
+    version_id = train_session.autopilot_profile_version_id
+    definition_digest = train_session.autopilot_profile_definition_digest
+    if version_id is None and definition_digest is None:
+        event_line = _enum_value(train_session.event_line)
+        try:
+            plan = runtime.build_session_plan(
+                bank, train_session.week_no, event_line)
+        except ValueError as exc:
+            raise AutopilotServiceError(
+                "autopilot_content_unavailable",
+                "当前冻结训练计划不可用",
+            ) from exc
+        return _ResolvedSessionTraversal(
+            session_plan=plan,
+            positions=autopilot_positions.plan_positions(plan),
+            completion_scope="canonical_full_source",
+        )
+    try:
+        resolved = autopilot_plan_profiles.resolve_for_session(
+            train_session, bank=bank, protocol=protocol)
+    except autopilot_plan_profiles.PlanProfileError as exc:
+        raise AutopilotServiceError(exc.code, exc.message) from exc
+    return _ResolvedSessionTraversal(
+        session_plan=resolved.session_plan,
+        positions=resolved.positions,
+        completion_scope=resolved.completion_scope,
+    )
+
+
 def session_repeat_protocol(
     train_session: TrainSession,
 ) -> repeat_intent.RepeatIntentProtocol:
@@ -589,6 +639,10 @@ def _require_plan_session_binding(
         != train_session.repeat_protocol_version_id
         or plan.repeat_protocol_definition_digest
         != train_session.repeat_protocol_definition_digest
+        or plan.autopilot_profile_version_id
+        != train_session.autopilot_profile_version_id
+        or plan.autopilot_profile_definition_digest
+        != train_session.autopilot_profile_definition_digest
     ):
         _fail(
             "autopilot_plan_session_binding_mismatch",
@@ -682,13 +736,9 @@ def _select_p0a_content(
             "autopilot_scope_unsupported",
             "P0a 只允许题库与自动化协议共同明确支持的第 2 周模拟场次",
         )
-    event_line = _enum_value(train_session.event_line)
-    try:
-        plan = runtime.build_session_plan(bank, train_session.week_no, event_line)
-    except ValueError as exc:
-        raise AutopilotServiceError(
-            "autopilot_content_unavailable", "当前冻结训练计划不可用") from exc
-    positions = autopilot_positions.plan_positions(plan)
+    resolved = _resolved_profile_plan(train_session, bank, protocol)
+    plan = resolved.session_plan
+    positions = resolved.positions
     if not positions:
         _fail("autopilot_content_incomplete", "自动驾驶冻结计划没有可执行位置")
     if item_id is None and turn_seq is None:
@@ -835,6 +885,49 @@ def _require_entire_plan_supported(
     to need a human at position 14.  We still keep the per-position checks during
     routing as a defence against corrupted or drifted state.
     """
+    resolved = _resolved_profile_plan(train_session, bank, protocol)
+    if resolved.completion_scope == "demo_plan_only":
+        positions = resolved.positions
+        if not positions:
+            _fail("autopilot_content_incomplete", "自动驾驶冻结计划没有可执行位置")
+        gaps = tuple(
+            gap
+            for position in positions
+            if (gap := autopilot_positions.readiness_gap(bank, position)) is not None
+        )
+        if gaps:
+            first = gaps[0]
+            _fail(
+                "autopilot_plan_not_fully_supported",
+                f"模拟演示计划仍有 {len(gaps)} 个位置不可执行；"
+                f"首个缺口为 {first.position.position_key}:"
+                f"{first.position.response_role}",
+                context={
+                    "unsupported_position_count": len(gaps),
+                    "structured_unsupported_position_count": len(gaps),
+                    "source_unstructured_position_count": 0,
+                    "source_protocol_position_count": bank.meta.get(
+                        "source_protocol_position_count"),
+                    "resolved_position_count": len(positions),
+                    "completion_scope": resolved.completion_scope,
+                    "first_gap": {
+                        "code": first.code,
+                        "item_id": first.position.item_id,
+                        "turn_seq": first.position.turn_seq,
+                        "response_role": first.position.response_role,
+                    },
+                },
+            )
+        for position in positions:
+            _select_p0a_content(
+                train_session,
+                bank,
+                protocol,
+                item_id=position.item_id,
+                turn_seq=position.turn_seq,
+            )
+        return
+
     event_line = _enum_value(train_session.event_line)
     try:
         positions = autopilot_positions.build_positions(
@@ -3489,15 +3582,22 @@ def route_tts_ended(
     next_decision: autopilot_positions.PositionDecision | None = None
     next_selected: _P0aContent | None = None
     if effect == "advance":
-        event_line = _enum_value(gate.train_session.event_line)
         try:
-            next_decision = autopilot_positions.next_position_decision(
-                resolved_bank,
-                week_no=gate.train_session.week_no,
-                event_line=event_line,
-                current_item_id=tts.item_id,
-                current_turn_seq=tts.turn_seq,
+            resolved_plan = _resolved_profile_plan(
+                gate.train_session, resolved_bank, resolved_protocol)
+            positions = resolved_plan.positions
+            current_position = autopilot_positions.find_position(
+                positions,
+                item_id=tts.item_id,
+                turn_seq=tts.turn_seq,
             )
+            current_index = positions.index(current_position)
+            if current_index + 1 >= len(positions):
+                next_decision = autopilot_positions.PositionDecision(
+                    completed=True)
+            else:
+                next_decision = autopilot_positions.decision_for_position(
+                    resolved_bank, positions[current_index + 1])
         except ValueError as exc:
             raise AutopilotServiceError(
                 "autopilot_position_invalid", "当前命令无法在冻结计划中推进") from exc
@@ -4112,6 +4212,7 @@ def _materialize_terminal_attempt_evidence(
     attempt: AttemptEvent,
     decision: _AttemptRouteDecision,
     bank: content.ItemBank,
+    protocol: dict,
 ) -> TerminalEvidenceMaterialization | None:
     """Stage the immutable operational projection for one terminal attempt.
 
@@ -4179,13 +4280,8 @@ def _materialize_terminal_attempt_evidence(
             "terminal attempt 的录音资产、收据或数据分类不一致",
         )
 
-    event_line = _enum_value(train_session.event_line)
-    try:
-        plan = runtime.build_session_plan(
-            bank, train_session.week_no, event_line)
-    except ValueError as exc:
-        raise AutopilotServiceError(
-            "autopilot_terminal_evidence_invalid", "场次冻结计划不可用") from exc
+    plan = _resolved_profile_plan(
+        train_session, bank, protocol).session_plan
     if not 0 <= gate.selected.item_index < len(plan.items):
         _fail("autopilot_terminal_evidence_invalid", "terminal attempt 计划位置越界")
     plan_item = plan.items[gate.selected.item_index]
@@ -4393,6 +4489,7 @@ def materialize_terminal_attempt_evidence(
         attempt=attempt,
         decision=decision,
         bank=resolved_bank,
+        protocol=resolved_protocol,
     )
 
 
@@ -4510,6 +4607,7 @@ def route_completed_attempt(
         attempt=attempt,
         decision=decision,
         bank=resolved_bank,
+        protocol=resolved_protocol,
     )
     active_capability = _lock_active_attempt_route_device(
         db,

@@ -170,6 +170,29 @@ test("a stale local cursor cannot be posted during the release render — the cu
   assert.ok(guardIdx > effectStart && depsIdx > guardIdx, "该 effect 必须同时在守卫与依赖数组里带上 manualInteractionBlocked");
 });
 
+test("manual recording authorization polling stops before any request or timer while the manual plane is blocked", () => {
+  const effectStart = indexOfOrFail(source, "// 周期重查服务端完整录音授权");
+  const effectEnd = indexOfOrFail(source, "const item: PlanItem", effectStart);
+  const body = source.slice(effectStart, effectEnd);
+  const guard = indexOfOrFail(body, "if (manualInteractionBlocked) {");
+  const denied = indexOfOrFail(body, 'setRecStatus("denied");', guard);
+  const request = indexOfOrFail(body, "api.recordingAuthorization(session.session_id)", guard);
+  const timer = indexOfOrFail(body, "window.setInterval", request);
+  assert.ok(guard < denied && denied < request && request < timer,
+    "人工面板被锁时必须在授权请求和定时器前直接拒绝并返回");
+  assert.match(body, /\}, \[manualInteractionBlocked, retryNonce, session\.session_id\]\);/,
+    "manualInteractionBlocked 必须是该 effect 的显式依赖，释放后才能重启核查");
+});
+
+test("training-screen cleanup never posts a stale manual cursor after server ownership or terminal projection", () => {
+  const cleanupStart = indexOfOrFail(source, "const withdrawRef = useRef<() => void>");
+  const cleanupEnd = indexOfOrFail(source, "// 老人端录完", cleanupStart);
+  const body = source.slice(cleanupStart, cleanupEnd);
+  const guard = indexOfOrFail(body, "if (!planTurn || ownershipRef.current.owned || terminal) return;");
+  const write = indexOfOrFail(body, 'postCursor({ screen: "thanks"', guard);
+  assert.ok(guard < write, "卸载收回写必须先核对服务端所有权与终态");
+});
+
 test("session switch clears transient observer state and no new poller is introduced", () => {
   assert.match(source, /resyncFence\.current\.sessionId !== session\.session_id/);
   assert.match(source, /automationExposure\.current = false;/);

@@ -239,6 +239,16 @@ def test_local_deployment_build_uses_frozen_frontend_lockfile():
     assert "npm install --no-audit --no-fund" not in launcher
 
 
+def test_local_demo20_launcher_is_explicit_and_loopback_only():
+    launcher = (ROOT / "scripts" / "serve.sh").read_text(encoding="utf-8")
+    assert 'if [ "${DEMO20:-0}" = "1" ]; then' in launcher
+    assert 'if [ "${INTRANET:-0}" = "1" ]; then' in launcher
+    assert "DEMO20 仅允许本机回环演示" in launcher
+    assert "export ALLOW_SIMULATION_DATA=1" in launcher
+    assert "export ENABLE_AUTOPILOT_P0A_SIMULATION=1" in launcher
+    assert "app.main:app --host 127.0.0.1 --port 8000" in launcher
+
+
 def test_answer_bearing_content_is_absent_from_web_static_roots():
     package = (ROOT / "web" / "package.json").read_text(encoding="utf-8")
     vite = (ROOT / "web" / "vite.config.ts").read_text(encoding="utf-8")

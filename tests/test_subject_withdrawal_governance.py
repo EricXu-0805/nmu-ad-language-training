@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 import hashlib
+import json
 from threading import Event
 
 import pytest
@@ -32,6 +33,7 @@ from app.models import (
     TurnConfirmationRevision,
     TurnEvent,
     VisitPlan,
+    VisitPlanCommand,
 )
 
 
@@ -92,8 +94,41 @@ def withdrawal_clients(monkeypatch, tmp_path):
         app.dependency_overrides.clear()
 
 
+WITHDRAWAL_PLAN_ID = "VP-WITHDRAW-APPROVED"
+WITHDRAWAL_PLAN_CREATE_KEY = "withdrawal-plan-create-historical-0001"
+WITHDRAWAL_PLAN_APPROVE_KEY = "withdrawal-plan-approve-historical-0001"
+
+
+def _plan_command_hash(command_type: str, payload: dict[str, object]) -> str:
+    """Independently reproduce the historical VisitPlan command digest."""
+    normalized = {
+        key: (value.isoformat() if isinstance(value, (date, datetime))
+              else getattr(value, "value", value))
+        for key, value in payload.items()
+    }
+    canonical = json.dumps(
+        {"command_type": command_type, **normalized},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _withdrawal_plan_slot_key() -> str:
+    canonical = "\x00".join((
+        "P-WITHDRAW",
+        "1",
+        "2",
+        PhaseType.正式训练.value,
+        EventLine.正式训练.value,
+    ))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _seed_patient_scope(engine) -> bytes:
     now = datetime.now()
+    scheduled_date = date.today()
     audio_bytes = b"\x1a\x45\xdf\xa3subject-withdrawal-audio"
     checksum = hashlib.sha256(audio_bytes).hexdigest()
     with Session(engine) as session:
@@ -162,10 +197,10 @@ def _seed_patient_scope(engine) -> bytes:
             patient_rec_json='{"active":true}',
         ))
         session.add(VisitPlan(
-            plan_id="VP-WITHDRAW-APPROVED",
-            protocol_slot_key="withdrawal-approved-slot",
+            plan_id=WITHDRAWAL_PLAN_ID,
+            protocol_slot_key=_withdrawal_plan_slot_key(),
             patient_id="P-WITHDRAW",
-            scheduled_date=date.today(),
+            scheduled_date=scheduled_date,
             scheduled_time=None,
             queue_order=0,
             session_sitting_no=1,
@@ -182,6 +217,42 @@ def _seed_patient_scope(engine) -> bytes:
             updated_at=now,
             approved_by="WITHDRAW-RESEARCHER",
             approved_at=now,
+        ))
+        session.add(VisitPlanCommand(
+            plan_id=WITHDRAWAL_PLAN_ID,
+            event_seq=1,
+            idempotency_key=WITHDRAWAL_PLAN_CREATE_KEY,
+            command_type="create",
+            request_hash=_plan_command_hash("create", {
+                "idempotency_key": WITHDRAWAL_PLAN_CREATE_KEY,
+                "patient_id": "P-WITHDRAW",
+                "scheduled_date": scheduled_date,
+                "scheduled_time": None,
+                "queue_order": 0,
+                "session_sitting_no": 1,
+                "week_no": 2,
+                "phase_type": PhaseType.正式训练,
+                "event_line": EventLine.正式训练,
+            }),
+            actor_id="WITHDRAW-RESEARCHER",
+            expected_revision=0,
+            resulting_revision=1,
+            created_at=now,
+        ))
+        session.add(VisitPlanCommand(
+            plan_id=WITHDRAWAL_PLAN_ID,
+            event_seq=2,
+            idempotency_key=WITHDRAWAL_PLAN_APPROVE_KEY,
+            command_type="approve",
+            request_hash=_plan_command_hash("approve", {
+                "plan_id": WITHDRAWAL_PLAN_ID,
+                "idempotency_key": WITHDRAWAL_PLAN_APPROVE_KEY,
+                "expected_revision": 1,
+            }),
+            actor_id="WITHDRAW-RESEARCHER",
+            expected_revision=1,
+            resulting_revision=2,
+            created_at=now,
         ))
         session.commit()
     audio_store.save_blob("withdrawal-recorded-audio", audio_bytes, "audio/webm")
@@ -229,7 +300,7 @@ def test_withdrawal_is_atomic_replayable_and_terminal_sessions_stay_terminal(
         "/visit-plans", params={"patient_id": "P-WITHDRAW"})
     assert before_plans.status_code == 200, before_plans.text
     assert [row["plan_id"] for row in before_plans.json()] == [
-        "VP-WITHDRAW-APPROVED"]
+        WITHDRAWAL_PLAN_ID]
 
     result = admin.post("/patients/P-WITHDRAW/withdrawal", json=_command())
     assert result.status_code == 200, result.text
@@ -259,10 +330,10 @@ def test_withdrawal_is_atomic_replayable_and_terminal_sessions_stay_terminal(
         "/visit-plans", params={"patient_id": "P-WITHDRAW"})
     assert admin_plans.status_code == 200, admin_plans.text
     assert [row["plan_id"] for row in admin_plans.json()] == [
-        "VP-WITHDRAW-APPROVED"]
+        WITHDRAWAL_PLAN_ID]
     assert admin_plans.json()[0]["status"] == "approved"
     denied_start = admin.post(
-        "/visit-plans/VP-WITHDRAW-APPROVED/start",
+        f"/visit-plans/{WITHDRAWAL_PLAN_ID}/start",
         json={
             "idempotency_key": "withdrawal-plan-start-denied-0001",
             "expected_revision": 2,
@@ -273,7 +344,7 @@ def test_withdrawal_is_atomic_replayable_and_terminal_sessions_stay_terminal(
         "visit_plan_patient_ineligible")
 
     denied_cancel = admin.post(
-        "/visit-plans/VP-WITHDRAW-APPROVED/cancel",
+        f"/visit-plans/{WITHDRAWAL_PLAN_ID}/cancel",
         json={
             "idempotency_key": "withdrawal-plan-cancel-denied-0001",
             "expected_revision": 2,
@@ -344,10 +415,10 @@ def test_withdrawal_is_atomic_replayable_and_terminal_sessions_stay_terminal(
         assert patient.cloud_processing_allowed is False
         assert patient.cloud_processing_revoked_at is not None
         assert patient.governance_revision == 1
-        plan = session.get(VisitPlan, "VP-WITHDRAW-APPROVED")
+        plan = session.get(VisitPlan, WITHDRAWAL_PLAN_ID)
         assert plan is not None
         assert plan.status == "approved"
-        assert plan.protocol_slot_key == "withdrawal-approved-slot"
+        assert plan.protocol_slot_key == _withdrawal_plan_slot_key()
         assert plan.status == "approved" and plan.revision == 2
         frozen_assessment = session.get(
             AssessmentEvent, "ASSESSMENT-WITHDRAW-FROZEN")
@@ -779,7 +850,7 @@ def test_withdrawal_migration_fresh_check_and_parent_roundtrip(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version")).scalar_one() == (
-                "a9d2e6f4c108")
+                "b3e7c5a9d214")
 
     command.downgrade(config, "f2b7d4e9a106")
     inspector = inspect(engine)
