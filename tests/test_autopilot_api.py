@@ -73,6 +73,17 @@ FIRST_ONLY_BANK = replace(
         "source_unstructured_positions": [],
     },
 )
+TWO_ONLY_BANK = replace(
+    BANK,
+    single_element=BANK.single_element[:2],
+    double_element=[],
+    multi_element=[],
+    meta={
+        **BANK.meta,
+        "source_protocol_position_count": 2,
+        "source_unstructured_positions": [],
+    },
+)
 PROTOCOL = content.load_autopilot_protocol(
     content.CONTENT_DIR / "autopilot_protocol_v1.json")
 
@@ -261,6 +272,21 @@ def api_clients(monkeypatch, tmp_path) -> ApiClients:
 def _enable_p0a(monkeypatch) -> None:
     monkeypatch.setenv("ENABLE_AUTOPILOT_P0A_SIMULATION", "1")
     monkeypatch.setenv("ALLOW_SIMULATION_DATA", "1")
+
+
+def _bind_api_bank(
+        clients: ApiClients, monkeypatch,
+        bank: content.ItemBank) -> None:
+    """Bind a bounded bank before start without bypassing the public journey."""
+    monkeypatch.setattr(content, "load_item_bank", lambda _path: bank)
+    with Session(clients.engine) as session:
+        train_session = session.get(TrainSession, SESSION_ID)
+        assert train_session is not None
+        train_session.item_bank_version_id = bank.version_id
+        train_session.item_bank_definition_digest = (
+            content.item_bank_definition_digest(bank))
+        session.add(train_session)
+        session.commit()
 
 
 def _start(clients: ApiClients, **overrides):
@@ -2179,6 +2205,23 @@ class _WrongAnswerAsr(_WorkerAsr):
         return asr.AsrResult("西瓜", 0.9, self.version, hotword_hit=False)
 
 
+class _FixedTranscriptAsr(_WorkerAsr):
+    """Return one non-target transcript across a multi-attempt API journey."""
+
+    def __init__(self, text: str):
+        super().__init__()
+        self.text = text
+
+    def transcribe(self, _audio_bytes, _hotwords):
+        self.calls += 1
+        return asr.AsrResult(
+            self.text,
+            None if self.text == "" else 0.9,
+            self.version,
+            hotword_hit=False,
+        )
+
+
 def _pause_drain_takeover(
         clients: ApiClients, record: dict, *, takeover_key: str) -> dict:
     paused = clients.account.post(f"/sessions/{SESSION_ID}/pause")
@@ -3061,13 +3104,15 @@ def test_late_generation_result_after_newer_generation_materializes_is_observati
     assert b_judge.calls == 1
 
 
-def _drive_second_processing_attempt_via_silence_cue(
-        clients: ApiClients) -> dict:
-    """Advance an already-answered/cued session to the next processing_attempt.
+def _drive_followup_processing_attempt_via_current_cue(
+        clients: ApiClients, *, suffix: str,
+        tts_device_event_seq: int, record_device_event_seq: int,
+        stop_reason: str = "silence") -> dict:
+    """Play the current cue and persist its following capture through public APIs.
 
     Mirrors ``_drive_to_processing_attempt``'s TTS/record ACK sequence, but for
-    the cue turn a completed (silence) first attempt just opened — i.e. one
-    step further along the same real device flow, not a shortcut.
+    a cue turn that a completed prior attempt opened — i.e. one step further
+    along the same real device flow, not a shortcut or direct database seed.
     """
     cue = _device_next(clients)
     assert cue is not None and cue["kind"] == "tts"
@@ -3075,14 +3120,16 @@ def _drive_second_processing_attempt_via_silence_cue(
         f"/sessions/{SESSION_ID}/autopilot/commands/{cue['command_key']}/acks",
         headers=clients.device_headers,
         json=_ack_body(
-            cue, ack_type="tts_ended", ack_key="ack-cross-attempt-cue-ended-0001",
-            device_event_seq=3, media_ended=True, media_duration_ms=4200,
+            cue, ack_type="tts_ended",
+            ack_key=f"ack-followup-cue-ended-{suffix}",
+            device_event_seq=tts_device_event_seq,
+            media_ended=True, media_duration_ms=4200,
         ),
     )
     assert ended.status_code == 200, ended.text
     record = ended.json()["command"]
     raw_audio_id = record["payload"]["raw_audio_id"]
-    blob = b"\x1a\x45\xdf\xa3p0a-second-attempt-worker"
+    blob = b"\x1a\x45\xdf\xa3p0a-followup-attempt-" + suffix.encode("ascii")
     uploaded = clients.device.put(
         f"/audio/{raw_audio_id}/blob",
         headers={**clients.device_headers, "content-type": "audio/webm"},
@@ -3113,8 +3160,8 @@ def _drive_second_processing_attempt_via_silence_cue(
         headers=clients.device_headers,
         json=_ack_body(
             record, ack_type="record_stopped",
-            ack_key="ack-cross-attempt-record-stopped-0001",
-            device_event_seq=4, stop_reason="silence",
+            ack_key=f"ack-followup-record-stopped-{suffix}",
+            device_event_seq=record_device_event_seq, stop_reason=stop_reason,
             raw_audio_id=raw_audio_id, receipt_server_seq=receipt["serverSeq"],
             checksum=upload_fact["checksum"], byte_count=upload_fact["bytes"],
             duration_seconds=1.5,
@@ -3123,6 +3170,277 @@ def _drive_second_processing_attempt_via_silence_cue(
     assert stopped.status_code == 200, stopped.text
     assert stopped.json()["status"] == "processing_attempt"
     return {"record": record, "raw_audio_id": raw_audio_id}
+
+
+def _drive_second_processing_attempt_via_current_cue(
+        clients: ApiClients) -> dict:
+    """Compatibility wrapper for the original two-attempt concurrency tests."""
+    return _drive_followup_processing_attempt_via_current_cue(
+        clients,
+        suffix="cross-attempt-0001",
+        tts_device_event_seq=3,
+        record_device_event_seq=4,
+    )
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected_path"),
+    [
+        ("", "silence"),
+        ("萝卜", "close"),
+        ("西瓜", "unknown"),
+    ],
+)
+def test_three_failed_api_worker_rounds_end_with_tell_answer_and_no_fourth_mic(
+        api_clients: ApiClients, monkeypatch, transcript, expected_path):
+    """Run the complete three-capture HTTP/worker ladder without DB shortcuts.
+
+    Each round persists upload + audioSaved + record_stopped evidence, then the
+    authoritative worker consumes it. The final answer playback closes the one-
+    position scope; no fourth record command may be issued.
+    """
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+    fake_asr = _FixedTranscriptAsr(transcript)
+    monkeypatch.setattr(asr, "get_engine", lambda: fake_asr)
+
+    for attempt_index in range(1, 4):
+        _run_p0a_attempt_worker(SESSION_ID)
+        speech = _device_next(api_clients)
+        assert speech is not None and speech["kind"] == "tts"
+        if attempt_index == 1:
+            assert speech["payload"]["purpose"] == "cue"
+            assert speech["payload"]["response_path"] == expected_path
+            assert (speech["prompt_level"], speech["attempt_seq"]) == (1, 2)
+        elif attempt_index == 2:
+            assert speech["payload"]["purpose"] == "cue"
+            assert "response_path" not in speech["payload"]
+            assert (speech["prompt_level"], speech["attempt_seq"]) == (2, 3)
+        else:
+            assert speech["payload"]["purpose"] == "tell_answer"
+            assert speech["payload"]["speech_text"] == (
+                BANK.single_element[0]["tell_answer"])
+            assert (speech["prompt_level"], speech["attempt_seq"]) == (3, 3)
+            break
+
+        _drive_followup_processing_attempt_via_current_cue(
+            api_clients,
+            suffix=f"three-fail-{expected_path}-{attempt_index + 1}",
+            tts_device_event_seq=(attempt_index * 2) + 1,
+            record_device_event_seq=(attempt_index * 2) + 2,
+        )
+
+    with Session(api_clients.engine) as session:
+        attempts = list(session.exec(select(AttemptEvent).order_by(
+            AttemptEvent.attempt_seq)))
+        commands = list(session.exec(select(RuntimeCommand).order_by(
+            RuntimeCommand.command_seq)))
+        assert [(row.attempt_seq, row.prompt_level, row.contains_target)
+                for row in attempts] == [
+                    (1, 0, False), (2, 1, False), (3, 2, False)]
+        assert [(row.kind, row.state) for row in commands] == [
+            ("tts", "succeeded"), ("record", "succeeded"),
+            ("tts", "succeeded"), ("record", "succeeded"),
+            ("tts", "succeeded"), ("record", "succeeded"),
+            ("tts", "pending"),
+        ]
+        assert len(list(session.exec(select(ItemEvent)))) == 1
+        turns = list(session.exec(select(TurnEvent)))
+        assert len(turns) == 1
+        assert turns[0].source_attempt_id == attempts[-1].id
+
+    terminal = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{speech['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(
+            speech,
+            ack_type="tts_ended",
+            ack_key=f"ack-three-fail-tell-ended-{expected_path}",
+            device_event_seq=7,
+            media_ended=True,
+            media_duration_ms=4_200,
+        ),
+    )
+    assert terminal.status_code == 200, terminal.text
+    assert terminal.json()["status"] == "scope_completed"
+    assert terminal.json()["command"] is None
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(RuntimeCommand)))) == 7
+        runtime = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime is not None and runtime.status == "intervention_completed"
+    assert fake_asr.calls == 3
+
+
+@pytest.mark.parametrize("success_level", [1, 2])
+def test_api_worker_success_after_cue_advances_exactly_one_frozen_position(
+        api_clients: ApiClients, monkeypatch, success_level):
+    """A cue1/cue2 target hit advances only after durable feedback ACK."""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(api_clients)
+    failed_asr = _EmptyTranscriptAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: failed_asr)
+    _run_p0a_attempt_worker(SESSION_ID)
+
+    for cue_level in range(1, success_level + 1):
+        _drive_followup_processing_attempt_via_current_cue(
+            api_clients,
+            suffix=f"cue{cue_level}-success-round{cue_level + 1}",
+            tts_device_event_seq=(cue_level * 2) + 1,
+            record_device_event_seq=(cue_level * 2) + 2,
+        )
+        if cue_level < success_level:
+            _run_p0a_attempt_worker(SESSION_ID)
+
+    target_asr = _WorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: target_asr)
+    _run_p0a_attempt_worker(SESSION_ID)
+    feedback = _device_next(api_clients)
+    assert feedback is not None and feedback["kind"] == "tts"
+    assert feedback["payload"]["purpose"] == "feedback"
+    if success_level == 1:
+        assert feedback["payload"]["response_path"] == "silence"
+    else:
+        assert "response_path" not in feedback["payload"]
+    assert (feedback["prompt_level"], feedback["attempt_seq"]) == (
+        success_level, success_level + 1)
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(RuntimeCommand)))) == (
+            (success_level * 2) + 3)
+
+    ended = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{feedback['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(
+            feedback,
+            ack_type="tts_ended",
+            ack_key=f"ack-cue{success_level}-success-feedback-ended-0001",
+            device_event_seq=(success_level * 2) + 3,
+            media_ended=True,
+            media_duration_ms=1_200,
+        ),
+    )
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["status"] == "waiting_tts"
+    successor = ended.json()["command"]
+    assert successor is not None
+    assert successor["item_ref"] == "itm-0002"
+    assert successor["payload"]["purpose"] == "question"
+    assert successor["payload"]["speech_text"] == (
+        TWO_ONLY_BANK.single_element[1]["initial_prompt"])
+    assert (successor["prompt_level"], successor["attempt_seq"]) == (0, 1)
+
+    replay = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{feedback['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(
+            feedback,
+            ack_type="tts_ended",
+            ack_key=f"ack-cue{success_level}-success-feedback-ended-0001",
+            device_event_seq=(success_level * 2) + 3,
+            media_ended=True,
+            media_duration_ms=1_200,
+        ),
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    assert replay.json()["status"] == "waiting_tts"
+    assert replay.json()["command"] is None
+    assert _device_next(api_clients) == successor
+    with Session(api_clients.engine) as session:
+        attempts = list(session.exec(select(AttemptEvent).order_by(
+            AttemptEvent.attempt_seq)))
+        assert [(row.attempt_seq, row.prompt_level, row.contains_target)
+                for row in attempts] == [
+                    *((index + 1, index, False)
+                      for index in range(success_level)),
+                    (success_level + 1, success_level, True),
+                ]
+        assert len(list(session.exec(select(RuntimeCommand)))) == (
+            (success_level * 2) + 4)
+        assert len(list(session.exec(select(ItemEvent)))) == 1
+        turns = list(session.exec(select(TurnEvent)))
+        assert len(turns) == 1
+        assert turns[0].source_attempt_id == attempts[-1].id
+        assert turns[0].prompt_level == success_level
+    assert failed_asr.calls == success_level
+    assert target_asr.calls == 1
+
+
+@pytest.mark.parametrize("failure_level", [1, 2])
+@pytest.mark.parametrize("error_code", ["asr_degraded", "asr_exception"])
+def test_api_worker_technical_failure_after_cue_pauses_without_next_prompt(
+        api_clients: ApiClients, monkeypatch, error_code, failure_level):
+    """A provider failure after cue1/cue2 pauses at the same content level."""
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+    failed_asr = _EmptyTranscriptAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: failed_asr)
+    _run_p0a_attempt_worker(SESSION_ID)
+
+    for cue_level in range(1, failure_level + 1):
+        _drive_followup_processing_attempt_via_current_cue(
+            api_clients,
+            suffix=f"cue{cue_level}-technical-{error_code}",
+            tts_device_event_seq=(cue_level * 2) + 1,
+            record_device_event_seq=(cue_level * 2) + 2,
+        )
+        if cue_level < failure_level:
+            _run_p0a_attempt_worker(SESSION_ID)
+
+    failing_asr = (
+        _DegradedAsr() if error_code == "asr_degraded"
+        else _WorkerAsr(fails=True)
+    )
+    monkeypatch.setattr(asr, "get_engine", lambda: failing_asr)
+    _run_p0a_attempt_worker(SESSION_ID)
+
+    with Session(api_clients.engine) as session:
+        attempts = list(session.exec(select(AttemptEvent).order_by(
+            AttemptEvent.attempt_seq)))
+        assert [(row.attempt_seq, row.prompt_level) for row in attempts] == [
+            (index + 1, index) for index in range(failure_level + 1)]
+        assert attempts[-1].processing_status == "technical_failure"
+        assert attempts[-1].error_code == error_code
+        assert attempts[-1].asr_text is None
+        assert attempts[-1].operational_answer_type is None
+        assert attempts[-1].contains_target is None
+        commands = list(session.exec(select(RuntimeCommand).order_by(
+            RuntimeCommand.command_seq)))
+        assert len(commands) == 2 + (failure_level * 2)
+        assert all(row.state == "succeeded" for row in commands)
+        assert [json.loads(row.payload_json)["purpose"] for row in commands
+                if row.kind == "tts"] == [
+                    "question", *("cue" for _ in range(failure_level))]
+        control = session.get(SessionAutopilotState, SESSION_ID)
+        runtime = session.get(SessionRuntimeState, SESSION_ID)
+        assert control is not None and control.status == "paused"
+        assert control.current_command_id is None
+        assert control.last_error_code == error_code
+        assert runtime is not None and runtime.status == "paused"
+        assert list(session.exec(select(ItemEvent))) == []
+        assert list(session.exec(select(TurnEvent))) == []
+        before_counts = (
+            len(attempts),
+            len(commands),
+            len(list(session.exec(select(AutopilotControlEvent)))),
+            len(list(session.exec(select(InteractionEvent)))),
+            len(list(session.exec(select(AttemptCaptureProcessing)))),
+        )
+    _run_p0a_attempt_worker(SESSION_ID)
+    with Session(api_clients.engine) as session:
+        assert (
+            len(list(session.exec(select(AttemptEvent)))),
+            len(list(session.exec(select(RuntimeCommand)))),
+            len(list(session.exec(select(AutopilotControlEvent)))),
+            len(list(session.exec(select(InteractionEvent)))),
+            len(list(session.exec(select(AttemptCaptureProcessing)))),
+        ) == before_counts
+    assert failed_asr.calls == failure_level
+    assert failing_asr.calls == 1
 
 
 def _live_snapshot(session: Session) -> tuple:
@@ -3336,7 +3654,7 @@ def test_stale_capture_asr_worker_across_logical_attempts_is_observation_only(
         # Device answers the cue and reaches processing_attempt #2 — a
         # different record, different raw_audio_id, same control/runner
         # generation as #1 (no pause/resume happened in between).
-        capture2 = _drive_second_processing_attempt_via_silence_cue(api_clients)
+        capture2 = _drive_second_processing_attempt_via_current_cue(api_clients)
         assert capture2["raw_audio_id"] != capture1["raw_audio_id"]
         assert capture2["record"]["command_key"] != capture1["record"]["command_key"]
         with Session(api_clients.engine) as session:
@@ -3400,7 +3718,7 @@ def test_stale_judgement_worker_across_logical_attempts_is_observation_only(
             assert len(attempts) == 1 and attempts[0].processing_status == "completed"
             assert attempts[0].contains_target is False
 
-        capture2 = _drive_second_processing_attempt_via_silence_cue(api_clients)
+        capture2 = _drive_second_processing_attempt_via_current_cue(api_clients)
         assert capture2["raw_audio_id"] != capture1["raw_audio_id"]
         with Session(api_clients.engine) as session:
             control = session.get(SessionAutopilotState, SESSION_ID)
@@ -3477,7 +3795,7 @@ def test_stale_route_across_logical_attempts_is_observation_only(
             control = session.get(SessionAutopilotState, SESSION_ID)
             assert control is not None and control.status == "waiting_tts"
 
-        capture2 = _drive_second_processing_attempt_via_silence_cue(api_clients)
+        capture2 = _drive_second_processing_attempt_via_current_cue(api_clients)
         assert capture2["raw_audio_id"] != capture1["raw_audio_id"]
         with Session(api_clients.engine) as session:
             control = session.get(SessionAutopilotState, SESSION_ID)
@@ -4960,3 +5278,34 @@ def test_ai_usage_endpoint_reports_actual_usage_not_probe(
     assert body["asr"]["engines"] == []
     assert body["asr"]["degraded_attempts"] == 0
     assert body["judge"]["modes"] == []
+
+
+def test_account_status_stays_readable_after_the_api_record_stop_chain(
+        api_clients: ApiClients, monkeypatch):
+    """录音收口进入 processing_attempt 后，账号端仍读得到控制状态。
+
+    这一格由完整的后端 API 状态转换链走出来，不是直接改库构造的：tts_ended
+    -> 上传 -> audioSaved -> record_stopped，全程走 TestClient 的 HTTP 路由。
+    它不涉及真浏览器、真设备或真麦克风。状态查询必须投影出被保留的 record
+    命令类型，而不是把合法的处理中状态当成状态机自相矛盾。
+    """
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+
+    status = api_clients.account.get(
+        f"/sessions/{SESSION_ID}/autopilot/status")
+    assert status.status_code == 200, status.text
+    body = status.json()
+    assert body["scope_key"] == "p0a_sim_first_single_v1"
+    assert body["mode"] == "autonomous"
+    assert body["status"] == "processing_attempt"
+    assert body["server_owned"] is True
+    assert body["current_command_kind"] == "record"
+    assert body["last_error_code"] is None
+    assert body["state_revision"] >= 1
+    assert _all_keys(body).isdisjoint({
+        "command", "payload", "speech_text", "image_id", "item_ref",
+        "item_id", "turn_key", "target_word", "cues", "tell_answer",
+        "raw_audio_id", "checksum", "stop_reason", "receipt_server_seq",
+        "issued_capability_token_hash", "issued_device_id_hash", "issued_at",
+    })

@@ -3150,6 +3150,17 @@ def takeover_autopilot_to_manual(
     return get_autopilot_status(db, session_id=session_id)
 
 
+# Mirrors the write-side contract in autopilot_ledger.fenced_autopilot_update:
+# a retained current command is proof of the state, so the projection must accept
+# exactly the same kind/lifecycle pairs the ledger is allowed to persist.
+_STATUS_CURRENT_COMMAND_CONTRACT: dict[str, tuple[str, frozenset[str]]] = {
+    "waiting_tts": ("tts", autopilot_ledger.CLAIMABLE_COMMAND_STATES),
+    "waiting_recording": ("record", autopilot_ledger.CLAIMABLE_COMMAND_STATES),
+    "processing_attempt": ("record", frozenset({"succeeded"})),
+    "manual_draining": ("record", autopilot_ledger.CLAIMABLE_COMMAND_STATES),
+}
+
+
 def get_autopilot_status(
     db: Session,
     *,
@@ -3176,6 +3187,7 @@ def get_autopilot_status(
     if state.mode not in {"autonomous", "manual"}:
         _fail("autopilot_state_invalid", "自动驾驶控制模式非法")
     current_kind: Literal["tts", "record"] | None = None
+    current_state: str | None = None
     if state.current_command_id is not None:
         command = db.get(RuntimeCommand, state.current_command_id)
         if (command is None or command.session_id != session_id
@@ -3185,14 +3197,22 @@ def get_autopilot_status(
                 or command.kind not in {"tts", "record"}):
             _fail("autopilot_state_invalid", "自动驾驶状态的当前命令不一致")
         current_kind = command.kind  # type: ignore[assignment]
-    command_matches_status = (
-        (state.status == "waiting_tts" and current_kind == "tts")
-        or (state.status == "waiting_recording" and current_kind == "record")
-        or (state.status not in {"waiting_tts", "waiting_recording"}
-            and current_kind is None)
-    )
-    if not command_matches_status:
+        current_state = command.state
+    expected = _STATUS_CURRENT_COMMAND_CONTRACT.get(state.status)
+    if expected is None:
+        if current_kind is not None:
+            _fail("autopilot_state_invalid", "自动驾驶状态与当前命令不一致")
+    elif current_kind != expected[0] or current_state not in expected[1]:
         _fail("autopilot_state_invalid", "自动驾驶状态与当前命令不一致")
+    # Ownership is a separate fact from the command chain: the server never
+    # claims idle while it drives, and a released manual plane never retains a
+    # command or an executing status.
+    if state.mode == "autonomous" and state.status == "idle":
+        _fail("autopilot_state_invalid", "服务器持有控制权时不得声明空闲")
+    if state.mode == "manual" and (
+            state.status not in {"paused", "scope_completed", "failed"}
+            or current_kind is not None):
+        _fail("autopilot_state_invalid", "人工接管状态不符合服务器释放契约")
     if (state.last_error_code is not None
             and re.fullmatch(r"[a-z][a-z0-9_]{0,95}", state.last_error_code) is None):
         _fail("autopilot_state_invalid", "自动驾驶错误码非法")

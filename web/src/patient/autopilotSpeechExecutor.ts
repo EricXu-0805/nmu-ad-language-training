@@ -3,11 +3,18 @@ import type {
   AutopilotSpeechPlayback,
 } from "./autopilotController.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
-import { fetchExactAutopilotTts } from "./autopilotMediaTransport.ts";
-import { browserAutopilotMediaDependencies } from "./autopilotBrowserMediaDependencies.ts";
-import { stopSpeaking, ttsEnabled } from "./tts.ts";
 
 type TtsCommand = Extract<NextCommandProjection, { kind: "tts" }>;
+
+export interface AutopilotSpeechBrowserPorts {
+  enabled(): boolean;
+  stopSpeaking(): void;
+  fetchTts(sessionId: string, command: TtsCommand, signal: AbortSignal): Promise<Blob | null>;
+  createAudio(): HTMLAudioElement;
+  createObjectUrl(blob: Blob): string;
+  revokeObjectUrl(url: string): void;
+  now(): number;
+}
 
 function deferred<T>(): {
   promise: Promise<T>;
@@ -37,12 +44,17 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
   private terminal = false;
   private readonly sessionId: string;
   private readonly command: TtsCommand;
+  private readonly ports: AutopilotSpeechBrowserPorts;
 
-  constructor(sessionId: string, command: TtsCommand) {
+  constructor(
+    sessionId: string,
+    command: TtsCommand,
+    ports: AutopilotSpeechBrowserPorts,
+  ) {
     this.sessionId = sessionId;
     this.command = command;
-    if (typeof Audio === "undefined") throw new Error("当前浏览器不支持可验证的音频播放");
-    this.audio = new Audio();
+    this.ports = ports;
+    this.audio = ports.createAudio();
     this.started = this.startedDeferred.promise;
     this.ended = this.endedDeferred.promise;
     this.closed = this.closedDeferred.promise;
@@ -63,7 +75,7 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
 
   private cleanupUrl(): void {
     if (!this.objectUrl) return;
-    URL.revokeObjectURL(this.objectUrl);
+    this.ports.revokeObjectUrl(this.objectUrl);
     this.objectUrl = null;
   }
 
@@ -79,28 +91,24 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
 
   private async run(): Promise<void> {
     try {
-      if (!ttsEnabled()) throw new Error("自动驾驶语音门禁未显式开启");
-      stopSpeaking();
-      const blob = await fetchExactAutopilotTts(
-        this.sessionId,
-        this.command,
-        this.abortController.signal,
-        browserAutopilotMediaDependencies,
-      );
+      if (!this.ports.enabled()) throw new Error("自动驾驶语音门禁未显式开启");
+      this.ports.stopSpeaking();
+      const blob = await this.ports.fetchTts(
+        this.sessionId, this.command, this.abortController.signal);
       if (blob === null) throw new Error("TTS 服务当前未产生音频");
       if (this.terminal) return;
-      this.objectUrl = URL.createObjectURL(blob);
+      this.objectUrl = this.ports.createObjectUrl(blob);
       this.audio.src = this.objectUrl;
       this.audio.onplaying = () => {
         if (this.terminal || this.startAtMs !== null) return;
-        this.startAtMs = performance.now();
+        this.startAtMs = this.ports.now();
         const duration = Number.isFinite(this.audio.duration) && this.audio.duration >= 0
           ? Math.round(this.audio.duration * 1_000) : undefined;
         this.startedDeferred.resolve(duration === undefined ? {} : { media_duration_ms: duration });
       };
       this.audio.onended = () => {
         if (this.terminal || this.startAtMs === null) return;
-        const elapsed = Math.max(0, Math.round(performance.now() - this.startAtMs));
+        const elapsed = Math.max(0, Math.round(this.ports.now() - this.startAtMs));
         this.terminal = true;
         this.cleanupUrl();
         this.endedDeferred.resolve({ media_duration_ms: elapsed });
@@ -116,11 +124,18 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
 
 export class BrowserAutopilotSpeechExecutor implements AutopilotSpeechExecutor {
   private readonly sessionId: string;
+  private readonly ports: AutopilotSpeechBrowserPorts;
 
-  constructor(sessionId: string) { this.sessionId = sessionId; }
+  constructor(
+    sessionId: string,
+    ports: AutopilotSpeechBrowserPorts,
+  ) {
+    this.sessionId = sessionId;
+    this.ports = ports;
+  }
 
   start(command: TtsCommand): AutopilotSpeechPlayback {
     if (command.state !== "pending") throw new Error("仅 pending TTS 命令可播放");
-    return new BrowserAutopilotSpeechPlayback(this.sessionId, command);
+    return new BrowserAutopilotSpeechPlayback(this.sessionId, command, this.ports);
   }
 }

@@ -140,6 +140,41 @@ test("status/start share an exact content-free receipt", () => {
   }), /禁用状态/);
 });
 
+test("processing and draining keep the record command kind, and stay fail-closed", () => {
+  const processing = {
+    ...safeStatus(), status: "processing_attempt", current_command_kind: "record",
+  };
+  const draining = {
+    ...safeStatus(), status: "manual_draining", current_command_kind: "record",
+  };
+  for (const receipt of [processing, draining]) {
+    const parsed = parseAutopilotStatusReceipt(receipt);
+    assert.equal(parsed.status, receipt.status);
+    assert.equal(parsed.commandKind, "record");
+    // 收麦/处理中仍由服务器持有，不是已释放的人工控制。
+    assert.equal(parsed.serverOwned, true);
+    assert.throws(
+      () => parseAutopilotStatusReceipt({ ...receipt, current_command_kind: "tts" }),
+      /命令不一致/,
+    );
+    assert.throws(
+      () => parseAutopilotStatusReceipt({ ...receipt, current_command_kind: null }),
+      /命令不一致/,
+    );
+    // 这两个状态属于 autonomous；manual 声称它们与安全释放契约冲突。
+    assert.throws(
+      () => parseAutopilotStatusReceipt({
+        ...receipt, mode: "manual", server_owned: false,
+      }),
+      /人工接管/,
+    );
+  }
+  // 最小收据里没有 command state，前端不得伪造这一层校验。
+  assert.throws(() => parseAutopilotStatusReceipt({
+    ...processing, command_state: "succeeded",
+  }));
+});
+
 test("console starts fail-closed, ignores stale status, and only unlocks on authority", () => {
   const initial = initialAutopilotConsoleState(SIMULATION_SESSION.session_id);
   assert.equal(initial.phase, "checking");

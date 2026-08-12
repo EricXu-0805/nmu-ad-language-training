@@ -9885,10 +9885,11 @@ def _materialize_attempt_from_capture(
 ) -> AttemptEvent | None:
     """Atomically create the deferred AttemptEvent for one claimed capture.
 
-    R1-foundation: this is the only place attempt_seq is ever consumed for the
-    autopilot_worker control plane. Repeat detection is fixed disabled this
-    batch, so a successful transcript always disposes ``answer_candidate``; a
-    future repeat-classifier would branch here, before attempt_seq is used.
+    For the ``autopilot_worker`` control plane, the caller has already handled
+    an exact explicit-repeat request before entering this function. Only an
+    ``answer_candidate`` reaches this point, and this is the only place its
+    ``attempt_seq`` is consumed. The repeat branch commits separately without
+    creating an ``AttemptEvent``.
     ``None`` return means the capture claim was lost (fenced out by a newer
     generation or an intervening pause/withdrawal) — including when it was
     already lost *before* this function's own work began. A stale/fenced-out

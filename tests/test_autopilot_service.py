@@ -1030,14 +1030,28 @@ def test_account_status_is_minimal_and_preserves_server_ownership(
             "issued_capability_token_hash", "issued_device_id_hash",
         })
 
+        # takeover 端点只可能停在 paused/scope_completed/failed 且不留当前命令
+        # （见 takeover_autopilot_to_manual 的 pause_required 与 CAS 条件）。把
+        # 执行中的 waiting_tts 直接改成 manual 是安全释放契约里造不出来的组合，
+        # 必须拒绝，而不是当成一次已完成的人工接管投影出去。
         state = db.get(SessionAutopilotState, SESSION_ID)
         assert state is not None
         state.mode = "manual"
         db.commit()
-        taken_over = get_autopilot_status(db, session_id=SESSION_ID)
-        assert taken_over.mode == "manual"
-        assert taken_over.server_owned is False
-        assert taken_over.current_command_kind == "tts"
+        with pytest.raises(AutopilotServiceError) as unsafe_manual:
+            get_autopilot_status(db, session_id=SESSION_ID)
+        assert unsafe_manual.value.code == "autopilot_state_invalid"
+
+        # 服务器仍持有控制权时不得声明空闲。
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        state.mode = "autonomous"
+        state.status = "idle"
+        state.current_command_id = None
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as owned_idle:
+            get_autopilot_status(db, session_id=SESSION_ID)
+        assert owned_idle.value.code == "autopilot_state_invalid"
 
 
 @pytest.mark.parametrize(
@@ -3319,3 +3333,262 @@ def test_account_status_disabled_is_canonical_and_active_state_is_consistent(
         with pytest.raises(AutopilotServiceError) as unsafe_error:
             get_autopilot_status(db, session_id=SESSION_ID)
         assert unsafe_error.value.code == "autopilot_state_invalid"
+
+
+def _drive_to_waiting_record(db: Session) -> tuple[RuntimeCommand, RuntimeCommand]:
+    """Persist the question-TTS -> record handoff through the service ACK path."""
+    _start(db)
+    db.commit()
+    tts = _current_tts(db)
+    _apply_ack(db, tts, AutopilotAckIn(
+        idempotency_key="ack-status-contract-tts-ended",
+        ack_type="tts_ended",
+        control_generation=1,
+        runner_generation=1,
+        command_revision=0,
+        device_event_seq=1,
+        media_ended=True,
+    ))
+    db.commit()
+    state = db.get(SessionAutopilotState, SESSION_ID)
+    assert state is not None and state.status == "waiting_recording"
+    record = db.get(RuntimeCommand, state.current_command_id)
+    assert record is not None and record.kind == "record"
+    assert record.state == "pending"
+    return tts, record
+
+
+def _ack_record_started(db: Session, record_id: int) -> None:
+    _apply_ack(db, db.get(RuntimeCommand, record_id), AutopilotAckIn(
+        idempotency_key="ack-status-contract-record-started",
+        ack_type="record_started",
+        control_generation=1,
+        runner_generation=1,
+        command_revision=0,
+        device_event_seq=2,
+        mime_type="audio/webm;codecs=opus",
+        sample_rate_hz=48_000,
+        channels=1,
+    ), now=NOW + timedelta(seconds=1))
+    db.commit()
+
+
+def _ack_record_stopped(db: Session, record: RuntimeCommand) -> None:
+    """Complete the capture proof chain so the record command reaches succeeded."""
+    raw_audio_id = record.expected_raw_audio_id
+    assert raw_audio_id is not None
+    checksum = "c" * 64
+    asset = db.get(AudioAssetRow, raw_audio_id)
+    assert asset is not None
+    asset.checksum = checksum
+    asset.byte_count = 2048
+    asset.uploaded_at = NOW + timedelta(seconds=1)
+    receipt = AudioCaptureReceipt(
+        raw_audio_id=raw_audio_id,
+        session_id=SESSION_ID,
+        turn_key=record.turn_key,
+        received_at=NOW + timedelta(seconds=1),
+        duration_seconds=2.5,
+        byte_count=2048,
+        checksum=checksum,
+        data_classification="simulation",
+        is_simulation=True,
+        contains_direct_identifier=False,
+    )
+    db.add(receipt)
+    db.commit()
+    assert receipt.server_seq is not None
+    record_id = record.id
+    _ack_record_started(db, record_id)
+    _apply_ack(db, db.get(RuntimeCommand, record_id), AutopilotAckIn(
+        idempotency_key="ack-status-contract-record-stopped",
+        ack_type="record_stopped",
+        control_generation=1,
+        runner_generation=1,
+        command_revision=1,
+        device_event_seq=3,
+        raw_audio_id=raw_audio_id,
+        receipt_server_seq=receipt.server_seq,
+        checksum=checksum,
+        byte_count=2048,
+        duration_seconds=2.5,
+        stop_reason="user_done",
+    ), now=NOW + timedelta(seconds=2))
+    db.commit()
+    stored = db.get(RuntimeCommand, record_id)
+    assert stored is not None and stored.state == "succeeded"
+
+
+def test_account_status_projects_processing_attempt_with_the_succeeded_record(
+        service_engine, monkeypatch):
+    """processing_attempt 保留的是已完成的 record 命令，不是状态机矛盾。"""
+    _enable_p0a(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_ready(db)
+        tts, record = _drive_to_waiting_record(db)
+        record_id = record.id
+        _ack_record_stopped(db, record)
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "processing_attempt"
+        assert state.current_command_id == record_id
+
+        projected = get_autopilot_status(db, session_id=SESSION_ID)
+        assert projected.scope_key == P0A_SCOPE_KEY
+        assert projected.mode == "autonomous"
+        assert projected.status == "processing_attempt"
+        # 所有权穿越处理中状态，本修复不解锁人工控制。
+        assert projected.server_owned is True
+        assert projected.current_command_kind == "record"
+        assert projected.last_error_code is None
+        assert _all_keys(projected.model_dump()).isdisjoint({
+            "command", "payload", "speech_text", "image_id", "item_ref",
+            "item_id", "turn_key", "target_word", "answer", "raw_audio_id",
+            "checksum", "issued_capability_token_hash", "issued_device_id_hash",
+        })
+
+        # 已完成的录音命令不是收麦持久态。
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        state.status = "manual_draining"
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as drained_terminal:
+            get_autopilot_status(db, session_id=SESSION_ID)
+        assert drained_terminal.value.code == "autopilot_state_invalid"
+
+        # processing_attempt 只对应 record；指回 TTS 命令必须拒绝。
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        state.status = "processing_attempt"
+        state.current_command_id = tts.id
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as wrong_kind:
+            get_autopilot_status(db, session_id=SESSION_ID)
+        assert wrong_kind.value.code == "autopilot_state_invalid"
+
+        # 两个 generation 的漂移都仍先于 status↔kind 匹配被拒。
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        state.current_command_id = record_id
+        db.commit()
+        for fence in ("control_generation", "runner_generation"):
+            state = db.get(SessionAutopilotState, SESSION_ID)
+            original = getattr(state, fence)
+            setattr(state, fence, original + 1)
+            db.commit()
+            with pytest.raises(AutopilotServiceError) as stale_generation:
+                get_autopilot_status(db, session_id=SESSION_ID)
+            assert stale_generation.value.code == "autopilot_state_invalid"
+            state = db.get(SessionAutopilotState, SESSION_ID)
+            setattr(state, fence, original)
+            db.commit()
+
+        restored = get_autopilot_status(db, session_id=SESSION_ID)
+        assert restored.status == "processing_attempt"
+        assert restored.current_command_kind == "record"
+
+
+def test_account_status_rejects_processing_attempt_without_a_finished_record(
+        service_engine, monkeypatch):
+    """处理中状态只接受已终态成功的录音命令，pending/started 一律拒绝。"""
+    _enable_p0a(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_ready(db)
+        _tts, record = _drive_to_waiting_record(db)
+        record_id = record.id
+
+        # 同一条命令在 waiting_recording 下是合法的，所以下面的拒绝只可能来自
+        # 状态改动本身，不是夹具把命令链搭坏了。
+        pending = get_autopilot_status(db, session_id=SESSION_ID)
+        assert pending.status == "waiting_recording"
+        assert pending.current_command_kind == "record"
+        assert pending.server_owned is True
+
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        state.status = "processing_attempt"
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as still_pending:
+            get_autopilot_status(db, session_id=SESSION_ID)
+        assert still_pending.value.code == "autopilot_state_invalid"
+
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        state.status = "waiting_recording"
+        db.commit()
+        _ack_record_started(db, record_id)
+        assert db.get(RuntimeCommand, record_id).state == "started"
+
+        started = get_autopilot_status(db, session_id=SESSION_ID)
+        assert started.status == "waiting_recording"
+        assert started.current_command_kind == "record"
+        assert started.server_owned is True
+
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        state.status = "processing_attempt"
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as still_started:
+            get_autopilot_status(db, session_id=SESSION_ID)
+        assert still_started.value.code == "autopilot_state_invalid"
+
+
+def test_account_status_accepts_only_claimable_record_for_manual_draining(
+        service_engine, monkeypatch):
+    """manual_draining 是 autonomous + server_owned 的安全收麦持久态。
+
+    生产目前没有已确认的写入者；这里只钉合法持久态契约，不代表该路径可执行。
+    """
+    _enable_p0a(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_ready(db)
+        tts, record = _drive_to_waiting_record(db)
+        record_id = record.id
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        state.status = "manual_draining"
+        db.commit()
+
+        pending = get_autopilot_status(db, session_id=SESSION_ID)
+        assert pending.status == "manual_draining"
+        assert pending.current_command_kind == "record"
+        assert pending.mode == "autonomous"
+        assert pending.server_owned is True
+
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        state.current_command_id = tts.id
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as wrong_kind:
+            get_autopilot_status(db, session_id=SESSION_ID)
+        assert wrong_kind.value.code == "autopilot_state_invalid"
+
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        state.status = "waiting_recording"
+        state.current_command_id = record_id
+        db.commit()
+        _ack_record_started(db, record_id)
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        state.status = "manual_draining"
+        db.commit()
+
+        started = get_autopilot_status(db, session_id=SESSION_ID)
+        assert started.status == "manual_draining"
+        assert started.current_command_kind == "record"
+        assert started.server_owned is True
+
+
+@pytest.mark.parametrize("status", ["processing_attempt", "manual_draining"])
+def test_autopilot_state_cannot_persist_those_statuses_without_a_command(
+        service_engine, monkeypatch, status):
+    """空 current_command_id 的处理中/收麦态在持久化层就被挡住。
+
+    只证明这一格进不了库，所以 get_autopilot_status 收不到它；不代表服务层对
+    这种行有任何额外契约，也不是一条可达状态。
+    """
+    _enable_p0a(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_ready(db)
+        _drive_to_waiting_record(db)
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        state.status = status
+        state.current_command_id = None
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+        assert db.get(
+            SessionAutopilotState, SESSION_ID).status == "waiting_recording"

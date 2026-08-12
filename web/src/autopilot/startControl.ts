@@ -192,12 +192,15 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
         ].includes(status) || value.current_command_kind !== null)) {
       throw new Error("人工接管状态不符合服务器释放契约");
     }
-    const commandMatches = status === "waiting_tts"
-      ? value.current_command_kind === "tts"
-      : status === "waiting_recording"
-        ? value.current_command_kind === "record"
-        : value.current_command_kind === null;
-    if (!commandMatches) throw new Error("自动驾驶状态与当前命令不一致");
+    const expectedKind = status === "waiting_tts"
+      ? "tts"
+      : status === "waiting_recording" || status === "processing_attempt"
+        || status === "manual_draining"
+        ? "record"
+        : null;
+    if (value.current_command_kind !== expectedKind) {
+      throw new Error("自动驾驶状态与当前命令不一致");
+    }
   }
 
   return {

@@ -28,6 +28,7 @@ import {
   type AutopilotRuntimeState,
 } from "./autopilotRuntime.ts";
 import { BrowserAutopilotSpeechExecutor } from "./autopilotSpeechExecutor.ts";
+import { browserAutopilotSpeechPorts } from "./autopilotBrowserSpeechPorts.ts";
 import {
   acknowledgeExactAutopilotDrain,
   fetchExactAutopilotDrainTarget,
@@ -536,7 +537,8 @@ export function usePatientAutopilot(input: {
       controller = new PatientAutopilotController({
         sessionId: input.sessionId as string,
         transport: autopilotHttpTransport,
-        speech: new BrowserAutopilotSpeechExecutor(input.sessionId as string),
+        speech: new BrowserAutopilotSpeechExecutor(
+          input.sessionId as string, browserAutopilotSpeechPorts),
         recording: new BrowserAutopilotRecordingExecutor(input.sessionId as string, {
           ownerGeneration: context.ownerGeneration,
           observe: observeCapturePhase,

@@ -51,9 +51,10 @@ export function answerWindowMs(maxDurationSeconds: number): number {
 /**
  * 从真实录音起点起算，还剩多少作答窗口。
  *
- * elapsedSinceStartMs 是**已经录进去**的那一段（构造 MediaRecorder 之后到武装
- * 定时器之间的耗时）。不扣掉它，这段就整段加在服务器上限之外——权限返回后那次
- * 授权复核是一整个网络往返，正是 T5 里自动收麦必被拒的主因。
+ * elapsedSinceStartMs 只计算真实 `MediaRecorder.onstart` 之后、到作答定时器武装
+ * 之前已经录进去的时间。权限返回后的第二次授权发生在 `startPrepared()` 之前，
+ * 属于开录前预算，不占老人的作答窗口；这里扣除的是 onstart 后的本地调度耗时，
+ * 防止它被额外加到服务器时长上限之外。
  */
 export function remainingAnswerWindowMs(
   maxDurationSeconds: number,
