@@ -45,6 +45,7 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                session_completion,
                resource_limits, patient_asset, patient_presentation,
                provider_readiness, repeat_evidence, repeat_intent,
+               research_dataset, research_read,
                scale_protocol,
                session_admission, session_closeout, tts,
                visit_plan_contract, visit_plan_service)
@@ -7464,6 +7465,100 @@ def get_ai_quality_metrics(
             "Cache-Control": "private, no-store", "Pragma": "no-cache",
         }) from exc
 
+
+
+# ---------------------------------------------------------------------------
+# 只读研究数据面 /research/v1/*（收据 187 之外的新增：给 PI 与合作者取数）
+# 全部是 GET，零写入口；输出与去标识导出包同一口径，可直接与 CSV 批次 join。
+# 访问策略里已把 research 登记为受保护命名空间首段，忘写显式规则也要具名账号。
+# ---------------------------------------------------------------------------
+_RESEARCH_NO_STORE = {"Cache-Control": "private, no-store", "Pragma": "no-cache"}
+
+
+def _research_reject(code: str, message: str, status: int) -> HTTPException:
+    return HTTPException(status_code=status, detail={"code": code, "message": message},
+                         headers=_RESEARCH_NO_STORE)
+
+
+def _research_query_guard(request: Request, allowed: set[str]) -> None:
+    """拒绝未知/重复查询参数，而不是静默接受一个契约没实现的维度。"""
+    seen: set[str] = set()
+    for name, _ in request.query_params.multi_items():
+        if name not in allowed or name in seen:
+            raise _research_reject(
+                "research_query_invalid",
+                f"只允许这些查询参数各一次：{sorted(allowed)}", 422)
+        seen.add(name)
+
+
+def _research_config(request: Request, action: str):
+    actor_id = _require_account_identity(
+        request, action, roles={"data_steward", "admin"})
+    return actor_id, research_read.load_config()
+
+
+@app.get("/research/v1/meta")
+def get_research_meta(request: Request, response: Response):
+    """就绪自诊面：**密钥没配也必须能读**，否则取数的人只拿到裸 503。"""
+    _require_account_identity(request, "查看研究数据接口状态",
+                              roles={"data_steward", "admin"})
+    _research_query_guard(request, set())
+    response.headers.update(_RESEARCH_NO_STORE)
+    try:
+        config = research_read.load_config()
+    except research_read.ResearchReadUnavailable as exc:
+        return research_read.build_meta(exc, None)
+    return research_read.build_meta(None, config)
+
+
+@app.get("/research/v1/dictionary")
+def get_research_dictionary(request: Request, response: Response):
+    """数据字典由列注册表生成，不可能与实际输出漂移。"""
+    _require_account_identity(request, "查看研究数据字典",
+                              roles={"data_steward", "admin"})
+    _research_query_guard(request, set())
+    response.headers.update(_RESEARCH_NO_STORE)
+    return {
+        "schema_version": research_dataset.SCHEMA_VERSION,
+        "columns": research_dataset.dictionary_rows(),
+    }
+
+
+@app.get("/research/v1/{dataset_key}")
+def get_research_dataset(
+        dataset_key: str,
+        data_classification: Literal["research", "simulation"],
+        request: Request, response: Response,
+        cursor: str | None = None, limit: int | None = None,
+        s: DBSession = Depends(get_session)):
+    """一个数据集的一页。data_classification 必填且无默认——沿用质量汇总口径。"""
+    dataset = research_dataset.dataset_for(dataset_key)
+    if dataset is None:
+        raise _research_reject(
+            "research_dataset_unknown",
+            f"未知数据集；可用的是 {list(research_dataset.dataset_keys())}", 404)
+    actor_id = _require_account_identity(
+        request, "读取去标识研究数据", roles={"data_steward", "admin"})
+    _research_query_guard(request, {"data_classification", "cursor", "limit"})
+    limited = _expensive_rate_limit(
+        request, f"account:{actor_id}:{_client_ip(request)}",
+        resource_path="/research/v1/dataset")
+    if limited is not None:
+        return limited
+    response.headers.update(_RESEARCH_NO_STORE)
+    try:
+        config = research_read.load_config()
+        size = research_read.clamp_limit(limit)
+        reader = {
+            "subjects": research_read.list_subjects,
+            "sessions": research_read.list_sessions,
+            "turns": research_read.list_turns,
+        }[dataset_key]
+        return reader(s, config=config, data_classification=data_classification,
+                      cursor=cursor, limit=size)
+    except research_read.ResearchReadUnavailable as exc:
+        status = 503 if exc.code == "research_deidentification_unavailable" else 422
+        raise _research_reject(exc.code, exc.message, status) from exc
 
 @app.get(
     "/ai/provider-readiness",

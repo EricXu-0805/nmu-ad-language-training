@@ -141,6 +141,14 @@ _ROUTE_RULES = (
            label="读取 AI 服务合成检查状态"),
     _route({"GET", "HEAD"}, r"/quality/ai-metrics", AccessKind.ACCOUNT,
            roles=KNOWN_ACCOUNT_ROLES, label="读取去标识 AI 质量汇总"),
+
+    # 只读研究数据面：给 PI 与合作者取数用，输出与去标识导出包同一口径
+    # （分域 HMAC 假名、无自由文本、无绝对时间）。故意收在数据治理角色上——
+    # researcher 是按 trainer_id 隔离的训练操作者，跨受试者只读属于治理面，
+    # 不能靠"通用已知账号"兜底顺手放宽。全部是 GET，没有任何写入口。
+    _route({"GET", "HEAD"}, r"/research/v1/[^/]+",
+           AccessKind.ACCOUNT, roles=DATA_GOVERNANCE_ROLES,
+           label="读取去标识研究数据"),
     _route({"POST"}, r"/ai/provider-readiness/probe", AccessKind.ACCOUNT,
            roles=ADMIN_ROLES, label="执行 AI 服务合成检查"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/start", AccessKind.ACCOUNT,
@@ -278,6 +286,9 @@ _API_ROOTS = frozenset({
     "ai", "quality", "exports", "governance", "assessment-events",
     "assessment-instances",
     "caregiver",
+    # 只读研究数据面。登记在这里，等于给它一个 fail-closed 的默认：
+    # 忘了写显式规则也要具名账号，而不是匿名可读。
+    "research",
 })
 
 # These roots are permanently reserved for server-controlled APIs.  Static SPA
@@ -425,6 +436,25 @@ def mutation_route_is_classified(method: str, path_template: str) -> bool:
         return True
     sample_path = re.sub(r"\{[^}]+\}", "X", path_template)
     return any(rule.matches(method.upper(), sample_path) for rule in _ROUTE_RULES)
+
+
+def read_route_is_classified(method: str, path_template: str) -> bool:
+    """Return whether a GET/HEAD template is protected other than by luck.
+
+    ``access_rule`` deliberately leaves *unknown* static GETs public so the login
+    page and the patient SPA shell can load.  That default is right for files and
+    wrong for data: a new ``@app.get("/whatever/…")`` that nobody remembered to
+    classify ships as an anonymous read of whatever it returns, and the mutation
+    coverage test skips GET by design.  This predicate is the missing half —
+    a read route counts as classified only if an explicit rule matches it or its
+    first segment is a reserved API namespace.
+    """
+    if method.upper() not in {"GET", "HEAD"}:
+        return True
+    sample_path = re.sub(r"\{[^}]+\}", "X", path_template)
+    if any(rule.matches(method.upper(), sample_path) for rule in _ROUTE_RULES):
+        return True
+    return protected_api_namespace_alias(sample_path)
 
 
 def autopilot_next_session_id(method: str, path: str) -> str | None:

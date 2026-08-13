@@ -1756,3 +1756,47 @@ def test_local_m0_mutation_fence_cannot_reopen_withdrawn_content(policy_client):
         assert session.exec(select(ItemEvent).where(
             ItemEvent.session_id == "S-POLICY")).all() == [
                 session.get(ItemEvent, turn.item_event_id)]
+
+
+def test_every_read_route_is_classified_and_not_public_by_accident():
+    """GET 也要显式分类——兜底把未知 GET 留成公开，对数据是错的。
+
+    `access_rule` 故意让未知的静态 GET 保持公开，好让登录页和老人端 SPA 外壳
+    能加载；对文件这是对的，对数据是灾难：一个没人记得分类的
+    `@app.get("/whatever/…")` 会以匿名可读的形态上线，而 mutation 覆盖测试
+    按设计跳过 GET，谁都发现不了。
+
+    下面这份豁免名单是**穷举**，加任何一条都必须解释为什么它可以匿名读。
+    """
+    deliberately_public = {
+        "GET /health", "HEAD /health",            # 存活探测，不含任何数据
+        "GET /auth/me", "HEAD /auth/me",          # 只回"你登录了没"，未登录返回空身份
+        "GET /auth/config", "HEAD /auth/config",  # 登录页要知道该显示账号还是 PIN
+        "GET /{full_path:path}", "HEAD /{full_path:path}",  # SPA 静态外壳兜底
+    }
+    unclassified = sorted(
+        f"{method} {route.path}"
+        for route in app.routes if isinstance(route, APIRoute)
+        for method in sorted(route.methods or set())
+        if method in {"GET", "HEAD"}
+        and not access_policy.read_route_is_classified(method, route.path)
+        and f"{method} {route.path}" not in deliberately_public
+    )
+    assert unclassified == [], (
+        "新读路由必须显式分类或落在受保护命名空间首段，否则它是匿名可读的："
+        f"{unclassified}"
+    )
+
+
+def test_research_read_surface_is_governance_only_and_has_no_write_verb():
+    for path in ("/research/v1/meta", "/research/v1/turns", "/research/v1/turns.csv"):
+        rule = access_policy.access_rule("GET", path)
+        assert rule.kind is access_policy.AccessKind.ACCOUNT
+        assert rule.roles == access_policy.DATA_GOVERNANCE_ROLES, path
+        # researcher 被 trainer_id 隔离，跨受试者只读属于治理面，不得靠通用兜底放宽
+        assert "researcher" not in rule.roles
+        assert "caregiver_operator" not in rule.roles
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        assert not access_policy.mutation_route_is_classified(
+            method, "/research/v1/turns"), (
+            "研究数据面必须零写入口；出现写路由说明范围被悄悄扩大了")
