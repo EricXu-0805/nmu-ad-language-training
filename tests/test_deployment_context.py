@@ -622,3 +622,53 @@ def test_vite_dev_proxy_covers_every_console_api_domain():
         "/sessions", "/turns", "/visit-plans",
     ):
         assert repr(prefix) in config
+
+
+def test_baremetal_unit_verifies_the_database_head_before_starting_the_app():
+    """裸机起服前必须验库结构版本（收据 187 的 U4）。
+
+    容器路径早在 docker-entrypoint.sh 里做了这件事，裸机一直没有；而裸机的
+    `Restart=always` 会把一棵只同步了一半的树反复拉起来继续对公网提供服务。
+    这条测试同时钉住"单元里写了这道闸"和"这道闸真的会拒绝"，两者缺一都没用。
+    """
+    unit = (ROOT / "deploy" / "systemd" / "nmu.service").read_text(
+        encoding="utf-8")
+
+    pre = [line for line in unit.splitlines()
+           if line.startswith("ExecStartPre=")]
+    assert len(pre) == 1, "起服前检查只应有一条，多条会掩盖执行顺序"
+    assert "scripts/check_database_head.py" in pre[0]
+    assert " -I " in pre[0], "必须隔离用户站点包，避免 PYTHONPATH 改变判定"
+    assert pre[0].split("=", 1)[1].strip().startswith("/"), "必须是绝对路径"
+    assert unit.index("ExecStartPre=") < unit.index("ExecStart="), (
+        "闸必须写在 ExecStart 之前，读单元的人要一眼看出先后")
+
+
+def test_database_head_gate_actually_rejects_a_stale_database(tmp_path):
+    """行为面：库停在旧修订时必须非零退出，而不是放行。"""
+    import sqlite3
+
+    stale = tmp_path / "stale.db"
+    connection = sqlite3.connect(stale)
+    try:
+        connection.execute(
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        connection.execute(
+            "INSERT INTO alembic_version (version_num) VALUES ('deadbeefcafe')")
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = subprocess.run(
+        [sys.executable, "-I", str(ROOT / "scripts" / "check_database_head.py")],
+        cwd=str(ROOT),
+        env={**os.environ, "DATABASE_URL": f"sqlite:///{stale}"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "database_revision_not_head" in result.stderr
+    # 拒绝理由不得带出路径或库内容
+    assert str(stale) not in result.stderr
+    assert result.stdout == ""

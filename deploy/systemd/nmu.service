@@ -6,6 +6,12 @@ After=network-online.target
 User=nmu
 WorkingDirectory=/opt/nmu/app
 EnvironmentFile=/opt/nmu/app/.env
+# 起服前先验数据库结构版本（收据 187 的 U4）。容器路径早就在 docker-entrypoint.sh
+# 里做了这件事，裸机这条路一直没有——而裸机恰恰是发布被打断时最危险的一条：
+# `Restart=always` 会把一棵只同步了一半的树反复拉起来继续对公网提供服务。
+# 这道闸让"代码与库结构对不上"直接拒绝起服，而不是带伤运行。
+# 缺失、旧头、多头歧义一律非零退出；`-I` 隔离用户站点包，避免 PYTHONPATH 干扰判定。
+ExecStartPre=/opt/nmu/venv/bin/python -I /opt/nmu/app/scripts/check_database_head.py
 # 走 `python -m`，不走 venv/bin/uvicorn：pip 生成的入口脚本把解释器绝对路径写死在
 # shebang 里。按锁重建 venv 的标准做法是"在旁边建好再改名换上"，改名那一刻
 # shebang 就指向一个不存在的目录，服务起不来。`-m` 免疫这一类。
