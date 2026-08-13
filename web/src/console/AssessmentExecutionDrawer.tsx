@@ -16,6 +16,7 @@ import {
   assessmentActionGates,
   parseAssessmentMutationFailure,
   parseResponseInput,
+  performAssessmentMutation,
   type AssessmentMutationFailure,
 } from "./assessmentExecution";
 import { assessmentCategoryLabel, assessmentInstanceStatusLabel } from "./assessmentQueue";
@@ -79,14 +80,23 @@ export function AssessmentExecutionDrawer({ event, readiness, onReceipt, onDismi
   const [cancelReason, setCancelReason] = useState<AssessmentCancellationReason>("schedule_changed");
   const gates = assessmentActionGates(event);
 
-  async function run(action: () => Promise<AssessmentEvent>) {
-    if (busy) return;
+  // 返回"服务器是否真的接受了"。调用方据此决定要不要清草稿——finally 里
+  // 永远不做清理，因为 finally 分不出成功和失败。
+  async function run(action: () => Promise<AssessmentEvent>): Promise<boolean> {
+    if (busy) return false;
     setBusy(true);
     setFailure(null);
     try {
-      onReceipt(await action());
+      const outcome = await performAssessmentMutation(action, onReceipt);
+      if (!outcome.ok) {
+        setFailure(outcome.failure);
+        return false;
+      }
+      return true;
     } catch (error) {
+      // onReceipt 自己抛错也算没成交：宁可让研究者重来一次，也不能清掉草稿。
       setFailure(parseAssessmentMutationFailure(error));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -147,7 +157,7 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
   readiness: ScaleProtocolReadiness;
   busy: boolean;
   enabled: { canRespond: boolean; canComplete: boolean; canDefer: boolean };
-  run: (action: () => Promise<AssessmentEvent>) => Promise<void>;
+  run: (action: () => Promise<AssessmentEvent>) => Promise<boolean>;
 }) {
   const [itemKey, setItemKey] = useState("");
   const [rawValue, setRawValue] = useState("");
@@ -164,26 +174,36 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
     setGrantBusy(true);
     setLocalError(null);
     try {
-      const issued = await api.issueAssessmentRecordingAuthorization(
-        event, instance, trimmed, readiness);
-      setGrant({ itemKey: trimmed, digest: issued.authorizedArtifactDigest, revision: issued.itemRevision });
-      setExpectedItemRevision(issued.itemRevision - 1);
-    } catch (error) {
-      setGrant(null);
-      setLocalError(parseAssessmentMutationFailure(error).message);
+      // 重签失败不得毁掉手上那份仍然有效的授权：原实现在 catch 里
+      // setGrant(null)，于是一次网络抖动就把已经签好的授权清成 null，
+      // 研究者再保存作答时会变成"无授权"提交。
+      const outcome = await performAssessmentMutation(
+        () => api.issueAssessmentRecordingAuthorization(
+          event, instance, trimmed, readiness),
+        (issued) => {
+          setGrant({
+            itemKey: trimmed,
+            digest: issued.authorizedArtifactDigest,
+            revision: issued.itemRevision,
+          });
+          setExpectedItemRevision(issued.itemRevision - 1);
+        });
+      if (!outcome.ok) {
+        setLocalError(outcome.failure.message);
+      }
     } finally {
       setGrantBusy(false);
     }
   }
 
-  function submitResponse() {
+  async function submitResponse() {
     const trimmed = itemKey.trim();
     if (!trimmed) { setLocalError("请填写 PI 施测表上的条目键"); return; }
     const parsed = parseResponseInput(rawValue);
     if (!parsed.ok) { setLocalError(parsed.reason ?? "作答无效"); return; }
     setLocalError(null);
     const artifact = grant && grant.itemKey === trimmed ? grant.digest : undefined;
-    void run(() => api.submitAssessmentItemResponse(event, instance, trimmed, {
+    const saved = await run(() => api.submitAssessmentItemResponse(event, instance, trimmed, {
       response: artifact === undefined
         ? { value: parsed.value }
         : { value: parsed.value, authorized_artifact_digest: artifact },
@@ -191,11 +211,11 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
       expected_instance_revision: instance.revision,
       expected_item_revision: expectedItemRevision,
       idempotency_key: key("response"),
-    }, readiness)).then(() => {
-      setGrant(null);
-      setRawValue("");
-      setExpectedItemRevision(0);
-    });
+    }, readiness));
+    if (saved !== true) return;
+    setGrant(null);
+    setRawValue("");
+    setExpectedItemRevision(0);
   }
 
   return (
@@ -270,7 +290,7 @@ function CloseoutForm({ event, readiness, busy, run }: {
   event: AssessmentEvent;
   readiness: ScaleProtocolReadiness;
   busy: boolean;
-  run: (action: () => Promise<AssessmentEvent>) => Promise<void>;
+  run: (action: () => Promise<AssessmentEvent>) => Promise<boolean>;
 }) {
   const [flags, setFlags] = useState<CloseFlags>({
     fatigue_observed: false,

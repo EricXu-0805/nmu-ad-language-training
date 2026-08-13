@@ -111,6 +111,31 @@ export function parseAssessmentMutationFailure(error: unknown): AssessmentMutati
   };
 }
 
+export type AssessmentMutationOutcome =
+  | { ok: true }
+  | { ok: false; failure: AssessmentMutationFailure };
+
+/** 只在服务器真的接受之后才交付回执；失败一律不碰调用方的草稿。
+ *
+ * 存在的理由是一个具体缺陷：原来保存作答走 `run(...).then(清理)`，而 run 把
+ * 失败吞成 setFailure，于是 409/403/5xx/断网/回执解析失败也会走到 .then，
+ * 把研究者刚敲进去的作答值、修订号和录音授权一起清掉。研究者当场看不出
+ * 已经丢了什么，只能重填——而重填时那份录音授权已经作废。
+ */
+export async function performAssessmentMutation<T>(
+  action: () => Promise<T>,
+  onSuccess: (value: T) => void,
+): Promise<AssessmentMutationOutcome> {
+  let value: T;
+  try {
+    value = await action();
+  } catch (error) {
+    return { ok: false, failure: parseAssessmentMutationFailure(error) };
+  }
+  onSuccess(value);
+  return { ok: true };
+}
+
 export interface ResponseInputResult {
   ok: boolean;
   value?: number;
