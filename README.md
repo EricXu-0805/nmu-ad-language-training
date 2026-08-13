@@ -93,6 +93,8 @@ cd web && npm run dev                     # 前端热更(另开 ./scripts/serve.
 ./scripts/serve.sh                        # 单机双窗:同机开 /console 与 /patient(localhost 麦克风可用)
 DEMO20=1 ./scripts/serve.sh               # 开启本机 20 题合成模拟入口（仅 127.0.0.1）
 ./scripts/run-caregiver-demo20.sh         # 干净临时库的一键照护员演练；退出即清理
+./scripts/run-caregiver-demo20.sh --browser-check start-pause
+                                          # 真 Chrome 跑「开始→暂停」并交叉核对临时库账本；见下
 # 内网首次启动前先交互建具名账号（口令不回显）：
 ./.venv/bin/python scripts/manage_users.py create 研究者 --role admin
 INTRANET=1 ./scripts/serve.sh             # 内网双端技术验证:0.0.0.0:8443 + 自签 TLS；自动生成并显示床旁 PIN
@@ -105,6 +107,16 @@ INTRANET=1 ./scripts/serve.sh             # 内网双端技术验证:0.0.0.0:844
 真正可打开后才显示登录信息；按 Ctrl+C 会停止服务并删除临时库。它不会写入
 正式 `data/`，也不能用于真人、养老院现场或正式研究。`DEMO20=1 serve.sh`
 只是打开已有本机库的模拟能力，不会替使用者准备账号、安排或语音就绪证据。
+
+`--browser-check start-pause` 在同一个一次性环境里用**真 Chrome** 跑一遍
+「开始练习 → 暂停」，再用仓库 venv 读临时库账本，把浏览器观察到的
+command_key / session_id / revision 与服务端持久化事实逐项对上；收据写成
+0600 文件，拒绝覆盖、拒绝符号链接、拒绝错误属主。这条路径**只在这台
+macOS 开发机上成立**：它要求本机已装 Python Playwright（见
+`requirements-dev.txt`）和 Google Chrome，两者缺一即明确停止，**不会自动
+联网安装**；`playwright` 故意不进 `requirements-deploy.lock.txt`，所以
+**CI 永远覆盖不到这条路径**，它绿不代表 CI 验过，也不代表真实设备验收
+通过（真机验收另见 `docs/acceptance/` 下的八项清单）。
 
 容器发布只安装 `requirements-deploy.lock.txt` 中逐包哈希锁定的 Python 3.12 传递依赖；`requirements-deploy.txt` 只是人工维护的直接依赖输入。更新依赖时必须重新生成 lock、复核差异并跑完整回归，不能在发布机临时 `pip install`。默认发布锁不含可选 Piper；若挂载本地 Piper 模型，镜像中必须同时安装与验证固定版本的 `piper-tts`，否则保持模型与包同时缺失并走明确降级。
 

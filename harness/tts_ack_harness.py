@@ -97,6 +97,7 @@ MARKER_VALUE = "demo20-profile-tts-ack-v1"
 ROOT_ENV = "NMU_HARNESS_ROOT"
 TTS_CACHE_ENV = "NMU_HARNESS_TTS_CACHE_DIR"
 TTS_MODE_ENV = "NMU_HARNESS_TTS_MODE"
+TTS_DURATION_PROFILE_ENV = "NMU_HARNESS_TTS_DURATION_PROFILE"
 PASSWORD_ENV = "NMU_HARNESS_PASSWORD"
 ACTOR_ENV = "NMU_HARNESS_ACTOR"
 FINGERPRINT_KEY_ENV = "PROVIDER_READINESS_FINGERPRINT_KEY"
@@ -318,13 +319,15 @@ def resolve_config(env: Mapping[str, str] | None = None) -> HarnessConfig:
 # ----------------------------------------------------------------------------
 # 合成 TTS（训练内容仍为 canonical + exact profile）
 # ----------------------------------------------------------------------------
-def deterministic_wav(text: str) -> bytes:
+def deterministic_wav(text: str, *, duration_seconds: float = 0.6) -> bytes:
     """同一句话永远得到同一段非零 WAV；确定性、可复现、离线。"""
+    if duration_seconds not in {0.6, 5.0}:
+        raise HarnessConfigError("合成语音时长只允许默认或浏览器验收档位")
     digest = hashlib.sha256(text.encode("utf-8")).digest()
     freq = 220 + (digest[0] << 8 | digest[1]) % 440
     rate = 8000
     frames = bytearray()
-    for i in range(int(rate * 0.6)):
+    for i in range(int(rate * duration_seconds)):
         sample = int(11000 * math.sin(2 * math.pi * freq * i / rate))
         frames += int(sample).to_bytes(2, "little", signed=True)
     buffer = io.BytesIO()
@@ -340,14 +343,23 @@ class DeterministicHarnessTtsEngine:
     """本地确定性引擎：cloud=False，文本不出机器。仅 synthetic 模式启用。"""
 
     cloud = False
-    cache_params = "harness-synthetic-v1"
-    version = "harness-synthetic/1"
+    def __init__(self) -> None:
+        profile = os.environ.get(TTS_DURATION_PROFILE_ENV, "default")
+        if profile == "default":
+            self.duration_seconds = 0.6
+            self.version = "harness-synthetic/1"
+        elif profile == "browser-start-pause":
+            self.duration_seconds = 5.0
+            self.version = "harness-synthetic-browser/1"
+        else:
+            raise HarnessConfigError("合成语音时长档位无效")
+        self.cache_params = "harness-synthetic-v1"
 
     def available(self) -> bool:
         return True
 
     def synthesize(self, text: str) -> bytes | None:
-        return deterministic_wav(text)
+        return deterministic_wav(text, duration_seconds=self.duration_seconds)
 
 
 def canonical_bank_loader(original_loader, bank):

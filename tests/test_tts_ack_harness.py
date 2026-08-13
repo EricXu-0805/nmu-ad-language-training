@@ -271,6 +271,20 @@ def test_deterministic_wav_is_stable_and_non_empty():
     assert len(first) > 44
 
 
+def test_browser_duration_profile_is_closed_and_changes_cache_identity(monkeypatch):
+    monkeypatch.setenv(harness.TTS_DURATION_PROFILE_ENV, "browser-start-pause")
+    browser_engine = harness.DeterministicHarnessTtsEngine()
+    assert browser_engine.duration_seconds == 5.0
+    assert browser_engine.version == "harness-synthetic-browser/1"
+    assert browser_engine.cache_params == "harness-synthetic-v1"
+    assert len(browser_engine.synthesize("小语来了")) > len(
+        harness.deterministic_wav("小语来了"))
+
+    monkeypatch.setenv(harness.TTS_DURATION_PROFILE_ENV, "invented")
+    with pytest.raises(harness.HarnessConfigError):
+        harness.DeterministicHarnessTtsEngine()
+
+
 # ==========================================================================
 # B. 隔离子进程：校验失败必须早于任何 app import
 # ==========================================================================

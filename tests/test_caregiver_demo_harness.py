@@ -311,6 +311,32 @@ def test_shell_help_is_read_only(tmp_path):
     assert list(scratch.iterdir()) == before
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--port",),
+        ("--port", "8815", "--port", "8816"),
+        ("--browser-check",),
+        ("--browser-check", "full20"),
+        ("--browser-check", "start-pause", "--browser-check", "start-pause"),
+        ("--unknown",),
+    ],
+)
+def test_shell_rejects_invalid_browser_arguments_before_writing(tmp_path, arguments):
+    script = shared.PLATFORM_ROOT / "scripts" / "run-caregiver-demo20.sh"
+    scratch = _private_root(tmp_path, "argument-scratch")
+    result = subprocess.run(
+        ["/bin/bash", str(script), *arguments],
+        cwd=str(scratch),
+        env={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 64
+    assert list(scratch.iterdir()) == []
+
+
 def test_shell_instructions_match_the_real_console_and_pairing_order():
     guide = (shared.PLATFORM_ROOT / "docs" / "照护员本机操作指南.md").read_text(
         encoding="utf-8",
@@ -366,6 +392,12 @@ def test_shell_cleanup_and_minimal_environment_are_structurally_pinned():
     assert 'X-NMU-Test-Harness'.lower() in text.lower()
     assert 'x-nmu-caregiver-harness-instance' in text.lower()
     assert '"NMU_CAREGIVER_HARNESS_INSTANCE=$INSTANCE_MARKER"' in text
+    assert '--browser-check start-pause' in text
+    assert 'BROWSER_PYTHON' in text
+    assert 'from playwright.sync_api import sync_playwright' in text
+    assert '不会自动联网安装' in text
+    assert 'Google Chrome.app' in text
+    assert 'browser-start-pause-result.json' not in text
     assert '"$PYTHON" -I -c' in text
     assert "trap '' INT TERM HUP" in text
     assert 'http://127.0.0.1:$PORT/health"' in text

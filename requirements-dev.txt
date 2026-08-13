@@ -1,0 +1,19 @@
+# 本机验收工具，不进发布锁。
+#
+# 这里的东西只在开发机上跑，绝不进 requirements-deploy.lock.txt、SBOM 或
+# 生产 venv：supply_chain_check.py 比对的是"生产 venv ↔ 部署锁"，把 harness
+# 专用依赖塞进那条链只会让门禁开始报锁外来客。
+#
+# playwright 只被 harness/caregiver_browser_acceptance.py 用（函数内惰性
+# import），因此没装它时后端测试与 CI 全部照常通过——代价是这条真浏览器
+# 路径 CI 永远覆盖不到，只能在装了它的 macOS 机器上手动跑。
+#
+# 安装（在本仓库的 .venv 里）：
+#   .venv/bin/python -m pip install -r requirements-dev.txt
+#   .venv/bin/python -m playwright install chromium   # 可选；默认走系统 Chrome
+#
+# 真浏览器验收还额外要求本机装有 Google Chrome
+# (/Applications/Google Chrome.app)，脚本以 channel="chrome" 启动它；
+# 缺任何一项 scripts/run-caregiver-demo20.sh --browser-check 会明确停止，
+# 不会自动联网安装。
+playwright>=1.49

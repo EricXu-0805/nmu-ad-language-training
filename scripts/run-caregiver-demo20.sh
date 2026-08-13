@@ -9,6 +9,7 @@ usage() {
 
 用法：
   scripts/run-caregiver-demo20.sh [--port 端口]
+  scripts/run-caregiver-demo20.sh [--port 端口] --browser-check start-pause
   scripts/run-caregiver-demo20.sh --help
 
 作用：
@@ -16,6 +17,12 @@ usage() {
   2. 建立临时管理员、照护员和虚构档案；
   3. 真实跑通离线语音自检，建立「已审核」20 题安排；
   4. 只在 127.0.0.1 启动；正常退出或 Ctrl+C 后删除临时数据。
+
+可选真实浏览器验收：
+  --browser-check start-pause
+  用本机已有 Chrome 走完开始、配对、朗读、录音、上传、
+  ASR/判定、下一条命令和安全暂停，然后自动核对同一临时库。
+  默认不执行浏览器验收，原有人工演练行为不变。
 
 默认端口：8815
 前置条件：web/dist/index.html 已完成构建，且 .venv 可用。
@@ -35,13 +42,45 @@ case "${1:-}" in
 esac
 
 PORT=8815
-if [ "$#" -gt 0 ]; then
-  if [ "$#" -ne 2 ] || [ "$1" != "--port" ]; then
-    echo "错误：只接受 --port 端口；请用 --help 查看说明" >&2
-    exit 64
-  fi
-  PORT="$2"
-fi
+PORT_SEEN=0
+BROWSER_CHECK=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --port)
+      [ "$#" -ge 2 ] || {
+        echo "错误：--port 后需要端口数字" >&2
+        exit 64
+      }
+      [ "$PORT_SEEN" -eq 0 ] || {
+        echo "错误：--port 不能重复" >&2
+        exit 64
+      }
+      PORT="$2"
+      PORT_SEEN=1
+      shift 2
+      ;;
+    --browser-check)
+      [ "$#" -ge 2 ] || {
+        echo "错误：--browser-check 后需要 start-pause" >&2
+        exit 64
+      }
+      [ -z "$BROWSER_CHECK" ] || {
+        echo "错误：--browser-check 不能重复" >&2
+        exit 64
+      }
+      [ "$2" = "start-pause" ] || {
+        echo "错误：目前只支持 --browser-check start-pause" >&2
+        exit 64
+      }
+      BROWSER_CHECK="$2"
+      shift 2
+      ;;
+    *)
+      echo "错误：不识别参数 $1；请用 --help 查看说明" >&2
+      exit 64
+      ;;
+  esac
+done
 case "$PORT" in
   ''|*[!0-9]*)
     echo "错误：端口必须是 1024–65535 的数字" >&2
@@ -69,6 +108,31 @@ if [ ! -f "$REPO/web/dist/index.html" ]; then
 fi
 "$PYTHON" "$REPO/scripts/verify_browser_dist.py" \
   --source-root "$REPO" "$REPO/web/dist"
+
+BROWSER_PYTHON=""
+if [ -n "$BROWSER_CHECK" ]; then
+  BROWSER_CANDIDATES=("$PYTHON")
+  if command -v python3 >/dev/null 2>&1; then
+    BROWSER_CANDIDATES+=("$(command -v python3)")
+  fi
+  BROWSER_CANDIDATES+=("/opt/homebrew/bin/python3")
+  for candidate in "${BROWSER_CANDIDATES[@]}"; do
+    [ -x "$candidate" ] || continue
+    if "$candidate" -I -c 'from playwright.sync_api import sync_playwright' \
+        >/dev/null 2>&1; then
+      BROWSER_PYTHON="$candidate"
+      break
+    fi
+  done
+  if [ -z "$BROWSER_PYTHON" ]; then
+    echo "错误：本机没有可用的 Python Playwright；已停止，不会自动联网安装" >&2
+    exit 1
+  fi
+  if [ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
+    echo "错误：本机没有可用的 Google Chrome，已停止" >&2
+    exit 1
+  fi
+fi
 
 HARNESS_ROOT=""
 SERVER_PID=""
@@ -162,6 +226,9 @@ HARNESS_ENV=(
   "ASR_ENGINE=null"
   "LLM_JUDGE=off"
 )
+if [ -n "$BROWSER_CHECK" ]; then
+  HARNESS_ENV+=("NMU_HARNESS_TTS_DURATION_PROFILE=browser-start-pause")
+fi
 
 env -i "${HARNESS_ENV[@]}" \
   "$PYTHON" -m harness.caregiver_demo_harness --migrate-and-seed
@@ -224,7 +291,16 @@ if [ "$READY" -ne 1 ]; then
   exit 1
 fi
 
-if [ -t 0 ] && [ -t 1 ]; then
+if [ -n "$BROWSER_CHECK" ]; then
+  echo "真实 Chrome 验收开始（不显示临时凭据）…"
+  env -i "${HARNESS_ENV[@]}" \
+    "$BROWSER_PYTHON" -I "$REPO/harness/caregiver_browser_acceptance.py" \
+    --start-pause --origin "http://127.0.0.1:$PORT"
+  env -i "${HARNESS_ENV[@]}" \
+    "$PYTHON" -m harness.caregiver_browser_acceptance --verify-ledger
+  echo "真实 Chrome start-pause 本机验收已全部通过"
+  exit 0
+elif [ -t 0 ] && [ -t 1 ]; then
   echo ""
   echo "照护员本机演练已就绪："
   echo "  工作人员窗口：http://127.0.0.1:$PORT/console"
