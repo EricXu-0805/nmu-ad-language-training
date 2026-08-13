@@ -4,6 +4,7 @@ import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
 import type { AssessmentEvent, AssessmentEventsToday, ScaleProtocolReadiness } from "../types";
+import { AssessmentEventCreateForm } from "./AssessmentEventCreateForm";
 import { AssessmentExecutionDrawer } from "./AssessmentExecutionDrawer";
 import {
   assessmentCategoryLabel,
@@ -103,6 +104,9 @@ export function AssessmentQueuePanel() {
           就绪(ready_for_research)后每行出现「打开执行」入口。
         </Alert>
       )}
+      {executionOpen && <AssessmentEventCreateForm
+        readiness={readiness}
+        onCreated={() => { void loadAssessmentQueue(); }} />}
       {executionOpen && executionEvent && (
         <AssessmentExecutionDrawer
           event={executionEvent}
