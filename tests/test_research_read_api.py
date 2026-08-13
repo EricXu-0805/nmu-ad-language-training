@@ -241,3 +241,40 @@ def test_dictionary_documents_the_excluded_columns(research_env, monkeypatch):
     assert ("turns", "asr_text") in excluded
     assert ("subjects", "patient_id") in excluded
     assert ("sessions", "training_date") in excluded
+
+
+def test_csv_carries_a_bom_and_the_same_columns_as_json(research_env, monkeypatch):
+    _with_key(monkeypatch)
+    client = _client("steward")
+    for dataset in research_dataset.dataset_keys():
+        json_body = client.get(
+            f"/research/v1/{dataset}?data_classification=research").json()
+        csv_response = client.get(
+            f"/research/v1/{dataset}.csv?data_classification=research")
+        assert csv_response.status_code == 200, dataset
+        assert csv_response.headers["content-type"].startswith("text/csv")
+        assert "attachment" in csv_response.headers["content-disposition"]
+        raw = csv_response.content
+        # Windows 上的 Excel/SPSS 不看 BOM 就按本地代码页解，中文列名会乱码
+        assert raw.startswith(b"\xef\xbb\xbf"), dataset
+        header = raw.decode("utf-8-sig").splitlines()[0].split(",")
+        assert header == json_body["columns"], dataset
+        assert SECRET_TEXT not in raw.decode("utf-8-sig")
+
+
+def test_dictionary_csv_is_available_and_json_suffix_is_not(research_env, monkeypatch):
+    _with_key(monkeypatch)
+    client = _client("steward")
+    csv_response = client.get("/research/v1/dictionary.csv")
+    assert csv_response.status_code == 200
+    body = csv_response.content.decode("utf-8-sig")
+    assert body.splitlines()[0].startswith("dataset,column,disclosure")
+    assert "asr_text" in body, "被排除的列也要出现在字典里"
+
+
+def test_csv_is_refused_without_the_deidentification_key(research_env, monkeypatch):
+    _without_key(monkeypatch)
+    client = _client("steward")
+    response = client.get("/research/v1/turns.csv?data_classification=research")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "research_deidentification_unavailable"

@@ -68,3 +68,14 @@ def test_pseudonymizer_wrapper_keeps_none_as_none():
     apply = rd.make_pseudonymizer(lambda value: f"X-{value}")
     assert apply(None) is None
     assert apply("P-1") == "X-P-1"
+
+
+def test_csv_rendering_neutralises_formula_injection():
+    from app import research_read
+    raw = research_read.render_csv(
+        ["a", "b"], [["=cmd|' /c calc'!A1", "+1+1"], ["@SUM(1)", "-2"]])
+    text = raw.decode("utf-8-sig")
+    for line in text.splitlines()[1:]:
+        for cell in line.split(","):
+            stripped = cell.strip('"')
+            assert not stripped[:1] in {"=", "+", "-", "@"} or stripped.startswith("'"), cell

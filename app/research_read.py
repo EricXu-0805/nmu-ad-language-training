@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import hmac
+import io
 import json
 from typing import Any, Iterable
 
@@ -341,3 +343,35 @@ def build_meta(config_error: ResearchReadUnavailable | None,
         "note": ("轮换去标识密钥会让所有假名改变，已交付的 CSV 无法与新拉取 join；"
                  "pseudonym_key_id 是唯一的检测手段。"),
     }
+
+
+# ---------------------------------------------------------------------------
+# CSV
+# ---------------------------------------------------------------------------
+def render_csv(header: list[str], matrix: list[list[Any]]) -> bytes:
+    """带 BOM 的 UTF-8 CSV。
+
+    BOM 不是装饰：Windows 上的 Excel 和 SPSS 不看 BOM 就按本地代码页解，
+    中文列名直接乱码。JSON 端点保持纯 UTF-8，只有 CSV 走 utf-8-sig。
+    每个单元过 sanitize_csv_cell 中和公式注入（``=``/``+``/``-``/``@`` 开头的
+    字符串在表格软件里会被当公式执行）。
+    """
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow([export_security.sanitize_csv_cell(name) for name in header])
+    for row in matrix:
+        writer.writerow([export_security.sanitize_csv_cell(cell) for cell in row])
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def dataset_csv(payload: dict[str, Any]) -> bytes:
+    header = list(payload["columns"])
+    matrix = [[row.get(name) for name in header] for row in payload["rows"]]
+    return render_csv(header, matrix)
+
+
+def dictionary_csv() -> bytes:
+    rows = research_dataset.dictionary_rows()
+    header = ["dataset", "column", "disclosure", "dtype", "unit",
+              "description", "source", "published"]
+    return render_csv(header, [[row.get(name) for name in header] for row in rows])

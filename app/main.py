@@ -7524,14 +7524,41 @@ def get_research_dictionary(request: Request, response: Response):
     }
 
 
+def _research_csv(payload_bytes: bytes, filename: str) -> PlainResponse:
+    return PlainResponse(
+        content=payload_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={**_RESEARCH_NO_STORE,
+                 "Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/research/v1/{dataset_key}")
 def get_research_dataset(
         dataset_key: str,
-        data_classification: Literal["research", "simulation"],
         request: Request, response: Response,
+        data_classification: Literal["research", "simulation"] | None = None,
         cursor: str | None = None, limit: int | None = None,
         s: DBSession = Depends(get_session)):
-    """一个数据集的一页。data_classification 必填且无默认——沿用质量汇总口径。"""
+    """一个数据集的一页；``.csv`` 后缀返回同一投影的 CSV。
+
+    CSV 与 JSON 共用同一份行投影，结构上不可能出现"网页上看到的和导出的不一样"。
+    """
+    wants_csv = dataset_key.endswith(".csv")
+    if wants_csv:
+        dataset_key = dataset_key[: -len(".csv")]
+    if dataset_key == "dictionary":
+        _require_account_identity(request, "导出研究数据字典",
+                                  roles={"data_steward", "admin"})
+        _research_query_guard(request, set())
+        if not wants_csv:
+            raise _research_reject(
+                "research_dataset_unknown", "数据字典请用 /research/v1/dictionary", 404)
+        return _research_csv(research_read.dictionary_csv(),
+                             "nmu-research-dictionary.csv")
+    if data_classification is None:
+        raise _research_reject(
+            "research_query_invalid", "data_classification 必填，且没有默认值", 422)
     dataset = research_dataset.dataset_for(dataset_key)
     if dataset is None:
         raise _research_reject(
@@ -7554,8 +7581,14 @@ def get_research_dataset(
             "sessions": research_read.list_sessions,
             "turns": research_read.list_turns,
         }[dataset_key]
-        return reader(s, config=config, data_classification=data_classification,
-                      cursor=cursor, limit=size)
+        payload = reader(s, config=config,
+                         data_classification=data_classification,
+                         cursor=cursor, limit=size)
+        if wants_csv:
+            return _research_csv(
+                research_read.dataset_csv(payload),
+                f"nmu-{dataset_key}-{data_classification}.csv")
+        return payload
     except research_read.ResearchReadUnavailable as exc:
         status = 503 if exc.code == "research_deidentification_unavailable" else 422
         raise _research_reject(exc.code, exc.message, status) from exc
