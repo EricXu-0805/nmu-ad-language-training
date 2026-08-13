@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:1076bc5e-4347-9388-1814-635b1208d5c1",
+  "serialNumber": "urn:uuid:2ec9c748-4ae0-d77a-36df-e77bdb6dc477",
   "version": 1,
   "metadata": {
     "component": {
@@ -1431,9 +1431,9 @@
     {
       "type": "library",
       "name": "nanoid",
-      "version": "3.3.17",
-      "purl": "pkg:npm/nanoid@3.3.17",
-      "bom-ref": "pkg:npm/nanoid@3.3.17",
+      "version": "3.3.18",
+      "purl": "pkg:npm/nanoid@3.3.18",
+      "bom-ref": "pkg:npm/nanoid@3.3.18",
       "scope": "optional",
       "properties": [
         {
@@ -1442,11 +1442,11 @@
         },
         {
           "name": "nmu:npm:integrity",
-          "value": "sha512-xQLf0A3HOMlgHq0n247/LRuAOYmB7dXJ/DvAxGvsSBij45XtBSmQycu+F8ODbHwns/XyFZagyL1+J0Offw1E0g=="
+          "value": "sha512-DTg4MJbGMWkfi6VZFdNt2/caMbQy4Ou+Op/hJQvGEWcnVfoA1QA+xzRKAzw9jD6+GVOOeYr/mIcuDSdug6F6+w=="
         },
         {
           "name": "nmu:npm:resolved",
-          "value": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.17.tgz"
+          "value": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.18.tgz"
         }
       ]
     },

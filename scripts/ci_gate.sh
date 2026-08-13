@@ -48,10 +48,24 @@ vulnerabilities() {
 # 单独建一个只装锁的干净环境，用它证明"锁本身自洽"：--require-hashes 装得上、
 # 且装完之后的集合与锁逐个对得上。拿开发机的 .venv 验这件事没有意义,那里面
 # 有 pytest 之类锁外的东西。
+#
+# 解释器版本从锁自己的头部读，不写死：锁是 uv 按某个 --python-version 编出来的，
+# 里面的 marker 分叉（例如 websockets 17 要 >=3.11）只在那个版本上成立。曾经这里
+# 写死 3.10 而锁早已重出成 3.12，这一关就一直红——而 GitHub 上那份工作流用的是
+# 3.12，本地和云上因此对不上账。
+lock_python_version() {
+  sed -n 's/.*--python-version \([0-9][0-9.]*\).*/\1/p' \
+    requirements-deploy.lock.txt | head -1
+}
+
 locked_environment() {
   local venv; venv="$(mktemp -d)/venv"
+  local pyver; pyver="$(lock_python_version)"
+  if [ -z "$pyver" ]; then
+    echo "锁头部没写 --python-version，无法确定干净环境该用哪个解释器"; return 1
+  fi
   if command -v uv >/dev/null 2>&1; then
-    uv venv --python 3.10 "$venv" >/dev/null 2>&1 \
+    uv venv --python "$pyver" "$venv" >/dev/null 2>&1 \
       && uv pip install --python "$venv/bin/python" --quiet \
            --require-hashes -r requirements-deploy.lock.txt
   else
