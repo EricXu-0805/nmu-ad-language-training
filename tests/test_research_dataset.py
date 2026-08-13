@@ -78,4 +78,5 @@ def test_csv_rendering_neutralises_formula_injection():
     for line in text.splitlines()[1:]:
         for cell in line.split(","):
             stripped = cell.strip('"')
-            assert not stripped[:1] in {"=", "+", "-", "@"} or stripped.startswith("'"), cell
+            assert (stripped[:1] not in {"=", "+", "-", "@"}
+                    or stripped.startswith("'")), cell
