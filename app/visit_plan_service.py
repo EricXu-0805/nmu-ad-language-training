@@ -14,7 +14,12 @@ from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
 from . import (
-    autopilot_plan_profiles, content, repeat_intent, session_admission)
+    autopilot_plan_profiles,
+    content,
+    provider_readiness,
+    repeat_intent,
+    session_admission,
+)
 from .models import (
     AssessmentEvent,
     Patient,
@@ -1583,6 +1588,17 @@ def start_plan(
     if _linked_session(db, plan.plan_id) is not None:
         _fail(409, "visit_plan_session_conflict", "该安排已关联场次")
 
+    # A successful caregiver replay is already an immutable result and remains
+    # available even if the provider later becomes unavailable.  For a new
+    # start, first report every more durable business fact (CAS, admission,
+    # due date, actor/patient occupancy and existing link).  Only then recheck
+    # the current metadata-only provider proof, still before the first write.
+    if require_caregiver_operational_demo20:
+        try:
+            provider_readiness.require_start_ready(db)
+        except provider_readiness.ProviderReadinessConflict as exc:
+            _fail(409, exc.code, "语音服务未准备，请联系管理员")
+
     session_id = _new_id("s")
     train_session = TrainSession(
         session_id=session_id,
@@ -1658,6 +1674,19 @@ def today_queue(
     # an actionable canonical plan.
     for plan in rows:
         _assert_profile_projectable(plan, plan.status)
+    if require_caregiver_operational_demo20:
+        try:
+            provider_readiness.require_start_ready(db)
+        except provider_readiness.ProviderReadinessConflict:
+            # The caregiver queue promises that every visible row can be
+            # started now.  Provider readiness is shared by all rows, so one
+            # failed proof withholds the whole due queue without mutating its
+            # immutable scheduling facts.
+            return VisitPlanTodayOut(
+                as_of_date=current_date,
+                plans=[],
+                withheld_count=len(rows),
+            )
     # The queue is an operational bedside projection, not an immutable audit
     # listing.  Revalidate the current patient gate on every read so an approved
     # plan cannot remain visible after withdrawal, consent loss, or another

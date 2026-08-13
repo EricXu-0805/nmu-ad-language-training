@@ -215,4 +215,15 @@ test("only structured readiness 409s are known pre-write rejections", () => {
   assert.equal(isProviderReadinessPrewriteConflict(new ApiError(
     500, "failure", { code: "provider_readiness_missing" }, "nested-detail",
   )), false);
+  assert.equal(isProviderReadinessPrewriteConflict(new ApiError(
+    409,
+    "decorated",
+    { code: "provider_readiness_missing" },
+    "noncanonical-json",
+  )), false);
+  assert.equal(isProviderReadinessPrewriteConflict({
+    status: 409,
+    detailEnvelope: "nested-detail",
+    detailData: { code: "provider_readiness_missing" },
+  }), false);
 });

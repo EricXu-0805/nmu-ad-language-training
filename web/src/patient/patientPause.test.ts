@@ -7,6 +7,7 @@ import {
   createPatientPauseOutbox,
   loadPatientPauseOutbox,
   observePatientPauseOnServer,
+  PATIENT_PAUSE_OUTBOX_TTL_MS,
   PATIENT_PAUSE_STORAGE_LOCK_NAME,
   parsePatientPauseReceipt,
   parsePatientPauseOutbox,
@@ -30,13 +31,20 @@ class MemoryStorage {
 }
 
 const UUID = "01234567-89ab-cdef-0123-456789abcdef";
+const TEST_CLOCK_MS = Date.now();
+const TEST_NOW = () => new Date(TEST_CLOCK_MS);
+const TEST_TEN_MINUTES_LATER = () => new Date(TEST_CLOCK_MS + 10 * 60 * 1_000);
+const TEST_AT_EXPIRY = () => new Date(TEST_CLOCK_MS + PATIENT_PAUSE_OUTBOX_TTL_MS);
+const TEST_CREATED_AT = TEST_NOW().toISOString();
+const TEST_EXPIRES_AT = TEST_AT_EXPIRY().toISOString();
 
 test("patient pause outbox keeps one exact key across offline retry and refresh", () => {
   const storage = new MemoryStorage();
   const pending = createPatientPauseOutbox(
-    "S-ONE", () => UUID, () => new Date("2026-08-12T00:00:00Z"));
+    "S-ONE", () => UUID, TEST_NOW);
   assert.equal(pending.idempotencyKey, "patient_pause:0123456789abcdef0123456789abcdef");
-  assert.equal(pending.expiresAt, "2026-08-13T00:00:00.000Z");
+  assert.equal(pending.createdAt, TEST_CREATED_AT);
+  assert.equal(pending.expiresAt, TEST_EXPIRES_AT);
   assert.equal(savePatientPauseOutbox(storage, pending), true);
   assert.deepEqual(loadPatientPauseOutbox(storage, "S-ONE"), pending);
   assert.equal(loadPatientPauseOutbox(storage, "S-TWO"), null);
@@ -92,8 +100,8 @@ test("tampered/cross-shape pause outbox fails closed", () => {
     sessionId: "S-ONE",
     idempotencyKey: "patient_pause:not-hex",
     state: "pending",
-    createdAt: "2026-08-12T00:00:00Z",
-    expiresAt: "2026-08-13T00:00:00Z",
+    createdAt: TEST_CREATED_AT,
+    expiresAt: TEST_EXPIRES_AT,
     pauseSessionWseq: null,
   }), null);
   assert.equal(parsePatientPauseOutbox({
@@ -101,8 +109,8 @@ test("tampered/cross-shape pause outbox fails closed", () => {
     sessionId: "S-ONE",
     idempotencyKey: "patient_pause:0123456789abcdef0123456789abcdef",
     state: "pending",
-    createdAt: "2026-08-12T00:00:00Z",
-    expiresAt: "2026-08-13T00:00:00Z",
+    createdAt: TEST_CREATED_AT,
+    expiresAt: TEST_EXPIRES_AT,
     pauseSessionWseq: null,
     capability: "must-never-store-a-bearer",
   }), null);
@@ -111,11 +119,11 @@ test("tampered/cross-shape pause outbox fails closed", () => {
 test("an expired persistent pause never disappears or retries as a fresh intent", () => {
   const storage = new MemoryStorage();
   const pending = createPatientPauseOutbox(
-    "S-ONE", () => UUID, () => new Date("2026-08-12T00:00:00Z"));
+    "S-ONE", () => UUID, TEST_NOW);
   savePatientPauseOutbox(storage, pending);
 
   assert.equal(loadPatientPauseOutbox(
-    storage, "S-ONE", () => new Date("2026-08-13T00:00:00Z"),
+    storage, "S-ONE", TEST_AT_EXPIRY,
   )?.state, "server_resolution_required");
   assert.notEqual(loadPatientPauseOutbox(storage, "S-ONE"), null);
 });
@@ -123,7 +131,7 @@ test("an expired persistent pause never disappears or retries as a fresh intent"
 test("a pause key remains a stop signal until paused then resumed, then becomes a tombstone", () => {
   const storage = new MemoryStorage();
   const pending = createPatientPauseOutbox(
-    "S-ONE", () => UUID, () => new Date("2026-08-12T00:00:00Z"));
+    "S-ONE", () => UUID, TEST_NOW);
   savePatientPauseOutbox(storage, pending);
   assert.deepEqual(patientPauseOutboxForStopSignal(
     storage, "S-ONE", pending.idempotencyKey), pending);
@@ -155,13 +163,13 @@ test("a pause key remains a stop signal until paused then resumed, then becomes 
   assert.equal(patientPauseOutboxForStopSignal(
     storage, "S-ONE", "patient_pause:ffffffffffffffffffffffffffffffff"), null);
   assert.equal(loadPatientPauseOutbox(
-    storage, "S-ONE", () => new Date("2026-08-13T00:00:00Z")), null);
+    storage, "S-ONE", TEST_AT_EXPIRY), null);
 });
 
 test("late tabs cannot roll a pause epoch backward or overwrite a newer key", () => {
   const storage = new MemoryStorage();
   const first = createPatientPauseOutbox(
-    "S-ONE", () => UUID, () => new Date("2026-08-12T00:00:00Z"));
+    "S-ONE", () => UUID, TEST_NOW);
   savePatientPauseOutbox(storage, first);
   const observed = observePatientPauseOnServer(storage, first, 200);
   assert.deepEqual(acknowledgePatientPauseOutbox(storage, first), observed);
@@ -174,7 +182,7 @@ test("late tabs cannot roll a pause epoch backward or overwrite a newer key", ()
   const second = createPatientPauseOutbox(
     "S-ONE",
     () => "fedcba98-7654-3210-fedc-ba9876543210",
-    () => new Date("2026-08-12T00:10:00Z"),
+    TEST_TEN_MINUTES_LATER,
   );
   savePatientPauseOutbox(storage, second);
   assert.deepEqual(observePatientPauseOnServer(storage, first, 201), second);
@@ -186,7 +194,7 @@ test("late tabs cannot roll a pause epoch backward or overwrite a newer key", ()
 test("resolve rechecks the newest shared pause clock inside the serialized transition", () => {
   const storage = new MemoryStorage();
   const pending = createPatientPauseOutbox(
-    "S-ONE", () => UUID, () => new Date("2026-08-12T00:00:00Z"));
+    "S-ONE", () => UUID, TEST_NOW);
   savePatientPauseOutbox(storage, pending);
   const oldObserved = observePatientPauseOnServer(storage, pending, 200);
   // Another serialized observer owns a newer paused frame before this tab's
@@ -205,7 +213,7 @@ test("resolve rechecks the newest shared pause clock inside the serialized trans
 test("a failed durable transition throws and never returns a fictitious local stage", () => {
   const storage = new MemoryStorage();
   const pending = createPatientPauseOutbox(
-    "S-ONE", () => UUID, () => new Date("2026-08-12T00:00:00Z"));
+    "S-ONE", () => UUID, TEST_NOW);
   savePatientPauseOutbox(storage, pending);
   storage.failWrites = true;
   assert.throws(
@@ -228,7 +236,7 @@ test("a failed durable transition throws and never returns a fictitious local st
 test("a missing shared intent cannot masquerade as a successful transition", () => {
   const storage = new MemoryStorage();
   const pending = createPatientPauseOutbox(
-    "S-ONE", () => UUID, () => new Date("2026-08-12T00:00:00Z"));
+    "S-ONE", () => UUID, TEST_NOW);
   assert.throws(
     () => acknowledgePatientPauseOutbox(storage, pending),
     /共享暂停状态缺失/,

@@ -92,12 +92,19 @@ cd web && npm run dev                     # 前端热更(另开 ./scripts/serve.
 ```bash
 ./scripts/serve.sh                        # 单机双窗:同机开 /console 与 /patient(localhost 麦克风可用)
 DEMO20=1 ./scripts/serve.sh               # 开启本机 20 题合成模拟入口（仅 127.0.0.1）
+./scripts/run-caregiver-demo20.sh         # 干净临时库的一键照护员演练；退出即清理
 # 内网首次启动前先交互建具名账号（口令不回显）：
 ./.venv/bin/python scripts/manage_users.py create 研究者 --role admin
 INTRANET=1 ./scripts/serve.sh             # 内网双端技术验证:0.0.0.0:8443 + 自签 TLS；自动生成并显示床旁 PIN
                                           #   平板开 https://<本机IP>:8443/patient(首次信任证书)
                                           #   操作电脑开 https://<本机IP>:8443/console
 ```
+
+普通照护员演练优先使用 `run-caregiver-demo20.sh`：它只在本机建立一次性
+虚构档案、临时账号、床旁 PIN、已审核 20 题安排和离线语音就绪证据，服务
+真正可打开后才显示登录信息；按 Ctrl+C 会停止服务并删除临时库。它不会写入
+正式 `data/`，也不能用于真人、养老院现场或正式研究。`DEMO20=1 serve.sh`
+只是打开已有本机库的模拟能力，不会替使用者准备账号、安排或语音就绪证据。
 
 容器发布只安装 `requirements-deploy.lock.txt` 中逐包哈希锁定的 Python 3.12 传递依赖；`requirements-deploy.txt` 只是人工维护的直接依赖输入。更新依赖时必须重新生成 lock、复核差异并跑完整回归，不能在发布机临时 `pip install`。默认发布锁不含可选 Piper；若挂载本地 Piper 模型，镜像中必须同时安装与验证固定版本的 `piper-tts`，否则保持模型与包同时缺失并走明确降级。
 

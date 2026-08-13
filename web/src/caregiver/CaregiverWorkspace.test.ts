@@ -67,3 +67,21 @@ test("a non-ready current session exposes only safe closeout and never renders s
   assert.match(source, /const showStart = operationalDemoReady/);
   assert.match(source, /if \(!current\.operationalDemoReady \|\| !actions\.startPractice\) return/);
 });
+
+test("provider readiness conflicts give caregivers a deterministic administrator action", () => {
+  assert.match(source, /isProviderReadinessPrewriteConflict/);
+  assert.match(
+    source,
+    /const PROVIDER_NOT_READY_MESSAGE = "语音服务未准备，请联系管理员。"/,
+  );
+  assert.equal(
+    source.match(/setOperationProblem\(PROVIDER_NOT_READY_MESSAGE\)/g)?.length,
+    2,
+  );
+  assert.match(
+    source,
+    /title=\{operationProblem === PROVIDER_NOT_READY_MESSAGE\s*\? "暂时不能开始"\s*:\s*"这一步还没有确认"\}/,
+  );
+  assert.match(source, /else \{\s*reportUnconfirmed\("开始本次"\)/);
+  assert.match(source, /else \{\s*reportUnconfirmed\("开始练习"\)/);
+});

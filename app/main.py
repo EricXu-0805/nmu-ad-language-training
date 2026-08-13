@@ -8052,6 +8052,11 @@ def autopilot_start(
             provider_readiness.require_start_ready(s)
         except provider_readiness.ProviderReadinessConflict as exc:
             s.rollback()
+            if getattr(request.state, "actor_role", None) == "caregiver_operator":
+                raise HTTPException(status_code=409, detail={
+                    "code": exc.code,
+                    "message": "语音服务未准备，请联系管理员",
+                }) from exc
             raise HTTPException(
                 status_code=409,
                 detail=provider_readiness.conflict_detail(exc)) from exc

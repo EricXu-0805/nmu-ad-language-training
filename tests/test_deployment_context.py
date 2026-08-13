@@ -1,5 +1,10 @@
+import hashlib
+import json
+import os
 from pathlib import Path
 import subprocess
+import sys
+import time
 
 from app import http_security
 
@@ -233,10 +238,265 @@ def test_compose_has_bounded_logs_and_health_gated_proxy_start(monkeypatch):
     assert not http_security.host_allowed("127.0.0.1:8000")
 
 
-def test_local_deployment_build_uses_frozen_frontend_lockfile():
+def test_local_launcher_requires_a_prebuilt_ui_before_database_migration():
     launcher = (ROOT / "scripts" / "serve.sh").read_text(encoding="utf-8")
+    ui_gate = launcher.index("if [ ! -f web/dist/index.html ]; then")
+    integrity_gate = launcher.index(
+        "scripts/verify_browser_dist.py --source-root . web/dist")
+    migration = launcher.index("alembic upgrade head")
+    assert ui_gate < integrity_gate < migration
     assert "npm ci --no-audit --no-fund" in launcher
     assert "npm install --no-audit --no-fund" not in launcher
+    assert "纯 API 模式" not in launcher
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _isolated_local_launcher(tmp_path: Path, *, with_ui: bool) -> tuple[Path, Path]:
+    root = tmp_path / "isolated-launcher"
+    script = root / "scripts" / "serve.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        (ROOT / "scripts" / "serve.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    verifier = root / "scripts" / "verify_browser_dist.py"
+    verifier.write_text(
+        (ROOT / "scripts" / "verify_browser_dist.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    _write_executable(
+        root / ".venv" / "bin" / "python",
+        "#!/bin/sh\n"
+        "case \"${1:-}\" in\n"
+        "  */verify_browser_dist.py|scripts/verify_browser_dist.py) "
+        "exec \"$NMU_TEST_REAL_PYTHON\" \"$@\" ;;\n"
+        "esac\n"
+        "exit 0\n",
+    )
+    if with_ui:
+        for relative in (
+            "index.html",
+            "package.json",
+            "package-lock.json",
+            "tsconfig.json",
+            "tsconfig.app.json",
+            "tsconfig.node.json",
+            "vite.config.ts",
+            "scripts/build-integrity.d.mts",
+            "scripts/build-integrity.mjs",
+            "scripts/build-fingerprint.d.mts",
+            "scripts/build-fingerprint.mjs",
+        ):
+            path = root / "web" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"fixture:{relative}\n", encoding="utf-8")
+        (root / "web" / "src").mkdir(parents=True)
+        for relative in (
+            "item_bank_v1.json",
+            "week1_script.json",
+            "autopilot_protocol_v1.json",
+        ):
+            path = root / "content" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+    _write_executable(
+        root / ".venv" / "bin" / "alembic",
+        "#!/bin/sh\n"
+        "[ -z \"${NMU_TEST_ALEMBIC_MARKER:-}\" ] || : > \"$NMU_TEST_ALEMBIC_MARKER\"\n"
+        "exit 0\n",
+    )
+    if with_ui:
+        index = root / "web" / "dist" / "index.html"
+        index.parent.mkdir(parents=True)
+        index_bytes = b"<!doctype html><title>test</title>"
+        index.write_bytes(index_bytes)
+        from scripts.verify_browser_dist import _current_source_fingerprint
+
+        fingerprint = (
+            _current_source_fingerprint(root).encode("ascii") + b"\n"
+        )
+        (index.parent / "build-fingerprint.sha256").write_bytes(fingerprint)
+        manifest = {
+            "schema_version": "nmu.browser-dist-sha256.v1",
+            "algorithm": "SHA-256",
+            "root": "dist/",
+            "excluded_paths": ["browser-dist-sha256.json"],
+            "files": [
+                {
+                    "path": "build-fingerprint.sha256",
+                    "size": len(fingerprint),
+                    "sha256": hashlib.sha256(fingerprint).hexdigest(),
+                },
+                {
+                    "path": "index.html",
+                    "size": len(index_bytes),
+                    "sha256": hashlib.sha256(index_bytes).hexdigest(),
+                },
+            ],
+        }
+        (index.parent / "browser-dist-sha256.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+    return root, script
+
+
+def _launcher_env(root: Path, fake_bin: Path, **extra: str) -> dict[str, str]:
+    return {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        "ALLOW_SIMULATION_DATA": "1",
+        "DASHSCOPE_API_KEY": "synthetic-launcher-test-key",
+        "NO_OPEN": "1",
+        "NMU_TEST_REAL_PYTHON": sys.executable,
+        **extra,
+    }
+
+
+def test_local_launcher_missing_ui_fails_before_migration(tmp_path):
+    root, script = _isolated_local_launcher(tmp_path, with_ui=False)
+    marker = tmp_path / "alembic-ran"
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=root,
+        env={**os.environ, "NMU_TEST_ALEMBIC_MARKER": str(marker)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "缺少网页界面 web/dist/index.html" in result.stderr
+    assert "未迁移数据库、未启动服务" in result.stderr
+    assert not marker.exists()
+
+
+def test_local_launcher_only_reports_ready_after_health_and_both_html_pages(tmp_path):
+    root, script = _isolated_local_launcher(tmp_path, with_ui=True)
+    fake_bin = tmp_path / "ready-bin"
+    _write_executable(
+        fake_bin / "curl",
+        "#!/bin/sh\n"
+        "writeout=0\n"
+        "last=''\n"
+        "for arg in \"$@\"; do\n"
+        "  [ \"$arg\" != '-w' ] || writeout=1\n"
+        "  last=$arg\n"
+        "done\n"
+        "[ \"$writeout\" -eq 1 ] || exit 7\n"
+        "case \"$last\" in\n"
+        "  */health) printf '200 application/json' ;;\n"
+        "  */console|*/patient) printf '200 text/html; charset=utf-8' ;;\n"
+        "  *) printf '404 text/plain' ;;\n"
+        "esac\n",
+    )
+    _write_executable(
+        root / ".venv" / "bin" / "uvicorn",
+        "#!/bin/sh\nsleep 1\nexit 0\n",
+    )
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=root,
+        env=_launcher_env(root, fake_bin),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "服务已就绪" in result.stdout
+
+
+def test_local_launcher_rejects_tampered_ui_before_database_migration(tmp_path):
+    root, script = _isolated_local_launcher(tmp_path, with_ui=True)
+    marker = tmp_path / "alembic-ran"
+    fake_bin = tmp_path / "unused-curl-bin"
+    (root / "web" / "dist" / "index.html").write_text(
+        "<!doctype html><title>tampered</title>",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=root,
+        env=_launcher_env(
+            root,
+            fake_bin,
+            NMU_TEST_ALEMBIC_MARKER=str(marker),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "网页文件大小不符：index.html" in result.stderr
+    assert not marker.exists()
+
+
+def test_local_launcher_rejects_partial_ui_and_terminates_child_on_timeout(tmp_path):
+    root, script = _isolated_local_launcher(tmp_path, with_ui=True)
+    fake_bin = tmp_path / "not-ready-bin"
+    terminated = tmp_path / "uvicorn-terminated"
+    _write_executable(
+        fake_bin / "curl",
+        "#!/bin/sh\n"
+        "writeout=0\n"
+        "last=''\n"
+        "for arg in \"$@\"; do\n"
+        "  [ \"$arg\" != '-w' ] || writeout=1\n"
+        "  last=$arg\n"
+        "done\n"
+        "[ \"$writeout\" -eq 1 ] || exit 7\n"
+        "sleep 1\n"
+        "case \"$last\" in\n"
+        "  */health) printf '200 application/json' ;;\n"
+        "  */console) printf '200 text/html; charset=utf-8' ;;\n"
+        "  */patient) printf '404 text/html; charset=utf-8' ;;\n"
+        "esac\n",
+    )
+    _write_executable(
+        root / ".venv" / "bin" / "uvicorn",
+        "#!/bin/sh\n"
+        "on_term() { : > \"$NMU_TEST_TERMINATED\"; exit 0; }\n"
+        "trap on_term TERM INT\n"
+        "while :; do sleep 0.1; done\n",
+    )
+
+    started_at = time.monotonic()
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=root,
+        env=_launcher_env(
+            root,
+            fake_bin,
+            NMU_STARTUP_TIMEOUT_SECONDS="2",
+            NMU_TEST_TERMINATED=str(terminated),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert result.returncode != 0
+    assert "服务已就绪" not in result.stdout
+    assert "必须同时通过 /health、/console 和 /patient" in result.stderr
+    assert terminated.is_file()
+    # Three one-second probes used to multiply every nominal loop.  The real
+    # two-second wall-clock deadline must win before another probe can begin;
+    # leave generous process scheduling headroom without accepting the old loop.
+    assert elapsed < 6, f"startup timeout took {elapsed:.2f}s"
 
 
 def test_local_demo20_launcher_is_explicit_and_loopback_only():
@@ -253,13 +513,20 @@ def test_local_launcher_help_is_read_only_and_unknown_arguments_fail_closed():
     launcher_path = ROOT / "scripts" / "serve.sh"
     launcher = launcher_path.read_text(encoding="utf-8")
     help_gate = launcher.index('if [ "$#" -gt 0 ]; then')
+    timeout_gate = launcher.index('case "${NMU_STARTUP_TIMEOUT_SECONDS:-60}"')
+    assert help_gate < timeout_gate
     assert help_gate < launcher.index("PY=./.venv/bin/python")
     assert help_gate < launcher.index("alembic upgrade head")
     assert help_gate < launcher.index("run_server()")
 
+    invalid_timeout_env = {
+        **os.environ,
+        "NMU_STARTUP_TIMEOUT_SECONDS": "not-an-integer",
+    }
     help_result = subprocess.run(
         ["bash", str(launcher_path), "--help"],
         cwd=ROOT,
+        env=invalid_timeout_env,
         text=True,
         capture_output=True,
         check=False,
@@ -271,12 +538,27 @@ def test_local_launcher_help_is_read_only_and_unknown_arguments_fail_closed():
     unknown_result = subprocess.run(
         ["bash", str(launcher_path), "--unknown"],
         cwd=ROOT,
+        env=invalid_timeout_env,
         text=True,
         capture_output=True,
         check=False,
     )
     assert unknown_result.returncode == 64
     assert "不支持的参数" in unknown_result.stderr
+
+    for invalid_timeout in ("0", "301", "01", "1.5", "not-an-integer"):
+        invalid_result = subprocess.run(
+            ["bash", str(launcher_path)],
+            cwd=ROOT,
+            env={**os.environ, "NMU_STARTUP_TIMEOUT_SECONDS": invalid_timeout},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert invalid_result.returncode != 0
+        assert "NMU_STARTUP_TIMEOUT_SECONDS 必须是 1..300 的整数" in (
+            invalid_result.stderr
+        )
 
 
 def test_answer_bearing_content_is_absent_from_web_static_roots():

@@ -1,8 +1,8 @@
 """Narrow caregiver-operator HTTP vertical and deny-by-default boundary."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +13,7 @@ from app import (
     autopilot_plan_profiles,
     auth,
     db,
+    provider_readiness,
     repeat_intent,
     visit_plan_contract,
     visit_plan_service,
@@ -22,6 +23,7 @@ from app.main import app
 from app.models import (
     CaregiverHelpRequest,
     Patient,
+    ProviderReadinessProbe,
     ResearchUser,
     Session as TrainSession,
     SessionRuntimeState,
@@ -75,6 +77,70 @@ def _visit_plan_write_counts(engine) -> tuple[int, int, int, int]:
             len(list(session.exec(select(TrainSession)))),
             len(list(session.exec(select(SessionRuntimeState)))),
         )
+
+
+def _freeze_provider_configuration(monkeypatch):
+    configuration = provider_readiness.capture_configuration()
+    monkeypatch.setattr(
+        provider_readiness,
+        "capture_configuration",
+        lambda **_kwargs: configuration,
+    )
+    return configuration
+
+
+def _add_provider_probe(engine, monkeypatch, *, state: str = "ready"):
+    """Append a network-free readiness fact for one isolated test database."""
+    configuration = _freeze_provider_configuration(monkeypatch)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    ready_capabilities = state != "required_capability_failed"
+    checked_at = now - timedelta(hours=2) if state == "expired" else now
+    expires_at = (
+        now - timedelta(hours=1)
+        if state == "expired"
+        else now + timedelta(hours=1)
+    )
+    fingerprint = configuration.fingerprint
+    if state == "config_mismatch":
+        fingerprint = (
+            "0" * 64 if configuration.fingerprint != "0" * 64 else "1" * 64)
+    with Session(engine) as session:
+        session.add(ProviderReadinessProbe(
+            probe_id=f"prb_caregiver_{state}",
+            schema_version=provider_readiness.SCHEMA_VERSION,
+            runtime_contract=provider_readiness.RUNTIME_CONTRACT,
+            config_fingerprint=fingerprint,
+            tts_engine_version=configuration.tts_engine_version,
+            asr_engine_version=configuration.asr_engine_version,
+            llm_engine_version=configuration.llm_engine_version,
+            tts_required=True,
+            tts_success=ready_capabilities,
+            tts_failure_code=(
+                None if ready_capabilities else "tts_synthetic_probe_failed"),
+            asr_required=True,
+            asr_success=True,
+            llm_required=False,
+            llm_configured=configuration.llm_configured,
+            llm_success=configuration.llm_configured,
+            llm_failure_code=(
+                None if configuration.llm_configured
+                else "llm_not_required_not_configured"),
+            required_capabilities_ready=ready_capabilities,
+            all_configured_capabilities_ready=ready_capabilities,
+            probe_failure_code=(
+                None if ready_capabilities else "tts_synthetic_probe_failed"),
+            checked_at=checked_at,
+            expires_at=expires_at,
+            actor_display_id="ACTOR-provider-admin",
+        ))
+        session.commit()
+    if state == "expired":
+        monkeypatch.setattr(
+            provider_readiness,
+            "_utc_now_naive",
+            lambda: now + timedelta(hours=3),
+        )
+    return configuration
 
 
 def _create_and_approve_plan(
@@ -315,7 +381,7 @@ def test_caregiver_login_today_status_activation_and_logout(caregiver_clients):
 
 
 def test_real_approved_plan_to_owned_caregiver_bedside_vertical(
-        caregiver_visit_plan_clients):
+        caregiver_visit_plan_clients, monkeypatch):
     """Exercise the real VisitPlan service; no start/queue boundary is mocked."""
     researcher = caregiver_visit_plan_clients.researcher
     owner = caregiver_visit_plan_clients.owner
@@ -346,6 +412,8 @@ def test_real_approved_plan_to_owned_caregiver_bedside_vertical(
     assert approved_response.status_code == 200, approved_response.text
     approved = approved_response.json()
     assert approved["status"] == "approved"
+    _add_provider_probe(
+        caregiver_visit_plan_clients.engine, monkeypatch, state="ready")
 
     queue_response = owner.get("/caregiver/today")
     assert queue_response.status_code == 200, queue_response.text
@@ -398,7 +466,7 @@ def test_real_approved_plan_to_owned_caregiver_bedside_vertical(
 
 
 def test_caregiver_today_withholds_canonical_from_mixed_approved_queue(
-        caregiver_visit_plan_clients):
+        caregiver_visit_plan_clients, monkeypatch):
     researcher = caregiver_visit_plan_clients.researcher
     canonical, _ = _create_and_approve_plan(
         researcher,
@@ -412,6 +480,8 @@ def test_caregiver_today_withholds_canonical_from_mixed_approved_queue(
         session_sitting_no=2,
         demo20=True,
     )
+    _add_provider_probe(
+        caregiver_visit_plan_clients.engine, monkeypatch, state="ready")
 
     response = caregiver_visit_plan_clients.owner.get("/caregiver/today")
     assert response.status_code == 200, response.text
@@ -435,12 +505,153 @@ def test_caregiver_today_withholds_exact_demo_when_either_flag_is_off(
         session_sitting_no=1,
         demo20=True,
     )
+    _add_provider_probe(
+        caregiver_visit_plan_clients.engine, monkeypatch, state="ready")
     monkeypatch.delenv(disabled_flag, raising=False)
 
     response = caregiver_visit_plan_clients.owner.get("/caregiver/today")
     assert response.status_code == 200, response.text
     assert response.json()["plans"] == []
     assert response.json()["withheld_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["missing", "expired", "config_mismatch", "required_capability_failed"],
+)
+def test_caregiver_today_withholds_all_due_plans_when_provider_is_not_ready(
+        caregiver_visit_plan_clients, monkeypatch, state):
+    _create_and_approve_plan(
+        caregiver_visit_plan_clients.researcher,
+        key_suffix=f"today-provider-{state}",
+        session_sitting_no=1,
+        demo20=True,
+    )
+    if state == "missing":
+        _freeze_provider_configuration(monkeypatch)
+    else:
+        _add_provider_probe(
+            caregiver_visit_plan_clients.engine, monkeypatch, state=state)
+
+    response = caregiver_visit_plan_clients.owner.get("/caregiver/today")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["plans"] == []
+    assert response.json()["withheld_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "state,expected_code",
+    [
+        ("missing", "provider_readiness_missing"),
+        ("expired", "provider_readiness_expired"),
+        ("config_mismatch", "provider_readiness_config_mismatch"),
+        (
+            "required_capability_failed",
+            "provider_readiness_required_capability_failed",
+        ),
+    ],
+)
+def test_caregiver_start_provider_gate_is_stable_and_has_zero_writes(
+        caregiver_visit_plan_clients, monkeypatch, state, expected_code):
+    created, approved = _create_and_approve_plan(
+        caregiver_visit_plan_clients.researcher,
+        key_suffix=f"start-provider-{state}",
+        session_sitting_no=1,
+        demo20=True,
+    )
+    if state == "missing":
+        _freeze_provider_configuration(monkeypatch)
+    else:
+        _add_provider_probe(
+            caregiver_visit_plan_clients.engine, monkeypatch, state=state)
+    before = _visit_plan_write_counts(caregiver_visit_plan_clients.engine)
+
+    response = caregiver_visit_plan_clients.owner.post(
+        f"/caregiver/visit-plans/{created['plan_id']}/start",
+        json={
+            "idempotency_key": f"caregiver-provider-{state}-start",
+            "expected_revision": approved["revision"],
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == {
+        "code": expected_code,
+        "message": "语音服务未准备，请联系管理员",
+    }
+    assert _visit_plan_write_counts(caregiver_visit_plan_clients.engine) == before
+
+
+def test_caregiver_start_revision_conflict_precedes_provider_gate(
+        caregiver_visit_plan_clients, monkeypatch):
+    created, approved = _create_and_approve_plan(
+        caregiver_visit_plan_clients.researcher,
+        key_suffix="start-provider-revision",
+        session_sitting_no=1,
+        demo20=True,
+    )
+    _freeze_provider_configuration(monkeypatch)
+    before = _visit_plan_write_counts(caregiver_visit_plan_clients.engine)
+
+    response = caregiver_visit_plan_clients.owner.post(
+        f"/caregiver/visit-plans/{created['plan_id']}/start",
+        json={
+            "idempotency_key": "caregiver-provider-wrong-revision",
+            "expected_revision": approved["revision"] + 1,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "visit_plan_revision_conflict"
+    assert _visit_plan_write_counts(caregiver_visit_plan_clients.engine) == before
+
+
+def test_caregiver_open_session_precedes_later_provider_failure(
+        caregiver_visit_plan_clients, monkeypatch):
+    first_created, first_approved = _create_and_approve_plan(
+        caregiver_visit_plan_clients.researcher,
+        key_suffix="provider-priority-first",
+        session_sitting_no=1,
+        demo20=True,
+    )
+    second_created, second_approved = _create_and_approve_plan(
+        caregiver_visit_plan_clients.researcher,
+        key_suffix="provider-priority-second",
+        session_sitting_no=2,
+        demo20=True,
+    )
+    configuration = _add_provider_probe(
+        caregiver_visit_plan_clients.engine, monkeypatch, state="ready")
+    first = caregiver_visit_plan_clients.owner.post(
+        f"/caregiver/visit-plans/{first_created['plan_id']}/start",
+        json={
+            "idempotency_key": "caregiver-provider-priority-first",
+            "expected_revision": first_approved["revision"],
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    # The already-open session is a durable business fact.  Even if provider
+    # readiness changes afterwards, a second start must report that fact first
+    # and leave every scheduling/runtime table unchanged.
+    monkeypatch.setattr(
+        provider_readiness,
+        "capture_configuration",
+        lambda **_kwargs: replace(configuration, fingerprint="f" * 64),
+    )
+    before = _visit_plan_write_counts(caregiver_visit_plan_clients.engine)
+    second = caregiver_visit_plan_clients.owner.post(
+        f"/caregiver/visit-plans/{second_created['plan_id']}/start",
+        json={
+            "idempotency_key": "caregiver-provider-priority-second",
+            "expected_revision": second_approved["revision"],
+        },
+    )
+
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["code"] == "visit_plan_actor_session_open"
+    assert _visit_plan_write_counts(caregiver_visit_plan_clients.engine) == before
 
 
 def test_caregiver_canonical_start_is_refused_with_zero_writes(
@@ -504,6 +715,8 @@ def test_caregiver_successful_start_replays_after_flags_are_removed(
         session_sitting_no=1,
         demo20=True,
     )
+    configuration = _add_provider_probe(
+        caregiver_visit_plan_clients.engine, monkeypatch, state="ready")
     body = {
         "idempotency_key": "caregiver-start-replay-000001",
         "expected_revision": approved["revision"],
@@ -515,6 +728,11 @@ def test_caregiver_successful_start_replays_after_flags_are_removed(
 
     monkeypatch.delenv("ALLOW_SIMULATION_DATA", raising=False)
     monkeypatch.delenv("ENABLE_AUTOPILOT_P0A_SIMULATION", raising=False)
+    monkeypatch.setattr(
+        provider_readiness,
+        "capture_configuration",
+        lambda **_kwargs: replace(configuration, fingerprint="f" * 64),
+    )
     replay = caregiver_visit_plan_clients.owner.post(
         f"/caregiver/visit-plans/{created['plan_id']}/start", json=body)
 
@@ -564,6 +782,37 @@ def test_current_non_demo_session_can_close_safely_but_cannot_start_practice(
     )
     assert ended.status_code == 200, ended.text
     assert ended.json()["runtime_status"] == "aborted"
+
+
+def test_caregiver_autopilot_provider_conflict_is_plain_and_redacted(
+        caregiver_clients, monkeypatch):
+    session_id = OWNER_SESSION
+    _freeze_provider_configuration(monkeypatch)
+    monkeypatch.setattr(
+        autopilot_plan_profiles,
+        "resolve_exact_runnable_demo20",
+        lambda _session: object(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_require_started_visit_plan_session",
+        lambda *_args, **_kwargs: None,
+    )
+
+    response = caregiver_clients.owner.post(
+        f"/sessions/{session_id}/autopilot/start",
+        json={
+            "idempotency_key": "caregiver-provider-start-practice",
+            "expected_revision": 0,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == {
+        "code": "provider_readiness_missing",
+        "message": "语音服务未准备，请联系管理员",
+    }
+    assert "readiness" not in response.json()["detail"]
 
 
 def test_caregiver_help_is_atomic_exact_replay_and_not_patient_pause(

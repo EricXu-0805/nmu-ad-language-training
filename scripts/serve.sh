@@ -44,6 +44,18 @@ if [ "$#" -gt 0 ]; then
   esac
 fi
 
+# 只在 --help / 未知参数的纯读门之后解析环境，避免一个坏环境变量
+# 把“只看帮助”变成配置失败。只接受无前导零的 1..300 秒整数。
+case "${NMU_STARTUP_TIMEOUT_SECONDS:-60}" in
+  [1-9]|[1-9][0-9]|[12][0-9][0-9]|300)
+    STARTUP_TIMEOUT_SECONDS="${NMU_STARTUP_TIMEOUT_SECONDS:-60}"
+    ;;
+  *)
+    echo "✗ NMU_STARTUP_TIMEOUT_SECONDS 必须是 1..300 的整数" >&2
+    exit 1
+    ;;
+esac
+
 PY=./.venv/bin/python
 [ -x "$PY" ] || { echo "缺 .venv,先: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt"; exit 1; }
 
@@ -68,15 +80,17 @@ if [ "${INTRANET:-0}" != "1" ] && [ -z "${ALLOW_SIMULATION_DATA:-}" ]; then
   echo "✓ 回环开发模式：已启用显式模拟数据路径（真实研究门禁仍保持关闭）"
 fi
 
+# 这个入口三种模式都是带界面的操作流，不存在“纯 API 也算启动成功”。
+# 先查产物再迁移：界面不完整时不应为一次必然失败的启动改动数据库。
+if [ ! -f web/dist/index.html ]; then
+  echo "✗ 缺少网页界面 web/dist/index.html，已停止，未迁移数据库、未启动服务。" >&2
+  echo "  请先执行: cd web && npm ci --no-audit --no-fund && npm run build" >&2
+  exit 1
+fi
+"$PY" scripts/verify_browser_dist.py --source-root . web/dist
+
 # 1) 数据库迁移到最新(幂等;真机患者数据靠它升级,禁止删库重建)
 ./.venv/bin/alembic upgrade head
-
-# 2) 前端产物:web/dist 缺失且有 npm 时现场构建(纯静态,构建后运行期不需要 node)
-if [ ! -d web/dist ] && command -v npm >/dev/null 2>&1; then
-  # 部署构建必须与已审查 lockfile 完全一致；不允许 npm install 在现场改锁。
-  (cd web && npm ci --no-audit --no-fund && npm run build)
-fi
-[ -d web/dist ] || echo "⚠️ 无 web/dist(纯 API 模式);要带界面请先在有 node 的机器上构建后拷入"
 
 # 云语音 Key(可选):环境没带时从 macOS 钥匙串取。录入(终端里输,别贴聊天):
 #   security add-generic-password -s nmu-dashscope -a nmu -w '<你的KEY>'
@@ -92,27 +106,95 @@ fi
 # 后台起服务 → 探测真正监听后才报地址(横幅先于就绪打印会诱导过早开浏览器→连接被拒);
 # 单机模式就绪后自动开两窗(macOS;NO_OPEN=1 关闭)。Ctrl-C 正常退出并带走服务进程。
 # 本机回环探测一律绕过代理:装了 Clash/VPN 的机器,shell 里的 http_proxy 会把
-# curl 127.0.0.1 劫持到代理、代理回 502,curl 收到响应即 exit 0,会被误判成"端口已占用"。
-probe_local() { curl -sk --noproxy '*' -o /dev/null "$1" 2>/dev/null; }
+# curl 127.0.0.1 劫持到代理。启动前只用“能否收到响应”判断端口占用；
+# 启动后的就绪判定则必须更严：/health 是 JSON 200，/console 与 /patient 都是 HTML 200。
+# 每次 curl 不得超过剩余墙钟预算，且单次最多 1 秒；多个探测不能把 60 秒串行放大。
+probe_timeout_seconds() {
+  local deadline="$1" remaining
+  remaining=$((deadline - SECONDS))
+  [ "$remaining" -gt 0 ] || return 1
+  if [ "$remaining" -gt 1 ]; then
+    remaining=1
+  fi
+  printf '%s' "$remaining"
+}
 
-run_server() { # $1=探测URL $2=就绪后要打印/打开的说明,其余=uvicorn 参数
-  local probe="$1" ready_msg="$2"; shift 2
-  if probe_local "$probe"; then
+probe_any_response() {
+  local timeout
+  timeout=$(probe_timeout_seconds "$2") || return 1
+  curl -sk --noproxy '*' --connect-timeout "$timeout" --max-time "$timeout" \
+    -o /dev/null "$1/health" 2>/dev/null
+}
+
+probe_health_200() {
+  local result timeout
+  timeout=$(probe_timeout_seconds "$2") || return 1
+  result=$(curl -sk --noproxy '*' --connect-timeout "$timeout" --max-time "$timeout" \
+    -o /dev/null -w '%{http_code} %{content_type}' "$1/health" 2>/dev/null) || return 1
+  case "$result" in
+    "200 application/json"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+probe_html_200() {
+  local result timeout
+  timeout=$(probe_timeout_seconds "$2") || return 1
+  result=$(curl -sk --noproxy '*' --connect-timeout "$timeout" --max-time "$timeout" \
+    -o /dev/null -w '%{http_code} %{content_type}' "$1" 2>/dev/null) || return 1
+  case "$result" in
+    "200 text/html"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+probe_application_ready() {
+  local base="$1" deadline="$2"
+  probe_health_200 "$base" "$deadline" \
+    && probe_html_200 "$base/console" "$deadline" \
+    && probe_html_200 "$base/patient" "$deadline"
+}
+
+terminate_server() {
+  local srv="$1" stop_deadline
+  kill "$srv" 2>/dev/null || true
+  # 先给 Uvicorn 最多 3 秒处理 TERM；仍不退出才 KILL，不让启动器永久挂住。
+  stop_deadline=$((SECONDS + 3))
+  while kill -0 "$srv" 2>/dev/null && [ "$SECONDS" -lt "$stop_deadline" ]; do
+    sleep 0.1
+  done
+  if kill -0 "$srv" 2>/dev/null; then
+    kill -KILL "$srv" 2>/dev/null || true
+  fi
+  wait "$srv" 2>/dev/null || true
+}
+
+run_server() { # $1=回环基地址 $2=就绪后要打印/打开的说明,其余=uvicorn 参数
+  local base="$1" ready_msg="$2" deadline ready=0; shift 2
+  deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
+  if probe_any_response "$base" "$deadline"; then
     echo "✗ 端口上已有服务在跑(多半是上一个 serve.sh 没关)。"
     echo "  先到旧窗口按 Ctrl-C,或执行: pkill -f app.main:app  再重新启动。"
     exit 1
+  fi
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    echo "✗ 端口检查超过 ${STARTUP_TIMEOUT_SECONDS} 秒，未启动服务。" >&2
+    return 1
   fi
   # 路径中含研究、场次和录音标识，不应进入终端/systemd 访问日志。
   # 保留 Uvicorn 启动/错误日志；研究动作由应用内审计账本记录。
   ./.venv/bin/uvicorn --no-access-log "$@" &
   local srv=$!
   trap 'kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null; exit 0' INT TERM
-  for _ in $(seq 1 120); do
+  while [ "$SECONDS" -lt "$deadline" ]; do
     if ! kill -0 "$srv" 2>/dev/null; then
-      echo "✗ 服务启动失败(常见:端口被占,查 lsof -i :${probe##*:} 的端口段;或看上方报错)"
-      exit 1
+      wait "$srv" 2>/dev/null || true
+      trap - INT TERM
+      echo "✗ 服务启动失败(常见:端口被占,查 lsof -i :${base##*:} 的端口段;或看上方报错)"
+      return 1
     fi
-    if probe_local "$probe"; then
+    if probe_application_ready "$base" "$deadline"; then
+      ready=1
       echo "════════════════════════════════════════"
       echo "✓ 服务已就绪"
       printf '%b\n' "$ready_msg"
@@ -126,6 +208,12 @@ run_server() { # $1=探测URL $2=就绪后要打印/打开的说明,其余=uvico
     fi
     sleep 0.5
   done
+  if [ "$ready" -ne 1 ]; then
+    echo "✗ 服务在 ${STARTUP_TIMEOUT_SECONDS} 秒内未完成就绪：必须同时通过 /health、/console 和 /patient。" >&2
+    trap - INT TERM
+    terminate_server "$srv"
+    return 1
+  fi
   wait "$srv"
 }
 
@@ -157,13 +245,13 @@ if [ "${INTRANET:-0}" = "1" ]; then
   fi
   chmod 700 "$CERT_DIR"
   chmod 600 "$CERT_DIR/server.key" "$CERT_DIR/server.crt"
-  run_server "https://127.0.0.1:8443/patient" \
+  run_server "https://127.0.0.1:8443" \
     "  操作电脑: https://$HOST_IP:8443/console\n  平板:     https://$HOST_IP:8443/patient(首次需信任自签证书)" \
     app.main:app --host 0.0.0.0 --port 8443 \
     --ssl-keyfile "$CERT_DIR/server.key" --ssl-certfile "$CERT_DIR/server.crt"
 else
   # 3b) 单机双窗:只听本机回环
-  run_server "http://127.0.0.1:8000/patient" \
+  run_server "http://127.0.0.1:8000" \
     "  操作端: http://127.0.0.1:8000/console\n  老人端: http://127.0.0.1:8000/patient(已自动打开;NO_OPEN=1 可关)" \
     app.main:app --host 127.0.0.1 --port 8000
 fi

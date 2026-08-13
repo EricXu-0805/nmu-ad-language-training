@@ -1,3 +1,5 @@
+import { ApiError } from "../apiResponse.ts";
+
 export type ProviderReadinessStatus =
   | "missing"
   | "expired"
@@ -153,9 +155,10 @@ const PREWRITE_CODES = new Set([
 ]);
 
 export function isProviderReadinessPrewriteConflict(error: unknown): boolean {
-  const candidate = record(error);
-  if (candidate?.status !== 409) return false;
-  const detail = record(candidate.detailData);
+  if (!(error instanceof ApiError)
+      || error.status !== 409
+      || error.detailEnvelope !== "nested-detail") return false;
+  const detail = record(error.detailData);
   return typeof detail?.code === "string" && PREWRITE_CODES.has(detail.code);
 }
 

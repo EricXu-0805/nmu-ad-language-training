@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { isProviderReadinessPrewriteConflict } from "../autopilot/providerReadiness";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -31,6 +32,8 @@ type BusyAction =
   | "end"
   | "logout"
   | null;
+
+const PROVIDER_NOT_READY_MESSAGE = "语音服务未准备，请联系管理员。";
 
 interface EndedView {
   session: CaregiverSessionSummary;
@@ -512,8 +515,12 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         ? { ...previous, plans: previous.plans.filter((candidate) => candidate.planId !== plan.planId) }
         : previous);
       setNotice("本次已开始。请确认另一个窗口的老人画面已打开。");
-    } catch {
-      reportUnconfirmed("开始本次");
+    } catch (error) {
+      if (isProviderReadinessPrewriteConflict(error)) {
+        setOperationProblem(PROVIDER_NOT_READY_MESSAGE);
+      } else {
+        reportUnconfirmed("开始本次");
+      }
     } finally {
       setBusyAction(null);
       setStartingPlanId(null);
@@ -536,8 +543,12 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
       clearKey(scope);
       adoptStatus(next);
       setNotice("练习已开始。请留在老人旁边观察。");
-    } catch {
-      reportUnconfirmed("开始练习");
+    } catch (error) {
+      if (isProviderReadinessPrewriteConflict(error)) {
+        setOperationProblem(PROVIDER_NOT_READY_MESSAGE);
+      } else {
+        reportUnconfirmed("开始练习");
+      }
     } finally {
       setBusyAction(null);
     }
@@ -706,7 +717,14 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
               </Alert>
             )}
             {operationProblem && (
-              <Alert tone="danger" title="这一步还没有确认">{operationProblem}</Alert>
+              <Alert
+                tone="danger"
+                title={operationProblem === PROVIDER_NOT_READY_MESSAGE
+                  ? "暂时不能开始"
+                  : "这一步还没有确认"}
+              >
+                {operationProblem}
+              </Alert>
             )}
             {notice && <Alert tone="ok" title="已确认">{notice}</Alert>}
 
