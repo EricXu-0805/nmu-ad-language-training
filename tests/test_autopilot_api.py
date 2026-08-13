@@ -848,6 +848,7 @@ def test_account_start_and_exact_device_get_are_separate_principals(
         "status": "waiting_tts",
         "state_revision": 1,
         "server_owned": True,
+        "takeover_ready": False,
         "current_command_kind": "tts",
         "last_error_code": None,
     }
@@ -1705,6 +1706,10 @@ def test_server_owned_scope_blocks_every_legacy_manual_write_and_resume(
 
     paused = api_clients.account.post(f"/sessions/{SESSION_ID}/pause")
     assert paused.status_code == 200, paused.text
+    paused_status = api_clients.account.get(
+        f"/sessions/{SESSION_ID}/autopilot/status")
+    assert paused_status.status_code == 200, paused_status.text
+    assert paused_status.json()["takeover_ready"] is False
     assert paused.json()["status"] == "paused"
     with Session(api_clients.engine) as session:
         control = session.get(SessionAutopilotState, SESSION_ID)
@@ -4950,6 +4955,10 @@ def test_exact_drain_then_explicit_takeover_is_strict_idempotent_and_releases_ma
         drain_url, headers=api_clients.device_headers)
     assert drained.status_code == 200, drained.text
     assert drained.json() == {"replayed": False, "state_revision": 3}
+    drained_status = api_clients.account.get(
+        f"/sessions/{SESSION_ID}/autopilot/status")
+    assert drained_status.status_code == 200, drained_status.text
+    assert drained_status.json()["takeover_ready"] is True
     replayed_drain = api_clients.device.post(
         drain_url, headers=api_clients.device_headers, json={})
     assert replayed_drain.status_code == 200, replayed_drain.text
@@ -4990,6 +4999,7 @@ def test_exact_drain_then_explicit_takeover_is_strict_idempotent_and_releases_ma
         "status": "paused",
         "state_revision": 4,
         "server_owned": False,
+        "takeover_ready": False,
         "current_command_kind": None,
         "last_error_code": None,
     }

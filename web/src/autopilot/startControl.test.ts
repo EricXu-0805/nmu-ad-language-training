@@ -11,6 +11,7 @@ import {
   initialAutopilotConsoleState,
   parseAutopilotStatusReceipt,
   p0aConsoleEligibility,
+  receiptAllowsAutopilotTakeover,
 } from "./startControl.ts";
 
 test("server start stays disabled until the entire operational plan is ready", () => {
@@ -37,6 +38,7 @@ const safeStatus = () => ({
   status: "waiting_tts",
   state_revision: 1,
   server_owned: true,
+  takeover_ready: false,
   current_command_kind: "tts",
   last_error_code: null,
 });
@@ -84,6 +86,22 @@ test("takeover request is deterministic and fenced to a proven server revision",
   assert.throws(() => buildAutopilotTakeoverRequest("受试者\n答案", 3), /不能安全/);
 });
 
+test("account takeover stays closed until the exact server drain proof is ready", () => {
+  assert.equal(receiptAllowsAutopilotTakeover(null), false);
+  const paused = parseAutopilotStatusReceipt({
+    ...safeStatus(), status: "paused", current_command_kind: null,
+  });
+  assert.equal(receiptAllowsAutopilotTakeover(paused), false);
+  const drained = parseAutopilotStatusReceipt({
+    ...safeStatus(), status: "paused", current_command_kind: null,
+    takeover_ready: true,
+  });
+  assert.equal(receiptAllowsAutopilotTakeover(drained), true);
+  assert.equal(receiptAllowsAutopilotTakeover({
+    ...drained, serverOwned: false,
+  }), false);
+});
+
 test("status/start share an exact content-free receipt", () => {
   assert.deepEqual(parseAutopilotStatusReceipt(safeStatus()), {
     scopeKey: "p0a_sim_first_single_v1",
@@ -91,17 +109,20 @@ test("status/start share an exact content-free receipt", () => {
     status: "waiting_tts",
     stateRevision: 1,
     serverOwned: true,
+    takeoverReady: false,
     commandKind: "tts",
     lastErrorCode: null,
   });
   assert.deepEqual(parseAutopilotStatusReceipt({
     scope_key: "disabled", mode: "disabled", status: "idle",
-    state_revision: 0, server_owned: false, current_command_kind: null,
+    state_revision: 0, server_owned: false, takeover_ready: false,
+    current_command_kind: null,
     last_error_code: null,
   }).serverOwned, false);
   assert.deepEqual(parseAutopilotStatusReceipt({
     scope_key: "p0a_sim_first_single_v1", mode: "manual", status: "paused",
-    state_revision: 3, server_owned: false, current_command_kind: null,
+    state_revision: 3, server_owned: false, takeover_ready: false,
+    current_command_kind: null,
     last_error_code: null,
   }), {
     scopeKey: "p0a_sim_first_single_v1",
@@ -109,12 +130,16 @@ test("status/start share an exact content-free receipt", () => {
     status: "paused",
     stateRevision: 3,
     serverOwned: false,
+    takeoverReady: false,
     commandKind: null,
     lastErrorCode: null,
   });
   assert.throws(() => parseAutopilotStatusReceipt({ ...safeStatus(), token: "secret" }));
   assert.throws(() => parseAutopilotStatusReceipt({ ...safeStatus(), current_command_kind: "record" }), /命令不一致/);
   assert.throws(() => parseAutopilotStatusReceipt({ ...safeStatus(), server_owned: false }), /所有权/);
+  assert.throws(() => parseAutopilotStatusReceipt({
+    ...safeStatus(), takeover_ready: true,
+  }), /接管就绪/);
   assert.throws(() => parseAutopilotStatusReceipt({
     ...safeStatus(), state_revision: 0,
   }), /版本/);
@@ -135,9 +160,21 @@ test("status/start share an exact content-free receipt", () => {
   assert.throws(() => parseAutopilotStatusReceipt({ ...safeStatus(), last_error_code: "patient said carrot" }));
   assert.throws(() => parseAutopilotStatusReceipt({
     scope_key: "disabled", mode: "disabled", status: "idle",
-    state_revision: 2, server_owned: false, current_command_kind: null,
+    state_revision: 2, server_owned: false, takeover_ready: false,
+    current_command_kind: null,
     last_error_code: null,
   }), /禁用状态/);
+  const ready = parseAutopilotStatusReceipt({
+    scope_key: "p0a_sim_first_single_v1",
+    mode: "autonomous",
+    status: "paused",
+    state_revision: 3,
+    server_owned: true,
+    takeover_ready: true,
+    current_command_kind: null,
+    last_error_code: null,
+  });
+  assert.equal(ready.takeoverReady, true);
 });
 
 test("processing and draining keep the record command kind, and stay fail-closed", () => {
@@ -181,7 +218,8 @@ test("console starts fail-closed, ignores stale status, and only unlocks on auth
   assert.equal(autopilotServerOwnsConsole(initial), true);
   const idleReceipt = parseAutopilotStatusReceipt({
     scope_key: "disabled", mode: "disabled", status: "idle",
-    state_revision: 0, server_owned: false, current_command_kind: null,
+    state_revision: 0, server_owned: false, takeover_ready: false,
+    current_command_kind: null,
     last_error_code: null,
   });
   const idle = autopilotConsoleReducer(initial, {
@@ -212,6 +250,7 @@ test("console starts fail-closed, ignores stale status, and only unlocks on auth
       status: "paused",
       state_revision: 1,
       server_owned: false,
+      takeover_ready: false,
       current_command_kind: null,
       last_error_code: null,
     }),

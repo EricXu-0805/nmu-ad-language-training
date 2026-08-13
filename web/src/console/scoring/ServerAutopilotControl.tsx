@@ -7,6 +7,7 @@ import {
   completePlanAllowsAutopilotStart,
   initialAutopilotConsoleState,
   p0aConsoleEligibility,
+  receiptAllowsAutopilotTakeover,
   sameAutopilotStatusReceipt,
   type AutopilotConsoleState,
 } from "../../autopilot/startControl";
@@ -308,7 +309,7 @@ export function ServerAutopilotControl({
 
   const takeover = async () => {
     const receipt = state.receipt;
-    if (!receipt?.serverOwned || takeoverBusy) return;
+    if (!receiptAllowsAutopilotTakeover(receipt) || takeoverBusy) return;
     setConfirmTakeover(false);
     setTakeoverBusy(true);
     controlWriteInFlight.current = true;
@@ -319,7 +320,7 @@ export function ServerAutopilotControl({
     try {
       const latest = await api.autopilotStatus(session.session_id);
       acceptReceipt(latest);
-      if (!latest.serverOwned) return;
+      if (!receiptAllowsAutopilotTakeover(latest)) return;
       const next = await api.takeoverAutopilot(
         session.session_id,
         latest.stateRevision,
@@ -357,7 +358,7 @@ export function ServerAutopilotControl({
   const providerBlocked = providerReadiness?.startAllowed !== true;
   const manual = state.receipt?.scopeKey === "p0a_sim_first_single_v1"
     && state.receipt.mode === "manual";
-  const canTakeover = state.receipt?.serverOwned === true
+  const canTakeover = receiptAllowsAutopilotTakeover(state.receipt)
     && (paused || completed || serverFailed);
   const title = manual ? "AI 自动干预已完成审计接管"
     : active ? "当前冻结位置由服务器 AI 控制"

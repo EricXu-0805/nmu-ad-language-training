@@ -32,6 +32,7 @@ export interface AutopilotStatusReceipt {
   status: AutopilotServerStatus;
   stateRevision: number;
   serverOwned: boolean;
+  takeoverReady: boolean;
   commandKind: "tts" | "record" | null;
   lastErrorCode: string | null;
 }
@@ -147,7 +148,7 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
   if (!isRecord(value)
       || !hasExactKeys(value, [
         "scope_key", "mode", "status", "state_revision", "server_owned",
-        "current_command_kind", "last_error_code",
+        "takeover_ready", "current_command_kind", "last_error_code",
       ])
       || (value.scope_key !== "disabled" && value.scope_key !== P0A_SCOPE_KEY)
       || (value.mode !== "disabled" && value.mode !== "autonomous" && value.mode !== "manual")
@@ -159,6 +160,7 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
       || !Number.isSafeInteger(value.state_revision)
       || value.state_revision < 0
       || typeof value.server_owned !== "boolean"
+      || typeof value.takeover_ready !== "boolean"
       || (value.current_command_kind !== null
         && value.current_command_kind !== "tts"
         && value.current_command_kind !== "record")
@@ -172,7 +174,7 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
   const disabled = value.scope_key === "disabled";
   if (disabled) {
     if (value.mode !== "disabled" || status !== "idle" || value.state_revision !== 0
-        || value.server_owned || value.current_command_kind !== null
+        || value.server_owned || value.takeover_ready || value.current_command_kind !== null
         || value.last_error_code !== null) {
       throw new Error("自动驾驶禁用状态内部矛盾");
     }
@@ -189,7 +191,7 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
     if (value.mode === "manual"
         && (![
           "paused", "scope_completed", "failed",
-        ].includes(status) || value.current_command_kind !== null)) {
+        ].includes(status) || value.current_command_kind !== null || value.takeover_ready)) {
       throw new Error("人工接管状态不符合服务器释放契约");
     }
     const expectedKind = status === "waiting_tts"
@@ -201,6 +203,12 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
     if (value.current_command_kind !== expectedKind) {
       throw new Error("自动驾驶状态与当前命令不一致");
     }
+    if (value.takeover_ready
+        && (value.mode !== "autonomous"
+          || !["paused", "scope_completed", "failed"].includes(status)
+          || value.current_command_kind !== null)) {
+      throw new Error("自动驾驶接管就绪状态与安全收口契约矛盾");
+    }
   }
 
   return {
@@ -209,6 +217,7 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
     status,
     stateRevision: value.state_revision,
     serverOwned: value.server_owned,
+    takeoverReady: value.takeover_ready,
     commandKind: value.current_command_kind,
     lastErrorCode: value.last_error_code,
   };
@@ -223,8 +232,15 @@ export function sameAutopilotStatusReceipt(
     && left.status === right.status
     && left.stateRevision === right.stateRevision
     && left.serverOwned === right.serverOwned
+    && left.takeoverReady === right.takeoverReady
     && left.commandKind === right.commandKind
     && left.lastErrorCode === right.lastErrorCode;
+}
+
+export function receiptAllowsAutopilotTakeover(
+  receipt: AutopilotStatusReceipt | null,
+): boolean {
+  return receipt?.serverOwned === true && receipt.takeoverReady === true;
 }
 
 export const parseAutopilotStartReceipt = parseAutopilotStatusReceipt;

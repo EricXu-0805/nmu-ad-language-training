@@ -259,6 +259,7 @@ class AutopilotStatusReceipt(BaseModel):
     ]
     state_revision: int = Field(ge=0)
     server_owned: bool
+    takeover_ready: bool
     current_command_kind: Literal["tts", "record"] | None = None
     last_error_code: str | None = Field(
         default=None,
@@ -737,7 +738,6 @@ def _select_p0a_content(
             "P0a 只允许题库与自动化协议共同明确支持的第 2 周模拟场次",
         )
     resolved = _resolved_profile_plan(train_session, bank, protocol)
-    plan = resolved.session_plan
     positions = resolved.positions
     if not positions:
         _fail("autopilot_content_incomplete", "自动驾驶冻结计划没有可执行位置")
@@ -3142,6 +3142,27 @@ def _safe_takeover_proof(
     )
 
 
+def _takeover_is_ready(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+) -> bool:
+    """Project whether the exact takeover endpoint can safely succeed now.
+
+    A paused runtime is deliberately insufficient.  This projection reuses the
+    same persisted command/control proof that the mutation requires, so the UI
+    cannot guess readiness from a broad status label.
+    """
+    if (state.mode != "autonomous"
+            or state.status not in {"paused", "scope_completed", "failed"}):
+        return False
+    try:
+        _safe_takeover_proof(db, state=state)
+    except AutopilotServiceError:
+        return False
+    return True
+
+
 def takeover_autopilot_to_manual(
     db: Session,
     *,
@@ -3282,6 +3303,7 @@ def get_autopilot_status(
             # half-initialized row. This fixed value keeps refresh recovery exact.
             state_revision=0,
             server_owned=False,
+            takeover_ready=False,
             current_command_kind=None,
             last_error_code=None,
         )
@@ -3327,6 +3349,7 @@ def get_autopilot_status(
         # Autonomous ownership persists across refresh, processing, pause, failure
         # and scope completion. Only an explicit future manual takeover releases it.
         server_owned=state.mode == "autonomous",
+        takeover_ready=_takeover_is_ready(db, state=state),
         current_command_kind=current_kind,
         last_error_code=state.last_error_code,
     )

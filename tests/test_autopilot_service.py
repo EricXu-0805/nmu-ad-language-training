@@ -1127,6 +1127,7 @@ def test_account_status_is_minimal_and_preserves_server_ownership(
             "status": "idle",
             "state_revision": 0,
             "server_owned": False,
+            "takeover_ready": False,
             "current_command_kind": None,
             "last_error_code": None,
         }
@@ -1140,6 +1141,7 @@ def test_account_status_is_minimal_and_preserves_server_ownership(
             "status": "waiting_tts",
             "state_revision": 1,
             "server_owned": True,
+            "takeover_ready": False,
             "current_command_kind": "tts",
             "last_error_code": None,
         }
@@ -3436,6 +3438,7 @@ def test_account_status_disabled_is_canonical_and_active_state_is_consistent(
             "status": "idle",
             "state_revision": 0,
             "server_owned": False,
+            "takeover_ready": False,
             "current_command_kind": None,
             "last_error_code": None,
         }

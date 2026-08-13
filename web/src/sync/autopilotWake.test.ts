@@ -28,6 +28,7 @@ function ownedReceipt(stateRevision: number, status = "waiting_tts", kind: strin
     status,
     state_revision: stateRevision,
     server_owned: true,
+    takeover_ready: false,
     current_command_kind: kind,
     last_error_code: null,
   });
@@ -226,6 +227,8 @@ test("console ownership receipts are actually wired to the patient probe epoch",
     new URL("../console/scoring/ServerAutopilotControl.tsx", import.meta.url), "utf8");
   assert.match(consoleSource, /nextServerOwnershipWake\(lastWakeToken\.current, session\.session_id, receipt\)/);
   assert.match(consoleSource, /PATIENT_AUTOPILOT_WAKE_EVENT, \{ detail: wake \}/);
+  assert.match(consoleSource, /receiptAllowsAutopilotTakeover\(state\.receipt\)/);
+  assert.match(consoleSource, /receiptAllowsAutopilotTakeover\(latest\)/);
   const hookSource = readFileSync(
     new URL("../patient/usePatientAutopilot.ts", import.meta.url), "utf8");
   assert.match(hookSource, /addEventListener\(PATIENT_AUTOPILOT_WAKE_EVENT/);
