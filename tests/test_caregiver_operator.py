@@ -346,6 +346,7 @@ def test_caregiver_login_today_status_activation_and_logout(caregiver_clients):
     before = owner.get(f"/caregiver/sessions/{OWNER_SESSION}/status")
     assert before.status_code == 200, before.text
     assert before.json()["active_bedside_session"] is False
+    assert before.json()["autopilot"]["takeover_ready"] is False
     assert "cursor" not in before.json()
     assert "rapportStep" not in before.json()
 

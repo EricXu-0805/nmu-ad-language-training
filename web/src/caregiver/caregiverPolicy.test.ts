@@ -20,6 +20,7 @@ function status(overrides: Partial<CaregiverSessionStatus> = {}): CaregiverSessi
     patientPresence: "online",
     runtimeRevision: 5,
     practiceRevision: 3,
+    takeoverReady: false,
     isSimulation: true,
     dataClassification: "simulation",
     autopilotProfileVersionId: "week2-single20-demo-v1",
@@ -107,6 +108,7 @@ test("take-over appears only after the exact paused state and terminal states ex
   const paused = status({
     runtimeState: "paused",
     practiceState: "paused",
+    takeoverReady: true,
     allowed: {
       startPractice: false,
       pause: false,
@@ -121,6 +123,33 @@ test("take-over appears only after the exact paused state and terminal states ex
     help: true,
     takeOver: true,
     end: true,
+  });
+  assert.deepEqual(caregiverActionAvailability(status({
+    runtimeState: "paused",
+    practiceState: "paused",
+    takeoverReady: false,
+    allowed: {
+      startPractice: false,
+      pause: false,
+      help: true,
+      takeOver: true,
+      end: true,
+    },
+  })), {
+    startPractice: false,
+    pause: false,
+    help: true,
+    takeOver: false,
+    end: true,
+  });
+  assert.deepEqual(caregiverStatusPresentation(status({
+    runtimeState: "paused",
+    practiceState: "paused",
+    takeoverReady: false,
+  })), {
+    title: "练习已暂停",
+    detail: "设备正在安全收尾，请稍候",
+    tone: "warn",
   });
   assert.deepEqual(caregiverActionAvailability(status({ runtimeState: "intervention_completed" })), {
     startPractice: false,

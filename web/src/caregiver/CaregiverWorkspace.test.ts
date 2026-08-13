@@ -16,6 +16,12 @@ test("pause stays available during status re-check and uses the bodyless safety 
   assert.doesNotMatch(source, /api\.pauseSession\(current\.sessionId,\s*\{/);
 });
 
+test("takeover stays disabled until the exact server drain proof is ready", () => {
+  assert.match(source, /const actions = status \? caregiverActionAvailability\(status\) : null/);
+  assert.match(source, /disabled=\{busy \|\| !actions\?\.takeOver\}/);
+  assert.match(source, /if \(!actions\.takeOver\) return/);
+});
+
 test("caregiver workspace contains only the approved bedside capabilities", () => {
   for (const label of [
     "今天任务",

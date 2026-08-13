@@ -1,4 +1,5 @@
 import { ApiError, apiNetworkError, decodeJsonApiResponse } from "./apiResponse.ts";
+import { parseAutopilotStatusReceipt } from "./autopilot/startControl.ts";
 import type {
   CaregiverAbortReasonCode,
   CaregiverApi,
@@ -34,19 +35,6 @@ const RUNTIME_STATES = new Set<CaregiverRuntimeState>([
   "aborted",
   "failed",
 ]);
-const AUTOPILOT_MODES = new Set(["disabled", "autonomous", "manual"]);
-const AUTOPILOT_STATUSES = new Set([
-  "idle",
-  "running",
-  "waiting_tts",
-  "waiting_recording",
-  "processing_attempt",
-  "manual_draining",
-  "paused",
-  "scope_completed",
-  "failed",
-]);
-
 function record(value: unknown, message = "服务器返回了无法确认的照护状态"): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new ApiError(502, message, value, "noncanonical-json");
@@ -252,12 +240,20 @@ function parseStatus(value: unknown): CaregiverSessionStatus {
   const candidate = record(value);
   const boundary = sessionBoundary(candidate);
   const runtime = runtimeState(candidate);
-  const autopilot = record(candidate.autopilot, "服务器缺少自动练习状态");
-  const mode = stringField(autopilot, "mode");
-  const autopilotStatus = stringField(autopilot, "status");
-  if (!AUTOPILOT_MODES.has(mode) || !AUTOPILOT_STATUSES.has(autopilotStatus)) {
-    throw new ApiError(502, "服务器自动练习状态无效", autopilot, "noncanonical-json");
+  const rawAutopilot = record(candidate.autopilot, "服务器缺少自动练习状态");
+  let autopilot: ReturnType<typeof parseAutopilotStatusReceipt>;
+  try {
+    autopilot = parseAutopilotStatusReceipt(rawAutopilot);
+  } catch {
+    throw new ApiError(
+      502,
+      "服务器自动练习状态无效",
+      rawAutopilot,
+      "noncanonical-json",
+    );
   }
+  const mode = autopilot.mode;
+  const autopilotStatus = autopilot.status;
   const presence = record(candidate.patient_presence, "服务器缺少老人画面连接状态");
   if (typeof presence.online !== "boolean" || typeof candidate.active_bedside_session !== "boolean") {
     throw new ApiError(502, "服务器老人画面连接状态无效", candidate, "noncanonical-json");
@@ -272,7 +268,8 @@ function parseStatus(value: unknown): CaregiverSessionStatus {
       ? (presence.online ? "online" : "offline")
       : "unknown",
     runtimeRevision: integerField(candidate, "runtime_revision"),
-    practiceRevision: integerField(autopilot, "state_revision"),
+    practiceRevision: autopilot.stateRevision,
+    takeoverReady: autopilot.takeoverReady,
     ...boundary,
     allowed: {
       startPractice: runtime === "active"
@@ -283,7 +280,8 @@ function parseStatus(value: unknown): CaregiverSessionStatus {
       help: runtimeOpen,
       takeOver: runtime === "paused"
         && mode === "autonomous"
-        && currentPractice === "paused",
+        && currentPractice === "paused"
+        && autopilot.takeoverReady,
       end: runtimeOpen,
     },
   };

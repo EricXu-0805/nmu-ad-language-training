@@ -155,6 +155,8 @@ export interface CaregiverSessionStatus extends CaregiverOperationalBoundary {
   patientPresence: CaregiverPatientPresence;
   runtimeRevision: number;
   practiceRevision: number;
+  /** 只有服务器已持久化精确收麦证据时才为 true。 */
+  takeoverReady: boolean;
   allowed: CaregiverServerAllowedActions;
 }
 
@@ -241,6 +243,7 @@ export function caregiverActionAvailability(status: CaregiverSessionStatus): Car
     help: status.allowed.help
       && (status.runtimeState === "active" || status.runtimeState === "paused"),
     takeOver: status.allowed.takeOver
+      && status.takeoverReady
       && status.runtimeState === "paused"
       && status.practiceState === "paused",
     end: status.allowed.end
@@ -287,7 +290,9 @@ export function caregiverStatusPresentation(status: CaregiverSessionStatus): Car
   if (status.runtimeState === "paused" || status.practiceState === "paused") {
     return {
       title: "练习已暂停",
-      detail: "声音和交互正在停止；本页不会重新启动。",
+      detail: status.takeoverReady
+        ? "设备已经安全停下，可以接管或结束本次。"
+        : "设备正在安全收尾，请稍候",
       tone: "warn",
     };
   }

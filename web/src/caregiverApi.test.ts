@@ -30,6 +30,7 @@ const STATUS = {
     status: "idle",
     state_revision: 0,
     server_owned: false,
+    takeover_ready: false,
     current_command_kind: null,
     last_error_code: null,
   },
@@ -163,6 +164,7 @@ test("status parser derives the exact safe bedside actions", () => {
     patientPresence: "online",
     runtimeRevision: 4,
     practiceRevision: 0,
+    takeoverReady: false,
     isSimulation: true,
     dataClassification: "simulation",
     autopilotProfileVersionId: "week2-single20-demo-v1",
@@ -189,13 +191,35 @@ test("status parser derives the exact safe bedside actions", () => {
       status: "paused",
       state_revision: 7,
       server_owned: true,
+      takeover_ready: false,
     },
   });
   assert.equal(paused.allowed.startPractice, false);
   assert.equal(paused.allowed.pause, false);
   assert.equal(paused.allowed.help, true);
-  assert.equal(paused.allowed.takeOver, true);
+  assert.equal(paused.takeoverReady, false);
+  assert.equal(paused.allowed.takeOver, false);
   assert.equal(paused.allowed.end, true);
+
+  const drained = caregiverApiContract.parseStatus({
+    ...STATUS,
+    runtime_status: "paused",
+    runtime_revision: 5,
+    autopilot: {
+      ...STATUS.autopilot,
+      scope_key: "p0a_sim_first_single_v1",
+      mode: "autonomous",
+      status: "paused",
+      state_revision: 8,
+      server_owned: true,
+      takeover_ready: true,
+    },
+  });
+  assert.equal(drained.takeoverReady, true);
+  assert.equal(drained.allowed.pause, false);
+  assert.equal(drained.allowed.help, true);
+  assert.equal(drained.allowed.takeOver, true);
+  assert.equal(drained.allowed.end, true);
 
   const historical = caregiverApiContract.parseStatus({
     ...STATUS,
@@ -233,6 +257,19 @@ test("status parser fails closed on unknown server states", () => {
   assert.throws(() => caregiverApiContract.parseStatus({
     ...STATUS,
     autopilot: { ...STATUS.autopilot, status: "invented" },
+  }), /自动练习状态/);
+  assert.throws(() => caregiverApiContract.parseStatus({
+    ...STATUS,
+    autopilot: { ...STATUS.autopilot, takeover_ready: true },
+  }), /自动练习状态/);
+  const { takeover_ready: _missingTakeoverReady, ...missingTakeoverReady } = STATUS.autopilot;
+  assert.throws(() => caregiverApiContract.parseStatus({
+    ...STATUS,
+    autopilot: missingTakeoverReady,
+  }), /自动练习状态/);
+  assert.throws(() => caregiverApiContract.parseStatus({
+    ...STATUS,
+    autopilot: { ...STATUS.autopilot, extra: "not allowed" },
   }), /自动练习状态/);
   const { operational_demo_ready: _missing, ...missingReady } = STATUS;
   assert.throws(() => caregiverApiContract.parseStatus(missingReady), /operational_demo_ready/);
