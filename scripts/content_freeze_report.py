@@ -19,11 +19,49 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import content  # noqa: E402
+from app import content, runtime  # noqa: E402
 
 
 CONTENT_TEAM = "PI / 内容组（工程侧不得代笔）"
 ENGINEERING = "工程侧"
+
+
+
+def delivery_gap(bank: content.ItemBank) -> dict[str, object]:
+    """算出 README/DEPLOY 里那个「交付缺口」总数，别让它只活在措辞里。
+
+    口径：**计划内跑不动的题位 + 源协议里还没结构化的题位**。
+    "跑不动"的判据与自动驾驶实际用的那一条完全相同——冻结自动协议目前只覆盖
+    单要素/命名，其余题位（双要素命名缺自动协议、开放回答缺 rubric）在开场时
+    一律 fail-closed。
+
+    这个数以前只写在六份文档的正文里，靠人手同步；任何一次内容交付都可能让
+    它悄悄失真。现在它由题库自己算出来。
+    """
+    readiness = content.content_readiness(bank)
+    unstructured = int(readiness["source_unstructured_position_count"])
+    plan = runtime.build_session_plan(bank, 2, "正式训练")
+    runnable = 0
+    in_plan = 0
+    breakdown: dict[str, int] = {}
+    for item in plan.items:
+        task_type = getattr(item.task_type, "value", item.task_type)
+        for turn in item.turns:
+            role = getattr(turn.response_role, "value", turn.response_role)
+            in_plan += 1
+            if task_type == "单要素" and role == "命名":
+                runnable += 1
+            else:
+                breakdown[f"{task_type}:{role}"] = (
+                    breakdown.get(f"{task_type}:{role}", 0) + 1)
+    return {
+        "in_plan_positions": in_plan,
+        "runnable_by_frozen_automation": runnable,
+        "in_plan_gaps": in_plan - runnable,
+        "unstructured_source_positions": unstructured,
+        "delivery_gap_total": (in_plan - runnable) + unstructured,
+        "in_plan_gap_breakdown": dict(sorted(breakdown.items())),
+    }
 
 
 def collect(bank: content.ItemBank) -> dict[str, object]:
@@ -83,6 +121,7 @@ def collect(bank: content.ItemBank) -> dict[str, object]:
         })
 
     return {
+        "delivery_gap": delivery_gap(bank),
         "item_bank_version_id": meta.get("item_bank_version_id"),
         "draft_revision": meta.get("draft_revision"),
         "qc_status": bank.qc_status,
@@ -94,12 +133,19 @@ def collect(bank: content.ItemBank) -> dict[str, object]:
 
 
 def render(report: dict[str, object], *, max_items: int) -> str:
+    gap = report["delivery_gap"]
+    assert isinstance(gap, dict)
     lines = [
         "题库冻结阻断清单",
         f"  版本 {report['item_bank_version_id']}"
         f"  修订 {report['draft_revision']}"
         f"  qc_status={report['qc_status']}",
         f"  源协议题位总数 {report['source_protocol_position_count']}",
+        f"  **交付缺口合计 {gap['delivery_gap_total']}**"
+        f"（计划内跑不动 {gap['in_plan_gaps']}"
+        f" + 源协议未结构化 {gap['unstructured_source_positions']}）",
+        f"  计划内 {gap['in_plan_positions']} 个题位里，"
+        f"冻结自动化能跑的只有 {gap['runnable_by_frozen_automation']} 个",
         f"  可用于真实受试者：{'是' if report['ready_for_research'] else '否'}",
         "",
     ]

@@ -46,3 +46,33 @@ def test_delivery_docs_separate_scale_definitions_from_platform_implementation()
     assert "20（仅字段级协议完整）" in freeze_package
     assert "当前默认整计划仍是 **0 个可启动**" in freeze_package
     assert "definitions 完整本身不得显示为“已冻结可用”" in deploy
+
+
+def test_the_delivery_gap_number_in_the_docs_is_the_one_the_script_computes():
+    """文档里那个「交付缺口」数必须等于题库自己算出来的数。
+
+    它以前只写在六份文档的正文里靠人手同步，任何一次内容交付都可能让它悄悄
+    失真——而这个数正是"能不能收真实受试者"的门槛之一。现在脚本会算，这条
+    测试把两边钉在一起：内容组交付后数变了，文档没跟上就红。
+    """
+    import importlib.util
+    from app import content
+
+    spec = importlib.util.spec_from_file_location(
+        "content_freeze_report",
+        ROOT / "scripts" / "content_freeze_report.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+    gap = module.delivery_gap(bank)
+    total = gap["delivery_gap_total"]
+    assert total == gap["in_plan_gaps"] + gap["unstructured_source_positions"]
+
+    stated = f"{total} 个交付缺口"
+    for name in ("README.md", "DEPLOY.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert stated in text, (
+            f"{name} 里的交付缺口数与脚本算出的 {total} 对不上；"
+            "内容交付后请同时更新文档，或反过来查是不是题库被改坏了")
