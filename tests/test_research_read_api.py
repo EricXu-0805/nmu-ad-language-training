@@ -747,3 +747,79 @@ def test_columns_the_dictionary_declares_as_variables_actually_carry_values(
         "source_attempt_seq 整列都是 null——字典宣称它是关联的原始尝试序号"
     for row in turns:
         assert "source_attempt_id" not in row, "反查成序号，不能把主键漏出去"
+
+
+def test_the_schema_surface_stays_readable_without_a_key_but_carries_no_data(
+        research_env, monkeypatch):
+    """meta 与 dictionary 在密钥未配时仍可读——但必须证明它们零数据。
+
+    拦住它们保护不了任何东西（两者全由静态列注册表生成），只会让人在最需要弄清
+    "这个接口出哪些列"的时候看不到答案。代价是这个例外必须被钉死：字典里一旦
+    出现任何一行真实数据，这条测试就红。
+    """
+    _without_key(monkeypatch)
+    client = _client("steward")
+
+    for path in ("/research/v1/meta", "/research/v1/dictionary",
+                 "/research/v1/dictionary.csv"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        raw = response.text
+        for secret in ("P-REAL-1", "P-GONE-1", "S-REAL-1", SECRET_TEXT, "王家属"):
+            assert secret not in raw, f"{path} 漏了 {secret}"
+        assert "rows" not in response.json() if path.endswith("dictionary") else True
+
+    # 而一切带数据行的端点必须 503
+    for dataset in research_dataset.dataset_keys():
+        for suffix in ("", ".csv"):
+            response = client.get(
+                f"/research/v1/{dataset}{suffix}?data_classification=research")
+            assert response.status_code == 503, f"{dataset}{suffix}"
+            assert response.json()["detail"]["code"] == \
+                "research_deidentification_unavailable"
+
+
+def test_paging_turns_one_at_a_time_gives_exactly_the_same_rows_as_one_big_page(
+        research_env, monkeypatch):
+    """把 keyset 判据推进 SQL 之后，结果必须逐行等于原来的全量。
+
+    重写取数路径最容易出的错不是报错，是**悄悄少几行或多几行**。这条把
+    limit=1 逐页走完的结果与一次性拉全量逐行比对；顺带覆盖撤回墓碑与在训行
+    混在一起翻页的情形（撤回者的行也占位置，不能被跳过）。
+    """
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        item = session.exec(select(ItemEvent).where(
+            ItemEvent.session_id == "S-REAL-1")).first()
+        for seq in (2, 3):
+            session.add(TurnEvent(
+                item_event_id=item.id, turn_seq=seq, response_role="命名",
+                prompt_level=1, ai_score=0.0, judge_portrait_used=False))
+        extra = ItemEvent(session_id="S-REAL-1", item_id="SE_苹果",
+                          task_type="单要素", item_set_type="训练集",
+                          presentation_order=2)
+        session.add(extra)
+        session.commit()
+        session.add(TurnEvent(
+            item_event_id=extra.id, turn_seq=1, response_role="命名",
+            prompt_level=0, ai_score=1.0, judge_portrait_used=False))
+        session.commit()
+
+    client = _client("steward")
+    whole = client.get(
+        "/research/v1/turns?data_classification=research&limit=1000").json()
+    assert whole["row_count"] >= 4, "行数太少，翻页断言会是空转"
+
+    walked: list[dict] = []
+    cursor = None
+    for _ in range(whole["row_count"] + 3):
+        query = "/research/v1/turns?data_classification=research&limit=1"
+        if cursor:
+            query += f"&cursor={cursor}"
+        page = client.get(query).json()
+        walked.extend(page["rows"])
+        cursor = page["next_cursor"]
+        if not cursor:
+            break
+    assert cursor is None, "翻到上限还没走完，游标没有前进"
+    assert walked == whole["rows"], "逐页走出来的行与一次全量拉的不一致"

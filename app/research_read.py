@@ -4,8 +4,11 @@
 **读出来的东西符合去标识口径**，并在越界时 fail-closed 而不是降级。
 
 三条硬边界：
-  - 未配置 ``DEIDENTIFICATION_KEY`` 时，除 ``meta`` 外一律拒绝，且**绝不**退化成
-    返回明文 patient_id；
+  - 未配置 ``DEIDENTIFICATION_KEY`` 时，**一切带数据行的端点一律 503**，且
+    **绝不**退化成返回明文 patient_id。``meta`` 与 ``dictionary`` 例外——
+    它们完全由静态列注册表生成，一个受试者字段都不碰：拦住它们保护不了任何东西，
+    只会让人在最需要弄清"这个接口到底出哪些列"的时候看不到答案。
+    这个例外由测试钉住：字典的响应里出现任何一行数据即视为回归。
   - 输出列是闭集（``research_dataset`` 的注册表），多带的键会被丢弃；
   - 序列化之前统一过 ``export_security.assert_deidentified_sheets``。
 
@@ -30,6 +33,7 @@ import secrets
 from typing import Any, Iterable
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from sqlalchemy import and_, or_
 from sqlmodel import Session as DBSession, select
 
 from . import export_security, research_dataset, session_admission
@@ -262,62 +266,70 @@ def list_sessions(db: DBSession, *, config, data_classification: str,
 
 def list_turns(db: DBSession, *, config, data_classification: str,
                cursor: str | None, limit: int) -> dict[str, Any]:
+    """按 (场次, 题目, 环节序号) 的 keyset 翻页。
+
+    第一版是在 Python 里翻：把该分区的全部场次、每个场次的全部题目、每道题的
+    全部环节都取出来，再用 ``key <= after`` 逐行跳过。于是第 k 页要为前
+    (k-1)×limit 行重跑一遍全部 I/O——页数越深越慢，而这套服务和床旁训练同进程、
+    同一台 1 GiB 的机器。判据推进 SQL，一页就是一次带 LIMIT 的查询。
+    """
     after = decode_cursor(cursor, config, "turns") if cursor else None
-    sessions = {
-        sess.session_id: sess
-        for sess in db.exec(select(Session).where(
-            Session.data_classification == data_classification))
-    }
+    statement = (
+        select(TurnEvent, ItemEvent, Session)
+        .join(ItemEvent, TurnEvent.item_event_id == ItemEvent.id)
+        .join(Session, ItemEvent.session_id == Session.session_id)
+        .where(Session.data_classification == data_classification)
+        .order_by(ItemEvent.session_id, ItemEvent.item_id, TurnEvent.turn_seq)
+    )
+    if after is not None:
+        session_after, item_after, seq_after = after
+        statement = statement.where(or_(
+            ItemEvent.session_id > session_after,
+            and_(ItemEvent.session_id == session_after,
+                 ItemEvent.item_id > item_after),
+            and_(ItemEvent.session_id == session_after,
+                 ItemEvent.item_id == item_after,
+                 TurnEvent.turn_seq > seq_after),
+        ))
+    picked = list(db.exec(statement.limit(limit + 1)))
+    page, has_more = _page(picked, limit)
+
     withdrawn = _withdrawn_patient_ids(db)
-    # 同上：字典宣称 source_attempt_seq 是"关联的原始尝试序号"，turn 上存的是
-    # source_attempt_id（数据库主键，禁出）。反查成序号——序号是自然键的一部分，
-    # 本来就该出。
-    attempt_seq = {
-        attempt.id: attempt.attempt_seq
-        for attempt in db.exec(select(AttemptEvent))
-    }
+    # 只查这一页真正引用到的 attempt，别把整张表拉进来——那会把刚省下的
+    # 全表扫描从 turn 挪到 attempt 上。
+    attempt_ids = {turn.source_attempt_id for turn, _, _ in page
+                   if turn.source_attempt_id is not None}
+    attempt_seq: dict[Any, int] = {}
+    if attempt_ids:
+        attempt_seq = {
+            attempt.id: attempt.attempt_seq
+            for attempt in db.exec(select(AttemptEvent).where(
+                AttemptEvent.id.in_(attempt_ids)))
+        }
+
     rows: list[dict[str, Any]] = []
     last_key: list[Any] | None = None
-    has_more = False
-
-    for session_id in sorted(sessions):
-        sess = sessions[session_id]
-        items = list(db.exec(select(ItemEvent).where(
-            ItemEvent.session_id == session_id).order_by(ItemEvent.item_id)))
+    for turn, item, sess in page:
         subject_code = export_security.pseudonymize_subject(
             sess.patient_id, config)
-        session_code = export_security.pseudonymize_session(session_id, config)
-        for item in items:
-            turns = list(db.exec(select(TurnEvent).where(
-                TurnEvent.item_event_id == item.id).order_by(TurnEvent.turn_seq)))
-            for turn in turns:
-                key = [session_id, item.item_id, turn.turn_seq]
-                if after is not None and key <= after:
-                    continue
-                if len(rows) >= limit:
-                    has_more = True
-                    break
-                if sess.patient_id in withdrawn:
-                    # 自然键必须留着。全置 null 会让一个 36 环节的场次返回 36 行
-                    # 逐字节相同的行，`distinct()` 一跑塌成 1——而墓碑存在的唯一
-                    # 理由就是保住这个分母。item_id 与 turn_seq 本来就是公开列，
-                    # 不是标识符。
-                    rows.append(_tombstone("turns", {
-                        "session_code": session_code,
-                        "subject_code": subject_code,
-                        "item_id": item.item_id,
-                        "turn_seq": turn.turn_seq,
-                        "withdrawn": True,
-                    }))
-                else:
-                    rows.append(_turn_row(
-                        session_code, subject_code, item, turn,
-                        attempt_seq.get(turn.source_attempt_id)))
-                last_key = key
-            if has_more:
-                break
-        if has_more:
-            break
+        session_code = export_security.pseudonymize_session(
+            sess.session_id, config)
+        if sess.patient_id in withdrawn:
+            # 自然键必须留着。全置 null 会让一个 36 环节的场次返回 36 行逐字节
+            # 相同的行，`distinct()` 一跑塌成 1——而墓碑存在的唯一理由就是保住
+            # 这个分母。item_id 与 turn_seq 本来就是公开列，不是标识符。
+            rows.append(_tombstone("turns", {
+                "session_code": session_code,
+                "subject_code": subject_code,
+                "item_id": item.item_id,
+                "turn_seq": turn.turn_seq,
+                "withdrawn": True,
+            }))
+        else:
+            rows.append(_turn_row(
+                session_code, subject_code, item, turn,
+                attempt_seq.get(turn.source_attempt_id)))
+        last_key = [sess.session_id, item.item_id, turn.turn_seq]
 
     next_cursor = (encode_cursor(last_key, config, "turns")
                    if has_more and last_key is not None else None)
