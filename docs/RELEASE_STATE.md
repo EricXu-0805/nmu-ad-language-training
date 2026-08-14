@@ -11,22 +11,20 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `f813af0`（2026-08-14 20:28 上线；此前 `d8d3edd` 09:52 上线） | 部署树里有 `app/research_read.py`、`scripts/content_gap_workbook.py`、`web/dist` 里有 `AcceptanceScreen-*.js` |
+| 应用代码版本 | `167273f`（2026-08-15 06:05 上线；此前 `f813af0` 08-14 20:28、`d8d3edd` 08-14 09:52） | 部署树里有 `app/research_read.py`、`scripts/content_gap_workbook.py`、`web/dist` 里有 `AcceptanceScreen-*.js` |
 | 部署树后续同步 | 已与 `main` 一致 | `git diff f813af0..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b3e7c5a9d214` | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `2d50ce0cad5f7813a5c3` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 一致 |
-| 回滚存档 | `/opt/nmu/app-before-deploy-20260814-2030.tar.gz`（退到 `d8d3edd`）；再往前退到 `9c34dcb` 用 `app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
-| 回滚锚点快照 | 退到 `d8d3edd`：`20260814-122721`（同结构，新校验器验过，直接可用）。**跨结构**退回 `9c34dcb` 才用 `20260814-015251`（旧结构，现在 `legacy-unvalidated/`），那时要连**旧代码树 + 旧校验器**一起放回 |
+| 回滚存档 | `/opt/nmu/app-before-deploy-20260815-0605.tar.gz`（退到 `f813af0`）；更早的存档按 `ls -t` 逐级回退，跨结构退回 `9c34dcb` 用 `app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
+| 回滚锚点快照 | 退到 `f813af0`：`20260814-220517`（同结构，新校验器验过，直接可用）。**跨结构**退回 `9c34dcb` 才用 `20260814-015251`（旧结构，现在 `legacy-unvalidated/`），那时要连**旧代码树 + 旧校验器**一起放回 |
 | 起服前闸门 | 已装（`ExecStartPre` 验库头，以 `User=nmu` 身份跑） | `systemctl cat nmu.service \| grep ExecStartPre`；journal 里 `OK database_at_head` 应在 `Started` 之前 |
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
 | 库里数据 | 1 个受试者、1 个场次、0 条云语音使用记录 | 这台机器**从未被真实使用过** |
 
-最后一次只读核对：**2026-08-14 20:30（上海时间）**。
+最后一次只读核对：**2026-08-15 06:10（上海时间）**。
 
-预检 `--require-all` 结果：**7 项 PASS、1 项 FAIL**。唯一 FAIL 是
-「OS 安全补丁：8 个待安装」（systemd 一族），**与本次上线无关**——它是 08-10
-那次周检之后攒下来的，回滚这次上线也不会让它消失。装补丁的命令当时被权限
-分类器拒绝，未执行。修法：`apt-get upgrade`，装完再跑一次预检。
+预检 `--require-all` 结果：**8 项全 PASS、退出码 0**。这台机器上线以来第一次全绿——
+2026-08-15 装完 8 个 systemd 安全补丁后，OS 补丁那一项从 FAIL 转 PASS。
 
 ## 迁移头前进的部署收尾三件套（缺一必出误报）
 
@@ -66,6 +64,7 @@
 
 | 日期 | 代码版本 | 结构版本 | 回滚存档 | 备注 |
 | --- | --- | --- | --- | --- |
+| 2026-08-15 06:05 | `167273f` | `b3e7c5a9d214`（未变） | `app-before-deploy-20260815-0605.tar.gz` | 无迁移的安全修（两轮对抗复核 149 agent、坐实 30 条的处置，收据 212）：授权判定改用与路由器同源的 `scope["path"]`（原来被解码出的 `#` 截断，researcher 拿到 404 而非 403）、`/research` 整个命名空间收窄（原来只盖一段，其余拼写掉回含 researcher 的兜底）、跨站顶层跳转不再能带 SameSite=Lax cookie 拉走 CSV、角色判定挪到 404/422 之前、墓碑保住分母、撤回判定改调全仓权威判据、翻页判据下推 SQL、字典宣称的两列真填。 |
 | 2026-08-14 20:28 | `f813af0` | `b3e7c5a9d214`（未变） | `app-before-deploy-20260814-2030.tar.gz` | 无迁移的安全修：分页游标从"只签名"改成 AES-GCM 真加密（原来 base64 解码就是明文 patient_id）、撤回判定改调全仓权威判据、补上研究取数的限速策略与审计账本。**这些缺陷在配上 `DEIDENTIFICATION_KEY` 之前打不出来（端点一律 503），配之前必须先上这一版。** |
 | 2026-08-14 09:52 | `d8d3edd` | `b3e7c5a9d214` | `app-before-deploy-20260814-015250.tar.gz` | 受控技术环境更新：照护员弧、老人端暂停、研究数据面 `/research/v1/*` 与总览屏、真机验收向导页、起服前库头闸门。**不构成任何外部批准。** |
 | 2026-08-08 15:40 | `9c34dcb` | `b8e5f2a91c07` | `app-before-deploy-20260808-154014.tar.gz` | 量表注册生产入口收口 |
