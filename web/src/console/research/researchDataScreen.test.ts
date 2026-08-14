@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 const screen = readFileSync(new URL("./ResearchDataScreen.tsx", import.meta.url), "utf8");
 const analysis = readFileSync(new URL("../AnalysisScreen.tsx", import.meta.url), "utf8");
 const api = readFileSync(new URL("../../api.ts", import.meta.url), "utf8");
+const table = readFileSync(new URL("./ResearchDataTable.tsx", import.meta.url), "utf8");
 
 test("总览屏只渲染响应自己声明的列，源码里不出现任何被禁列名", () => {
   // 行是按 columns 投影出来的数组，屏幕结构上取不到别的东西；这里再钉一遍
@@ -12,14 +13,17 @@ test("总览屏只渲染响应自己声明的列，源码里不出现任何被�
   for (const forbidden of ["patient_id", "asr_text", "judge_reason",
                            "confirmed_response_text", "consent_person",
                            "raw_audio_id", "created_at"]) {
-    assert.doesNotMatch(screen, new RegExp(forbidden), `屏上不得出现 ${forbidden}`);
+    for (const [name, source] of [["总览屏", screen], ["表格", table]] as const) {
+      assert.doesNotMatch(source, new RegExp(forbidden), `${name}不得出现 ${forbidden}`);
+    }
   }
-  assert.match(screen, /page\.columns\.map/);
-  assert.match(screen, /page\.rows\.map/);
+  assert.match(table, /page\.columns\.map/);
+  assert.match(table, /page\.rows\.map/);
 });
 
 test("总览屏是只读的：不发任何写请求", () => {
   assert.doesNotMatch(screen, /"(POST|PUT|PATCH|DELETE)"/);
+  assert.doesNotMatch(table, /\bapi\./);
   assert.doesNotMatch(screen, /api\.(create|start|cancel|submit|complete|approve|close|delete|set)[A-Z]/);
 });
 
