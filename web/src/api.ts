@@ -19,6 +19,16 @@ import {
 } from "./security/deviceCapability";
 import { csrfHeader } from "./security/csrf";
 import {
+  parseResearchDictionary,
+  parseResearchMeta,
+  parseResearchPage,
+  researchDatasetPath,
+  type ResearchDataClassification,
+  type ResearchDictionaryRow,
+  type ResearchMeta,
+  type ResearchPage,
+} from "./console/research/researchDataContract";
+import {
   buildAutopilotStartRequest,
   buildAutopilotTakeoverRequest,
   parseAutopilotStatusReceipt,
@@ -286,6 +296,8 @@ async function pairDevice(pin: string): Promise<DeviceCapabilityRecord> {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 12_000;
+// 研究取数一页最多 1000 行，还要在服务端过一遍去标识断言，比普通读慢。
+const RESEARCH_READ_TIMEOUT_MS = 45_000;
 
 interface RequestOptions {
   silent401?: boolean;
@@ -361,6 +373,33 @@ async function req<T>(method: string, path: string, body?: unknown,
   } finally {
     window.clearTimeout(timeout);
     opts?.signal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
+// CSV 走裸 fetch 而不是 <a download>：顶层导航会把控制台带走，而且失败时浏览器
+// 会把错误响应当文件存下来。这样非 2xx 仍走与 JSON 读同一条错误解码路径。
+async function fetchResearchCsv(path: string): Promise<Blob> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), RESEARCH_READ_TIMEOUT_MS);
+  try {
+    const res = await fetch(path, {
+      method: "GET", signal: controller.signal,
+      credentials: "same-origin", cache: "no-store",
+    });
+    if (!res.ok) {
+      if (res.status === 401) window.dispatchEvent(new Event(ACCOUNT_REAUTH_REQUIRED_EVENT));
+      const text = await res.text();
+      decodeJsonApiResponse({
+        status: res.status, ok: false, statusText: res.statusText, text,
+        retryAfter: res.headers.get("Retry-After"),
+      });
+    }
+    return await res.blob();
+  } catch (error) {
+    if (controller.signal.aborted) throw new ApiError(408, "导出超时，请把每页行数调小后重试");
+    throw apiNetworkError(error);
+  } finally {
+    window.clearTimeout(timeout);
   }
 }
 
@@ -453,6 +492,37 @@ export const api = {
       "GET", `/patients/${encodeURIComponent(id)}/sessions`, undefined,
       DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
     ), id),
+
+  // 只读研究数据面。全部 GET，零写入口；投影与去标识导出包同一口径。
+  researchMeta: async (signal?: AbortSignal): Promise<ResearchMeta> =>
+    parseResearchMeta(await req<unknown>(
+      "GET", "/research/v1/meta", undefined,
+      DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
+    )),
+  researchDictionary: async (signal?: AbortSignal): Promise<ResearchDictionaryRow[]> =>
+    parseResearchDictionary(await req<unknown>(
+      "GET", "/research/v1/dictionary", undefined,
+      DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
+    )),
+  researchDataset: async (request: {
+    dataset: string;
+    classification: ResearchDataClassification;
+    cursor?: string | null;
+    limit?: number | null;
+    signal?: AbortSignal;
+  }): Promise<ResearchPage> => parseResearchPage(await req<unknown>(
+    "GET", researchDatasetPath(request), undefined,
+    RESEARCH_READ_TIMEOUT_MS, { noStore: true, signal: request.signal },
+  ), request.dataset),
+  researchCsv: (request: {
+    dataset: string;
+    classification: ResearchDataClassification;
+    cursor?: string | null;
+    limit?: number | null;
+  }): Promise<Blob> =>
+    fetchResearchCsv(researchDatasetPath({ ...request, csv: true })),
+  researchDictionaryCsv: (): Promise<Blob> =>
+    fetchResearchCsv("/research/v1/dictionary.csv"),
   cloudProcessingPolicy: () => req<CloudProcessingPolicy>("GET", "/cloud-processing/policy"),
   setPatientCloudProcessing: (
     id: string,

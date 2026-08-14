@@ -667,6 +667,30 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .quality-confusion-matrix td[data-state="suppressed"] { background: var(--c-warn-bg); color: var(--c-warn-text); }
 .quality-confusion-matrix abbr { text-decoration: none; }
 .quality-confusion-matrix-region:focus-visible { outline-offset: 3px; }
+.research-table-region {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--c-line-soft);
+  border-radius: var(--radius-sm);
+}
+.research-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--c-surface);
+  font-size: var(--text-sm);
+}
+.research-table th,
+.research-table td {
+  padding: var(--sp-2) var(--sp-3);
+  border-right: 1px solid var(--c-line-soft);
+  border-bottom: 1px solid var(--c-line-soft);
+  text-align: left;
+  white-space: nowrap;
+}
+.research-table tr > :last-child { border-right: 0; }
+.research-table tbody tr:last-child > * { border-bottom: 0; }
+.research-table thead th { background: var(--c-surface-subtle); }
+
 .quality-metric-section { margin-top: var(--sp-3); }
 .quality-metric-list ~ h4,
 .form-section h4,

@@ -44,6 +44,7 @@ import {
   type DataClassification,
 } from "./dataClassification";
 import { auditActionLabel, auditDisplaySummary } from "./auditPresentation";
+import { ResearchDataScreen } from "./research/ResearchDataScreen";
 
 type QualityRequestState = {
   classification: "research" | "simulation";
@@ -132,6 +133,7 @@ export function AnalysisScreen() {
   const [patientId, setPatientId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [classificationFilter, setClassificationFilter] = useState<DataClassification>("research");
+  const [researchDataOpen, setResearchDataOpen] = useState(false);
   const [qualityState, setQualityState] = useState<QualityRequestState | null>(null);
   const [qualityReloadToken, setQualityReloadToken] = useState(0);
   const [qualityNowMs, setQualityNowMs] = useState(() => Date.now());
@@ -211,6 +213,9 @@ export function AnalysisScreen() {
     return () => window.clearInterval(timer);
   }, [qualityRetryAtMs]);
 
+  if (researchDataOpen) {
+    return <ResearchDataScreen onBack={() => setResearchDataOpen(false)} />;
+  }
   if (sessionId && patientId) {
     // key 强制按 exact patient+session 重新挂载:换场次绝不能在 effect 清空前的
     // 那一次 render 里,把 A 场次的 journal/usage state 短暂配上 B 的标题渲染出来。
@@ -243,6 +248,15 @@ export function AnalysisScreen() {
         </div>
         <IntegrityBadge />
       </header>
+      <section className="form-section">
+        <div className="form-section-header">
+          <div>
+            <h3>去标识研究数据</h3>
+            <p className="muted">跨受试者的三张长表：受试者、场次、逐环节。可在屏上翻页，也可导出 CSV 直接给 SPSS/R。只向数据管理员与管理员开放。</p>
+          </div>
+          <Button onClick={() => setResearchDataOpen(true)}>打开研究数据总览</Button>
+        </div>
+      </section>
       {err && <Alert tone="danger" title="受试者列表加载失败">{err}</Alert>}
       {rows && rows.length === 0 && !err && <Alert tone="info" title="暂无数据">还没有登记受试者或采集数据。</Alert>}
       {rows && rows.length > 0 && (
