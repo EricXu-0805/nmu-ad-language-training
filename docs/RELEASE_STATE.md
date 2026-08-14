@@ -15,8 +15,8 @@
 | 部署树后续同步 | 已与 `main` 一致 | `git diff f813af0..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b3e7c5a9d214` | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `2d50ce0cad5f7813a5c3` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 一致 |
-| 回滚存档 | `/opt/nmu/app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
-| 回滚锚点快照 | `20260814-015251`（旧结构停写快照，已异地归档，现在 `legacy-unvalidated/`） | 结构一升级它就不再被新校验器背书，这是设计；回滚要连**旧代码树 + 旧校验器**一起放回 |
+| 回滚存档 | `/opt/nmu/app-before-deploy-20260814-2030.tar.gz`（退到 `d8d3edd`）；再往前退到 `9c34dcb` 用 `app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
+| 回滚锚点快照 | 退到 `d8d3edd`：`20260814-122721`（同结构，新校验器验过，直接可用）。**跨结构**退回 `9c34dcb` 才用 `20260814-015251`（旧结构，现在 `legacy-unvalidated/`），那时要连**旧代码树 + 旧校验器**一起放回 |
 | 起服前闸门 | 已装（`ExecStartPre` 验库头，以 `User=nmu` 身份跑） | `systemctl cat nmu.service \| grep ExecStartPre`；journal 里 `OK database_at_head` 应在 `Started` 之前 |
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
 | 库里数据 | 1 个受试者、1 个场次、0 条云语音使用记录 | 这台机器**从未被真实使用过** |
