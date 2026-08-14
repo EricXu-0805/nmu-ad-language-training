@@ -1910,17 +1910,25 @@ def test_routes_that_rely_on_the_namespace_fallback_are_enumerated():
 def test_the_route_table_has_no_unreviewed_non_api_entries():
     """路由覆盖测试只枚举 APIRoute——Mount 之类的注册方式它看不见。
 
-    今天非 APIRoute 的只有 FastAPI 自带的四条文档路由（生产必须 404，
-    由 preflight 的红线检查盯着）和 /assets 静态挂载。多出任何一条，
-    说明有人用覆盖测试照不到的方式加了东西。
+    断言的是"没有名单之外的"，不是"必须恰好是这几条"：`/assets` 只在
+    `web/dist` 真的存在时才挂载（见 main._mount_spa），CI 里不构建前端，
+    所以那条在 CI 缺席、在本机存在。第一版把它写成精确相等，于是本机全绿、
+    CI 两个 backend job 全红——**测试自己依赖了一个环境差异**。
     """
-    others = sorted(
-        f"{type(route).__name__} {getattr(route, 'path', '?')}"
-        for route in app.routes if not isinstance(route, APIRoute))
-    assert others == [
-        "Mount /assets",
+    reviewed = {
+        # FastAPI 自带的文档路由。生产必须 404，由 preflight 的红线检查盯着。
         "Route /docs",
         "Route /docs/oauth2-redirect",
         "Route /openapi.json",
         "Route /redoc",
-    ], others
+        # 构建产物的静态挂载，只在 web/dist 存在时注册。
+        "Mount /assets",
+    }
+    actual = {
+        f"{type(route).__name__} {getattr(route, 'path', '?')}"
+        for route in app.routes if not isinstance(route, APIRoute)
+    }
+    unreviewed = sorted(actual - reviewed)
+    assert not unreviewed, (
+        "有人用路由覆盖测试照不到的方式加了东西，先确认它的访问策略："
+        + str(unreviewed))
