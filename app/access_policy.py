@@ -146,7 +146,17 @@ _ROUTE_RULES = (
     # （分域 HMAC 假名、无自由文本、无绝对时间）。故意收在数据治理角色上——
     # researcher 是按 trainer_id 隔离的训练操作者，跨受试者只读属于治理面，
     # 不能靠"通用已知账号"兜底顺手放宽。全部是 GET，没有任何写入口。
-    _route({"GET", "HEAD"}, r"/research/v1/[^/]+",
+    # 正则要盖住 /research 下的**一切**，不只是恰好一段。
+    # 2026-08-15 复核实测：`/research/v1/[^/]+` 只 fullmatch 一段，于是
+    # `/research/v1/`、`/research/v1/subjects/`、`/research/v1/a/b`、`/research/v2/x`
+    # 统统掉回下面那条命名空间兜底——而兜底用的是默认 KNOWN_ACCOUNT_ROLES，
+    # 里面有 researcher。收窄一个命名空间时，把边界写成"恰好当前这些路由的形状"
+    # 就是在赌将来没人加第二段；这里改成盖住整个前缀，任何写法都落治理角色。
+    # 只挂 GET/HEAD：写方法要继续掉到下面那条 admin-only 的写兜底去。
+    # 第一版修法顺手把写方法也挂上治理角色，被既有测试当场抓住——那等于让
+    # data_steward 将来能写，比现有的 admin-only 兜底更松。收窄一个命名空间时，
+    # 该收的是路径维度，不是把方法维度一起放宽。
+    _route({"GET", "HEAD"}, r"/research(?:/.*)?",
            AccessKind.ACCOUNT, roles=DATA_GOVERNANCE_ROLES,
            label="读取去标识研究数据"),
     _route({"POST"}, r"/ai/provider-readiness/probe", AccessKind.ACCOUNT,

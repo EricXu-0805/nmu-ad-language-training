@@ -405,7 +405,16 @@ def _expensive_rate_limit(
 
 @app.middleware("http")
 async def console_auth_guard(request: Request, call_next):
-    path = request.url.path
+    # 判定源必须与路由器匹配用的是同一个字符串。`request.url.path` 不是——
+    # Starlette 先把 scope 拼成完整 URL 再 urlsplit，于是路径里解码出来的 `#`
+    # 会把它截断：scope["path"]="/research/v1/#subjects" 到这里变成
+    # "/research/v1/"。中间件据此判权限（落到宽松的命名空间兜底），路由器却按
+    # 未截断的那个匹配到 /research/v1/{dataset_key} 并真的进了处理器。
+    # 一句话：**授权跑在一条路径上，路由跑在另一条上**。
+    # 2026-08-15 实测：researcher 打 /research/v1/%23subjects 拿到的是处理器内
+    # 部的 404 而不是红线要求的 403。今天没漏数据，只因为每个研究处理器自己
+    # 还有一道 data_steward/admin 闸——纵深防御兜住了，不等于第一道门是对的。
+    path = request.scope.get("path") or request.url.path
     raw_path_value = request.scope.get("raw_path")
     raw_path = (
         raw_path_value.decode("latin-1")
@@ -7544,12 +7553,16 @@ def get_research_dataset(
 
     CSV 与 JSON 共用同一份行投影，结构上不可能出现"网页上看到的和导出的不一样"。
     """
+    # 角色判定排在一切之前。原来它排在 422（缺参）与 404（未知数据集）之后，
+    # 于是一个本该 403 的 researcher 可以用不同的 dataset_key 打出 404 与 200 的
+    # 差分，从而枚举出有哪些数据集——那是他无权知道的事。判定顺序本身就是
+    # 授权面的一部分：先确认你是谁，再谈你问的东西存不存在。
+    actor_id = _require_account_identity(
+        request, "读取去标识研究数据", roles={"data_steward", "admin"})
     wants_csv = dataset_key.endswith(".csv")
     if wants_csv:
         dataset_key = dataset_key[: -len(".csv")]
     if dataset_key == "dictionary":
-        _require_account_identity(request, "导出研究数据字典",
-                                  roles={"data_steward", "admin"})
         _research_query_guard(request, set())
         if not wants_csv:
             raise _research_reject(
@@ -7564,12 +7577,13 @@ def get_research_dataset(
         raise _research_reject(
             "research_dataset_unknown",
             f"未知数据集；可用的是 {list(research_dataset.dataset_keys())}", 404)
-    actor_id = _require_account_identity(
-        request, "读取去标识研究数据", roles={"data_steward", "admin"})
     _research_query_guard(request, {"data_classification", "cursor", "limit"})
+    # 这个路径不是真实 URL 的形状——`/research/v1/dataset` 会被
+    # `{dataset_key}` 匹配到，等于自己给自己开了一个可达入口并重复计费。
+    # 用一个 URL 里不可能出现的记号，只当限速桶的名字。
     limited = _expensive_rate_limit(
         request, f"account:{actor_id}:{_client_ip(request)}",
-        resource_path="/research/v1/dataset")
+        resource_path="@research-read")
     if limited is not None:
         return limited
     response.headers.update(_RESEARCH_NO_STORE)

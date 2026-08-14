@@ -6,15 +6,19 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
 import re
 
 import pytest
+from fastapi import HTTPException, Response
 from fastapi.testclient import TestClient
+from starlette.datastructures import QueryParams, URL
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import (auth, content, db, export_security, repeat_intent,
-                 research_dataset, session_admission)
+                 main, research_dataset, session_admission)
 from app.db import get_session
 from app.main import app
 from app.models import (
@@ -575,3 +579,91 @@ def test_withdrawn_is_a_real_boolean_on_every_dataset_not_a_missing_value(
         for row in rows:
             assert isinstance(row["withdrawn"], bool), \
                 f"{dataset} 的 withdrawn 是 {row['withdrawn']!r}，不是布尔"
+
+
+ODD_SPELLINGS = (
+    "/research/v1/%23subjects?data_classification=research",
+    "/research/v1/subjects/?data_classification=research",
+    "/research/v1/?data_classification=research",
+    "/research/v1/a/b?data_classification=research",
+)
+
+
+def test_odd_path_spellings_get_the_same_verdict_as_the_canonical_one(
+        research_env, monkeypatch):
+    """换个拼法不能换来一个更宽松的判定。
+
+    2026-08-15 实测：`/research/v1/%23subjects` 里解码出的 `#` 把中间件读的
+    `request.url.path` 截断成 `/research/v1/`，权限落到含 researcher 的命名空间
+    兜底，路由器却照未截断的路径把请求送进了研究处理器——researcher 拿到的是
+    处理器内部的 404 而不是红线要求的 403。
+    """
+    _with_key(monkeypatch)
+    researcher = _client("researcher")
+    caregiver = _client("caregiver")
+    anonymous = TestClient(app)
+    for path in ODD_SPELLINGS:
+        assert researcher.get(path).status_code in (403, 404), path
+        body = researcher.get(path).json()
+        assert "subjects" not in str(body.get("detail", "")) or \
+            researcher.get(path).status_code == 403, \
+            f"{path} 把数据集清单漏给了 researcher"
+        assert caregiver.get(path).status_code in (403, 404), path
+        assert anonymous.get(path).status_code == 401, path
+
+
+def test_the_handler_authorizes_before_it_answers_whether_a_dataset_exists(
+        research_env, monkeypatch):
+    """角色判定要排在"你问的东西存不存在"之前——这里直接打处理器。
+
+    原来 422（缺参）与 404（未知数据集）都排在角色校验前面：一个本该 403 的
+    调用者可以用不同的 dataset_key 打出 404 与 200 的差分，把有哪些数据集枚举
+    出来。
+
+    **不能用 TestClient 测这一条**：命名空间规则修好之后，中间件会先答 403，
+    处理器内的顺序在 HTTP 层不再可观测。而中间件不判角色的场合是存在的
+    （回环 M0 开放模式），那时处理器内这道闸是唯一防线。所以这里绕过中间件，
+    直接调处理器函数。
+    """
+    _with_key(monkeypatch)
+
+    class _FakeRequest:
+        method = "GET"
+
+        def __init__(self):
+            self.state = SimpleNamespace(actor="RESEARCHER", actor_role="researcher")
+            self.query_params = QueryParams("data_classification=research")
+            self.url = URL("http://t/research/v1/x")
+            self.client = None
+            self.headers = {}
+
+    seen = set()
+    for key in ("subjects", "turns", "不存在的表", "dictionary", "subjects.csv"):
+        with pytest.raises(HTTPException) as caught:
+            main.get_research_dataset(
+                key, _FakeRequest(), Response(),
+                data_classification=None, cursor=None, limit=None,
+                s=next(iter([None])))
+        seen.add(caught.value.status_code)
+    assert seen == {403}, (
+        f"处理器对 researcher 给出了不止一种回答：{sorted(seen)}——"
+        "存在与否、参数齐不齐，都不该在鉴权之前被回答")
+
+
+def test_deleting_the_in_handler_role_checks_makes_the_suite_go_red(
+        research_env, monkeypatch):
+    """处理器内那四道角色闸必须有测试盯着。
+
+    复核实测：把四处 _require_account_identity 全删掉，整套测试仍然 134 全绿——
+    因为中间件那一层先拒了，测试从来没走到处理器里那道闸。而在回环 M0 开放模式
+    下（auth 未启用），中间件不判角色，处理器内那道闸是唯一的防线。
+    """
+    _with_key(monkeypatch)
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    block = source.split("# 只读研究数据面 /research/v1/*")[1].split("\n@app.get(\n    \"/ai/provider-readiness\"")[0]
+    guards = block.count("_require_account_identity(")
+    assert guards >= 3, (
+        f"研究面只剩 {guards} 处处理器内角色闸；中间件之外必须还有一道，"
+        "回环 M0 开放模式下它是唯一防线")
+    for action in ("查看研究数据接口状态", "查看研究数据字典", "读取去标识研究数据"):
+        assert action in block, f"少了 {action} 那一道闸"

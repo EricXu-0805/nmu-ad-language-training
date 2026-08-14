@@ -1,5 +1,6 @@
 """认证主体矩阵：匿名 / 老人端 PIN / 具名账号 / 未知角色。"""
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from fastapi.routing import APIRoute
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import access_policy, audio_store, auth, db
+from app import access_policy, audio_store, auth, db, main
 from app.main import app
 from app.models import (AttemptEvent, AudioAssetRow, AuditLog, AuthSession, ItemEvent,
                         Patient, PatientDeviceCapability, ResearchUser,
@@ -1800,3 +1801,50 @@ def test_research_read_surface_is_governance_only_and_has_no_write_verb():
         assert not access_policy.mutation_route_is_classified(
             method, "/research/v1/turns"), (
             "研究数据面必须零写入口；出现写路由说明范围被悄悄扩大了")
+
+
+def test_the_guard_decides_on_the_same_path_the_router_matches():
+    """授权判定与路由匹配必须用同一个字符串。
+
+    `request.url.path` 不是那个字符串：Starlette 先把 scope 拼成完整 URL 再
+    urlsplit，路径里解码出来的 `#` 会把它截断。2026-08-15 实测：
+    scope["path"]="/research/v1/#subjects" 在中间件那里变成 "/research/v1/"，
+    于是权限落到宽松的命名空间兜底，路由器却照 `{dataset_key}` 把请求送进了
+    研究处理器——授权跑在一条路径上，路由跑在另一条上。
+
+    行为层的证据在 tests/test_research_read_api.py 里跑真 HTTP；这里只钉住
+    判定源本身，因为它是全站每一条路由共用的那一行。
+    """
+    from starlette.datastructures import URL
+    scope = {
+        "type": "http", "scheme": "http", "server": ("t", 80),
+        "path": "/research/v1/#subjects", "query_string": b"", "headers": [],
+    }
+    assert URL(scope=scope).path != scope["path"], (
+        "这条测试的前提是 request.url.path 会被截断；Starlette 若改了行为，"
+        "这里就是空转，要重新审这一处")
+    # 直接读源文件而不是 inspect：@app.middleware 装饰器只做注册，
+    # 模块里那个名字未必还指向函数对象。
+    source = (Path(main.__file__).read_text(encoding="utf-8")
+              .split("async def console_auth_guard")[1].split("\n@app.")[0])
+    assert 'request.scope.get("path")' in source, \
+        "中间件的判定源必须是 scope['path']，不能是 request.url.path"
+    assert "path = request.url.path" not in source, "又退回 request.url.path 了"
+
+
+def test_the_whole_research_namespace_is_governance_only_however_you_spell_it():
+    """收窄一个命名空间，边界不能写成"恰好当前这些路由的形状"。
+
+    第一版是 `/research/v1/[^/]+`，只 fullmatch 一段——`/research/v1/`、
+    `/research/v1/subjects/`、`/research/v1/a/b`、`/research/v2/x` 全都掉回
+    命名空间兜底，而兜底的默认角色集里有 researcher。
+    """
+    for path in ("/research", "/research/", "/research/v1", "/research/v1/",
+                 "/research/v1/subjects", "/research/v1/subjects/",
+                 "/research/v1/subjects.csv", "/research/v1/a/b/c",
+                 "/research/v2/whatever", "/research/v1/#subjects"):
+        for method in ("GET", "HEAD"):
+            rule = access_policy.access_rule(method, path)
+            assert rule.kind is access_policy.AccessKind.ACCOUNT, f"{method} {path}"
+            assert rule.roles == access_policy.DATA_GOVERNANCE_ROLES, \
+                f"{method} {path} 落到了 {sorted(rule.roles)}"
