@@ -11,7 +11,8 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 代码版本 | `d8d3edd`（2026-08-14 09:52 上线） | 部署树里有 `app/research_read.py`、`scripts/content_gap_workbook.py`、`web/dist` 里有 `AcceptanceScreen-*.js` |
+| 应用代码版本 | `d8d3edd`（2026-08-14 09:52 上线） | 部署树里有 `app/research_read.py`、`scripts/content_gap_workbook.py`、`web/dist` 里有 `AcceptanceScreen-*.js` |
+| 部署树后续同步 | 同日又同步过文档、Mac 侧安装器与测试；**`app/`、`web/dist`、`alembic/` 一个字节没变**，服务未重启 | `git diff d8d3edd..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b3e7c5a9d214` | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `2d50ce0cad5f7813a5c3` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 一致 |
 | 回滚存档 | `/opt/nmu/app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
@@ -42,7 +43,7 @@
 
 ## 待上线增量
 
-无。`main` 与生产同为 `d8d3edd`。
+无。`main` 与生产部署树一致。
 
 ## 这次上线踩的三个坑（下次照 runbook §4.1 走可以全避开）
 
