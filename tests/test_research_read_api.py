@@ -516,7 +516,7 @@ def test_turn_tombstones_keep_the_natural_key_so_the_denominator_survives(
                 asr_text=SECRET_TEXT, prompt_level=1, ai_score=0.0,
                 judge_portrait_used=False))
         session.commit()
-    before = client_rows = _client("steward").get(
+    before = _client("steward").get(
         "/research/v1/turns?data_classification=research").json()["rows"]
     live = [r for r in before if r["session_code"]]
     assert len(live) == 4, "先确认这个场次真的有 4 个环节，否则下面是空转"
