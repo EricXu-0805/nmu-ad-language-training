@@ -172,16 +172,27 @@ def list_subjects(db: DBSession, *, config, data_classification: str,
 
     rows = []
     for patient in page:
-        withdrawn = _is_withdrawn(patient)
+        subject_code = export_security.pseudonymize_subject(
+            patient.patient_id, config)
+        count = session_counts.get(patient.patient_id, 0)
+        if _is_withdrawn(patient):
+            # 撤回者也走墓碑。第一版只把 withdrawn 置 true、其余临床属性照发，
+            # 于是 secondary_use_allowed 仍是 true——那等于对 PI 说"这个人可以
+            # 二次利用"，而他恰恰撤回了。场次数留着，因为分母要稳。
+            rows.append(_tombstone("subjects", {
+                "subject_code": subject_code,
+                "withdrawn": True,
+                "session_count": count,
+            }))
+            continue
         rows.append({
-            "subject_code": export_security.pseudonymize_subject(
-                patient.patient_id, config),
+            "subject_code": subject_code,
             "dementia_severity": patient.dementia_severity,
             "mandarin_eligible": patient.mandarin_eligible,
             "is_simulation_subject": bool(patient.is_simulation_subject),
             "secondary_use_allowed": patient.secondary_use_allowed,
-            "withdrawn": withdrawn,
-            "session_count": session_counts.get(patient.patient_id, 0),
+            "withdrawn": False,
+            "session_count": count,
         })
     next_cursor = (encode_cursor([page[-1].patient_id], config, "subjects")
                    if page and has_more else None)
@@ -219,7 +230,7 @@ def list_sessions(db: DBSession, *, config, data_classification: str,
             # 的旁路。发一行无内容的墓碑行，分母保持稳定。
             rows.append(_tombstone("sessions", {
                 "session_code": session_code, "subject_code": subject_code,
-                "pseudonym_key_id": config.key_id,
+                "withdrawn": True, "pseudonym_key_id": config.key_id,
             }))
             continue
         rows.append({
@@ -234,6 +245,7 @@ def list_sessions(db: DBSession, *, config, data_classification: str,
             "data_classification": sess.data_classification,
             "item_bank_version_id": sess.item_bank_version_id,
             "autopilot_profile_version_id": sess.autopilot_profile_version_id,
+            "withdrawn": False,
             "pseudonym_key_id": config.key_id,
         })
     next_cursor = (encode_cursor([page[-1].session_id], config, "sessions")
@@ -272,9 +284,16 @@ def list_turns(db: DBSession, *, config, data_classification: str,
                     has_more = True
                     break
                 if sess.patient_id in withdrawn:
+                    # 自然键必须留着。全置 null 会让一个 36 环节的场次返回 36 行
+                    # 逐字节相同的行，`distinct()` 一跑塌成 1——而墓碑存在的唯一
+                    # 理由就是保住这个分母。item_id 与 turn_seq 本来就是公开列，
+                    # 不是标识符。
                     rows.append(_tombstone("turns", {
                         "session_code": session_code,
                         "subject_code": subject_code,
+                        "item_id": item.item_id,
+                        "turn_seq": turn.turn_seq,
+                        "withdrawn": True,
                     }))
                 else:
                     rows.append(_turn_row(
@@ -313,6 +332,9 @@ def _turn_row(session_code: str, subject_code: str,
         "element_value": getattr(turn.element_value, "value", turn.element_value),
         "ai_human_diff": diff,
         "judge_portrait_used": turn.judge_portrait_used,
+        # 在训的人必须是 False 而不是 null：SPSS 里 null 是缺失值，
+        # `filter withdrawn = 0` 会把在训的人一起滤掉。
+        "withdrawn": False,
     }
 
 

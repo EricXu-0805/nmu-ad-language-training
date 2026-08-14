@@ -84,6 +84,10 @@ _SESSIONS = Dataset(
         Column("data_classification", "clear", "string", "数据分区：research / simulation"),
         Column("item_bank_version_id", "clear", "string", "冻结题库版本"),
         Column("autopilot_profile_version_id", "clear", "string", "自动驾驶计划档版本"),
+        Column("withdrawn", "clear", "boolean",
+               "该场次的受试者是否已登记研究撤回。撤回者的行是墓碑：除编号、"
+               "自然键与本列外全为空。**统计时必须先按本列过滤**——行还在是为了"
+               "让分母稳定，不是为了让内容可用"),
         Column("pseudonym_key_id", "clear", "string",
                "生成本次假名的密钥标识；两次导出此值不同就不能 join"),
         Column("training_date", "forbidden", "-", "绝对日期：永不出现，只出相对量"),
@@ -114,6 +118,10 @@ _TURNS = Dataset(
         Column("ai_human_diff", "clear", "float", "人工分减 AI 分，两者皆有时才有值"),
         Column("judge_portrait_used", "clear", "boolean",
                "判分是否用过画像：恒为 false，这一列是★画像不进判分的审计证据"),
+        Column("withdrawn", "clear", "boolean",
+               "该环节的受试者是否已登记研究撤回。撤回者的行是墓碑：自然键"
+               "（item_id / turn_seq）与本列保留，其余全为空。**统计时必须先按"
+               "本列过滤**——行还在是为了让分母稳定，不是为了让内容可用"),
         Column("asr_text", "forbidden", "-", "语音识别原文：永不出现"),
         Column("confirmed_response_text", "forbidden", "-", "人工确认作答文本：永不出现"),
         Column("judge_reason", "forbidden", "-", "AI 判分理由：永不出现"),

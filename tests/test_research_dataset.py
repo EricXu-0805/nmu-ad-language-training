@@ -80,3 +80,26 @@ def test_csv_rendering_neutralises_formula_injection():
             stripped = cell.strip('"')
             assert (stripped[:1] not in {"=", "+", "-", "@"}
                     or stripped.startswith("'")), cell
+
+
+def test_the_handover_doc_and_the_registry_cannot_drift_apart():
+    """文档说什么、注册表出什么，必须对得上。
+
+    2026-08-14 的复核发现文档 §4.2 要求"统计时按 withdrawn 过滤"，而
+    sessions / turns 两张主力表里根本没有这一列——写给 PI 的指令不可执行。
+    这条测试把两边钉在一起。
+    """
+    from pathlib import Path
+    doc = (Path(__file__).resolve().parents[1]
+           / "docs/handover/研究数据接口使用说明.md").read_text(encoding="utf-8")
+    assert "统计时按 `withdrawn` 过滤" in doc, "文档改了措辞，这条断言要跟着改"
+    for dataset in rd.DATASETS:
+        assert "withdrawn" in rd.published_columns(dataset), \
+            f"文档要求按 withdrawn 过滤，但 {dataset.key} 没有这一列"
+    # 文档声明的自然键，三列必须都在 turns 的发布列里，否则墓碑一置空就塌行
+    turns = rd.dataset_for("turns")
+    assert turns is not None
+    for column in ("session_code", "item_id", "turn_seq"):
+        assert column in rd.published_columns(turns), column
+    assert "(`session_code`, `item_id`, `turn_seq`)" in doc or \
+        "`(session_code, item_id, turn_seq)`" in doc, "文档里的自然键写法变了"

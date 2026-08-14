@@ -488,3 +488,90 @@ def test_every_research_read_leaves_an_audit_entry_without_identifiers(
         assert row.actor == "STEWARD"
         for secret in ("P-REAL-1", "S-REAL-1", "P-GONE-1", SECRET_TEXT):
             assert secret not in row.summary, f"账本自己漏了 {secret}"
+
+
+def _withdraw(engine, patient_id: str) -> None:
+    with Session(engine) as session:
+        patient = session.get(Patient, patient_id)
+        patient.withdrawal_status = "withdrawn"
+        session.add(patient)
+        session.commit()
+
+
+def test_turn_tombstones_keep_the_natural_key_so_the_denominator_survives(
+        research_env, monkeypatch):
+    """墓碑存在的唯一理由就是保住分母，而第一版恰好毁了它。
+
+    第一版把 item_id 与 turn_seq 一起置 null，于是一个 36 环节的场次返回 36 行
+    逐字节相同的行——PI 一跑 distinct() 就塌成 1 行，分母从 36 变 1。
+    这两列本来就是公开列（``clear``），不是标识符，没有任何理由抹掉。
+    """
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        item = session.exec(select(ItemEvent).where(
+            ItemEvent.session_id == "S-REAL-1")).first()
+        for seq in (2, 3, 4):
+            session.add(TurnEvent(
+                item_event_id=item.id, turn_seq=seq, response_role="命名",
+                asr_text=SECRET_TEXT, prompt_level=1, ai_score=0.0,
+                judge_portrait_used=False))
+        session.commit()
+    before = client_rows = _client("steward").get(
+        "/research/v1/turns?data_classification=research").json()["rows"]
+    live = [r for r in before if r["session_code"]]
+    assert len(live) == 4, "先确认这个场次真的有 4 个环节，否则下面是空转"
+
+    _withdraw(research_env, "P-REAL-1")
+    after = _client("steward").get(
+        "/research/v1/turns?data_classification=research").json()["rows"]
+    assert len(after) == len(before), "撤回后行数变了，分母就不稳了"
+
+    keys = {(r["session_code"], r["item_id"], r["turn_seq"]) for r in after}
+    assert len(keys) == len(after), "自然键不唯一——distinct() 一跑就塌行"
+    for row in after:
+        assert row["withdrawn"] is True
+        assert row["item_id"] and row["turn_seq"] is not None, "自然键被抹掉了"
+        assert row["ai_score"] is None and row["prompt_level"] is None, \
+            "撤回者的内容不该还在"
+
+
+def test_a_withdrawn_subject_row_stops_claiming_secondary_use_is_allowed(
+        research_env, monkeypatch):
+    """撤回者的 secondary_use_allowed 还是 true，等于对 PI 说"这人可以二次利用"。"""
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        patient = session.get(Patient, "P-REAL-1")
+        patient.secondary_use_allowed = True
+        session.add(patient)
+        session.commit()
+    _withdraw(research_env, "P-REAL-1")
+    config = export_security.load_deidentification_config()
+    code = export_security.pseudonymize_subject("P-REAL-1", config)
+    rows = _client("steward").get(
+        "/research/v1/subjects?data_classification=research").json()["rows"]
+    row = next(r for r in rows if r["subject_code"] == code)
+    assert row["withdrawn"] is True
+    assert row["secondary_use_allowed"] is None, "撤回者仍在声称可以二次利用"
+    assert row["dementia_severity"] is None, "撤回者的临床属性仍在照发"
+    assert row["session_count"] == 1, "场次数要留着，分母才稳"
+
+
+def test_withdrawn_is_a_real_boolean_on_every_dataset_not_a_missing_value(
+        research_env, monkeypatch):
+    """交接文档要求"统计时按 withdrawn 过滤"，那三张表就都得有这一列。
+
+    而且在训的人必须是 False 而不是 null——SPSS 里 null 是缺失值，
+    `filter withdrawn = 0` 会把在训的人一起滤掉。
+    """
+    _with_key(monkeypatch)
+    client = _client("steward")
+    for dataset in research_dataset.dataset_keys():
+        columns = research_dataset.published_columns(
+            research_dataset.dataset_for(dataset))
+        assert "withdrawn" in columns, f"{dataset} 没有 withdrawn 列"
+        rows = client.get(
+            f"/research/v1/{dataset}?data_classification=research").json()["rows"]
+        assert rows, f"{dataset} 零行，这条断言是空转"
+        for row in rows:
+            assert isinstance(row["withdrawn"], bool), \
+                f"{dataset} 的 withdrawn 是 {row['withdrawn']!r}，不是布尔"
