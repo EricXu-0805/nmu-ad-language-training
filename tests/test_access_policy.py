@@ -1,4 +1,5 @@
 """认证主体矩阵：匿名 / 老人端 PIN / 具名账号 / 未知角色。"""
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -1848,3 +1849,78 @@ def test_the_whole_research_namespace_is_governance_only_however_you_spell_it():
             assert rule.kind is access_policy.AccessKind.ACCOUNT, f"{method} {path}"
             assert rule.roles == access_policy.DATA_GOVERNANCE_ROLES, \
                 f"{method} {path} 落到了 {sorted(rule.roles)}"
+
+
+def _namespace_fallback_reads() -> list[str]:
+    """靠命名空间兜底、而非显式规则拿到分类的 GET/HEAD。"""
+    found = []
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        for method in sorted(route.methods or set()):
+            if method not in {"GET", "HEAD"}:
+                continue
+            sample = re.sub(r"\{[^}]+\}", "X", route.path)
+            explicit = any(rule.matches(method, sample)
+                           for rule in access_policy._ROUTE_RULES)  # noqa: SLF001
+            if not explicit and access_policy.protected_api_namespace_alias(sample):
+                found.append(f"{method} {route.path}")
+    return sorted(found)
+
+
+def test_routes_that_rely_on_the_namespace_fallback_are_enumerated():
+    """read_route_is_classified 只判"分没分类"，不判"分给了谁"。
+
+    命名空间兜底给的是 KNOWN_ACCOUNT_ROLES——里面有 researcher。所以一条新的
+    GET 只要落在受保护命名空间里，就算"已分类"，哪怕作者从没想过 researcher
+    该不该读它。**"故意靠兜底"和"忘了分类"今天长得一模一样。**
+
+    这份名单是穷举：新增一条落到兜底的读路由，这里必须同时加进来，
+    也就必须为"researcher 可以读它"这件事做一次明确决定。
+    """
+    deliberately_on_fallback = {
+        # 研究者本来就要读自己带的场次、题库、录音与实时状态——兜底角色集
+        # （含 researcher）正是这些路由想要的策略，不是疏忽。
+        "GET /cloud-processing/policy",
+        "GET /patients/{patient_id}/sessions",
+        "GET /sessions/{session_id}",
+        "GET /sessions/{session_id}/runtime",
+        "GET /sessions/{session_id}/attempts",
+        "GET /sessions/{session_id}/journal",
+        "GET /sessions/{session_id}/scores",
+        "GET /content/item-bank",
+        "GET /content/scale-protocol",
+        "GET /audio/{raw_audio_id}",
+        "GET /audio/{raw_audio_id}/blob",
+        "GET /live/console-state",
+        "GET /asr/hotwords",
+        "GET /tts/speak",
+    }
+    actual = set(_namespace_fallback_reads())
+    added = sorted(actual - deliberately_on_fallback)
+    removed = sorted(deliberately_on_fallback - actual)
+    assert not added, (
+        "这些读路由落在命名空间兜底上，于是 researcher 也能读。"
+        "确认这是你想要的策略后再加进名单；不是的话请写显式规则：" + str(added))
+    assert not removed, (
+        "名单里这些路由不在兜底上了（可能已加显式规则或被删）。"
+        "把它们从名单去掉，否则名单会慢慢变成摆设：" + str(removed))
+
+
+def test_the_route_table_has_no_unreviewed_non_api_entries():
+    """路由覆盖测试只枚举 APIRoute——Mount 之类的注册方式它看不见。
+
+    今天非 APIRoute 的只有 FastAPI 自带的四条文档路由（生产必须 404，
+    由 preflight 的红线检查盯着）和 /assets 静态挂载。多出任何一条，
+    说明有人用覆盖测试照不到的方式加了东西。
+    """
+    others = sorted(
+        f"{type(route).__name__} {getattr(route, 'path', '?')}"
+        for route in app.routes if not isinstance(route, APIRoute))
+    assert others == [
+        "Mount /assets",
+        "Route /docs",
+        "Route /docs/oauth2-redirect",
+        "Route /openapi.json",
+        "Route /redoc",
+    ], others
