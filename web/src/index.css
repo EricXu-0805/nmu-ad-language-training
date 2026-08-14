@@ -667,6 +667,18 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .quality-confusion-matrix td[data-state="suppressed"] { background: var(--c-warn-bg); color: var(--c-warn-text); }
 .quality-confusion-matrix abbr { text-decoration: none; }
 .quality-confusion-matrix-region:focus-visible { outline-offset: 3px; }
+.acceptance-step {
+  border: 1px solid var(--c-line-soft);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-3) var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+.acceptance-step h3 { margin: 0; font-size: var(--text-base); }
+.acceptance-build-id { margin: 0; word-break: break-all; font-size: var(--text-sm); }
+.acceptance-step p { margin: 0; }
+
 .research-table-region {
   max-width: 100%;
   overflow-x: auto;

@@ -12,6 +12,9 @@ const PatientShell = lazy(async () => ({
 const DeviceCheckScreen = lazy(async () => ({
   default: (await import("./device/DeviceCheckScreen")).DeviceCheckScreen,
 }));
+const AcceptanceScreen = lazy(async () => ({
+  default: (await import("./acceptance/AcceptanceScreen")).AcceptanceScreen,
+}));
 
 // 两路由:/console 操作端 · /patient 老人端。零外链(硬约束3)。SPA fallback 由 main.py 提供,clean URL 可刷新。
 export default function App() {
@@ -37,6 +40,13 @@ export default function App() {
         <Route path="/device-check" element={
           <Boundary variant="console">
             <Suspense fallback={<ConsoleLoading />}><DeviceCheckScreen /></Suspense>
+          </Boundary>
+        } />
+        {/* 目标设备的八项验收记录:同样不登录、不碰受试者数据,只在本机产出回执。
+            刻意不依赖服务器——验收当天可能正好在验"断网会怎样"。 */}
+        <Route path="/acceptance" element={
+          <Boundary variant="console">
+            <Suspense fallback={<ConsoleLoading />}><AcceptanceScreen /></Suspense>
           </Boundary>
         } />
         <Route path="*" element={<Navigate to="/" replace />} />
@@ -264,7 +274,8 @@ function Landing() {
       <p className="landing-note">
         一台设备即可完成全程：进入操作端建好场次，点「受试者画面」全屏切给受试者，研究者按住角落按钮返回。
         也支持双窗/双设备同步运行。
-        首次在新设备或新房间使用，先跑一遍<Link to="/device-check">设备基础检查</Link>（约 20 秒，测麦克风、噪声、网络与播放）。
+        首次在新设备或新房间使用，先跑一遍<Link to="/device-check">设备基础检查</Link>（约 20 秒，测麦克风、噪声、网络与播放），
+        再按<Link to="/acceptance">真机验收八项</Link>逐项记录。
       </p>
       <p className="landing-note">
         当前仅限模拟预演和受控技术验证，不得用于正式受试者采集。启用云服务后，固定话术、回答音频或回答文本会按所用能力发送至第三方云端；AI 实时判断不是正式研究评分。
