@@ -10,8 +10,13 @@
   - 序列化之前统一过 ``export_security.assert_deidentified_sheets``。
 
 分页用 keyset 而不是 offset：offset 在并发写入下会漏行或重行，而研究取数最不该
-出现的就是"每次拉到的行数不一样"。游标对外不透明，且用去标识密钥签名——它编码
-的是自然键，签名只是防止有人手改游标去试探不属于自己的范围。
+出现的就是"每次拉到的行数不一样"。
+
+游标里装的是数据库自然键（patient_id / session_id），**那是本接口明令禁出的直接
+标识符**，所以它必须是真加密而不是只签名。第一版只做了 HMAC 签名、载荷是明文
+base64，`encode_cursor(["P-REAL-042"])` 解码出来就是 `["P-REAL-042"]`——签名防的是
+篡改，从来不防读。现在走 AES-GCM（密钥由去标识密钥分域派生），密文与随机 nonce
+一起编码；游标同时绑定数据集名，跨数据集复用会被拒而不是静默截断。
 """
 from __future__ import annotations
 
@@ -21,11 +26,13 @@ import hashlib
 import hmac
 import io
 import json
+import secrets
 from typing import Any, Iterable
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlmodel import Session as DBSession, select
 
-from . import export_security, research_dataset
+from . import export_security, research_dataset, session_admission
 from .models import ItemEvent, Patient, Session, TurnEvent
 
 
@@ -55,43 +62,54 @@ def load_config() -> export_security.DeidentificationConfig:
 # ---------------------------------------------------------------------------
 # 游标
 # ---------------------------------------------------------------------------
-def _sign(payload: bytes, config: export_security.DeidentificationConfig) -> str:
-    digest = hmac.new(config.key, b"nmu-research-cursor:v1\x00" + payload,
-                      hashlib.sha256).digest()[:16]
-    return base64.urlsafe_b64encode(payload + digest).decode("ascii").rstrip("=")
+_CURSOR_VERSION = b"\x02"
+_CURSOR_NONCE_BYTES = 12
+_CURSOR_INVALID = "分页游标无效，请从第一页重新开始"
+
+
+def _cursor_key(config: export_security.DeidentificationConfig) -> bytes:
+    """分域派生：游标密钥与假名密钥同源但不同域，互相拿不到对方。"""
+    return hmac.new(config.key, b"nmu-research-cursor-aead:v2",
+                    hashlib.sha256).digest()
+
+
+def _cursor_reject() -> ResearchReadUnavailable:
+    return ResearchReadUnavailable("research_cursor_invalid", _CURSOR_INVALID)
 
 
 def encode_cursor(key: list[Any],
-                  config: export_security.DeidentificationConfig) -> str:
-    return _sign(json.dumps(key, ensure_ascii=False,
-                            separators=(",", ":")).encode("utf-8"), config)
+                  config: export_security.DeidentificationConfig,
+                  dataset: str) -> str:
+    """把自然键加密成游标。dataset 进 AAD，跨数据集复用会解不开。"""
+    payload = json.dumps(key, ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+    nonce = secrets.token_bytes(_CURSOR_NONCE_BYTES)
+    sealed = AESGCM(_cursor_key(config)).encrypt(
+        nonce, payload, _CURSOR_VERSION + dataset.encode("utf-8"))
+    return base64.urlsafe_b64encode(
+        _CURSOR_VERSION + nonce + sealed).decode("ascii").rstrip("=")
 
 
 def decode_cursor(cursor: str,
-                  config: export_security.DeidentificationConfig) -> list[Any]:
+                  config: export_security.DeidentificationConfig,
+                  dataset: str) -> list[Any]:
     padded = cursor + "=" * (-len(cursor) % 4)
     try:
         blob = base64.urlsafe_b64decode(padded.encode("ascii"))
     except Exception as exc:
-        raise ResearchReadUnavailable(
-            "research_cursor_invalid", "分页游标无效，请从第一页重新开始") from exc
-    if len(blob) <= 16:
-        raise ResearchReadUnavailable(
-            "research_cursor_invalid", "分页游标无效，请从第一页重新开始")
-    payload, digest = blob[:-16], blob[-16:]
-    expected = hmac.new(config.key, b"nmu-research-cursor:v1\x00" + payload,
-                        hashlib.sha256).digest()[:16]
-    if not hmac.compare_digest(digest, expected):
-        raise ResearchReadUnavailable(
-            "research_cursor_invalid", "分页游标无效，请从第一页重新开始")
+        raise _cursor_reject() from exc
+    if len(blob) <= 1 + _CURSOR_NONCE_BYTES or blob[:1] != _CURSOR_VERSION:
+        raise _cursor_reject()
+    nonce = blob[1:1 + _CURSOR_NONCE_BYTES]
     try:
+        payload = AESGCM(_cursor_key(config)).decrypt(
+            nonce, blob[1 + _CURSOR_NONCE_BYTES:],
+            _CURSOR_VERSION + dataset.encode("utf-8"))
         decoded = json.loads(payload.decode("utf-8"))
     except Exception as exc:
-        raise ResearchReadUnavailable(
-            "research_cursor_invalid", "分页游标无效，请从第一页重新开始") from exc
+        raise _cursor_reject() from exc
     if not isinstance(decoded, list):
-        raise ResearchReadUnavailable(
-            "research_cursor_invalid", "分页游标无效，请从第一页重新开始")
+        raise _cursor_reject()
     return decoded
 
 
@@ -113,13 +131,27 @@ def _page(rows: list[Any], limit: int) -> tuple[list[Any], bool]:
     return (rows[:limit], len(rows) > limit)
 
 
+def _is_withdrawn(patient: Patient) -> bool:
+    """撤回判定直接借全仓那一个，不在这里另写一份。
+
+    第一版在这里自建了白名单（放行 "active"/"not_withdrawn"），而且只看
+    ``withdrawal_status``。两处都错：口径一分岔，同一个受试者会在别处算已撤回、
+    在这里算在训，全量明细照出；而**撤回还有一支只体现在知情同意字段上**
+    （见 ``main.py`` 里那句"A legacy record may express study withdrawal only
+    through the consent field"），只看 withdrawal_status 会整支漏掉。
+    ``session_admission.patient_content_sealed`` 是全仓的权威判据，六个别的读面
+    都用它。宁可多发墓碑，不可少发。
+    """
+    return session_admission.patient_content_sealed(patient)
+
+
 def _subject_is_research(patient: Patient) -> bool:
     return not bool(patient.is_simulation_subject)
 
 
 def list_subjects(db: DBSession, *, config, data_classification: str,
                   cursor: str | None, limit: int) -> dict[str, Any]:
-    after = decode_cursor(cursor, config)[0] if cursor else None
+    after = decode_cursor(cursor, config, "subjects")[0] if cursor else None
     statement = select(Patient).order_by(Patient.patient_id)
     if after is not None:
         statement = statement.where(Patient.patient_id > after)
@@ -140,8 +172,7 @@ def list_subjects(db: DBSession, *, config, data_classification: str,
 
     rows = []
     for patient in page:
-        withdrawn = str(patient.withdrawal_status or "").lower() not in {
-            "", "none", "active", "not_withdrawn"}
+        withdrawn = _is_withdrawn(patient)
         rows.append({
             "subject_code": export_security.pseudonymize_subject(
                 patient.patient_id, config),
@@ -152,7 +183,7 @@ def list_subjects(db: DBSession, *, config, data_classification: str,
             "withdrawn": withdrawn,
             "session_count": session_counts.get(patient.patient_id, 0),
         })
-    next_cursor = (encode_cursor([page[-1].patient_id], config)
+    next_cursor = (encode_cursor([page[-1].patient_id], config, "subjects")
                    if page and has_more else None)
     return _envelope("subjects", rows, next_cursor, has_more, config)
 
@@ -160,15 +191,14 @@ def list_subjects(db: DBSession, *, config, data_classification: str,
 def _withdrawn_patient_ids(db: DBSession) -> set[str]:
     withdrawn: set[str] = set()
     for patient in db.exec(select(Patient)):
-        if str(patient.withdrawal_status or "").lower() not in {
-                "", "none", "active", "not_withdrawn"}:
+        if _is_withdrawn(patient):
             withdrawn.add(patient.patient_id)
     return withdrawn
 
 
 def list_sessions(db: DBSession, *, config, data_classification: str,
                   cursor: str | None, limit: int) -> dict[str, Any]:
-    after = decode_cursor(cursor, config)[0] if cursor else None
+    after = decode_cursor(cursor, config, "sessions")[0] if cursor else None
     statement = select(Session).where(
         Session.data_classification == data_classification,
     ).order_by(Session.session_id)
@@ -206,14 +236,14 @@ def list_sessions(db: DBSession, *, config, data_classification: str,
             "autopilot_profile_version_id": sess.autopilot_profile_version_id,
             "pseudonym_key_id": config.key_id,
         })
-    next_cursor = (encode_cursor([page[-1].session_id], config)
+    next_cursor = (encode_cursor([page[-1].session_id], config, "sessions")
                    if page and has_more else None)
     return _envelope("sessions", rows, next_cursor, has_more, config)
 
 
 def list_turns(db: DBSession, *, config, data_classification: str,
                cursor: str | None, limit: int) -> dict[str, Any]:
-    after = decode_cursor(cursor, config) if cursor else None
+    after = decode_cursor(cursor, config, "turns") if cursor else None
     sessions = {
         sess.session_id: sess
         for sess in db.exec(select(Session).where(
@@ -255,7 +285,7 @@ def list_turns(db: DBSession, *, config, data_classification: str,
         if has_more:
             break
 
-    next_cursor = (encode_cursor(last_key, config)
+    next_cursor = (encode_cursor(last_key, config, "turns")
                    if has_more and last_key is not None else None)
     return _envelope("turns", rows, next_cursor, has_more, config)
 

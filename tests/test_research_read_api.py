@@ -4,18 +4,21 @@
 """
 from __future__ import annotations
 
+import base64
 from datetime import datetime
 import re
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import auth, content, db, repeat_intent, research_dataset
+from app import (auth, content, db, export_security, repeat_intent,
+                 research_dataset, session_admission)
 from app.db import get_session
 from app.main import app
 from app.models import (
+    AuditLog,
     ItemEvent,
     Patient,
     ResearchUser,
@@ -278,3 +281,210 @@ def test_csv_is_refused_without_the_deidentification_key(research_env, monkeypat
     response = client.get("/research/v1/turns.csv?data_classification=research")
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "research_deidentification_unavailable"
+
+
+def _add_second_page_rows(engine) -> None:
+    """让三张表都真的有第二页。
+
+    默认 fixture 只有 1 个场次、1 条环节，于是 ``has_more`` 恒为 False、
+    ``next_cursor`` 恒为 null——针对游标的断言会在空转里全绿。上一版泄漏回归
+    就是这么漏掉明文游标的：它测的那条路径压根没被走到。
+    """
+    with Session(engine) as session:
+        train = TrainSession(
+            session_id="S-REAL-2", patient_id="P-REAL-1", week_no=2,
+            phase_type="正式训练", event_line="正式训练", trainer_id="RESEARCHER",
+            item_bank_version_id=BANK.version_id,
+            item_bank_definition_digest=BANK_DIGEST,
+            autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
+            autopilot_protocol_definition_digest=PROTOCOL_DIGEST,
+            repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
+            repeat_protocol_definition_digest=REPEAT_PROTOCOL.definition_digest,
+            is_simulation=False, data_classification="research")
+        session.add(train)
+        session.commit()
+        item = ItemEvent(session_id="S-REAL-2", item_id="SE_苹果",
+                         task_type="单要素", item_set_type="训练集",
+                         presentation_order=1)
+        session.add(item)
+        session.commit()
+        session.add(TurnEvent(
+            item_event_id=item.id, turn_seq=1, response_role="命名",
+            asr_confidence=0.8, prompt_level=0, ai_score=1.0,
+            judge_portrait_used=False))
+        session.commit()
+
+
+def _decoded_cursor_bytes(cursor: str) -> bytes:
+    """把游标还原成它承载的原始字节——用来证明里面没有明文标识符。"""
+    return base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+
+
+def test_pagination_cursor_never_carries_a_plaintext_identifier(
+        research_env, monkeypatch):
+    """游标里装的是数据库自然键，而那正是本接口明令禁出的直接标识符。
+
+    第一版只做 HMAC 签名、载荷明文 base64，``encode_cursor(["P-REAL-1"])`` 解码
+    出来就是 ``["P-REAL-1"]``。上一版的泄漏回归抓不住它，因为那条断言是对响应
+    **原文**做子串匹配，而游标是 base64——`"P-REAL-1" in response.text` 恒为
+    False。所以这里必须把游标解出来再看。
+    """
+    _with_key(monkeypatch)
+    _add_second_page_rows(research_env)
+    client = _client("steward")
+    for dataset, secrets_that_must_not_appear in (
+            ("subjects", (b"P-REAL-1", b"P-GONE-1")),
+            ("sessions", (b"S-REAL-1", b"P-REAL-1")),
+            ("turns", (b"S-REAL-1", b"P-REAL-1"))):
+        response = client.get(
+            f"/research/v1/{dataset}?data_classification=research&limit=1")
+        assert response.status_code == 200, dataset
+        cursor = response.json()["next_cursor"]
+        assert cursor, f"{dataset} 应当还有下一页，否则这条断言是空转"
+        blob = _decoded_cursor_bytes(cursor)
+        for secret in secrets_that_must_not_appear:
+            assert secret not in blob, f"{dataset} 的游标里带着明文 {secret!r}"
+
+
+def test_a_cursor_from_one_dataset_is_rejected_by_another(
+        research_env, monkeypatch):
+    """跨数据集复用游标必须被拒，而不是静默截断结果。"""
+    _with_key(monkeypatch)
+    _add_second_page_rows(research_env)
+    client = _client("steward")
+    cursor = client.get(
+        "/research/v1/subjects?data_classification=research&limit=1"
+    ).json()["next_cursor"]
+    assert cursor
+    response = client.get(
+        f"/research/v1/turns?data_classification=research&cursor={cursor}")
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "research_cursor_invalid"
+
+
+def test_the_same_key_encodes_to_a_different_cursor_every_time(
+        research_env, monkeypatch):
+    """随机 nonce：同一个位置两次翻页给出不同游标，不能被当成位置指纹比对。"""
+    _with_key(monkeypatch)
+    _add_second_page_rows(research_env)
+    client = _client("steward")
+    path = "/research/v1/subjects?data_classification=research&limit=1"
+    first = client.get(path).json()["next_cursor"]
+    second = client.get(path).json()["next_cursor"]
+    assert first and second and first != second
+
+
+def test_pagination_still_walks_every_row_exactly_once(
+        research_env, monkeypatch):
+    """加密之后分页得照样能用：逐页走完，不漏行不重行。"""
+    _with_key(monkeypatch)
+    _add_second_page_rows(research_env)
+    client = _client("steward")
+    seen: list[str] = []
+    cursor = None
+    for _ in range(10):
+        query = "/research/v1/subjects?data_classification=research&limit=1"
+        if cursor:
+            query += f"&cursor={cursor}"
+        payload = client.get(query).json()
+        seen.extend(row["subject_code"] for row in payload["rows"])
+        cursor = payload["next_cursor"]
+        if not cursor:
+            break
+    assert len(seen) == len(set(seen)), "翻页翻出了重复行"
+    everything = client.get(
+        "/research/v1/subjects?data_classification=research").json()
+    assert seen == [row["subject_code"] for row in everything["rows"]]
+
+
+def test_research_reads_are_actually_rate_limited(research_env, monkeypatch):
+    """限速要真的挂上策略表，别只是调了一次返回 None 的函数。
+
+    第一版端点老老实实调了 ``_expensive_rate_limit``，但 ``_POLICIES`` 里没有
+    任何一条能 fullmatch 到它传的路径，于是 ``consume`` 永远返回 None——一次
+    全库刮取不会被拖慢半秒。
+    """
+    _with_key(monkeypatch)
+    client = _client("steward")
+    path = "/research/v1/subjects?data_classification=research"
+    codes = [client.get(path).status_code for _ in range(24)]
+    assert 429 in codes, "连打 24 次一次都没被拦，限速策略没挂上"
+    limited = client.get(path)
+    if limited.status_code == 429:
+        assert limited.json()["code"] == "resource_rate_limited"
+        assert int(limited.headers["Retry-After"]) >= 1
+
+
+def test_a_withdrawn_subject_is_judged_by_the_same_rule_as_everywhere_else(
+        research_env, monkeypatch):
+    """撤回判定与 main.py / ai_quality_service.py 同一条口径：非空即撤回。
+
+    第一版在取数层自建了白名单（放行 "active"/"not_withdrawn"），口径一分岔，
+    同一个人就会在别处算已撤回、在这里算在训，全量明细照出。
+    """
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        patient = session.get(Patient, "P-GONE-1")
+        patient.withdrawal_status = "active"      # 别处会判成"已撤回"
+        session.add(patient)
+        session.commit()
+    client = _client("steward")
+    payload = client.get(
+        "/research/v1/subjects?data_classification=research").json()
+    gone = export_security.pseudonymize_subject(
+        "P-GONE-1", export_security.load_deidentification_config())
+    row = next(r for r in payload["rows"] if r["subject_code"] == gone)
+    assert row["withdrawn"] is True, "取数层的撤回口径与全仓不一致"
+
+
+def test_withdrawal_expressed_only_through_the_consent_field_still_seals(
+        research_env, monkeypatch):
+    """有一支撤回只体现在知情同意字段上，只看 withdrawal_status 会整支漏掉。
+
+    仓库自己在 main.py 里写着 "A legacy record may express study withdrawal
+    only through the consent field"，六个别的读面都防了这一支，取数层第一版没防。
+    """
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        patient = session.get(Patient, "P-REAL-1")
+        patient.withdrawal_status = None
+        patient.consent_status = "已撤回"
+        session.add(patient)
+        session.commit()
+        assert session_admission.patient_content_sealed(patient)
+    client = _client("steward")
+    config = export_security.load_deidentification_config()
+    code = export_security.pseudonymize_subject("P-REAL-1", config)
+    subjects = client.get(
+        "/research/v1/subjects?data_classification=research").json()
+    row = next(r for r in subjects["rows"] if r["subject_code"] == code)
+    assert row["withdrawn"] is True, "只在同意字段上撤回的人被当成了在训"
+    turns = client.get(
+        "/research/v1/turns?data_classification=research").json()
+    for turn in turns["rows"]:
+        if turn["subject_code"] == code:
+            assert turn["ai_score"] is None, "撤回者的逐环节明细照发了"
+            assert turn["prompt_level"] is None
+
+
+def test_every_research_read_leaves_an_audit_entry_without_identifiers(
+        research_env, monkeypatch):
+    """批量取数必须进账本——限速拦不住有耐心的内部人，账本才能事后追责。
+
+    本仓库的惯例是每个批量读面都记（导出、音频元数据读、录音字节读都写）。
+    第一版的取数面是唯一一个不写的：跑 60 次取数，AuditLog 里只有一行登录。
+    但账本本身也不能变成泄漏面——只记元数据，不记编号、不记游标。
+    """
+    _with_key(monkeypatch)
+    client = _client("steward")
+    client.get("/research/v1/turns?data_classification=research")
+    client.get("/research/v1/subjects.csv?data_classification=research")
+    with Session(research_env) as session:
+        rows = [r for r in session.exec(select(AuditLog))
+                if r.action == "research_read"]
+    assert len(rows) == 2, "两次取数应当留下两条账本"
+    assert {"json", "csv"} == {"csv" if "csv" in r.summary else "json" for r in rows}
+    for row in rows:
+        assert row.actor == "STEWARD"
+        for secret in ("P-REAL-1", "S-REAL-1", "P-GONE-1", SECRET_TEXT):
+            assert secret not in row.summary, f"账本自己漏了 {secret}"

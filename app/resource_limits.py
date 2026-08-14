@@ -30,6 +30,12 @@ _POLICIES = (
      12.0, 1.0),
     ("attempt", "POST", re.compile(r"/sessions/[^/]+/attempts/process"), 6.0, 0.5),
     ("legacy-asr", "POST", re.compile(r"/asr/transcribe/[^/]+"), 4.0, 0.25),
+    # 研究取数一页最多 1000 行，还要逐行算分域假名并过一遍去标识断言——按行数算
+    # 是本服务最贵的读。端点传的是合成路径 "/research/v1/dataset"（不是真实 URL），
+    # 因为按数据集分桶会让一个人换个数据集就绕开配额。
+    # 放行量按"人在页面上点着看"够用、"脚本整库刮"会被拖慢来定：突发 10 页，
+    # 之后每 3 秒回一页。十万行的 turns 全量拉完约 5 分钟，不影响正当取数。
+    ("research-read", "GET", re.compile(r"/research/v1/dataset"), 10.0, 1.0 / 3.0),
 )
 
 

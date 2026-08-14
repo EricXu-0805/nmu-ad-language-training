@@ -7584,6 +7584,14 @@ def get_research_dataset(
         payload = reader(s, config=config,
                          data_classification=data_classification,
                          cursor=cursor, limit=size)
+        # 限速拦不住有耐心的内部人，账本才是唯一的事后追责面。本仓库的惯例是
+        # 每个批量读面都记（导出、音频元数据读、录音字节读都写），新加的取数面
+        # 不能是唯一一个不写的。只记元数据：数据集、分区、行数、有没有下一页，
+        # 不记受试者编号、不记游标（游标里装着自然键）。
+        _audit(s, request, "research_read",
+               f"取数 {dataset_key}/{data_classification} 行数={payload['row_count']}"
+               f" 格式={'csv' if wants_csv else 'json'}"
+               f" 还有下一页={payload['has_more']}")
         if wants_csv:
             return _research_csv(
                 research_read.dataset_csv(payload),
