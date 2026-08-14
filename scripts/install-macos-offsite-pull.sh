@@ -101,7 +101,7 @@ if [ "\$rc" -ne 0 ]; then
       msg="异地备份部分完成:有快照进了 legacy/conflicts 等人工处置,其余已归档。pull.log 尾部:
 \$(tail -5 '$ROOT/offsite/pull.log' 2>/dev/null || echo '(pull.log 不可读)')"
     else
-      msg="异地备份拉取失败 rc=\$rc。pull.log 尾部:
+      msg="异地备份拉取失败 rc=\${rc}。pull.log 尾部:
 \$(tail -5 '$ROOT/offsite/pull.log' 2>/dev/null || echo '(pull.log 不可读)')"
     fi
     '$ROOT/venv/bin/python' ./scripts/notify_ops.py \\
@@ -186,8 +186,15 @@ status=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
   | awk -F'= ' '/last exit code/{print $2; exit}')
 echo "launchd 上次退出码: ${status:-未知}"
 tail -3 "$ROOT/offsite/pull.log" 2>/dev/null || echo "(还没有 pull.log)"
-[ "${status:-1}" = "0" ] || {
-  echo "launchd 这一路仍然不通，看 $HOME/Library/Logs/nmu-vps-backup-pull.log" >&2
-  exit 1
-}
-echo "异地拉取这条路已经跑通，每天 12:30 自动执行。"
+case "${status:-1}" in
+  0) echo "异地拉取这条路已经跑通，每天 12:30 自动执行。" ;;
+  # 退出码 4 = 拉取本身成功，但有快照进了 legacy/conflicts 等人工处置。
+  # 迁移头一前进，升级前拍的所有快照都会一次性变成这个状态——那是设计。
+  # 第一版把 4 也报成"不通"，于是每次带迁移的上线之后都会有人被派去查一个
+  # 根本不存在的故障。装没装上和有没有待处置的快照，是两件事。
+  4) echo "异地拉取这条路已经跑通，每天 12:30 自动执行。"
+     echo "注意：有快照待人工处置（见上面 pull.log 尾部与 $ROOT/offsite/legacy-unvalidated/）。" >&2
+     echo "刚做过迁移头前进的话，这是预期结果，不是故障。" >&2 ;;
+  *) echo "launchd 这一路仍然不通，看 $HOME/Library/Logs/nmu-vps-backup-pull.log" >&2
+     exit 1 ;;
+esac

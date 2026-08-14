@@ -80,6 +80,30 @@ ssh root@<服务器> 'sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py'
 # 与本地 `git show <发布SHA>:scripts/verify_backup_snapshot.py | shasum -a 256` 对比
 ```
 
+### 4.1 同步完必须做两件收尾（2026-08-14 各栽过一次）
+
+**（a）清掉 dist 里的陈旧文件。** 不带 `--delete` 的代价是历次构建的 JS bundle
+会一直堆在 `web/dist/assets/`。`verify_browser_dist.py` 对**多出来的文件**同样
+fail-closed（这是对的：旧缓存可能加载到带旧安全行为的 chunk）。按 DEPLOY.md
+「陈旧文件由人工清」处理，而且**移走不删**，留证据也留退路：
+
+```bash
+# 把清单之外的文件移进带时间戳的隔离目录，然后复查
+ssh root@<服务器> '/opt/nmu/venv/bin/python /opt/nmu/app/scripts/verify_browser_dist.py /opt/nmu/app/web/dist'
+```
+
+**（b）规范化代码树权限。** 服务以 `User=nmu` 运行，而 `rsync -a` 会原样复制
+本机的权限位。2026-08-14 那次，本机一个迁移文件恰好是 `-rw-------`，同步过去后
+`ExecStartPre` 的库头闸门以 `nmu` 身份读不到迁移图，服务起不来。
+`__pycache__` 里 root 用 `umask 077` 生成的 `.pyc` 是同一类。
+
+```bash
+ssh root@<服务器> 'find /opt/nmu/app -path /opt/nmu/app/data -prune -o -name ".env*" -prune -o -print0 \
+  | xargs -0 chmod o+rX'
+# 复查：下面这条必须输出 0，且 .env 仍是 600、data/ 仍是 700
+ssh root@<服务器> 'find /opt/nmu/app -type f ! -perm -o+r ! -path "*/data/*" ! -name ".env*" | wc -l'
+```
+
 ## 5. 先查依赖锁有没有变
 
 ```bash

@@ -11,14 +11,21 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 代码版本 | `9c34dcb`（2026-08-08 15:40 上线） | 部署树里有 `web/src/console/AssessmentExecutionDrawer.tsx`、**没有** `app/caregiver_service.py` |
-| 数据库结构版本 | `b8e5f2a91c07` | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
-| 备份校验器指纹（前 20 位） | `fd5710a787cc90c9a626` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 一致 |
-| 回滚存档 | `/opt/nmu/app-before-deploy-20260808-154014.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
+| 代码版本 | `d8d3edd`（2026-08-14 09:52 上线） | 部署树里有 `app/research_read.py`、`scripts/content_gap_workbook.py`、`web/dist` 里有 `AcceptanceScreen-*.js` |
+| 数据库结构版本 | `b3e7c5a9d214` | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
+| 备份校验器指纹（前 20 位） | `2d50ce0cad5f7813a5c3` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 一致 |
+| 回滚存档 | `/opt/nmu/app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
+| 回滚锚点快照 | `20260814-015251`（旧结构停写快照，已异地归档，现在 `legacy-unvalidated/`） | 结构一升级它就不再被新校验器背书，这是设计；回滚要连**旧代码树 + 旧校验器**一起放回 |
+| 起服前闸门 | 已装（`ExecStartPre` 验库头，以 `User=nmu` 身份跑） | `systemctl cat nmu.service \| grep ExecStartPre`；journal 里 `OK database_at_head` 应在 `Started` 之前 |
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
 | 库里数据 | 1 个受试者、1 个场次、0 条云语音使用记录 | 这台机器**从未被真实使用过** |
 
-最后一次只读核对：**2026-08-14 08:00（上海时间）**——上面六行逐条实查，全部未变。
+最后一次只读核对：**2026-08-14 17:55（上海时间）**。
+
+预检 `--require-all` 结果：**7 项 PASS、1 项 FAIL**。唯一 FAIL 是
+「OS 安全补丁：8 个待安装」（systemd 一族），**与本次上线无关**——它是 08-10
+那次周检之后攒下来的，回滚这次上线也不会让它消失。装补丁的命令当时被权限
+分类器拒绝，未执行。修法：`apt-get upgrade`，装完再跑一次预检。
 
 ## 迁移头前进的部署收尾三件套（缺一必出误报）
 
@@ -33,32 +40,31 @@
 副作用要提前知道：**升级之后，升级前拍的所有快照都不再能被新校验器背书**，
 会被移进 `legacy-unvalidated/` 等人处置。它们不是坏备份，但绝不能改名当成当前合格快照。
 
-## 待上线增量（截至 2026-08-14 08:00）
+## 待上线增量
 
-`main` 比生产多 **29 个提交**，数据库结构要从 `b8e5f2a91c07` 前进到 `b3e7c5a9d214`
-（两支迁移）。主要内容：老人端一键暂停、照护员工作台与 20 题演练、自动驾驶接管
-就绪契约、发布证据门禁、只读研究数据面 `/research/v1/*` 与总览屏、真机验收向导页。
+无。`main` 与生产同为 `d8d3edd`。
 
-**这些尚未上线。** 上线记录写在下面的历史表里。
+## 这次上线踩的三个坑（下次照 runbook §4.1 走可以全避开）
 
-### 为什么还没上线（2026-08-14）
-
-迁移窗口的前置条件在 2026-08-14 08:00 逐条实查**全部满足**：CI 在同一个 SHA 全绿、
-备份链末行 4 小时内 `ok`、异地 `conflicts/` 为空、部署的校验器指纹与
-`9c34dcb` 上的值一致、磁盘与内存都过线、锚点快照做过恢复演练。
-
-卡在执行环节：对生产执行 `systemctl stop`（停定时器 / 停服）**被 Claude Code
-自动模式的权限分类器拒绝**，两次尝试都在命令下发前被拦。没有绕。生产因此
-一个字节没动——服务与四个定时器全部 `active`，库头仍是 `b8e5f2a91c07`，
-最新快照仍是锚点 `20260813-193151`。
-
-要往下走，二选一：给这类命令放行，或者由负责人本人照
-`docs/上线runbook_受控技术环境更新.md` 执行。那份 runbook 里窗口内的顺序、
-判据和回滚逐条可核。
+1. **dist 里堆着 9 次历史构建的陈旧 bundle**。不带 `--delete` 的必然代价，
+   而 `verify_browser_dist.py` 对**多出来的文件**同样 fail-closed（对的：旧缓存
+   可能加载到带旧安全行为的 chunk）。51 个陈旧文件已移进
+   `/opt/nmu/dist-stale-20260814-015250`，**没删**。
+2. **`rsync -a` 把本机的权限位原样搬了过去**。本机一个迁移文件恰好是 `-rw-------`，
+   同步后新装的 `ExecStartPre` 闸门以 `User=nmu` 身份读不到迁移图，服务起不来
+   （`REJECTED code=migration_graph_unreadable`）。连同 106 个 root 用 `umask 077`
+   生成的 `.pyc`，已用 `chmod o+rX` 规范化；`.env` 仍 600、`data/` 仍 700。
+   **这个问题在装闸门之前就存在，只是没有东西去读它**——闸门抓到的是真问题。
+3. **异地拉取脚本的告警分支是坏的**。`install-macos-offsite-pull.sh` 里
+   `rc=$rc。` 少一对花括号（`c99d3ad` 修过同类的全角逗号，这是第二处全角句号）：
+   `set -u` 下只要退出码不是 0/3/4，脚本就崩在 "unbound variable" 而不是发告警——
+   正好是那个脚本当初要解决的"静默失败没人知道"。已修，并加了
+   `tests/test_shell_script_hygiene.py` 钉住这一类（先红后绿验过）。
 
 ## 历史
 
 | 日期 | 代码版本 | 结构版本 | 回滚存档 | 备注 |
 | --- | --- | --- | --- | --- |
+| 2026-08-14 09:52 | `d8d3edd` | `b3e7c5a9d214` | `app-before-deploy-20260814-015250.tar.gz` | 受控技术环境更新：照护员弧、老人端暂停、研究数据面 `/research/v1/*` 与总览屏、真机验收向导页、起服前库头闸门。**不构成任何外部批准。** |
 | 2026-08-08 15:40 | `9c34dcb` | `b8e5f2a91c07` | `app-before-deploy-20260808-154014.tar.gz` | 量表注册生产入口收口 |
 | 2026-07-23 02:4x | `release/curated-landing-20260722` | `f9b2d6e4a801` | `app-before-cutover-20260722.tgz` | 首次公网上线 |
