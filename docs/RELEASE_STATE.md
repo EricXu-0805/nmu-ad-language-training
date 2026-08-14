@@ -11,8 +11,8 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `d8d3edd`（2026-08-14 09:52 上线） | 部署树里有 `app/research_read.py`、`scripts/content_gap_workbook.py`、`web/dist` 里有 `AcceptanceScreen-*.js` |
-| 部署树后续同步 | 同日又同步过文档、Mac 侧安装器与测试；**`app/`、`web/dist`、`alembic/` 一个字节没变**，服务未重启 | `git diff d8d3edd..main -- app web alembic` 应为空 |
+| 应用代码版本 | `f813af0`（2026-08-14 20:28 上线；此前 `d8d3edd` 09:52 上线） | 部署树里有 `app/research_read.py`、`scripts/content_gap_workbook.py`、`web/dist` 里有 `AcceptanceScreen-*.js` |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff f813af0..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b3e7c5a9d214` | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `2d50ce0cad5f7813a5c3` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 一致 |
 | 回滚存档 | `/opt/nmu/app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
@@ -21,7 +21,7 @@
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
 | 库里数据 | 1 个受试者、1 个场次、0 条云语音使用记录 | 这台机器**从未被真实使用过** |
 
-最后一次只读核对：**2026-08-14 17:55（上海时间）**。
+最后一次只读核对：**2026-08-14 20:30（上海时间）**。
 
 预检 `--require-all` 结果：**7 项 PASS、1 项 FAIL**。唯一 FAIL 是
 「OS 安全补丁：8 个待安装」（systemd 一族），**与本次上线无关**——它是 08-10
@@ -66,6 +66,7 @@
 
 | 日期 | 代码版本 | 结构版本 | 回滚存档 | 备注 |
 | --- | --- | --- | --- | --- |
+| 2026-08-14 20:28 | `f813af0` | `b3e7c5a9d214`（未变） | `app-before-deploy-20260814-2030.tar.gz` | 无迁移的安全修：分页游标从"只签名"改成 AES-GCM 真加密（原来 base64 解码就是明文 patient_id）、撤回判定改调全仓权威判据、补上研究取数的限速策略与审计账本。**这些缺陷在配上 `DEIDENTIFICATION_KEY` 之前打不出来（端点一律 503），配之前必须先上这一版。** |
 | 2026-08-14 09:52 | `d8d3edd` | `b3e7c5a9d214` | `app-before-deploy-20260814-015250.tar.gz` | 受控技术环境更新：照护员弧、老人端暂停、研究数据面 `/research/v1/*` 与总览屏、真机验收向导页、起服前库头闸门。**不构成任何外部批准。** |
 | 2026-08-08 15:40 | `9c34dcb` | `b8e5f2a91c07` | `app-before-deploy-20260808-154014.tar.gz` | 量表注册生产入口收口 |
 | 2026-07-23 02:4x | `release/curated-landing-20260722` | `f9b2d6e4a801` | `app-before-cutover-20260722.tgz` | 首次公网上线 |
