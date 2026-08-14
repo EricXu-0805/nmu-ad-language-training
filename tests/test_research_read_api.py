@@ -22,11 +22,13 @@ from app import (auth, content, db, export_security, repeat_intent,
 from app.db import get_session
 from app.main import app
 from app.models import (
+    AttemptEvent,
     AuditLog,
     ItemEvent,
     Patient,
     ResearchUser,
     Session as TrainSession,
+    SessionRuntimeState,
     TurnEvent,
 )
 
@@ -667,3 +669,81 @@ def test_deleting_the_in_handler_role_checks_makes_the_suite_go_red(
         "回环 M0 开放模式下它是唯一防线")
     for action in ("查看研究数据接口状态", "查看研究数据字典", "读取去标识研究数据"):
         assert action in block, f"少了 {action} 那一道闸"
+
+
+def test_a_cross_site_navigation_cannot_pull_the_csv_with_a_logged_in_cookie(
+        research_env, monkeypatch):
+    """会话 cookie 是 SameSite=Lax——跨站的顶层跳转照样带 cookie。
+
+    恶意页面只要 `<a href="…/research/v1/turns.csv" download>`，受害者的 steward
+    身份就会把一份去标识研究数据拉到他自己机器上，而账本会记成"这位数据管理员
+    取了数"。攻击者读不到响应（无 CORS），但归属被污染了。
+    """
+    _with_key(monkeypatch)
+    client = _client("steward")
+    path = "/research/v1/turns.csv?data_classification=research"
+
+    for site in ("cross-site", "same-site"):
+        blocked = client.get(path, headers={"Sec-Fetch-Site": site})
+        assert blocked.status_code == 403, site
+        assert blocked.json()["code"] == "request_origin_rejected", site
+
+    # 本站页面自己发的请求照常
+    assert client.get(path, headers={"Sec-Fetch-Site": "same-origin"}).status_code == 200
+    # 人自己敲地址 / 点书签
+    assert client.get(path, headers={"Sec-Fetch-Site": "none"}).status_code == 200
+    # 非浏览器客户端根本不带这个头——它们是这个接口的主要用户
+    assert client.get(path).status_code == 200
+
+
+def test_the_cross_site_read_guard_does_not_break_opening_the_console(
+        research_env, monkeypatch):
+    """SPA 外壳与静态资源是 PUBLIC，跨站点开控制台不能被这道闸误伤。"""
+    _with_key(monkeypatch)
+    anonymous = TestClient(app)
+    for path in ("/console", "/patient", "/", "/health"):
+        response = anonymous.get(path, headers={"Sec-Fetch-Site": "cross-site"})
+        assert response.status_code != 403, f"{path} 被误伤了"
+
+
+def test_columns_the_dictionary_declares_as_variables_actually_carry_values(
+        research_env, monkeypatch):
+    """字典宣称是真变量的列，取数层不能写死 null。
+
+    `runtime_status` 与 `source_attempt_seq` 在数据字典里各有一句中文说明，
+    实现里却是两个硬编码的 None——**那比不给这一列更坏**：PI 会照着字典建分析，
+    拿到一整列缺失值，而缺失值在统计上意味着"没测到"，不是"我们没做"。
+
+    这两列空了两周没人发现，因为没有任何断言看过它们的值。
+    """
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        session.add(SessionRuntimeState(session_id="S-REAL-1", status="completed"))
+        item = session.exec(select(ItemEvent).where(
+            ItemEvent.session_id == "S-REAL-1")).first()
+        attempt = AttemptEvent(
+            session_id="S-REAL-1", item_id=item.item_id, turn_seq=1,
+            attempt_seq=7, response_role="命名",
+            raw_audio_id="AUDIO-FIXTURE-1", prompt_level=0)
+        session.add(attempt)
+        session.commit()
+        turn = session.exec(select(TurnEvent).where(
+            TurnEvent.item_event_id == item.id)).first()
+        turn.source_attempt_id = attempt.id
+        session.add(turn)
+        session.commit()
+
+    client = _client("steward")
+    sessions = client.get(
+        "/research/v1/sessions?data_classification=research").json()["rows"]
+    live = [r for r in sessions if r["session_code"] and not r["withdrawn"]]
+    assert live, "没有在训场次，这条断言是空转"
+    assert any(r["runtime_status"] == "completed" for r in live), \
+        "runtime_status 整列都是 null——字典宣称它是真变量"
+
+    turns = client.get(
+        "/research/v1/turns?data_classification=research").json()["rows"]
+    assert any(r["source_attempt_seq"] == 7 for r in turns), \
+        "source_attempt_seq 整列都是 null——字典宣称它是关联的原始尝试序号"
+    for row in turns:
+        assert "source_attempt_id" not in row, "反查成序号，不能把主键漏出去"

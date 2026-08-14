@@ -33,7 +33,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlmodel import Session as DBSession, select
 
 from . import export_security, research_dataset, session_admission
-from .models import ItemEvent, Patient, Session, TurnEvent
+from .models import (AttemptEvent, ItemEvent, Patient, Session,
+                     SessionRuntimeState, TurnEvent)
 
 
 MAX_PAGE_SIZE = 1000
@@ -210,6 +211,12 @@ def _withdrawn_patient_ids(db: DBSession) -> set[str]:
 def list_sessions(db: DBSession, *, config, data_classification: str,
                   cursor: str | None, limit: int) -> dict[str, Any]:
     after = decode_cursor(cursor, config, "sessions")[0] if cursor else None
+    # 字典把 runtime_status 登记成真变量，取数层却写死 null——那比不给这一列更坏，
+    # PI 会照着它建分析。终态存在 SessionRuntimeState 里，一次查完。
+    runtime_status = {
+        state.session_id: state.status
+        for state in db.exec(select(SessionRuntimeState))
+    }
     statement = select(Session).where(
         Session.data_classification == data_classification,
     ).order_by(Session.session_id)
@@ -240,7 +247,7 @@ def list_sessions(db: DBSession, *, config, data_classification: str,
             "phase_type": getattr(sess.phase_type, "value", sess.phase_type),
             "event_line": getattr(sess.event_line, "value", sess.event_line),
             "session_sitting_no": sess.session_sitting_no,
-            "runtime_status": None,
+            "runtime_status": runtime_status.get(sess.session_id),
             "is_simulation": bool(sess.is_simulation),
             "data_classification": sess.data_classification,
             "item_bank_version_id": sess.item_bank_version_id,
@@ -262,6 +269,13 @@ def list_turns(db: DBSession, *, config, data_classification: str,
             Session.data_classification == data_classification))
     }
     withdrawn = _withdrawn_patient_ids(db)
+    # 同上：字典宣称 source_attempt_seq 是"关联的原始尝试序号"，turn 上存的是
+    # source_attempt_id（数据库主键，禁出）。反查成序号——序号是自然键的一部分，
+    # 本来就该出。
+    attempt_seq = {
+        attempt.id: attempt.attempt_seq
+        for attempt in db.exec(select(AttemptEvent))
+    }
     rows: list[dict[str, Any]] = []
     last_key: list[Any] | None = None
     has_more = False
@@ -297,7 +311,8 @@ def list_turns(db: DBSession, *, config, data_classification: str,
                     }))
                 else:
                     rows.append(_turn_row(
-                        session_code, subject_code, item, turn))
+                        session_code, subject_code, item, turn,
+                        attempt_seq.get(turn.source_attempt_id)))
                 last_key = key
             if has_more:
                 break
@@ -310,7 +325,8 @@ def list_turns(db: DBSession, *, config, data_classification: str,
 
 
 def _turn_row(session_code: str, subject_code: str,
-              item: ItemEvent, turn: TurnEvent) -> dict[str, Any]:
+              item: ItemEvent, turn: TurnEvent,
+              source_attempt_seq: int | None) -> dict[str, Any]:
     diff = (None if turn.reviewed_score is None or turn.ai_score is None
             else round(turn.reviewed_score - turn.ai_score, 4))
     return {
@@ -320,7 +336,7 @@ def _turn_row(session_code: str, subject_code: str,
         "task_type": getattr(item.task_type, "value", item.task_type),
         "turn_seq": turn.turn_seq,
         "response_role": getattr(turn.response_role, "value", turn.response_role),
-        "source_attempt_seq": None,
+        "source_attempt_seq": source_attempt_seq,
         "prompt_level": turn.prompt_level,
         "asr_confidence": turn.asr_confidence,
         "ai_answer_type": getattr(turn.ai_answer_type, "value", turn.ai_answer_type),

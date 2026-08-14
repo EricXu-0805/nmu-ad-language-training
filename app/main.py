@@ -474,6 +474,22 @@ async def console_auth_guard(request: Request, call_next):
             "detail": "写请求来源不是本平台同源页面",
             "code": "request_origin_rejected",
         })
+    # 读也要拦，因为会话 cookie 是 SameSite=Lax：跨站的**顶层跳转**照样带 cookie。
+    # 一个恶意页面只要 `<a href="…/research/v1/turns.csv" download>`，受害者的
+    # steward 身份就会把一份去标识研究数据拉到他自己机器上，而账本会记成"这位
+    # 数据管理员取了数"——他从没打算取。攻击者读不到响应（无 CORS），但归属被
+    # 污染了，临床研究里这本身就是问题。
+    #
+    # 只拦 cross-site 与 same-site，**放过 none**：`none` 是人自己敲地址或点书签，
+    # 拿浏览器直接看一眼接口是正当用法。完全不带这个头的非浏览器客户端
+    # （curl、R、Python 取数脚本）一律不受影响——它们本来就是这个接口的主要用户。
+    if (not unsafe_method
+            and rule.kind == access_policy.AccessKind.ACCOUNT
+            and fetch_site in {"cross-site", "same-site"}):
+        return JSONResponse(status_code=403, content={
+            "detail": "读请求来自跨站页面的跳转，已拒绝",
+            "code": "request_origin_rejected",
+        })
     pin = os.environ.get("CONSOLE_PIN")
     pin_valid = bool(
         rule.kind == access_policy.AccessKind.DEVICE_PAIR
