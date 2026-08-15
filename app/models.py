@@ -1082,6 +1082,51 @@ def _reject_caregiver_help_request_mutation(*_args) -> None:
     raise RuntimeError("CaregiverHelpRequest 是只追加床旁呼叫回执")
 
 
+#: 求助的四态，按发生顺序。**可跳过**：没有通知通道时 ``delivered`` 永远到不了，
+#: 但工作人员当面走过来仍然能直接到 ``acknowledged``——那是真的发生了，不能因为
+#: 没配通道就否认。当前状态 = 已追加的转移里最靠后的那个。
+CAREGIVER_HELP_STATES = ("recorded", "delivered", "acknowledged", "resolved")
+
+
+class CaregiverHelpDisposition(SQLModel, table=True):
+    """求助从"已登记"往后走的只追加转移。
+
+    ``delivered`` 只能由通知通道带着回执写入，**任何人都不能声称它**。
+    放行清单原文：「不能假装工作人员已收到求助」。所以这张表把"我们记下了"
+    和"确实有人收到了"分成两件独立的事实，各自要各自的证据。
+
+    ``acknowledged`` / ``resolved`` 必须是具名账号——谁接的、谁处理的要能追责。
+    """
+    __table_args__ = (
+        UniqueConstraint(
+            "request_id", "state",
+            name="uq_caregiver_help_disposition_request_state"),
+        CheckConstraint(
+            "state IN ('delivered','acknowledged','resolved')",
+            name="ck_caregiver_help_disposition_state_closed"),
+        CheckConstraint(
+            _hex64_sql("evidence_sha256"),
+            name="ck_caregiver_help_disposition_evidence_hash"),
+    )
+
+    disposition_id: str = Field(primary_key=True)
+    request_id: str = Field(
+        foreign_key="caregiverhelprequest.request_id", index=True)
+    state: str
+    #: 人类状态是具名账号；``delivered`` 是通道标识，不是人。
+    actor_id: str = Field(index=True)
+    #: 证据指纹：``delivered`` 是通道回执的摘要，人类状态是操作请求的摘要。
+    #: 只存摘要不存正文——回执里可能带值班人姓名与电话。
+    evidence_sha256: str
+    created_at: datetime = Field(default_factory=_utc_now_naive)
+
+
+@sa_event.listens_for(CaregiverHelpDisposition, "before_update")
+@sa_event.listens_for(CaregiverHelpDisposition, "before_delete")
+def _reject_caregiver_help_disposition_mutation(*_args) -> None:
+    raise RuntimeError("CaregiverHelpDisposition 是只追加求助处置转移")
+
+
 class Week1Profile(SQLModel, table=True):
     """★ 第1周画像——独立命名空间。判分链不得 join。只喂交互侧。"""
     patient_id: str = Field(primary_key=True, foreign_key="patient.patient_id")

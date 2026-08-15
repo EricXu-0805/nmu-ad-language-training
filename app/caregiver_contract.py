@@ -129,3 +129,34 @@ class CaregiverHelpRequestOut(BaseModel):
     runtime_revision: int = Field(ge=0)
     created_at: datetime
     idempotent: bool
+
+
+class CaregiverHelpDispositionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # 有意不含 "delivered"：送达只能由通知通道带回执写入，不能由人在界面上声称。
+    state: Literal["acknowledged", "resolved"]
+    #: 现场说明（谁来了、怎么处理的）。**只入摘要不入库**——它可能带值班人
+    #: 姓名与电话，正文留在机构自己的交接本里。
+    note: str = Field(min_length=1, max_length=500)
+
+
+class CaregiverHelpDispositionEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["delivered", "acknowledged", "resolved"]
+    actor_id: str
+    at: str
+
+
+class CaregiverHelpStatusOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    state: Literal["recorded", "delivered", "acknowledged", "resolved"]
+    states: list[str]
+    notify_channel_configured: bool
+    #: 没配通知对象时恒为 false。界面据此说"已登记，请当面叫人"，
+    #: 不能显示"等待送达"——那是在暗示有人已经被通知到了。
+    delivery_reachable: bool
+    reached: list[CaregiverHelpDispositionEntry]

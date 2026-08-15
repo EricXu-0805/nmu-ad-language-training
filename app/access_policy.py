@@ -179,6 +179,16 @@ _ROUTE_RULES = (
            roles=CAREGIVER_ROLES, label="查看本人床旁状态"),
     _route({"POST"}, r"/caregiver/sessions/[^/]+/help-requests", AccessKind.ACCOUNT,
            roles=CAREGIVER_ROLES, label="暂停并呼叫其他工作人员"),
+    # 求助处置是"谁来了、处理完没有"。来的人可能是照护员，也可能是具名研究者
+    # 或管理员，所以这两条比上面宽一档；但仍在 /caregiver 窄路径里，且处理器
+    # 内仍做本人 owner 核验。
+    _route({"GET", "HEAD"}, r"/caregiver/sessions/[^/]+/help-requests/[^/]+",
+           AccessKind.ACCOUNT, roles=CAREGIVER_SESSION_CONTROL_ROLES,
+           label="查看呼叫处置状态"),
+    _route({"POST"},
+           r"/caregiver/sessions/[^/]+/help-requests/[^/]+/dispositions",
+           AccessKind.ACCOUNT, roles=CAREGIVER_SESSION_CONTROL_ROLES,
+           label="记录呼叫处置"),
 
     # 训练安排是测试前的具名账号工作流。数据管理员可读取溯源，
     # 但不能建立、审批、启动或取消临床训练安排。

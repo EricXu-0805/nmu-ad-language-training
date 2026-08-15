@@ -1416,12 +1416,12 @@ def test_publish_parent_fsync_failure_rolls_back_to_staging(monkeypatch, tmp_pat
 
 
 # --------------------------------------------------------------------------
-# Current head: b3e7c5a9d214 (caregiver help receipts) recovery contract,
+# Current head: c5a8f2d91e40 (caregiver help dispositions) recovery contract,
 # plus the patient-pause/assessment/disposal/profile layers it builds on.
 # --------------------------------------------------------------------------
 
 
-CURRENT_HEAD = "b3e7c5a9d214"
+CURRENT_HEAD = "c5a8f2d91e40"
 DISPOSAL_HEAD = "f7c2e8a4d105"
 PROFILE_HEAD = "e4a7c1d9b206"
 PRE_PROFILE_HEAD = "d3f8b5c1a704"

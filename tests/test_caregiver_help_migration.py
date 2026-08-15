@@ -8,7 +8,11 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 
-HEAD = "b3e7c5a9d214"
+GLOBAL_HEAD = "c5a8f2d91e40"
+#: 本迁移自身的版本。它已不再是全局 head(求助处置转移在其上),所以下面一律
+#: 显式升到 THIS 而不是 "head"——升到 head 会把后代表也建起来,再往下降时
+#: 后代的 downgrade 先执行、先提交,schema 快照就对不上了。
+THIS = "b3e7c5a9d214"
 PARENT = "a9d2e6f4c108"
 
 
@@ -31,10 +35,9 @@ def test_caregiver_help_migration_is_single_head_and_roundtrips_empty_sqlite(
         tmp_path):
     db_path = tmp_path / "caregiver-help-clean.sqlite"
     config = _config(db_path)
-    assert ScriptDirectory.from_config(config).get_heads() == [HEAD]
+    assert ScriptDirectory.from_config(config).get_heads() == [GLOBAL_HEAD]
 
-    command.upgrade(config, "head")
-    command.check(config)
+    command.upgrade(config, THIS)
     engine = create_engine(f"sqlite:///{db_path}")
     inspector = inspect(engine)
     assert "caregiverhelprequest" in inspector.get_table_names()
@@ -48,21 +51,20 @@ def test_caregiver_help_migration_is_single_head_and_roundtrips_empty_sqlite(
     }
     with engine.connect() as connection:
         assert connection.execute(text(
-            "SELECT version_num FROM alembic_version")).scalar_one() == HEAD
+            "SELECT version_num FROM alembic_version")).scalar_one() == THIS
 
     command.downgrade(config, PARENT)
     assert "caregiverhelprequest" not in inspect(engine).get_table_names()
-    command.upgrade(config, "head")
-    command.check(config)
+    command.upgrade(config, THIS)
     with engine.connect() as connection:
         assert connection.execute(text(
-            "SELECT version_num FROM alembic_version")).scalar_one() == HEAD
+            "SELECT version_num FROM alembic_version")).scalar_one() == THIS
 
 
 def test_caregiver_help_downgrade_refuses_evidence_before_any_ddl(tmp_path):
     db_path = tmp_path / "caregiver-help-evidence.sqlite"
     config = _config(db_path)
-    command.upgrade(config, "head")
+    command.upgrade(config, THIS)
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.begin() as connection:
         connection.execute(text("PRAGMA foreign_keys=OFF"))
@@ -81,6 +83,6 @@ def test_caregiver_help_downgrade_refuses_evidence_before_any_ddl(tmp_path):
     assert _schema_rows(engine) == schema_before
     with engine.connect() as connection:
         assert connection.execute(text(
-            "SELECT version_num FROM alembic_version")).scalar_one() == HEAD
+            "SELECT version_num FROM alembic_version")).scalar_one() == THIS
         assert connection.execute(text(
             "SELECT count(*) FROM caregiverhelprequest")).scalar_one() == 1

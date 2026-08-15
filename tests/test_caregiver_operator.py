@@ -12,6 +12,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app import (
     autopilot_plan_profiles,
     auth,
+    caregiver_service,
     db,
     provider_readiness,
     repeat_intent,
@@ -21,6 +22,7 @@ from app import (
 from app import main as main_module
 from app.main import app
 from app.models import (
+    CaregiverHelpDisposition,
     CaregiverHelpRequest,
     Patient,
     ProviderReadinessProbe,
@@ -873,6 +875,164 @@ def test_caregiver_can_pause_but_receives_no_runtime_cursor(caregiver_clients):
         "runtime_revision": 1,
         "end_reason": None,
     }
+
+
+def _raise_help(client, key: str = "caregiver-help-disp-000001") -> str:
+    assert client.put(
+        f"/caregiver/sessions/{OWNER_SESSION}/activation").status_code == 200
+    response = client.post(
+        f"/caregiver/sessions/{OWNER_SESSION}/help-requests",
+        json={"reason_code": "other_staff_needed", "idempotency_key": key})
+    assert response.status_code == 200, response.text
+    return response.json()["request_id"]
+
+
+def test_help_status_says_no_channel_is_configured_instead_of_awaiting_delivery(
+        caregiver_clients, monkeypatch):
+    monkeypatch.delenv(
+        caregiver_service.HELP_NOTIFY_CHANNEL_ENV, raising=False)
+    request_id = _raise_help(caregiver_clients.owner)
+
+    response = caregiver_clients.owner.get(
+        f"/caregiver/sessions/{OWNER_SESSION}/help-requests/{request_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "request_id": request_id,
+        "state": "recorded",
+        "states": ["recorded", "delivered", "acknowledged", "resolved"],
+        "notify_channel_configured": False,
+        "delivery_reachable": False,
+        "reached": [],
+    }
+
+
+def test_nobody_can_claim_delivery_over_http_even_with_a_channel_configured(
+        caregiver_clients, monkeypatch):
+    monkeypatch.setenv(
+        caregiver_service.HELP_NOTIFY_CHANNEL_ENV, "station-3")
+    request_id = _raise_help(caregiver_clients.owner)
+
+    response = caregiver_clients.owner.post(
+        f"/caregiver/sessions/{OWNER_SESSION}/help-requests/{request_id}"
+        "/dispositions",
+        json={"state": "delivered", "note": "我说它送到了"})
+
+    # 契约层就把 delivered 挡在外面：它不是人能声称的状态，422 而不是 409。
+    assert response.status_code == 422, response.text
+    with Session(caregiver_clients.engine) as session:
+        assert list(session.exec(select(CaregiverHelpDisposition))) == []
+
+
+def test_someone_walking_over_can_be_recorded_without_any_channel(
+        caregiver_clients, monkeypatch):
+    monkeypatch.delenv(
+        caregiver_service.HELP_NOTIFY_CHANNEL_ENV, raising=False)
+    request_id = _raise_help(caregiver_clients.owner)
+    url = (f"/caregiver/sessions/{OWNER_SESSION}/help-requests/{request_id}"
+           "/dispositions")
+
+    acknowledged = caregiver_clients.owner.post(
+        url, json={"state": "acknowledged", "note": "护士长过来了"})
+    assert acknowledged.status_code == 201, acknowledged.text
+    assert acknowledged.json()["state"] == "acknowledged"
+    assert acknowledged.json()["delivery_reachable"] is False
+
+    resolved = caregiver_clients.owner.post(
+        url, json={"state": "resolved", "note": "已扶回床上，训练改期"})
+    assert resolved.status_code == 201, resolved.text
+    assert resolved.json()["state"] == "resolved"
+    assert [entry["state"] for entry in resolved.json()["reached"]] == [
+        "acknowledged", "resolved"]
+    assert all(entry["actor_id"] == OWNER_ACTOR
+               for entry in resolved.json()["reached"])
+
+    replay = caregiver_clients.owner.post(
+        url, json={"state": "resolved", "note": "再点一次"})
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["detail"]["code"] == "help_state_already_reached"
+
+
+def test_help_disposition_note_never_reaches_the_database_or_the_response(
+        caregiver_clients):
+    request_id = _raise_help(caregiver_clients.owner)
+    note = "王护士 13800000000 来处理"
+
+    response = caregiver_clients.owner.post(
+        f"/caregiver/sessions/{OWNER_SESSION}/help-requests/{request_id}"
+        "/dispositions",
+        json={"state": "acknowledged", "note": note})
+
+    assert response.status_code == 201, response.text
+    assert note not in response.text
+    assert "13800000000" not in response.text
+    with Session(caregiver_clients.engine) as session:
+        rows = list(session.exec(select(CaregiverHelpDisposition)))
+        assert len(rows) == 1
+        serialized = repr(rows[0].model_dump())
+        assert note not in serialized
+        assert "13800000000" not in serialized
+
+
+def test_a_foreign_caregiver_can_neither_read_nor_dispose_of_someone_elses_help(
+        caregiver_clients):
+    request_id = _raise_help(caregiver_clients.owner)
+    base = f"/caregiver/sessions/{OWNER_SESSION}/help-requests/{request_id}"
+
+    assert caregiver_clients.other.get(base).status_code == 404
+    disposed = caregiver_clients.other.post(
+        f"{base}/dispositions",
+        json={"state": "acknowledged", "note": "我来处理"})
+    assert disposed.status_code == 404, disposed.text
+    with Session(caregiver_clients.engine) as session:
+        assert list(session.exec(select(CaregiverHelpDisposition))) == []
+
+
+def test_a_help_request_id_from_another_session_is_not_an_existence_oracle(
+        caregiver_clients):
+    request_id = _raise_help(caregiver_clients.owner)
+
+    response = caregiver_clients.owner.get(
+        f"/caregiver/sessions/{FOREIGN_SESSION}/help-requests/{request_id}")
+
+    # 场次不是本人的 → 先在场次这一层 404，不泄露"这个呼叫号存在"。
+    assert response.status_code == 404, response.text
+
+
+def test_a_foreign_help_request_id_under_my_own_session_is_still_404(
+        caregiver_clients):
+    """真正走到"呼叫号属于别的场次"那条分支。
+
+    上一条测试到不了它——场次判定先 404 了。这里让调用者拿着**自己拥有的**
+    场次去套一个**别人场次**的呼叫号：场次这一关过得去，只剩呼叫归属这一关。
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    foreign_request_id = "CHR-FOREIGN-PROBE"
+    with Session(caregiver_clients.engine) as session:
+        session.add(CaregiverHelpRequest(
+            request_id=foreign_request_id,
+            session_id=FOREIGN_SESSION,
+            actor_id=FOREIGN_ACTOR,
+            reason_code="other_staff_needed",
+            idempotency_key_sha256="a" * 64,
+            request_hash="b" * 64,
+            runtime_revision=0,
+            created_at=now,
+        ))
+        session.commit()
+
+    read = caregiver_clients.owner.get(
+        f"/caregiver/sessions/{OWNER_SESSION}/help-requests/"
+        f"{foreign_request_id}")
+    assert read.status_code == 404, read.text
+
+    disposed = caregiver_clients.owner.post(
+        f"/caregiver/sessions/{OWNER_SESSION}/help-requests/"
+        f"{foreign_request_id}/dispositions",
+        json={"state": "acknowledged", "note": "我来处理"})
+    assert disposed.status_code == 404, disposed.text
+    with Session(caregiver_clients.engine) as session:
+        assert list(session.exec(select(CaregiverHelpDisposition))) == []
 
 
 def test_caregiver_finish_insufficient_evidence_has_no_research_diagnostics(

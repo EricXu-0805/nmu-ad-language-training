@@ -258,10 +258,10 @@ def test_fresh_upgrade_reaches_exactly_one_new_head(tmp_path):
     db_path = _head_database(tmp_path)
     config = _config(db_path)
 
-    # 全局单一 head 不变量;当前头由 b3e7c5a9d214(照护员呼叫证据)持有,
+    # 全局单一 head 不变量;当前头由 c5a8f2d91e40(求助处置转移)持有,
     # 本迁移必须仍在其祖先链上。
     heads = list(ScriptDirectory.from_config(config).get_heads())
-    assert heads == ["b3e7c5a9d214"]
+    assert heads == ["c5a8f2d91e40"]
     assert _revision(db_path) == HEAD
 
 
@@ -795,7 +795,7 @@ def test_legacy_null_only_roundtrip_preserves_every_old_field_and_constraint(
     assert {table: _snapshot(db_path, table) for table in tables} == (
         first_head_schema)
     assert_old_rows_and_null_profiles()
-    # 本迁移已不再是全局 head(b3e7c5a9d214 在其上),up-to-date 检查不再适用;
+    # 本迁移已不再是全局 head(b3e7c5a9d214、c5a8f2d91e40 在其上),up-to-date 检查不再适用;
     # 往返完整性由上面的 revision/schema/行快照断言承担。
 
 

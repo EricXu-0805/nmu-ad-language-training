@@ -58,6 +58,7 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      AttemptCaptureProcessing,
                      AttemptEvent, AuditLog, AudioAssetRow,
                      AudioCaptureReceipt, AudioLocalCopyDisposalReceipt,
+                     CaregiverHelpRequest,
                      ExportBatch, InteractionEvent,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
                      Patient, PatientDeviceCapability, PatientPauseReceipt,
@@ -6127,6 +6128,86 @@ def caregiver_request_help(
         session_id=session_id,
     )
     return caregiver_service.help_projection(row, idempotent=False)
+
+
+def _help_request_in_session(
+        session_id: str, request_id: str, s: DBSession) -> CaregiverHelpRequest:
+    row = s.get(CaregiverHelpRequest, request_id)
+    if row is None or row.session_id != session_id:
+        # 不区分"不存在"与"属于别的场次"：区分开就成了一个探测别人呼叫的接口。
+        raise HTTPException(404, "呼叫不存在")
+    return row
+
+
+@app.get(
+    "/caregiver/sessions/{session_id}/help-requests/{request_id}",
+    response_model=caregiver_contract.CaregiverHelpStatusOut,
+)
+def caregiver_help_status(
+        session_id: str,
+        request_id: str,
+        request: Request,
+        response: Response,
+        s: DBSession = Depends(get_session)):
+    _preauthorize_session_subject_fence(request, session_id, s, "查看呼叫状态")
+    sess = s.exec(select(TrainSession).where(
+        TrainSession.session_id == session_id)).first()
+    if sess is None:
+        raise HTTPException(404, "场次不存在")
+    _require_session_operator(request, sess, s, "查看呼叫状态")
+    _help_request_in_session(session_id, request_id, s)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return caregiver_service.help_status_projection(s, request_id=request_id)
+
+
+@app.post(
+    "/caregiver/sessions/{session_id}/help-requests/{request_id}/dispositions",
+    response_model=caregiver_contract.CaregiverHelpStatusOut,
+    status_code=201,
+)
+def caregiver_append_help_disposition(
+        session_id: str,
+        request_id: str,
+        body: caregiver_contract.CaregiverHelpDispositionIn,
+        request: Request,
+        s: DBSession = Depends(get_session)):
+    """记下"有人来了"与"处理完了"。**没有写「已送达」的入口**，那是通道的事。"""
+    actor_id = _require_account_identity(
+        request, "记录呼叫处置",
+        roles=set(access_policy.CAREGIVER_SESSION_CONTROL_ROLES))
+    patient_id = _preauthorize_session_subject_fence(
+        request, session_id, s, "记录呼叫处置")
+    with governance_lock.subject_fence(s, patient_id):
+        sess = s.exec(select(TrainSession).where(
+            TrainSession.session_id == session_id,
+        ).with_for_update()).first()
+        if sess is None:
+            raise HTTPException(404, "场次不存在")
+        _require_session_operator(request, sess, s, "记录呼叫处置", mutation=True)
+        _help_request_in_session(session_id, request_id, s)
+        try:
+            caregiver_service.append_help_disposition(
+                s, request_id=request_id, state=body.state,
+                actor_id=actor_id, evidence=body.note)
+            s.commit()
+        except caregiver_service.HelpDispositionRejected as exc:
+            s.rollback()
+            raise HTTPException(status_code=409, detail={
+                "code": exc.code, "message": exc.message}) from exc
+        except IntegrityError as exc:
+            s.rollback()
+            raise HTTPException(status_code=409, detail={
+                "code": "help_state_already_reached",
+                "message": "这条呼叫的该状态已被记录，请刷新后查看",
+            }) from exc
+    _audit(
+        s, request, "caregiver_help_disposition",
+        f"request_id={request_id} state={body.state}",
+        patient_id=sess.patient_id,
+        session_id=session_id,
+    )
+    return caregiver_service.help_status_projection(s, request_id=request_id)
 
 
 def _autopilot_wake_projection(
