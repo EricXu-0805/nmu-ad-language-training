@@ -29,6 +29,7 @@ export interface ResearchMetaReady {
   datasets: ResearchDatasetMeta[];
   defaultLimit: number;
   maxLimit: number;
+  release: ResearchReleaseState;
   note: string;
 }
 
@@ -36,15 +37,30 @@ export interface ResearchMetaUnavailable {
   configured: false;
   schemaVersion: string;
   reason: string;
+  release: ResearchReleaseState;
   note: string;
 }
 
 export type ResearchMeta = ResearchMetaReady | ResearchMetaUnavailable;
 
+/** 冻结发布纪元。研究分区的每一页都必须说自己出自哪一版。 */
+export interface ResearchRelease {
+  epochSeq: number;
+  cohortRuleVersion: string;
+  aggregatePayloadSha256: string;
+}
+
+export type ResearchReleaseState =
+  | ({ bound: true; asOf: string; frozenAt: string; frozenSessionCount: number }
+      & ResearchRelease)
+  | { bound: false; code: string; reason: string };
+
 export interface ResearchPage {
   schemaVersion: string;
   dataset: string;
   grain: string;
+  /** 仿真分区恒 null：那里没有真人，不冻纪元，也不该看起来像冻过。 */
+  release: ResearchRelease | null;
   pseudonymVersion: string;
   pseudonymKeyId: string;
   columns: string[];
@@ -112,12 +128,14 @@ export function parseResearchMeta(value: unknown): ResearchMeta {
   if (!deid || typeof deid.configured !== "boolean") {
     throw new Error("研究数据接口状态响应缺少 deidentification.configured");
   }
+  const release = parseResearchReleaseState(root.research_release);
   if (!deid.configured) {
     // 密钥未配时**必须**仍然可读，否则取数的人只拿到裸 503 无法自诊。
     return {
       configured: false,
       schemaVersion,
       reason: text(deid.reason, "deidentification.reason"),
+      release,
       note,
     };
   }
@@ -145,6 +163,7 @@ export function parseResearchMeta(value: unknown): ResearchMeta {
     datasets,
     defaultLimit: positiveInt(page.default_limit, "page.default_limit"),
     maxLimit: positiveInt(page.max_limit, "page.max_limit"),
+    release,
     note,
   };
 }
@@ -166,7 +185,51 @@ function assertCell(column: string, cell: unknown, rowIndex: number): ResearchCe
   return cell;
 }
 
-export function parseResearchPage(value: unknown, expectedDataset: string): ResearchPage {
+function parseRelease(value: unknown, field: string): ResearchRelease {
+  const row = record(value);
+  if (!row) throw new Error(`${field} 不是对象`);
+  if (!Number.isInteger(row.epoch_seq) || (row.epoch_seq as number) < 1) {
+    throw new Error(`${field}.epoch_seq 不是正整数`);
+  }
+  const digest = text(row.aggregate_payload_sha256, `${field}.aggregate_payload_sha256`);
+  if (!/^[0-9a-f]{64}$/.test(digest)) {
+    throw new Error(`${field}.aggregate_payload_sha256 不是 sha256`);
+  }
+  return {
+    epochSeq: row.epoch_seq as number,
+    cohortRuleVersion: text(row.cohort_rule_version, `${field}.cohort_rule_version`),
+    aggregatePayloadSha256: digest,
+  };
+}
+
+export function parseResearchReleaseState(value: unknown): ResearchReleaseState {
+  const row = record(value);
+  if (!row || typeof row.bound !== "boolean") {
+    throw new Error("研究数据接口状态缺少 research_release.bound");
+  }
+  if (!row.bound) {
+    return {
+      bound: false,
+      code: text(row.code, "research_release.code"),
+      reason: text(row.reason, "research_release.reason"),
+    };
+  }
+  if (!Number.isInteger(row.frozen_session_count)) {
+    throw new Error("research_release.frozen_session_count 不是整数");
+  }
+  return {
+    bound: true,
+    ...parseRelease(row, "research_release"),
+    asOf: text(row.as_of, "research_release.as_of"),
+    frozenAt: text(row.frozen_at, "research_release.frozen_at"),
+    frozenSessionCount: row.frozen_session_count as number,
+  };
+}
+
+export function parseResearchPage(
+  value: unknown, expectedDataset: string,
+  classification: ResearchDataClassification,
+): ResearchPage {
   const root = record(value);
   if (!root) throw new Error("研究数据响应不是对象");
   const dataset = text(root.dataset, "dataset");
@@ -201,10 +264,23 @@ export function parseResearchPage(value: unknown, expectedDataset: string): Rese
     }
     return columns.map((column) => assertCell(column, row[column] ?? null, rowIndex));
   });
+  // 研究分区没有冻结纪元标识就不许渲染：那说明服务端把行面从纪元上解开了，
+  // 而屏幕上那一页会看起来和绑着的时候一模一样。
+  if (root.release === undefined) {
+    throw new Error("研究数据响应没有说自己出自哪一个冻结纪元，已拒绝显示");
+  }
+  const release = root.release === null ? null : parseRelease(root.release, "release");
+  if (classification === "research" && release === null) {
+    throw new Error("真实研究分区返回了未冻结的数据，已拒绝显示");
+  }
+  if (classification === "simulation" && release !== null) {
+    throw new Error("模拟演练分区不该带冻结纪元标识，已拒绝显示");
+  }
   return {
     schemaVersion: text(root.schema_version, "schema_version"),
     dataset,
     grain: text(root.grain, "grain"),
+    release,
     pseudonymVersion: text(root.pseudonym_version, "pseudonym_version"),
     pseudonymKeyId: text(root.pseudonym_key_id, "pseudonym_key_id"),
     columns,
@@ -259,6 +335,12 @@ export function researchDatasetPath(request: {
 
 export function researchCsvFilename(
   dataset: string, classification: ResearchDataClassification,
+  release: ResearchRelease | null,
 ): string {
-  return `nmu-${dataset}-${classification}.csv`;
+  // 与服务端 Content-Disposition 同一口径。文件存到磁盘之后信封就不在了，
+  // 而"这份数据是哪一版"正是半年后写论文时最需要留住的。
+  const stamp = release === null
+    ? ""
+    : `-epoch${String(release.epochSeq).padStart(3, "0")}`;
+  return `nmu-${dataset}-${classification}${stamp}.csv`;
 }

@@ -102,7 +102,9 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
         : await api.researchCsv({ dataset, classification, cursor });
       saveBlob(blob, kind === "dictionary"
         ? "nmu-research-dictionary.csv"
-        : researchCsvFilename(dataset, classification));
+        : researchCsvFilename(
+            dataset, classification,
+            pageState.status === "ready" ? pageState.page.release : null));
     } catch (error: unknown) {
       setDownloadError(errorText(error));
     } finally {
@@ -190,6 +192,19 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
                 本区数据只用于流程和模型调试，不得并入真实研究结果或写进论文。
               </Alert>
             )}
+            {classification === "research" && meta.release.bound === false && (
+              <Alert tone="warn" title="真实研究分区还没有可发布的冻结版本">
+                <p>{meta.release.reason}</p>
+                <p className="muted">
+                  这不是故障。真实研究分区只发**冻结纪元**里的那批场次：由数据管理员与
+                  管理员两个具名的人各跑一次
+                  <code>scripts/cut_quality_release.py</code>（一个提议、另一个拿着
+                  sha256 批准）之后，这里才会有数据。这样做是为了让同一版数据反复拉取
+                  逐字节相同——否则两次拉取之差里装着这期间新入组那几个人的全部明细。
+                  拒绝码 <code>{meta.release.code}</code>。
+                </p>
+              </Alert>
+            )}
           </section>
 
           {pageState.status === "loading" && (
@@ -225,6 +240,15 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
               <code>{meta.pseudonymVersion}</code> · 假名密钥编号{" "}
               <code>{meta.pseudonymKeyId}</code>
             </p>
+            {meta.release.bound && (
+              <p className="muted">
+                冻结发布纪元 <code>第 {meta.release.epochSeq} 版</code> · 队列
+                {meta.release.frozenSessionCount} 个场次 · 截止时刻{" "}
+                <code>{meta.release.asOf}</code> · 聚合载荷指纹{" "}
+                <code>{meta.release.aggregatePayloadSha256.slice(0, 12)}</code>
+                。两份导出只有纪元号相同才能直接比对。
+              </p>
+            )}
             <p className="muted">{meta.note}</p>
           </footer>
         </>

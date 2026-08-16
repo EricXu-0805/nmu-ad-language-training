@@ -526,7 +526,7 @@ export const api = {
   }): Promise<ResearchPage> => parseResearchPage(await req<unknown>(
     "GET", researchDatasetPath(request), undefined,
     RESEARCH_READ_TIMEOUT_MS, { noStore: true, signal: request.signal },
-  ), request.dataset),
+  ), request.dataset, request.classification),
   researchCsv: (request: {
     dataset: string;
     classification: ResearchDataClassification;

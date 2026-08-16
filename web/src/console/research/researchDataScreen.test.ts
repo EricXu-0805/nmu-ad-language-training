@@ -55,3 +55,17 @@ test("分析后台挂上了入口，并写明只向数据管理员开放", () =>
 test("换数据集或分区必须回到第一页——游标是按自然键签名的", () => {
   assert.match(screen, /setCursorStack\(\[null\]\);? \}, \[dataset, classification\]\)/);
 });
+
+test("真实分区没有冻结版本时，屏上解释这不是故障并说清怎么解", () => {
+  // 不这么写的话，第一个打开这一屏的人看到的是一个裸 503 码，然后很可能去调松阈值。
+  assert.match(screen, /meta\.release\.bound === false/);
+  assert.match(screen, /真实研究分区还没有可发布的冻结版本/);
+  assert.match(screen, /这不是故障/);
+  assert.match(screen, /cut_quality_release\.py/);
+  assert.match(screen, /两个具名的人/);
+});
+
+test("屏上与导出都说得出这份数据是哪一版", () => {
+  assert.match(screen, /meta\.release\.bound &&[\s\S]{0,400}冻结发布纪元/);
+  assert.match(screen, /researchCsvFilename\(\s*dataset, classification,\s*\n\s*pageState\.status === "ready" \? pageState\.page\.release : null\)/);
+});
