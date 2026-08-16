@@ -91,6 +91,8 @@ def _result() -> browser.BrowserResult:
         drain_command_key="CMD-TTS-2",
         drain_state_revision=5,
         native_audio_pause_observed=True,
+        help_request_id="CHR-BROWSER-1",
+        help_states_walked=True,
     )
 
 
@@ -193,6 +195,23 @@ def test_result_receipt_requires_native_audio_pause_evidence(tmp_path):
     target.write_text(json.dumps(payload), encoding="utf-8")
     target.chmod(0o600)
     with pytest.raises(browser.BrowserAcceptanceError, match="原生音频"):
+        browser._read_result_receipt(root)
+
+
+def test_result_receipt_requires_help_states_evidence(tmp_path):
+    """求助四态没走完的收据不许被后续核验当成通过。
+
+    这一条与上面那条同形：收据里少一样证据，就不该有人能拿它去过账本核验。
+    """
+    root = _root(tmp_path)
+    config = browser.resolve_browser_config("http://127.0.0.1:8815", _env(root))
+    browser._write_result_receipt(config, _result())
+    target = root / browser.RESULT_RECEIPT_NAME
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload["help_states_walked"] = False
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    target.chmod(0o600)
+    with pytest.raises(browser.BrowserAcceptanceError, match="求助四态"):
         browser._read_result_receipt(root)
 
 
