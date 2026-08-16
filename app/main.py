@@ -44,7 +44,7 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                ai_quality_service, llm_judge, rule_judge, runtime, scoring,
                session_completion,
                resource_limits, patient_asset, patient_presentation,
-               provider_readiness, repeat_evidence, repeat_intent,
+               provider_readiness, quality_release, repeat_evidence, repeat_intent,
                research_dataset, research_read,
                scale_protocol,
                session_admission, session_closeout, tts,
@@ -7604,7 +7604,8 @@ def _research_config(request: Request, action: str):
 
 
 @app.get("/research/v1/meta")
-def get_research_meta(request: Request, response: Response):
+def get_research_meta(request: Request, response: Response,
+                      s: DBSession = Depends(get_session)):
     """就绪自诊面：**密钥没配也必须能读**，否则取数的人只拿到裸 503。"""
     _require_account_identity(request, "查看研究数据接口状态",
                               roles={"data_steward", "admin"})
@@ -7614,7 +7615,8 @@ def get_research_meta(request: Request, response: Response):
         config = research_read.load_config()
     except research_read.ResearchReadUnavailable as exc:
         return research_read.build_meta(exc, None)
-    return research_read.build_meta(None, config)
+    return research_read.build_meta(
+        None, config, quality_release.binding_state(s, config=config))
 
 
 @app.get("/research/v1/dictionary")
@@ -7687,6 +7689,10 @@ def get_research_dataset(
     try:
         config = research_read.load_config()
         size = research_read.clamp_limit(limit)
+        # 研究分区只发冻结纪元里的那批场次。仿真分区不绑——那里没有真人，冻纪元
+        # 只会让演练也需要治理动作。
+        binding = (quality_release.bind_research_read(s, config=config)
+                   if data_classification == "research" else None)
         reader = {
             "subjects": research_read.list_subjects,
             "sessions": research_read.list_sessions,
@@ -7694,7 +7700,7 @@ def get_research_dataset(
         }[dataset_key]
         payload = reader(s, config=config,
                          data_classification=data_classification,
-                         cursor=cursor, limit=size)
+                         cursor=cursor, limit=size, binding=binding)
         # 限速拦不住有耐心的内部人，账本才是唯一的事后追责面。本仓库的惯例是
         # 每个批量读面都记（导出、音频元数据读、录音字节读都写），新加的取数面
         # 不能是唯一一个不写的。只记元数据：数据集、分区、行数、有没有下一页，
@@ -7703,14 +7709,24 @@ def get_research_dataset(
                f"取数 {dataset_key}/{data_classification} 行数={payload['row_count']}"
                f" 格式={'csv' if wants_csv else 'json'}"
                f" 还有下一页={payload['has_more']}")
+        if binding is not None:
+            quality_release.record_row_disclosure(
+                s, binding, actor_id=actor_id,
+                actor_role=getattr(request.state, "actor_role", None) or "")
         if wants_csv:
+            # 纪元号进文件名：CSV 存到磁盘之后，信封与响应头都不在了，而"这份
+            # 数据是哪一版"恰恰是 PI 半年后最需要知道的一件事。
+            stamp = ("" if binding is None
+                     else f"-epoch{binding.epoch_seq:03d}")
             return _research_csv(
                 research_read.dataset_csv(payload),
-                f"nmu-{dataset_key}-{data_classification}.csv")
+                f"nmu-{dataset_key}-{data_classification}{stamp}.csv")
         return payload
     except research_read.ResearchReadUnavailable as exc:
         status = 503 if exc.code == "research_deidentification_unavailable" else 422
         raise _research_reject(exc.code, exc.message, status) from exc
+    except quality_release.ReleaseRefused as refused:
+        raise _research_reject(refused.code, refused.detail, 503) from refused
 
 @app.get(
     "/ai/provider-readiness",

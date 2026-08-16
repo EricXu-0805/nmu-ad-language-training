@@ -17,8 +17,8 @@ from starlette.datastructures import QueryParams, URL
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import (auth, content, db, export_security, repeat_intent,
-                 main, research_dataset, session_admission)
+from app import (auth, content, db, export_security, quality_release,
+                 repeat_intent, main, research_dataset, session_admission)
 from app.db import get_session
 from app.main import app
 from app.models import (
@@ -26,6 +26,9 @@ from app.models import (
     AuditLog,
     ItemEvent,
     Patient,
+    QualityDisclosureRecord,
+    QualityReleaseEpoch,
+    QualityReleaseEpochSession,
     ResearchUser,
     Session as TrainSession,
     SessionRuntimeState,
@@ -43,6 +46,51 @@ PASSWORD = "research-read-password-2026"
 KEY = "r" * 48
 KEY_ID = "nmu-test-2026"
 SECRET_TEXT = "我叫王大爷住城东"
+CONFIG = export_security.DeidentificationConfig(
+    key=KEY.encode("utf-8"), key_id=KEY_ID)
+
+
+def _freeze_epoch(engine, *session_ids: str, key_id: str = KEY_ID) -> str:
+    """切一个纪元，成员就是给定的这几个场次。
+
+    不走 ``publish_epoch``：那条路要先算出一份真载荷，而行面只消费三样东西——
+    纪元号、成员假名、冻结时用的密钥标识。用真载荷会把这套测试变成对聚合管线
+    的测试，行面自己的边界反而测不干净。
+    """
+    with Session(engine) as session:
+        previous = session.exec(
+            select(QualityReleaseEpoch)
+            .where(QualityReleaseEpoch.status == "published")
+            .order_by(QualityReleaseEpoch.epoch_seq.desc())).first()
+        seq = 1 if previous is None else previous.epoch_seq + 1
+        epoch_id = f"qre_test_{seq}"
+        session.add(QualityReleaseEpoch(
+            epoch_id=epoch_id, epoch_seq=seq, status="published",
+            as_of=datetime(2026, 8, 1), frozen_at=datetime(2026, 8, 2),
+            cohort_rule_version=quality_release.COHORT_RULE_VERSION,
+            registry_version=quality_release.REGISTRY_VERSION,
+            schema_version=quality_release.RELEASE_SCHEMA_VERSION,
+            cohort_size_band="0-9", session_count_band="0-9",
+            payload_json="{}", payload_sha256=f"{seq:064d}",
+            min_subjects_applied=5, min_cell_subjects_applied=5,
+            band_width_applied=10, rate_decimals_applied=2,
+            diagnostics_status="complete", deidentification_key_id=key_id,
+            builder_actor_display_id="STEWARD", builder_actor_role="data_steward",
+            approver_actor_display_id="ADMIN", approver_actor_role="admin",
+            idempotency_key_sha256=f"{seq:064x}"))
+        session.flush()
+        for session_id in session_ids:
+            session.add(QualityReleaseEpochSession(
+                epoch_id=epoch_id,
+                session_pseudonym=export_security.pseudonymize_session(
+                    session_id, CONFIG),
+                evidence_watermark=1))
+        if previous is not None:
+            previous.status = "superseded"
+            previous.superseded_at = datetime(2026, 8, 2)
+            session.add(previous)
+        session.commit()
+    return epoch_id
 
 
 @pytest.fixture
@@ -75,17 +123,18 @@ def research_env(monkeypatch):
             consent_status="已同意", consent_type="本人同意",
             mandarin_eligible=True, recording_allowed=True,
             withdrawal_status="withdrawn"))
-        train = TrainSession(
-            session_id="S-REAL-1", patient_id="P-REAL-1", week_no=2,
-            phase_type="正式训练", event_line="正式训练", trainer_id="RESEARCHER",
-            item_bank_version_id=BANK.version_id,
-            item_bank_definition_digest=BANK_DIGEST,
-            autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
-            autopilot_protocol_definition_digest=PROTOCOL_DIGEST,
-            repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
-            repeat_protocol_definition_digest=REPEAT_PROTOCOL.definition_digest,
-            is_simulation=False, data_classification="research")
-        session.add(train)
+        for session_id, patient_id in (("S-REAL-1", "P-REAL-1"),
+                                       ("S-GONE-1", "P-GONE-1")):
+            session.add(TrainSession(
+                session_id=session_id, patient_id=patient_id, week_no=2,
+                phase_type="正式训练", event_line="正式训练", trainer_id="RESEARCHER",
+                item_bank_version_id=BANK.version_id,
+                item_bank_definition_digest=BANK_DIGEST,
+                autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
+                autopilot_protocol_definition_digest=PROTOCOL_DIGEST,
+                repeat_protocol_version_id=REPEAT_PROTOCOL.version_id,
+                repeat_protocol_definition_digest=REPEAT_PROTOCOL.definition_digest,
+                is_simulation=False, data_classification="research"))
         session.commit()
         item = ItemEvent(session_id="S-REAL-1", item_id="SE_胡萝卜",
                          task_type="单要素", item_set_type="训练集",
@@ -98,6 +147,10 @@ def research_env(monkeypatch):
             asr_confidence=0.9, prompt_level=0, ai_score=1.0,
             reviewed_score=1.0, score_locked=True, judge_portrait_used=False))
         session.commit()
+
+    # 研究分区的行面绑在冻结纪元上：不切纪元就一行也读不到。默认 fixture 把这
+    # 两个场次冻进纪元 1，让绝大多数用例测的是"绑上之后"的正常路径。
+    _freeze_epoch(engine, "S-REAL-1", "S-GONE-1")
 
     def override_session():
         with Session(engine) as session:
@@ -120,6 +173,8 @@ def _client(username: str) -> TestClient:
 def _with_key(monkeypatch):
     monkeypatch.setenv("DEIDENTIFICATION_KEY", KEY)
     monkeypatch.setenv("DEIDENTIFICATION_KEY_ID", KEY_ID)
+    monkeypatch.setenv(quality_release.RELEASE_MODE_ENV,
+                       quality_release.RELEASE_MODE_REQUIRED)
 
 
 def _without_key(monkeypatch):
@@ -289,10 +344,10 @@ def test_csv_is_refused_without_the_deidentification_key(research_env, monkeypat
     assert response.json()["detail"]["code"] == "research_deidentification_unavailable"
 
 
-def _add_second_page_rows(engine) -> None:
-    """让三张表都真的有第二页。
+def _create_second_session(engine) -> None:
+    """再建一个研究场次，**不切纪元**——所以它不会出现在行面里。
 
-    默认 fixture 只有 1 个场次、1 条环节，于是 ``has_more`` 恒为 False、
+    默认 fixture 只有 1 个有内容的场次、1 条环节，于是 ``has_more`` 恒为 False、
     ``next_cursor`` 恒为 null——针对游标的断言会在空转里全绿。上一版泄漏回归
     就是这么漏掉明文游标的：它测的那条路径压根没被走到。
     """
@@ -319,6 +374,16 @@ def _add_second_page_rows(engine) -> None:
             asr_confidence=0.8, prompt_level=0, ai_score=1.0,
             judge_portrait_used=False))
         session.commit()
+
+
+def _add_second_page_rows(engine) -> None:
+    """建第二个场次并把它冻进新纪元——行面要能翻页，前提是它在队列里。
+
+    新场次不会自己进已冻结的队列，那正是绑定要挡的事。想让它出现在行面里，
+    只有一条路：再切一个纪元。
+    """
+    _create_second_session(engine)
+    _freeze_epoch(engine, "S-REAL-1", "S-GONE-1", "S-REAL-2")
 
 
 def _decoded_cursor_bytes(cursor: str) -> bytes:
@@ -823,3 +888,251 @@ def test_paging_turns_one_at_a_time_gives_exactly_the_same_rows_as_one_big_page(
             break
     assert cursor is None, "翻到上限还没走完，游标没有前进"
     assert walked == whole["rows"], "逐页走出来的行与一次全量拉的不一致"
+
+
+# ---------------------------------------------------------------------------
+# 行面绑定到冻结纪元
+#
+# 绑定之前，行面与聚合面算的是两个队列：聚合是冻结、过隔离期的那批场次，行面是
+# 库里当下的一切。于是拿到 CSV 的人复现不出看板上任何一个数，而"两次拉取之差"
+# 里装着这期间新入组那几个人的全部明细。
+# ---------------------------------------------------------------------------
+
+def _drop_every_epoch(engine) -> None:
+    with Session(engine) as session:
+        for row in session.exec(select(QualityReleaseEpoch)):
+            row.status = "revoked"
+            row.revoked_at = datetime(2026, 8, 3)
+            row.revoke_reason_code = "test"
+            session.add(row)
+        session.commit()
+
+
+ROW_PATHS = tuple(
+    f"/research/v1/{dataset}{suffix}?data_classification=research"
+    for dataset in ("subjects", "sessions", "turns")
+    for suffix in ("", ".csv"))
+
+
+def test_research_rows_are_refused_until_the_frozen_mode_is_switched_on(
+        research_env, monkeypatch):
+    """未启用冻结发布 = 行面关着，而不是照发全库。"""
+    _with_key(monkeypatch)
+    monkeypatch.delenv(quality_release.RELEASE_MODE_ENV, raising=False)
+    client = _client("steward")
+    for path in ROW_PATHS:
+        response = client.get(path)
+        assert response.status_code == 503, path
+        assert response.json()["detail"]["code"] == "research_release_not_frozen"
+        assert "P-REAL-1" not in response.text, path
+
+
+def test_research_rows_are_refused_when_the_mode_is_on_but_nothing_was_cut(
+        research_env, monkeypatch):
+    """开关打开、纪元没切，同样一行都不发。开关本身不是授权。"""
+    _with_key(monkeypatch)
+    _drop_every_epoch(research_env)
+    client = _client("steward")
+    response = client.get("/research/v1/turns?data_classification=research")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "research_release_not_frozen"
+
+
+def test_a_session_outside_the_frozen_cohort_never_reaches_the_row_face(
+        research_env, monkeypatch):
+    """队列外的场次不出现在任何一张表里——这是绑定的全部意义。"""
+    _with_key(monkeypatch)
+    _add_second_page_rows(research_env)          # 建 S-REAL-2 并把它冻进纪元 2
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")   # 纪元 3 把它排除掉
+    client = _client("steward")
+
+    excluded = export_security.pseudonymize_session("S-REAL-2", CONFIG)
+    sessions = client.get(
+        "/research/v1/sessions?data_classification=research").json()
+    codes = {row["session_code"] for row in sessions["rows"]}
+    assert export_security.pseudonymize_session("S-REAL-1", CONFIG) in codes, \
+        "队列内的场次没出来，这条断言会因为整表为空而空转"
+    assert excluded not in codes, "队列外的场次出现在行面里"
+
+    turns = client.get(
+        "/research/v1/turns?data_classification=research").json()
+    assert excluded not in {row["session_code"] for row in turns["rows"]}
+
+
+def test_data_written_after_the_freeze_does_not_move_the_row_face(
+        research_env, monkeypatch):
+    """同一纪元内两次拉取必须逐字节相同，哪怕中间又训练了一场。
+
+    这条正是绑定要挡的那个差分：不绑的话，第二次拉取减第一次，差出来的就是
+    这期间新做的那一场的全部明细。
+    """
+    _with_key(monkeypatch)
+    client = _client("steward")
+    path = "/research/v1/turns?data_classification=research"
+    before = client.get(path).text
+    assert '"row_count":1' in before.replace(" ", ""), \
+        "第一次拉取就是空的，后面比对逐字节相同也说明不了什么"
+    _create_second_session(research_env)          # 又训了一场，但没有切新纪元
+    assert client.get(path).text == before, "冻结之后新写入的数据改变了行面的输出"
+
+
+def test_rotating_the_key_closes_the_row_face_instead_of_emptying_it(
+        research_env, monkeypatch):
+    """轮换密钥之后旧纪元的假名对不上——必须拒绝，不能静默返回零行。
+
+    静默零行是最坏的形态：调用者拿到一份 200、标着"纪元 N"、却一行都没有的
+    数据，会以为这个队列真的空了。
+    """
+    _with_key(monkeypatch)
+    _freeze_epoch(research_env, "S-REAL-1", key_id="nmu-old-key")
+    client = _client("steward")
+    response = client.get("/research/v1/sessions?data_classification=research")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "research_release_key_rotated"
+
+
+def test_a_frozen_session_that_no_longer_resolves_closes_the_row_face(
+        research_env, monkeypatch):
+    """队列里有场次在库中找不到，就不许发——发出去的是纪元 N 的一个子集。"""
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        epoch = session.exec(
+            select(QualityReleaseEpoch).where(
+                QualityReleaseEpoch.status == "published")).first()
+        session.add(QualityReleaseEpochSession(
+            epoch_id=epoch.epoch_id,
+            session_pseudonym=export_security.pseudonymize_session(
+                "S-NEVER-EXISTED", CONFIG),
+            evidence_watermark=1))
+        session.commit()
+    client = _client("steward")
+    response = client.get("/research/v1/turns?data_classification=research")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "research_release_cohort_unresolved"
+
+
+def test_the_simulation_partition_is_not_bound_to_any_epoch(
+        research_env, monkeypatch):
+    """仿真分区照常可读：那里没有真人，冻纪元只会让演练也要走治理动作。"""
+    _with_key(monkeypatch)
+    _drop_every_epoch(research_env)
+    client = _client("steward")
+    response = client.get("/research/v1/sessions?data_classification=simulation")
+    assert response.status_code == 200
+    assert response.json()["release"] is None, "仿真分区不该看起来像冻过纪元"
+
+
+def test_subject_session_counts_only_count_the_frozen_sessions(
+        research_env, monkeypatch):
+    """session_count 数全部场次就是个活计数器：又训一场，同一纪元里它就变了。"""
+    _with_key(monkeypatch)
+    _add_second_page_rows(research_env)                   # P-REAL-1 现在有两场
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")   # 只冻其中一场
+    code = export_security.pseudonymize_subject("P-REAL-1", CONFIG)
+    rows = _client("steward").get(
+        "/research/v1/subjects?data_classification=research").json()["rows"]
+    row = next(r for r in rows if r["subject_code"] == code)
+    assert row["session_count"] == 1, \
+        "队列外的场次被数进了 session_count，这一列会随新训练而变"
+
+
+def test_a_subject_outside_the_cohort_is_absent_rather_than_zero_rowed(
+        research_env, monkeypatch):
+    """新入组但还没有冻结场次的人整个不出现。
+
+    留一行零场次的占位等于把"谁入组了"做成一张每次拉取都在更新的名册，
+    而入组本身就是要保护的事实。
+    """
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        session.add(Patient(
+            patient_id="P-NEW-1", is_simulation_subject=False,
+            consent_status="已同意", consent_type="本人同意",
+            mandarin_eligible=True, recording_allowed=True))
+        session.commit()
+    newcomer = export_security.pseudonymize_subject("P-NEW-1", CONFIG)
+    payload = _client("steward").get(
+        "/research/v1/subjects?data_classification=research").json()
+    codes = {row["subject_code"] for row in payload["rows"]}
+    assert codes, "受试者表为空，这条断言会空转"
+    assert newcomer not in codes, "队列外的受试者出现在行面里"
+
+
+def test_every_bound_page_says_which_epoch_it_came_from(
+        research_env, monkeypatch):
+    """信封要能回答"这份数据是哪一版"，否则半年后 PI 没法比对两份 CSV。"""
+    _with_key(monkeypatch)
+    client = _client("steward")
+    for dataset in research_dataset.dataset_keys():
+        payload = client.get(
+            f"/research/v1/{dataset}?data_classification=research").json()
+        release = payload["release"]
+        assert release["epoch_seq"] == 1, dataset
+        assert release["cohort_rule_version"] == quality_release.COHORT_RULE_VERSION
+        assert len(release["aggregate_payload_sha256"]) == 64, dataset
+
+
+def test_the_release_envelope_carries_no_absolute_time(
+        research_env, monkeypatch):
+    """信封里放 ISO 时刻会被泄漏回归抓住，而且没必要——纪元号已经唯一确定版本。
+
+    绝对时刻只出现在 /research/v1/meta，那是给运维与 PI 自诊的面。
+    """
+    _with_key(monkeypatch)
+    client = _client("steward")
+    raw = client.get("/research/v1/turns?data_classification=research").text
+    assert not re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", raw)
+    meta = client.get("/research/v1/meta").json()["research_release"]
+    assert meta["bound"] is True
+    assert meta["as_of"].startswith("2026-08-01"), "meta 才是给出截止时刻的地方"
+    assert meta["frozen_session_count"] == 2
+
+
+def test_meta_names_the_gate_that_closed_the_row_face(
+        research_env, monkeypatch):
+    """503 只给一个码，取数的人要在 meta 里看懂是哪一道闸拦的。"""
+    _with_key(monkeypatch)
+    monkeypatch.delenv(quality_release.RELEASE_MODE_ENV, raising=False)
+    state = _client("steward").get("/research/v1/meta").json()["research_release"]
+    assert state["bound"] is False
+    assert state["code"] == "research_release_not_frozen"
+    assert state["reason"]
+
+
+def test_meta_stays_readable_and_honest_without_the_key(
+        research_env, monkeypatch):
+    """密钥没配时 meta 仍可读，而且不能声称行面绑上了。"""
+    _without_key(monkeypatch)
+    state = _client("steward").get("/research/v1/meta").json()["research_release"]
+    assert state["bound"] is False
+    assert state["code"] == "research_deidentification_unavailable"
+
+
+def test_the_row_face_records_who_read_which_epoch(
+        research_env, monkeypatch):
+    """聚合与明细指向同一个纪元，"谁看过纪元 N"就该把两条路径记在一起。
+
+    AuditLog 记得下这次取数，但它不知道纪元是哪一个。
+    """
+    _with_key(monkeypatch)
+    client = _client("steward")
+    client.get("/research/v1/turns?data_classification=research")
+    client.get("/research/v1/subjects.csv?data_classification=research")
+    client.get("/research/v1/sessions?data_classification=simulation")
+    with Session(research_env) as session:
+        records = list(session.exec(select(QualityDisclosureRecord)))
+    assert len(records) == 2, "仿真分区不该记披露，研究分区两次都该记"
+    for record in records:
+        assert record.actor_id == "STEWARD"
+        assert record.actor_role == "data_steward"
+        assert record.epoch_id == "qre_test_1"
+
+
+def test_the_csv_filename_carries_the_epoch(research_env, monkeypatch):
+    """CSV 落到磁盘之后信封与响应头都没了，而"哪一版"正是最需要留住的。"""
+    _with_key(monkeypatch)
+    response = _client("steward").get(
+        "/research/v1/turns.csv?data_classification=research")
+    assert response.status_code == 200
+    assert 'filename="nmu-turns-research-epoch001.csv"' in \
+        response.headers["content-disposition"]

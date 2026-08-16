@@ -155,11 +155,28 @@ def _subject_is_research(patient: Patient) -> bool:
 
 
 def list_subjects(db: DBSession, *, config, data_classification: str,
-                  cursor: str | None, limit: int) -> dict[str, Any]:
+                  cursor: str | None, limit: int,
+                  binding: Any = None) -> dict[str, Any]:
     after = decode_cursor(cursor, config, "subjects")[0] if cursor else None
     statement = select(Patient).order_by(Patient.patient_id)
     if after is not None:
         statement = statement.where(Patient.patient_id > after)
+
+    # 场次数必须只数冻结进纪元的那些。数全部的话这一列就是个活计数器：新做一
+    # 场训练，同一个纪元里同一个人的 session_count 就变了——纪元内两次拉取之差
+    # 恒为零这句话立刻不成立，而且它和 sessions 表里真发出去的行对不上。
+    counted = select(Session.patient_id)
+    cohort_patients: set[str] | None = None
+    if binding is not None:
+        counted = counted.where(Session.session_id.in_(binding.session_ids))
+        cohort_patients = set()
+        for row in db.exec(select(Session.patient_id).where(
+                Session.session_id.in_(binding.session_ids))):
+            cohort_patients.add(row if isinstance(row, str) else row[0])
+        # 队列外的受试者整个不出现。留着（哪怕零场次）等于把"谁入组了"做成一条
+        # 每次拉取都在更新的名册，而入组本身就是要保护的事实。
+        statement = statement.where(Patient.patient_id.in_(cohort_patients))
+
     wanted_research = data_classification == "research"
     picked: list[Patient] = []
     for patient in db.exec(statement):
@@ -171,7 +188,7 @@ def list_subjects(db: DBSession, *, config, data_classification: str,
     page, has_more = _page(picked, limit)
 
     session_counts: dict[str, int] = {}
-    for row in db.exec(select(Session.patient_id)):
+    for row in db.exec(counted):
         pid = row if isinstance(row, str) else row[0]
         session_counts[pid] = session_counts.get(pid, 0) + 1
 
@@ -201,7 +218,7 @@ def list_subjects(db: DBSession, *, config, data_classification: str,
         })
     next_cursor = (encode_cursor([page[-1].patient_id], config, "subjects")
                    if page and has_more else None)
-    return _envelope("subjects", rows, next_cursor, has_more, config)
+    return _envelope("subjects", rows, next_cursor, has_more, config, binding)
 
 
 def _withdrawn_patient_ids(db: DBSession) -> set[str]:
@@ -213,7 +230,8 @@ def _withdrawn_patient_ids(db: DBSession) -> set[str]:
 
 
 def list_sessions(db: DBSession, *, config, data_classification: str,
-                  cursor: str | None, limit: int) -> dict[str, Any]:
+                  cursor: str | None, limit: int,
+                  binding: Any = None) -> dict[str, Any]:
     after = decode_cursor(cursor, config, "sessions")[0] if cursor else None
     # 字典把 runtime_status 登记成真变量，取数层却写死 null——那比不给这一列更坏，
     # PI 会照着它建分析。终态存在 SessionRuntimeState 里，一次查完。
@@ -224,6 +242,8 @@ def list_sessions(db: DBSession, *, config, data_classification: str,
     statement = select(Session).where(
         Session.data_classification == data_classification,
     ).order_by(Session.session_id)
+    if binding is not None:
+        statement = statement.where(Session.session_id.in_(binding.session_ids))
     if after is not None:
         statement = statement.where(Session.session_id > after)
     picked = list(db.exec(statement.limit(limit + 1)))
@@ -261,11 +281,12 @@ def list_sessions(db: DBSession, *, config, data_classification: str,
         })
     next_cursor = (encode_cursor([page[-1].session_id], config, "sessions")
                    if page and has_more else None)
-    return _envelope("sessions", rows, next_cursor, has_more, config)
+    return _envelope("sessions", rows, next_cursor, has_more, config, binding)
 
 
 def list_turns(db: DBSession, *, config, data_classification: str,
-               cursor: str | None, limit: int) -> dict[str, Any]:
+               cursor: str | None, limit: int,
+               binding: Any = None) -> dict[str, Any]:
     """按 (场次, 题目, 环节序号) 的 keyset 翻页。
 
     第一版是在 Python 里翻：把该分区的全部场次、每个场次的全部题目、每道题的
@@ -281,6 +302,9 @@ def list_turns(db: DBSession, *, config, data_classification: str,
         .where(Session.data_classification == data_classification)
         .order_by(ItemEvent.session_id, ItemEvent.item_id, TurnEvent.turn_seq)
     )
+    if binding is not None:
+        statement = statement.where(
+            ItemEvent.session_id.in_(binding.session_ids))
     if after is not None:
         session_after, item_after, seq_after = after
         statement = statement.where(or_(
@@ -333,7 +357,7 @@ def list_turns(db: DBSession, *, config, data_classification: str,
 
     next_cursor = (encode_cursor(last_key, config, "turns")
                    if has_more and last_key is not None else None)
-    return _envelope("turns", rows, next_cursor, has_more, config)
+    return _envelope("turns", rows, next_cursor, has_more, config, binding)
 
 
 def _turn_row(session_code: str, subject_code: str,
@@ -377,7 +401,7 @@ def _tombstone(dataset_key: str, known: dict[str, Any]) -> dict[str, Any]:
 
 def _envelope(dataset_key: str, rows: Iterable[dict[str, Any]],
               next_cursor: str | None, has_more: bool,
-              config) -> dict[str, Any]:
+              config, binding: Any = None) -> dict[str, Any]:
     dataset = research_dataset.dataset_for(dataset_key)
     assert dataset is not None
     projected = research_dataset.project_all(dataset, rows)
@@ -387,6 +411,8 @@ def _envelope(dataset_key: str, rows: Iterable[dict[str, Any]],
         "schema_version": research_dataset.SCHEMA_VERSION,
         "dataset": dataset_key,
         "grain": dataset.grain,
+        # 研究分区必有；仿真分区恒 null——仿真数据不冻纪元，也不该看起来像冻过。
+        "release": binding.envelope() if binding is not None else None,
         "pseudonym_version": export_security.PSEUDONYM_VERSION,
         "pseudonym_key_id": config.key_id,
         "columns": list(research_dataset.published_columns(dataset)),
@@ -398,12 +424,15 @@ def _envelope(dataset_key: str, rows: Iterable[dict[str, Any]],
 
 
 def build_meta(config_error: ResearchReadUnavailable | None,
-               config) -> dict[str, Any]:
+               config, release_state: dict[str, Any] | None = None) -> dict[str, Any]:
     """密钥缺失时**仍然可读**——否则取数的人只拿到一个裸 503，无法自诊。"""
     if config_error is not None:
         return {
             "schema_version": research_dataset.SCHEMA_VERSION,
             "deidentification": {"configured": False,
+                                 "reason": config_error.message},
+            "research_release": {"bound": False,
+                                 "code": config_error.code,
                                  "reason": config_error.message},
             "datasets": [],
             "note": "配置去标识密钥后本接口才会返回数据集；此前一行也不会返回。",
@@ -413,6 +442,9 @@ def build_meta(config_error: ResearchReadUnavailable | None,
         "deidentification": {"configured": True,
                              "pseudonym_version": export_security.PSEUDONYM_VERSION,
                              "pseudonym_key_id": config.key_id},
+        # 研究分区的行面绑在冻结纪元上。没绑上时这里说明是哪一道闸拦的——否则
+        # 取数的人只看到 503，分不清"还没切纪元"和"密钥换过了"。
+        "research_release": release_state or {},
         "datasets": [
             {"key": dataset.key, "title": dataset.title, "grain": dataset.grain,
              "columns": list(research_dataset.published_columns(dataset))}
@@ -421,7 +453,8 @@ def build_meta(config_error: ResearchReadUnavailable | None,
         "page": {"default_limit": DEFAULT_PAGE_SIZE, "max_limit": MAX_PAGE_SIZE,
                  "style": "keyset"},
         "note": ("轮换去标识密钥会让所有假名改变，已交付的 CSV 无法与新拉取 join；"
-                 "pseudonym_key_id 是唯一的检测手段。"),
+                 "pseudonym_key_id 是唯一的检测手段。研究分区只发冻结纪元里的"
+                 "那批场次，纪元号写在每一页的 release 里，也写在 CSV 文件名上。"),
     }
 
 
