@@ -365,6 +365,29 @@ def test_every_read_is_named_in_the_disclosure_ledger(
     assert {row.actor_role for row in rows} == {"data_steward", "admin"}
 
 
+def test_the_ledger_does_not_depend_on_the_caller_committing(
+        engine, deidentified, readable):
+    """账本必须自己落库。
+
+    上一版是往调用方会话里 add + flush 就完了。这条测试的上一版紧跟着写了句
+    ``db.commit()``，于是全绿；而 HTTP 上 ``get_session`` 从头到尾不 commit，
+    读接口本来也没有别的写——每一行都在请求结束时随会话一起回滚。交接文档写着
+    "每一次读取都往只追加的账本里写一行"，实际上账本一行都没有。
+
+    所以这里**故意回滚调用方的事务**，再从另一个会话里查。
+    """
+    with Session(engine) as db:
+        _publish(db)
+        db.commit()
+        quality_release.serve(db, actor_id="STEWARD-A", actor_role="data_steward")
+        db.rollback()
+
+    with Session(engine) as other:
+        rows = list(other.exec(select(QualityDisclosureRecord)))
+    assert [row.actor_id for row in rows] == ["STEWARD-A"], \
+        "调用方回滚之后账本空了——那正是 HTTP 上每一次读取的实际情形"
+
+
 def test_the_frozen_cohort_stores_pseudonyms_not_session_ids(
         engine, deidentified):
     with Session(engine) as db:

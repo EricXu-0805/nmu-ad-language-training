@@ -544,15 +544,174 @@ def serve(
     if payload_digest(payload) != epoch.payload_sha256:
         raise ReleaseRefused(
             "research_release_payload_corrupt", "冻结载荷与其指纹对不上")
-    s.add(QualityDisclosureRecord(
-        record_id=f"qdr_{secrets.token_urlsafe(18)}",
-        epoch_id=epoch.epoch_id,
-        actor_id=actor_id,
-        actor_role=actor_role,
-        payload_sha256=epoch.payload_sha256,
-    ))
-    s.flush()
+    _append_disclosure(s, epoch_id=epoch.epoch_id, actor_id=actor_id,
+                       actor_role=actor_role,
+                       payload_sha256=epoch.payload_sha256)
     return payload
+
+
+def _append_disclosure(
+    s: DBSession, *, epoch_id: str, actor_id: str, actor_role: str,
+    payload_sha256: str,
+) -> None:
+    """把一次读取记进披露账本，**用自己的会话提交**。
+
+    第一版是往调用方的会话里 ``add`` + ``flush`` 就完了。单元测试里紧跟着一句
+    ``db.commit()``，于是全绿；而 HTTP 上 ``get_session`` 从头到尾不 commit，
+    读接口本来也没有别的写——每一行都在请求结束时随会话一起回滚。交接文档写着
+    "每一次读取都往只追加的账本里写一行"，实际上账本一行都没有。
+
+    照 ``audit.record`` 的做法：绑同一个引擎、开自己的会话、自己提交，绝不
+    commit 调用方的事务。
+    """
+    with DBSession(s.get_bind()) as ledger:
+        ledger.add(QualityDisclosureRecord(
+            record_id=f"qdr_{secrets.token_urlsafe(18)}",
+            epoch_id=epoch_id,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            payload_sha256=payload_sha256,
+        ))
+        ledger.commit()
+
+
+# ---------------------------------------------------------------------------
+# 行级取数面的绑定
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ResearchBinding:
+    """把 ``/research/v1/*`` 的研究分区钉在某一个冻结纪元上。
+
+    在这之前，行面与聚合面算的是两个不同的队列：聚合是冻结的、过了隔离期的那批
+    场次，行面是库里当下的一切。两个后果——拿到 CSV 的人复现不出看板上任何一个
+    数（连"这两份说的是不是同一批人"都无从判断）；而"两次拉取之差"里正好装着
+    这期间新入组的那几个人的全部明细。
+
+    **行面的读者是 data_steward 与 admin，他们本来就能直接读库。** 所以这层绑定
+    给的是可复现、可比对、可审计，不是遏制——这一点在
+    ``docs/handover/研究分区披露控制_给PI.md`` §5.2 里写着，别在别处写强了。
+    """
+    epoch_id: str
+    epoch_seq: int
+    as_of: datetime
+    frozen_at: datetime
+    cohort_rule_version: str
+    payload_sha256: str
+    session_ids: frozenset[str]
+
+    def envelope(self) -> dict[str, Any]:
+        """进每一页响应的发布标识。
+
+        **不放绝对时间。** 逐行禁出绝对时间是这个接口的红线，泄漏回归对整份响应
+        原文做正则，信封里放一个 ISO 时刻同样会被抓住——而且没有必要：epoch_seq
+        与聚合载荷的 sha256 已经唯一确定是哪一版。要看截止时刻去
+        ``/research/v1/meta``，那是给运维与 PI 自诊的面，不是数据面。
+        """
+        return {
+            "epoch_seq": self.epoch_seq,
+            "cohort_rule_version": self.cohort_rule_version,
+            "aggregate_payload_sha256": self.payload_sha256,
+        }
+
+
+def bind_research_read(
+    s: DBSession, *, config: Any,
+) -> ResearchBinding:
+    """取当前纪元，并把它冻住的那批场次还原成本库的场次号。
+
+    这里**不查** ``authorized_reader_roles()``：那个白名单管的是"谁可以读研究
+    分区**聚合**"，是一个 PI 要单独签字的治理决定。行面的读者集合由端点自己的
+    ``{data_steward, admin}`` 限定，两件事不要合成一件——合起来会让一个没配
+    聚合读者的机构连行级取数也一起消失，而那不是同一个决定。
+    """
+    if (os.environ.get(RELEASE_MODE_ENV) or "").strip() != RELEASE_MODE_REQUIRED:
+        raise ReleaseRefused(
+            "research_release_not_frozen", "研究分区未启用冻结发布")
+    epoch = current_epoch(s)
+    if epoch is None:
+        raise ReleaseRefused("research_release_not_frozen", "还没有切过纪元")
+    if epoch.deidentification_key_id != config.key_id:
+        # 轮换密钥之后旧纪元的假名与当前密钥算不出同一个值。不拒的话这里会
+        # 静默地一个场次都匹配不上，然后返回一份零行却仍标着"纪元 N"的数据。
+        raise ReleaseRefused(
+            "research_release_key_rotated",
+            "去标识密钥已轮换，本纪元的假名与当前密钥对不上，需重新切纪元")
+    return ResearchBinding(
+        epoch_id=epoch.epoch_id,
+        epoch_seq=epoch.epoch_seq,
+        as_of=epoch.as_of,
+        frozen_at=epoch.frozen_at,
+        cohort_rule_version=epoch.cohort_rule_version,
+        payload_sha256=epoch.payload_sha256,
+        session_ids=_resolve_frozen_sessions(s, epoch, config),
+    )
+
+
+def _resolve_frozen_sessions(
+    s: DBSession, epoch: QualityReleaseEpoch, config: Any,
+) -> frozenset[str]:
+    """把纪元成员表里的场次假名还原成场次号。
+
+    成员表有意只存假名——它就是队列构成本身，比任何聚合都更直接地指向人。代价
+    是行面要用它过滤就得反查：假名是 HMAC，没有逆函数，只能把本库研究口径的
+    场次号逐个算出假名来比。研究期是几百个场次量级，一次单列查询加几百次 HMAC；
+    真涨到几万，下游那几条 ``IN`` 子句要先改成分块。
+    """
+    frozen = {
+        row.session_pseudonym
+        for row in s.exec(select(QualityReleaseEpochSession).where(
+            QualityReleaseEpochSession.epoch_id == epoch.epoch_id))
+    }
+    resolved: dict[str, str] = {}
+    for row in s.exec(select(TrainSession.session_id).where(
+            TrainSession.data_classification == "research")):
+        session_id = row if isinstance(row, str) else row[0]
+        pseudonym = export_security.pseudonymize_session(session_id, config)
+        if pseudonym in frozen:
+            resolved[pseudonym] = session_id
+    if len(resolved) != len(frozen):
+        # 少一个都不许发：那样发出去的是纪元 N 的一个子集，却仍旧标着纪元 N。
+        raise ReleaseRefused(
+            "research_release_cohort_unresolved",
+            "冻结队列里有场次在本库中找不到，行级取数面已关闭")
+    return frozenset(resolved.values())
+
+
+def binding_state(s: DBSession, *, config: Any) -> dict[str, Any]:
+    """``/research/v1/meta`` 用的自诊投影：绑上了没有，没绑是因为什么。
+
+    这里给出**精确**的冻结场次数，而聚合面只发档位。不矛盾：meta 的读者与行面
+    的读者是同一批人，他们翻完页自己就能数出来，而把这个数摆在前面是他们校验
+    "我是不是拉全了"的唯一手段。别把这条当成"精确队列规模可以发布"的先例。
+    """
+    try:
+        binding = bind_research_read(s, config=config)
+    except ReleaseRefused as refused:
+        return {"bound": False, "code": refused.code, "reason": refused.detail}
+    return {
+        "bound": True,
+        **binding.envelope(),
+        "as_of": binding.as_of.isoformat() + "Z",
+        "frozen_at": binding.frozen_at.isoformat() + "Z",
+        "frozen_session_count": len(binding.session_ids),
+    }
+
+
+def record_row_disclosure(
+    s: DBSession, binding: ResearchBinding, *, actor_id: str, actor_role: str,
+) -> None:
+    """行面的一次取数也记进披露账本。
+
+    聚合与明细指向同一个纪元，"谁看过纪元 N"就该把两条路径记在一起；AuditLog
+    记得下这次取数，但它不知道纪元是哪一个。一页一行，不是一行一行。
+
+    这里**不是** best-effort。`_audit` 那句 try/except 是给临床写路径的——锁分不能
+    因为审计库抖动而失败。取数不是临床写：记不下谁读过就不该把数据发出去。
+    """
+    _append_disclosure(s, epoch_id=binding.epoch_id, actor_id=actor_id,
+                       actor_role=actor_role,
+                       payload_sha256=binding.payload_sha256)
 
 
 def registry_problems(payload: dict[str, Any]) -> list[str]:
