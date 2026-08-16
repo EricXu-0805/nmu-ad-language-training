@@ -1127,6 +1127,169 @@ def _reject_caregiver_help_disposition_mutation(*_args) -> None:
     raise RuntimeError("CaregiverHelpDisposition 是只追加求助处置转移")
 
 
+#: 冻结发布纪元的状态闭集。``superseded`` 只由下一个纪元发布时置上。
+QUALITY_RELEASE_EPOCH_STATES = ("published", "superseded", "revoked")
+
+
+class QualityReleaseEpoch(SQLModel, table=True):
+    """一次治理性"切纪元"：把研究分区的聚合冻成一段字节，此后逐字节复读。
+
+    为什么冻的是**场次集合**而不是受试者集合：只冻人的话，训练师给已在册的
+    人追加新场次就能让聚合动，纪元内的差分立刻复活。所以成员表存的是场次。
+
+    读路径**不重算任何东西**，也不查任何活表——取这一行、校验 sha256、
+    ``json.loads`` 返回，到此为止。同一纪元两次读之间的差恒为零，不是"大概率
+    相等"，是同一串字节，连 ``generated_at`` 都取 ``frozen_at``。
+
+    切纪元没有 HTTP 入口，只有 ``scripts/cut_quality_release.py``。一个全研究
+    期只做几次的动作，不值得给床旁 web 应用永久增加一个写面。
+    """
+    __table_args__ = (
+        UniqueConstraint("epoch_seq", name="uq_quality_release_epoch_seq"),
+        UniqueConstraint(
+            "idempotency_key_sha256",
+            name="uq_quality_release_epoch_idempotency_hash"),
+        Index("ix_quality_release_epoch_status_seq", "status", "epoch_seq"),
+        CheckConstraint(
+            "status IN ('published','superseded','revoked')",
+            name="ck_quality_release_epoch_status_closed"),
+        CheckConstraint(
+            "epoch_seq >= 1", name="ck_quality_release_epoch_seq_positive"),
+        CheckConstraint(
+            _hex64_sql("payload_sha256"),
+            name="ck_quality_release_epoch_payload_hash"),
+        CheckConstraint(
+            _hex64_sql("idempotency_key_sha256"),
+            name="ck_quality_release_epoch_idempotency_hash_shape"),
+        CheckConstraint(
+            "builder_actor_role IN ('data_steward','admin') "
+            "AND approver_actor_role IN ('data_steward','admin')",
+            name="ck_quality_release_epoch_actor_roles"),
+        # 双人具名。这只是一条对字符串的约束，两个有 shell 的人可以是同一个人
+        # 敲两个名字——职责分离在这里是程序性的，不是技术性的。
+        CheckConstraint(
+            "builder_actor_display_id <> approver_actor_display_id",
+            name="ck_quality_release_epoch_two_person"),
+        CheckConstraint(
+            "min_subjects_applied >= 2 AND min_cell_subjects_applied >= 2 "
+            "AND band_width_applied >= 5 AND rate_decimals_applied >= 1",
+            name="ck_quality_release_epoch_thresholds_sane"),
+    )
+
+    epoch_id: str = Field(primary_key=True)
+    epoch_seq: int = Field(index=True)
+    status: str = Field(default="published")
+    #: 队列截断时刻。队列是它的函数，不是人选出来的——没有 --include/--exclude，
+    #: 否则 leave-one-out 在任何一条路线上都成立。
+    as_of: datetime
+    frozen_at: datetime = Field(default_factory=_utc_now_naive)
+    cohort_rule_version: str
+    registry_version: str
+    schema_version: str
+    #: 队列规模只发档位，不发精确数——精确数就是一条排班表差分信道。
+    cohort_size_band: str
+    session_count_band: str
+    payload_json: str
+    payload_sha256: str
+    #: 阈值抄进这一行。读路径永不读环境变量：切完之后有人改 env，
+    #: 旧纪元里"已满足 k=5"的声明就变成假话。
+    min_subjects_applied: int
+    min_cell_subjects_applied: int
+    band_width_applied: int
+    rate_decimals_applied: int
+    #: 冻结当时的完整性，不在读时对载荷求 any()——载荷里的计数已经被抑制成
+    #: None，``any([None, ...])`` 恒 False，会把 partial 谎报成 complete。
+    diagnostics_status: str
+    deidentification_key_id: str
+    builder_actor_display_id: str
+    builder_actor_role: str
+    approver_actor_display_id: str
+    approver_actor_role: str
+    idempotency_key_sha256: str
+    superseded_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    revoke_reason_code: Optional[str] = None
+
+
+class QualityReleaseEpochSession(SQLModel, table=True):
+    """纪元冻住的那一批场次。**只存假名与水位线，不存 session_id/patient_id。**
+
+    这张表绝不进 ``research_dataset.DATASETS``——它是队列构成本身，比任何
+    聚合都更直接地指向人。
+    """
+    __table_args__ = (
+        UniqueConstraint(
+            "epoch_id", "session_pseudonym",
+            name="uq_quality_release_epoch_session"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    epoch_id: str = Field(
+        foreign_key="qualityreleaseepoch.epoch_id", index=True)
+    session_pseudonym: str
+    #: 冻结时该场次的证据行数。approve 时复核它没变——两阶段之间 DB 动过就拒绝。
+    evidence_watermark: int
+
+
+class QualityDisclosureRecord(SQLModel, table=True):
+    """谁在什么时候读过哪一个纪元。只追加。
+
+    它是**追责**不是**预算**：按纪元记，新纪元重置，幂等免账让"永远持有两版"
+    零成本。写成"预算"会让人误以为差分次数有上界——没有。
+    """
+    __table_args__ = (
+        Index("ix_quality_disclosure_epoch_actor", "epoch_id", "actor_id"),
+        CheckConstraint(
+            _hex64_sql("payload_sha256"),
+            name="ck_quality_disclosure_payload_hash"),
+    )
+
+    record_id: str = Field(primary_key=True)
+    epoch_id: str = Field(
+        foreign_key="qualityreleaseepoch.epoch_id", index=True)
+    actor_id: str
+    actor_role: str
+    payload_sha256: str
+    requested_at: datetime = Field(default_factory=_utc_now_naive)
+
+
+#: 纪元行里唯一允许后续改动的字段。冻结的载荷、阈值与两个操作人一旦落库
+#: 就不能再动——能改载荷的话，"逐字节复读"这句话就没有意义了。
+_QUALITY_EPOCH_LIFECYCLE_COLUMNS = frozenset({
+    "status", "superseded_at", "revoked_at", "revoke_reason_code"})
+
+
+@sa_event.listens_for(QualityReleaseEpoch, "before_update")
+def _reject_quality_release_epoch_content_mutation(_mapper, _conn, target) -> None:
+    changed = {
+        attr.key
+        for attr in sa_inspect(target).attrs
+        if attr.history.has_changes()
+    }
+    forbidden = changed - _QUALITY_EPOCH_LIFECYCLE_COLUMNS
+    if forbidden:
+        raise RuntimeError(
+            "QualityReleaseEpoch 的冻结内容不可改："
+            + ",".join(sorted(forbidden)))
+
+
+@sa_event.listens_for(QualityReleaseEpoch, "before_delete")
+def _reject_quality_release_epoch_delete(*_args) -> None:
+    raise RuntimeError("QualityReleaseEpoch 只能作废，不能删除")
+
+
+@sa_event.listens_for(QualityReleaseEpochSession, "before_update")
+@sa_event.listens_for(QualityReleaseEpochSession, "before_delete")
+def _reject_quality_release_session_mutation(*_args) -> None:
+    raise RuntimeError("QualityReleaseEpochSession 是冻结的队列构成")
+
+
+@sa_event.listens_for(QualityDisclosureRecord, "before_update")
+@sa_event.listens_for(QualityDisclosureRecord, "before_delete")
+def _reject_quality_disclosure_mutation(*_args) -> None:
+    raise RuntimeError("QualityDisclosureRecord 是只追加取数账本")
+
+
 class Week1Profile(SQLModel, table=True):
     """★ 第1周画像——独立命名空间。判分链不得 join。只喂交互侧。"""
     patient_id: str = Field(primary_key=True, foreign_key="patient.patient_id")

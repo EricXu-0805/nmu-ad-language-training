@@ -335,6 +335,11 @@ def test_research_threshold_fails_before_evidence_load(
 
 def test_configured_research_stays_suppressed_before_any_cohort_read(
         quality_env, monkeypatch):
+    """门槛配对了也不发：还要有人具名指定谁可以读、并且真切过一次纪元。
+
+    拒绝码是"没人被授权读"而不是"还没切纪元"——角色闸有意排在最前，
+    不在白名单的人不该从拒绝码里学到纪元存不存在。
+    """
     monkeypatch.setenv(ai_quality_service.RESEARCH_MIN_SUBJECTS_ENV, "2")
 
     def forbidden_read(*_args, **_kwargs):
@@ -346,7 +351,7 @@ def test_configured_research_stays_suppressed_before_any_cohort_read(
     row = _quality(_client("admin"), "research").json()["rows"][0]
     assert row["suppression"] == {
         "status": "suppressed",
-        "reason": "research_release_not_frozen",
+        "reason": "research_release_reader_not_authorized",
         "minimum_distinct_subjects": None,
         "distinct_subjects": None,
     }

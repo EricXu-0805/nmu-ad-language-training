@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -63,3 +64,36 @@ def test_the_generated_offsite_runner_also_parses():
         f"安装器生成出来的 run-pull.sh 语法不合法：{result.stderr.strip()}")
     for match in BARE_VAR_BEFORE_WIDE.finditer(generated):
         pytest.fail(f"生成出来的 run-pull.sh 里有裸变量接全角字符：{match.group(0)!r}")
+
+
+# ---------------------------------------------------------------------------
+# 前端测试清单
+# ---------------------------------------------------------------------------
+# web/package.json 的 test/pretest 是**显式文件清单**而不是 glob。
+# 2026-08-16 实测：新写的 qualityReleaseContract.test.ts 忘了加进去，
+# `npm test` 全绿而那 16 条断言一次都没跑过——和"断言在空转"是同一个病，
+# 只是换到了运行器这一层。
+
+WEB = Path(__file__).resolve().parents[1] / "web"
+
+
+def test_every_frontend_test_file_is_actually_in_the_run_list():
+    package = json.loads((WEB / "package.json").read_text(encoding="utf-8"))
+    listed = set()
+    for script in ("test", "pretest"):
+        listed |= {
+            part for part in package["scripts"][script].split()
+            if part.endswith((".test.ts", ".test.mjs"))
+        }
+    on_disk = {
+        str(path.relative_to(WEB))
+        for pattern in ("src/**/*.test.ts", "src/**/*.test.mjs",
+                        "scripts/*.test.mjs")
+        for path in WEB.glob(pattern)
+    }
+
+    # 集合差，不是精确相等——清单里多列一个已删除的文件是另一类问题，
+    # 由 node --test 自己报错，不该让这条断言跟着红。
+    assert on_disk - listed == set(), (
+        "这些前端测试文件存在但不在 npm test/pretest 清单里，等于没写：\n"
+        + "\n".join(sorted(on_disk - listed)))

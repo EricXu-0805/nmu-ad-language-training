@@ -36,6 +36,8 @@ import {
   buildAIQualityDashboardViewModel,
   type AIQualityDashboardViewModel,
 } from "./quality/qualityDashboardViewModel";
+import { AI_QUALITY_RELEASE_SCHEMA_VERSION } from "./quality/qualityReleaseContract";
+import { buildAIQualityReleaseViewModel } from "./quality/qualityReleaseViewModel";
 import {
   DATA_CLASSIFICATION_META,
   partitionByDataClassification,
@@ -157,7 +159,9 @@ export function AnalysisScreen() {
         setQualityState({
           classification,
           status: "ready",
-          model: buildAIQualityDashboardViewModel(contract),
+          model: contract.schema_version === AI_QUALITY_RELEASE_SCHEMA_VERSION
+            ? buildAIQualityReleaseViewModel(contract)
+            : buildAIQualityDashboardViewModel(contract),
         });
       })
       .catch((error: unknown) => {

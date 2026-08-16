@@ -2175,24 +2175,33 @@ def build_ai_quality_dashboard(
     visibility_scope = _visibility_scope(actor_role)
     threshold = _parse_threshold()
     if data_classification == "research":
-        # A total-subject threshold alone cannot protect sparse metric cells or
-        # repeated-query differencing. Until a durable frozen cohort/release
-        # epoch and complementary per-cell suppression exist, research metrics
-        # remain wholly suppressed before reading any session or evidence.
-        reason = (
-            "research_threshold_unconfigured"
-            if threshold.status == "unconfigured"
-            else "research_threshold_invalid"
-            if threshold.status == "invalid"
-            else "research_release_not_frozen"
-        )
-        return _suppressed_payload(
-            data_classification=data_classification,
-            visibility_scope=visibility_scope,
-            generated_at=now,
-            reason=reason,
-            minimum=None,
-        )
+        # 一个总人数门槛既挡不住稀疏单元，也挡不住重复查询做差分。所以研究分区
+        # 不在这条请求路径上计算任何东西——要么复读一份冻结的纪元
+        # （`app/quality_release.py`），要么整体抑制。**全部闸门都在读任何
+        # session 或证据之前**。
+        if threshold.status != "configured":
+            return _suppressed_payload(
+                data_classification=data_classification,
+                visibility_scope=visibility_scope,
+                generated_at=now,
+                reason=("research_threshold_unconfigured"
+                        if threshold.status == "unconfigured"
+                        else "research_threshold_invalid"),
+                minimum=None,
+            )
+        from . import quality_release  # 局部导入：它反过来要用本模块的投影函数
+
+        try:
+            return quality_release.serve(
+                s, actor_id=actor_id, actor_role=actor_role)
+        except quality_release.ReleaseRefused as refused:
+            return _suppressed_payload(
+                data_classification=data_classification,
+                visibility_scope=visibility_scope,
+                generated_at=now,
+                reason=refused.code,
+                minimum=None,
+            )
 
     _begin_stable_read_snapshot(s)
     visible = _visible_sessions(

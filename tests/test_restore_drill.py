@@ -14,7 +14,7 @@ drill = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(drill)
 
 
-def _restored(tmp_path: Path, *, head: str = "c5a8f2d91e40",
+def _restored(tmp_path: Path, *, head: str = "141bc30e4580",
               heads: list[str] | None = None) -> Path:
     path = tmp_path / "app.db"
     connection = sqlite3.connect(path)
@@ -32,7 +32,7 @@ def _restored(tmp_path: Path, *, head: str = "c5a8f2d91e40",
 def test_a_clean_restore_reports_head_and_row_counts(tmp_path):
     facts = drill._inspect(_restored(tmp_path))
 
-    assert facts["alembic_head"] == "c5a8f2d91e40"
+    assert facts["alembic_head"] == "141bc30e4580"
     assert facts["row_counts"]["patient"] == 1
     assert facts["row_counts"]["session"] == 0
 
@@ -61,7 +61,7 @@ def test_a_foreign_key_violation_fails_the_drill(tmp_path):
     path = tmp_path / "app.db"
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE alembic_version (version_num TEXT)")
-    connection.execute("INSERT INTO alembic_version VALUES ('c5a8f2d91e40')")
+    connection.execute("INSERT INTO alembic_version VALUES ('141bc30e4580')")
     connection.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
     connection.execute(
         "CREATE TABLE child (id INTEGER PRIMARY KEY, "

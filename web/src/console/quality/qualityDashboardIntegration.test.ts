@@ -6,14 +6,30 @@ function source(path: string): string {
   return readFileSync(new URL(path, import.meta.url), "utf8");
 }
 
-test("API binds one no-store quality request to the selected classification and strict v2 parser", () => {
+test("API binds one no-store quality request to the selected classification and strict parsers", () => {
   const api = source("../../api.ts");
 
   assert.match(api, /getAIQualityMetrics: async \(/);
   assert.match(api, /qualityDashboardRequestPath\(classification\)/);
   assert.match(api, /\{ noStore: true, signal \}/);
-  assert.match(api, /\), classification\),/);
+  // v2 聚合仍必须把分区绑进解析器；冻结发布走另一份契约，按 schema_version 分派。
+  assert.match(api, /parseAIQualityDashboard\(body, classification\)/);
+  assert.match(api, /isFrozenReleasePayload\(body\)\s*\?\s*parseAIQualityRelease\(body\)/);
   assert.match(api, /retryAfter: res\.headers\.get\("Retry-After"\)/);
+});
+
+test("the frozen release never reaches the v2 parser and never renders a null as zero", () => {
+  const api = source("../../api.ts");
+  const viewModel = source("./qualityReleaseViewModel.ts");
+
+  // 分派必须先判冻结发布：反过来写的话，v2 解析器会先把它当成畸形载荷抛掉。
+  const dispatch = api.indexOf("isFrozenReleasePayload(body)");
+  const v2 = api.indexOf("parseAIQualityDashboard(body, classification)");
+  assert.ok(dispatch > 0 && v2 > dispatch);
+
+  assert.match(viewModel, /const SUPPRESSED = "已抑制"/);
+  assert.doesNotMatch(viewModel, /\?\?\s*0\b/);
+  assert.doesNotMatch(viewModel, /value: "0"/);
 });
 
 test("analysis screen never requests legacy quality data and never flashes the previous classification", () => {

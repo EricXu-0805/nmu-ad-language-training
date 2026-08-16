@@ -73,6 +73,11 @@ import {
   type AIQualityDashboardContract,
   type QualityDataClassification,
 } from "./console/quality/qualityDashboardContract";
+import {
+  isFrozenReleasePayload,
+  parseAIQualityRelease,
+  type AIQualityReleaseContract,
+} from "./console/quality/qualityReleaseContract";
 import { qualityDashboardRequestPath } from "./console/quality/qualityDashboardRequestPolicy";
 import { parseSessionAiUsage, type SessionAiUsageContract } from "./console/sessionAiUsageContract";
 import type { CursorMsg } from "./sync/messages";
@@ -483,10 +488,18 @@ export const api = {
   getAIQualityMetrics: async (
     classification: QualityDataClassification,
     signal?: AbortSignal,
-  ): Promise<AIQualityDashboardContract> => parseAIQualityDashboard(await req<unknown>(
-    "GET", qualityDashboardRequestPath(classification), undefined,
-    DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
-  ), classification),
+  ): Promise<AIQualityDashboardContract | AIQualityReleaseContract> => {
+    const body = await req<unknown>(
+      "GET", qualityDashboardRequestPath(classification), undefined,
+      DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
+    );
+    // 研究分区在配了冻结发布之后返回的是另一份契约，字段集合与 v2 聚合
+    // 有意不同（精确计数全部拿掉）。按 schema_version 分派，不要试图让
+    // 一个解析器同时吃两种形状——那些为它开的 if 迟早会被误用到 v2 上。
+    return isFrozenReleasePayload(body)
+      ? parseAIQualityRelease(body)
+      : parseAIQualityDashboard(body, classification);
+  },
   patientSessions: async (id: string): Promise<Session[]> =>
     parsePatientSessionList(await req<unknown>(
       "GET", `/patients/${encodeURIComponent(id)}/sessions`, undefined,
