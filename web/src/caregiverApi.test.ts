@@ -306,3 +306,49 @@ test("adapter source contains only the approved mutation paths", () => {
     "/audio", "/runtime/cursor", "/patient-pause",
   ]) assert.doesNotMatch(source, new RegExp(forbidden.replaceAll("/", "\\/")));
 });
+
+const HELP_STATUS = {
+  request_id: "CHR-1",
+  state: "recorded",
+  states: ["recorded", "delivered", "acknowledged", "resolved"],
+  notify_channel_configured: false,
+  delivery_reachable: false,
+  reached: [],
+};
+
+test("help status parser keeps delivery reachability exactly as the server said", () => {
+  const parsed = caregiverApiContract.parseHelpStatus(HELP_STATUS);
+
+  assert.equal(parsed.requestId, "CHR-1");
+  assert.equal(parsed.state, "recorded");
+  assert.equal(parsed.deliveryReachable, false);
+  assert.equal(parsed.notifyChannelConfigured, false);
+  assert.deepEqual(parsed.reached, []);
+});
+
+test("a missing reachability field is refused, never defaulted to true", () => {
+  // 补默认值就会让屏上显示「等待送达」，而实际上没有任何人被通知到。
+  const { delivery_reachable: _omitted, ...withoutField } = HELP_STATUS;
+  assert.throws(() => caregiverApiContract.parseHelpStatus(withoutField));
+  assert.throws(
+    () => caregiverApiContract.parseHelpStatus({ ...HELP_STATUS, delivery_reachable: "yes" }));
+});
+
+test("an unknown help state is refused rather than rendered as-is", () => {
+  assert.throws(
+    () => caregiverApiContract.parseHelpStatus({ ...HELP_STATUS, state: "notified" }),
+    /求助状态不在闭集内/);
+  assert.throws(
+    () => caregiverApiContract.parseHelpStatus({
+      ...HELP_STATUS,
+      reached: [{ state: "notified", actor_id: "A", at: "2026-08-16T00:00:00Z" }],
+    }),
+    /求助状态不在闭集内/);
+});
+
+test("每一条处置都必须记名——匿名条目整份拒收", () => {
+  assert.throws(() => caregiverApiContract.parseHelpStatus({
+    ...HELP_STATUS,
+    reached: [{ state: "acknowledged", at: "2026-08-16T00:00:00Z" }],
+  }));
+});

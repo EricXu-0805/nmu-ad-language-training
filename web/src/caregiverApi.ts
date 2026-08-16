@@ -7,6 +7,7 @@ import type {
   CaregiverDataClassification,
   CaregiverEndRequest,
   CaregiverHelpReasonCode,
+  CaregiverHelpStatus,
   CaregiverPlan,
   CaregiverRuntimeState,
   CaregiverSessionStatus,
@@ -104,6 +105,38 @@ function sessionBoundary(candidate: Record<string, unknown>) {
     completionScope: completionScopeField(candidate),
     resolvedPositionCount: nullableIntegerField(candidate, "resolved_position_count"),
     operationalDemoReady: booleanField(candidate, "operational_demo_ready"),
+  };
+}
+
+const HELP_STATES = new Set(["recorded", "delivered", "acknowledged", "resolved"]);
+
+/**
+ * 求助四态投影。
+ *
+ * 服务器少给一个字段时**不补默认值**：把 delivery_reachable 缺省成 true，
+ * 屏上就会显示"等待送达"，而实际上没有任何人被通知到。宁可整份拒收。
+ */
+function parseHelpStatus(value: unknown): CaregiverHelpStatus {
+  const row = record(value, "服务器返回了无法确认的求助状态");
+  const state = stringField(row, "state");
+  if (!HELP_STATES.has(state)) throw new Error("求助状态不在闭集内");
+  const reachedRaw = row.reached;
+  if (!Array.isArray(reachedRaw)) throw new Error("求助处置列表形状不对");
+  return {
+    requestId: stringField(row, "request_id"),
+    state: state as CaregiverHelpStatus["state"],
+    notifyChannelConfigured: booleanField(row, "notify_channel_configured"),
+    deliveryReachable: booleanField(row, "delivery_reachable"),
+    reached: reachedRaw.map((entry) => {
+      const item = record(entry, "求助处置条目形状不对");
+      const reachedState = stringField(item, "state");
+      if (!HELP_STATES.has(reachedState)) throw new Error("求助状态不在闭集内");
+      return {
+        state: reachedState as CaregiverHelpStatus["state"],
+        actorId: stringField(item, "actor_id"),
+        at: stringField(item, "at"),
+      };
+    }),
   };
 }
 
@@ -350,16 +383,31 @@ export const caregiverApi: CaregiverApi = {
     sessionId,
   ),
   requestHelp: async (sessionId, help) => {
-    await request(
+    const receipt = await request(
       "POST",
       `/caregiver/sessions/${encodeURIComponent(sessionId)}/help-requests`,
       {
         reason_code: help.reasonCode as CaregiverHelpReasonCode,
         idempotency_key: help.idempotencyKey,
       },
-    );
-    return { recorded: true, status: await getSessionStatus(sessionId) };
+    ) as { request_id?: unknown };
+    const requestId = typeof receipt.request_id === "string" ? receipt.request_id : "";
+    if (!requestId) throw new Error("求助回执缺少呼叫号");
+    return { recorded: true, requestId, status: await getSessionStatus(sessionId) };
   },
+  getHelpStatus: async (sessionId, requestId) => parseHelpStatus(await request(
+    "GET",
+    `/caregiver/sessions/${encodeURIComponent(sessionId)}`
+    + `/help-requests/${encodeURIComponent(requestId)}`,
+  )),
+  recordHelpDisposition: async (sessionId, requestId, disposition) => parseHelpStatus(
+    await request(
+      "POST",
+      `/caregiver/sessions/${encodeURIComponent(sessionId)}`
+      + `/help-requests/${encodeURIComponent(requestId)}/dispositions`,
+      { state: disposition.state, note: disposition.note },
+    ),
+  ),
   takeOverSession: async (sessionId, command) => mutateThenStatus(
     "POST",
     `/sessions/${encodeURIComponent(sessionId)}/autopilot/takeover`,
@@ -387,5 +435,6 @@ export const caregiverApi: CaregiverApi = {
 export const caregiverApiContract = {
   parseToday,
   parseStatus,
+  parseHelpStatus,
   nullableStringField,
 };

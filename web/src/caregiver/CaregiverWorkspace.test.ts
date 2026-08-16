@@ -46,10 +46,20 @@ test("patient view remains a separate-window instruction rather than a mounted o
   assert.doesNotMatch(source, /PATIENT_VIEW_EVENT|PatientViewHost|PatientShell/);
 });
 
-test("help copy never claims that another person received the local record", () => {
-  assert.match(source, /本机已记录/);
-  assert.match(source, /不代表对方已收到消息/);
-  assert.doesNotMatch(source, /已送达|对方已收到(?!消息)/);
+test("help copy is owned by caregiverHelpPrompt, not composed in the screen", () => {
+  // 文案曾经写死在这个组件里。搬进 caregiverHelpPrompt 之后，「没配通知对象
+  // 时不许说已通知」那条保证由 caregiverPolicy.test.ts 按**行为**验，
+  // 比在这里 grep 源码强——那条 grep 挡不住有人再拼一句新的乐观文案出来。
+  assert.match(source, /caregiverHelpPrompt\(helpStatus\)/);
+  assert.match(source, /\{prompt\.text\}/);
+  // 组件自己不得再拼任何一句关于"对方收到没有"的话。
+  assert.doesNotMatch(source, /已送达|对方已收到|已通知负责人/);
+});
+
+test("the screen offers no way to claim delivery, only arrival and completion", () => {
+  assert.match(source, /recordHelpDisposition\("acknowledged"\)/);
+  assert.match(source, /recordHelpDisposition\("resolved"\)/);
+  assert.doesNotMatch(source, /recordHelpDisposition\("delivered"\)/);
 });
 
 test("the local synthetic boundary stays visible in the header, alert, and every plan", () => {

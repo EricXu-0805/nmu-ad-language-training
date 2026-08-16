@@ -181,7 +181,72 @@ export type CaregiverEndRequest =
 
 export interface CaregiverHelpReceipt {
   recorded: true;
+  requestId: string;
   status: CaregiverSessionStatus;
+}
+
+/** 求助四态。`delivered` 只能由通知通道带回执写入，界面上没有写它的入口。 */
+export type CaregiverHelpState = "recorded" | "delivered" | "acknowledged" | "resolved";
+
+/** 人能在界面上追加的两态。缺 `delivered` 是有意的，不是漏了。 */
+export type CaregiverHelpHumanState = "acknowledged" | "resolved";
+
+export interface CaregiverHelpStatus {
+  requestId: string;
+  state: CaregiverHelpState;
+  notifyChannelConfigured: boolean;
+  /** 没配通知对象时恒 false：那一态结构上到不了。 */
+  deliveryReachable: boolean;
+  reached: { state: CaregiverHelpState; actorId: string; at: string }[];
+}
+
+/**
+ * 求助登记之后，屏上该说哪句话。
+ *
+ * 这是整个功能里最容易说谎的一处：把「已登记」写成「已通知负责人」，
+ * 护理员就会站在原地等一个永远不会来的人。所以没有通知通道时，
+ * 文案必须明确要求当面去叫人。
+ */
+export function caregiverHelpPrompt(status: CaregiverHelpStatus): {
+  tone: "warn" | "info";
+  text: string;
+  canRecordArrival: boolean;
+  canRecordResolved: boolean;
+} {
+  // 每一态能给哪些入口，由这一态本身完全决定——状态是"已追加转移里最靠后
+  // 的那个"，所以 acknowledged 时不可能还没到过 acknowledged。早先这里按
+  // `reached` 再算一遍，那个计算在任何一条分支上都恒为真，是句废话。
+  if (status.state === "resolved") {
+    return {
+      tone: "info", text: "本次求助已处理完毕。",
+      canRecordArrival: false, canRecordResolved: false,
+    };
+  }
+  if (status.state === "acknowledged") {
+    return {
+      tone: "info",
+      text: "已有工作人员到场并接手。处理完成后请在本页记一笔。",
+      canRecordArrival: false,
+      canRecordResolved: true,
+    };
+  }
+  if (!status.deliveryReachable) {
+    return {
+      tone: "warn",
+      text: "本机已记录。本机构尚未配置自动通知对象，请立即当面联系负责人——"
+        + "本页不代表任何人已经收到消息。",
+      canRecordArrival: true,
+      canRecordResolved: true,
+    };
+  }
+  return {
+    tone: "warn",
+    text: status.state === "delivered"
+      ? "通知已送达，正在等待工作人员到场。"
+      : "本机已记录，通知尚未确认送达。请同时按院内现行方式联系负责人。",
+    canRecordArrival: true,
+    canRecordResolved: true,
+  };
 }
 
 /**
@@ -196,6 +261,11 @@ export interface CaregiverApi {
   getSessionStatus(sessionId: string): Promise<CaregiverSessionStatus>;
   pauseSession(sessionId: string): Promise<CaregiverSessionStatus>;
   requestHelp(sessionId: string, request: CaregiverHelpRequest): Promise<CaregiverHelpReceipt>;
+  getHelpStatus(sessionId: string, requestId: string): Promise<CaregiverHelpStatus>;
+  recordHelpDisposition(
+    sessionId: string, requestId: string,
+    disposition: { state: CaregiverHelpHumanState; note: string },
+  ): Promise<CaregiverHelpStatus>;
   takeOverSession(sessionId: string, request: CaregiverRevisionRequest): Promise<CaregiverSessionStatus>;
   endSession(sessionId: string, request: CaregiverEndRequest): Promise<CaregiverSessionStatus>;
 }

@@ -9,13 +9,16 @@ import {
   CAREGIVER_DEMO_BOUNDARY_MESSAGE,
   CAREGIVER_HELP_REASONS,
   caregiverActionAvailability,
+  caregiverHelpPrompt,
   caregiverPatientPresenceLabel,
   caregiverSessionIsTerminal,
   caregiverStatusPresentation,
   makeCaregiverEndRequest,
   type CaregiverApi,
   type CaregiverEndSelection,
+  type CaregiverHelpHumanState,
   type CaregiverHelpReasonCode,
+  type CaregiverHelpStatus,
   type CaregiverIdentity,
   type CaregiverPlan,
   type CaregiverSessionStatus,
@@ -366,6 +369,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
   const [syncProblem, setSyncProblem] = useState(false);
   const [operationProblem, setOperationProblem] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [helpStatus, setHelpStatus] = useState<CaregiverHelpStatus | null>(null);
   const [busyAction, setBusyAction] = useState<BusyAction>(null);
   const [startingPlanId, setStartingPlanId] = useState<string | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -587,11 +591,35 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
       adoptStatus(receipt.status);
       setHelpOpen(false);
       setHelpReason(null);
-      setNotice("本机已记录。请立即按院内现行方式联系负责人；本页不代表对方已收到消息。");
+      setNotice(null);
+      try {
+        setHelpStatus(await api.getHelpStatus(current.sessionId, receipt.requestId));
+      } catch {
+        // 读不到四态投影不影响"已经登记"这个事实，但不能因此说得更乐观。
+        setHelpStatus({
+          requestId: receipt.requestId, state: "recorded",
+          notifyChannelConfigured: false, deliveryReachable: false, reached: [],
+        });
+      }
     } catch {
       setHelpOpen(false);
       setHelpReason(null);
       reportUnconfirmed("请求协助");
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const recordHelpDisposition = async (state: CaregiverHelpHumanState) => {
+    if (!current || !helpStatus || busyAction) return;
+    setBusyAction("help");
+    setOperationProblem(null);
+    try {
+      setHelpStatus(await api.recordHelpDisposition(
+        current.sessionId, helpStatus.requestId,
+        { state, note: state === "acknowledged" ? "工作人员已到场" : "现场已处理" }));
+    } catch {
+      reportUnconfirmed(state === "acknowledged" ? "记录到场" : "记录处理完成");
     } finally {
       setBusyAction(null);
     }
@@ -727,6 +755,30 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
               </Alert>
             )}
             {notice && <Alert tone="ok" title="已确认">{notice}</Alert>}
+            {helpStatus && (() => {
+              const prompt = caregiverHelpPrompt(helpStatus);
+              return (
+                <Alert tone={prompt.tone} title="求助已登记">
+                  <p>{prompt.text}</p>
+                  <div className="form-actions">
+                    {prompt.canRecordArrival && (
+                      <Button
+                        type="button" variant="secondary"
+                        disabled={busyAction !== null}
+                        onClick={() => { void recordHelpDisposition("acknowledged"); }}
+                      >记：已有人到场</Button>
+                    )}
+                    {prompt.canRecordResolved && (
+                      <Button
+                        type="button" variant="secondary"
+                        disabled={busyAction !== null}
+                        onClick={() => { void recordHelpDisposition("resolved"); }}
+                      >记：已处理完</Button>
+                    )}
+                  </div>
+                </Alert>
+              );
+            })()}
 
             {ended ? (
               <section className="page-shell page-shell--medium" aria-labelledby="caregiver-ended-title">

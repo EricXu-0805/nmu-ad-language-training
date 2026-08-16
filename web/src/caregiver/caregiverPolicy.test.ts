@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   CAREGIVER_END_REASONS,
@@ -6,6 +7,7 @@ import {
   CAREGIVER_HELP_REASONS,
   CAREGIVER_VISIBLE_ACTION_LABELS,
   caregiverActionAvailability,
+  caregiverHelpPrompt,
   caregiverStatusPresentation,
   identityIsCaregiverOperator,
   makeCaregiverEndRequest,
@@ -204,4 +206,74 @@ test("end request maps only to finish or the three approved abort reasons", () =
     expectedRevision: 12,
     idempotencyKey: "cg-request-3",
   });
+});
+
+test("没配通知对象时，屏上必须要求当面叫人，不能暗示已经通知到了", () => {
+  const prompt = caregiverHelpPrompt({
+    requestId: "CHR-1",
+    state: "recorded",
+    notifyChannelConfigured: false,
+    deliveryReachable: false,
+    reached: [],
+  });
+
+  assert.equal(prompt.tone, "warn");
+  assert.match(prompt.text, /当面联系负责人/);
+  assert.match(prompt.text, /不代表任何人已经收到消息/);
+  // 反过来钉住：不能出现任何"已通知/已送达/正在等待"这类说法。
+  assert.doesNotMatch(prompt.text, /已通知|已送达|等待工作人员/);
+  assert.equal(prompt.canRecordArrival, true);
+});
+
+test("配了通道但尚未确认送达时，说的是「尚未确认」而不是「已送达」", () => {
+  const prompt = caregiverHelpPrompt({
+    requestId: "CHR-1",
+    state: "recorded",
+    notifyChannelConfigured: true,
+    deliveryReachable: true,
+    reached: [],
+  });
+
+  assert.match(prompt.text, /尚未确认送达/);
+  assert.doesNotMatch(prompt.text, /已送达/);
+});
+
+test("有人到场之后不再重复要求叫人，也不再给「记到场」的入口", () => {
+  const prompt = caregiverHelpPrompt({
+    requestId: "CHR-1",
+    state: "acknowledged",
+    notifyChannelConfigured: false,
+    deliveryReachable: false,
+    reached: [{ state: "acknowledged", actorId: "A", at: "2026-08-16T00:00:00Z" }],
+  });
+
+  assert.equal(prompt.tone, "info");
+  assert.equal(prompt.canRecordArrival, false);
+  assert.equal(prompt.canRecordResolved, true);
+  assert.doesNotMatch(prompt.text, /当面联系/);
+});
+
+test("处理完之后两个入口都关掉，避免同一态被记两次", () => {
+  const prompt = caregiverHelpPrompt({
+    requestId: "CHR-1",
+    state: "resolved",
+    notifyChannelConfigured: true,
+    deliveryReachable: true,
+    reached: [
+      { state: "acknowledged", actorId: "A", at: "2026-08-16T00:00:00Z" },
+      { state: "resolved", actorId: "A", at: "2026-08-16T00:05:00Z" },
+    ],
+  });
+
+  assert.equal(prompt.canRecordArrival, false);
+  assert.equal(prompt.canRecordResolved, false);
+});
+
+test("界面上没有任何写「已送达」的入口——那不是人能声称的", () => {
+  const source = readFileSync(
+    new URL("./caregiverPolicy.ts", import.meta.url), "utf8");
+  // 人能追加的两态是一个闭集，delivered 不在里面。
+  assert.match(
+    source,
+    /CaregiverHelpHumanState = "acknowledged" \| "resolved"/);
 });

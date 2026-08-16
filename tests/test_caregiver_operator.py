@@ -39,6 +39,7 @@ FOREIGN_SESSION = "S-CAREGIVER-FOREIGN"
 PATIENT_ID = "P-CAREGIVER"
 OWNER_ACTOR = "ACTOR-caregiver-owner"
 FOREIGN_ACTOR = "ACTOR-caregiver-other"
+ADMIN_ACTOR = "ACTOR-visit-plan-admin"
 DEMO_VERSION = autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_VERSION
 DEMO_DIGEST = autopilot_plan_profiles.WEEK2_SINGLE20_DEMO_DIGEST
 
@@ -55,6 +56,7 @@ class CaregiverVisitPlanClients:
     researcher: TestClient
     owner: TestClient
     other: TestClient
+    admin: TestClient
     engine: object
 
 
@@ -304,6 +306,13 @@ def caregiver_visit_plan_clients(
                 role="caregiver_operator",
                 created_at=now,
             ),
+            ResearchUser(
+                username="visit-plan-admin",
+                display_id=ADMIN_ACTOR,
+                password_hash=password_hash,
+                role="admin",
+                created_at=now,
+            ),
         ])
         session.commit()
 
@@ -312,6 +321,7 @@ def caregiver_visit_plan_clients(
         researcher=_login("visit-plan-researcher"),
         owner=_login("visit-plan-caregiver"),
         other=_login("visit-plan-other-caregiver"),
+        admin=_login("visit-plan-admin"),
         engine=engine,
     )
     try:
@@ -320,6 +330,7 @@ def caregiver_visit_plan_clients(
         clients.researcher.close()
         clients.owner.close()
         clients.other.close()
+        clients.admin.close()
 
 
 def test_caregiver_login_today_status_activation_and_logout(caregiver_clients):
@@ -1212,3 +1223,51 @@ def test_caregiver_start_adapter_assigns_new_session_to_exact_actor(
     with Session(caregiver_clients.engine) as session:
         row = session.get(TrainSession, "S-CAREGIVER-STARTED")
         assert row is not None and row.trainer_id == OWNER_ACTOR
+
+
+def test_after_a_caregiver_help_pause_a_named_supervisor_can_still_resume(
+        caregiver_visit_plan_clients, monkeypatch):
+    """求助会暂停场次。暂停之后必须有人能把它接回去，否则只剩"结束"一条路。
+
+    现有测试只证明了照护员**不能**恢复（那是安全设计）。这一条走正向：
+    照护员求助 → 场次 paused → 具名管理员恢复 → 场次 active。
+    没有它，"谁能恢复"这件事在工程侧其实从来没被走通过。
+    """
+    clients = caregiver_visit_plan_clients
+    created, approved = _create_and_approve_plan(
+        clients.researcher, key_suffix="help-resume-0001",
+        session_sitting_no=1, demo20=True)
+    _add_provider_probe(clients.engine, monkeypatch, state="ready")
+
+    started = clients.owner.post(
+        f"/caregiver/visit-plans/{created['plan_id']}/start",
+        json={"idempotency_key": "help-resume-start-0001",
+              "expected_revision": approved["revision"]})
+    assert started.status_code == 200, started.text
+    session_id = started.json()["session"]["session_id"]
+    assert clients.owner.put(
+        f"/caregiver/sessions/{session_id}/activation").status_code == 200
+
+    helped = clients.owner.post(
+        f"/caregiver/sessions/{session_id}/help-requests",
+        json={"reason_code": "other_staff_needed",
+              "idempotency_key": "help-resume-call-00001"})
+    assert helped.status_code == 200, helped.text
+    assert helped.json()["runtime_status"] == "paused"
+    # 直接问库。回执里的 runtime_status 是个 Literal["paused"]，就算暂停
+    # 根本没发生它也照样是这个值——信它等于没验。
+    with Session(clients.engine) as session:
+        paused_state = session.get(SessionRuntimeState, session_id)
+        assert paused_state is not None
+        assert paused_state.status == "paused"
+
+    # 照护员自己恢复不了——这是设计，不是缺陷。
+    assert clients.owner.post(
+        f"/sessions/{session_id}/resume").status_code == 403
+
+    resumed = clients.admin.post(f"/sessions/{session_id}/resume")
+    assert resumed.status_code == 200, resumed.text
+    with Session(clients.engine) as session:
+        state = session.get(SessionRuntimeState, session_id)
+        assert state is not None
+        assert state.status == "active"
