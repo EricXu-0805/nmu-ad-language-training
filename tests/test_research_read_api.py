@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import re
@@ -18,7 +20,8 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import (auth, content, db, export_security, quality_release,
-                 repeat_intent, main, research_dataset, session_admission)
+                 repeat_intent, main, research_dataset, research_read,
+                 session_admission)
 from app.db import get_session
 from app.main import app
 from app.models import (
@@ -28,6 +31,7 @@ from app.models import (
     Patient,
     QualityDisclosureRecord,
     QualityReleaseEpoch,
+    QualityReleaseEpochRowSnapshot,
     QualityReleaseEpochSession,
     ResearchUser,
     Session as TrainSession,
@@ -50,14 +54,91 @@ CONFIG = export_security.DeidentificationConfig(
     key=KEY.encode("utf-8"), key_id=KEY_ID)
 
 
-def _freeze_epoch(engine, *session_ids: str, key_id: str = KEY_ID) -> str:
-    """切一个纪元，成员就是给定的这几个场次。
+class _LiveSnapshotBinding:
+    """仅在切测试纪元时使用的活投影边界。"""
 
-    不走 ``publish_epoch``：那条路要先算出一份真载荷，而行面只消费三样东西——
-    纪元号、成员假名、冻结时用的密钥标识。用真载荷会把这套测试变成对聚合管线
-    的测试，行面自己的边界反而测不干净。
+    def __init__(self, session_ids: tuple[str, ...]):
+        self.session_ids = frozenset(session_ids)
+
+    def envelope(self):
+        return {"fixture": "snapshot-builder"}
+
+
+def _snapshot_rows(session: Session, session_ids: tuple[str, ...]):
+    """先用旧的活投影构造候选行，随后只把规范 JSON 存入纪元。"""
+    binding = _LiveSnapshotBinding(session_ids)
+    datasets: dict[str, dict] = {}
+    frozen_rows: list[tuple[str, int, str, str]] = []
+    readers = {
+        "subjects": research_read.list_subjects,
+        "sessions": research_read.list_sessions,
+        "turns": research_read.list_turns,
+    }
+    for dataset_key, reader in readers.items():
+        cursor = None
+        rows: list[dict] = []
+        while True:
+            payload = reader(
+                session,
+                config=CONFIG,
+                data_classification="research",
+                cursor=cursor,
+                limit=research_read.MAX_PAGE_SIZE,
+                binding=binding,
+            )
+            rows.extend(payload["rows"])
+            cursor = payload["next_cursor"]
+            if cursor is None:
+                break
+        row_hasher = hashlib.sha256()
+        for ordinal, row in enumerate(rows, start=1):
+            raw = quality_release.canonical_bytes(row)
+            row_hasher.update(len(raw).to_bytes(8, "big"))
+            row_hasher.update(raw)
+            frozen_rows.append((
+                dataset_key,
+                ordinal,
+                raw.decode("utf-8"),
+                hashlib.sha256(raw).hexdigest(),
+            ))
+        dataset = research_dataset.dataset_for(dataset_key)
+        assert dataset is not None
+        datasets[dataset_key] = {
+            "columns": list(research_dataset.published_columns(dataset)),
+            "row_count": len(rows),
+            "rows_sha256": row_hasher.hexdigest(),
+        }
+    manifest = {
+        "schema_version": quality_release.RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+        "datasets": datasets,
+    }
+    manifest_json = quality_release.canonical_bytes(manifest).decode("utf-8")
+    return (
+        manifest,
+        manifest_json,
+        hashlib.sha256(manifest_json.encode("utf-8")).hexdigest(),
+        frozen_rows,
+    )
+
+
+def _freeze_epoch(
+    engine,
+    *session_ids: str,
+    key_id: str = KEY_ID,
+    snapshot: bool = True,
+) -> str:
+    """切一个纪元，同一事务内冻结成员、发布行与快照清单。
+
+    这里不走聚合发布的门槛计算：这套测试只钉行面的不可变复读。但它不再
+    伪造“只冻成员名单”的旧纪元，而是把当时实际发布的三张表一起冻住。
     """
     with Session(engine) as session:
+        if snapshot:
+            manifest, manifest_json, snapshot_sha256, rows = _snapshot_rows(
+                session, tuple(session_ids))
+        else:
+            manifest = manifest_json = snapshot_sha256 = None
+            rows = []
         previous = session.exec(
             select(QualityReleaseEpoch)
             .where(QualityReleaseEpoch.status == "published")
@@ -77,8 +158,20 @@ def _freeze_epoch(engine, *session_ids: str, key_id: str = KEY_ID) -> str:
             diagnostics_status="complete", deidentification_key_id=key_id,
             builder_actor_display_id="STEWARD", builder_actor_role="data_steward",
             approver_actor_display_id="ADMIN", approver_actor_role="admin",
-            idempotency_key_sha256=f"{seq:064x}"))
+            idempotency_key_sha256=f"{seq:064x}",
+            research_snapshot_schema_version=(
+                manifest["schema_version"] if manifest is not None else None),
+            research_snapshot_manifest_json=manifest_json,
+            research_snapshot_sha256=snapshot_sha256))
         session.flush()
+        for dataset_key, ordinal, row_json, row_sha256 in rows:
+            session.add(QualityReleaseEpochRowSnapshot(
+                epoch_id=epoch_id,
+                dataset_key=dataset_key,
+                row_ordinal=ordinal,
+                row_json=row_json,
+                row_sha256=row_sha256,
+            ))
         for session_id in session_ids:
             session.add(QualityReleaseEpochSession(
                 epoch_id=epoch_id,
@@ -393,12 +486,10 @@ def _decoded_cursor_bytes(cursor: str) -> bytes:
 
 def test_pagination_cursor_never_carries_a_plaintext_identifier(
         research_env, monkeypatch):
-    """游标里装的是数据库自然键，而那正是本接口明令禁出的直接标识符。
+    """冻结游标只该带行序号与签名，旧的自然键明文不得再出现。
 
-    第一版只做 HMAC 签名、载荷明文 base64，``encode_cursor(["P-REAL-1"])`` 解码
-    出来就是 ``["P-REAL-1"]``。上一版的泄漏回归抓不住它，因为那条断言是对响应
-    **原文**做子串匹配，而游标是 base64——`"P-REAL-1" in response.text` 恒为
-    False。所以这里必须把游标解出来再看。
+    只在响应原文里搜不够：标识符若先被 base64，子串检查会空转。因此这里
+    先把游标还原成原始字节再搜。
     """
     _with_key(monkeypatch)
     _add_second_page_rows(research_env)
@@ -433,16 +524,58 @@ def test_a_cursor_from_one_dataset_is_rejected_by_another(
     assert response.json()["detail"]["code"] == "research_cursor_invalid"
 
 
-def test_the_same_key_encodes_to_a_different_cursor_every_time(
+def test_a_cursor_from_an_older_epoch_is_rejected(
         research_env, monkeypatch):
-    """随机 nonce：同一个位置两次翻页给出不同游标，不能被当成位置指纹比对。"""
+    """游标必须绑定纪元与快照，新纪元不能把旧页码当成自己的位置。"""
     _with_key(monkeypatch)
     _add_second_page_rows(research_env)
     client = _client("steward")
-    path = "/research/v1/subjects?data_classification=research&limit=1"
-    first = client.get(path).json()["next_cursor"]
-    second = client.get(path).json()["next_cursor"]
-    assert first and second and first != second
+    cursor = client.get(
+        "/research/v1/sessions?data_classification=research&limit=1"
+    ).json()["next_cursor"]
+    assert cursor
+
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1", "S-REAL-2")
+    response = client.get(
+        "/research/v1/sessions?data_classification=research"
+        f"&limit=1&cursor={cursor}")
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "research_cursor_invalid"
+
+
+def test_a_legacy_live_cursor_is_rejected_by_the_frozen_reader(
+        research_env, monkeypatch):
+    """v2 游标装自然键，不能在 v3 冻结页上被解释成行序号。"""
+    _with_key(monkeypatch)
+    legacy = research_read.encode_cursor(
+        ["S-REAL-1"], CONFIG, "sessions")
+    response = _client("steward").get(
+        "/research/v1/sessions?data_classification=research"
+        f"&cursor={legacy}")
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "research_cursor_invalid"
+
+
+def test_the_live_cursor_keeps_its_random_nonce(research_env, monkeypatch):
+    """仿真活读仍用随机 AES-GCM 游标，冻结路径不得改它。"""
+    _with_key(monkeypatch)
+    first = research_read.encode_cursor(["SIM-1"], CONFIG, "subjects")
+    second = research_read.encode_cursor(["SIM-1"], CONFIG, "subjects")
+    assert first != second
+
+
+def test_the_same_frozen_page_has_the_same_body_and_cursor(
+        research_env, monkeypatch):
+    """冻结页不能因随机 nonce 每次变字节；下一页位置也是发布物的一部分。"""
+    _with_key(monkeypatch)
+    _add_second_page_rows(research_env)
+    client = _client("steward")
+    path = "/research/v1/sessions?data_classification=research&limit=1"
+    first = client.get(path)
+    second = client.get(path)
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
+    assert first.json()["next_cursor"] == second.json()["next_cursor"]
 
 
 def test_pagination_still_walks_every_row_exactly_once(
@@ -499,6 +632,7 @@ def test_a_withdrawn_subject_is_judged_by_the_same_rule_as_everywhere_else(
         patient.withdrawal_status = "active"      # 别处会判成"已撤回"
         session.add(patient)
         session.commit()
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
     client = _client("steward")
     payload = client.get(
         "/research/v1/subjects?data_classification=research").json()
@@ -523,6 +657,7 @@ def test_withdrawal_expressed_only_through_the_consent_field_still_seals(
         session.add(patient)
         session.commit()
         assert session_admission.patient_content_sealed(patient)
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
     client = _client("steward")
     config = export_security.load_deidentification_config()
     code = export_security.pseudonymize_subject("P-REAL-1", config)
@@ -587,12 +722,14 @@ def test_turn_tombstones_keep_the_natural_key_so_the_denominator_survives(
                 asr_text=SECRET_TEXT, prompt_level=1, ai_score=0.0,
                 judge_portrait_used=False))
         session.commit()
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
     before = _client("steward").get(
         "/research/v1/turns?data_classification=research").json()["rows"]
     live = [r for r in before if r["session_code"]]
     assert len(live) == 4, "先确认这个场次真的有 4 个环节，否则下面是空转"
 
     _withdraw(research_env, "P-REAL-1")
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
     after = _client("steward").get(
         "/research/v1/turns?data_classification=research").json()["rows"]
     assert len(after) == len(before), "撤回后行数变了，分母就不稳了"
@@ -616,6 +753,7 @@ def test_a_withdrawn_subject_row_stops_claiming_secondary_use_is_allowed(
         session.add(patient)
         session.commit()
     _withdraw(research_env, "P-REAL-1")
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
     config = export_security.load_deidentification_config()
     code = export_security.pseudonymize_subject("P-REAL-1", config)
     rows = _client("steward").get(
@@ -797,6 +935,7 @@ def test_columns_the_dictionary_declares_as_variables_actually_carry_values(
         turn.source_attempt_id = attempt.id
         session.add(turn)
         session.commit()
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
 
     client = _client("steward")
     sessions = client.get(
@@ -869,6 +1008,7 @@ def test_paging_turns_one_at_a_time_gives_exactly_the_same_rows_as_one_big_page(
             item_event_id=extra.id, turn_seq=1, response_role="命名",
             prompt_level=0, ai_score=1.0, judge_portrait_used=False))
         session.commit()
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
 
     client = _client("steward")
     whole = client.get(
@@ -976,6 +1116,143 @@ def test_data_written_after_the_freeze_does_not_move_the_row_face(
     assert client.get(path).text == before, "冻结之后新写入的数据改变了行面的输出"
 
 
+def test_mutating_live_patient_runtime_turn_and_attempt_keeps_frozen_bytes(
+        research_env, monkeypatch):
+    """不只冻场次 ID：既有成员的四类活表变化也不得改变 JSON/CSV。"""
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        session.add(SessionRuntimeState(
+            session_id="S-REAL-1", status="completed"))
+        item = session.exec(select(ItemEvent).where(
+            ItemEvent.session_id == "S-REAL-1")).first()
+        attempt = AttemptEvent(
+            session_id="S-REAL-1", item_id=item.item_id, turn_seq=1,
+            attempt_seq=7, response_role="命名",
+            raw_audio_id="AUDIO-SNAPSHOT-1", prompt_level=0)
+        session.add(attempt)
+        session.commit()
+        turn = session.exec(select(TurnEvent).where(
+            TurnEvent.item_event_id == item.id)).first()
+        turn.source_attempt_id = attempt.id
+        session.add(turn)
+        session.commit()
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
+
+    client = _client("steward")
+    paths = tuple(
+        f"/research/v1/{dataset}{suffix}?data_classification=research"
+        for dataset in ("subjects", "sessions", "turns")
+        for suffix in ("", ".csv")
+    )
+    before: dict[str, bytes] = {}
+    for path in paths:
+        response = client.get(path)
+        assert response.status_code == 200, path
+        before[path] = response.content
+
+    with Session(research_env) as session:
+        patient = session.get(Patient, "P-REAL-1")
+        patient.dementia_severity = "重度"
+        session.add(patient)
+        runtime_state = session.get(SessionRuntimeState, "S-REAL-1")
+        runtime_state.status = "paused"
+        session.add(runtime_state)
+        turn = session.exec(select(TurnEvent).join(
+            ItemEvent, TurnEvent.item_event_id == ItemEvent.id).where(
+                ItemEvent.session_id == "S-REAL-1")).first()
+        turn.prompt_level = 2
+        turn.reviewed_score = 0.0
+        session.add(turn)
+        attempt = session.get(AttemptEvent, turn.source_attempt_id)
+        attempt.attempt_seq = 8
+        session.add(attempt)
+        session.commit()
+
+    # 限速器按具名账号计数；换另一个同权限账号做第二次复读，
+    # 避免“验证不变性”这件事自己被 429 打断。发布字节本来就不绑读者。
+    verifier = _client("admin")
+    for path in paths:
+        response = verifier.get(path)
+        assert response.status_code == 200, path
+        assert response.content == before[path], \
+            f"{path} 被冻结后的活表变化改动了"
+
+
+def test_frozen_readers_select_only_the_snapshot_row_model(
+        research_env, monkeypatch):
+    """冻结分支必须在第一次查询前分流，不能先摸活表再丢掉结果。"""
+    _with_key(monkeypatch)
+    real_select = research_read.select
+    selected: list[tuple[object, ...]] = []
+
+    def snapshot_select_only(*entities):
+        selected.append(entities)
+        assert entities == (QualityReleaseEpochRowSnapshot,), \
+            f"冻结读取触碰了非快照模型：{entities!r}"
+        return real_select(*entities)
+
+    monkeypatch.setattr(research_read, "select", snapshot_select_only)
+    client = _client("steward")
+    for dataset in ("subjects", "sessions", "turns"):
+        response = client.get(
+            f"/research/v1/{dataset}?data_classification=research")
+        assert response.status_code == 200, dataset
+    assert len(selected) == 3
+
+
+def test_a_snapshot_row_that_no_longer_matches_its_hash_is_refused(
+        research_env, monkeypatch):
+    """存储损坏不能被 JSON 解析“修好”后继续发，逐行指纹必须对上。"""
+    _with_key(monkeypatch)
+    # 绕过 ORM 的不可变事件，模拟磁盘/管理员层面的存储损坏。
+    with research_env.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE qualityreleaseepochrowsnapshot SET row_json='{}' "
+            "WHERE dataset_key='subjects' AND row_ordinal=1")
+    with Session(research_env) as session:
+        with pytest.raises(quality_release.ReleaseRefused) as caught:
+            quality_release.bind_research_read(session, config=CONFIG)
+    assert caught.value.code == "research_release_snapshot_corrupt"
+    response = _client("steward").get(
+        "/research/v1/subjects?data_classification=research")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == (
+        "research_release_snapshot_corrupt")
+
+
+def test_changing_both_a_snapshot_row_and_its_local_hash_is_refused(
+        research_env, monkeypatch):
+    """The manifest must anchor the set; a self-consistent edited row is corrupt."""
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        row = session.exec(select(QualityReleaseEpochRowSnapshot).where(
+            QualityReleaseEpochRowSnapshot.dataset_key == "subjects",
+            QualityReleaseEpochRowSnapshot.row_ordinal == 1,
+        )).one()
+        decoded = json.loads(row.row_json)
+    decoded["dementia_severity"] = "TAMPERED"
+    raw = json.dumps(
+        decoded, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    with research_env.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE qualityreleaseepochrowsnapshot "
+            "SET row_json=?, row_sha256=? "
+            "WHERE dataset_key='subjects' AND row_ordinal=1",
+            (raw, digest),
+        )
+
+    with Session(research_env) as session:
+        with pytest.raises(quality_release.ReleaseRefused) as caught:
+            quality_release.bind_research_read(session, config=CONFIG)
+    assert caught.value.code == "research_release_snapshot_corrupt"
+    response = _client("steward").get(
+        "/research/v1/subjects?data_classification=research")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == (
+        "research_release_snapshot_corrupt")
+
+
 def test_rotating_the_key_closes_the_row_face_instead_of_emptying_it(
         research_env, monkeypatch):
     """轮换密钥之后旧纪元的假名对不上——必须拒绝，不能静默返回零行。
@@ -991,24 +1268,17 @@ def test_rotating_the_key_closes_the_row_face_instead_of_emptying_it(
     assert response.json()["detail"]["code"] == "research_release_key_rotated"
 
 
-def test_a_frozen_session_that_no_longer_resolves_closes_the_row_face(
+def test_a_legacy_epoch_without_a_row_snapshot_closes_the_row_face(
         research_env, monkeypatch):
-    """队列里有场次在库中找不到，就不许发——发出去的是纪元 N 的一个子集。"""
+    """旧纪元只冻成员假名，无法证明行字节没变；不自动回填，也不回退活表。"""
     _with_key(monkeypatch)
-    with Session(research_env) as session:
-        epoch = session.exec(
-            select(QualityReleaseEpoch).where(
-                QualityReleaseEpoch.status == "published")).first()
-        session.add(QualityReleaseEpochSession(
-            epoch_id=epoch.epoch_id,
-            session_pseudonym=export_security.pseudonymize_session(
-                "S-NEVER-EXISTED", CONFIG),
-            evidence_watermark=1))
-        session.commit()
+    _freeze_epoch(
+        research_env, "S-REAL-1", "S-GONE-1", snapshot=False)
     client = _client("steward")
     response = client.get("/research/v1/turns?data_classification=research")
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "research_release_cohort_unresolved"
+    assert response.json()["detail"]["code"] == \
+        "research_release_snapshot_missing"
 
 
 def test_the_simulation_partition_is_not_bound_to_any_epoch(

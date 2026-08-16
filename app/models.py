@@ -1174,6 +1174,39 @@ class QualityReleaseEpoch(SQLModel, table=True):
             "min_subjects_applied >= 2 AND min_cell_subjects_applied >= 2 "
             "AND band_width_applied >= 5 AND rate_decimals_applied >= 1",
             name="ck_quality_release_epoch_thresholds_sane"),
+        CheckConstraint(
+            "((research_snapshot_schema_version IS NULL AND "
+            "research_snapshot_manifest_json IS NULL AND "
+            "research_snapshot_sha256 IS NULL) OR "
+            "(research_snapshot_schema_version IS NOT NULL AND "
+            "research_snapshot_manifest_json IS NOT NULL AND "
+            "research_snapshot_sha256 IS NOT NULL))",
+            name="ck_quality_release_epoch_research_snapshot_complete"),
+        CheckConstraint(
+            "research_snapshot_schema_version IS NULL OR "
+            "(length(trim(research_snapshot_schema_version)) > 0 AND "
+            "research_snapshot_schema_version = "
+            "trim(research_snapshot_schema_version))",
+            name="ck_quality_release_epoch_research_snapshot_schema"),
+        CheckConstraint(
+            "research_snapshot_sha256 IS NULL OR "
+            + _hex64_sql("research_snapshot_sha256"),
+            name="ck_quality_release_epoch_research_snapshot_hash"),
+        CheckConstraint(
+            "((proposal_sha256 IS NULL AND "
+            "entry_quarantine_days_applied IS NULL) OR "
+            "(proposal_sha256 IS NOT NULL AND "
+            "entry_quarantine_days_applied IS NOT NULL))",
+            name="ck_quality_release_epoch_recovery_evidence_complete"),
+        CheckConstraint(
+            "proposal_sha256 IS NULL OR "
+            + _hex64_sql("proposal_sha256"),
+            name="ck_quality_release_epoch_proposal_hash"),
+        CheckConstraint(
+            "entry_quarantine_days_applied IS NULL OR "
+            "(entry_quarantine_days_applied >= 0 AND "
+            "entry_quarantine_days_applied <= 365)",
+            name="ck_quality_release_epoch_quarantine_days"),
     )
 
     epoch_id: str = Field(primary_key=True)
@@ -1206,9 +1239,48 @@ class QualityReleaseEpoch(SQLModel, table=True):
     approver_actor_display_id: str
     approver_actor_role: str
     idempotency_key_sha256: str
+    #: 三个字段是一个不可分割的冻结契约：旧纪元全为 NULL；新纪元要么
+    #: 三者都有，要么拒绝入库。读路径只能按 manifest 复读下方冻结行。
+    research_snapshot_schema_version: Optional[str] = None
+    research_snapshot_manifest_json: Optional[str] = None
+    research_snapshot_sha256: Optional[str] = None
+    #: 这一对是发布不确定态的恢复证据：纪元自证它批准的提案与
+    #: 当时实际执行的入口隔离政策。旧纪元保持 NULL/NULL。
+    proposal_sha256: Optional[str] = None
+    entry_quarantine_days_applied: Optional[int] = None
     superseded_at: Optional[datetime] = None
     revoked_at: Optional[datetime] = None
     revoke_reason_code: Optional[str] = None
+
+
+class QualityReleaseEpochRowSnapshot(SQLModel, table=True):
+    """纪元发布时研究数据集的逐行冻结副本。
+
+    每行保留稳定序号、精确 JSON 字节的文本表示与独立摘要。这张表
+    不参与活数据重算；载荷发布后只能追加新纪元，不能修改或删除旧行。
+    """
+    __table_args__ = (
+        UniqueConstraint(
+            "epoch_id", "dataset_key", "row_ordinal",
+            name="uq_quality_release_epoch_row_snapshot_ordinal"),
+        CheckConstraint(
+            "dataset_key IN ('subjects','sessions','turns')",
+            name="ck_quality_release_epoch_row_snapshot_dataset_closed"),
+        CheckConstraint(
+            "row_ordinal >= 1",
+            name="ck_quality_release_epoch_row_snapshot_ordinal_positive"),
+        CheckConstraint(
+            _hex64_sql("row_sha256"),
+            name="ck_quality_release_epoch_row_snapshot_hash"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    epoch_id: str = Field(
+        foreign_key="qualityreleaseepoch.epoch_id", index=True)
+    dataset_key: str
+    row_ordinal: int
+    row_json: str
+    row_sha256: str
 
 
 class QualityReleaseEpochSession(SQLModel, table=True):
@@ -1282,6 +1354,12 @@ def _reject_quality_release_epoch_delete(*_args) -> None:
 @sa_event.listens_for(QualityReleaseEpochSession, "before_delete")
 def _reject_quality_release_session_mutation(*_args) -> None:
     raise RuntimeError("QualityReleaseEpochSession 是冻结的队列构成")
+
+
+@sa_event.listens_for(QualityReleaseEpochRowSnapshot, "before_update")
+@sa_event.listens_for(QualityReleaseEpochRowSnapshot, "before_delete")
+def _reject_quality_release_row_snapshot_mutation(*_args) -> None:
+    raise RuntimeError("QualityReleaseEpochRowSnapshot 是冻结的研究数据行")
 
 
 @sa_event.listens_for(QualityDisclosureRecord, "before_update")

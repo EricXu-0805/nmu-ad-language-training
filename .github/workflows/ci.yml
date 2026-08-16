@@ -1,8 +1,9 @@
-# 合并前的自动检查。真正的判据全在 scripts/ci_gate.sh 里，这里只负责在云上调它——
-# 同一套检查本地一条命令也能跑完，不会出现"只有 CI 知道怎么验"的情况。
+# 合并前的自动检查。Python/Node 依赖由 workflow 先准备，判据则调用
+# scripts/ci_gate.sh 的共享 suite；该脚本不会改写当前 Python 或 node_modules。
+# 因此同一套核心检查在本地和 CI 不会各写一份。
 #
-# ⚠ 截至 2026-08-06 这个仓库还没 push 过 origin。在推上去之前，这个文件不会被
-#   执行一次。它不是"已经有 CI 了"的证据，只是推上去那天立刻生效的定义。
+# 这个文件只是门禁定义，不能证明 GitHub 已把它设为 required check，也不能证明
+# 当前 SHA 曾经跑绿；这两件事必须以仓库设置和对应 SHA 的云端运行证据为准。
 name: CI
 
 on:
@@ -43,8 +44,22 @@ jobs:
         # 从未验证过的新规则进来(首绿尝试就是这样红的——I001 只在 CI 出现)。
         # 升级 = 本地先升、先绿,再改这里。
         run: pip install pytest==9.1.1 ruff==0.15.15
-      - run: ruff check .
-      - run: python -m pytest -q
+      - name: 共享后端门（ruff + pytest）
+        run: NMU_GATE_PYTHON=python scripts/ci_gate.sh --only backend
+      - name: 生成 240 场机械容量验收回执（留档用）
+        if: matrix.python == '3.12'
+        run: |
+          receipt_dir="$RUNNER_TEMP/quality-scale-receipt"
+          install -d -m 700 "$receipt_dir"
+          python -m harness.quality_release_scale --profile full \
+            --receipt "$receipt_dir/quality-release-scale.json"
+      - name: 归档 240 场验收回执
+        if: matrix.python == '3.12'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: quality-release-scale-python-3.12
+          path: ${{ runner.temp }}/quality-scale-receipt/quality-release-scale.json
+          if-no-files-found: error
 
   frontend:
     runs-on: ubuntu-latest
@@ -52,7 +67,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020   # v7.0.0
         with:
-          # 必须 ≥25：测试用 node --test 直接跑 .ts（原生类型剥离），且渲染类
+          # 必须与本地共享门一致为 25.x：测试用 node --test 直接跑 .ts（原生类型剥离），且渲染类
           # 测试用到 node 25 起默认可用的 localStorage（24 上直接 ReferenceError，
           # 首绿尝试就是这么红的）。本地验证环境即 node 25。
           # 镜像底座是 node 22，那一层只跑 vite build，不跑这些测试。
@@ -61,14 +76,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: web
-      - run: npm run lint
-        working-directory: web
-      - run: npm run pretest
-        working-directory: web
-      - run: npm test
-        working-directory: web
-      - run: npm run build
-        working-directory: web
+      - name: 共享前端门（含 Node major 对齐）
+        run: scripts/ci_gate.sh --only frontend
 
   supply-chain:
     runs-on: ubuntu-latest
@@ -77,18 +86,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
         with:
           python-version: "3.12"
-      - name: SBOM 必须与当前依赖一致
-        run: python scripts/generate_sbom.py --check
-      - name: OSV 漏洞扫描（未豁免的一条就红）
-        run: python scripts/vuln_scan.py
-      - name: 锁自洽——干净环境按哈希装完要与锁逐个对上
-        # 装完卸掉 pip:锁里没有 pip,留着就是一个没人审过、没有哈希校验的包,
-        # supply_chain_check 会如实判 [unlocked]。生产 venv 同样不带 pip。
-        run: |
-          python -m venv /tmp/locked
-          /tmp/locked/bin/pip install --require-hashes -r requirements-deploy.lock.txt
-          /tmp/locked/bin/python -m pip uninstall -y pip
-          python scripts/supply_chain_check.py --python /tmp/locked/bin/python
+      - name: 共享供应链门（SBOM + OSV + 锁自洽）
+        run: NMU_GATE_PYTHON=python scripts/ci_gate.sh --only supply-chain
       - name: 归档 SBOM
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         with:

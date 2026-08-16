@@ -5,14 +5,16 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 import json
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import ai_quality_service, export_security, quality_release
+from app import ai_quality_service, export_security, quality_release, research_read
 from app.ai_quality_metrics import (
     AttemptQualityEvidence,
     QualityDimensions,
@@ -23,6 +25,7 @@ from app.models import (
     Patient,
     QualityDisclosureRecord,
     QualityReleaseEpoch,
+    QualityReleaseEpochRowSnapshot,
     QualityReleaseEpochSession,
     Session as TrainSession,
     SessionRuntimeState,
@@ -77,14 +80,87 @@ def _payload(*, cohort_band: str = "30-39") -> dict:
         included_sessions=240, thresholds=THRESHOLDS)
 
 
+def _snapshot_for_sessions(session_ids: list[str]):
+    config = export_security.load_deidentification_config()
+    subjects_dataset = quality_release.research_dataset.dataset_for("subjects")
+    sessions_dataset = quality_release.research_dataset.dataset_for("sessions")
+    assert subjects_dataset is not None and sessions_dataset is not None
+    subject_rows = []
+    session_rows = []
+    for index, session_id in enumerate(session_ids, start=1):
+        patient_id = f"P-{index}-{session_id}"
+        subject_code = export_security.pseudonymize_subject(patient_id, config)
+        session_code = export_security.pseudonymize_session(session_id, config)
+        subject_row = {
+            name: None for name in
+            quality_release.research_dataset.published_columns(subjects_dataset)
+        }
+        subject_row.update({
+            "subject_code": subject_code,
+            "withdrawn": False,
+            "session_count": 1,
+        })
+        session_row = {
+            name: None for name in
+            quality_release.research_dataset.published_columns(sessions_dataset)
+        }
+        session_row.update({
+            "session_code": session_code,
+            "subject_code": subject_code,
+            "is_simulation": False,
+            "data_classification": "research",
+            "withdrawn": False,
+            "pseudonym_key_id": config.key_id,
+        })
+        subject_rows.append(subject_row)
+        session_rows.append(session_row)
+    return quality_release._snapshot_from_rows({
+        "subjects": subject_rows, "sessions": session_rows, "turns": [],
+    })
+
+
 def _publish(db: Session, *, key: str = "cut-0001") -> QualityReleaseEpoch:
+    snapshot = _snapshot_for_sessions(["S-1", "S-2"])
+    payload = _payload()
+    watermarks = {"S-1": 240, "S-2": 240}
+    proposal_sha256 = quality_release.proposal_digest(
+        payload, watermarks, as_of=NOW,
+        config=export_security.load_deidentification_config(),
+        thresholds=THRESHOLDS, builder=("STEWARD-A", "data_steward"),
+        research_snapshot_sha256=snapshot.snapshot_sha256)
     epoch = quality_release.publish_epoch(
-        db, payload=_payload(), watermarks={"S-1": 240, "S-2": 240},
+        db, payload=payload, watermarks=watermarks,
+        research_snapshot=snapshot,
+        proposal_sha256=proposal_sha256,
         as_of=NOW, thresholds=THRESHOLDS,
         builder=("STEWARD-A", "data_steward"),
         approver=("ADMIN-B", "admin"), idempotency_key=key, now=NOW)
     db.commit()
     return epoch
+
+
+def test_publish_rejects_a_same_size_snapshot_for_a_different_cohort(
+        engine, deidentified):
+    payload = _payload()
+    watermarks = {"S-1": 240, "S-2": 240}
+    snapshot = _snapshot_for_sessions(["S-OTHER", "S-2"])
+    config = export_security.load_deidentification_config()
+    proposal = quality_release.proposal_digest(
+        payload, watermarks, as_of=NOW, config=config,
+        thresholds=THRESHOLDS, builder=("STEWARD-A", "data_steward"),
+        research_snapshot_sha256=snapshot.snapshot_sha256)
+
+    with Session(engine) as db, pytest.raises(ReleaseRefused) as caught:
+        quality_release.publish_epoch(
+            db, payload=payload, watermarks=watermarks,
+            research_snapshot=snapshot, proposal_sha256=proposal,
+            as_of=NOW, thresholds=THRESHOLDS,
+            builder=("STEWARD-A", "data_steward"),
+            approver=("ADMIN-B", "admin"), idempotency_key="cut-mismatch")
+
+    assert caught.value.code == "release_research_snapshot_membership_mismatch"
+    with Session(engine) as db:
+        assert db.exec(select(QualityReleaseEpoch)).first() is None
 
 
 def _evidence(count: int) -> list[TurnQualityEvidence]:
@@ -137,6 +213,45 @@ def test_rates_really_compute_when_the_contributor_count_clears_the_threshold():
     assert row["research_truth"]["reviewed_decisions_band"] is not None
 
 
+def test_false_positive_and_negative_rates_keep_their_original_denominators():
+    # 真实阴性 4 条：1 FP + 3 TN => FPR 0.25。
+    # 真实阳性 6 条：2 FN + 4 TP => FNR 0.33（两位截断）。
+    pairs = (
+        [(True, False)] + [(False, False)] * 3
+        + [(False, True)] * 2 + [(True, True)] * 4
+    )
+    evidence = [TurnQualityEvidence(
+        dimensions=QualityDimensions(data_classification="research"),
+        eligible=True,
+        attempts=(AttemptQualityEvidence(
+            prompt_level=0, processing_status="completed", latency_ms=5),),
+        audio_evidenced=True,
+        ai_attempted=True, ai_judged=True, ai_predicted_correct=predicted,
+        asr_reviewed=False,
+        human_truth_locked=True, human_truth_correct=actual,
+        technical_pause_count=0, researcher_takeover_count=0,
+    ) for predicted, actual in pairs]
+    released = ai_quality_service._released_payload(
+        data_classification="research", visibility_scope="all_sessions",
+        generated_at=datetime(2026, 8, 16, tzinfo=timezone.utc),
+        threshold=ai_quality_service._Threshold("configured", 5),
+        distinct_patients=30, visible_sessions=30, included_sessions=30,
+        source_turns=len(evidence), evidence=evidence, restricted_sessions=0,
+        classification_bad_sessions=0, protocol_binding_invalid_sessions=0,
+        structural_invalid_evidence_records=0, lineage_invalid_turns=0)
+    contributors = {
+        key: 30 for key in quality_release._METRIC_CONTRIBUTOR_KEYS
+    }
+
+    row = quality_release._apply_disclosure_control(
+        released, distinct_subjects=30, included_sessions=30,
+        thresholds=THRESHOLDS, metric_contributors=contributors)["rows"][0]
+
+    assert row["research_truth"]["agreement_rate"] == 0.7
+    assert row["research_truth"]["false_positive_rate"] == 0.25
+    assert row["research_truth"]["false_negative_rate"] == 0.33
+
+
 def test_too_few_reviewers_nulls_the_rates_that_would_otherwise_be_published():
     row = _payload_with_rates(reviewed_subjects=3)["rows"][0]
 
@@ -146,9 +261,175 @@ def test_too_few_reviewers_nulls_the_rates_that_would_otherwise_be_published():
         "false_negative_rate": None,
         "reviewed_decisions_band": None,
     }
-    # 连接闭包：复核格被抑制，同一批人支撑的队列侧比率也必须跟着灭。
-    assert all(value is None for key, value in row["operational"].items()
-               if key.endswith("_rate"))
+    # 真值与 operational 是重叠但不可相加的分母组。复核者少只能
+    # 关闭真值指标，不应随机拖灭无算术关系的 operational 率。
+    assert row["operational"]["asr_manual_correction_rate"] is not None
+
+
+def test_each_metric_uses_its_own_real_contributor_count():
+    released = ai_quality_service._released_payload(
+        data_classification="research", visibility_scope="all_sessions",
+        generated_at=datetime(2026, 8, 16, tzinfo=timezone.utc),
+        threshold=ai_quality_service._Threshold("configured", 5),
+        distinct_patients=30, visible_sessions=30, included_sessions=30,
+        source_turns=700, evidence=_evidence(700), restricted_sessions=0,
+        classification_bad_sessions=0, protocol_binding_invalid_sessions=0,
+        structural_invalid_evidence_records=0, lineage_invalid_turns=0)
+    contributors = {key: 30 for key in quality_release._METRIC_CONTRIBUTOR_KEYS}
+    contributors["asr_manual_correction_rate"] = 1
+
+    row = quality_release._apply_disclosure_control(
+        released, distinct_subjects=30, included_sessions=30,
+        thresholds=THRESHOLDS, metric_contributors=contributors)["rows"][0]
+
+    assert row["operational"]["asr_manual_correction_rate"] is None
+    assert row["operational"]["prompt_escalation_rate"] is not None
+    assert row["research_truth"]["agreement_rate"] is not None
+
+
+def test_contributor_recorder_uses_each_real_metric_denominator():
+    buckets = {key: set() for key in quality_release._METRIC_CONTRIBUTOR_KEYS}
+    quality_release._record_metric_contributors(
+        buckets, patient_id="P-ASR", evidence=[TurnQualityEvidence(
+            dimensions=QualityDimensions(data_classification="research"),
+            eligible=True, attempts=(), asr_reviewed=True,
+            asr_corrected=False)])
+    quality_release._record_metric_contributors(
+        buckets, patient_id="P-PROMPT", evidence=[TurnQualityEvidence(
+            dimensions=QualityDimensions(data_classification="research"),
+            eligible=False, attempts=(AttemptQualityEvidence(
+                prompt_level=1, processing_status="received", latency_ms=None),))])
+    quality_release._record_metric_contributors(
+        buckets, patient_id="P-LATENCY", evidence=[TurnQualityEvidence(
+            dimensions=QualityDimensions(data_classification="research"),
+            eligible=False, attempts=(AttemptQualityEvidence(
+                prompt_level=3, processing_status="received", latency_ms=12),))])
+    quality_release._record_metric_contributors(
+        buckets, patient_id="P-TRUTH", evidence=[TurnQualityEvidence(
+            dimensions=QualityDimensions(data_classification="research"),
+            eligible=True, attempts=(AttemptQualityEvidence(
+                prompt_level=0, processing_status="completed", latency_ms=5),),
+            ai_attempted=True, ai_judged=True, ai_predicted_correct=True,
+            human_truth_locked=True, human_truth_correct=False)])
+    quality_release._record_metric_contributors(
+        buckets, patient_id="P-TRUTH-POS", evidence=[TurnQualityEvidence(
+            dimensions=QualityDimensions(data_classification="research"),
+            eligible=True, attempts=(AttemptQualityEvidence(
+                prompt_level=3, processing_status="completed", latency_ms=None),),
+            ai_attempted=True, ai_judged=True, ai_predicted_correct=False,
+            human_truth_locked=True, human_truth_correct=True)])
+
+    assert buckets["asr_manual_correction_rate"] == {"P-ASR"}
+    assert buckets["prompt_escalation_rate"] == {"P-PROMPT", "P-TRUTH"}
+    assert buckets["latency_p50_band"] == {"P-LATENCY", "P-TRUTH"}
+    assert buckets["pause_rate"] == {"P-ASR", "P-TRUTH", "P-TRUTH-POS"}
+    assert buckets["takeover_rate"] == {"P-ASR", "P-TRUTH", "P-TRUTH-POS"}
+    assert buckets["agreement_rate"] == {"P-TRUTH", "P-TRUTH-POS"}
+    assert buckets["false_positive_rate"] == {"P-TRUTH"}
+    assert buckets["false_negative_rate"] == {"P-TRUTH-POS"}
+    assert buckets["reviewed_decisions_band"] == {"P-TRUTH", "P-TRUTH-POS"}
+
+
+def test_the_watermark_counts_all_nine_loaded_evidence_groups():
+    loaded = SimpleNamespace(
+        items=[1], turn_pairs=[1, 2], attempts=[1, 2, 3],
+        audios=[1, 2, 3, 4], receipts=[1, 2, 3, 4, 5],
+        interactions=[1, 2, 3, 4, 5, 6],
+        revision_pairs=[1, 2, 3, 4, 5, 6, 7],
+        pause_receipts=list(range(8)), control_events=list(range(9)))
+
+    assert quality_release._watermark(loaded) == sum(range(1, 10))
+
+
+@pytest.mark.parametrize("bad_session_ids,refused", [({"S-4"}, True), (set(), False)])
+def test_total_subject_threshold_is_applied_after_bad_sessions_are_excluded(
+        monkeypatch, bad_session_ids, refused):
+    subject_count = 5
+    sessions = [TrainSession(
+        session_id=f"S-{index}", patient_id=f"P-{index}",
+        training_date=date.today(), week_no=2, phase_type="正式训练",
+        event_line="正式训练", trainer_id="T-1",
+        item_bank_version_id="bank-v1", is_simulation=False,
+        data_classification="research") for index in range(subject_count)]
+    plans = {row.session_id: SimpleNamespace(
+        total_turns=lambda: 0, invalid=row.session_id in bad_session_ids)
+             for row in sessions}
+    loaded = SimpleNamespace(
+        items=[], turn_pairs=[], attempts=[], audios=[], receipts=[],
+        interactions=[], revision_pairs=[], pause_receipts=[], control_events=[])
+    monkeypatch.setattr(ai_quality_service, "_plans_for_sessions",
+                        lambda _rows: (plans, set()))
+    monkeypatch.setattr(ai_quality_service, "_preflight_evidence_budget",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ai_quality_service, "_load_evidence_rows",
+                        lambda *_args, **_kwargs: loaded)
+    monkeypatch.setattr(ai_quality_service, "_enforce_loaded_evidence_budget",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ai_quality_service, "_classification_inconsistent_sessions",
+                        lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(ai_quality_service, "_group_evidence",
+                        lambda _loaded: {row.session_id: {} for row in sessions})
+    monkeypatch.setattr(ai_quality_service, "_structural_evidence_invalid",
+                        lambda plan, *_args, **_kwargs: int(plan.invalid))
+    monkeypatch.setattr(ai_quality_service, "_project_session",
+                        lambda *_args, **_kwargs: ([], 0, 0))
+    blob_scans: list[tuple] = []
+    monkeypatch.setattr(
+        quality_release.audio_store, "index_blobs",
+        lambda raw_ids: blob_scans.append(tuple(raw_ids)) or {})
+    fake_db = SimpleNamespace(exec=lambda *_args, **_kwargs: [])
+
+    if refused:
+        with pytest.raises(ReleaseRefused) as caught:
+            quality_release.build_payload(
+                fake_db, sessions, as_of=NOW, thresholds=THRESHOLDS)
+        assert caught.value.code == "release_cohort_below_threshold"
+    else:
+        payload, watermarks = quality_release.build_payload(
+            fake_db, sessions, as_of=NOW, thresholds=THRESHOLDS)
+        assert payload["rows"][0]["suppression"]["status"] == "released"
+        assert len(watermarks) == 5
+    assert len(blob_scans) == 1, "一个提案只能完整扫描一次音频目录"
+
+
+def test_watermarks_contain_only_the_sessions_in_the_released_cohort(
+        monkeypatch):
+    sessions = [TrainSession(
+        session_id=f"S-{index}", patient_id=f"P-{index}",
+        training_date=date.today(), week_no=2, phase_type="正式训练",
+        event_line="正式训练", trainer_id="T-1",
+        item_bank_version_id="bank-v1", is_simulation=False,
+        data_classification="research") for index in range(5)]
+    plans = {row.session_id: SimpleNamespace(
+        total_turns=lambda: 0, invalid=row.session_id == "S-4")
+             for row in sessions}
+    loaded = SimpleNamespace(
+        items=[1], turn_pairs=[], attempts=[], audios=[], receipts=[],
+        interactions=[], revision_pairs=[], pause_receipts=[], control_events=[])
+    monkeypatch.setattr(ai_quality_service, "_plans_for_sessions",
+                        lambda _rows: (plans, set()))
+    monkeypatch.setattr(ai_quality_service, "_preflight_evidence_budget",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ai_quality_service, "_load_evidence_rows",
+                        lambda *_args, **_kwargs: loaded)
+    monkeypatch.setattr(ai_quality_service, "_enforce_loaded_evidence_budget",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ai_quality_service, "_classification_inconsistent_sessions",
+                        lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(ai_quality_service, "_group_evidence",
+                        lambda _loaded: {row.session_id: {} for row in sessions})
+    monkeypatch.setattr(ai_quality_service, "_structural_evidence_invalid",
+                        lambda plan, *_args, **_kwargs: int(plan.invalid))
+    monkeypatch.setattr(ai_quality_service, "_project_session",
+                        lambda *_args, **_kwargs: ([], 0, 0))
+    monkeypatch.setattr(quality_release.audio_store, "index_blobs", lambda _: {})
+    fake_db = SimpleNamespace(exec=lambda *_args, **_kwargs: [])
+    thresholds = replace(THRESHOLDS, min_subjects=4)
+
+    _payload, watermarks = quality_release.build_payload(
+        fake_db, sessions, as_of=NOW, thresholds=thresholds)
+
+    assert watermarks == {f"S-{index}": 1 for index in range(4)}
 
 
 def test_rates_never_publish_more_decimals_than_the_frozen_setting():
@@ -196,6 +477,61 @@ def test_an_unregistered_leaf_is_caught_rather_than_published_silently():
 
     assert quality_release.registry_problems(smuggled) == [
         "rows/0/operational/exact_subject_count"]
+
+
+def test_research_snapshot_reuses_the_closed_row_projection_and_binds_all_pages(
+        monkeypatch):
+    severity = {"value": "轻度"}
+
+    def reader(dataset_key):
+        dataset = quality_release.research_dataset.dataset_for(dataset_key)
+        assert dataset is not None
+        columns = list(
+            quality_release.research_dataset.published_columns(dataset))
+
+        def read(_db, *, cursor, binding, **_kwargs):
+            assert binding.session_ids == frozenset({"S-1", "S-2"})
+            raw = {name: None for name in columns}
+            if dataset_key == "subjects":
+                raw["subject_code"] = "SUBJ_TEST"
+                raw["dementia_severity"] = severity["value"]
+                raw["withdrawn"] = False
+                page, has_more, next_cursor = [raw], False, None
+            elif dataset_key == "sessions":
+                raw["session_code"] = "SESS_1" if cursor is None else "SESS_2"
+                raw["withdrawn"] = False
+                page = [raw]
+                has_more = cursor is None
+                next_cursor = "page-2" if has_more else None
+            else:
+                page, has_more, next_cursor = [], False, None
+            return {
+                "schema_version": quality_release.research_dataset.SCHEMA_VERSION,
+                "dataset": dataset_key,
+                "columns": columns,
+                "rows": page,
+                "row_count": len(page),
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }
+        return read
+
+    monkeypatch.setattr(research_read, "list_subjects", reader("subjects"))
+    monkeypatch.setattr(research_read, "list_sessions", reader("sessions"))
+    monkeypatch.setattr(research_read, "list_turns", reader("turns"))
+    first = quality_release.build_research_snapshot(
+        object(), session_ids=["S-1", "S-2"],
+        config=SimpleNamespace(key_id="test"))
+    severity["value"] = "中度"
+    second = quality_release.build_research_snapshot(
+        object(), session_ids=["S-1", "S-2"],
+        config=SimpleNamespace(key_id="test"))
+
+    manifest = json.loads(first.manifest_json)
+    assert manifest["datasets"]["sessions"]["row_count"] == 2
+    assert [(row.dataset_key, row.row_ordinal) for row in first.rows] == [
+        ("subjects", 1), ("sessions", 1), ("sessions", 2)]
+    assert first.snapshot_sha256 != second.snapshot_sha256
 
 
 def test_reading_twice_returns_the_identical_bytes_including_generated_at(
@@ -401,6 +737,27 @@ def test_the_frozen_cohort_stores_pseudonyms_not_session_ids(
     assert all(row.session_pseudonym.startswith("SESS") for row in rows)
 
 
+def test_the_epoch_persists_the_manifest_and_each_canonical_snapshot_row(
+        engine, deidentified):
+    with Session(engine) as db:
+        epoch = _publish(db)
+        rows = list(db.exec(select(QualityReleaseEpochRowSnapshot).where(
+            QualityReleaseEpochRowSnapshot.epoch_id == epoch.epoch_id)))
+
+    assert epoch.research_snapshot_schema_version == (
+        quality_release.RESEARCH_SNAPSHOT_SCHEMA_VERSION)
+    assert len(epoch.research_snapshot_sha256 or "") == 64
+    manifest = json.loads(epoch.research_snapshot_manifest_json or "")
+    assert manifest["datasets"]["sessions"]["row_count"] == 2
+    assert sorted((row.dataset_key, row.row_ordinal) for row in rows) == [
+        ("sessions", 1), ("sessions", 2),
+        ("subjects", 1), ("subjects", 2)]
+    assert all(
+        quality_release.payload_digest(json.loads(row.row_json))
+        == row.row_sha256
+        for row in rows)
+
+
 def test_the_frozen_content_cannot_be_edited_only_its_lifecycle(
         engine, deidentified):
     with Session(engine) as db:
@@ -460,6 +817,9 @@ def test_the_cohort_takes_only_settled_sessions_past_the_quarantine(engine):
         _seed_session(db, "S-FRESH", status="completed", settled_days_ago=3)
         _seed_session(db, "S-RUNNING", status="active", settled_days_ago=30)
         _seed_session(db, "S-PAUSED", status="paused", settled_days_ago=30)
+        _seed_session(
+            db, "S-REVIEWABLE", status="intervention_completed",
+            settled_days_ago=30)
         db.commit()
 
         cohort = quality_release.derive_cohort(

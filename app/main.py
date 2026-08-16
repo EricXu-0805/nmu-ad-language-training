@@ -7723,7 +7723,10 @@ def get_research_dataset(
                 f"nmu-{dataset_key}-{data_classification}{stamp}.csv")
         return payload
     except research_read.ResearchReadUnavailable as exc:
-        status = 503 if exc.code == "research_deidentification_unavailable" else 422
+        status = 503 if exc.code in {
+            "research_deidentification_unavailable",
+            "research_release_snapshot_corrupt",
+        } else 422
         raise _research_reject(exc.code, exc.message, status) from exc
     except quality_release.ReleaseRefused as refused:
         raise _research_reject(refused.code, refused.detail, 503) from refused

@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, inspect, text
 
 
 PARENT = "e8a1c4b7d902"
-HEAD = "141bc30e4580"
+HEAD = "6f2a9c4d8e17"
 RECORDING_AUTH_REVISION = "b8e5f2a91c07"
 TABLES = {
     "assessmentevent",

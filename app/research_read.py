@@ -12,14 +12,14 @@
   - 输出列是闭集（``research_dataset`` 的注册表），多带的键会被丢弃；
   - 序列化之前统一过 ``export_security.assert_deidentified_sheets``。
 
-分页用 keyset 而不是 offset：offset 在并发写入下会漏行或重行，而研究取数最不该
-出现的就是"每次拉到的行数不一样"。
+分页用 keyset 而不是 offset：仿真活读用数据库自然键，冻结研究行用发布时的
+连续行序号。offset 在并发写入下会漏行或重行，而研究取数最不该出现的就是
+"每次拉到的行数不一样"。
 
-游标里装的是数据库自然键（patient_id / session_id），**那是本接口明令禁出的直接
-标识符**，所以它必须是真加密而不是只签名。第一版只做了 HMAC 签名、载荷是明文
-base64，`encode_cursor(["P-REAL-042"])` 解码出来就是 `["P-REAL-042"]`——签名防的是
-篡改，从来不防读。现在走 AES-GCM（密钥由去标识密钥分域派生），密文与随机 nonce
-一起编码；游标同时绑定数据集名，跨数据集复用会被拒而不是静默截断。
+仿真活读游标里装数据库自然键（patient_id / session_id），**那是本接口明令
+禁出的直接标识符**，所以必须用 AES-GCM 真加密。冻结研究游标只装行序号，
+用确定性 HMAC 绑定纪元、快照、数据集与分区；因此同一页能逐字节复读，也不能
+跨纪元或跨数据集复用。
 """
 from __future__ import annotations
 
@@ -37,8 +37,15 @@ from sqlalchemy import and_, or_
 from sqlmodel import Session as DBSession, select
 
 from . import export_security, research_dataset, session_admission
-from .models import (AttemptEvent, ItemEvent, Patient, Session,
-                     SessionRuntimeState, TurnEvent)
+from .models import (
+    AttemptEvent,
+    ItemEvent,
+    Patient,
+    QualityReleaseEpochRowSnapshot,
+    Session,
+    SessionRuntimeState,
+    TurnEvent,
+)
 
 
 MAX_PAGE_SIZE = 1000
@@ -69,6 +76,9 @@ def load_config() -> export_security.DeidentificationConfig:
 # ---------------------------------------------------------------------------
 _CURSOR_VERSION = b"\x02"
 _CURSOR_NONCE_BYTES = 12
+_SNAPSHOT_CURSOR_VERSION = b"\x03"
+_SNAPSHOT_CURSOR_ORDINAL_BYTES = 8
+_SNAPSHOT_CURSOR_TAG_BYTES = hashlib.sha256().digest_size
 _CURSOR_INVALID = "分页游标无效，请从第一页重新开始"
 
 
@@ -118,6 +128,119 @@ def decode_cursor(cursor: str,
     return decoded
 
 
+def _snapshot_cursor_key(
+        config: export_security.DeidentificationConfig) -> bytes:
+    """冻结行面不再携带数据库自然键，游标只表示行序号。
+
+    仍然单独分域：不复用活读 AES 游标的密钥，也不复用受试者假名密钥的
+    语义。行序号不是标识符，因此只需要防篡改，不需要随机加密；确定性正是
+    “同一纪元同一页逐字节相同”的一部分。
+    """
+    return hmac.new(
+        config.key,
+        b"nmu-research-snapshot-cursor-hmac:v1",
+        hashlib.sha256,
+    ).digest()
+
+
+def _snapshot_cursor_message(
+    *, binding: Any, dataset: str, data_classification: str, ordinal: int,
+) -> bytes:
+    """用规范 JSON 解决变长字段拼接歧义。
+
+    epoch + snapshot + dataset + classification 全进 MAC：旧纪元、另一张表或
+    仿真分区拿到的游标都不能被当成一个“合法位置”静默接受。
+    """
+    return json.dumps(
+        [
+            binding.epoch_id,
+            binding.research_snapshot_sha256,
+            dataset,
+            data_classification,
+            ordinal,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def encode_snapshot_cursor(
+    ordinal: int,
+    config: export_security.DeidentificationConfig,
+    *,
+    binding: Any,
+    dataset: str,
+    data_classification: str,
+) -> str:
+    if type(ordinal) is not int or ordinal < 1:
+        raise _cursor_reject()
+    try:
+        ordinal_bytes = ordinal.to_bytes(
+            _SNAPSHOT_CURSOR_ORDINAL_BYTES, "big", signed=False)
+    except OverflowError as exc:
+        raise _cursor_reject() from exc
+    tag = hmac.new(
+        _snapshot_cursor_key(config),
+        _snapshot_cursor_message(
+            binding=binding,
+            dataset=dataset,
+            data_classification=data_classification,
+            ordinal=ordinal,
+        ),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(
+        _SNAPSHOT_CURSOR_VERSION + ordinal_bytes + tag
+    ).decode("ascii").rstrip("=")
+
+
+def decode_snapshot_cursor(
+    cursor: str,
+    config: export_security.DeidentificationConfig,
+    *,
+    binding: Any,
+    dataset: str,
+    data_classification: str,
+) -> int:
+    if (not cursor
+            or any(char not in
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                   for char in cursor)):
+        raise _cursor_reject()
+    padded = cursor + "=" * (-len(cursor) % 4)
+    try:
+        blob = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except Exception as exc:
+        raise _cursor_reject() from exc
+    if (base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=")
+            != cursor):
+        raise _cursor_reject()
+    expected_size = (
+        1 + _SNAPSHOT_CURSOR_ORDINAL_BYTES + _SNAPSHOT_CURSOR_TAG_BYTES
+    )
+    if len(blob) != expected_size or blob[:1] != _SNAPSHOT_CURSOR_VERSION:
+        # v2 的活读游标也在这里拒绝：它装的是自然键，不是冻结行序号。
+        raise _cursor_reject()
+    ordinal = int.from_bytes(
+        blob[1:1 + _SNAPSHOT_CURSOR_ORDINAL_BYTES], "big", signed=False)
+    if ordinal < 1:
+        raise _cursor_reject()
+    expected_tag = hmac.new(
+        _snapshot_cursor_key(config),
+        _snapshot_cursor_message(
+            binding=binding,
+            dataset=dataset,
+            data_classification=data_classification,
+            ordinal=ordinal,
+        ),
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(
+            blob[1 + _SNAPSHOT_CURSOR_ORDINAL_BYTES:], expected_tag):
+        raise _cursor_reject()
+    return ordinal
+
+
 def clamp_limit(limit: int | None) -> int:
     if limit is None:
         return DEFAULT_PAGE_SIZE
@@ -157,6 +280,16 @@ def _subject_is_research(patient: Patient) -> bool:
 def list_subjects(db: DBSession, *, config, data_classification: str,
                   cursor: str | None, limit: int,
                   binding: Any = None) -> dict[str, Any]:
+    if _has_frozen_snapshot(binding):
+        return _list_frozen_snapshot(
+            db,
+            dataset_key="subjects",
+            config=config,
+            data_classification=data_classification,
+            cursor=cursor,
+            limit=limit,
+            binding=binding,
+        )
     after = decode_cursor(cursor, config, "subjects")[0] if cursor else None
     statement = select(Patient).order_by(Patient.patient_id)
     if after is not None:
@@ -232,6 +365,16 @@ def _withdrawn_patient_ids(db: DBSession) -> set[str]:
 def list_sessions(db: DBSession, *, config, data_classification: str,
                   cursor: str | None, limit: int,
                   binding: Any = None) -> dict[str, Any]:
+    if _has_frozen_snapshot(binding):
+        return _list_frozen_snapshot(
+            db,
+            dataset_key="sessions",
+            config=config,
+            data_classification=data_classification,
+            cursor=cursor,
+            limit=limit,
+            binding=binding,
+        )
     after = decode_cursor(cursor, config, "sessions")[0] if cursor else None
     # 字典把 runtime_status 登记成真变量，取数层却写死 null——那比不给这一列更坏，
     # PI 会照着它建分析。终态存在 SessionRuntimeState 里，一次查完。
@@ -294,6 +437,16 @@ def list_turns(db: DBSession, *, config, data_classification: str,
     (k-1)×limit 行重跑一遍全部 I/O——页数越深越慢，而这套服务和床旁训练同进程、
     同一台 1 GiB 的机器。判据推进 SQL，一页就是一次带 LIMIT 的查询。
     """
+    if _has_frozen_snapshot(binding):
+        return _list_frozen_snapshot(
+            db,
+            dataset_key="turns",
+            config=config,
+            data_classification=data_classification,
+            cursor=cursor,
+            limit=limit,
+            binding=binding,
+        )
     after = decode_cursor(cursor, config, "turns") if cursor else None
     statement = (
         select(TurnEvent, ItemEvent, Session)
@@ -397,6 +550,164 @@ def _tombstone(dataset_key: str, known: dict[str, Any]) -> dict[str, Any]:
                            research_dataset.published_columns(dataset)}
     row.update(known)
     return row
+
+
+def _has_frozen_snapshot(binding: Any) -> bool:
+    """只要 binding 声明了快照，就绝不允许回退到活表。
+
+    一个属性缺失属于绑定层的损坏；读取层仍然 fail-closed，避免并行升级期
+    出现“manifest 有了、sha 还没有，先查活表”的短暂漏口。
+    """
+    if binding is None:
+        return False
+    manifest = getattr(binding, "snapshot_manifest", None)
+    snapshot_sha256 = getattr(binding, "research_snapshot_sha256", None)
+    if (manifest is None) != (snapshot_sha256 is None):
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照不完整，行级取数面已关闭",
+        )
+    return manifest is not None
+
+
+def _snapshot_dataset_manifest(binding: Any, dataset_key: str) -> dict[str, Any]:
+    manifest = binding.snapshot_manifest
+    datasets = manifest.get("datasets") if isinstance(manifest, dict) else None
+    entry = datasets.get(dataset_key) if isinstance(datasets, dict) else None
+    dataset = research_dataset.dataset_for(dataset_key)
+    expected_columns = (
+        list(research_dataset.published_columns(dataset))
+        if dataset is not None else None
+    )
+    if not isinstance(entry, dict):
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照与清单对不上，行级取数面已关闭",
+        )
+    row_count = entry.get("row_count")
+    if (type(row_count) is not int or row_count < 0
+            or entry.get("columns") != expected_columns):
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照与清单对不上，行级取数面已关闭",
+        )
+    return entry
+
+
+def _decode_snapshot_row(
+    snapshot: QualityReleaseEpochRowSnapshot, *, dataset_key: str,
+) -> dict[str, Any]:
+    raw = snapshot.row_json.encode("utf-8")
+    if not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(), snapshot.row_sha256):
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照与行指纹对不上，行级取数面已关闭",
+        )
+    try:
+        row = json.loads(snapshot.row_json)
+    except (TypeError, ValueError) as exc:
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照不可解析，行级取数面已关闭",
+        ) from exc
+    if not isinstance(row, dict):
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照不是数据行，行级取数面已关闭",
+        )
+    # 快照写入时约定的就是这串规范字节；重新规范化后不等即表示
+    # 库内行被修改过，不能解析后“看起来还一样”就继续发。
+    canonical = json.dumps(
+        row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    dataset = research_dataset.dataset_for(dataset_key)
+    assert dataset is not None
+    if (canonical != snapshot.row_json
+            or set(row) != set(research_dataset.published_columns(dataset))):
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照与发布列契约对不上，行级取数面已关闭",
+        )
+    return row
+
+
+def _list_frozen_snapshot(
+    db: DBSession,
+    *,
+    dataset_key: str,
+    config: export_security.DeidentificationConfig,
+    data_classification: str,
+    cursor: str | None,
+    limit: int,
+    binding: Any,
+) -> dict[str, Any]:
+    """从纪元的冻结行表复读一页，整条路径不触碰临床活表。"""
+    if data_classification != "research":
+        # 正常 HTTP 处理器只会给 research 分区传 binding。这道内层闸
+        # 防止以后的调用方把冻结真人行误标成 simulation 发出。
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_partition_invalid",
+            "冻结研究行快照不属于请求的数据分区",
+        )
+    manifest = _snapshot_dataset_manifest(binding, dataset_key)
+    total = manifest["row_count"]
+    after = (
+        decode_snapshot_cursor(
+            cursor,
+            config,
+            binding=binding,
+            dataset=dataset_key,
+            data_classification=data_classification,
+        )
+        if cursor else 0
+    )
+    if after > total:
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照页码超出清单，行级取数面已关闭",
+        )
+
+    fetched = list(db.exec(
+        select(QualityReleaseEpochRowSnapshot)
+        .where(
+            QualityReleaseEpochRowSnapshot.epoch_id == binding.epoch_id,
+            QualityReleaseEpochRowSnapshot.dataset_key == dataset_key,
+            QualityReleaseEpochRowSnapshot.row_ordinal > after,
+        )
+        .order_by(QualityReleaseEpochRowSnapshot.row_ordinal)
+        .limit(limit + 1)
+    ))
+    expected_fetched = min(limit + 1, total - after)
+    if len(fetched) != expected_fetched:
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照行数与清单对不上，行级取数面已关闭",
+        )
+    expected_ordinals = list(range(after + 1, after + 1 + len(fetched)))
+    if [row.row_ordinal for row in fetched] != expected_ordinals:
+        raise ResearchReadUnavailable(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照序号不连续，行级取数面已关闭",
+        )
+
+    page = fetched[:limit]
+    rows = [
+        _decode_snapshot_row(row, dataset_key=dataset_key)
+        for row in page
+    ]
+    has_more = after + len(page) < total
+    next_cursor = (
+        encode_snapshot_cursor(
+            page[-1].row_ordinal,
+            config,
+            binding=binding,
+            dataset=dataset_key,
+            data_classification=data_classification,
+        )
+        if page and has_more else None
+    )
+    return _envelope(
+        dataset_key, rows, next_cursor, has_more, config, binding)
 
 
 def _envelope(dataset_key: str, rows: Iterable[dict[str, Any]],

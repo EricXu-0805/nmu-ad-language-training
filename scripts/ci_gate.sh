@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # 一次跑完所有"合并前必须绿"的检查。
 #
-# 这个脚本是 CI 的本体，.github/workflows/ci.yml 只是在云上调它。这样做的理由：
-# 仓库直到 2026-08-06 都还没 push 过，一份只存在于 GitHub 的流水线等于没有；
-# 而本地能一条命令跑完的东西，今天就在挡问题。
+# 这个脚本是本地与 CI 共用的核心判据；workflow 只负责准备矩阵环境并调它。
+# 文件存在不等于 GitHub required check 已启用或当前 SHA 已经跑绿，那要看云端证据。
 #
 # 用法：
-#   scripts/ci_gate.sh              # 全跑
-#   scripts/ci_gate.sh --offline    # 不出网(漏洞扫描改用存好的 OSV 应答)
+#   scripts/ci_gate.sh                         # 全跑
+#   scripts/ci_gate.sh --offline-osv           # 仅离线重放 OSV 应答
+#   scripts/ci_gate.sh --only backend          # CI 与本地共用的后端门
+#   scripts/ci_gate.sh --only frontend         # CI 与本地共用的前端门
+#   scripts/ci_gate.sh --only supply-chain     # CI 与本地共用的供应链门
 #   NMU_GATE_PYTHON=/path/to/python scripts/ci_gate.sh
 set -uo pipefail                    # 故意不加 -e：每一关都要跑完再汇总，不是撞到第一个就跑
 
@@ -15,9 +17,64 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
 PYTHON="${NMU_GATE_PYTHON:-$REPO/.venv/bin/python}"
-[ -x "$PYTHON" ] || PYTHON=python3
-OFFLINE=0
-[ "${1:-}" = "--offline" ] && OFFLINE=1
+command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
+OFFLINE_OSV=0
+ONLY="all"
+EXPECTED_NODE_MAJOR="25"
+EXPECTED_RUFF_VERSION="0.15.15"
+
+usage() {
+  cat <<'EOF'
+用法: scripts/ci_gate.sh [--only backend|frontend|supply-chain] [--offline-osv]
+
+  无参数                    运行所有本地门禁
+  --only <suite>           只运行一组共享门禁（供 CI 矩阵调用）
+  --offline-osv            只让漏洞扫描重放 security/osv-response.json
+
+--offline-osv 不是“全离线”模式：锁自洽检查仍可能需要从包源取得已锁依赖。
+脚本不会往当前 Python 或 web/node_modules 安装依赖；请先准备好环境。
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --only)
+      if [ "$#" -lt 2 ]; then
+        echo "--only 缺少 suite" >&2
+        usage >&2
+        exit 64
+      fi
+      ONLY="$2"
+      shift 2
+      ;;
+    --offline-osv)
+      OFFLINE_OSV=1
+      shift
+      ;;
+    --offline)
+      echo "--offline 会让人误以为全程不出网，已拒绝；仅重放 OSV 请用 --offline-osv。" >&2
+      exit 64
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "未知参数: $1" >&2
+      usage >&2
+      exit 64
+      ;;
+  esac
+done
+
+case "$ONLY" in
+  all|backend|frontend|supply-chain) ;;
+  *)
+    echo "未知 suite: $ONLY" >&2
+    usage >&2
+    exit 64
+    ;;
+esac
 
 names=(); codes=()
 
@@ -31,14 +88,47 @@ stage() {
   [ $code -eq 0 ] || echo "!! $name 退出码 $code"
 }
 
+ruff_check() {
+  local reported_version
+  local runner=()
+
+  if "$PYTHON" -m ruff --version >/dev/null 2>&1; then
+    runner=("$PYTHON" -m ruff)
+  elif command -v ruff >/dev/null 2>&1; then
+    # 保留仓库原有的本机习惯：开发 venv 可不装 ruff，但 PATH 上的
+    # runner 必须与 CI 钉住的版本逐字一致，不得悄悄换规则集。
+    runner=(ruff)
+  else
+    echo "找不到 ruff ${EXPECTED_RUFF_VERSION}；脚本不会自动安装"
+    return 1
+  fi
+
+  reported_version="$("${runner[@]}" --version 2>/dev/null)"
+  if [ "$reported_version" != "ruff $EXPECTED_RUFF_VERSION" ]; then
+    echo "ruff 版本不一致：当前 ${reported_version:-unknown}，CI 要求 ruff ${EXPECTED_RUFF_VERSION}"
+    return 1
+  fi
+  "${runner[@]}" check .
+}
+
 frontend() {
+  local actual_node_major
+  if ! command -v node >/dev/null 2>&1; then
+    echo "找不到 Node.js；前端门禁需要 Node ${EXPECTED_NODE_MAJOR}.x"
+    return 1
+  fi
+  actual_node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
+  if [ "$actual_node_major" != "$EXPECTED_NODE_MAJOR" ]; then
+    echo "Node major 不一致：当前 ${actual_node_major:-unknown}，CI 与本地门禁要求 ${EXPECTED_NODE_MAJOR}.x"
+    return 1
+  fi
   ( cd web && npm run lint && npm run pretest && npm test && npm run build ) 2>&1 \
     | grep -vE '^\s*$|^> ' | tail -20
   return "${PIPESTATUS[0]}"
 }
 
 vulnerabilities() {
-  if [ "$OFFLINE" = 1 ]; then
+  if [ "$OFFLINE_OSV" = 1 ]; then
     "$PYTHON" scripts/vuln_scan.py --offline security/osv-response.json
   else
     "$PYTHON" scripts/vuln_scan.py
@@ -59,10 +149,14 @@ lock_python_version() {
 }
 
 locked_environment() {
-  local venv; venv="$(mktemp -d)/venv"
+  local tmpdir venv
+  tmpdir="$(mktemp -d)" || { echo "无法创建锁检查临时目录"; return 1; }
+  venv="$tmpdir/venv"
   local pyver; pyver="$(lock_python_version)"
   if [ -z "$pyver" ]; then
-    echo "锁头部没写 --python-version，无法确定干净环境该用哪个解释器"; return 1
+    echo "锁头部没写 --python-version，无法确定干净环境该用哪个解释器"
+    rm -rf "$tmpdir"
+    return 1
   fi
   if command -v uv >/dev/null 2>&1; then
     uv venv --python "$pyver" "$venv" >/dev/null 2>&1 \
@@ -71,20 +165,33 @@ locked_environment() {
   else
     "$PYTHON" -m venv "$venv" \
       && "$venv/bin/python" -m pip install --quiet --require-hashes \
-           -r requirements-deploy.lock.txt
-  fi || { echo "按锁装不出干净环境"; return 1; }
+           -r requirements-deploy.lock.txt \
+      && "$venv/bin/python" -m pip uninstall -y pip >/dev/null
+  fi || {
+    echo "按锁装不出干净环境"
+    rm -rf "$tmpdir"
+    return 1
+  }
   "$PYTHON" scripts/supply_chain_check.py --python "$venv/bin/python"
   local code=$?
-  rm -rf "$(dirname "$venv")"
+  rm -rf "$tmpdir"
   return $code
 }
 
-stage "ruff"        ruff check .
-stage "后端 pytest"  "$PYTHON" -m pytest -q
-stage "前端"         frontend
-stage "SBOM 一致"    "$PYTHON" scripts/generate_sbom.py --check
-stage "漏洞扫描"     vulnerabilities
-stage "锁自洽"       locked_environment
+if [ "$ONLY" = "all" ] || [ "$ONLY" = "backend" ]; then
+  stage "ruff"        ruff_check
+  stage "后端 pytest"  "$PYTHON" -m pytest -q
+fi
+
+if [ "$ONLY" = "all" ] || [ "$ONLY" = "frontend" ]; then
+  stage "前端" frontend
+fi
+
+if [ "$ONLY" = "all" ] || [ "$ONLY" = "supply-chain" ]; then
+  stage "SBOM 一致" "$PYTHON" scripts/generate_sbom.py --check
+  stage "漏洞扫描"  vulnerabilities
+  stage "锁自洽"    locked_environment
+fi
 
 echo ""
 echo "═════ 汇总 ═════"

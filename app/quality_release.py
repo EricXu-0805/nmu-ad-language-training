@@ -24,26 +24,37 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 import secrets
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from sqlmodel import Session as DBSession, select
 
-from . import ai_quality_service, audio_store, export_security, quality_disclosure
+from . import (
+    ai_quality_service,
+    audio_store,
+    export_security,
+    quality_disclosure,
+    research_dataset,
+)
 from .models import (
+    AudioAssetRow,
     QualityDisclosureRecord,
     QualityReleaseEpoch,
+    QualityReleaseEpochRowSnapshot,
     QualityReleaseEpochSession,
     Session as TrainSession,
     SessionRuntimeState,
 )
-from .quality_disclosure import Cell, PublishedLeaf, band, plan_suppression, rate
+from .quality_disclosure import PublishedLeaf, band, rate
 
 
 COHORT_RULE_VERSION = "quality-release-cohort.v1"
 REGISTRY_VERSION = "quality-release-registry.v1"
 RELEASE_SCHEMA_VERSION = "ai-quality-release.v1"
+PROPOSAL_SCHEMA_VERSION = "quality-release-proposal.v1"
+RESEARCH_SNAPSHOT_SCHEMA_VERSION = "research-row-snapshot.v1"
 
 RELEASE_MODE_ENV = "AI_QUALITY_RESEARCH_RELEASE_MODE"
 RELEASE_MODE_REQUIRED = "frozen_epoch"
@@ -61,6 +72,7 @@ DEFAULT_ENTRY_QUARANTINE_DAYS = 14
 #: 角色白名单**不给默认值**：谁能看研究分区是治理决定，不是工程默认。
 #: 未配置 = 谁都看不到。这一条要 Eric 与 PI 明确签字之后才配上去。
 ALLOWED_READER_ROLES = frozenset({"researcher", "data_steward", "admin"})
+_RELEASE_TERMINAL_SESSION_STATUSES = frozenset({"completed", "aborted", "failed"})
 
 
 class ReleaseRefused(RuntimeError):
@@ -72,6 +84,10 @@ class ReleaseRefused(RuntimeError):
         self.detail = detail
 
 
+class ReleaseSnapshotUnavailable(RuntimeError):
+    """后端无法提供一个稳定的切纪元事务快照。"""
+
+
 @dataclass(frozen=True)
 class ReleaseThresholds:
     min_subjects: int
@@ -79,6 +95,32 @@ class ReleaseThresholds:
     band_width: int
     rate_decimals: int
     entry_quarantine_days: int
+
+
+@dataclass(frozen=True)
+class ResearchSnapshotRow:
+    dataset_key: str
+    row_ordinal: int
+    row_json: str
+    row_sha256: str
+
+
+@dataclass(frozen=True)
+class ResearchSnapshot:
+    manifest_json: str
+    snapshot_sha256: str
+    rows: tuple[ResearchSnapshotRow, ...]
+
+
+@dataclass(frozen=True)
+class _LiveSnapshotBinding:
+    """只在切纪元事务里把活投影限制到最终纳入的场次。"""
+
+    session_ids: frozenset[str]
+
+    def envelope(self) -> dict[str, Any]:
+        # build_research_snapshot 只消费 rows；临时信封绝不持久化或对外发送。
+        return {}
 
 
 def _utc_now_naive() -> datetime:
@@ -122,6 +164,35 @@ def load_thresholds() -> ReleaseThresholds:
             ENTRY_QUARANTINE_DAYS_ENV, low=0, high=365,
             fallback=DEFAULT_ENTRY_QUARANTINE_DAYS),
     )
+
+
+def begin_release_transaction(s: DBSession, *, writable: bool) -> None:
+    """在第一次 SELECT 前建立切纪元的唯一事务快照。
+
+    approve 需要在同一快照内写入 epoch，所以不能直接复用只读
+    dashboard 的 snapshot helper。未知后端、复用的 dirty Session 均关闭。
+    """
+    if s.in_transaction():
+        raise ReleaseSnapshotUnavailable
+    try:
+        dialect = s.get_bind().dialect.name
+        if dialect == "postgresql":
+            connection = s.connection(execution_options={
+                "isolation_level": "SERIALIZABLE" if writable
+                else "REPEATABLE READ",
+            })
+            if not writable:
+                connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            return
+        if dialect == "sqlite":
+            connection = s.connection()
+            connection.exec_driver_sql("BEGIN IMMEDIATE" if writable else "BEGIN")
+            return
+    except ReleaseSnapshotUnavailable:
+        raise
+    except Exception as exc:
+        raise ReleaseSnapshotUnavailable from exc
+    raise ReleaseSnapshotUnavailable
 
 
 def authorized_reader_roles() -> frozenset[str]:
@@ -171,7 +242,7 @@ def _session_settled_before(
     读不到状态行就当没结束：宁可漏收一场，不可把在跑的场次冻进纪元。
     """
     state = s.get(SessionRuntimeState, session.session_id)
-    if state is None or state.status in {"active", "paused"}:
+    if state is None or state.status not in _RELEASE_TERMINAL_SESSION_STATUSES:
         return False
     updated = state.updated_at
     if updated is None:
@@ -183,6 +254,66 @@ def _session_settled_before(
 # 装载荷
 # ---------------------------------------------------------------------------
 
+_METRIC_CONTRIBUTOR_KEYS = (
+    "asr_manual_correction_rate",
+    "prompt_escalation_rate",
+    "pause_rate",
+    "takeover_rate",
+    "latency_p50_band",
+    "latency_p95_band",
+    "agreement_rate",
+    "false_positive_rate",
+    "false_negative_rate",
+    "reviewed_decisions_band",
+)
+
+
+def _record_metric_contributors(
+    contributors: dict[str, set[str]], *, patient_id: str,
+    evidence: Sequence[Any],
+) -> None:
+    """按与 ``ai_quality_metrics`` 分母相同的条件记真实贡献者。"""
+    for item in evidence:
+        attempts = item.attempts or ()
+        if (item.eligible is True and item.asr_reviewed is True
+                and type(item.asr_corrected) is bool):
+            contributors["asr_manual_correction_rate"].add(patient_id)
+        if any(type(attempt.prompt_level) is int
+               and attempt.prompt_level in {0, 1, 2}
+               for attempt in attempts):
+            contributors["prompt_escalation_rate"].add(patient_id)
+        if item.eligible is True:
+            contributors["pause_rate"].add(patient_id)
+            contributors["takeover_rate"].add(patient_id)
+        if any(type(attempt.latency_ms) in {int, float}
+               and attempt.latency_ms >= 0
+               and math.isfinite(attempt.latency_ms)
+               for attempt in attempts):
+            contributors["latency_p50_band"].add(patient_id)
+            contributors["latency_p95_band"].add(patient_id)
+
+        has_completed_attempt = any(
+            attempt.processing_status == "completed" for attempt in attempts)
+        binary_reviewed = (
+            item.eligible is True
+            and item.ai_attempted is True
+            and item.ai_judged is True
+            and has_completed_attempt
+            and type(item.ai_predicted_correct) is bool
+            and item.human_truth_locked is True
+            and type(item.human_truth_correct) is bool
+        )
+        if binary_reviewed:
+            for key in ("agreement_rate", "reviewed_decisions_band"):
+                contributors[key].add(patient_id)
+            # 假阳性率只以真实阴性 (FP + TN) 为分母；假阴性率只以
+            # 真实阳性 (FN + TP) 为分母。不能拿“有任意二元复核”的受试者
+            # 同时替两个指标过披露门槛。
+            if item.human_truth_correct is False:
+                contributors["false_positive_rate"].add(patient_id)
+            if item.human_truth_correct is True:
+                contributors["false_negative_rate"].add(patient_id)
+
 def build_payload(
     s: DBSession,
     cohort: Sequence[TrainSession],
@@ -192,10 +323,11 @@ def build_payload(
 ) -> tuple[dict[str, Any], dict[str, int]]:
     """把队列折成一份可发布的载荷，外加每个场次的证据水位线。
 
-    **逐场次流式**，不是一次把整个队列丢进取数预算。实测：week2 一场次 30 题
-    70 环节 ⇒ 证据行地板约 240 行，而 `MAX_EVIDENCE_ROWS` 是 20000——83 场次
-    就撞上限。30 人 × 8 周 = 240 场次 ≈ 57600 行，走现有请求路径必然打不出来。
-    这个洞与披露控制无关，但会先炸，所以这里一场次一场次地取。
+    **逐场次流式**，不是一次把整个队列丢进取数预算。Week2 一场次是 30 题、
+    70 环节；完整 happy-path 证据还包含 attempt、音频、capture receipt、
+    interaction 与人工复核修订，不能再用早期“约 240 行/场”的估算当容量
+    下界。请求路径的 `MAX_EVIDENCE_ROWS` 只是单次资源闸，切纪元必须按场
+    取证并由独立 scale harness 验证整体容量。
     """
     if not cohort:
         raise ReleaseRefused("release_cohort_empty", "队列里一个场次都没有")
@@ -209,25 +341,36 @@ def build_payload(
 
     evidence: list[Any] = []
     watermarks: dict[str, int] = {}
-    #: 复核格的贡献者要真数，不能拿队列人数顶替。逐场次走的时候顺手记下来，
-    #: 因为 TurnQualityEvidence 本身有意不带受试者键，事后无从统计。
-    reviewed_contributors: set[str] = set()
+    contributor_ids: dict[str, set[str]] = {
+        key: set() for key in _METRIC_CONTRIBUTOR_KEYS
+    }
     source_turns = 0
     structural_invalid_records = 0
     lineage_invalid_turns = 0
     classification_bad: set[str] = set()
     structural_bad: set[str] = set()
 
+    candidate_ids = [row.session_id for row in candidate]
+    raw_audio_ids = [
+        value if isinstance(value, str) else value[0]
+        for value in s.exec(select(AudioAssetRow.raw_audio_id).where(
+            AudioAssetRow.session_id.in_(candidate_ids)))
+    ]
+    # `index_blobs` 本身是一次目录扫描。原来它写在逐场循环里，240 场就把
+    # 同一个音频目录完整扫 240 遍；先把最终候选的 id 合并，整个提案只扫一次。
+    all_blob_index = audio_store.index_blobs(raw_audio_ids)
+
     for row in candidate:
         session_id = row.session_id
         ai_quality_service._preflight_evidence_budget(s, [session_id])
         loaded = ai_quality_service._load_evidence_rows(s, [session_id])
         ai_quality_service._enforce_loaded_evidence_budget(loaded)
-        watermarks[session_id] = _watermark(loaded)
         # 音频目录瞬时故障不能被冻成一个结论：请求路径把它降级成"物理证据
         # 不可用"，切纪元必须直接拒绝。
-        blob_index = audio_store.index_blobs(
-            item.raw_audio_id for item in loaded.audios)
+        blob_index = {
+            item.raw_audio_id: all_blob_index[item.raw_audio_id]
+            for item in loaded.audios if item.raw_audio_id in all_blob_index
+        }
         bad = ai_quality_service._classification_inconsistent_sessions(
             loaded, expected_simulation=False, data_classification="research")
         if bad:
@@ -240,14 +383,17 @@ def build_payload(
             structural_bad.add(session_id)
             structural_invalid_records += invalid
             continue
+        # 水位线同时是发布成员名单。只能在分类与结构完整性都通过后
+        # 写入，否则看板排除的坏场次会被研究行快照错误冻结。
+        watermarks[session_id] = _watermark(loaded)
         source_turns += plans[session_id].total_turns()
         projected, invalid_records, invalid_lineage = (
             ai_quality_service._project_session(
                 row, plans[session_id], grouped[session_id],
                 data_classification="research", blob_index=blob_index))
         evidence.extend(projected)
-        if any(item.human_truth_locked is True for item in projected):
-            reviewed_contributors.add(row.patient_id)
+        _record_metric_contributors(
+            contributor_ids, patient_id=row.patient_id, evidence=projected)
         structural_invalid_records += invalid_records
         lineage_invalid_turns += invalid_lineage
 
@@ -258,13 +404,21 @@ def build_payload(
         raise ReleaseRefused(
             "release_cohort_all_excluded", "队列里的场次全部被排除")
 
+    distinct_subjects = ai_quality_service._distinct_patients(included)
+    if distinct_subjects < thresholds.min_subjects:
+        raise ReleaseRefused(
+            "release_cohort_below_threshold",
+            "通过完整性复核的受试者数未达冻结发布总门槛")
+
     released = ai_quality_service._released_payload(
         data_classification="research",
         visibility_scope="frozen_release_cohort",
-        generated_at=as_of,
+        generated_at=(as_of.replace(tzinfo=timezone.utc)
+                      if as_of.tzinfo is None or as_of.utcoffset() is None
+                      else as_of.astimezone(timezone.utc)),
         threshold=ai_quality_service._Threshold(
             "configured", thresholds.min_subjects),
-        distinct_patients=ai_quality_service._distinct_patients(included),
+        distinct_patients=distinct_subjects,
         visible_sessions=len(cohort),
         included_sessions=len(included),
         source_turns=source_turns,
@@ -277,8 +431,10 @@ def build_payload(
     )
     payload = _apply_disclosure_control(
         released,
-        distinct_subjects=ai_quality_service._distinct_patients(included),
-        reviewed_subjects=len(reviewed_contributors),
+        distinct_subjects=distinct_subjects,
+        metric_contributors={
+            key: len(value) for key, value in contributor_ids.items()
+        },
         included_sessions=len(included),
         thresholds=thresholds,
     )
@@ -289,8 +445,9 @@ def build_payload(
 def _watermark(loaded: Any) -> int:
     """一个场次冻结时的证据行数。approve 阶段拿它复核 DB 中间没动过。"""
     total = 0
-    for name in ("items", "turns", "attempts", "audios", "capture_receipts",
-                 "interactions", "confirmations", "pauses", "controls"):
+    for name in ("items", "turn_pairs", "attempts", "audios", "receipts",
+                 "interactions", "revision_pairs", "pause_receipts",
+                 "control_events"):
         rows = getattr(loaded, name, None)
         if rows is not None:
             total += len(rows)
@@ -299,8 +456,9 @@ def _watermark(loaded: Any) -> int:
 
 def _apply_disclosure_control(
     released: dict[str, Any], *, distinct_subjects: int,
-    reviewed_subjects: int, included_sessions: int,
-    thresholds: ReleaseThresholds,
+    included_sessions: int, thresholds: ReleaseThresholds,
+    metric_contributors: dict[str, int] | None = None,
+    reviewed_subjects: int | None = None,
 ) -> dict[str, Any]:
     """把一行 v2 聚合收窄成 v1 发布面。**相对今天全是收紧。**
 
@@ -311,18 +469,27 @@ def _apply_disclosure_control(
     operational = dict(row.get("operational") or {})
     truth = dict(row.get("research_truth") or {})
 
-    # 两个格由不同人群支撑：队列格是全部人，复核格只有真被锁过分的人。
-    # 复核格常常小得多——它是这份载荷里最先触发抑制的那一格。
-    #
-    # 这里**不声明 linked**：只有两个格时互补抑制已经必然把另一个也拖下水，
-    # 链接一条都不会改变结果，写上去就是一条永远不被执行的声明。往
-    # `_dimensions()` 里加维度、格数变多的那天要回来补——那时互补规则只会挑
-    # "剩下里最小的那个"，不保证挑中同一批人支撑的那个。
-    cells = [
-        Cell("cohort", distinct_subjects),
-        Cell("reviewed", reviewed_subjects),
-    ]
-    suppressed = plan_suppression(cells, minimum=thresholds.min_cell_subjects)
+    if metric_contributors is None:
+        # 保留纯函数单测的简写入口；生产 build_payload 永远传逐指标真值。
+        reviewed = distinct_subjects if reviewed_subjects is None else reviewed_subjects
+        truth_keys = {
+            "agreement_rate", "false_positive_rate",
+            "false_negative_rate", "reviewed_decisions_band",
+        }
+        metric_contributors = {
+            key: reviewed if key in truth_keys else distinct_subjects
+            for key in _METRIC_CONTRIBUTOR_KEYS
+        }
+    if set(metric_contributors) != set(_METRIC_CONTRIBUTOR_KEYS):
+        raise ReleaseRefused(
+            "release_metric_contributors_incomplete",
+            "指标贡献者登记与发布面不一致")
+    # 这些是重叠、不可相加的分母组，不能喂给用于“同一张可加表”的
+    # 互补抑制算法。每项只按自己真正的贡献者门槛决定。
+    suppressed = {
+        key for key, count in metric_contributors.items()
+        if count < thresholds.min_cell_subjects
+    }
 
     decimals = thresholds.rate_decimals
     width = thresholds.band_width
@@ -335,46 +502,56 @@ def _apply_disclosure_control(
         operational.get("prompt_level_0_count"),
         operational.get("prompt_level_1_count"),
         operational.get("prompt_level_2_count"))
-    # 每个率只由支撑它的那一格决定，不做全有全无——那样连接闭包就成了摆设，
-    # 而闭包正是"复核格被抑制、队列侧也得跟着灭"这件事的唯一实现。
-    def _op(numerator: Any, denominator: Any) -> float | None:
+    def _metric_rate(
+        key: str, numerator: Any, denominator: Any,
+    ) -> float | None:
         return _rate_or_none(numerator, denominator, decimals,
-                             blocked="cohort" in suppressed)
+                             blocked=key in suppressed)
 
-    def _truth(numerator: Any, denominator: Any) -> float | None:
-        return _rate_or_none(numerator, denominator, decimals,
-                             blocked="reviewed" in suppressed)
+    def _metric_band(key: str, value: Any) -> str | None:
+        return None if key in suppressed else band(value, width=width)
 
     published_operational = {
-        "asr_manual_correction_rate": _op(
+        "asr_manual_correction_rate": _metric_rate(
+            "asr_manual_correction_rate",
             operational.get("asr_corrected_turns"),
             operational.get("asr_reviewed_turns")),
-        "prompt_escalation_rate": _op(
+        "prompt_escalation_rate": _metric_rate(
+            "prompt_escalation_rate",
             _sum_or_none(operational.get("prompt_level_1_count"),
                          operational.get("prompt_level_2_count")),
             escalation_denominator),
-        "pause_rate": _op(
+        "pause_rate": _metric_rate(
+            "pause_rate",
             operational.get("technical_pause_count"),
             operational.get("eligible_turns")),
-        "takeover_rate": _op(
+        "takeover_rate": _metric_rate(
+            "takeover_rate",
             operational.get("researcher_takeover_count"),
             operational.get("eligible_turns")),
-        "latency_p50_band": band(
-            operational.get("latency_p50_ms"), width=width),
-        "latency_p95_band": band(
-            operational.get("latency_p95_ms"), width=width),
+        "latency_p50_band": _metric_band(
+            "latency_p50_band", operational.get("latency_p50_ms")),
+        "latency_p95_band": _metric_band(
+            "latency_p95_band", operational.get("latency_p95_ms")),
     }
     reviewed = truth.get("reviewed_decisions")
+    negative_truth = _sum_or_none(
+        truth.get("false_positive"), truth.get("true_negative"))
+    positive_truth = _sum_or_none(
+        truth.get("false_negative"), truth.get("true_positive"))
     published_truth = {
         # 混淆矩阵的四个原始格永远 null：一个格子小到 1 就直接指到一次判错。
         # 一致率 = (TP + TN) / 复核量。
-        "agreement_rate": _truth(
+        "agreement_rate": _metric_rate(
+            "agreement_rate",
             _sum_or_none(truth.get("true_positive"), truth.get("true_negative")),
             reviewed),
-        "false_positive_rate": _truth(truth.get("false_positive"), reviewed),
-        "false_negative_rate": _truth(truth.get("false_negative"), reviewed),
-        "reviewed_decisions_band": (
-            None if "reviewed" in suppressed else band(reviewed, width=width)),
+        "false_positive_rate": _metric_rate(
+            "false_positive_rate", truth.get("false_positive"), negative_truth),
+        "false_negative_rate": _metric_rate(
+            "false_negative_rate", truth.get("false_negative"), positive_truth),
+        "reviewed_decisions_band": _metric_band(
+            "reviewed_decisions_band", reviewed),
     }
     return {
         "schema_version": RELEASE_SCHEMA_VERSION,
@@ -445,11 +622,342 @@ def payload_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
+def _rows_digest(row_bytes: Sequence[bytes]) -> str:
+    """长度前缀让相邻两行的边界也进入摘要，避免串接歧义。"""
+    digest = hashlib.sha256()
+    for raw in row_bytes:
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def _snapshot_from_rows(
+    rows_by_dataset: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> ResearchSnapshot:
+    """把已去标识、已按注册表投影的三张行表冻成唯一字节表示。"""
+    if set(rows_by_dataset) != set(research_dataset.dataset_keys()):
+        raise ReleaseRefused(
+            "release_research_snapshot_incomplete",
+            "研究行快照没有覆盖全部登记数据集")
+    stored: list[ResearchSnapshotRow] = []
+    manifest_datasets: dict[str, Any] = {}
+    for dataset_key in research_dataset.dataset_keys():
+        dataset = research_dataset.dataset_for(dataset_key)
+        assert dataset is not None
+        columns = list(research_dataset.published_columns(dataset))
+        encoded_rows: list[bytes] = []
+        projected_rows: list[dict[str, Any]] = []
+        for ordinal, raw_row in enumerate(rows_by_dataset[dataset_key], start=1):
+            row = dict(raw_row)
+            projected = research_dataset.project(dataset, row)
+            if row != projected:
+                raise ReleaseRefused(
+                    "release_research_snapshot_row_invalid",
+                    "研究行快照与公开列注册表不一致")
+            encoded = canonical_bytes(projected)
+            encoded_rows.append(encoded)
+            projected_rows.append(projected)
+            stored.append(ResearchSnapshotRow(
+                dataset_key=dataset_key,
+                row_ordinal=ordinal,
+                row_json=encoded.decode("utf-8"),
+                row_sha256=hashlib.sha256(encoded).hexdigest(),
+            ))
+        try:
+            export_security.assert_deidentified_sheets(
+                {dataset_key: projected_rows})
+        except Exception as exc:
+            raise ReleaseRefused(
+                "release_research_snapshot_not_deidentified",
+                "研究行快照未通过去标识边界") from exc
+        manifest_datasets[dataset_key] = {
+            "columns": columns,
+            "row_count": len(encoded_rows),
+            "rows_sha256": _rows_digest(encoded_rows),
+        }
+    manifest = {
+        "schema_version": RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+        "datasets": manifest_datasets,
+    }
+    manifest_json = canonical_bytes(manifest).decode("utf-8")
+    return ResearchSnapshot(
+        manifest_json=manifest_json,
+        snapshot_sha256=hashlib.sha256(
+            manifest_json.encode("utf-8")).hexdigest(),
+        rows=tuple(stored),
+    )
+
+
+def build_research_snapshot(
+    s: DBSession, *, session_ids: Sequence[str], config: Any,
+) -> ResearchSnapshot:
+    """在切纪元的同一个稳定事务里物化三张公开行表。
+
+    这里复用当前行面投影，而不是复制一份 Patient/Session/Turn 规则。临时 binding
+    只负责把活投影限制到已经通过聚合完整性门禁的最终场次集合；不会写披露账本。
+    """
+    from . import research_read  # 延迟导入，避免 quality_release <-> research_read 环
+
+    requested_ids = tuple(session_ids)
+    frozen_ids = frozenset(requested_ids)
+    if not frozen_ids or len(frozen_ids) != len(requested_ids):
+        raise ReleaseRefused(
+            "release_research_snapshot_sessions_invalid",
+            "研究行快照的场次集合为空或重复")
+    binding = _LiveSnapshotBinding(session_ids=frozen_ids)
+    rows_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    readers = {
+        "subjects": research_read.list_subjects,
+        "sessions": research_read.list_sessions,
+        "turns": research_read.list_turns,
+    }
+    for dataset_key in research_dataset.dataset_keys():
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        collected: list[dict[str, Any]] = []
+        while True:
+            payload = readers[dataset_key](
+                s, config=config, data_classification="research",
+                cursor=cursor, limit=research_read.MAX_PAGE_SIZE,
+                binding=binding,
+            )
+            dataset = research_dataset.dataset_for(dataset_key)
+            assert dataset is not None
+            if (payload.get("schema_version") != research_dataset.SCHEMA_VERSION
+                    or payload.get("dataset") != dataset_key
+                    or payload.get("columns") != list(
+                        research_dataset.published_columns(dataset))
+                    or payload.get("row_count") != len(payload.get("rows", ()))):
+                raise ReleaseRefused(
+                    "release_research_snapshot_projection_invalid",
+                    "研究行投影返回了不一致的闭集契约")
+            page_rows = payload.get("rows")
+            if not isinstance(page_rows, list) or not all(
+                    isinstance(row, dict) for row in page_rows):
+                raise ReleaseRefused(
+                    "release_research_snapshot_projection_invalid",
+                    "研究行投影返回了非规范行")
+            collected.extend(page_rows)
+            has_more = payload.get("has_more")
+            next_cursor = payload.get("next_cursor")
+            if has_more is False and next_cursor is None:
+                break
+            if (has_more is not True or not isinstance(next_cursor, str)
+                    or not next_cursor or next_cursor in seen_cursors):
+                raise ReleaseRefused(
+                    "release_research_snapshot_pagination_invalid",
+                    "研究行投影分页没有稳定向前推进")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        rows_by_dataset[dataset_key] = collected
+    if len(rows_by_dataset["sessions"]) != len(frozen_ids):
+        raise ReleaseRefused(
+            "release_research_snapshot_session_count_mismatch",
+            "冻结行面的场次数与发布队列不一致")
+    return _snapshot_from_rows(rows_by_dataset)
+
+
+def _is_sha256(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value))
+
+
+def _validated_snapshot_manifest(
+    manifest_json: str, snapshot_sha256: str,
+) -> dict[str, Any]:
+    try:
+        manifest = json.loads(manifest_json)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseRefused(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照的清单无法解析") from exc
+    if (not isinstance(manifest, dict)
+            or set(manifest) != {"schema_version", "datasets"}
+            or manifest.get("schema_version") != RESEARCH_SNAPSHOT_SCHEMA_VERSION
+            or not isinstance(manifest.get("datasets"), dict)
+            or set(manifest["datasets"]) != set(research_dataset.dataset_keys())):
+        raise ReleaseRefused(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照的清单版本或数据集闭集不一致")
+    canonical = canonical_bytes(manifest).decode("utf-8")
+    if (canonical != manifest_json or not _is_sha256(snapshot_sha256)
+            or hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            != snapshot_sha256):
+        raise ReleaseRefused(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照的清单与摘要不一致")
+    for dataset_key in research_dataset.dataset_keys():
+        dataset = research_dataset.dataset_for(dataset_key)
+        assert dataset is not None
+        facts = manifest["datasets"][dataset_key]
+        if (not isinstance(facts, dict)
+                or set(facts) != {"columns", "row_count", "rows_sha256"}
+                or facts.get("columns") != list(
+                    research_dataset.published_columns(dataset))
+                or type(facts.get("row_count")) is not int
+                or facts["row_count"] < 0
+                or not _is_sha256(facts.get("rows_sha256"))):
+            raise ReleaseRefused(
+                "research_release_snapshot_corrupt",
+                "冻结研究行快照的数据集清单不一致")
+    return manifest
+
+
+def _validate_research_snapshot(snapshot: ResearchSnapshot) -> dict[str, Any]:
+    manifest = _validated_snapshot_manifest(
+        snapshot.manifest_json, snapshot.snapshot_sha256)
+    rows_by_dataset: dict[str, list[ResearchSnapshotRow]] = {
+        key: [] for key in research_dataset.dataset_keys()
+    }
+    for row in snapshot.rows:
+        if row.dataset_key not in rows_by_dataset:
+            raise ReleaseRefused(
+                "research_release_snapshot_corrupt",
+                "冻结研究行快照含未登记数据集")
+        rows_by_dataset[row.dataset_key].append(row)
+    for dataset_key, rows in rows_by_dataset.items():
+        rows.sort(key=lambda row: row.row_ordinal)
+        if [row.row_ordinal for row in rows] != list(range(1, len(rows) + 1)):
+            raise ReleaseRefused(
+                "research_release_snapshot_corrupt",
+                "冻结研究行快照序号不连续")
+        encoded_rows: list[bytes] = []
+        dataset = research_dataset.dataset_for(dataset_key)
+        assert dataset is not None
+        for row in rows:
+            try:
+                decoded = json.loads(row.row_json)
+            except (TypeError, ValueError) as exc:
+                raise ReleaseRefused(
+                    "research_release_snapshot_corrupt",
+                    "冻结研究行快照含不可解析行") from exc
+            if (not isinstance(decoded, dict)
+                    or canonical_bytes(decoded).decode("utf-8") != row.row_json
+                    or hashlib.sha256(row.row_json.encode("utf-8")).hexdigest()
+                    != row.row_sha256
+                    or decoded != research_dataset.project(dataset, decoded)):
+                raise ReleaseRefused(
+                    "research_release_snapshot_corrupt",
+                    "冻结研究行快照的行内容或摘要不一致")
+            encoded_rows.append(row.row_json.encode("utf-8"))
+        facts = manifest["datasets"][dataset_key]
+        if (facts["row_count"] != len(rows)
+                or facts["rows_sha256"] != _rows_digest(encoded_rows)):
+            raise ReleaseRefused(
+                "research_release_snapshot_corrupt",
+                "冻结研究行快照的行集合与清单不一致")
+    return manifest
+
+
+def _validate_snapshot_membership(
+    snapshot: ResearchSnapshot,
+    watermarks: Mapping[str, int],
+    config: Any,
+) -> None:
+    """Prove that every frozen row belongs to the exact released cohort.
+
+    Counting the ``sessions`` rows is not sufficient: a caller could provide a
+    perfectly canonical snapshot for a different cohort of the same size.  The
+    aggregate member ledger stores pseudonyms, so compare in that same domain
+    and also close the subject/turn foreign-key projection.
+    """
+    expected_sessions = {
+        export_security.pseudonymize_session(session_id, config)
+        for session_id in watermarks
+    }
+    decoded: dict[str, list[dict[str, Any]]] = {
+        key: [] for key in research_dataset.dataset_keys()
+    }
+    for row in snapshot.rows:
+        value = json.loads(row.row_json)
+        assert isinstance(value, dict)  # `_validate_research_snapshot` ran first.
+        decoded[row.dataset_key].append(value)
+
+    session_subject: dict[str, str] = {}
+    for row in decoded["sessions"]:
+        session_code = row.get("session_code")
+        subject_code = row.get("subject_code")
+        if (not isinstance(session_code, str) or not session_code
+                or not isinstance(subject_code, str) or not subject_code
+                or session_code in session_subject):
+            raise ReleaseRefused(
+                "release_research_snapshot_membership_mismatch",
+                "冻结研究行的场次或受试者关联不一致")
+        session_subject[session_code] = subject_code
+    if set(session_subject) != expected_sessions:
+        raise ReleaseRefused(
+            "release_research_snapshot_membership_mismatch",
+            "冻结研究行与发布队列不是同一批场次")
+
+    expected_subjects = set(session_subject.values())
+    actual_subjects = [row.get("subject_code") for row in decoded["subjects"]]
+    if (any(not isinstance(value, str) or not value for value in actual_subjects)
+            or len(set(actual_subjects)) != len(actual_subjects)
+            or set(actual_subjects) != expected_subjects):
+        raise ReleaseRefused(
+            "release_research_snapshot_membership_mismatch",
+            "冻结研究行的受试者集合与场次不一致")
+    for row in decoded["turns"]:
+        session_code = row.get("session_code")
+        if (not isinstance(session_code, str)
+                or session_code not in session_subject
+                or row.get("subject_code") != session_subject[session_code]):
+            raise ReleaseRefused(
+                "release_research_snapshot_membership_mismatch",
+                "冻结训练环节不属于发布队列")
+
+
+def proposal_digest(
+    payload: dict[str, Any], watermarks: dict[str, int], *,
+    as_of: datetime, config: Any, thresholds: ReleaseThresholds,
+    builder: tuple[str, str], research_snapshot_sha256: str,
+) -> str:
+    """把公开载荷与精确队列水位绑成两阶段复核指纹。
+
+    成员不以真实 session id 进摘要；用同一去标识密钥产生的
+    session 假名排序。摘要只对外发 sha256，不发成员列表。
+    """
+    if not _is_sha256(research_snapshot_sha256):
+        raise ReleaseRefused(
+            "release_research_snapshot_corrupt",
+            "研究行快照摘要不是规范 sha256")
+    if as_of.tzinfo is not None and as_of.utcoffset() is not None:
+        normalized = as_of.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        normalized = as_of
+    members = sorted(
+        (export_security.pseudonymize_session(session_id, config), count)
+        for session_id, count in watermarks.items()
+    )
+    candidate = {
+        "schema_version": PROPOSAL_SCHEMA_VERSION,
+        "as_of": normalized.isoformat() + "Z",
+        "payload_sha256": payload_digest(payload),
+        "research_snapshot_sha256": research_snapshot_sha256,
+        "evidence_watermarks": members,
+        "policy": {
+            "cohort_rule_version": COHORT_RULE_VERSION,
+            "registry_version": REGISTRY_VERSION,
+            "release_schema_version": RELEASE_SCHEMA_VERSION,
+            "deidentification_key_id": config.key_id,
+            "min_subjects": thresholds.min_subjects,
+            "min_cell_subjects": thresholds.min_cell_subjects,
+            "band_width": thresholds.band_width,
+            "rate_decimals": thresholds.rate_decimals,
+            "entry_quarantine_days": thresholds.entry_quarantine_days,
+        },
+        "builder": {"display_id": builder[0], "role": builder[1]},
+    }
+    return hashlib.sha256(canonical_bytes(candidate)).hexdigest()
+
+
 def publish_epoch(
     s: DBSession,
     *,
     payload: dict[str, Any],
     watermarks: dict[str, int],
+    research_snapshot: ResearchSnapshot,
+    proposal_sha256: str,
     as_of: datetime,
     thresholds: ReleaseThresholds,
     builder: tuple[str, str],
@@ -458,7 +966,21 @@ def publish_epoch(
     now: datetime | None = None,
 ) -> QualityReleaseEpoch:
     """把载荷冻进一行，并把上一个已发布纪元置为 superseded。"""
+    manifest = _validate_research_snapshot(research_snapshot)
+    if manifest["datasets"]["sessions"]["row_count"] != len(watermarks):
+        raise ReleaseRefused(
+            "release_research_snapshot_session_count_mismatch",
+            "冻结行面的场次数与发布队列不一致")
     config = export_security.load_deidentification_config()
+    _validate_snapshot_membership(research_snapshot, watermarks, config)
+    if (not _is_sha256(proposal_sha256)
+            or proposal_sha256 != proposal_digest(
+                payload, watermarks, as_of=as_of, config=config,
+                thresholds=thresholds, builder=builder,
+                research_snapshot_sha256=research_snapshot.snapshot_sha256)):
+        raise ReleaseRefused(
+            "release_proposal_digest_invalid",
+            "写入纪元的提案摘要与本次冻结事实不一致")
     pseudonymize = export_security.pseudonymize_session
     previous = current_epoch(s)
     epoch_seq = 1 if previous is None else previous.epoch_seq + 1
@@ -490,6 +1012,11 @@ def publish_epoch(
         approver_actor_role=approver[1],
         idempotency_key_sha256=hashlib.sha256(
             idempotency_key.encode("utf-8")).hexdigest(),
+        proposal_sha256=proposal_sha256,
+        entry_quarantine_days_applied=thresholds.entry_quarantine_days,
+        research_snapshot_schema_version=RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+        research_snapshot_manifest_json=research_snapshot.manifest_json,
+        research_snapshot_sha256=research_snapshot.snapshot_sha256,
     )
     s.add(epoch)
     s.flush()
@@ -498,6 +1025,14 @@ def publish_epoch(
             epoch_id=epoch.epoch_id,
             session_pseudonym=pseudonymize(session_id, config),
             evidence_watermark=watermark,
+        ))
+    for row in research_snapshot.rows:
+        s.add(QualityReleaseEpochRowSnapshot(
+            epoch_id=epoch.epoch_id,
+            dataset_key=row.dataset_key,
+            row_ordinal=row.row_ordinal,
+            row_json=row.row_json,
+            row_sha256=row.row_sha256,
         ))
     if previous is not None:
         previous.status = "superseded"
@@ -599,6 +1134,14 @@ class ResearchBinding:
     cohort_rule_version: str
     payload_sha256: str
     session_ids: frozenset[str]
+    snapshot_manifest: dict[str, Any] | None = None
+    research_snapshot_sha256: str | None = None
+
+    @property
+    def frozen_session_count(self) -> int:
+        if self.snapshot_manifest is not None:
+            return self.snapshot_manifest["datasets"]["sessions"]["row_count"]
+        return len(self.session_ids)
 
     def envelope(self) -> dict[str, Any]:
         """进每一页响应的发布标识。
@@ -637,6 +1180,8 @@ def bind_research_read(
         raise ReleaseRefused(
             "research_release_key_rotated",
             "去标识密钥已轮换，本纪元的假名与当前密钥对不上，需重新切纪元")
+    manifest = validate_epoch_research_snapshot(s, epoch)
+    assert epoch.research_snapshot_sha256 is not None
     return ResearchBinding(
         epoch_id=epoch.epoch_id,
         epoch_seq=epoch.epoch_seq,
@@ -644,8 +1189,99 @@ def bind_research_read(
         frozen_at=epoch.frozen_at,
         cohort_rule_version=epoch.cohort_rule_version,
         payload_sha256=epoch.payload_sha256,
-        session_ids=_resolve_frozen_sessions(s, epoch, config),
+        # 新纪元读取冻结行，不再把假名反查回活 Session。保留空集合只为旧的
+        # simulation/live projection 类型兼容；snapshot 分支绝不能消费它。
+        session_ids=frozenset(),
+        snapshot_manifest=manifest,
+        research_snapshot_sha256=epoch.research_snapshot_sha256,
     )
+
+
+def validate_epoch_research_snapshot(
+    s: DBSession, epoch: QualityReleaseEpoch,
+) -> dict[str, Any]:
+    """Validate one persisted epoch against its aggregate row-set anchor.
+
+    This is shared by the HTTP bind and receipt recovery.  A per-row hash alone
+    is not an anchor because an in-place DB edit can change both ``row_json``
+    and ``row_sha256``; the immutable manifest digest must be recomputed too.
+    """
+    snapshot_fields = (
+        epoch.research_snapshot_schema_version,
+        epoch.research_snapshot_manifest_json,
+        epoch.research_snapshot_sha256,
+    )
+    if all(value is None for value in snapshot_fields):
+        raise ReleaseRefused(
+            "research_release_snapshot_missing",
+            "这一历史纪元没有冻结研究行快照，需重新切纪元后才能取行数据")
+    if (any(value is None for value in snapshot_fields)
+            or epoch.research_snapshot_schema_version
+            != RESEARCH_SNAPSHOT_SCHEMA_VERSION):
+        raise ReleaseRefused(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照的纪元字段不完整或版本不一致")
+    assert epoch.research_snapshot_manifest_json is not None
+    assert epoch.research_snapshot_sha256 is not None
+    manifest = _validated_snapshot_manifest(
+        epoch.research_snapshot_manifest_json,
+        epoch.research_snapshot_sha256,
+    )
+    _validate_persisted_snapshot_rows(s, epoch.epoch_id, manifest)
+    return manifest
+
+
+def _validate_persisted_snapshot_rows(
+    s: DBSession, epoch_id: str, manifest: dict[str, Any],
+) -> None:
+    datasets = {
+        value if isinstance(value, str) else value[0]
+        for value in s.exec(
+            select(QualityReleaseEpochRowSnapshot.dataset_key)
+            .where(QualityReleaseEpochRowSnapshot.epoch_id == epoch_id)
+            .distinct()
+        )
+    }
+    if not datasets <= set(research_dataset.dataset_keys()):
+        raise ReleaseRefused(
+            "research_release_snapshot_corrupt",
+            "冻结研究行快照含未登记数据集")
+    for dataset_key in research_dataset.dataset_keys():
+        rows = list(s.exec(
+            select(QualityReleaseEpochRowSnapshot).where(
+                QualityReleaseEpochRowSnapshot.epoch_id == epoch_id,
+                QualityReleaseEpochRowSnapshot.dataset_key == dataset_key,
+            ).order_by(QualityReleaseEpochRowSnapshot.row_ordinal)
+        ))
+        facts = manifest["datasets"][dataset_key]
+        if ([row.row_ordinal for row in rows]
+                != list(range(1, facts["row_count"] + 1))):
+            raise ReleaseRefused(
+                "research_release_snapshot_corrupt",
+                "冻结研究行快照的序号或行数与清单不一致")
+        encoded_rows: list[bytes] = []
+        dataset = research_dataset.dataset_for(dataset_key)
+        assert dataset is not None
+        for row in rows:
+            raw = row.row_json.encode("utf-8")
+            try:
+                decoded = json.loads(row.row_json)
+            except (TypeError, ValueError) as exc:
+                raise ReleaseRefused(
+                    "research_release_snapshot_corrupt",
+                    "冻结研究行快照含不可解析行") from exc
+            if (not isinstance(decoded, dict)
+                    or canonical_bytes(decoded) != raw
+                    or hashlib.sha256(raw).hexdigest() != row.row_sha256
+                    or decoded != research_dataset.project(dataset, decoded)):
+                raise ReleaseRefused(
+                    "research_release_snapshot_corrupt",
+                    "冻结研究行快照的行内容或摘要不一致")
+            encoded_rows.append(raw)
+        if _rows_digest(encoded_rows) != facts["rows_sha256"]:
+            raise ReleaseRefused(
+                "research_release_snapshot_corrupt",
+                "冻结研究行快照的行集合与清单不一致")
 
 
 def _resolve_frozen_sessions(
@@ -694,7 +1330,7 @@ def binding_state(s: DBSession, *, config: Any) -> dict[str, Any]:
         **binding.envelope(),
         "as_of": binding.as_of.isoformat() + "Z",
         "frozen_at": binding.frozen_at.isoformat() + "Z",
-        "frozen_session_count": len(binding.session_ids),
+        "frozen_session_count": binding.frozen_session_count,
     }
 
 

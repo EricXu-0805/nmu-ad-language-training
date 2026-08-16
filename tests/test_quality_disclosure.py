@@ -107,6 +107,8 @@ def test_rates_truncate_rather_than_round_so_neighbours_collapse():
     assert rate(4449, 10000, decimals=2) == 0.44
     assert rate(4451, 10000, decimals=2) == 0.44
     assert rate(1, 3, decimals=2) == 0.33
+    assert rate(29, 100, decimals=2) == 0.29
+    assert rate(29, 50, decimals=2) == 0.58
     assert rate(None, 10, decimals=2) is None
     assert rate(5, 0, decimals=2) is None
     assert rate(5, None, decimals=2) is None

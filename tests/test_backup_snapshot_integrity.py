@@ -1416,12 +1416,13 @@ def test_publish_parent_fsync_failure_rolls_back_to_staging(monkeypatch, tmp_pat
 
 
 # --------------------------------------------------------------------------
-# Current head: 141bc30e4580 (quality release epoch) recovery contract,
-# plus the patient-pause/assessment/disposal/profile layers it builds on.
+# Current head: 6f2a9c4d8e17 (frozen research row snapshot) recovery
+# contract, plus the quality-release/patient-pause/assessment layers beneath it.
 # --------------------------------------------------------------------------
 
 
-CURRENT_HEAD = "141bc30e4580"
+CURRENT_HEAD = "6f2a9c4d8e17"
+QUALITY_RELEASE_HEAD = "141bc30e4580"
 DISPOSAL_HEAD = "f7c2e8a4d105"
 PROFILE_HEAD = "e4a7c1d9b206"
 PRE_PROFILE_HEAD = "d3f8b5c1a704"
@@ -1531,6 +1532,7 @@ def _drop_profile_column(
 
 def test_recovery_contract_pins_the_current_head_only():
     assert _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS == frozenset({CURRENT_HEAD})
+    assert QUALITY_RELEASE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert DISPOSAL_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert PROFILE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert PRE_PROFILE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
@@ -1554,7 +1556,12 @@ def test_recovery_fingerprint_literal_matches_a_fresh_current_head(tmp_path):
     assert computed == _GUARD_MODULE.CURRENT_RECOVERY_SCHEMA_SHA256
 
 
-@pytest.mark.parametrize("stale_head", [PRE_PROFILE_HEAD, PROFILE_HEAD, DISPOSAL_HEAD])
+@pytest.mark.parametrize("stale_head", [
+    PRE_PROFILE_HEAD,
+    PROFILE_HEAD,
+    DISPOSAL_HEAD,
+    QUALITY_RELEASE_HEAD,
+])
 def test_real_stale_head_snapshot_is_rejected_as_unsupported_revision(
         tmp_path, stale_head):
     snapshot = tmp_path / "snapshot"

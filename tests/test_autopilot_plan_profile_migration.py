@@ -258,10 +258,10 @@ def test_fresh_upgrade_reaches_exactly_one_new_head(tmp_path):
     db_path = _head_database(tmp_path)
     config = _config(db_path)
 
-    # 全局单一 head 不变量;当前头由 141bc30e4580(研究分区披露控制)持有,
-    # 本迁移必须仍在其祖先链上。
+    # 全局单一 head 不变量；本迁移必须仍在当前冻结研究行
+    # 快照迁移的祖先链上。
     heads = list(ScriptDirectory.from_config(config).get_heads())
-    assert heads == ["141bc30e4580"]
+    assert heads == ["6f2a9c4d8e17"]
     assert _revision(db_path) == HEAD
 
 

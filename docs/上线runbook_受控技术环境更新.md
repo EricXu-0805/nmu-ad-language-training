@@ -16,8 +16,8 @@
 
 ## 0. 前置条件（任一不满足就停）
 
-- [ ] 本地工作树干净，HEAD 已推送到 origin，GitHub CI 三个作业在**同一个 SHA** 上全绿
-- [ ] `scripts/ci_gate.sh` 六关全绿
+- [ ] 本地工作树干净，HEAD 已推送到 origin，GitHub CI 所有必需作业在**同一个 SHA** 上全绿
+- [ ] `scripts/ci_gate.sh` 全部本地门禁全绿
 - [ ] 备份链健康：`backup.log` 最后一行是 30 小时内的 `ok`；`health.state` / `capacity.state` 正常
 - [ ] 异地 `conflicts/` 为空
 - [ ] 目标机空闲磁盘 > (2 × 单份快照大小 + 1 GiB)，可用内存 > 400 MiB

@@ -95,7 +95,9 @@ def rate(numerator: int | None, denominator: int | None, *,
     if decimals < 1:
         raise DisclosureRegistryError("rate_decimals_invalid", "小数位必须 >= 1")
     scale = 10 ** decimals
-    return int((numerator / denominator) * scale) / scale
+    # 先做整数乘法再整除。若先转 binary float，29 / 100 * 100
+    # 可能是 28.999...，再 int 会把数学上应发的 0.29 误截成 0.28。
+    return ((numerator * scale) // denominator) / scale
 
 
 @dataclass(frozen=True)

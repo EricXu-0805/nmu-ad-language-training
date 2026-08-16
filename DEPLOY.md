@@ -492,8 +492,16 @@ docker compose ps
 
 ```bash
 scripts/ci_gate.sh              # 全部：ruff / 后端 / 前端 / SBOM / 漏洞 / 锁自洽
-scripts/ci_gate.sh --offline    # 不出网(漏洞扫描改用存好的 OSV 应答)
+scripts/ci_gate.sh --offline-osv  # 仅漏洞扫描重放存好的 OSV 应答
 ```
+
+`--offline-osv` **不是全离线模式**：锁自洽门会在临时目录里重建干净
+Python 环境，本机缓存不足时仍可能访问包源。脚本本身不会往当前 `.venv`
+或 `web/node_modules` 安装东西；在无网环境使用时，应先准备已锁依赖缓存，不得把
+只离线重放 OSV 的结果说成“全程未出网”。
+
+前端共享门会先校验 Node major 是否与 CI 一致（当前为 25），再使用已有
+`node_modules` 运行 lint / pretest / test / build，不会隐式执行 `npm install`。
 
 - **锁 ↔ 运行环境**：`scripts/supply_chain_check.py --python <解释器>`。锁只在
   安装那一刻起作用；这条守的是"安装之后有没有人手工往里加东西"。已接进
