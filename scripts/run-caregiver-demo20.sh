@@ -21,7 +21,10 @@ usage() {
 可选真实浏览器验收：
   --browser-check start-pause
   用本机已有 Chrome 走完开始、配对、朗读、录音、上传、
-  ASR/判定、下一条命令和安全暂停，然后自动核对同一临时库。
+  ASR/判定、下一条命令、安全暂停，再把求助面板从「已登记」点到
+  「已处理」，然后自动核对同一临时库。
+  求助那一段同时证明两件事：没配通知通道时屏上绝不出现「已送达」，
+  而且库里也确实没有人写过 delivered。
   默认不执行浏览器验收，原有人工演练行为不变。
 
 默认端口：8815
@@ -298,7 +301,7 @@ if [ -n "$BROWSER_CHECK" ]; then
     --start-pause --origin "http://127.0.0.1:$PORT"
   env -i "${HARNESS_ENV[@]}" \
     "$PYTHON" -m harness.caregiver_browser_acceptance --verify-ledger
-  echo "真实 Chrome start-pause 本机验收已全部通过"
+  echo "真实 Chrome start-pause + 求助四态本机验收已全部通过"
   exit 0
 elif [ -t 0 ] && [ -t 1 ]; then
   echo ""

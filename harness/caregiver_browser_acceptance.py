@@ -72,6 +72,8 @@ class BrowserResult:
     drain_command_key: str
     drain_state_revision: int
     native_audio_pause_observed: bool
+    help_request_id: str
+    help_states_walked: bool
 
 
 def _validated_origin(raw: str) -> str:
@@ -223,6 +225,8 @@ def _write_result_receipt(config: BrowserAcceptanceConfig, result: BrowserResult
         "drain_command_key": result.drain_command_key,
         "drain_state_revision": result.drain_state_revision,
         "native_audio_pause_observed": result.native_audio_pause_observed,
+        "help_request_id": result.help_request_id,
+        "help_states_walked": result.help_states_walked,
     }, sort_keys=True, separators=(",", ":"))
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -260,13 +264,14 @@ def _read_result_receipt(root: Path) -> BrowserResult:
         "schema", "plan_id", "session_id", "first_tts_command_key",
         "record_command_key", "next_command_key", "next_command_seq",
         "pause_runtime_revision", "drain_command_key", "drain_state_revision",
-        "native_audio_pause_observed",
+        "native_audio_pause_observed", "help_request_id", "help_states_walked",
     } or value.get("schema") != "caregiver-browser-start-pause.v1":
         raise BrowserAcceptanceError("浏览器验收结果收据格式无效")
     text_fields = (
         value.get("plan_id"), value.get("session_id"),
         value.get("first_tts_command_key"), value.get("record_command_key"),
         value.get("next_command_key"), value.get("drain_command_key"),
+        value.get("help_request_id"),
     )
     if any(not isinstance(item, str) or not item or len(item) > 200 for item in text_fields):
         raise BrowserAcceptanceError("浏览器验收结果收据标识无效")
@@ -283,6 +288,8 @@ def _read_result_receipt(root: Path) -> BrowserResult:
         raise BrowserAcceptanceError("浏览器验收结果收据收麦修订无效")
     if value.get("native_audio_pause_observed") is not True:
         raise BrowserAcceptanceError("浏览器验收结果缺少原生音频暂停证据")
+    if value.get("help_states_walked") is not True:
+        raise BrowserAcceptanceError("浏览器验收结果缺少求助四态证据")
     return BrowserResult(
         plan_id=text_fields[0],
         session_id=text_fields[1],
@@ -294,6 +301,8 @@ def _read_result_receipt(root: Path) -> BrowserResult:
         drain_command_key=text_fields[5],
         drain_state_revision=drain_revision,
         native_audio_pause_observed=True,
+        help_request_id=text_fields[6],
+        help_states_walked=True,
     )
 
 
@@ -407,6 +416,8 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
         "drain_ack_revision": None,
         "drain_ack_replayed": None,
         "pause_runtime_revision": None,
+        "help_request_id": None,
+        "help_states_walked": False,
     }
 
     def violation(message: str) -> None:
@@ -811,6 +822,15 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                 raise BrowserAcceptanceError(violations[0])
             if not isinstance(observations["pause_runtime_revision"], int):
                 raise BrowserAcceptanceError("安全暂停回执没有进入浏览器证据")
+
+            _run_help_states(caregiver, observations)
+            if violations:
+                raise BrowserAcceptanceError(violations[0])
+            # 求助整条链跑完之后后续命令数不能变。求助会先暂停场次，而这里已经是
+            # 暂停态——它一条新命令都不该发。放在最后跑就是为了能这样复核。
+            if len(observations["next"]) != 3:
+                raise BrowserAcceptanceError("求助流程发出了未预期的后续命令")
+
             observations["teardown_started"] = True
             patient_context.close()
             caregiver_context.close()
@@ -831,6 +851,8 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                 drain_command_key=str(observations["drain_ack_key"]),
                 drain_state_revision=int(observations["drain_ack_revision"]),
                 native_audio_pause_observed=True,
+                help_request_id=str(observations["help_request_id"]),
+                help_states_walked=bool(observations["help_states_walked"]),
             )
             _write_result_receipt(config, result)
             return result
@@ -862,6 +884,104 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
             fake_audio.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+#: 界面在任何一态都不许出现的字样。没配通知通道时「已送达」结构上到不了，
+#: 屏上一旦出现它，就是在对现场工作人员说"有人已经收到消息了"——而没有人收到。
+_HELP_FORBIDDEN_PHRASES = ("已送达", "通知已送达", "等待送达")
+
+_HELP_REASON_LABEL = "设备或系统无法继续"
+
+
+def _assert_no_claimed_delivery(page, where: str) -> None:
+    body = page.locator("body").inner_text()
+    for phrase in _HELP_FORBIDDEN_PHRASES:
+        if phrase in body:
+            raise BrowserAcceptanceError(f"{where}出现了「{phrase}」，而通知通道并没有配")
+
+
+def _run_help_states(caregiver, observations: dict[str, object]) -> None:
+    """在真实 Chrome 里把求助面板从「已登记」走到「已处理」。
+
+    这条链此前只在服务层测过。浏览器这一半从来没被点过——而"没配通知通道时界面
+    绝不能显示已送达"这句话，恰恰只有把整页文字读出来才算证明。
+    """
+    help_button = caregiver.get_by_role("button", name="请求协助", exact=True)
+    help_button.wait_for(state="visible", timeout=20_000)
+    _assert_no_claimed_delivery(caregiver, "求助之前的照护员屏")
+    help_button.click()
+
+    dialog = caregiver.get_by_role("dialog")
+    dialog.wait_for(state="visible", timeout=20_000)
+    confirm = dialog.get_by_role("button", name="暂停并记录请求", exact=True)
+    confirm.wait_for(state="visible", timeout=20_000)
+    if confirm.is_enabled():
+        raise BrowserAcceptanceError("没选原因就能提交求助——原因不是可选项")
+    dialog.get_by_role("radio", name=re.compile(_HELP_REASON_LABEL)).check()
+    with caregiver.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and urlsplit(response.url).path.endswith("/help-requests")
+        ),
+        timeout=20_000,
+    ) as created:
+        confirm.click()
+    if created.value.status != 200:
+        raise BrowserAcceptanceError(
+            f"求助登记被拒绝（HTTP {created.value.status}）")
+    observations["help_request_id"] = (created.value.json() or {}).get("request_id")
+
+    banner = caregiver.get_by_text("求助已登记", exact=True)
+    banner.wait_for(state="visible", timeout=20_000)
+    # 顺序要紧：先查「屏上有没有出现已送达」，再查「诚实文案在不在」。
+    # 反过来写的话，一旦文案被改成谎称已送达，先炸的是"等不到诚实文案"的超时，
+    # 禁词那条断言一次都执行不到——回退验证实测就是这么红的，红得没有意义。
+    _assert_no_claimed_delivery(caregiver, "刚登记完的求助面板")
+    caregiver.get_by_text(re.compile("本机构尚未配置自动通知对象")).wait_for(
+        state="visible", timeout=20_000)
+
+    # 四态可跳过：没配通道时工作人员当面走过来仍能直接到「已有人到场」。
+    arrival = caregiver.get_by_role("button", name="记：已有人到场", exact=True)
+    arrival.wait_for(state="visible", timeout=20_000)
+    with caregiver.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and urlsplit(response.url).path.endswith("/dispositions")
+        ),
+        timeout=20_000,
+    ) as acknowledged:
+        arrival.click()
+    # 处置端点是 201 Created，不是 200——第一版照抄了求助登记那句 200，
+    # 结果整条链在真浏览器里跑到这里才炸。
+    if acknowledged.value.status != 201:
+        raise BrowserAcceptanceError(
+            f"记录到场被拒绝（HTTP {acknowledged.value.status}）")
+    caregiver.get_by_text(re.compile("已有工作人员到场并接手")).wait_for(
+        state="visible", timeout=20_000)
+    if caregiver.get_by_role("button", name="记：已有人到场", exact=True).count() != 0:
+        raise BrowserAcceptanceError("已经到场之后还能再记一次到场")
+    _assert_no_claimed_delivery(caregiver, "已接收态的求助面板")
+
+    resolved = caregiver.get_by_role("button", name="记：已处理完", exact=True)
+    resolved.wait_for(state="visible", timeout=20_000)
+    with caregiver.expect_response(
+        lambda response: (
+            response.request.method == "POST"
+            and urlsplit(response.url).path.endswith("/dispositions")
+        ),
+        timeout=20_000,
+    ) as done:
+        resolved.click()
+    if done.value.status != 201:
+        raise BrowserAcceptanceError(
+            f"记录处理完毕被拒绝（HTTP {done.value.status}）")
+    caregiver.get_by_text(re.compile("本次求助已处理完毕")).wait_for(
+        state="visible", timeout=20_000)
+    for label in ("记：已有人到场", "记：已处理完"):
+        if caregiver.get_by_role("button", name=label, exact=True).count() != 0:
+            raise BrowserAcceptanceError(f"求助已处理完之后「{label}」仍留在屏上")
+    _assert_no_claimed_delivery(caregiver, "已处理态的求助面板")
+    observations["help_states_walked"] = True
 
 
 def _one(rows: list[object], message: str):
@@ -1429,6 +1549,41 @@ def _validate_start_pause_database(config, result: BrowserResult) -> None:
             or status_receipt.last_error_code is not None
         ):
             raise BrowserAcceptanceError("账本没有同时证明自动流程、场次和老人画面已安全暂停")
+
+        _validate_help_states_database(session, result)
+
+
+def _validate_help_states_database(session, result: BrowserResult) -> None:
+    """账本这一半：屏上走过的四态，库里必须一模一样，且 delivered 一条都没有。
+
+    浏览器那一半证明的是"界面没说已送达"，这一半证明的是"确实没有人写过已送达"。
+    两句话不同——第一句可以被一个忘了渲染的分支伪造出来。
+    """
+    from sqlmodel import select
+
+    from app import caregiver_service
+    from app.models import CaregiverHelpRequest
+
+    requests = list(session.exec(select(CaregiverHelpRequest).where(
+        CaregiverHelpRequest.session_id == result.session_id)))
+    row = _one(requests, "本次场次的求助登记不是恰好一条")
+    if row.request_id != result.help_request_id:
+        raise BrowserAcceptanceError("库里的求助登记与浏览器拿到的不是同一条")
+    if row.reason_code != "technical_failure":
+        raise BrowserAcceptanceError("求助原因与屏上勾选的那一项对不上")
+    if not (row.actor_id or "").strip():
+        raise BrowserAcceptanceError("求助登记没有具名")
+
+    # 用服务层自己的取数：状态链的排序口径只该有一份，账本核验不另立一套。
+    dispositions = caregiver_service.help_dispositions(
+        session, request_id=row.request_id)
+    states = [item.state for item in dispositions]
+    if states != ["acknowledged", "resolved"]:
+        raise BrowserAcceptanceError(f"求助状态链是 {states}，不是当面到场后处理完")
+    if any(item.state == "delivered" for item in dispositions):
+        raise BrowserAcceptanceError("没有配通知通道，库里却出现了「已送达」")
+    if any(not (item.actor_id or "").strip() for item in dispositions):
+        raise BrowserAcceptanceError("有一条状态转移没有具名")
 
 
 def validate_start_pause_ledger(snapshot: BrowserResult | None = None) -> None:
