@@ -68,6 +68,27 @@ previous_head = e4a7c1d9b206 (head)
 （现在那个文件不存在，我这次是靠 80 个文件的指纹反查才定位到 `167273f` 的）。
 **倾向 ②**：一个会过期的记录比没有记录更危险，而逐文件指纹反正才是真判据。
 
+**不管选哪条，"真判据"这一步现在有工具了**：`scripts/verify_deployed_tree.py`。
+只读、不联网、不碰生产、没有任何写调用（有测试走 AST 逐个调用点钉住这一点，
+不是靠注释保证）。两步：
+
+```bash
+# 1) 打印一条只读命令，人自己拿到目标机上跑，结果存成 manifest.txt
+scripts/verify_deployed_tree.py --print-remote-command --tree-root /opt/nmu/app
+# 2) 回本仓库比对
+scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
+```
+
+退出码 **0 = 完全一致 / 1 = 有漂移 / 2 = 根本没量成**。第三种单独分出来，
+是因为"没量成"和"量到了没差别"看起来太像。2026-08-17 实跑的结果：
+
+```text
+167273f -> exit=0  MATCH  files=80 identical=80
+9c34dcb -> exit=1  DRIFT  identical=57 differing=15 absent_in_revision=8
+```
+
+第二行就是 `last-deploy.state` 声称的版本。
+
 预检 `--require-all` 结果：**8 项全 PASS、退出码 0**。这台机器上线以来第一次全绿——
 2026-08-15 装完 8 个 systemd 安全补丁后，OS 补丁那一项从 FAIL 转 PASS。
 
