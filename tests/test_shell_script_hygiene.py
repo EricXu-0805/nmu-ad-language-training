@@ -66,6 +66,31 @@ def test_the_generated_offsite_runner_also_parses():
         pytest.fail(f"生成出来的 run-pull.sh 里有裸变量接全角字符：{match.group(0)!r}")
 
 
+def test_the_verifier_fingerprint_records_the_installed_copy_not_the_repo_file():
+    """`verifier.sha256` 必须量**装好的那份**，不是仓库里那份。
+
+    两者在安装当刻字节相同，所以第一列的值一样；差别在第二列的路径。写成仓库
+    路径会有一个具体的坏后果：这个文件是 `shasum -c` 格式，而任何人真去
+    `shasum -c verifier.sha256` 时，校验的是**仓库里那份**——仓库一往前走就
+    FAILED，而那句 FAILED 跟"异地这份有没有被改过"毫无关系。
+
+    2026-08-17 实测：仓库已前进三个迁移头，`shasum -c` 当场报 FAILED，
+    而真正要守的不变量（异地副本 == 生产部署的那份）其实是成立的。
+    偏偏 `RELEASE_STATE.md` 让人在迁移窗口里核对这个文件——那正是最不该
+    出现假警报的时刻。
+    """
+    installer = SCRIPTS / "install-macos-offsite-pull.sh"
+    text = installer.read_text(encoding="utf-8")
+    # 注释行要排除：解释这条规则的注释里同样出现 shasum 与 verifier.sha256，
+    # 第一版这个选择器就选中了注释，于是打完补丁测试照红。
+    line = next(row for row in text.splitlines()
+                if "verifier.sha256" in row and "shasum" in row
+                and not row.lstrip().startswith("#"))
+    assert '"$ROOT/runtime/scripts/verify_backup_snapshot.py"' in line, (
+        "verifier.sha256 应当量装好的那份副本；量仓库那份会让 shasum -c 校验"
+        f"一个一直在动的目标。当前那行是：{line.strip()}")
+
+
 # ---------------------------------------------------------------------------
 # 前端测试清单
 # ---------------------------------------------------------------------------

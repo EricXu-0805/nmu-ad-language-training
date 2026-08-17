@@ -50,8 +50,14 @@ install -m 600 "$REPO/scripts/notify_ops.py" "$ROOT/runtime/scripts/notify_ops.p
 install -m 600 "$REPO/scripts/audit_anchor_check.py" "$ROOT/runtime/scripts/audit_anchor_check.py"
 
 # 校验器的 SUPPORTED_ALEMBIC_HEADS 是写死的，必须与生产同版本，否则每份快照
-# 都会被判成 legacy。把仓库当前的指纹留在运行时目录里，人工核对时一眼可比。
-shasum -a 256 "$REPO/scripts/verify_backup_snapshot.py" > "$ROOT/runtime/verifier.sha256"
+# 都会被判成 legacy。把指纹留在运行时目录里，人工核对时一眼可比。
+#
+# 量的是**装好的那份**，不是 $REPO 里那份。两者此刻字节相同，所以值一样；
+# 差别在于这个文件是 shasum -c 格式，路径写谁就校验谁。写 $REPO 的话，仓库
+# 一往前走，`shasum -c verifier.sha256` 就报 FAILED——而那句 FAILED 跟
+# "异地这份有没有被改过"毫无关系。2026-08-17 实测踩到过：仓库领先三个迁移头，
+# 核对时当场 FAILED，真正的不变量其实成立。
+shasum -a 256 "$ROOT/runtime/scripts/verify_backup_snapshot.py" > "$ROOT/runtime/verifier.sha256"
 chmod 600 "$ROOT/runtime/verifier.sha256"
 
 if [ ! -x "$ROOT/venv/bin/python" ]; then

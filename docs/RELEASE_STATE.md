@@ -30,7 +30,7 @@
 | 应用代码版本 | `167273f`（2026-08-15 06:05 上线；此前 `f813af0` 08-14 20:28、`d8d3edd` 08-14 09:52） | 部署树里有 `app/research_read.py`、`scripts/content_gap_workbook.py`、`web/dist` 里有 `AcceptanceScreen-*.js` |
 | 部署树后续同步 | 已与 `main` 一致 | `git diff f813af0..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b3e7c5a9d214` | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
-| 备份校验器指纹（前 20 位） | `2d50ce0cad5f7813a5c3` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 一致 |
+| 备份校验器指纹（前 20 位） | `2d50ce0cad5f7813a5c3` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。**别直接 `shasum -c` 这个文件**——2026-08-17 之前安装的那些，文件里第二列写的是仓库路径，仓库一往前走就报 FAILED，而那句 FAILED 与异地副本是否被改过无关（安装器已修，下次重装即正常） |
 | 回滚存档 | `/opt/nmu/app-before-deploy-20260815-0605.tar.gz`（退到 `f813af0`）；更早的存档按 `ls -t` 逐级回退，跨结构退回 `9c34dcb` 用 `app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
 | 回滚锚点快照 | 退到 `f813af0`：`20260814-220517`（同结构，新校验器验过，直接可用）。**跨结构**退回 `9c34dcb` 才用 `20260814-015251`（旧结构，现在 `legacy-unvalidated/`），那时要连**旧代码树 + 旧校验器**一起放回 |
 | 起服前闸门 | 已装（`ExecStartPre` 验库头，以 `User=nmu` 身份跑） | `systemctl cat nmu.service \| grep ExecStartPre`；journal 里 `OK database_at_head` 应在 `Started` 之前 |
