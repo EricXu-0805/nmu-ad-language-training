@@ -165,8 +165,28 @@ def test_contextless_judge_route_never_initializes_cloud_engine(client, monkeypa
     assert response.json()["judge_mode"] == "规则确定式"
 
 
-def test_judge_classify_open_role_fails_closed_without_frozen_rubric(client):
+def test_judge_classify_open_role_fails_closed_without_frozen_rubric(
+        client, monkeypatch, tmp_path):
+    """2026-08-19 起 week2 开放环节 rubric 已全部冻结交付；「缺 rubric → 409」
+    只能靠 staged 副本重现——这条 fail-closed 行为不因内容交付而消失。"""
+    import json
+    import shutil
+
     d = BANK.double_element[0]
+    staged = tmp_path / "content-staged"
+    shutil.copytree(content.CONTENT_DIR, staged)
+    bank_path = staged / "item_bank_v1.json"
+    data = json.loads(bank_path.read_text(encoding="utf-8"))
+    removed = False
+    for item in data["double_element"]:
+        if item["item_id"] == d["item_id"]:
+            del item["operational_rubrics"]["关系识别"]
+            removed = True
+    assert removed, f"staged 副本没找到 {d['item_id']}:关系识别 的 rubric"
+    bank_path.write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(content, "CONTENT_DIR", staged)
+
     r = client.post("/judge/classify", json={"item_id": d["item_id"], "response_role": "关系识别",
                                              "text": "随便说说"})
     assert r.status_code == 409

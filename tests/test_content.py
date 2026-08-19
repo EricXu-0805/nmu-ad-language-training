@@ -20,21 +20,25 @@ def test_shipped_item_bank_no_errors():
     assert bank.version_id == "wk2-v1-20260707"
     assert len(bank.single_element) == 20
     assert len(bank.double_element) == 10
-    assert len(bank.multi_element) == 0
+    assert len(bank.multi_element) == 2
     assert bank.supported_training_weeks == (2,)
-    assert bank.qc_status == "draft"
+    assert bank.qc_status == "frozen"
     result = validate_item_bank(bank)
     assert result["errors"] == [], f"题库不应有勘误级错误：{result['errors']}"
-    assert not any("SE_花" in w and "第1级线索" in w for w in result["warnings"])
+    # 2026-08-19 内容交付后随包题库零告警（含旧 SE_花 第1级线索缺失）；
+    # 任何新告警都是回归。
+    assert result["warnings"] == []
     assert bank.meta["source_document_sha256"] == (
         "b3310b61bdc6afb437cbc05785bd6f4e1f6c30dd53ad0999eb2c0fea10c3891a"
     )
     assert bank.meta["source_normalized_text_sha256"] == (
         "b7f2ad1d4389ee6193721402b1d39d9c3cc7a15d2341807471a5fc4627d06c55"
     )
-    assert bank.meta["draft_revision"] == "2026-07-20.4"
-    assert bank.meta["source_protocol_position_count"] == 80
-    assert len(bank.meta["source_unstructured_positions"]) == 10
+    assert bank.meta["draft_revision"] == "2026-08-19.1"
+    # 计分题位 78 = 20 单要素 + 10 双要素 × 5 + 2 多要素 × 4；
+    # ⑤整体描述不计分、不进协议题位（2026-08-19 钱凯口径）。
+    assert bank.meta["source_protocol_position_count"] == 78
+    assert bank.meta["source_unstructured_positions"] == []
 
 
 def test_item_bank_loader_accepts_explicit_multi_image_id(tmp_path):
@@ -161,17 +165,25 @@ def test_shipped_single_terms_and_recovered_flower_cue_are_structurally_clean():
     )
 
 
-def test_shipped_bank_is_explicitly_demo_only_until_qc_and_multi_complete():
+def test_shipped_bank_is_research_ready_and_a_draft_copy_stays_fail_closed(
+        tmp_path):
+    # 2026-08-19 内容交付：week2 题库冻结、开放环节 rubric 补齐、多要素入库。
     ready = content_readiness(load_item_bank(CONTENT_DIR / "item_bank_v1.json"))
-    assert ready["qc_status"] == "draft"
+    assert ready["qc_status"] == "frozen"
     assert ready["supported_training_weeks"] == [2]
-    assert ready["ready_for_research"] is False
-    assert any("多要素" in w for w in ready["warnings"])
-    assert ready["operational_autopilot_ready"] is False
-    assert any("关系识别" in position
-               for position in ready["unsupported_operational_rubrics"])
-    assert any("禁止以‘有回答’自动推进" in warning
-               for warning in ready["warnings"])
+    assert ready["ready_for_research"] is True
+    assert ready["operational_autopilot_ready"] is True
+    assert ready["unsupported_operational_rubrics"] == []
+    assert ready["errors"] == []
+    assert ready["warnings"] == []
+
+    # 守门行为不能随内容交付消失：qc 回到 draft 的 staged 副本必须立刻不 ready。
+    staged = json.loads(
+        (CONTENT_DIR / "item_bank_v1.json").read_text(encoding="utf-8"))
+    staged["qc_status"] = "draft"
+    draft = content_readiness(load_item_bank(
+        _write_definition(tmp_path, "item_bank_draft.json", staged)))
+    assert draft["ready_for_research"] is False
 
 
 def test_errata_was_recorded():
@@ -532,18 +544,23 @@ def test_wrong_or_null_declared_self_digest_is_rejected(
 
 def test_absent_and_explicit_empty_multi_element_share_runtime_identity(
         tmp_path):
+    # 2026-08-19 起随包题库自带 2 个多要素题，「缺键 vs 显式空表」的运行时
+    # 同一性只能在 staged 副本上验；这条等价关系保护的是无多要素题库的加载。
     source = json.loads(
         (CONTENT_DIR / "item_bank_v1.json").read_text(encoding="utf-8")
     )
-    assert "multi_element" not in source
-    absent = load_item_bank(CONTENT_DIR / "item_bank_v1.json")
-    expected = item_bank_definition_digest(absent)
+    assert source["multi_element"], "随包题库应已含多要素题"
+
+    absent = copy.deepcopy(source)
+    absent.pop("multi_element")
+    expected = item_bank_definition_digest(load_item_bank(
+        _write_definition(tmp_path, "item_bank_absent.json", absent)))
 
     explicit = copy.deepcopy(source)
     explicit["multi_element"] = []
     explicit["item_bank_definition_digest"] = expected
     loaded = load_item_bank(
-        _write_definition(tmp_path, "item_bank_v1.json", explicit)
+        _write_definition(tmp_path, "item_bank_explicit.json", explicit)
     )
     assert item_bank_definition_digest(loaded) == expected
 

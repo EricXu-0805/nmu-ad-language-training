@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 import hashlib
 import json
+from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -296,8 +297,11 @@ def _frozen_request_hash(command_type: str, payload: dict) -> str:
 LEGACY_DATE = date(2026, 7, 31)
 LEGACY_TIME = time(9, 30)
 LEGACY_BANK_VERSION = "wk2-v1-20260707"
-LEGACY_BANK_DIGEST = (
-    "80ca521df07de060b8f31f0c768c776ac4d2a62ef9114513aaae3c0cd5a016c4")
+# 与上面的字面收据不同：内容绑定摘要必须跟随当前冻结题库。绑定过期内容的
+# 旧安排被拒是设计（visit_plan_content_digest_mismatch 有专测），这里要证的
+# 是账本哈希算法的字节兼容，不是把测试钉在 2026-07 的题库内容上。
+LEGACY_BANK_DIGEST = content.item_bank_definition_digest(
+    content.load_item_bank_for_week(2))
 LEGACY_PROTOCOL_VERSION = "autopilot-v1-20260729"
 LEGACY_PROTOCOL_DIGEST = (
     "51fe62990cc0bc6934b4fbe7c8d902369c0b9fd7e092136572da3fa375b989d9")
@@ -2088,7 +2092,9 @@ def test_started_plan_list_conceals_session_binding_from_non_owner(
 ])
 def test_unsupported_protocol_may_be_drafted_but_cannot_be_approved(
         visit_clients: VisitClients, patient_id: str,
-        overrides: dict, code: str, reason: str):
+        overrides: dict, code: str, reason: str, monkeypatch, tmp_path):
+    if overrides.get("week_no") == 3:
+        _stage_content(tmp_path, monkeypatch, _drop_week3_from_index)
     created = _create(
         visit_clients.researcher,
         patient_id,
@@ -2159,7 +2165,8 @@ def _linked_session_for_test(session: Session, plan_id: str) -> TrainSession | N
 
 
 def test_start_revalidates_protocol_even_for_a_legacy_approved_plan(
-        visit_clients: VisitClients):
+        visit_clients: VisitClients, monkeypatch, tmp_path):
+    _stage_content(tmp_path, monkeypatch, _drop_week3_from_index)
     created = _create(
         visit_clients.researcher,
         "P-VISIT-11",
@@ -2206,8 +2213,40 @@ def test_start_revalidates_protocol_even_for_a_legacy_approved_plan(
         assert _linked_session_for_test(session, created["plan_id"]) is None
 
 
+def _stage_content(tmp_path, monkeypatch, mutate) -> Path:
+    """复制内容目录、按 mutate 改动后接管 CONTENT_DIR。
+
+    2026-08-19 起 week2-8 题库全部冻结交付，「内容未就绪」的场景只能靠
+    staged 副本重现——这些门禁测试守的行为不能因为内容交付而消失。
+    """
+    import shutil
+
+    staged = tmp_path / "content-staged"
+    shutil.copytree(content.CONTENT_DIR, staged)
+    mutate(staged)
+    monkeypatch.setattr(content, "CONTENT_DIR", staged)
+    return staged
+
+
+def _drop_week3_from_index(staged: Path) -> None:
+    index_path = staged / content.ITEM_BANK_INDEX_FILE
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["banks"] = [
+        row for row in index["banks"] if row["week_no"] != 3]
+    index_path.write_text(
+        json.dumps(index, ensure_ascii=False), encoding="utf-8")
+
+
 def test_week_two_real_research_still_fails_closed_on_content_readiness(
-        visit_clients: VisitClients):
+        visit_clients: VisitClients, monkeypatch, tmp_path):
+    def _week2_back_to_draft(staged: Path) -> None:
+        bank_path = staged / "item_bank_v1.json"
+        data = json.loads(bank_path.read_text(encoding="utf-8"))
+        data["qc_status"] = "draft"
+        bank_path.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    _stage_content(tmp_path, monkeypatch, _week2_back_to_draft)
     with Session(visit_clients.engine) as session:
         patient = session.get(Patient, "P-VISIT-12")
         assert patient is not None
@@ -4360,6 +4399,10 @@ def test_week3_unlocks_with_content_files_alone(
         json.dumps(bank_data, ensure_ascii=False), encoding="utf-8")
     index = json.loads(
         (staged / content.ITEM_BANK_INDEX_FILE).read_text(encoding="utf-8"))
+    # 2026-08-19 起第 3、4 周已正式登记；先摘除再登记合成第 3 周包，保持
+    # “零代码开闸只开登记过的周、未登记周仍关”的证明对象是登记动作本身。
+    index["banks"] = [
+        row for row in index["banks"] if row["week_no"] not in (3, 4)]
     index["banks"].append({"week_no": 3, "file": "item_bank_wk3_synth.json"})
     (staged / content.ITEM_BANK_INDEX_FILE).write_text(
         json.dumps(index, ensure_ascii=False), encoding="utf-8")

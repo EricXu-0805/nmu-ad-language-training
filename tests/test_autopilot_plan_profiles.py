@@ -245,7 +245,7 @@ def test_demo_resolution_reuses_exact_canonical_plan_items(
     assert resolved.unsupported_position_count == 0
     assert resolved.structured_readiness_gaps == ()
     assert resolved.source_unstructured_gaps == ()
-    assert resolved.source_protocol_position_count == 80
+    assert resolved.source_protocol_position_count == 78
     assert [position.position_key for position in resolved.positions] == [
         f"{row['item_id']}#1" for row in _bank().single_element
     ]
@@ -278,11 +278,13 @@ def test_paired_null_resolution_preserves_full_canonical_gap_accounting() -> Non
     assert resolved.profile_version_id is None
     assert resolved.profile_definition_digest is None
     assert resolved.completion_scope == "canonical_full_source"
-    assert resolved.resolved_position_count == 70
-    assert len(resolved.structured_readiness_gaps) == 50
-    assert len(resolved.source_unstructured_gaps) == 10
-    assert resolved.unsupported_position_count == 60
-    assert resolved.source_protocol_position_count == 80
+    # 2026-08-19 内容交付后源协议全量结构化:78 位置全入 canonical 计划,
+    # 无 source-only 缺口;58 个剩余缺口(双要素 10×5 + 多要素 2×4)全部结构化。
+    assert resolved.resolved_position_count == 78
+    assert len(resolved.structured_readiness_gaps) == 58
+    assert len(resolved.source_unstructured_gaps) == 0
+    assert resolved.unsupported_position_count == 58
+    assert resolved.source_protocol_position_count == 78
     assert resolved.resolved_position_content_ready is False
     assert resolved.source_unstructured_gaps == tuple(
         row["source_position_key"]

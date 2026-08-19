@@ -797,11 +797,11 @@ def test_real_cli_migrates_and_seeds_then_inspector_reads_temp_db(tmp_path):
     assert patient_id == harness.HARNESS_PATIENT_ID
     assert week_no == 2 and plan_id is not None and session_id
     assert profile_version == harness.DEMO_PROFILE_VERSION
-    # install 不再换 canonical loader：题库仍保留完整源清单和 60 缺口。
+    # install 不再换 canonical loader：题库仍保留完整源清单和 58 结构化缺口。
     assert payload["loader_module"] == "app.content"
     assert payload["positions"] == 20
-    assert payload["source_count"] == 80
-    assert len(payload["unstructured"]) == 10
+    assert payload["source_count"] == 78
+    assert len(payload["unstructured"]) == 0
     # 可执行范围来自不可变 profile，而不是裁题库。
     assert payload["resolved_profile"] == harness.DEMO_PROFILE_VERSION
     assert payload["resolved_positions"] == 20
@@ -814,7 +814,7 @@ def test_real_cli_migrates_and_seeds_then_inspector_reads_temp_db(tmp_path):
 
 
 # ==========================================================================
-# D. 隔离子进程：canonical 60 缺口仍拒绝 + exact demo20 解析为 20
+# D. 隔离子进程：canonical 58 缺口仍拒绝 + exact demo20 解析为 20
 # ==========================================================================
 _CONTENT_CONTRACT_SCRIPT = """
     import json, os
@@ -908,15 +908,16 @@ def test_content_contract_and_production_gate(tmp_path):
     root = _private_root(tmp_path, "content-root")
     payload = _payload(_run_script(_subprocess_env(root), _CONTENT_CONTRACT_SCRIPT))
 
-    # 生产题库仍然被 60 缺口门禁拒绝——这条红线不因 harness 存在而松动。
+    # 生产题库仍然被 58 结构化缺口门禁拒绝——这条红线不因 harness 存在而松动。
+    # (2026-08-19 内容交付后源协议全量结构化:78 位置,无 source-only 缺口。)
     assert payload["production_refusal"]["code"] == (
         "autopilot_plan_not_fully_supported")
     assert payload["production_refusal"]["context"][
-        "unsupported_position_count"] == 60
+        "unsupported_position_count"] == 58
     assert payload["production_positions"] == 20
-    assert payload["production_source_count"] == 80
-    assert payload["canonical_resolved_positions"] == 70
-    assert payload["canonical_unsupported_positions"] == 60
+    assert payload["production_source_count"] == 78
+    assert payload["canonical_resolved_positions"] == 78
+    assert payload["canonical_unsupported_positions"] == 58
     assert payload["canonical_completion_scope"] == "canonical_full_source"
 
     # 同一份 canonical 题库只经 exact profile 选位，20 位置完整通过。
@@ -1056,7 +1057,7 @@ def test_start_gate_issues_exactly_one_first_tts_command(tmp_path):
     # harness-only 标记头在生产路由上生效。
     assert payload["marker_header"] == harness.MARKER_VALUE
     assert payload["bank_positions"] == 20
-    assert payload["bank_source_count"] == 80
+    assert payload["bank_source_count"] == 78
 
 
 # ==========================================================================

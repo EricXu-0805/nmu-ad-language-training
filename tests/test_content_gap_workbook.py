@@ -19,8 +19,36 @@ BANK_PATH = content.CONTENT_DIR / "item_bank_v1.json"
 
 
 @pytest.fixture
-def bank():
-    return content.load_item_bank(BANK_PATH)
+def bank_path(tmp_path) -> Path:
+    """staged 降级副本：2026-08-19 内容交付后随包题库已无可填报缺口。
+
+    工作簿是给内容组填缺口用的工具，它的行为只能在一份还有缺口的题库上验：
+    qc 回 draft、双要素 rubric 摘掉（30 个判分缺口）、前三个单要素清掉
+    可接受说法与难度（3 个命名缺口）。
+    """
+    definition = json.loads(BANK_PATH.read_text(encoding="utf-8"))
+    definition["qc_status"] = "draft"
+    for item in definition["double_element"]:
+        item.pop("operational_rubrics", None)
+    for item in definition["single_element"][:3]:
+        item["acceptable_expressions"] = []
+        item["difficulty_level"] = None
+    path = tmp_path / "item_bank_draft.json"
+    path.write_text(
+        json.dumps(definition, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def bank(bank_path):
+    return content.load_item_bank(bank_path)
+
+
+def test_the_shipped_bank_has_no_workbook_gaps_left():
+    """2026-08-19 内容交付钉：随包题库两张表都再没有一行可导出。"""
+    shipped = content.load_item_bank(BANK_PATH)
+    assert wb.rubric_gaps(shipped) == []
+    assert wb.naming_gaps(shipped) == []
 
 
 def _read(path: Path, columns: list[str]) -> list[dict[str, str]]:
@@ -74,78 +102,81 @@ def test_empty_workbook_reports_every_missing_cell_by_position(bank, tmp_path, c
     assert "decision_policy 只能填" in out
 
 
-def test_filled_workbook_passes_and_merges(bank, tmp_path):
+def test_filled_workbook_passes_and_merges(bank, bank_path, tmp_path):
     wb.cmd_export(bank, tmp_path)
     _fill(tmp_path)
     assert wb.cmd_check(bank, tmp_path) == 0
     out = tmp_path / "merged.json"
-    assert wb.cmd_merge(bank, BANK_PATH, tmp_path, out) == 0
+    assert wb.cmd_merge(bank, bank_path, tmp_path, out) == 0
     merged = content.load_item_bank(out)
     assert content.unsupported_operational_rubrics(merged) == ()
 
 
 def test_merge_never_freezes_the_bank_and_never_makes_it_research_ready(
-        bank, tmp_path):
+        bank, bank_path, tmp_path):
     """填表 ≠ 冻结。这是这个脚本最重要的一条边界。"""
     wb.cmd_export(bank, tmp_path)
     _fill(tmp_path)
     out = tmp_path / "merged.json"
-    assert wb.cmd_merge(bank, BANK_PATH, tmp_path, out) == 0
+    assert wb.cmd_merge(bank, bank_path, tmp_path, out) == 0
     merged = content.load_item_bank(out)
     assert merged.qc_status == bank.qc_status == "draft"
     readiness = content.content_readiness(merged)
     assert readiness["ready_for_research"] is False
-    raw_before = json.loads(BANK_PATH.read_text(encoding="utf-8"))
+    raw_before = json.loads(bank_path.read_text(encoding="utf-8"))
     raw_after = json.loads(out.read_text(encoding="utf-8"))
     for key in wb.FROZEN_META_KEYS:
         assert raw_after.get(key) == raw_before.get(key), key
 
 
-def test_merge_refuses_when_the_workbook_is_not_finished(bank, tmp_path):
+def test_merge_refuses_when_the_workbook_is_not_finished(
+        bank, bank_path, tmp_path):
     wb.cmd_export(bank, tmp_path)
     out = tmp_path / "merged.json"
-    assert wb.cmd_merge(bank, BANK_PATH, tmp_path, out) == 1
+    assert wb.cmd_merge(bank, bank_path, tmp_path, out) == 1
     assert not out.exists(), "没填完就不该写出任何题库文件"
 
 
-def test_merge_refuses_to_overwrite_an_existing_target(bank, tmp_path):
+def test_merge_refuses_to_overwrite_an_existing_target(
+        bank, bank_path, tmp_path):
     wb.cmd_export(bank, tmp_path)
     _fill(tmp_path)
     out = tmp_path / "merged.json"
     out.write_text("{}", encoding="utf-8")
-    assert wb.cmd_merge(bank, BANK_PATH, tmp_path, out) == 2
+    assert wb.cmd_merge(bank, bank_path, tmp_path, out) == 2
     assert out.read_text(encoding="utf-8") == "{}"
 
 
 def test_merge_never_writes_acceptable_expressions_onto_non_single_element_items(
-        bank, tmp_path):
+        bank, bank_path, tmp_path):
     """双要素题的模式里没有这一格；写进去整份题库会结构不合法。"""
     wb.cmd_export(bank, tmp_path)
     _fill(tmp_path)
     out = tmp_path / "merged.json"
-    assert wb.cmd_merge(bank, BANK_PATH, tmp_path, out) == 0
+    assert wb.cmd_merge(bank, bank_path, tmp_path, out) == 0
     raw = json.loads(out.read_text(encoding="utf-8"))
     for item in raw["double_element"]:
         assert "acceptable_expressions" not in item, item["item_id"]
 
 
-def test_placeholders_are_never_merged_as_real_values(bank, tmp_path):
+def test_placeholders_are_never_merged_as_real_values(bank, bank_path, tmp_path):
     wb.cmd_export(bank, tmp_path)
     _fill(tmp_path)
     out = tmp_path / "merged.json"
-    assert wb.cmd_merge(bank, BANK_PATH, tmp_path, out) == 0
+    assert wb.cmd_merge(bank, bank_path, tmp_path, out) == 0
     text = out.read_text(encoding="utf-8")
     for placeholder in wb.PLACEHOLDERS:
         assert placeholder not in text, placeholder
 
 
-def test_a_broken_merge_leaves_no_half_written_bank_behind(bank, tmp_path, monkeypatch):
+def test_a_broken_merge_leaves_no_half_written_bank_behind(
+        bank, bank_path, tmp_path, monkeypatch):
     wb.cmd_export(bank, tmp_path)
     _fill(tmp_path)
     monkeypatch.setattr(wb, "merge_into_bank",
                         lambda *args, **kwargs: {"single_element": "不是数组"})
     out = tmp_path / "merged.json"
-    assert wb.cmd_merge(bank, BANK_PATH, tmp_path, out) == 1
+    assert wb.cmd_merge(bank, bank_path, tmp_path, out) == 1
     assert not out.exists()
     assert not list(tmp_path.glob("*.staged"))
 

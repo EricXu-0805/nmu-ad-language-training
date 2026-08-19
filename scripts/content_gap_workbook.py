@@ -163,7 +163,7 @@ README_TEXT = """# 内容缺口填表说明
 | --- | --- |
 | `item_id` / `task_type` / `response_role` | **系统填好的，不要改**。改了这一行会被判为无法对应到题位 |
 | `rubric_version` | 你自己的版本号，例如 `2026-08-v1`。改过口径就换一个 |
-| `decision_policy` | 只能填这三个之一：`any_acceptable_expression`（说中任意一个可接受说法就算对）、`all_required_concepts`（必须覆盖全部要点）、`hybrid`（两者结合） |
+| `decision_policy` | 只能填这四个之一：`any_acceptable_expression`（说中任意一个可接受说法就算对）、`all_required_concepts`（必须覆盖全部要点）、`all_concept_groups`（分组各取其一再求全，如"'大衣/衣服/外套'与'台灯/灯'"）、`hybrid`（前两者结合） |
 | `acceptable_expressions` | 可接受的说法，`；` 分隔 |
 | `required_concepts` | 必须说到的要点，`；` 分隔 |
 | `cue_1` | 第一层提示的原话（对老人说的完整句子） |
@@ -183,20 +183,16 @@ README_TEXT = """# 内容缺口填表说明
 
 ## 不在这两张表里的
 
-还有一批缺口不是填表能解决的，需要 PI 做内容决策：源协议里尚未结构化的题位、
-两张直接显示场景名称的刺激图是否去字重制、整体描述环节的完成条件、
-公园人物成功分支对"小伙子"的接受口径冲突。
-这些逐条列在 `scripts/content_freeze_report.py` 的输出里。
+还有一批缺口不是填表能解决的，需要 PI 做内容决策；逐条见
+`scripts/content_freeze_report.py` 的输出。
 
-## 先说清楚：填完这两张表，"交付缺口 60" 这个数不会变
+## 2026-08-19 起的现状
 
-这两张表补的是**内容**缺口——判分标准、可接受说法、难度标注。
-`content_freeze_report.py` 顶上那个"交付缺口合计 60"算的是另一件事：
-**冻结的自动流程今天只覆盖"单要素·命名"这一类题位**，双要素题不管判分标准写得
-多完整，自动执行仍然会被拒。那一条要靠扩自动流程协议来解，不是内容组的活。
-
-填完这两张表的实际效果是：题库的告警从 82 条降到 12 条，
-"缺判分标准的题位"从 30 个降到 0 个。这是真进展，只是它不体现在那个 60 上。
+第 2–8 周题库已按《会议决策总结20260706》判分口径结构化冻结，本工作簿导出的
+两张表在随包题库上已无空格可填。它仍然保留，用于两种情形：
+PI 修订某周判分口径时按位改词，以及下一迭代新增/替换题目时补内容。
+自动流程今天仍只覆盖"单要素·命名"（双要素/多要素为人工模式），
+那是自动流程协议的事，不是内容组的活。
 
 ## 填完之后
 
@@ -401,7 +397,7 @@ def cmd_merge(bank: content.ItemBank, bank_path: Path,
     print(f"  缺判分标准的题位：{len(content.unsupported_operational_rubrics(bank))}"
           f" → {len(content.unsupported_operational_rubrics(reloaded))}")
     print(f"  ready_for_research = {readiness['ready_for_research']}"
-          "（qc_status 还是 draft，本来就该是 False）")
+          "（merge 从不改 qc_status，冻结判定以复核签字为准）")
     if not readiness["operational_autopilot_ready"]:
         print("  自动执行仍未就绪：冻结的自动流程只覆盖「单要素·命名」，"
               "双要素题不管判分标准多完整都跑不了——那一条不是内容组能解的。")

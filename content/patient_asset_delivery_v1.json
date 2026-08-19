@@ -1,42 +1,1816 @@
 {
-  "manifest_schema_version": "patient-asset-delivery.v1",
-  "manifest_version_id": "wk2-private-webp-20260720.2",
-  "image_id_contract_version": "training-image-id.v1",
-  "definition_sha256": "f7c2ffcb870bd298febc2013839f26b5f73515b7bdcdd079cdebf15e235ed084",
-  "purpose": "simulation_private_byte_allowlist_not_research_asset_definition",
-  "release_scope": "simulation_only",
-  "research_release_status": "blocked_pending_source_transform_rights_and_content_approvals",
-  "media_type": "image/webp",
-  "assets": [
-    {"image_id": "wk2-01", "sha256": "9cdaf506a307e979a166c3f551ab5a7f07f006ec31c390bacef417ae9d31bcb1", "byte_size": 7058, "width": 388, "height": 240, "frame_count": 1},
-    {"image_id": "wk2-02", "sha256": "6f165554488d3675d02d8843d59d1a81b3d7e4e88b71d4847d4789107d3027e5", "byte_size": 6630, "width": 266, "height": 168, "frame_count": 1},
-    {"image_id": "wk2-03", "sha256": "942215d390a4dbe839db9a399239dfa6612f9b19e3bb1c4ce892e20aa6090a64", "byte_size": 27672, "width": 1122, "height": 1074, "frame_count": 1},
-    {"image_id": "wk2-04", "sha256": "a39f50eb68abd9fa2d74618d2d98812c2fbe60017314271feb6b8a43138fbfce", "byte_size": 8778, "width": 288, "height": 239, "frame_count": 1},
-    {"image_id": "wk2-05", "sha256": "35701ee9eb0bc15924f8da89974cf9b52b798f958bcb570f90c07adc2cc3a84d", "byte_size": 34018, "width": 1286, "height": 855, "frame_count": 1},
-    {"image_id": "wk2-06", "sha256": "ef42082a39f5450a67f709a0adbbcb3c231a78e9c00068904a113eaef4da03e0", "byte_size": 12900, "width": 1130, "height": 961, "frame_count": 1},
-    {"image_id": "wk2-07", "sha256": "91b59416e84dc59360ff588b4fbfda80915c021b33bf75a81dc66531f40528a6", "byte_size": 56818, "width": 1400, "height": 601, "frame_count": 1},
-    {"image_id": "wk2-08", "sha256": "44df83278f1544d4111af38f706b05e14d31085d8270ed3ec7b01fbb080b5167", "byte_size": 1896, "width": 132, "height": 114, "frame_count": 1},
-    {"image_id": "wk2-09", "sha256": "93fb9ef4bcef58bdd59bb8106938b3612d576dfb22307734dd9794563aba29a6", "byte_size": 5122, "width": 246, "height": 184, "frame_count": 1},
-    {"image_id": "wk2-10", "sha256": "54d22178daba7fe5de203ec0acbe3450cd6f680ea13c90e949cb55f483b1aeb1", "byte_size": 30700, "width": 975, "height": 1111, "frame_count": 1},
-    {"image_id": "wk2-11", "sha256": "28a9bc405319a8dc6aede76ad2639deb8cc33015cd7813528d52b952c0cb38c5", "byte_size": 4890, "width": 232, "height": 160, "frame_count": 1},
-    {"image_id": "wk2-12", "sha256": "9e07e3244989ef690189f2262ef40c3f4f701b2bf147f46868712353e3265fe0", "byte_size": 2656, "width": 173, "height": 167, "frame_count": 1},
-    {"image_id": "wk2-13", "sha256": "8e14e4d6b7d84c326b81fb416b01b3f07f68a5c815a8866b4ce08a79b315f2e9", "byte_size": 2604, "width": 240, "height": 196, "frame_count": 1},
-    {"image_id": "wk2-14", "sha256": "a60621844b3af6ccc1b35bd24c700d9d6370324669fe9085b15d59f61f4da6f6", "byte_size": 22210, "width": 936, "height": 946, "frame_count": 1},
-    {"image_id": "wk2-15", "sha256": "5e64348ad7e0ed5e28b9db90fe2b5117e4022037d8d652fa3ccdb1897dd9ac1e", "byte_size": 5534, "width": 259, "height": 151, "frame_count": 1},
-    {"image_id": "wk2-16", "sha256": "cb87a5c5c4f8fbf751b0ed863eec747740e07b5a066fd6003d333b425107cc14", "byte_size": 4330, "width": 165, "height": 200, "frame_count": 1},
-    {"image_id": "wk2-17", "sha256": "817329689153aec1de8f46d7a1e8439577978a771237ce6ba6b95f0bedd6f065", "byte_size": 3764, "width": 266, "height": 215, "frame_count": 1},
-    {"image_id": "wk2-18", "sha256": "656a85aeb561f150390ab5f36a9e9da97cc8fef4bbdf10250607914322d8521f", "byte_size": 17282, "width": 958, "height": 1201, "frame_count": 1},
-    {"image_id": "wk2-19", "sha256": "8db4b14422d8f2900b5e7d1e5a40281abbd312473fd023a0a0706505c7e9f4e6", "byte_size": 4050, "width": 199, "height": 147, "frame_count": 1},
-    {"image_id": "wk2-20", "sha256": "9d713ab75517e55f5ce0eda537b7a6e2c1c283abb4c0bd783d8caa79601468f7", "byte_size": 4790, "width": 278, "height": 182, "frame_count": 1},
-    {"image_id": "wk2-21", "sha256": "2d8c36d4641fc87fba8dcb306fb664e27b194b4391dd9b838f6587d29e687dfc", "byte_size": 15904, "width": 1045, "height": 460, "frame_count": 1},
-    {"image_id": "wk2-22", "sha256": "4f73d8fc0aab4ec2d2a127d77144f3dc1554125ab2928157569f4ff1aebbc9f0", "byte_size": 23492, "width": 985, "height": 439, "frame_count": 1},
-    {"image_id": "wk2-23", "sha256": "65e81dc8a7f54fee716bfe0e01b43db2263fff45e502407fc302fd9d369b9809", "byte_size": 14230, "width": 1255, "height": 465, "frame_count": 1},
-    {"image_id": "wk2-24", "sha256": "1772b8b1c68ec8af4a8929b3df910c7bbd7a146fa74bbb9bfb9980e77c1f5245", "byte_size": 10202, "width": 1035, "height": 410, "frame_count": 1},
-    {"image_id": "wk2-25", "sha256": "4df945c80d7753978042fc8fd092a7195567cca9543db969609c43ef28fdf0cd", "byte_size": 19150, "width": 1210, "height": 389, "frame_count": 1},
-    {"image_id": "wk2-26", "sha256": "d7277b995cf515a823c081e3dfe63afef4963fbbf1f6052768153dd61f991bc1", "byte_size": 25238, "width": 1105, "height": 394, "frame_count": 1},
-    {"image_id": "wk2-27", "sha256": "ada40c9f04c604133438ed9287fdac3dcca53c79e4a203dc9feeb7f21220cd3a", "byte_size": 22196, "width": 1260, "height": 385, "frame_count": 1},
-    {"image_id": "wk2-28", "sha256": "419e44be8a590cc8b9c08c03b2c2ae6656f5fb1112a26ee98c2abb65b1a72ed0", "byte_size": 12274, "width": 736, "height": 266, "frame_count": 1},
-    {"image_id": "wk2-29", "sha256": "26e95dcb97a151f7d66b55c7ca1c4540b8594b644ce63758cf1dbe157245708d", "byte_size": 21682, "width": 1142, "height": 581, "frame_count": 1},
-    {"image_id": "wk2-30", "sha256": "d5a91093ff2d522d43686f9320736edca5613028769cfb20a2a7ea8905b51051", "byte_size": 21014, "width": 1084, "height": 420, "frame_count": 1}
-  ]
+ "manifest_schema_version": "patient-asset-delivery.v1",
+ "manifest_version_id": "wk2-8-private-webp-20260819.1",
+ "image_id_contract_version": "training-image-id.v1",
+ "purpose": "research_and_simulation_byte_allowlist",
+ "release_scope": "research_and_simulation",
+ "research_release_status": "approved_for_research_presentation",
+ "media_type": "image/webp",
+ "assets": [
+  {
+   "image_id": "wk2-01",
+   "sha256": "9cdaf506a307e979a166c3f551ab5a7f07f006ec31c390bacef417ae9d31bcb1",
+   "byte_size": 7058,
+   "width": 388,
+   "height": 240,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-02",
+   "sha256": "6f165554488d3675d02d8843d59d1a81b3d7e4e88b71d4847d4789107d3027e5",
+   "byte_size": 6630,
+   "width": 266,
+   "height": 168,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-03",
+   "sha256": "942215d390a4dbe839db9a399239dfa6612f9b19e3bb1c4ce892e20aa6090a64",
+   "byte_size": 27672,
+   "width": 1122,
+   "height": 1074,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-04",
+   "sha256": "a39f50eb68abd9fa2d74618d2d98812c2fbe60017314271feb6b8a43138fbfce",
+   "byte_size": 8778,
+   "width": 288,
+   "height": 239,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-05",
+   "sha256": "35701ee9eb0bc15924f8da89974cf9b52b798f958bcb570f90c07adc2cc3a84d",
+   "byte_size": 34018,
+   "width": 1286,
+   "height": 855,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-06",
+   "sha256": "ef42082a39f5450a67f709a0adbbcb3c231a78e9c00068904a113eaef4da03e0",
+   "byte_size": 12900,
+   "width": 1130,
+   "height": 961,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-07",
+   "sha256": "91b59416e84dc59360ff588b4fbfda80915c021b33bf75a81dc66531f40528a6",
+   "byte_size": 56818,
+   "width": 1400,
+   "height": 601,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-08",
+   "sha256": "44df83278f1544d4111af38f706b05e14d31085d8270ed3ec7b01fbb080b5167",
+   "byte_size": 1896,
+   "width": 132,
+   "height": 114,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-09",
+   "sha256": "93fb9ef4bcef58bdd59bb8106938b3612d576dfb22307734dd9794563aba29a6",
+   "byte_size": 5122,
+   "width": 246,
+   "height": 184,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-10",
+   "sha256": "54d22178daba7fe5de203ec0acbe3450cd6f680ea13c90e949cb55f483b1aeb1",
+   "byte_size": 30700,
+   "width": 975,
+   "height": 1111,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-11",
+   "sha256": "28a9bc405319a8dc6aede76ad2639deb8cc33015cd7813528d52b952c0cb38c5",
+   "byte_size": 4890,
+   "width": 232,
+   "height": 160,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-12",
+   "sha256": "9e07e3244989ef690189f2262ef40c3f4f701b2bf147f46868712353e3265fe0",
+   "byte_size": 2656,
+   "width": 173,
+   "height": 167,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-13",
+   "sha256": "8e14e4d6b7d84c326b81fb416b01b3f07f68a5c815a8866b4ce08a79b315f2e9",
+   "byte_size": 2604,
+   "width": 240,
+   "height": 196,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-14",
+   "sha256": "a60621844b3af6ccc1b35bd24c700d9d6370324669fe9085b15d59f61f4da6f6",
+   "byte_size": 22210,
+   "width": 936,
+   "height": 946,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-15",
+   "sha256": "5e64348ad7e0ed5e28b9db90fe2b5117e4022037d8d652fa3ccdb1897dd9ac1e",
+   "byte_size": 5534,
+   "width": 259,
+   "height": 151,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-16",
+   "sha256": "cb87a5c5c4f8fbf751b0ed863eec747740e07b5a066fd6003d333b425107cc14",
+   "byte_size": 4330,
+   "width": 165,
+   "height": 200,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-17",
+   "sha256": "817329689153aec1de8f46d7a1e8439577978a771237ce6ba6b95f0bedd6f065",
+   "byte_size": 3764,
+   "width": 266,
+   "height": 215,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-18",
+   "sha256": "656a85aeb561f150390ab5f36a9e9da97cc8fef4bbdf10250607914322d8521f",
+   "byte_size": 17282,
+   "width": 958,
+   "height": 1201,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-19",
+   "sha256": "8db4b14422d8f2900b5e7d1e5a40281abbd312473fd023a0a0706505c7e9f4e6",
+   "byte_size": 4050,
+   "width": 199,
+   "height": 147,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-20",
+   "sha256": "9d713ab75517e55f5ce0eda537b7a6e2c1c283abb4c0bd783d8caa79601468f7",
+   "byte_size": 4790,
+   "width": 278,
+   "height": 182,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-21",
+   "sha256": "2d8c36d4641fc87fba8dcb306fb664e27b194b4391dd9b838f6587d29e687dfc",
+   "byte_size": 15904,
+   "width": 1045,
+   "height": 460,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-22",
+   "sha256": "4f73d8fc0aab4ec2d2a127d77144f3dc1554125ab2928157569f4ff1aebbc9f0",
+   "byte_size": 23492,
+   "width": 985,
+   "height": 439,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-23",
+   "sha256": "65e81dc8a7f54fee716bfe0e01b43db2263fff45e502407fc302fd9d369b9809",
+   "byte_size": 14230,
+   "width": 1255,
+   "height": 465,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-24",
+   "sha256": "1772b8b1c68ec8af4a8929b3df910c7bbd7a146fa74bbb9bfb9980e77c1f5245",
+   "byte_size": 10202,
+   "width": 1035,
+   "height": 410,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-25",
+   "sha256": "4df945c80d7753978042fc8fd092a7195567cca9543db969609c43ef28fdf0cd",
+   "byte_size": 19150,
+   "width": 1210,
+   "height": 389,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-26",
+   "sha256": "d7277b995cf515a823c081e3dfe63afef4963fbbf1f6052768153dd61f991bc1",
+   "byte_size": 25238,
+   "width": 1105,
+   "height": 394,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-27",
+   "sha256": "ada40c9f04c604133438ed9287fdac3dcca53c79e4a203dc9feeb7f21220cd3a",
+   "byte_size": 22196,
+   "width": 1260,
+   "height": 385,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-28",
+   "sha256": "419e44be8a590cc8b9c08c03b2c2ae6656f5fb1112a26ee98c2abb65b1a72ed0",
+   "byte_size": 12274,
+   "width": 736,
+   "height": 266,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-29",
+   "sha256": "26e95dcb97a151f7d66b55c7ca1c4540b8594b644ce63758cf1dbe157245708d",
+   "byte_size": 21682,
+   "width": 1142,
+   "height": 581,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-30",
+   "sha256": "d5a91093ff2d522d43686f9320736edca5613028769cfb20a2a7ea8905b51051",
+   "byte_size": 21014,
+   "width": 1084,
+   "height": 420,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-multi-01",
+   "sha256": "324e8b9a311a634031514cbd7a5f34555937672d624f0dcbeed5c30b5ab9a5ba",
+   "byte_size": 44180,
+   "width": 798,
+   "height": 790,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk2-multi-02",
+   "sha256": "a9301f45e14a517c9d2d069d6984e118d42f4bded0ddfa3fec5a6d81709d4dfd",
+   "byte_size": 122446,
+   "width": 1003,
+   "height": 1024,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-01",
+   "sha256": "bcc71037433c11b45c222c01871bb66add663f9a85d2b98be3b1e7d11b79ded6",
+   "byte_size": 8322,
+   "width": 370,
+   "height": 152,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-02",
+   "sha256": "d53e87aa9a7a377e8001ec7537157460a77521c4cf9f256f163cf71499425e5f",
+   "byte_size": 27432,
+   "width": 502,
+   "height": 702,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-03",
+   "sha256": "8a221644c21babb4421bb42e333e594da792a6d3b6d37988bf397e14bc653bb3",
+   "byte_size": 23194,
+   "width": 1183,
+   "height": 1181,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-04",
+   "sha256": "fe571edad0b8eb4690c6ec75872e682523d033d12d546278b918d6303493558e",
+   "byte_size": 3522,
+   "width": 194,
+   "height": 148,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-05",
+   "sha256": "a6255f4cabd31ca850c6c5269d49c2ec53129d11ec8209bd0db1fde611d6a6aa",
+   "byte_size": 71408,
+   "width": 1196,
+   "height": 1098,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-06",
+   "sha256": "02108b70b4ff87f403579e3ed8390e6b6fcbc293a9a8c58a86bdbbe02172263f",
+   "byte_size": 40992,
+   "width": 1230,
+   "height": 932,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-07",
+   "sha256": "a480dee4e3224943868fbf1985fc8aef329e270902180c63c3951f51329edb1b",
+   "byte_size": 5514,
+   "width": 204,
+   "height": 206,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-08",
+   "sha256": "9e8534acd937cb106d768869d2fa1c101e64cd3e1b577cf52acb84e63a089657",
+   "byte_size": 3256,
+   "width": 140,
+   "height": 110,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-09",
+   "sha256": "4eb040f8781aa63495c763ac7e8db5ee83d1ee6a2ea4ea6a1e9e6ab3ee95880f",
+   "byte_size": 7852,
+   "width": 266,
+   "height": 168,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-10",
+   "sha256": "ef4496ffb2f3b4adb7d89b651cc05038ead3a57a1eb51e1bd0b1f43a3ee0ec2d",
+   "byte_size": 4326,
+   "width": 292,
+   "height": 114,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-11",
+   "sha256": "49b5229903550e109a691cea5e50f54ac4cbbda8c04f3f8504d5cf26def536e3",
+   "byte_size": 41174,
+   "width": 975,
+   "height": 1111,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-12",
+   "sha256": "8a7f47a6c381ef1fc8f05d3bc31fd7ec7f8d3a297c04190bba55e4cd3591670f",
+   "byte_size": 243074,
+   "width": 1704,
+   "height": 1915,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-13",
+   "sha256": "a9cabfb3b32cda262d1118cc0a710eb67c5f126bdf8d72d74b9a63c73e6b26ab",
+   "byte_size": 3272,
+   "width": 179,
+   "height": 217,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-14",
+   "sha256": "8b68a9aa09f9385d937bb6a2004792a750b72c6980bb4ada2eac41f05c7c2c2a",
+   "byte_size": 7332,
+   "width": 164,
+   "height": 212,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-15",
+   "sha256": "1f85088f23d5ce29badc2e6928f53654448a38da19ef041bbde9489aea4cb0fe",
+   "byte_size": 33382,
+   "width": 1179,
+   "height": 1087,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-16",
+   "sha256": "73aeecd5f2e8fe755802b522c511d7e468506621985a3b47177c243c5e2dbbb7",
+   "byte_size": 11988,
+   "width": 374,
+   "height": 374,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-17",
+   "sha256": "c2fb3dd84b45829881db217936cfa7bcfe50335e7aa37219211722400b30aba9",
+   "byte_size": 5914,
+   "width": 270,
+   "height": 168,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-18",
+   "sha256": "f5af9bd0be81a2d24848f20eed7f3516fc86f1a32fce850a56eeaf5e6b5204e8",
+   "byte_size": 68530,
+   "width": 1258,
+   "height": 1052,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-19",
+   "sha256": "4d05c3cba9aa0a97b4a311a31df9e729e809e077e6491ce0616105c388da25a6",
+   "byte_size": 5120,
+   "width": 165,
+   "height": 200,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-20",
+   "sha256": "c99bdde91e0e0e140cee91b1512510c68485472d127ba38687e11de3882d203d",
+   "byte_size": 29528,
+   "width": 936,
+   "height": 946,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-21",
+   "sha256": "34409a95b841999ab588e17da485b2497a4f28f5e292d147ef2d102d0b60d2b5",
+   "byte_size": 7200,
+   "width": 667,
+   "height": 262,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-22",
+   "sha256": "f8a02a1144900161659fa3f7837179176e4c890d6a8a6de9da7f421ba9bc4a2f",
+   "byte_size": 32636,
+   "width": 1281,
+   "height": 461,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-23",
+   "sha256": "e80443f0b5312bc8970af5c01d55cdb8c8453cc878c6cb3bc94217c4666074cb",
+   "byte_size": 24998,
+   "width": 998,
+   "height": 581,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-24",
+   "sha256": "b4d42d1a48628523e522f59be528824b1ad661668aaa2a9b5cccf114515c793c",
+   "byte_size": 27522,
+   "width": 1142,
+   "height": 581,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-25",
+   "sha256": "aeb045afbaeb33a4121125ce40952ce5a56bc78d0a591131142a9f3c58969e0a",
+   "byte_size": 22500,
+   "width": 932,
+   "height": 392,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-26",
+   "sha256": "e0c84c1fc771c3ac1463ae8068141cbc032fdd4efef9471c267ed4713d639250",
+   "byte_size": 24624,
+   "width": 1028,
+   "height": 462,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-27",
+   "sha256": "f7efd6030db271f96c4a729f297c1b16fc5f1a4ca78c808971caebc316220eca",
+   "byte_size": 39740,
+   "width": 1033,
+   "height": 481,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-28",
+   "sha256": "2b98cab87b0a43b2d5ca9939a4309e417fc8335dba2a6352f5d38767391ac6e0",
+   "byte_size": 40730,
+   "width": 1284,
+   "height": 510,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-29",
+   "sha256": "73318cdedec45de04168b1a0f2638e65d4ae9c46e46f1f9cad7e5815faf2f210",
+   "byte_size": 24164,
+   "width": 1241,
+   "height": 535,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-30",
+   "sha256": "e920138a84ef069d0ca0292e8328889530d659cf610170d38d6e9f9f078d996a",
+   "byte_size": 23432,
+   "width": 716,
+   "height": 354,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-multi-01",
+   "sha256": "3a063ea193f65b2b3e62169c1328ed45097b85df75c7c2aa2ae054a28cdcd09e",
+   "byte_size": 91412,
+   "width": 914,
+   "height": 930,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk3-multi-02",
+   "sha256": "e386e0bf6958cd37778899660fc7b1db81c4a93fd8008dba2ce2fe0f055117a4",
+   "byte_size": 82850,
+   "width": 1222,
+   "height": 919,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-01",
+   "sha256": "adcff34f608f3dc0acb56bb9964cdd9b82fe111dd001688f38b50ea338986837",
+   "byte_size": 308714,
+   "width": 1902,
+   "height": 1824,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-02",
+   "sha256": "8a221644c21babb4421bb42e333e594da792a6d3b6d37988bf397e14bc653bb3",
+   "byte_size": 23194,
+   "width": 1183,
+   "height": 1181,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-03",
+   "sha256": "3c3675247f1a7f30d26a19365cf76ed82f8d7a429678a02b3aa32349a4bbc5c4",
+   "byte_size": 4606,
+   "width": 297,
+   "height": 163,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-04",
+   "sha256": "6035ee2326828e59dd31ec6f0c9e0b0860c5047ac91d34e93cecdd78334f73ab",
+   "byte_size": 50390,
+   "width": 1349,
+   "height": 1110,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-05",
+   "sha256": "c2a991cf6b91af23a677f23671cbf5eafea899888985eda8950c8f6fa412e962",
+   "byte_size": 2856,
+   "width": 147,
+   "height": 216,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-06",
+   "sha256": "69ad92212fdb0c2f40a217d23d9503e9c006613e1af252c48de67e623250a96d",
+   "byte_size": 5950,
+   "width": 188,
+   "height": 246,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-07",
+   "sha256": "c17d6fc594d74db6450fb0ed34bf0753ec6f83cdc35a304a343b396b759804ef",
+   "byte_size": 4064,
+   "width": 294,
+   "height": 173,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-08",
+   "sha256": "08a0a2e2532ebe5412249fec8a5409a9ae4931f67f0fc64cf45c1ade658736c6",
+   "byte_size": 27286,
+   "width": 794,
+   "height": 944,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-09",
+   "sha256": "4db41cc40a204fa41b64ab0adeac0c9bbf82d48fceea4d12b145f68aaa4a2c7b",
+   "byte_size": 13204,
+   "width": 582,
+   "height": 592,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-10",
+   "sha256": "6843c8c0f0a8e43e455aae07e2e7dfdba210af1647387c6b1f5ad3fd19af57e6",
+   "byte_size": 25314,
+   "width": 704,
+   "height": 1211,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-11",
+   "sha256": "a47f1addeb7a55068c134ebe36ae44a042964f3e44cdc06e710482503a7507a6",
+   "byte_size": 16726,
+   "width": 746,
+   "height": 590,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-12",
+   "sha256": "a9cabfb3b32cda262d1118cc0a710eb67c5f126bdf8d72d74b9a63c73e6b26ab",
+   "byte_size": 3272,
+   "width": 179,
+   "height": 217,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-13",
+   "sha256": "c99bdde91e0e0e140cee91b1512510c68485472d127ba38687e11de3882d203d",
+   "byte_size": 29528,
+   "width": 936,
+   "height": 946,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-14",
+   "sha256": "c074c5cf27facc698b226ac725545de83c7c9770e07fed641cb8e653c4537864",
+   "byte_size": 6158,
+   "width": 306,
+   "height": 221,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-15",
+   "sha256": "d3e6a0058a4df9126875a48bb58d7056a62cd13ce88eabf0026d8d569e94fa19",
+   "byte_size": 27526,
+   "width": 956,
+   "height": 972,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-16",
+   "sha256": "f7d74408b4f57eac616c70458e21908164e06a0e1b9d571246027f7de17e68bf",
+   "byte_size": 17420,
+   "width": 874,
+   "height": 756,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-17",
+   "sha256": "362a62db32e1cea8448d76fb98c1c21c97a00ff051509e791c3a88816506668e",
+   "byte_size": 6906,
+   "width": 275,
+   "height": 159,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-18",
+   "sha256": "9de219631cfa0210aba8194039af8056c0f57363d7da89a9f425cbc3df662082",
+   "byte_size": 36288,
+   "width": 750,
+   "height": 1162,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-19",
+   "sha256": "787e7217f6185a50217deabd85582cf42b5db972d1eb3265321cd5a754669dd3",
+   "byte_size": 60596,
+   "width": 726,
+   "height": 1178,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-20",
+   "sha256": "101319a1819ace560a4e5cd69e9aeaa2db42d25ced6b63aa838feca680213fd7",
+   "byte_size": 3086,
+   "width": 156,
+   "height": 164,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-21",
+   "sha256": "9981101ffb5f20b9b0baa20fa4ba6670d25e261054f1f12d4a8e9a5352d3dbbb",
+   "byte_size": 38032,
+   "width": 948,
+   "height": 416,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-22",
+   "sha256": "f94df04355ac5304964e3a2c1142c252391ddd41e10f1c6fbe287d0908368d75",
+   "byte_size": 25196,
+   "width": 1228,
+   "height": 593,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-23",
+   "sha256": "5a7bd26207bcced3a0445fba6ddea5f7da334501812092372506fe39e5d322fb",
+   "byte_size": 22200,
+   "width": 1187,
+   "height": 491,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-24",
+   "sha256": "ae58a486a886ff9d92a04a0c2c214f44addd7656b5f0d18ad152e1b63fb97bd4",
+   "byte_size": 24146,
+   "width": 852,
+   "height": 428,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-25",
+   "sha256": "8a2a055041c23cb36d585c3b43c4a2daaa386a3b400ed3801db47d391aba07ab",
+   "byte_size": 27334,
+   "width": 901,
+   "height": 455,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-26",
+   "sha256": "df0981ad686f5a9a9179767a7fb76c92759355aaa8994a3a23cd8a5f50a380f4",
+   "byte_size": 11328,
+   "width": 927,
+   "height": 394,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-27",
+   "sha256": "56cb9fce51706e2f99bb24e263e10388eedb384889287bbb1a54eb35b95a9b8e",
+   "byte_size": 18492,
+   "width": 932,
+   "height": 370,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-28",
+   "sha256": "ebda14c630f085fbcb39e0a670c6b5398a6a8796b0bdb5a80ee2a02083f4ee1a",
+   "byte_size": 12320,
+   "width": 712,
+   "height": 405,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-29",
+   "sha256": "ec418456e39d6c07f5eb36502a17826e526f84fe82d53ea1b8ba9567196fbae4",
+   "byte_size": 17064,
+   "width": 1017,
+   "height": 406,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-30",
+   "sha256": "4875488895a911e5c922973f6ffdd6897b23c33864040aebb76f782c02923e13",
+   "byte_size": 15542,
+   "width": 781,
+   "height": 348,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-multi-01",
+   "sha256": "294f4776bd7413aef28eeaf600c10b6035af7d6385c5711d09fd4b31426833fc",
+   "byte_size": 167962,
+   "width": 915,
+   "height": 932,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk4-multi-02",
+   "sha256": "55f5e86f00044ec41703b78f9c7c8b0ae02e6758e87b8989d0883e9ca23023de",
+   "byte_size": 40204,
+   "width": 961,
+   "height": 784,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-01",
+   "sha256": "f5130c8214497414cca67b8910b87b220aafa14cd6ced103566c9edbc3cf3883",
+   "byte_size": 14130,
+   "width": 246,
+   "height": 184,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-02",
+   "sha256": "03e2519074a6a4443ef12422b61a12a4d09c1b84391dd2763397dadaf7ce80ff",
+   "byte_size": 18224,
+   "width": 524,
+   "height": 1078,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-03",
+   "sha256": "504a6ebda878e1d0e407f2d30c6b27fcaa28e74de72f7743618bd5b5df1c4ef0",
+   "byte_size": 19898,
+   "width": 999,
+   "height": 809,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-04",
+   "sha256": "84c5526516d86a9514daad0d1622503582aca43771eb126f3a0aa02cc16e9327",
+   "byte_size": 5280,
+   "width": 248,
+   "height": 254,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-05",
+   "sha256": "8deb5549efcc6e917f918b358b0abab5523e2d658e4dde140caedd222fbfbce2",
+   "byte_size": 36136,
+   "width": 1016,
+   "height": 1130,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-06",
+   "sha256": "c053b333ef5ed9ca6fc1b3402617eddee893c3fcfd9d88a4526a2b23ad8494a5",
+   "byte_size": 131726,
+   "width": 1983,
+   "height": 851,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-07",
+   "sha256": "5612f03df527589ad4620b1ca03ef7d4403a95eadade38319035324667b2f095",
+   "byte_size": 5710,
+   "width": 278,
+   "height": 182,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-08",
+   "sha256": "005e762f2cd379d816703f7a10779b2ee29220bf9feb265ffe08dc79759879e5",
+   "byte_size": 15654,
+   "width": 1130,
+   "height": 961,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-09",
+   "sha256": "27955eefeb100db1cf267f48b3f7ded2580add9a6a219425f50de76c938a1cfc",
+   "byte_size": 49406,
+   "width": 824,
+   "height": 1214,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-10",
+   "sha256": "e7327df086d6beec6ec935dfef99b0c3200b580e1613f9c750591d2755bb95ed",
+   "byte_size": 37818,
+   "width": 1139,
+   "height": 1094,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-11",
+   "sha256": "c2a991cf6b91af23a677f23671cbf5eafea899888985eda8950c8f6fa412e962",
+   "byte_size": 2856,
+   "width": 147,
+   "height": 216,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-12",
+   "sha256": "de6db5c620bfe9d28a4ab01aafe3b9eda331490b323b5d296785ad72ff376a49",
+   "byte_size": 21196,
+   "width": 958,
+   "height": 1201,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-13",
+   "sha256": "75916fbe4ebc04b466d9f6b39a919cbba5d9d3670273ca1031550089e7036979",
+   "byte_size": 59784,
+   "width": 790,
+   "height": 1136,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-14",
+   "sha256": "de1b30e01a417b52767c86c8b0209c3fed8773fbbde7d90ea8020097297997ac",
+   "byte_size": 4524,
+   "width": 221,
+   "height": 121,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-15",
+   "sha256": "95aff406079e407662f15f00c4fda0b760e1e7330d62fef8d875968f5f9fa5a4",
+   "byte_size": 11988,
+   "width": 289,
+   "height": 158,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-16",
+   "sha256": "8ec5f739c09ed3827dd6cdbf602565bfa704cfadec1d211d98f6d00517f336c0",
+   "byte_size": 3634,
+   "width": 147,
+   "height": 165,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-17",
+   "sha256": "6362e0c3497b1a093d6e378be4dab74da7e79b43df726f8156b82d2d2e89531c",
+   "byte_size": 36252,
+   "width": 1122,
+   "height": 1074,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-18",
+   "sha256": "10fa54ed98a5ed4b27eeb679aa2a1d925e0cf5135cf1e31eaece761b878e1c82",
+   "byte_size": 6560,
+   "width": 259,
+   "height": 151,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-19",
+   "sha256": "ea5f302a0b831e73dbb1d27686f15dceb2516b2c6c7b5d0bfb3de8cacfc52f41",
+   "byte_size": 4806,
+   "width": 199,
+   "height": 147,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-20",
+   "sha256": "83a2a339fa52752705fd0bb62d2bf391d04431d043682cead39868c95343d040",
+   "byte_size": 39142,
+   "width": 954,
+   "height": 1142,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-21",
+   "sha256": "7d520e52fcd1dbba94a4c70c4f17fdee14f5aa717c2ac651317aa6747de3564c",
+   "byte_size": 19954,
+   "width": 1045,
+   "height": 460,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-22",
+   "sha256": "08a1d9a46d48b60218c524d7413f187b3c8caac91c79cbc8f26ab2257e6f0c8b",
+   "byte_size": 12806,
+   "width": 796,
+   "height": 471,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-23",
+   "sha256": "abd6324e7d8bdbde850c003d79796e39c59a415674b187fdc789b6b3240ab50c",
+   "byte_size": 15410,
+   "width": 914,
+   "height": 406,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-24",
+   "sha256": "838b7dfa944b9f4b644467f4b194acf2fd7e625b40ed83e93588b5efc3472012",
+   "byte_size": 20740,
+   "width": 1028,
+   "height": 451,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-25",
+   "sha256": "99c1f83f91c523e56401f58f7d267ab77ce29f7453e1520846c1d55dc73c5e68",
+   "byte_size": 35686,
+   "width": 1114,
+   "height": 442,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-26",
+   "sha256": "0c05071de16ab9e44c192bfd117833db2301cc763532a764a3a54a548191a66b",
+   "byte_size": 15452,
+   "width": 670,
+   "height": 239,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-27",
+   "sha256": "841e71e6ee8fa1706530c741494c5715f6b903e4e8604608d8a62729fca002a5",
+   "byte_size": 28728,
+   "width": 1260,
+   "height": 385,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-28",
+   "sha256": "b7e04e0d684d8bb50b435936706205031770b0bc10207a36b9f9a1c8886397de",
+   "byte_size": 14700,
+   "width": 609,
+   "height": 320,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-29",
+   "sha256": "0e0ff8f4480a2ef86a0776eb453e0fd7a501c1049ac7f389beb00b30dd25ed07",
+   "byte_size": 18356,
+   "width": 641,
+   "height": 358,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-30",
+   "sha256": "d000e616fe1c8f18593b4925f14bd6401907067e3a048c5c8579faac66244957",
+   "byte_size": 24036,
+   "width": 981,
+   "height": 469,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-multi-01",
+   "sha256": "11220039db6b93107529666b88df8d3d4a4c2e6c48d46d398aeab1e24529becb",
+   "byte_size": 43634,
+   "width": 1698,
+   "height": 922,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk5-multi-02",
+   "sha256": "67c67e60b8fd40e7808e2dd3740b20a69bb45261ae8620abcfd8135a269775a7",
+   "byte_size": 73568,
+   "width": 1290,
+   "height": 1030,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-01",
+   "sha256": "8b68a9aa09f9385d937bb6a2004792a750b72c6980bb4ada2eac41f05c7c2c2a",
+   "byte_size": 7332,
+   "width": 164,
+   "height": 212,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-02",
+   "sha256": "84c5526516d86a9514daad0d1622503582aca43771eb126f3a0aa02cc16e9327",
+   "byte_size": 5280,
+   "width": 248,
+   "height": 254,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-03",
+   "sha256": "581dde2cd3f18bf96b6dadd9ad7cc650f78602e6f533a3412b1e1f8d230407b0",
+   "byte_size": 37166,
+   "width": 858,
+   "height": 1144,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-04",
+   "sha256": "73aeecd5f2e8fe755802b522c511d7e468506621985a3b47177c243c5e2dbbb7",
+   "byte_size": 11988,
+   "width": 374,
+   "height": 374,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-05",
+   "sha256": "005edc520b7ccfc8571c4000dd9d6dacf1d6cad6e311d9feee198d79c04875ab",
+   "byte_size": 10460,
+   "width": 288,
+   "height": 239,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-06",
+   "sha256": "8a221644c21babb4421bb42e333e594da792a6d3b6d37988bf397e14bc653bb3",
+   "byte_size": 23194,
+   "width": 1183,
+   "height": 1181,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-07",
+   "sha256": "9ab8d1502e9f5ba2084639232209098003a954cb6ad1c7cb9fd52695a129d2c1",
+   "byte_size": 9812,
+   "width": 1046,
+   "height": 589,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-08",
+   "sha256": "bcc71037433c11b45c222c01871bb66add663f9a85d2b98be3b1e7d11b79ded6",
+   "byte_size": 8322,
+   "width": 370,
+   "height": 152,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-09",
+   "sha256": "49b5229903550e109a691cea5e50f54ac4cbbda8c04f3f8504d5cf26def536e3",
+   "byte_size": 41174,
+   "width": 975,
+   "height": 1111,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-10",
+   "sha256": "03a53370c6424ad5fa6a8b79358bea110e3db3288e690258184ab1b67ef05d1c",
+   "byte_size": 5624,
+   "width": 112,
+   "height": 254,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-11",
+   "sha256": "ef4496ffb2f3b4adb7d89b651cc05038ead3a57a1eb51e1bd0b1f43a3ee0ec2d",
+   "byte_size": 4326,
+   "width": 292,
+   "height": 114,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-12",
+   "sha256": "9e8534acd937cb106d768869d2fa1c101e64cd3e1b577cf52acb84e63a089657",
+   "byte_size": 3256,
+   "width": 140,
+   "height": 110,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-13",
+   "sha256": "8932e2c1a501a788a59d6fd21afe0cede32ce233f1e7bd2e6c69598d43905b7c",
+   "byte_size": 43142,
+   "width": 1286,
+   "height": 855,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-14",
+   "sha256": "1388c2b0ea49d99efaaa7793f0b65ca283916188e6849e5c83370e10015b4661",
+   "byte_size": 3286,
+   "width": 134,
+   "height": 222,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-15",
+   "sha256": "27f77e8a24f5e7967d21ade5faa0bce3d55fe13af2a22b553ecd68e15b9d65f4",
+   "byte_size": 8926,
+   "width": 330,
+   "height": 176,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-16",
+   "sha256": "ee8f1762962ff462a9bf8172961542f352e6cbed0a649b759bf5d191433c71b7",
+   "byte_size": 2916,
+   "width": 284,
+   "height": 171,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-17",
+   "sha256": "4953782b24e102d078a888d77aaf0b3083cad7eb3e921720d5714a9178bbf571",
+   "byte_size": 12594,
+   "width": 415,
+   "height": 228,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-18",
+   "sha256": "c34fa43790a84ad1381d2b653cbe2bbe3ee629756e65e2491f01a3534a7a77d4",
+   "byte_size": 31114,
+   "width": 1308,
+   "height": 973,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-19",
+   "sha256": "4d05c3cba9aa0a97b4a311a31df9e729e809e077e6491ce0616105c388da25a6",
+   "byte_size": 5120,
+   "width": 165,
+   "height": 200,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-20",
+   "sha256": "91460130047022c81afa8ddc61b37ea6ec18da31fd8f70539a330e8a213b68a7",
+   "byte_size": 69922,
+   "width": 1172,
+   "height": 1100,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-21",
+   "sha256": "34409a95b841999ab588e17da485b2497a4f28f5e292d147ef2d102d0b60d2b5",
+   "byte_size": 7200,
+   "width": 667,
+   "height": 262,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-22",
+   "sha256": "2c7a6cecd3a05c7ea39abdfab37d46480141e95e80d4e7ac46bf08449469ab5b",
+   "byte_size": 24940,
+   "width": 1167,
+   "height": 472,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-23",
+   "sha256": "bf97e8dc690a9550e01a846966f99f66b71b64d446d9421527db1a72e103800d",
+   "byte_size": 19482,
+   "width": 1100,
+   "height": 518,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-24",
+   "sha256": "5f3c03d5db04fe64454201de8ba498edda942c9f81b63b6ba38153f7416f0b87",
+   "byte_size": 9186,
+   "width": 899,
+   "height": 434,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-25",
+   "sha256": "c705bca5abed09050b1a78f973c1311a4e2eeec19356e291e82b483e8cdbe64e",
+   "byte_size": 23624,
+   "width": 991,
+   "height": 440,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-26",
+   "sha256": "e0c84c1fc771c3ac1463ae8068141cbc032fdd4efef9471c267ed4713d639250",
+   "byte_size": 24624,
+   "width": 1028,
+   "height": 462,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-27",
+   "sha256": "f8a02a1144900161659fa3f7837179176e4c890d6a8a6de9da7f421ba9bc4a2f",
+   "byte_size": 32636,
+   "width": 1281,
+   "height": 461,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-28",
+   "sha256": "6426eb46915580532f0b387aff238b79def962a03439c8eaaf6fe1888c8e5552",
+   "byte_size": 28522,
+   "width": 1030,
+   "height": 445,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-29",
+   "sha256": "2d0b73b4bae574f98839a7d3a25d951ed508b5d2320376609429d2cc3247749c",
+   "byte_size": 20064,
+   "width": 822,
+   "height": 465,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-30",
+   "sha256": "db8185f42d4a8417b88b77d83999c954c0e359200afdc45b5943c8abc1bb3023",
+   "byte_size": 29978,
+   "width": 1113,
+   "height": 406,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-multi-01",
+   "sha256": "3a063ea193f65b2b3e62169c1328ed45097b85df75c7c2aa2ae054a28cdcd09e",
+   "byte_size": 91412,
+   "width": 914,
+   "height": 930,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk6-multi-02",
+   "sha256": "181ae649646ab4de6b9a477c2883df3ad18a7349ca4df994cd4395a577dceec7",
+   "byte_size": 82968,
+   "width": 1254,
+   "height": 924,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-01",
+   "sha256": "69ad92212fdb0c2f40a217d23d9503e9c006613e1af252c48de67e623250a96d",
+   "byte_size": 5950,
+   "width": 188,
+   "height": 246,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-02",
+   "sha256": "8a221644c21babb4421bb42e333e594da792a6d3b6d37988bf397e14bc653bb3",
+   "byte_size": 23194,
+   "width": 1183,
+   "height": 1181,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-03",
+   "sha256": "8a7f47a6c381ef1fc8f05d3bc31fd7ec7f8d3a297c04190bba55e4cd3591670f",
+   "byte_size": 243074,
+   "width": 1704,
+   "height": 1915,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-04",
+   "sha256": "3c3675247f1a7f30d26a19365cf76ed82f8d7a429678a02b3aa32349a4bbc5c4",
+   "byte_size": 4606,
+   "width": 297,
+   "height": 163,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-05",
+   "sha256": "940c483c0ef0273bffd834e12e976fd9bbb4eb767c65a85b9af514ca772629ce",
+   "byte_size": 3180,
+   "width": 218,
+   "height": 146,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-06",
+   "sha256": "adcff34f608f3dc0acb56bb9964cdd9b82fe111dd001688f38b50ea338986837",
+   "byte_size": 308714,
+   "width": 1902,
+   "height": 1824,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-07",
+   "sha256": "02108b70b4ff87f403579e3ed8390e6b6fcbc293a9a8c58a86bdbbe02172263f",
+   "byte_size": 40992,
+   "width": 1230,
+   "height": 932,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-08",
+   "sha256": "bdf18ad4d50e69941b9b836ce606722d5adf83e2123aee6f15a123433979a2cc",
+   "byte_size": 38344,
+   "width": 1087,
+   "height": 777,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-09",
+   "sha256": "5238c5092ba797308c5fcaddf9faf64911bc5ac5da7498c4bdc37b76392c6e41",
+   "byte_size": 5038,
+   "width": 188,
+   "height": 94,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-10",
+   "sha256": "678ee17ce5c6f28d84b2d15cf14e834b462a64088739aaa3c9d5c7b6c7f34879",
+   "byte_size": 3974,
+   "width": 258,
+   "height": 148,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-11",
+   "sha256": "c17d6fc594d74db6450fb0ed34bf0753ec6f83cdc35a304a343b396b759804ef",
+   "byte_size": 4064,
+   "width": 294,
+   "height": 173,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-12",
+   "sha256": "08a0a2e2532ebe5412249fec8a5409a9ae4931f67f0fc64cf45c1ade658736c6",
+   "byte_size": 27286,
+   "width": 794,
+   "height": 944,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-13",
+   "sha256": "95a53ca86c2fb93c894812245895c3aba02820607d50e2fd9b72f1a67f8a8b4d",
+   "byte_size": 3218,
+   "width": 124,
+   "height": 229,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-14",
+   "sha256": "fdb65edd60ee88c4ce6a58790d38d674ce71c3eb97403ddfbf08e89dbbad96f7",
+   "byte_size": 3162,
+   "width": 250,
+   "height": 166,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-15",
+   "sha256": "42e1696ec46a42a19aa7924ea3a950fbba0b068fb0a933625b285e14d362fa82",
+   "byte_size": 4268,
+   "width": 148,
+   "height": 244,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-16",
+   "sha256": "ca489fbc02f2b9c25ddc41b127fbcf9e03416df0acaa27e4bb2104f310caa49a",
+   "byte_size": 23554,
+   "width": 1136,
+   "height": 1000,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-17",
+   "sha256": "8a6b327c23b19a538515b25e16a33cacd5f8c315bce7ddcf3a33cb2ad143d54b",
+   "byte_size": 4390,
+   "width": 240,
+   "height": 148,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-18",
+   "sha256": "15c07e7adfc80583b043b7893e3d9aa5b8c24d799ff39e3958cc7fdaa89a650a",
+   "byte_size": 4292,
+   "width": 242,
+   "height": 148,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-19",
+   "sha256": "10fa54ed98a5ed4b27eeb679aa2a1d925e0cf5135cf1e31eaece761b878e1c82",
+   "byte_size": 6560,
+   "width": 259,
+   "height": 151,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-20",
+   "sha256": "101319a1819ace560a4e5cd69e9aeaa2db42d25ced6b63aa838feca680213fd7",
+   "byte_size": 3086,
+   "width": 156,
+   "height": 164,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-21",
+   "sha256": "9981101ffb5f20b9b0baa20fa4ba6670d25e261054f1f12d4a8e9a5352d3dbbb",
+   "byte_size": 38032,
+   "width": 948,
+   "height": 416,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-22",
+   "sha256": "f7efd6030db271f96c4a729f297c1b16fc5f1a4ca78c808971caebc316220eca",
+   "byte_size": 39740,
+   "width": 1033,
+   "height": 481,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-23",
+   "sha256": "3f215dfb50fd009c032c99cfa45fed50a6ed21af94e54324c30336f11b2c6bb2",
+   "byte_size": 20878,
+   "width": 1017,
+   "height": 368,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-24",
+   "sha256": "073ab5f091176881c69cdfc6ea5964faa665327cebb8802ae30daf8705c776bb",
+   "byte_size": 13312,
+   "width": 917,
+   "height": 508,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-25",
+   "sha256": "3d89696fb0ea5ad22bccef55638c1235dbca5d521a87b266b45b7ebd15b34203",
+   "byte_size": 21194,
+   "width": 1242,
+   "height": 394,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-26",
+   "sha256": "df0981ad686f5a9a9179767a7fb76c92759355aaa8994a3a23cd8a5f50a380f4",
+   "byte_size": 11328,
+   "width": 927,
+   "height": 394,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-27",
+   "sha256": "f94df04355ac5304964e3a2c1142c252391ddd41e10f1c6fbe287d0908368d75",
+   "byte_size": 25196,
+   "width": 1228,
+   "height": 593,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-28",
+   "sha256": "59776d2e24693dd6c6aaf8ea518a02680612dca1105cdc29c3f10cf30ed891fe",
+   "byte_size": 11106,
+   "width": 905,
+   "height": 298,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-29",
+   "sha256": "003644b3a015645cc53e1ea649aadb0b098a71f9c99aa4394dd04756d597b8f8",
+   "byte_size": 23002,
+   "width": 1010,
+   "height": 412,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-30",
+   "sha256": "b51553e23f27d937ba36b2a035fec5e42802f411e8ff74094db3d15ec30751b5",
+   "byte_size": 13744,
+   "width": 824,
+   "height": 472,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-multi-01",
+   "sha256": "8ec9029cdfc64457c7e0d2262621093415f3237c66de7b3ce402bc4e6e029628",
+   "byte_size": 41554,
+   "width": 890,
+   "height": 930,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk7-multi-02",
+   "sha256": "21125758f97f979315fd444f9b93b8bbe19225cbb75b3e823a0935924f6c941c",
+   "byte_size": 107156,
+   "width": 1690,
+   "height": 928,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-01",
+   "sha256": "4db41cc40a204fa41b64ab0adeac0c9bbf82d48fceea4d12b145f68aaa4a2c7b",
+   "byte_size": 13204,
+   "width": 582,
+   "height": 592,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-02",
+   "sha256": "1e6d220a36f9abfa678b1618e440ea0ce2266df018d7e51caaa64f75a57e481e",
+   "byte_size": 4632,
+   "width": 266,
+   "height": 215,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-03",
+   "sha256": "1388c2b0ea49d99efaaa7793f0b65ca283916188e6849e5c83370e10015b4661",
+   "byte_size": 3286,
+   "width": 134,
+   "height": 222,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-04",
+   "sha256": "8ec5f739c09ed3827dd6cdbf602565bfa704cfadec1d211d98f6d00517f336c0",
+   "byte_size": 3634,
+   "width": 147,
+   "height": 165,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-05",
+   "sha256": "940c483c0ef0273bffd834e12e976fd9bbb4eb767c65a85b9af514ca772629ce",
+   "byte_size": 3180,
+   "width": 218,
+   "height": 146,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-06",
+   "sha256": "6035ee2326828e59dd31ec6f0c9e0b0860c5047ac91d34e93cecdd78334f73ab",
+   "byte_size": 50390,
+   "width": 1349,
+   "height": 1110,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-07",
+   "sha256": "c2a991cf6b91af23a677f23671cbf5eafea899888985eda8950c8f6fa412e962",
+   "byte_size": 2856,
+   "width": 147,
+   "height": 216,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-08",
+   "sha256": "581dde2cd3f18bf96b6dadd9ad7cc650f78602e6f533a3412b1e1f8d230407b0",
+   "byte_size": 37166,
+   "width": 858,
+   "height": 1144,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-09",
+   "sha256": "678ee17ce5c6f28d84b2d15cf14e834b462a64088739aaa3c9d5c7b6c7f34879",
+   "byte_size": 3974,
+   "width": 258,
+   "height": 148,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-10",
+   "sha256": "5244f69e2e87b98d03f4bbdd61a9c7ca68b05593e1d520a83c47d75782a43f5d",
+   "byte_size": 4294,
+   "width": 194,
+   "height": 120,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-11",
+   "sha256": "03e2519074a6a4443ef12422b61a12a4d09c1b84391dd2763397dadaf7ce80ff",
+   "byte_size": 18224,
+   "width": 524,
+   "height": 1078,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-12",
+   "sha256": "a6255f4cabd31ca850c6c5269d49c2ec53129d11ec8209bd0db1fde611d6a6aa",
+   "byte_size": 71408,
+   "width": 1196,
+   "height": 1098,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-13",
+   "sha256": "9ab8d1502e9f5ba2084639232209098003a954cb6ad1c7cb9fd52695a129d2c1",
+   "byte_size": 9812,
+   "width": 1046,
+   "height": 589,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-14",
+   "sha256": "ee8f1762962ff462a9bf8172961542f352e6cbed0a649b759bf5d191433c71b7",
+   "byte_size": 2916,
+   "width": 284,
+   "height": 171,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-15",
+   "sha256": "8a6b327c23b19a538515b25e16a33cacd5f8c315bce7ddcf3a33cb2ad143d54b",
+   "byte_size": 4390,
+   "width": 240,
+   "height": 148,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-16",
+   "sha256": "4fc9574cf580db532d0518df98b7891acf6bd398a529b4e81eaaa1bfd75b4874",
+   "byte_size": 3158,
+   "width": 173,
+   "height": 167,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-17",
+   "sha256": "c2fb3dd84b45829881db217936cfa7bcfe50335e7aa37219211722400b30aba9",
+   "byte_size": 5914,
+   "width": 270,
+   "height": 168,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-18",
+   "sha256": "504a6ebda878e1d0e407f2d30c6b27fcaa28e74de72f7743618bd5b5df1c4ef0",
+   "byte_size": 19898,
+   "width": 999,
+   "height": 809,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-19",
+   "sha256": "bdf18ad4d50e69941b9b836ce606722d5adf83e2123aee6f15a123433979a2cc",
+   "byte_size": 38344,
+   "width": 1087,
+   "height": 777,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-20",
+   "sha256": "3eab21a1999fc3ebec045bd425b409e22e5c08068160f924569c173bdc082d89",
+   "byte_size": 5672,
+   "width": 252,
+   "height": 174,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-21",
+   "sha256": "56cb9fce51706e2f99bb24e263e10388eedb384889287bbb1a54eb35b95a9b8e",
+   "byte_size": 18492,
+   "width": 932,
+   "height": 370,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-22",
+   "sha256": "08a1d9a46d48b60218c524d7413f187b3c8caac91c79cbc8f26ab2257e6f0c8b",
+   "byte_size": 12806,
+   "width": 796,
+   "height": 471,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-23",
+   "sha256": "09a1c5f577cde060b692752b04c80e70d7f59224931410f709ef7a90fe8ededc",
+   "byte_size": 18624,
+   "width": 1255,
+   "height": 465,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-24",
+   "sha256": "2b98cab87b0a43b2d5ca9939a4309e417fc8335dba2a6352f5d38767391ac6e0",
+   "byte_size": 40730,
+   "width": 1284,
+   "height": 510,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-25",
+   "sha256": "2c1ae8831190a22fdff063e0ac586d78398102d7df10bead276e89e297374e41",
+   "byte_size": 20836,
+   "width": 1001,
+   "height": 345,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-26",
+   "sha256": "abd6324e7d8bdbde850c003d79796e39c59a415674b187fdc789b6b3240ab50c",
+   "byte_size": 15410,
+   "width": 914,
+   "height": 406,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-27",
+   "sha256": "bf97e8dc690a9550e01a846966f99f66b71b64d446d9421527db1a72e103800d",
+   "byte_size": 19482,
+   "width": 1100,
+   "height": 518,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-28",
+   "sha256": "3f215dfb50fd009c032c99cfa45fed50a6ed21af94e54324c30336f11b2c6bb2",
+   "byte_size": 20878,
+   "width": 1017,
+   "height": 368,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-29",
+   "sha256": "59776d2e24693dd6c6aaf8ea518a02680612dca1105cdc29c3f10cf30ed891fe",
+   "byte_size": 11106,
+   "width": 905,
+   "height": 298,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-30",
+   "sha256": "5f3c03d5db04fe64454201de8ba498edda942c9f81b63b6ba38153f7416f0b87",
+   "byte_size": 9186,
+   "width": 899,
+   "height": 434,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-multi-01",
+   "sha256": "ab86428993e42e20f8b4f4a9f7dac896a181918bc9db8e3aa4e9a5b4e3a5ae0d",
+   "byte_size": 9818,
+   "width": 402,
+   "height": 596,
+   "frame_count": 1
+  },
+  {
+   "image_id": "wk8-multi-02",
+   "sha256": "7c094f0abf5725cf6293b39df591c2b61b3aeb700297bb07987aaf39aac91ff6",
+   "byte_size": 61652,
+   "width": 1133,
+   "height": 932,
+   "frame_count": 1
+  }
+ ],
+ "research_release_approvals": {
+  "source_transform_rights": {
+   "approved_by": "钱凯（口头授权按会议决策处理，Eric 2026-08-19 转达；书面签署待补）",
+   "approved_at": "2026-08-19",
+   "scope_sha256": "e480dae64a88befa3cbe8e04f7a9a0393ded16373dc442464906041f38b272cb"
+  },
+  "content": {
+   "approved_by": "钱凯（口头授权按会议决策处理，Eric 2026-08-19 转达；书面签署待补）",
+   "approved_at": "2026-08-19",
+   "scope_sha256": "e480dae64a88befa3cbe8e04f7a9a0393ded16373dc442464906041f38b272cb"
+  }
+ },
+ "definition_sha256": "d786faa0f8dcba657a9d2d8c95b3e3d50737500459b6aee8b3c5079b4a9605c4"
 }

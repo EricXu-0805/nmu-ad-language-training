@@ -189,9 +189,11 @@ def test_existing_week2_item_bank_image_ids_are_a_manifest_subset():
         if row.get("image_id")
     }
 
+    # 2026-08-19 内容交付后 week2 题库含 20 单要素 + 10 双要素 + 2 多要素,
+    # 多要素两题使用显式 multi 位(源 31/32 槽)的 image_id。
     assert bank_ids == {
         f"wk2-{position:02d}" for position in range(1, 31)
-    }
+    } | {"wk2-multi-01", "wk2-multi-02"}
     assert bank_ids <= manifest_ids
     assert bank["supported_training_weeks"] == [2]
     assert _load(PROTOCOL_PATH)["supported_training_weeks"] == [2]

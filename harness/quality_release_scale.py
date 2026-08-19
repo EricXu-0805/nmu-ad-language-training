@@ -48,12 +48,12 @@ from typing import Any
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 AS_OF = datetime(2026, 8, 17, 0, 0, 0)
 SETTLED_AT = AS_OF - timedelta(days=30)
-ITEMS_PER_WEEK2_SESSION = 30
-TURNS_PER_WEEK2_SESSION = 70
+ITEMS_PER_WEEK2_SESSION = 32
+TURNS_PER_WEEK2_SESSION = 78
 ATTEMPTS_PER_TURN = 2
 # item + turn + 2 attempts + 2 audio rows + 2 capture receipts + confirmation
-# revision + one interaction = 30 + 70 * 9 = 660.
-EVIDENCE_ROWS_PER_SESSION = 660
+# revision + one interaction = 32 + 78 * 9 = 734.
+EVIDENCE_ROWS_PER_SESSION = 734
 _SOURCE_IDENTITY_EXACT_FILES = (
     "alembic.ini",
     "pyproject.toml",

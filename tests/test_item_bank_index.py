@@ -21,14 +21,36 @@ def _index(banks) -> dict:
     return {"schema_version": "item-bank-index.v1", "banks": banks}
 
 
-def test_shipped_index_resolves_week_two_and_refuses_the_rest():
-    assert sorted(content.load_item_bank_index()) == [2]
-    bank = content.load_item_bank_for_week(2)
-    assert bank.version_id == "wk2-v1-20260707"
+def test_shipped_index_resolves_all_seven_training_weeks():
+    # 2026-08-19 内容交付:week2..8 七周题库全部登记并可解析。
+    assert sorted(content.load_item_bank_index()) == [2, 3, 4, 5, 6, 7, 8]
+    assert content.load_item_bank_for_week(2).version_id == "wk2-v1-20260707"
     for week in (3, 4, 5, 6, 7, 8):
-        with pytest.raises(content.TrainingWeekContentUnavailable) as exc:
-            content.load_item_bank_for_week(week)
-        assert f"第{week}周材料尚未结构化" in str(exc.value)
+        bank = content.load_item_bank_for_week(week)
+        assert bank.version_id == f"wk{week}-v1-20260819"
+        assert bank.supported_training_weeks == (week,)
+
+
+def test_dropping_a_week_from_the_index_refuses_that_week_again(tmp_path):
+    # 守门行为不因内容交付而消失:staged 副本摘掉第5周登记后必须回到 fail-closed。
+    staged = tmp_path / "content"
+    staged.mkdir()
+    for name in ("item_bank_v1.json",
+                 *(f"item_bank_week{w}_v1.json" for w in range(3, 9))):
+        shutil.copy(content.CONTENT_DIR / name, staged)
+    index = json.loads((content.CONTENT_DIR / content.ITEM_BANK_INDEX_FILE)
+                       .read_text(encoding="utf-8"))
+    index["banks"] = [row for row in index["banks"] if row["week_no"] != 5]
+    (staged / content.ITEM_BANK_INDEX_FILE).write_text(
+        json.dumps(index, ensure_ascii=False), encoding="utf-8")
+
+    assert sorted(content.load_item_bank_index(staged)) == [2, 3, 4, 6, 7, 8]
+    with pytest.raises(content.TrainingWeekContentUnavailable) as exc:
+        content.load_item_bank_for_week(5, staged)
+    assert "第5周材料尚未结构化" in str(exc.value)
+    # 未摘除的周解析不受影响。
+    assert content.load_item_bank_for_week(3, staged).version_id == (
+        "wk3-v1-20260819")
 
 
 def test_missing_or_malformed_index_fails_closed(tmp_path):

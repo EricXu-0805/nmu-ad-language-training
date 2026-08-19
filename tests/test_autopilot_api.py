@@ -766,13 +766,15 @@ def test_default_draft_week2_plan_returns_structured_gap_before_ownership(
     assert denied.json()["detail"] == {
         "code": "autopilot_plan_not_fully_supported",
         "message": (
-            "完整源协议仍有 60 个位置不受当前自动协议支持；"
+            "完整源协议仍有 58 个位置不受当前自动协议支持；"
             "首个缺口为 DE_烟灰缸+烟#1:左命名"
         ),
-        "unsupported_position_count": 60,
-        "structured_unsupported_position_count": 50,
-        "source_unstructured_position_count": 10,
-        "source_protocol_position_count": 80,
+        # 2026-08-19 内容交付后源协议全量结构化(78 位置,无 source-only 缺口);
+        # 剩余 58 个缺口全部是 operational_protocol_unavailable 类结构化缺口。
+        "unsupported_position_count": 58,
+        "structured_unsupported_position_count": 58,
+        "source_unstructured_position_count": 0,
+        "source_protocol_position_count": 78,
         "first_gap": {
             "code": "operational_protocol_unavailable",
             "item_id": "DE_烟灰缸+烟",

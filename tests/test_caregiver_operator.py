@@ -350,7 +350,7 @@ def test_caregiver_login_today_status_activation_and_logout(caregiver_clients):
         "data_classification": "simulation",
         "autopilot_profile_version_id": None,
         "completion_scope": "canonical_full_source",
-        "resolved_position_count": 70,
+        "resolved_position_count": 78,
         "operational_demo_ready": False,
         "runtime_status": "active",
         "runtime_revision": 0,

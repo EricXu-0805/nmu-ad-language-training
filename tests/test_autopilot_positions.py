@@ -11,7 +11,8 @@ BANK = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
 def test_current_bank_traverses_every_sequentially_complete_position_before_first_gap():
     positions = autopilot_positions.build_positions(
         BANK, week_no=2, event_line="正式训练")
-    assert len(positions) == 20 + 10 * 5
+    # 2026-08-19 起题库含 20 单要素 + 10 双要素(各 5 轮) + 2 多要素(各 4 轮)。
+    assert len(positions) == 20 + 10 * 5 + 2 * 4
 
     first = autopilot_positions.first_position_decision(
         BANK, week_no=2, event_line="正式训练")

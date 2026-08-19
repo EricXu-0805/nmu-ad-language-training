@@ -5,84 +5,19 @@
  "supported_training_weeks": [
   2
  ],
- "qc_status": "draft",
+ "qc_status": "frozen",
  "source": "20260629/第二周训练内容.docx（逐字抽取，仅代表第2周；第3–8周各有独立且部分复现的训练材料）",
  "source_document_sha256": "b3310b61bdc6afb437cbc05785bd6f4e1f6c30dd53ad0999eb2c0fea10c3891a",
  "source_normalized_text_sha256": "b7f2ad1d4389ee6193721402b1d39d9c3cc7a15d2341807471a5fc4627d06c55",
- "draft_revision": "2026-07-20.4",
+ "draft_revision": "2026-08-19.1",
  "patient_asset_delivery_manifest": {
-  "version_id": "wk2-private-webp-20260720.2",
-  "definition_sha256": "f7c2ffcb870bd298febc2013839f26b5f73515b7bdcdd079cdebf15e235ed084"
+  "version_id": "wk2-8-private-webp-20260819.1",
+  "definition_sha256": "d786faa0f8dcba657a9d2d8c95b3e3d50737500459b6aee8b3c5079b4a9605c4"
  },
- "source_protocol_position_count": 80,
- "source_unstructured_positions": [
-  {
-   "source_position_key": "week2:multi:动物园#1",
-   "response_role": "情境识别",
-   "source_paragraphs": [681, 685],
-   "status": "awaiting_content_decision"
-  },
-  {
-   "source_position_key": "week2:multi:动物园#2",
-   "response_role": "动物识别",
-   "source_paragraphs": [687, 691],
-   "status": "awaiting_content_decision"
-  },
-  {
-   "source_position_key": "week2:multi:动物园#3",
-   "response_role": "人物识别",
-   "source_paragraphs": [693, 697],
-   "status": "awaiting_content_decision"
-  },
-  {
-   "source_position_key": "week2:multi:动物园#4",
-   "response_role": "动作识别",
-   "source_paragraphs": [699, 704],
-   "status": "awaiting_content_decision"
-  },
-  {
-   "source_position_key": "week2:multi:动物园#5",
-   "response_role": "整体描述",
-   "source_paragraphs": [706, 707],
-   "status": "awaiting_pi_rubric"
-  },
-  {
-   "source_position_key": "week2:multi:公园#1",
-   "response_role": "情境识别",
-   "source_paragraphs": [711, 715],
-   "status": "awaiting_content_decision"
-  },
-  {
-   "source_position_key": "week2:multi:公园#2",
-   "response_role": "动植物识别",
-   "source_paragraphs": [717, 721],
-   "status": "awaiting_content_decision"
-  },
-  {
-   "source_position_key": "week2:multi:公园#3",
-   "response_role": "人物识别",
-   "source_paragraphs": [723, 727],
-   "status": "awaiting_content_decision"
-  },
-  {
-   "source_position_key": "week2:multi:公园#4",
-   "response_role": "动作识别",
-   "source_paragraphs": [729, 734],
-   "status": "awaiting_content_decision"
-  },
-  {
-   "source_position_key": "week2:multi:公园#5",
-   "response_role": "整体描述",
-   "source_paragraphs": [736, 737],
-   "status": "awaiting_pi_rubric"
-  }
- ],
- "source_unstructured_blockers": [
-  "两张刺激图直接显示场景名称，是否去字重制尚未冻结",
-  "整体描述环节缺正确/部分/错误 rubric 与完成条件",
-  "公园人物的成功分支与完成条件对“小伙子”的接受口径冲突"
- ],
- "note": "本文件由解析器从第2周源脚本抽取，供内容组核对补全（acceptable_expressions/image_id/难度/探针集标识等）。上线前须完成临床内容双人校对并将 qc_status 冻结；当前不得作为第3–8周题库复用。image_id 已于 2026-07-11 回填：图源为同一 DOCX 内嵌插图（30个单/双要素题图）；两张多要素场景图因图中文字泄题尚未纳入。",
+ "source_protocol_position_count": 78,
+ "source_unstructured_positions": [],
+ "source_unstructured_blockers": [],
+ "note": "本文件由解析器从第2周源脚本抽取，供内容组核对补全（acceptable_expressions/image_id/难度/探针集标识等）。上线前须完成临床内容双人校对并将 qc_status 冻结；当前不得作为第3–8周题库复用。image_id 已于 2026-07-11 回填：图源为同一 DOCX 内嵌插图（30个单/双要素题图）；两张多要素场景图因图中文字泄题尚未纳入。 判分口径：《会议决策总结20260706》变量记录表；关系识别按 2026-08-19 钱凯口径 正确=1 其余=0（取代会议表 0.5 档，Eric 转达）；多要素只计算情境/事物/人物/动作四个关键要素（评价体系第6条），⑤整体描述不计分、不进协议题位，故每周计分题位=20+10×5+2×4=78。多要素四环节按源文①-④顺序映射到会议表四列；个别场景第③环节源文实为物品识别（如 wk4 窗户、wk8 家里），列名沿用表头、语义以 rubric 话术为准，列名调整待 PI 定。 两张多要素场景图按源协议保留图内场景名牌（协议本身让患者读牌）；如 PI 决定去字需重做图并重审。冻结授权链：钱凯 2026-08-19 定判分口径（Eric 转达），书面签署待补。",
  "errata_fixed": [
   {
    "item": "斧子+树",
@@ -104,6 +39,13 @@
    "source_value": "5处引号/或字分隔被粘入单个数组值",
    "corrected_to": "按原稿逐个引号项拆分",
    "note": "仅修复结构化抽取边界，不新增、删除或改变任何临床词项"
+  },
+  {
+   "item": "ME_公园",
+   "field": "人物.完成条件",
+   "source_value": "小男孩/小孩",
+   "corrected_to": "小男孩/小孩/小伙子",
+   "note": "源稿成功分支明文接受“小伙子”而完成条件遗漏，按成功分支补齐"
   }
  ],
  "single_element": [
@@ -111,7 +53,9 @@
    "item_id": "SE_胡萝卜",
    "task_type": "单要素",
    "target_word": "胡萝卜",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "胡萝卜"
+   ],
    "related_but_inaccurate": [
     "蔬菜",
     "萝卜"
@@ -145,14 +89,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个蔬菜叫胡萝卜。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-01",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:胡萝卜"
   },
   {
    "item_id": "SE_熨斗",
    "task_type": "单要素",
    "target_word": "熨斗",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "熨斗"
+   ],
    "related_but_inaccurate": [
     "烙铁"
    ],
@@ -185,14 +131,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫熨斗。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-02",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:熨斗"
   },
   {
    "item_id": "SE_锚",
    "task_type": "单要素",
    "target_word": "锚",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "锚"
+   ],
    "related_but_inaccurate": [
     "剑",
     "弓箭",
@@ -227,14 +175,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫锚。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-03",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:锚"
   },
   {
    "item_id": "SE_树",
    "task_type": "单要素",
    "target_word": "树",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "树"
+   ],
    "related_but_inaccurate": [
     "植物"
    ],
@@ -267,14 +217,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫树。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-04",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:树"
   },
   {
    "item_id": "SE_狐狸",
    "task_type": "单要素",
    "target_word": "狐狸",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "狐狸"
+   ],
    "related_but_inaccurate": [
     "动物",
     "狼",
@@ -309,14 +261,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫狐狸。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-05",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:狐狸"
   },
   {
    "item_id": "SE_针",
    "task_type": "单要素",
    "target_word": "针",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "针"
+   ],
    "related_but_inaccurate": [
     "缝衣服的",
     "尖尖的",
@@ -351,14 +305,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫针。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-06",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:针"
   },
   {
    "item_id": "SE_船",
    "task_type": "单要素",
    "target_word": "船",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "船"
+   ],
    "related_but_inaccurate": [
     "汽艇",
     "快艇"
@@ -392,14 +348,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫船。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-07",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:船"
   },
   {
    "item_id": "SE_纽扣",
    "task_type": "单要素",
    "target_word": "纽扣",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "纽扣"
+   ],
    "related_but_inaccurate": [
     "扣",
     "衣服",
@@ -434,14 +392,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫纽扣。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-08",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:纽扣"
   },
   {
    "item_id": "SE_烟灰缸",
    "task_type": "单要素",
    "target_word": "烟灰缸",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "烟灰缸"
+   ],
    "related_but_inaccurate": [
     "烟"
    ],
@@ -474,14 +434,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫烟灰缸。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-09",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:烟灰缸"
   },
   {
    "item_id": "SE_鸡",
    "task_type": "单要素",
    "target_word": "鸡",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "鸡"
+   ],
    "related_but_inaccurate": [
     "动物",
     "家禽",
@@ -516,14 +478,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫鸡。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-10",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:鸡"
   },
   {
    "item_id": "SE_蜜蜂",
    "task_type": "单要素",
    "target_word": "蜜蜂",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "蜜蜂"
+   ],
    "related_but_inaccurate": [
     "动物",
     "昆虫"
@@ -557,14 +521,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫蜜蜂。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-11",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:蜜蜂"
   },
   {
    "item_id": "SE_螺丝钉",
    "task_type": "单要素",
    "target_word": "螺丝钉",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "螺丝钉"
+   ],
    "related_but_inaccurate": [
     "钉子",
     "工具"
@@ -598,14 +564,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫螺丝钉。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-12",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:螺丝钉"
   },
   {
    "item_id": "SE_斧子",
    "task_type": "单要素",
    "target_word": "斧子",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "斧子"
+   ],
    "related_but_inaccurate": [
     "工具"
    ],
@@ -638,14 +606,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫斧子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-13",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:斧子"
   },
   {
    "item_id": "SE_花",
    "task_type": "单要素",
    "target_word": "花",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "花"
+   ],
    "related_but_inaccurate": [
     "植物"
    ],
@@ -678,14 +648,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫花。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-14",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:花"
   },
   {
    "item_id": "SE_鞋",
    "task_type": "单要素",
    "target_word": "鞋",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "鞋"
+   ],
    "related_but_inaccurate": [
     "穿脚上的",
     "走路用的",
@@ -721,14 +693,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫鞋。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-15",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:鞋"
   },
   {
    "item_id": "SE_衬衫",
    "task_type": "单要素",
    "target_word": "衬衫",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "衬衫"
+   ],
    "related_but_inaccurate": [
     "衣服",
     "穿的",
@@ -763,14 +737,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫衬衫。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-16",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:衬衫"
   },
   {
    "item_id": "SE_螺丝刀",
    "task_type": "单要素",
    "target_word": "螺丝刀",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "螺丝刀"
+   ],
    "related_but_inaccurate": [
     "工具",
     "修东西的",
@@ -806,14 +782,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫螺丝刀。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-17",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:螺丝刀"
   },
   {
    "item_id": "SE_烟",
    "task_type": "单要素",
    "target_word": "烟",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "烟"
+   ],
    "related_but_inaccurate": [
     "抽的",
     "冒烟的",
@@ -849,14 +827,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫烟。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-18",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:烟"
   },
   {
    "item_id": "SE_兔子",
    "task_type": "单要素",
    "target_word": "兔子",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "兔子"
+   ],
    "related_but_inaccurate": [
     "动物"
    ],
@@ -889,14 +869,16 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个动物叫兔子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-19",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:兔子"
   },
   {
    "item_id": "SE_刷子",
    "task_type": "单要素",
    "target_word": "刷子",
-   "acceptable_expressions": [],
+   "acceptable_expressions": [
+    "刷子"
+   ],
    "related_but_inaccurate": [
     "鞋刷",
     "梳子"
@@ -930,7 +912,7 @@
    "tell_answer": "没关系，这种练习就是为了帮助您重新建立图片和名称之间的联系。这个物品叫刷子。我们多试几次会越来越顺手的，辛苦了。我们继续下一个。",
    "image_id": "wk2-20",
    "item_set_type": "训练集",
-   "difficulty_level": null,
+   "difficulty_level": 2,
    "raw_source_ref": "week2:刷子"
   }
  ],
@@ -946,8 +928,57 @@
    "relation_cue": "抽烟时产生的烟灰需要弹在烟灰缸里，吸完的烟头也会在里面掐灭。",
    "image_id": "wk2-21",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:烟灰缸+烟"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:烟灰缸+烟",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "吸",
+      "烟丝",
+      "纸包",
+      "条状"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是生活中常见的一种条状物，外面通常用纸包着，里面有烟丝和配料，是供人吸用的。",
+      "2": "没关系，左边这是生活中常见的一种条状物，外面通常用纸包着，里面有烟丝和配料，是供人吸用的。"
+     },
+     "tell_answer": "没关系，左边这是生活中常见的一种条状物，外面通常用纸包着，里面有烟丝和配料，是供人吸用的。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "烟灰",
+      "烟蒂",
+      "收集",
+      "凹槽"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是一件常见的桌面容器，四周通常有几个小凹槽，专门用来收集烟灰、放烟蒂。",
+      "2": "没关系，右边这是一件常见的桌面容器，四周通常有几个小凹槽，专门用来收集烟灰、放烟蒂。"
+     },
+     "tell_answer": "没关系，右边这是一件常见的桌面容器，四周通常有几个小凹槽，专门用来收集烟灰、放烟蒂。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "抽烟",
+      "弹",
+      "掐灭"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "抽烟时产生的烟灰需要弹在烟灰缸里，吸完的烟头也会在里面掐灭。",
+      "2": "抽烟时产生的烟灰需要弹在烟灰缸里，吸完的烟头也会在里面掐灭。"
+     },
+     "tell_answer": "抽烟时产生的烟灰需要弹在烟灰缸里，吸完的烟头也会在里面掐灭。"
+    }
+   }
   },
   {
    "item_id": "DE_狐狸+鸡",
@@ -960,8 +991,56 @@
    "relation_cue": "在自然界中，狐狸是肉食动物，经常会去农场里抓鸡、偷鸡吃。",
    "image_id": "wk2-22",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:狐狸+鸡"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:狐狸+鸡",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "狡猾",
+      "像狼",
+      "昼伏夜出",
+      "三角"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是一种哺乳动物，外形有点像狼，面部比较长，耳朵通常是三角形的，尾巴比较长，毛色常见的是赤黄色。它常常昼伏夜出，给人的印象是比较狡猾、多疑。",
+      "2": "没关系，左边这是一种哺乳动物，外形有点像狼，面部比较长，耳朵通常是三角形的，尾巴比较长，毛色常见的是赤黄色。它常常昼伏夜出，给人的印象是比较狡猾、多疑。"
+     },
+     "tell_answer": "没关系，左边这是一种哺乳动物，外形有点像狼，面部比较长，耳朵通常是三角形的，尾巴比较长，毛色常见的是赤黄色。它常常昼伏夜出，给人的印象是比较狡猾、多疑。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "家禽",
+      "冠",
+      "翅膀"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是一种常见的家禽，品种很多。它的嘴比较短，上嘴稍微弯曲，头部通常有红色的肉冠，翅膀比较短，一般不能高飞。",
+      "2": "没关系，右边这是一种常见的家禽，品种很多。它的嘴比较短，上嘴稍微弯曲，头部通常有红色的肉冠，翅膀比较短，一般不能高飞。"
+     },
+     "tell_answer": "没关系，右边这是一种常见的家禽，品种很多。它的嘴比较短，上嘴稍微弯曲，头部通常有红色的肉冠，翅膀比较短，一般不能高飞。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "抓",
+      "偷",
+      "吃"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "在自然界中，狐狸是肉食动物，经常会去农场里抓鸡、偷鸡吃。",
+      "2": "在自然界中，狐狸是肉食动物，经常会去农场里抓鸡、偷鸡吃。"
+     },
+     "tell_answer": "在自然界中，狐狸是肉食动物，经常会去农场里抓鸡、偷鸡吃。"
+    }
+   }
   },
   {
    "item_id": "DE_螺丝刀+螺丝钉",
@@ -974,8 +1053,58 @@
    "relation_cue": "螺丝刀是专门用来拧螺丝钉的工具，我们在修理或组装东西时，需要用螺丝刀把螺丝钉拧紧或者松开。",
    "image_id": "wk2-23",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:螺丝刀+螺丝钉"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:螺丝刀+螺丝钉",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "装卸",
+      "螺钉",
+      "十字",
+      "扁平"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是一种装卸螺钉用的工具。它的尖端有扁平、十字等形状，适合用在钉帽上有槽纹的螺钉上。",
+      "2": "没关系，左边这是一种装卸螺钉用的工具。它的尖端有扁平、十字等形状，适合用在钉帽上有槽纹的螺钉上。"
+     },
+     "tell_answer": "没关系，左边这是一种装卸螺钉用的工具。它的尖端有扁平、十字等形状，适合用在钉帽上有槽纹的螺钉上。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "螺纹",
+      "零件",
+      "圆柱",
+      "圆锥"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是一种常见的金属零件，形状像圆柱形或圆锥形的金属杆，杆上带有螺纹，一端有帽。",
+      "2": "没关系，右边这是一种常见的金属零件，形状像圆柱形或圆锥形的金属杆，杆上带有螺纹，一端有帽。"
+     },
+     "tell_answer": "没关系，右边这是一种常见的金属零件，形状像圆柱形或圆锥形的金属杆，杆上带有螺纹，一端有帽。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "拧",
+      "松开",
+      "组装",
+      "修理"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "螺丝刀是专门用来拧螺丝钉的工具，我们在修理或组装东西时，需要用螺丝刀把螺丝钉拧紧或者松开。",
+      "2": "螺丝刀是专门用来拧螺丝钉的工具，我们在修理或组装东西时，需要用螺丝刀把螺丝钉拧紧或者松开。"
+     },
+     "tell_answer": "螺丝刀是专门用来拧螺丝钉的工具，我们在修理或组装东西时，需要用螺丝刀把螺丝钉拧紧或者松开。"
+    }
+   }
   },
   {
    "item_id": "DE_针+纽扣",
@@ -988,8 +1117,55 @@
    "relation_cue": "衣服上的纽扣掉了或者需要固定时，我们需要用针穿着线，把纽扣缝在衣服上。",
    "image_id": "wk2-24",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:针+纽扣"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:针+纽扣",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "缝",
+      "穿线",
+      "尖",
+      "小孔"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是生活中常见的一种家用小工具。它非常细小，一头很尖，另一头有个小孔用来穿线，平时缝补衣服常常会用到它。",
+      "2": "没关系，左边这是生活中常见的一种家用小工具。它非常细小，一头很尖，另一头有个小孔用来穿线，平时缝补衣服常常会用到它。"
+     },
+     "tell_answer": "没关系，左边这是生活中常见的一种家用小工具。它非常细小，一头很尖，另一头有个小孔用来穿线，平时缝补衣服常常会用到它。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "扣",
+      "球状",
+      "片状"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是衣服上常见的小物件，可以把衣服等扣起来。它通常比较小，可以是球状的，也可以是片状的。",
+      "2": "没关系，右边这是衣服上常见的小物件，可以把衣服等扣起来。它通常比较小，可以是球状的，也可以是片状的。"
+     },
+     "tell_answer": "没关系，右边这是衣服上常见的小物件，可以把衣服等扣起来。它通常比较小，可以是球状的，也可以是片状的。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "缝",
+      "固定"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "衣服上的纽扣掉了或者需要固定时，我们需要用针穿着线，把纽扣缝在衣服上。",
+      "2": "衣服上的纽扣掉了或者需要固定时，我们需要用针穿着线，把纽扣缝在衣服上。"
+     },
+     "tell_answer": "衣服上的纽扣掉了或者需要固定时，我们需要用针穿着线，把纽扣缝在衣服上。"
+    }
+   }
   },
   {
    "item_id": "DE_兔子+胡萝卜",
@@ -1002,8 +1178,55 @@
    "relation_cue": "兔子喜欢吃胡萝卜。",
    "image_id": "wk2-25",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:兔子+胡萝卜"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:兔子+胡萝卜",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "跳",
+      "跑",
+      "耳朵"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是一种哺乳动物，头部有点像鼠，耳朵很大，上唇中间分裂，尾巴短而向上翘，前肢比后肢短，善于跳跃，跑得也很快。",
+      "2": "没关系，左边这是一种哺乳动物，头部有点像鼠，耳朵很大，上唇中间分裂，尾巴短而向上翘，前肢比后肢短，善于跳跃，跑得也很快。"
+     },
+     "tell_answer": "没关系，左边这是一种哺乳动物，头部有点像鼠，耳朵很大，上唇中间分裂，尾巴短而向上翘，前肢比后肢短，善于跳跃，跑得也很快。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "蔬菜",
+      "食物",
+      "橘红",
+      "圆锥"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是一种常见蔬菜。它的根通常是肉质的，形状多为圆锥形或圆柱形，颜色有紫红、橘红、黄色等多种，可以作为食物。",
+      "2": "没关系，右边这是一种常见蔬菜。它的根通常是肉质的，形状多为圆锥形或圆柱形，颜色有紫红、橘红、黄色等多种，可以作为食物。"
+     },
+     "tell_answer": "没关系，右边这是一种常见蔬菜。它的根通常是肉质的，形状多为圆锥形或圆柱形，颜色有紫红、橘红、黄色等多种，可以作为食物。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "吃",
+      "喜欢"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "兔子喜欢吃胡萝卜。",
+      "2": "兔子喜欢吃胡萝卜。"
+     },
+     "tell_answer": "兔子喜欢吃胡萝卜。"
+    }
+   }
   },
   {
    "item_id": "DE_船+锚",
@@ -1016,8 +1239,59 @@
    "relation_cue": "锚是船上用来停泊固定的重要工具。当船需要停留在水面上不被冲走时，就需要把锚抛入水中。",
    "image_id": "wk2-26",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:船+锚"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:船+锚",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "行驶",
+      "载人",
+      "运输",
+      "水上"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是一种水上的主要运输工具，可以在江河湖海上行驶，用来载人或运输物品。",
+      "2": "没关系，左边这是一种水上的主要运输工具，可以在江河湖海上行驶，用来载人或运输物品。"
+     },
+     "tell_answer": "没关系，左边这是一种水上的主要运输工具，可以在江河湖海上行驶，用来载人或运输物品。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "停泊",
+      "停船",
+      "抛",
+      "倒钩",
+      "稳定"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是船停泊时所用的器具，通常用铁制成。一端有两个或两个以上带倒钩的爪儿，另一端用铁链连在船上。停船时，会把带倒钩的一端抛到水底或岸边，用来稳定船舶。",
+      "2": "没关系，右边这是船停泊时所用的器具，通常用铁制成。一端有两个或两个以上带倒钩的爪儿，另一端用铁链连在船上。停船时，会把带倒钩的一端抛到水底或岸边，用来稳定船舶。"
+     },
+     "tell_answer": "没关系，右边这是船停泊时所用的器具，通常用铁制成。一端有两个或两个以上带倒钩的爪儿，另一端用铁链连在船上。停船时，会把带倒钩的一端抛到水底或岸边，用来稳定船舶。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "抛",
+      "停泊",
+      "固定",
+      "停留"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "锚是船上用来停泊固定的重要工具。当船需要停留在水面上不被冲走时，就需要把锚抛入水中。",
+      "2": "锚是船上用来停泊固定的重要工具。当船需要停留在水面上不被冲走时，就需要把锚抛入水中。"
+     },
+     "tell_answer": "锚是船上用来停泊固定的重要工具。当船需要停留在水面上不被冲走时，就需要把锚抛入水中。"
+    }
+   }
   },
   {
    "item_id": "DE_刷子+鞋",
@@ -1030,8 +1304,56 @@
    "relation_cue": "刷子是可以用来清除脏物的用具，鞋是穿在脚上、走路时着地的东西。鞋子脏了以后，可以用刷子把鞋面或鞋底上的脏东西刷干净。",
    "image_id": "wk2-27",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:刷子+鞋"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:刷子+鞋",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "清除",
+      "脏物",
+      "涂抹",
+      "膏油"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是一种常见的用具，通常用毛、棕、塑料丝或金属丝等制成，可以用来清除脏物，也可以用来涂抹膏油等。它一般是长形或椭圆形，有的还带有柄。",
+      "2": "没关系，左边这是一种常见的用具，通常用毛、棕、塑料丝或金属丝等制成，可以用来清除脏物，也可以用来涂抹膏油等。它一般是长形或椭圆形，有的还带有柄。"
+     },
+     "tell_answer": "没关系，左边这是一种常见的用具，通常用毛、棕、塑料丝或金属丝等制成，可以用来清除脏物，也可以用来涂抹膏油等。它一般是长形或椭圆形，有的还带有柄。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "脚",
+      "走路",
+      "保护"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是生活中常见的物品，通常穿在脚上，走路的时候会着地，可以保护我们的脚。",
+      "2": "没关系，右边这是生活中常见的物品，通常穿在脚上，走路的时候会着地，可以保护我们的脚。"
+     },
+     "tell_answer": "没关系，右边这是生活中常见的物品，通常穿在脚上，走路的时候会着地，可以保护我们的脚。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "刷",
+      "清除",
+      "干净"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "刷子是可以用来清除脏物的用具，鞋是穿在脚上、走路时着地的东西。鞋子脏了以后，可以用刷子把鞋面或鞋底上的脏东西刷干净。",
+      "2": "刷子是可以用来清除脏物的用具，鞋是穿在脚上、走路时着地的东西。鞋子脏了以后，可以用刷子把鞋面或鞋底上的脏东西刷干净。"
+     },
+     "tell_answer": "刷子是可以用来清除脏物的用具，鞋是穿在脚上、走路时着地的东西。鞋子脏了以后，可以用刷子把鞋面或鞋底上的脏东西刷干净。"
+    }
+   }
   },
   {
    "item_id": "DE_蜜蜂+花",
@@ -1044,8 +1366,59 @@
    "relation_cue": "蜜蜂最喜欢停在花朵上，它们从花朵里采集花蜜来做蜂蜜，同时也能帮助花儿传授花粉。",
    "image_id": "wk2-28",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:蜜蜂+花"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:蜜蜂+花",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "采",
+      "酿蜜",
+      "传粉",
+      "蜇",
+      "毒刺"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是一种昆虫，体表有很密的绒毛，前翅比后翅大。它们常常成群居住，工蜂能采花粉、酿蜜，还能帮助某些植物传粉，有些蜜蜂还有毒刺，能蜇人。",
+      "2": "没关系，左边这是一种昆虫，体表有很密的绒毛，前翅比后翅大。它们常常成群居住，工蜂能采花粉、酿蜜，还能帮助某些植物传粉，有些蜜蜂还有毒刺，能蜇人。"
+     },
+     "tell_answer": "没关系，左边这是一种昆虫，体表有很密的绒毛，前翅比后翅大。它们常常成群居住，工蜂能采花粉、酿蜜，还能帮助某些植物传粉，有些蜜蜂还有毒刺，能蜇人。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "花瓣",
+      "香",
+      "艳丽",
+      "繁殖"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是种子植物的有性繁殖器官，通常由花瓣、花萼、花托、花蕊组成，有各种颜色，有的很艳丽，也有香味。",
+      "2": "没关系，右边这是种子植物的有性繁殖器官，通常由花瓣、花萼、花托、花蕊组成，有各种颜色，有的很艳丽，也有香味。"
+     },
+     "tell_answer": "没关系，右边这是种子植物的有性繁殖器官，通常由花瓣、花萼、花托、花蕊组成，有各种颜色，有的很艳丽，也有香味。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "采",
+      "花蜜",
+      "花粉",
+      "蜂蜜"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "蜜蜂最喜欢停在花朵上，它们从花朵里采集花蜜来做蜂蜜，同时也能帮助花儿传授花粉。",
+      "2": "蜜蜂最喜欢停在花朵上，它们从花朵里采集花蜜来做蜂蜜，同时也能帮助花儿传授花粉。"
+     },
+     "tell_answer": "蜜蜂最喜欢停在花朵上，它们从花朵里采集花蜜来做蜂蜜，同时也能帮助花儿传授花粉。"
+    }
+   }
   },
   {
    "item_id": "DE_熨斗+衬衫",
@@ -1058,8 +1431,56 @@
    "relation_cue": "当衬衫洗完变皱了之后，我们需要用加热后的熨斗在衬衫上推移，把上面的皱褶烫平整。",
    "image_id": "wk2-29",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:熨斗+衬衫"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:熨斗+衬衫",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "烫",
+      "熨",
+      "用电",
+      "发热"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是一种用来烫平衣物的金属器具，形状像斗。旧式熨斗中间可以烧木炭，新式熨斗一般用电发热。",
+      "2": "没关系，左边这是一种用来烫平衣物的金属器具，形状像斗。旧式熨斗中间可以烧木炭，新式熨斗一般用电发热。"
+     },
+     "tell_answer": "没关系，左边这是一种用来烫平衣物的金属器具，形状像斗。旧式熨斗中间可以烧木炭，新式熨斗一般用电发热。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "上衣",
+      "西式",
+      "穿在"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是一种西式单上衣，可以穿在里面，也可以单独穿在外面。",
+      "2": "没关系，右边这是一种西式单上衣，可以穿在里面，也可以单独穿在外面。"
+     },
+     "tell_answer": "没关系，右边这是一种西式单上衣，可以穿在里面，也可以单独穿在外面。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "烫",
+      "皱",
+      "加热"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "当衬衫洗完变皱了之后，我们需要用加热后的熨斗在衬衫上推移，把上面的皱褶烫平整。",
+      "2": "当衬衫洗完变皱了之后，我们需要用加热后的熨斗在衬衫上推移，把上面的皱褶烫平整。"
+     },
+     "tell_answer": "当衬衫洗完变皱了之后，我们需要用加热后的熨斗在衬衫上推移，把上面的皱褶烫平整。"
+    }
+   }
   },
   {
    "item_id": "DE_斧子+树",
@@ -1072,9 +1493,230 @@
    "relation_cue": "斧子是专门用来砍伐树木的工具。人们经常挥动斧子把大树砍倒，用来劈柴或者获取木材。",
    "image_id": "wk2-30",
    "item_set_type": "训练集",
-   "difficulty_level": null,
-   "raw_source_ref": "week2:斧子+树"
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:斧子+树",
+   "operational_rubrics": {
+    "左作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "砍",
+      "楔形",
+      "木柄"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，左边这是一种砍竹子、木头等用的金属工具，头部呈楔形，通常装有木柄。",
+      "2": "没关系，左边这是一种砍竹子、木头等用的金属工具，头部呈楔形，通常装有木柄。"
+     },
+     "tell_answer": "没关系，左边这是一种砍竹子、木头等用的金属工具，头部呈楔形，通常装有木柄。"
+    },
+    "右作用": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "植物",
+      "树干",
+      "树枝",
+      "树叶"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "没关系，右边这是一种木本植物，是自然界中很常见的植物类型，通常有树干、树枝和树叶。",
+      "2": "没关系，右边这是一种木本植物，是自然界中很常见的植物类型，通常有树干、树枝和树叶。"
+     },
+     "tell_answer": "没关系，右边这是一种木本植物，是自然界中很常见的植物类型，通常有树干、树枝和树叶。"
+    },
+    "关系识别": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "砍",
+      "劈"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "斧子是专门用来砍伐树木的工具。人们经常挥动斧子把大树砍倒，用来劈柴或者获取木材。",
+      "2": "斧子是专门用来砍伐树木的工具。人们经常挥动斧子把大树砍倒，用来劈柴或者获取木材。"
+     },
+     "tell_answer": "斧子是专门用来砍伐树木的工具。人们经常挥动斧子把大树砍倒，用来劈柴或者获取木材。"
+    }
+   }
   }
  ],
- "cue1_variant_source_locator_scheme": "python-docx compatible body paragraph index, zero-based"
+ "cue1_variant_source_locator_scheme": "python-docx compatible body paragraph index, zero-based",
+ "multi_element": [
+  {
+   "item_id": "ME_动物园",
+   "task_type": "多要素",
+   "scene_title": "动物园",
+   "initial_prompt": "您好，您看看这张图片，这里像是什么地方？",
+   "key_elements": [
+    {
+     "key": "情境",
+     "label": "情境"
+    },
+    {
+     "key": "事物",
+     "label": "事物"
+    },
+    {
+     "key": "人物",
+     "label": "人物"
+    },
+    {
+     "key": "动作",
+     "label": "动作"
+    }
+   ],
+   "operational_rubrics": {
+    "情境": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "动物园"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "您再看看上边的指示牌，上面写着什么？",
+      "2": "您再看看上边的指示牌，上面写着什么？"
+     },
+     "tell_answer": "您看上面的这个牌子，上面写着‘动物园’，所以这里是动物园。"
+    },
+    "事物": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "all_required_concepts",
+     "acceptable_expressions": [],
+     "required_concepts": [
+      "兔子",
+      "鸡"
+     ],
+     "cues": {
+      "1": "非常好，图中有小兔子。您再看看，栅栏后面还有什么动物？",
+      "2": "非常好，图中有小兔子。您再看看，栅栏后面还有什么动物？"
+     },
+     "tell_answer": "图片里有一只兔子和一只鸡。"
+    },
+    "人物": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "小女孩",
+      "小姑娘",
+      "小孩"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "您看看右边站着的人是谁？",
+      "2": "您看看右边站着的人是谁？"
+     },
+     "tell_answer": "图片右边站着一个小女孩。"
+    },
+    "动作": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "看",
+      "站"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "很好，小女孩站在那里。她站在那里干什么呢？",
+      "2": "很好，小女孩站在那里。她站在那里干什么呢？"
+     },
+     "tell_answer": "小女孩正站在栅栏外面，看着里面的兔子和鸡。"
+    }
+   },
+   "image_id": "wk2-multi-01",
+   "item_set_type": "训练集",
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:multi:动物园"
+  },
+  {
+   "item_id": "ME_公园",
+   "task_type": "多要素",
+   "scene_title": "公园",
+   "initial_prompt": "您好，您看看这张图片，这里像是什么地方？",
+   "key_elements": [
+    {
+     "key": "情境",
+     "label": "情境"
+    },
+    {
+     "key": "事物",
+     "label": "事物"
+    },
+    {
+     "key": "人物",
+     "label": "人物"
+    },
+    {
+     "key": "动作",
+     "label": "动作"
+    }
+   ],
+   "operational_rubrics": {
+    "情境": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "公园"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "您再看看右边的指示牌，上面写着什么？",
+      "2": "您再看看右边的指示牌，上面写着什么？"
+     },
+     "tell_answer": "您看右边的这个牌子，上面写着‘公园’，所以这里是公园。"
+    },
+    "事物": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "all_required_concepts",
+     "acceptable_expressions": [],
+     "required_concepts": [
+      "蜜蜂",
+      "花"
+     ],
+     "cues": {
+      "1": "非常好，图中有小蜜蜂（或花）。您再看看，旁边还有什么？",
+      "2": "非常好，图中有小蜜蜂（或花）。您再看看，旁边还有什么？"
+     },
+     "tell_answer": "图片里有几只飞舞的蜜蜂和几朵盛开的花。"
+    },
+    "人物": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "小男孩",
+      "小孩",
+      "小伙子"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "您看看左边大树下坐着的人是谁？",
+      "2": "您看看左边大树下坐着的人是谁？"
+     },
+     "tell_answer": "图片左边的树下坐着一个小男孩。"
+    },
+    "动作": {
+     "rubric_version": "wk2-r1-20260819",
+     "decision_policy": "any_acceptable_expression",
+     "acceptable_expressions": [
+      "看",
+      "坐"
+     ],
+     "required_concepts": [],
+     "cues": {
+      "1": "很好，小男孩坐在那里。他坐在那里干什么呢？",
+      "2": "很好，小男孩坐在那里。他坐在那里干什么呢？"
+     },
+     "tell_answer": "小男孩正坐在树下，看着旁边的蜜蜂和花朵。"
+    }
+   },
+   "image_id": "wk2-multi-02",
+   "item_set_type": "训练集",
+   "difficulty_level": 2,
+   "raw_source_ref": "week2:multi:公园"
+  }
+ ]
 }

@@ -339,7 +339,7 @@ def test_future_asset_selectors_and_legacy_static_paths_are_closed(
         assert b"RIFF" not in public.content
 
     assert not list((PROJECT_ROOT / "web" / "public" / "img").glob("*.webp"))
-    assert len(list((PROJECT_ROOT / "content" / "patient_assets").glob("*.webp"))) == 30
+    assert len(list((PROJECT_ROOT / "content" / "patient_assets").glob("*.webp"))) == 224
 
 
 @pytest.mark.parametrize("runtime_status", [
@@ -380,31 +380,45 @@ def test_week1_explicit_no_image_returns_204(asset_client, monkeypatch):
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
-def test_delivery_manifest_is_simulation_only_and_transitively_bound():
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+def test_delivery_manifest_is_research_approved_and_transitively_bound(
+        tmp_path, monkeypatch):
+    """2026-08-19 起交付清单是研究批准 scope,覆盖 wk2..wk8 全部 224 张私有图。"""
     manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
 
-    assert manifest["purpose"] == (
-        "simulation_private_byte_allowlist_not_research_asset_definition")
-    assert manifest["release_scope"] == "simulation_only"
+    assert manifest["purpose"] == "research_and_simulation_byte_allowlist"
+    assert manifest["release_scope"] == "research_and_simulation"
     assert manifest["research_release_status"] == (
-        "blocked_pending_source_transform_rights_and_content_approvals")
+        "approved_for_research_presentation")
+    assert set(manifest["research_release_approvals"]) == {
+        "source_transform_rights", "content"}
+    assert patient_asset.research_release_approved() is True
     assert manifest["image_id_contract_version"] == (
         patient_asset.IMAGE_ID_CONTRACT_VERSION)
     assert manifest["definition_sha256"] == _canonical_manifest_digest(manifest)
-    assert bank.meta["patient_asset_delivery_manifest"] == {
-        "version_id": manifest["manifest_version_id"],
-        "definition_sha256": manifest["definition_sha256"],
-    }
-    bank_ids = {
-        row["image_id"]
-        for row in (
-            *bank.single_element, *bank.double_element, *bank.multi_element)
-        if row.get("image_id")
-    }
+
     manifest_rows = {row["image_id"]: row for row in manifest["assets"]}
-    assert set(manifest_rows) == bank_ids
-    assert len(manifest_rows) == 30
+    assert len(manifest_rows) == 224
+
+    index = json.loads(
+        (content.CONTENT_DIR / "item_bank_index.json").read_text("utf-8"))
+    assert [entry["week_no"] for entry in index["banks"]] == list(range(2, 9))
+    week2_bank = None
+    all_bank_ids: set[str] = set()
+    for entry in index["banks"]:
+        bank = content.load_item_bank(content.CONTENT_DIR / entry["file"])
+        if entry["week_no"] == 2:
+            week2_bank = bank
+        assert bank.meta["patient_asset_delivery_manifest"] == {
+            "version_id": manifest["manifest_version_id"],
+            "definition_sha256": manifest["definition_sha256"],
+        }, entry
+        all_bank_ids |= {
+            row["image_id"]
+            for row in (
+                *bank.single_element, *bank.double_element, *bank.multi_element)
+            if row.get("image_id")
+        }
+    assert set(manifest_rows) == all_bank_ids
     for image_id, row in manifest_rows.items():
         payload = (
             PROJECT_ROOT / "content" / "patient_assets" / f"{image_id}.webp"
@@ -414,15 +428,25 @@ def test_delivery_manifest_is_simulation_only_and_transitively_bound():
         assert patient_asset._webp_metadata(payload) == (
             row["width"], row["height"], row["frame_count"])
 
-    changed = deepcopy(bank)
+    changed = deepcopy(week2_bank)
     changed.meta["patient_asset_delivery_manifest"] = {
         **changed.meta["patient_asset_delivery_manifest"],
         "definition_sha256": "0" * 64,
     }
     assert content.item_bank_definition_digest(changed) != (
-        content.item_bank_definition_digest(bank))
+        content.item_bank_definition_digest(week2_bank))
     with pytest.raises(patient_asset.PatientAssetError, match="未绑定"):
         patient_asset.resolve_runtime_asset(changed, "wk2-01")
+
+    # 旧行为路径(staged 副本):simulation_only 清单按旧契约仍成立,且不算研究批准。
+    staged = _simulation_only_manifest()
+    rebound = _rebind_delivery(week2_bank, staged)
+    staged_path = tmp_path / "delivery-simulation.json"
+    staged_path.write_text(
+        json.dumps(staged, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(patient_asset, "DELIVERY_MANIFEST_PATH", staged_path)
+    assert patient_asset.research_release_approved() is False
+    assert len(patient_asset._delivery_manifest(rebound)) == 224
 
 
 def _rebind_delivery(bank, manifest):
@@ -435,35 +459,37 @@ def _rebind_delivery(bank, manifest):
     return rebound
 
 
-def test_delivery_contract_accepts_explicit_multi_id_without_remapping(
-        tmp_path, monkeypatch):
-    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
-    manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
-    manifest["assets"].append({
-        **manifest["assets"][0],
-        "image_id": "wk2-multi-01",
-    })
-    rebound = _rebind_delivery(bank, manifest)
-    path = tmp_path / "delivery-with-multi.json"
-    path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-    monkeypatch.setattr(patient_asset, "DELIVERY_MANIFEST_PATH", path)
+def _resign_research_approvals(manifest: dict) -> None:
+    """夹具改动清单正文后,按 app 契约重算两份审批事实的 scope_sha256。
 
-    rows = patient_asset._delivery_manifest(rebound)
+    只在想让校验走到审批之后那道门(如资产行值/定义摘要)时调用;
+    伪造审批的场景绝不能调用它,否则断言会空转。
+    """
+    scope_digest = hashlib.sha256(json.dumps(
+        {key: value for key, value in manifest.items()
+         if key not in {"definition_sha256", "research_release_approvals"}},
+        ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    for fact in manifest["research_release_approvals"].values():
+        fact["scope_sha256"] = scope_digest
+
+
+def test_delivery_contract_accepts_explicit_multi_id_without_remapping():
+    """2026-08-19 起 wk2 双多要素图真实入册:显式 multi id 直接交付,不做数字重映射。"""
+    bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
+
+    rows = patient_asset._delivery_manifest(bank)
 
     assert "wk2-multi-01" in rows
+    assert "wk2-multi-02" in rows
     assert "wk2-31" not in rows
+    assert "wk2-32" not in rows
 
     payload = (
-        PROJECT_ROOT / "content" / "patient_assets" / "wk2-01.webp"
+        PROJECT_ROOT / "content" / "patient_assets" / "wk2-multi-01.webp"
     ).read_bytes()
-    runtime_dir = tmp_path / "patient-assets"
-    runtime_dir.mkdir()
-    (runtime_dir / "wk2-multi-01.webp").write_bytes(payload)
-    rebound.multi_element.append({"image_id": "wk2-multi-01"})
-    monkeypatch.setattr(patient_asset, "RUNTIME_ASSET_DIRS", (runtime_dir,))
-
-    runtime_asset = patient_asset.resolve_runtime_asset(
-        rebound, "wk2-multi-01")
+    runtime_asset = patient_asset.resolve_runtime_asset(bank, "wk2-multi-01")
     assert patient_asset.read_runtime_asset(runtime_asset) == payload
 
 
@@ -473,6 +499,7 @@ def test_delivery_contract_rejects_numeric_multi_remaps(
     bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
     manifest["assets"][0]["image_id"] = image_id
+    _resign_research_approvals(manifest)
     rebound = _rebind_delivery(bank, manifest)
     path = tmp_path / f"delivery-{image_id}.json"
     path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
@@ -488,6 +515,7 @@ def test_delivery_contract_rejects_noncanonical_frame_count(
     bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
     manifest["assets"][0]["frame_count"] = frame_count
+    _resign_research_approvals(manifest)
     rebound = _rebind_delivery(bank, manifest)
     path = tmp_path / "delivery-frame-count.json"
     path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
@@ -503,6 +531,8 @@ def test_delivery_manifest_tamper_fails_closed(tmp_path, monkeypatch, tamper):
     manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
     if tamper == "body_only":
         manifest["assets"][0]["byte_size"] += 1
+        # 审批 scope 对齐后,剩下的失配只在 definition_sha256 这一道门。
+        _resign_research_approvals(manifest)
     else:
         manifest["definition_sha256"] = "0" * 64
     path = tmp_path / "delivery.json"
@@ -531,6 +561,7 @@ def test_private_webp_declared_decode_facts_are_verified_at_read_time(
     bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
     manifest["assets"][0]["width"] += 1
+    _resign_research_approvals(manifest)
     rebound = _rebind_delivery(bank, manifest)
     path = tmp_path / "delivery-wrong-dimensions.json"
     path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
@@ -610,8 +641,22 @@ def test_old_session_digest_rejects_simultaneously_rebound_delivery(
     assert _detail_code(response) == "patient_asset_definition_mismatch"
 
 
+def _simulation_only_manifest() -> dict:
+    """由当前研究批准清单派生一份 simulation_only 清单(staged 旧契约场景)。"""
+    manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
+    manifest["manifest_version_id"] = "wk2-8-private-webp-simulation-test.1"
+    manifest["purpose"] = (
+        "simulation_private_byte_allowlist_not_research_asset_definition")
+    manifest["release_scope"] = "simulation_only"
+    manifest["research_release_status"] = (
+        "blocked_pending_source_transform_rights_and_content_approvals")
+    manifest.pop("research_release_approvals", None)
+    manifest["definition_sha256"] = _canonical_manifest_digest(manifest)
+    return manifest
+
+
 def _research_approved_manifest() -> dict:
-    """由当前模拟清单派生一份"已批准真实研究呈现"的清单(测试专用签字工件)。"""
+    """由当前交付清单派生一份测试签署的研究批准清单(测试专用签字工件)。"""
     manifest = json.loads(patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
     manifest["manifest_version_id"] = "wk2-private-webp-research-test.1"
     manifest["purpose"] = "research_and_simulation_byte_allowlist"
@@ -672,8 +717,8 @@ def test_research_approved_manifest_serves_research_session(
 
 def test_research_release_contract_is_fail_closed(tmp_path, monkeypatch):
     approved = _research_approved_manifest()
-    simulation_original = json.loads(
-        patient_asset.DELIVERY_MANIFEST_PATH.read_text("utf-8"))
+    # 2026-08-19 起在册清单本身已是研究批准 scope;旧契约路径用 staged 副本重现。
+    simulation_staged = _simulation_only_manifest()
     original_bank = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
     manifest_path = tmp_path / "delivery.json"
     monkeypatch.setattr(patient_asset, "DELIVERY_MANIFEST_PATH", manifest_path)
@@ -688,7 +733,7 @@ def test_research_release_contract_is_fail_closed(tmp_path, monkeypatch):
     assert patient_asset.research_release_approved() is True
     assert patient_asset._delivery_manifest(bank)
 
-    bank = install(deepcopy(simulation_original))
+    bank = install(deepcopy(simulation_staged))
     assert patient_asset.research_release_approved() is False
     assert patient_asset._delivery_manifest(bank)  # 模拟合同本身仍有效
 
@@ -723,7 +768,7 @@ def test_research_release_contract_is_fail_closed(tmp_path, monkeypatch):
     bank = install(mismatched)
     assert patient_asset.research_release_approved() is False
 
-    smuggled = deepcopy(simulation_original)
+    smuggled = deepcopy(simulation_staged)
     smuggled["research_release_approvals"] = deepcopy(
         approved["research_release_approvals"])
     bank = install(smuggled)
@@ -733,9 +778,15 @@ def test_research_release_contract_is_fail_closed(tmp_path, monkeypatch):
 
 
 def test_simulation_only_delivery_rejects_research_classified_session(
-        asset_client, monkeypatch):
+        asset_client, monkeypatch, tmp_path):
+    """守门:simulation_only 清单(staged 副本)在场时,研究场次必须被拒绝呈现。"""
     client, _full_plan, capability = _seed_current_week2(
         asset_client, monkeypatch)
+    staged = _simulation_only_manifest()
+    staged_path = tmp_path / "delivery-simulation.json"
+    staged_path.write_text(
+        json.dumps(staged, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(patient_asset, "DELIVERY_MANIFEST_PATH", staged_path)
     with Session(client.test_engine) as session:
         row = session.get(TrainSession, "S-ASSET-001")
         assert row is not None

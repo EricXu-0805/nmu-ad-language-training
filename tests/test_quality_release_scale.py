@@ -14,13 +14,13 @@ def test_full_profile_is_exactly_the_mechanical_240_session_contract():
 
     assert profile.session_count == 240
     assert profile.subject_count == 30
-    assert profile.expected_evidence_rows == 158_400
-    assert profile.expected_audio_files == 33_600
-    assert profile.expected_turn_rows == 16_800
-    assert profile.expected_turn_pages == 17
-    assert scale.ITEMS_PER_WEEK2_SESSION == 30
-    assert scale.TURNS_PER_WEEK2_SESSION == 70
-    assert scale.EVIDENCE_ROWS_PER_SESSION == 660
+    assert profile.expected_evidence_rows == 176_160
+    assert profile.expected_audio_files == 37_440
+    assert profile.expected_turn_rows == 18_720
+    assert profile.expected_turn_pages == 19
+    assert scale.ITEMS_PER_WEEK2_SESSION == 32
+    assert scale.TURNS_PER_WEEK2_SESSION == 78
+    assert scale.EVIDENCE_ROWS_PER_SESSION == 734
 
 
 def test_http_429_backoff_retries_the_same_cursor_without_a_server():
@@ -92,36 +92,36 @@ def test_smoke_profile_runs_the_real_frozen_release_chain(tmp_path):
         "subjects": 2,
         "sessions": 4,
         "week_numbers": [2],
-        "items_per_session": 30,
-        "turns_per_session": 70,
+        "items_per_session": 32,
+        "turns_per_session": 78,
     }
-    assert receipt["evidence"]["rows_per_session"] == 660
-    assert receipt["evidence"]["watermark_rows_per_session"] == 660
-    assert receipt["evidence"]["total_rows"] == 2_640
+    assert receipt["evidence"]["rows_per_session"] == 734
+    assert receipt["evidence"]["watermark_rows_per_session"] == 734
+    assert receipt["evidence"]["total_rows"] == 2_936
     assert receipt["evidence"]["database_counts"] == {
-        "items": 120,
-        "turns": 280,
-        "attempts": 560,
-        "audios": 560,
-        "receipts": 560,
-        "interactions": 280,
-        "revisions": 280,
+        "items": 128,
+        "turns": 312,
+        "attempts": 624,
+        "audios": 624,
+        "receipts": 624,
+        "interactions": 312,
+        "revisions": 312,
         "pause_receipts": 0,
         "control_events": 0,
     }
     assert receipt["snapshot"]["subjects"] == 2
     assert receipt["snapshot"]["sessions"] == 4
-    assert receipt["snapshot"]["turns"] == 280
-    assert receipt["snapshot"]["persisted_rows"] == 286
+    assert receipt["snapshot"]["turns"] == 312
+    assert receipt["snapshot"]["persisted_rows"] == 318
     assert receipt["io"]["audio_directory_scans"] == 1
-    assert receipt["io"]["audio_hashed_files"] == 560
+    assert receipt["io"]["audio_hashed_files"] == 624
     assert receipt["io"]["audio_hashed_bytes"] > 0
     assert receipt["io"]["average_audio_bytes_per_file"] > 0
     assert 0 < receipt["io"]["sql_select_count"] <= 410
     assert receipt["frozen_turn_pagination"] == {
         "page_size": 64,
-        "page_count": math.ceil(280 / 64),
-        "unique_rows": 280,
+        "page_count": math.ceil(312 / 64),
+        "unique_rows": 312,
         "missing_rows": 0,
         "duplicate_rows": 0,
         "cursor_deterministic": True,
@@ -142,10 +142,10 @@ def test_full_240_session_profile_is_a_permanent_release_regression():
     assert receipt["scope"]["eight_week_content_complete"] is False
     assert receipt["cohort"]["subjects"] == 30
     assert receipt["cohort"]["sessions"] == 240
-    assert receipt["evidence"]["total_rows"] == 158_400
-    assert receipt["snapshot"]["turns"] == 16_800
+    assert receipt["evidence"]["total_rows"] == 176_160
+    assert receipt["snapshot"]["turns"] == 18_720
     assert receipt["io"]["audio_directory_scans"] == 1
-    assert receipt["frozen_turn_pagination"]["page_count"] == 17
+    assert receipt["frozen_turn_pagination"]["page_count"] == 19
     assert receipt["frozen_turn_pagination"]["missing_rows"] == 0
     assert receipt["frozen_turn_pagination"]["duplicate_rows"] == 0
     assert receipt["frozen_turn_pagination"]["body_deterministic"] is True

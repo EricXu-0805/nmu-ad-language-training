@@ -266,7 +266,7 @@ export function classifyStorage(quotaBytes: number | null, usageBytes: number | 
 
 export function classifyScreen(screen: { width: number; height: number; pixelRatio: number }): CheckResult {
   const id = "screen";
-  const title = "屏幕";
+  const title = "屏幕显示";
   const shorter = Math.min(screen.width, screen.height);
   const spec = `${screen.width}×${screen.height} @${screen.pixelRatio}x`;
   if (shorter < 500) {
@@ -443,7 +443,7 @@ export async function runAutoChecks(
     const estimate = await deps.storageEstimate();
     return classifyStorage(estimate.quotaBytes, estimate.usageBytes);
   });
-  await guarded("screen", "屏幕", () => classifyScreen(deps.screen));
+  await guarded("screen", "屏幕显示", () => classifyScreen(deps.screen));
 
   return { results, micInfo };
 }

@@ -1,4 +1,5 @@
 import json
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -13,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import asr, evidence_ledger, export, export_security, llm_judge
+from app import asr, content, evidence_ledger, export, export_security, llm_judge
 from app import repeat_intent
 from app.db import get_session
 from app.enums import AnswerType
@@ -811,9 +812,33 @@ def test_rule_fallback_records_actual_engine_and_matched_on(client_db, monkeypat
     assert attempt["judge_reason"] is None
 
 
+def _stage_content_without_rubric(
+        tmp_path, monkeypatch, *, item_id: str, response_role: str) -> None:
+    """复制内容目录、删掉指定开放环节的 rubric 后接管 CONTENT_DIR。
+
+    2026-08-19 起 week2 双要素三开放环节全部交付冻结 rubric，「缺 rubric →
+    技术暂停」只能靠 staged 副本重现——这条 fail-closed 行为不因内容交付而消失。
+    """
+    staged = tmp_path / "content-staged"
+    shutil.copytree(content.CONTENT_DIR, staged)
+    bank_path = staged / "item_bank_v1.json"
+    data = json.loads(bank_path.read_text(encoding="utf-8"))
+    removed = False
+    for item in data["double_element"]:
+        if item["item_id"] == item_id:
+            del item["operational_rubrics"][response_role]
+            removed = True
+    assert removed, f"staged 副本没找到 {item_id}:{response_role} 的 rubric"
+    bank_path.write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(content, "CONTENT_DIR", staged)
+
+
 def test_open_answer_without_frozen_rubric_is_a_technical_pause_not_success(
-        client_db, monkeypatch):
+        client_db, monkeypatch, tmp_path):
     client, _engine = client_db
+    _stage_content_without_rubric(
+        tmp_path, monkeypatch, item_id="DE_斧子+树", response_role="关系识别")
     _seed_session(client)
     _seed_audio(
         client, "missing-rubric", turn_key="DE_斧子+树#5")

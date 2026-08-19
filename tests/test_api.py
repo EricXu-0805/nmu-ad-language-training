@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import json
+import shutil
 
 import pytest
 from fastapi.testclient import TestClient
@@ -287,7 +288,18 @@ def test_session_needs_patient_and_version(client):
     assert client.post("/sessions", json=bad_version).status_code == 409
 
 
-def test_real_session_is_blocked_while_content_is_not_research_ready(client):
+def test_real_session_is_blocked_while_content_is_not_research_ready(
+        client, monkeypatch, tmp_path):
+    # 2026-08-19 起 week2 题库已冻结交付;「内容未就绪」只能用 staged 草稿
+    # 副本重现——这个守门测试守的拒绝行为不因内容交付而消失。
+    staged = tmp_path / "content-staged"
+    shutil.copytree(content.CONTENT_DIR, staged)
+    bank_path = staged / "item_bank_v1.json"
+    data = json.loads(bank_path.read_text(encoding="utf-8"))
+    data["qc_status"] = "draft"
+    bank_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(content, "CONTENT_DIR", staged)
+
     assert client.post("/patients", json={
         "patient_id": "P-REAL-CONTENT", **ELIGIBLE_PATIENT,
     }).status_code == 200
@@ -356,8 +368,9 @@ def test_proxy_consent_requires_proxy_and_assent(client):
                                     "proxy_consent": True, "assent_obtained": True})
     allowed = client.post("/sessions", json={**session, "session_id": "S-PROXY-OK",
                                               "patient_id": "P-PROXY-OK"})
-    assert allowed.status_code == 409
-    assert "题库" in allowed.json()["detail"]
+    # 代理同意 + 本人赞同齐备后放行(2026-08-19 内容冻结交付,真实场次可建),
+    # 反证上面的 409 拦的确是 assent 而非别的门。
+    assert allowed.status_code == 200, allowed.text
 
 
 def test_simulation_session_and_audio_are_explicit_and_server_derived(client, monkeypatch):
@@ -424,10 +437,14 @@ def test_legacy_unknown_session_is_visible_but_blocked_from_new_processing(clien
 
 
 def test_item_bank_endpoint(client):
+    # 2026-08-19 内容交付后的现实:week2 题库 20单+10双+2多、qc frozen、
+    # 零 error 零 warning、全部开放环节有 operational_rubrics;自动执行协议
+    # 仍只覆盖单要素命名,故 10双×5 + 2多×4 = 58 个题位不可自动驾驶。
     d = client.get("/content/item-bank").json()
     assert d["single_count"] == 20 and d["double_count"] == 10
-    assert d["multi_count"] == 0 and d["supported_training_weeks"] == [2]
-    assert d["qc_status"] == "draft" and d["ready_for_research"] is False
+    assert d["multi_count"] == 2 and d["supported_training_weeks"] == [2]
+    assert d["structured_training_weeks"] == [2, 3, 4, 5, 6, 7, 8]
+    assert d["qc_status"] == "frozen" and d["ready_for_research"] is True
     assert d["operational_autopilot_ready"] is False
     assert len(d["item_bank_definition_digest"]) == 64
     assert d["autopilot_protocol_version_id"] == "autopilot-v1-20260729"
@@ -437,34 +454,33 @@ def test_item_bank_endpoint(client):
     assert d["autopilot_admission_validation_issue"]["code"] == (
         "autopilot_plan_not_fully_supported")
     assert d["autopilot_admission_validation_issue"]["context"][
-        "unsupported_position_count"] == 60
-    assert d["operational_position_count"] == 70
-    assert d["unsupported_operational_position_count"] == 50
-    assert len(d["unsupported_operational_positions"]) == 50
+        "unsupported_position_count"] == 58
+    assert d["operational_position_count"] == 78
+    assert d["unsupported_operational_position_count"] == 58
+    assert len(d["unsupported_operational_positions"]) == 58
     assert "SE_花:命名" not in d["unsupported_operational_positions"]
     assert "DE_斧子+树:左命名" in d["unsupported_operational_positions"]
+    assert "ME_动物园:情境" in d["unsupported_operational_positions"]
     assert d["unsupported_operational_position_counts_by_code"] == {
         "source_field_unavailable": 0,
-        "operational_rubric_unavailable": 30,
-        "operational_protocol_unavailable": 20,
+        "operational_rubric_unavailable": 0,
+        "operational_protocol_unavailable": 58,
     }
-    assert len(d["unsupported_operational_position_gaps"]) == 50
-    assert d["source_protocol_position_count"] == 80
-    assert d["source_unstructured_position_count"] == 10
-    assert len(d["source_unstructured_positions"]) == 10
-    assert d["delivery_unsupported_position_count"] == 60
+    assert len(d["unsupported_operational_position_gaps"]) == 58
+    assert d["source_protocol_position_count"] == 78
+    assert d["source_unstructured_position_count"] == 0
+    assert d["source_unstructured_positions"] == []
+    assert d["delivery_unsupported_position_count"] == 58
     assert d["source_document_sha256"] == (
         "b3310b61bdc6afb437cbc05785bd6f4e1f6c30dd53ad0999eb2c0fea10c3891a"
     )
-    assert d["draft_revision"] == "2026-07-20.4"
+    assert d["draft_revision"] == "2026-08-19.1"
     # The rubric-only QC list remains separately available and must not be
-    # mistaken for the stronger full-plan automatic protocol scan.
-    assert len(d["unsupported_operational_rubrics"]) == 30
-    assert any("关系识别" in position
-               for position in d["unsupported_operational_rubrics"])
+    # mistaken for the stronger full-plan automatic protocol scan; with all
+    # open-ended rubrics delivered it is now empty.
+    assert d["unsupported_operational_rubrics"] == []
     assert d["errors"] == []
-    assert not any("SE_花" in w and "第1级线索" in w for w in d["warnings"])
-    assert any("week2:multi:动物园#1" in w for w in d["warnings"])
+    assert d["warnings"] == []
 
 
 def test_score_double_all_correct_is_100(client):
@@ -1237,7 +1253,7 @@ def _authoritative_turn(client, session_id: str, item_event_id: int, item_id: st
 def test_session_plan_expands_turns(client):
     _mk_session(client)
     d = client.get("/sessions/SM0/plan", params={"week_no": 2, "event_line": "正式训练"}).json()
-    assert d["total_items"] == 30 and d["total_turns"] == 20 + 10 * 5
+    assert d["total_items"] == 32 and d["total_turns"] == 20 + 10 * 5 + 2 * 4
 
 
 def test_session_plan_uses_persisted_context_and_fails_closed(client):

@@ -13,19 +13,25 @@ def test_week1_has_no_scoring_items():
     assert plan.items == ()          # 关系建立周旁路判分
 
 
-def test_week2_expands_single_and_double_turns():
+def test_week2_expands_single_double_and_multi_turns():
     plan = build_session_plan(_bank(), week_no=2, event_line="正式训练")
     singles = [it for it in plan.items if it.task_type == "单要素"]
     doubles = [it for it in plan.items if it.task_type == "双要素"]
-    assert len(singles) == 20 and len(doubles) == 10
+    multis = [it for it in plan.items if it.task_type == "多要素"]
+    assert len(singles) == 20 and len(doubles) == 10 and len(multis) == 2
     assert all(len(it.turns) == 1 for it in singles)
     assert all(len(it.turns) == 5 for it in doubles)
     # 双要素5环节 = 固定角色序，含关系识别在末
     assert tuple(t.response_role for t in doubles[0].turns) == DOUBLE_ROLES
     assert doubles[0].display["left_function_cue"]
     assert doubles[0].display["right_function_cue"]
-    # 20单 + 10双×5 = 70 环节
-    assert plan.total_turns() == 20 + 10 * 5
+    # 多要素4环节 = 情境/事物/人物/动作四个关键要素(2026-08-19 内容交付)
+    assert all(len(it.turns) == 4 for it in multis)
+    for it in multis:
+        assert tuple(t.response_role for t in it.turns) == (
+            "情境", "事物", "人物", "动作")
+    # 20单 + 10双×5 + 2多×4 = 78 环节
+    assert plan.total_turns() == 20 + 10 * 5 + 2 * 4
 
 
 def test_unstructured_weeks_fail_closed_instead_of_reusing_week2():

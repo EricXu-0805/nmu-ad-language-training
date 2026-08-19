@@ -1014,7 +1014,8 @@ def test_legacy_runtime_command_binding_is_not_replayed(
 
 def test_start_rejects_default_week2_plan_before_taking_control(
         service_engine, monkeypatch):
-    """All structured and source-only gaps are counted before ownership."""
+    """2026-08-19 内容交付后源协议全量结构化：剩余缺口全部是结构化协议缺口，
+    仍要求在取得控制权之前全量清点并拒绝。"""
     _enable_p0a(monkeypatch)
     with Session(service_engine) as db:
         _seed_ready(db, bank=BANK)
@@ -1022,10 +1023,10 @@ def test_start_rejects_default_week2_plan_before_taking_control(
             _start(db, bank=BANK)
         assert caught.value.code == "autopilot_plan_not_fully_supported"
         assert caught.value.context == {
-            "unsupported_position_count": 60,
-            "structured_unsupported_position_count": 50,
-            "source_unstructured_position_count": 10,
-            "source_protocol_position_count": 80,
+            "unsupported_position_count": 58,
+            "structured_unsupported_position_count": 58,
+            "source_unstructured_position_count": 0,
+            "source_protocol_position_count": 78,
             "first_gap": {
                 "code": "operational_protocol_unavailable",
                 "item_id": "DE_烟灰缸+烟",

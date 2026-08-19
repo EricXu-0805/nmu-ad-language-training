@@ -75,8 +75,13 @@ def _stage(tmp_path, packages: dict[str, dict], active: str):
     import shutil
 
     # 启动安装链含「量表一与训练词表不相交」检查(收据 150 S4),该检查对
-    # 训练索引 fail-closed;临时内容目录须带真实训练索引+题库。
-    for name in (content.ITEM_BANK_INDEX_FILE, "item_bank_v1.json"):
+    # 训练索引 fail-closed;临时内容目录须带真实训练索引+索引登记的全部周题库
+    # (2026-08-19 起索引登记 week2..8 共 7 份,缺任何一份即整链降级)。
+    index_raw = json.loads(
+        (_REAL_CONTENT_DIR / content.ITEM_BANK_INDEX_FILE).read_text(
+            encoding="utf-8"))
+    bank_files = [entry["file"] for entry in index_raw["banks"]]
+    for name in (content.ITEM_BANK_INDEX_FILE, *bank_files):
         if not (tmp_path / name).exists():
             shutil.copy(_REAL_CONTENT_DIR / name, tmp_path)
     import hashlib
