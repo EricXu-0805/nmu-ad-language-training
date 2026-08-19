@@ -101,31 +101,30 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**有（2026-08-19 内容交付 + UI 迭代，未部署）。** 生产仍 = `10c90e4`；`main` 已到
-`669d83b`（+5 提交；内容交付部分 CI run 32237700279 五 job 全绿，UI 部分推送后 CI 运行中）：
+**无。生产 = `b1765c0` = origin/main（2026-08-20 00:10 上线）。**
 
-- `55c51d7` **修复快速演练一键链**：内容交付把后端 demo profile digest 重钉而前端
-  字面量没跟上，浏览器里模拟一键开场必失败；已同步并新增跨端钉测试
-  `tests/test_demo_profile_frontend_pin.py`。
-- `669d83b` UI 全面迭代（67 文件全在 `web/`）：文案三层制（工程腔全下屏）、禁用
-  原因可见化、iPad 触控 44px + 860px 断点、锁分 0/1 两键、控件归一。行为零改动，
-  本机六关 `ci_gate.sh` 全绿。**无新迁移头**。
+## 2026-08-20 上线记录（b1765c0：内容交付 + 快速演练修复 + UI 迭代，零迁移）
 
-- `f19a114` 判分口径：关系识别 0/0.5/1 → **0/1**（钱凯 2026-08-19 口径）、
-  新增 `all_concept_groups` rubric 策略、分析后台锁分合同补多要素条目。
-- `28ff4c0` 第 2–8 周题库全量交付（各 20 单+10 双+2 多，全部 frozen 零告警
-  `ready_for_research=true`）、224 张图片入研究交付清单、勘误 32 条、
-  47 个测试迁移。**无新迁移头**（库结构不变，纯内容+代码）。
+受控技术环境更新，Eric 本人执行一键窗口脚本（`项目综合审计_20260717/
+PM_20260730_自动对话/218-上线命令_b1765c0.sh`），Claude 只读核验前提与收尾：
 
-上线注意：
+| 步骤 | 结果 |
+| --- | --- |
+| 前提 | `10c90e4..b1765c0` 迁移与依赖锁**零变化** → 没停定时器、没碰 venv、没拍停写快照（夜间照常）；备份链三件套脚本零变化 → 异地校验器免重装 |
+| 回滚存档 | `/opt/nmu/app-before-deploy-20260820-001042.tar.gz`（排除 data/） |
+| 同步 | 旧 dist 整体隔离进 `/opt/nmu/dist-stale-20260820-001042`（移走不删）→ `RSYNC_EXIT=0`；权限规范化后不可读文件 0，`.env` 600、`data/` 700 |
+| 校验器 | 部署树 `verify_backup_snapshot.py` sha == 本地 `7d434d79…` ✓ |
+| dist 绑定 | 首查 FAIL——**服务器 `web/src` 里躺着一个早已删除的 `SessionCreateScreen.tsx`**（历次无 `--delete` 同步的残留；以前的复查不带 `--source-root` 从没量过源指纹）。隔离进 `/opt/nmu/src-stale-20260820-001042` 后复查 **15 个受管文件通过** |
+| 库头闸 | `OK database_at_head`（`6f2a9c4d8e17` 不变，数据一行没动） |
+| 起服 | 本地与公网 `/health` 200；`/docs` 404；公网 `build-id` 与本地 dist 逐字符一致 |
+| 预检 | `--require-all` **8/8 全 PASS 退出码 0**（含 OS 安全补丁积压 0） |
+| 收尾核验 | `verify_deployed_tree.py --revision b1765c0` → **MATCH files=85 identical=85** |
+| 部署记录 | `/opt/nmu/last-deploy.state` 已写本次事实（此前它还停在 08-08 的 `9c34dcb`） |
+| 异地 | 手动拉取 `ok snapshots=35 pulled=1`；当日 12:31 定时拉取曾 FAIL rc=255 属 VPN 链路瞬断；held=12 为 08-18 升库前历史快照按 §8.1 等运维处置（设计如此） |
 
-1. 无迁移，不需要停写快照/升库三件套；但 `content/` 新增 200 个文件
-   （6 题库 + 194 WebP），rsync 排除规则照旧（`.env`、`data/` 除外即可）。
-2. 图片交付清单的研究发布审批事实现记**钱凯口头授权（Eric 转达）**，
-   书面双签补齐后要重出清单换 approved_by。
-3. 部署后 `verify_deployed_tree.py --revision 28ff4c0` 应 MATCH。
-
-收据：`项目综合审计_20260717/PM_20260730_自动对话/217-…-20260819.md`。
+**runbook 教训（已体现在下次照做的清单里）**：不带 `--delete` 的同步会让被删除的
+源文件永远留在服务器上；`verify_browser_dist.py --source-root` 是唯一能照出它们的
+检查，每次上线都要带上，多出来的文件隔离进 `src-stale-<ts>`（移走不删）。
 
 ## 2026-08-19 这次上线的实际记录
 
