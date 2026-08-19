@@ -7,7 +7,7 @@ import type { EventLine, PhaseType, Session, SessionPlan } from "../types";
  */
 export const WEEK2_SINGLE20_DEMO_PROFILE_VERSION = "week2-single20-demo-v1" as const;
 export const WEEK2_SINGLE20_DEMO_PROFILE_DIGEST =
-  "a82bf3910e2e4f0f5a0b78eb3e4c9b8fc4d8a73f16bb570f118f1d5136311f34" as const;
+  "089c44fc5f20b541b374b24289693e066550acf6999e0b5dc382cd5f10ba71fc" as const;
 
 const WEEK2_SINGLE20_POSITION_COUNT = 20;
 

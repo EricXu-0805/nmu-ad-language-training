@@ -10,7 +10,7 @@ import type { Session } from "./types.ts";
 
 const DEMO_VERSION = "week2-single20-demo-v1";
 const DEMO_DIGEST =
-  "a82bf3910e2e4f0f5a0b78eb3e4c9b8fc4d8a73f16bb570f118f1d5136311f34";
+  "089c44fc5f20b541b374b24289693e066550acf6999e0b5dc382cd5f10ba71fc";
 function demoPlan() {
   return {
     item_bank_version_id: "wk2-v1-20260707",

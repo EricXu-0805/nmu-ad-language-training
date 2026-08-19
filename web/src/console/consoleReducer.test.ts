@@ -40,7 +40,7 @@ function session(runtime_status: Session["runtime_status"], week_no = 2): Sessio
 
 const DEMO_PROFILE_VERSION = "week2-single20-demo-v1";
 const DEMO_PROFILE_DIGEST =
-  "a82bf3910e2e4f0f5a0b78eb3e4c9b8fc4d8a73f16bb570f118f1d5136311f34";
+  "089c44fc5f20b541b374b24289693e066550acf6999e0b5dc382cd5f10ba71fc";
 
 // The key production actually reads.  The legacy `…:LOCAL-M0` key is deleted
 // on every load and never parsed, so seeding it would prove nothing.
