@@ -11,9 +11,8 @@ export const num = (x: number | null | undefined, digits = 2): string =>
 export const secs = (s: number | null | undefined): string =>
   s == null ? "—" : `${Number(s).toFixed(1)}s`;
 
-// double 环节值展示:关系识别 0/0.5/1 → 未识别/部分/识别;其余 0/1 → 否/是。
+// 环节值展示:全部环节 0/1(关系识别 0.5 档已于 2026-08-19 取消)。
 export const elementLabel = (v: number | null | undefined): string => {
   if (v == null) return "未评";
-  if (v === 0.5) return "部分(0.5)";
   return v >= 1 ? "是(1)" : "否(0)";
 };

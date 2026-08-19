@@ -47,7 +47,8 @@ test("relation role alone cannot manufacture the three-value scoring enum", () =
   assert.equal(gate.blockers.some((blocker) => blocker.code === "unknown_scoring_contract"), true);
 });
 
-test("the exact double-element relation contract allows 0.5", () => {
+test("the double-element relation contract rejects the retired 0.5", () => {
+  // 2026-08-19 钱凯口径：关系识别必须正确才给分，0.5 档取消。
   const gate = evaluateResearchReviewGate({
     ...VALID_GATE_INPUT,
     taskType: "双要素",
@@ -55,7 +56,30 @@ test("the exact double-element relation contract allows 0.5", () => {
     responseRole: "关系识别",
     selectedScore: "0.5",
   });
-  assert.equal(gate.canLockScore, true);
+  assert.equal(gate.canLockScore, false);
+  assert.equal(gate.blockers.some((blocker) => blocker.code === "invalid_score"), true);
+
+  const binary = evaluateResearchReviewGate({
+    ...VALID_GATE_INPUT,
+    taskType: "双要素",
+    scoringKey: "relation",
+    responseRole: "关系识别",
+    selectedScore: "1",
+  });
+  assert.equal(binary.canLockScore, true);
+});
+
+test("multi-element key-element contracts lock binary scores", () => {
+  for (const key of ["情境", "事物", "人物", "动作"]) {
+    const gate = evaluateResearchReviewGate({
+      ...VALID_GATE_INPUT,
+      taskType: "多要素",
+      scoringKey: key,
+      responseRole: key,
+      selectedScore: "1",
+    });
+    assert.equal(gate.canLockScore, true, `多要素 ${key} 应可锁分`);
+  }
 });
 
 test("missing or failed authenticated audio blocks lock even with a known contract", () => {

@@ -2155,8 +2155,9 @@ function LockControl({ taskType, role, suggestedPromptLevel = 0, onLock, locking
   const relation = isRelationRole(role);
   const single = taskType === "单要素";
 
+  // 关系识别 0.5 档已于 2026-08-19 取消（钱凯口径：必须正确才给分）。
   const choices: { v: number; label: string; tone: "ok" | "warn" | "danger" }[] = relation
-    ? [{ v: 1, label: "识别(1)", tone: "ok" }, { v: 0.5, label: "部分(0.5)", tone: "warn" }, { v: 0, label: "未识别(0)", tone: "danger" }]
+    ? [{ v: 1, label: "识别(1)", tone: "ok" }, { v: 0, label: "未识别(0)", tone: "danger" }]
     : [{ v: 1, label: single ? "命名正确(1)" : "正确(1)", tone: "ok" }, { v: 0, label: single ? "未正确(0)" : "错误(0)", tone: "danger" }];
 
   return (

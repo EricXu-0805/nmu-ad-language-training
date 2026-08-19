@@ -49,19 +49,25 @@ def test_double_element_item_all_correct_is_one():
 
 
 def test_double_element_item_partial():
-    # 0.15·1 + 0.10·0 + 0.15·1 + 0.10·0 + 0.5·0.5 = 0.55
-    it = DoubleElementItem("d2", left_name=1, left_function=0, right_name=1, right_function=0, relation=0.5)
-    assert math.isclose(score_double_element_item(it), 0.55)
+    # 0.15·1 + 0.10·0 + 0.15·1 + 0.10·0 + 0.5·0 = 0.30
+    it = DoubleElementItem("d2", left_name=1, left_function=0, right_name=1, right_function=0, relation=0)
+    assert math.isclose(score_double_element_item(it), 0.30)
 
 
 def test_double_element_aggregate():
     items = [
         DoubleElementItem("d1", 1, 1, 1, 1, 1),      # 1.00, 自发关系正确
-        DoubleElementItem("d2", 1, 0, 1, 0, 0.5),    # 0.55, 关系相关但不完整
+        DoubleElementItem("d2", 1, 0, 1, 0, 0),      # 0.30, 关系未识别
     ]
     r = score_double_element(items)
-    assert math.isclose(r["weekly_de_score_percentile"], (1.0 + 0.55) / 2 * 100)
+    assert math.isclose(r["weekly_de_score_percentile"], (1.0 + 0.30) / 2 * 100)
     assert r["spontaneous_relation_identification_rate"] == 0.5  # 只有 d1 relation==1
+
+
+def test_double_element_relation_rejects_the_retired_half_point():
+    # 会议表原有 0.5 档；2026-08-19 钱凯口径取消。回归钉住不许再回来。
+    with pytest.raises(ValueError):
+        score_double_element_item(DoubleElementItem("bad", 1, 1, 1, 1, relation=0.5))
 
 
 def test_double_element_bad_relation():

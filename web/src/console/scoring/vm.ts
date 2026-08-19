@@ -25,5 +25,6 @@ export function assertPortraitFree(payload: Record<string, unknown>): void {
   }
 }
 
-// 关系识别环节用三段值 0 / 0.5 / 1;其余(命名/作用/关键要素)为 0 / 1。
+// 全部环节 0 / 1;关系识别 0.5 档已于 2026-08-19 取消(钱凯口径:必须正确才给分)。
+// 保留此判定用于关系环节的专用按钮文案(识别/未识别)。
 export const isRelationRole = (role: string): boolean => role === "关系识别";

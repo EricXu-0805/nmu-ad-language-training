@@ -226,20 +226,34 @@ class _RubricCuesSchema(_FrozenContentSchema):
 class _OperationalRubricSchema(_FrozenContentSchema):
     rubric_version: str = Field(min_length=1)
     decision_policy: Literal[
-        "any_acceptable_expression", "all_required_concepts", "hybrid"
+        "any_acceptable_expression", "all_required_concepts",
+        "all_concept_groups", "hybrid"
     ]
     acceptable_expressions: list[str] = Field(default_factory=list)
     required_concepts: list[str] = Field(default_factory=list)
+    required_concept_groups: list[list[str]] | None = None
     cues: _RubricCuesSchema
     tell_answer: str = Field(min_length=1)
 
     @model_validator(mode="after")
     def _has_operational_truth(self):
-        values = (*self.acceptable_expressions, *self.required_concepts)
+        group_values = tuple(
+            value for group in (self.required_concept_groups or [])
+            for value in group)
+        values = (*self.acceptable_expressions, *self.required_concepts,
+                  *group_values)
         if not any(value.strip() for value in values):
             raise ValueError("must contain at least one non-blank truth expression")
         if any(not value.strip() for value in values):
             raise ValueError("truth expressions must not be blank")
+        if self.decision_policy == "all_concept_groups":
+            if not self.required_concept_groups \
+                    or any(not group for group in self.required_concept_groups):
+                raise ValueError(
+                    "all_concept_groups requires non-empty required_concept_groups")
+        elif self.required_concept_groups is not None:
+            raise ValueError(
+                "required_concept_groups is only valid with all_concept_groups")
         return self
 
 
@@ -805,9 +819,13 @@ def validate_autopilot_protocol(p: dict) -> list[str]:
 
 
 _DOUBLE_OPEN_OPERATIONAL_ROLES = ("左作用", "右作用", "关系识别")
+# all_concept_groups：源文完成条件形如「同时抓取到“甲/乙”与“丙”（或丁）」——
+# 每组内任取其一、组间求与。拍平成 all_required_concepts 会把标准正确回答
+# （说了甲和丙）判失败，2026-08-19 保真度审计实测踩到（wk6 院子/wk8 家里等）。
 _RUBRIC_POLICIES = {
     "any_acceptable_expression",
     "all_required_concepts",
+    "all_concept_groups",
     "hybrid",
 }
 
@@ -841,6 +859,7 @@ def unsupported_operational_rubrics(bank: ItemBank) -> tuple[str, ...]:
             rubric = rubrics.get(role) if isinstance(rubrics, dict) else None
             expressions = rubric.get("acceptable_expressions") if isinstance(rubric, dict) else None
             concepts = rubric.get("required_concepts") if isinstance(rubric, dict) else None
+            groups = rubric.get("required_concept_groups") if isinstance(rubric, dict) else None
             policy = rubric.get("decision_policy") if isinstance(rubric, dict) else None
             cues = rubric.get("cues") if isinstance(rubric, dict) else None
             if not (
@@ -853,6 +872,11 @@ def unsupported_operational_rubrics(bank: ItemBank) -> tuple[str, ...]:
                         isinstance(value, str) and value.strip() for value in expressions)
                     or isinstance(concepts, list) and any(
                         isinstance(value, str) and value.strip() for value in concepts)
+                    or isinstance(groups, list) and groups and all(
+                        isinstance(group, list) and group and all(
+                            isinstance(value, str) and value.strip()
+                            for value in group)
+                        for group in groups)
                 )
                 and isinstance(cues, dict)
                 and all(

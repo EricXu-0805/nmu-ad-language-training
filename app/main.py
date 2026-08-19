@@ -8159,16 +8159,27 @@ def _classify_with_operational_rubric(
         for value in rubric.get("required_concepts") or []
         if rule_judge.normalize(value)
     ]
+    # 组间求与、组内任取其一：「同时抓取到“甲/乙”与“丙”（或丁）」这类完成条件。
+    groups = [
+        [rule_judge.normalize(value) for value in group
+         if rule_judge.normalize(value)]
+        for group in rubric.get("required_concept_groups") or []
+    ]
+    groups = [group for group in groups if group]
     expression_hit = any(value == response or value in response for value in expressions)
     concept_hits = sum(value in response for value in concepts)
+    group_hits = sum(
+        any(value in response for value in group) for group in groups)
     policy = rubric["decision_policy"]
     all_concepts = bool(concepts) and concept_hits == len(concepts)
+    all_groups = bool(groups) and group_hits == len(groups)
     correct = (
         expression_hit if policy == "any_acceptable_expression"
         else all_concepts if policy == "all_required_concepts"
+        else all_groups if policy == "all_concept_groups"
         else expression_hit or all_concepts
     )
-    partial = not correct and concept_hits > 0
+    partial = not correct and (concept_hits > 0 or group_hits > 0)
     return {
         "answer_type": "正确" if correct else "部分正确" if partial else "未识别",
         "ai_score": 1.0 if correct else 0.5 if partial else 0.0,
@@ -8179,7 +8190,8 @@ def _classify_with_operational_rubric(
         "judge_reason": None,
         "matched_on": (
             "rubric:acceptable" if expression_hit
-            else f"rubric:concepts:{concept_hits}/{len(concepts)}"
+            else f"rubric:groups:{group_hits}/{len(groups)}"
+            if groups else f"rubric:concepts:{concept_hits}/{len(concepts)}"
             if concepts else "rubric:none"
         ),
         "contains_target": correct,
@@ -9581,7 +9593,7 @@ class LockIn(BaseModel):
     # operator comes from authentication, prompt level from source AttemptEvent,
     # and reviewed_score must equal the one human research input element_value.
     reviewer_id: str | None = PydanticField(default=None, max_length=128)
-    element_value: float                     # 单要素 final_correct(0/1) / 双要素分环节(0/1，关系0/0.5/1) / 多要素(0/1)
+    element_value: float                     # 全部环节 0/1（关系识别 0.5 档已于 2026-08-19 取消）
     reviewed_score: float | None = None       # legacy 兼容；提供时必须等于 element_value
     prompt_level: int | None = PydanticField(default=None, ge=0, le=3)
 
@@ -13059,8 +13071,7 @@ def list_attempts(session_id: str, request: Request, response: Response,
 
 
 def _allowed_lock_values(task_type: str, response_role: str) -> set[float]:
-    if task_type == "双要素" and response_role == "关系识别":
-        return {0.0, 0.5, 1.0}
+    # 关系识别原有 0.5 档；2026-08-19 钱凯口径“必须正确才给分”后全部环节二值。
     return {0.0, 1.0}
 
 

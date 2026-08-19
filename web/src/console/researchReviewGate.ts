@@ -3,7 +3,7 @@ import type { TaskType } from "../types";
 export type AudioEvidenceStatus = "missing" | "idle" | "loading" | "ready" | "error";
 
 export interface ResearchScoreOption {
-  value: "0" | "0.5" | "1";
+  value: "0" | "1";
   label: string;
 }
 
@@ -29,9 +29,14 @@ const BINARY_FUNCTION_OPTIONS = [
   { value: "0", label: "功能描述不正确（0）" },
 ] as const;
 
+// 会议表原有“部分识别 0.5”档；2026-08-19 钱凯口径“必须正确才给分”后取消。
 const RELATION_OPTIONS = [
   { value: "1", label: "识别（1）" },
-  { value: "0.5", label: "部分识别（0.5）" },
+  { value: "0", label: "未识别（0）" },
+] as const;
+
+const BINARY_KEY_ELEMENT_OPTIONS = [
+  { value: "1", label: "正确识别（1）" },
   { value: "0", label: "未识别（0）" },
 ] as const;
 
@@ -78,6 +83,14 @@ const KNOWN_CONTRACTS: readonly ResearchScoringContract[] = [
     responseRole: "关系识别",
     options: RELATION_OPTIONS,
   },
+  // 多要素只计算关键要素识别（会议决策评价体系6）：情境/事物/人物/动作各 0/1。
+  ...(["情境", "事物", "人物", "动作"] as const).map((key) => ({
+    id: `multi.${key}.v1`,
+    taskType: "多要素" as TaskType,
+    scoringKey: key,
+    responseRole: key,
+    options: BINARY_KEY_ELEMENT_OPTIONS,
+  })),
 ] as const;
 
 export function resolveResearchScoringContract(

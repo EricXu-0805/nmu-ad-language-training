@@ -68,14 +68,18 @@ class DoubleElementItem:
     left_function: int        # 正确描述 1 / 不完全或未描述 0
     right_name: int
     right_function: int
-    relation: float           # 自发识别正确 1 / 相关但不完整 0.5 / 未识别 0
+    # 识别正确 1 / 其余（相关但不完整、未识别）0。会议表原有 0.5 档，
+    # 2026-08-19 钱凯口径改为“必须正确才给分”（Eric 转达），0.5 不再合法。
+    relation: float
 
 
 def score_double_element_item(it: DoubleElementItem) -> float:
     for f in ("left_name", "left_function", "right_name", "right_function"):
         _check01(getattr(it, f), f"{it.item_id}.{f}")
-    if it.relation not in (0, 0.5, 1):
-        raise ValueError(f"{it.item_id}.relation 必须 0 / 0.5 / 1，收到 {it.relation!r}")
+    if it.relation not in (0, 1):
+        raise ValueError(
+            f"{it.item_id}.relation 必须 0 或 1（2026-08-19 起取消 0.5 档），"
+            f"收到 {it.relation!r}")
     return (DE_WEIGHTS["left_name"] * it.left_name
             + DE_WEIGHTS["left_function"] * it.left_function
             + DE_WEIGHTS["right_name"] * it.right_name
