@@ -23,7 +23,7 @@ test("TTS serve evidence section states never overclaim playback, and stay disti
   const contractError = renderToStaticMarkup(React.createElement(TtsServeEvidenceSectionView, {
     section: { status: "contract-error", message: "text_sha256 必须是 64 位小写 hex" },
   }));
-  assert.match(contractError, /TTS 证据契约异常/);
+  assert.match(contractError, /语音返回记录异常/);
   assert.match(contractError, /text_sha256/);
 
   const empty = renderToStaticMarkup(React.createElement(TtsServeEvidenceSectionView, {
@@ -57,7 +57,7 @@ test("TTS serve evidence section states never overclaim playback, and stay disti
     for (const phrase of FORBIDDEN_PLAYBACK_CLAIMS) {
       assert.equal(markup.includes(phrase), false, `不该出现「${phrase}」`);
     }
-    assert.match(markup, /终端侧音频消费情况不在本证据范围/);
+    assert.match(markup, /不代表老人设备上已实际播放/);
   }
 });
 
@@ -88,8 +88,8 @@ test("confirmation revision history is content-blind and distinguishes no_ledger
       ],
     },
   }));
-  assert.match(tracked, /revision 1/);
-  assert.match(tracked, /revision 2/);
+  assert.match(tracked, /第 1 次修订/);
+  assert.match(tracked, /第 2 次修订/);
   assert.match(tracked, /操作者 researcher-1/);
   assert.match(tracked, /内容无关记录/);
 });
@@ -123,7 +123,7 @@ test("AI usage section distinguishes loading/forbidden/withdrawn/network-error/c
   const contractError = renderToStaticMarkup(React.createElement(AiUsageSectionView, {
     state: { status: "contract-error", message: "AI 使用汇总返回了其他场次，已拒绝显示" },
   }));
-  assert.match(contractError, /AI 使用汇总契约异常/);
+  assert.match(contractError, /AI 使用汇总数据异常/);
   assert.match(contractError, /其他场次/);
 
   const emptyReady = renderToStaticMarkup(React.createElement(AiUsageSectionView, {

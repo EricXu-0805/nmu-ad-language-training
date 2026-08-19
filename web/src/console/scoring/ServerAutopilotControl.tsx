@@ -369,7 +369,7 @@ export function ServerAutopilotControl({
           : serverFailed ? "AI 自动干预已进入失败锁定"
             : checking ? "正在核对服务器控制权"
           : uncertain ? "服务器状态待核实 · 人工控制已锁定"
-            : "服务器 AI 自动干预 · 仅模拟且逐位置校验";
+            : "AI 自动带练（仅限演练场次）";
 
   return (
     <>
@@ -416,46 +416,61 @@ export function ServerAutopilotControl({
           {canProbeProvider && !autopilotServerOwnsConsole(state) && (
             <Button type="button" variant="secondary" disabled={providerProbeBusy}
               onClick={() => { void runProviderProbe(); }}>
-              {providerProbeBusy ? "正在实际检查 TTS→ASR→LLM…" : "执行 AI 服务合成检查"}
+              {providerProbeBusy ? "正在检查 AI 服务…" : "检查 AI 服务"}
             </Button>
           )}
         </div>
       }
     >
       {manual ? (
-        <>服务器已记录接管人、原因和状态版本，旧自动命令不再有效。如场次仍在暂停，请先核对老人状态再恢复人工流程。</>
+        <>已转为人工操作，服务器已记录本次接管。如场次仍在暂停，请先确认老人状态再继续。</>
       ) : active ? (
-        <>服务器已签发当前设备命令。旧的本地推进、提示与录音入口保持关闭。</>
+        <>AI 正在进行当前环节；本页人工操作暂时关闭。</>
       ) : processing ? (
-        <>录音已交给服务器做权威 ASR 与 operational 判类；完成前不会开放旧人工推进。</>
+        <>服务器正在处理刚才的回答，请稍候。</>
       ) : paused ? (
         contentGap ? (
-          <>下一协议位置缺少冻结的 operational rubric 或自动交互协议，服务器已在边界停止且不会跳题。请由研究团队补齐并复核内容，或完成收麦后显式接管。</>
+          <>下一题缺少自动训练内容，AI 已停下，不会跳题。请点「收麦后转为人工处置」继续人工操作。</>
         ) : (
-          <>服务器已保持当前题位与提示等级，旧人工入口仍锁定；后续需走显式接管流程。</>
+          <>AI 已暂停，题目停在当前位置；要继续人工操作，请点「收麦后转为人工处置」。</>
         )
       ) : completed ? (
-        <>本次冻结计划中所有可证明完整的模拟位置已经结束。旧人工入口不会自动恢复，需由服务器确认下一控制模式。</>
+        <>本次模拟训练的自动部分已完成；如需继续，请点「收麦后转为人工处置」。</>
       ) : serverFailed ? (
-        <>服务器保留控制权并停止推进，不会因刷新开放旧人工入口。{state.receipt?.lastErrorCode ? ` 错误码：${state.receipt.lastErrorCode}。` : ""}</>
+        <>
+          AI 自动训练出错停止，页面保持锁定；请联系研究团队处置。
+          {state.receipt?.lastErrorCode && (
+            <details style={{ marginTop: "var(--sp-2)" }}>
+              <summary>技术详情</summary>
+              <div style={{ marginTop: "var(--sp-1)" }}>错误码：{state.receipt.lastErrorCode}</div>
+            </details>
+          )}
+        </>
       ) : checking ? (
-        <>刷新后先从服务器恢复真实控制状态；查询完成前，旧标签页不能成为第二个驾驶员。</>
+        <>正在向服务器确认控制状态，请稍候。</>
       ) : uncertain ? (
-        <>启动请求可能已经在服务器提交，但响应未能确认。当前页不会假定“仍是人工模式”；请保持场次暂停或等待权威状态查询。</>
+        <>启动结果待确认，页面已锁定，请稍候。</>
       ) : completePlanBlocked ? (
         operationalAutopilotReady === null ? (
-          <>正在核对完整冻结计划的每一个题目和环节；核对完成前不会把控制权交给服务器 AI。</>
+          <>正在核对训练内容，请稍候。</>
         ) : (
-          <>服务器 AI 启动已禁用：源脚本当前有 {unsupportedOperationalPositions.length} 个交付缺口（包含尚未结构化的多要素环节）；服务器启动时还会再次逐一复核。请先由研究团队冻结评分边界、自动问句、提示、反馈和推进协议，不能启动后再中途交给现场人员补位。</>
+          <>训练内容还有 {unsupportedOperationalPositions.length} 处未配齐，AI 自动干预不可启动，请人工操作。</>
         )
       ) : providerBlocked ? (
         <>
-          {providerReadinessLabel(providerReadiness)}。只有具名管理员用固定合成内容实际通过 TTS→ASR，
-          并对已配置 LLM 完成结构检查后，服务器才会取得控制权。
-          {providerReadinessError ? ` 就绪状态读取失败：${providerReadinessError}。` : ""}
+          {providerReadinessLabel(providerReadiness)}。请管理员先点「检查 AI 服务」，通过后才能启动。
+          {providerReadinessError ? ` 检查状态读取失败：${providerReadinessError}。` : ""}
         </>
       ) : (
-        <>管理员的最新合成检查已通过。点击后服务器还会核对具名研究账号、双重模拟开关、模拟档案、录音授权、实时场次和唯一配对设备。服务器只会按顺序执行内容完整的冻结协议位置；一旦缺少 rubric 或自动话术就会停在边界。</>
+        <>
+          AI 服务检查已通过，可以启动。
+          <details style={{ marginTop: "var(--sp-2)" }}>
+            <summary>技术详情</summary>
+            <div style={{ marginTop: "var(--sp-1)" }}>
+              启动时服务器会自动核对：研究账号、模拟档案与开关、录音授权、场次状态、配对设备；缺少内容的环节会自动停下，不会跳题。
+            </div>
+          </details>
+        </>
       )}
       {providerReadiness && (
         <details style={{ marginTop: 8 }}>
@@ -463,7 +478,7 @@ export function ServerAutopilotControl({
           <div style={{ marginTop: 6 }}>
             TTS：{providerReadiness.tts.success ? "通过" : `未通过（${providerReadiness.tts.failureCode ?? "unknown"}）`}，
             ASR：{providerReadiness.asr.success ? "通过" : `未通过（${providerReadiness.asr.failureCode ?? "unknown"}）`}，
-            LLM：{providerReadiness.llm.required ? "本运行合同必需" : "本运行合同非必需"}·
+            LLM：{providerReadiness.llm.required ? "必需" : "非必需"}·
             {providerReadiness.llm.success ? "通过" : `未通过（${providerReadiness.llm.failureCode ?? "unknown"}）`}。
             {providerReadiness.checkedAt && providerReadiness.expiresAt
               ? ` 检查时间 ${new Date(providerReadiness.checkedAt).toLocaleString()}，有效至 ${new Date(providerReadiness.expiresAt).toLocaleString()}。`
@@ -479,7 +494,7 @@ export function ServerAutopilotControl({
     <ConfirmDialog
       open={confirmTakeover}
       title="确认结束服务器控制并转为人工处置？"
-      body="服务器仅会在老人端已完成收麦证明、当前命令已失效时放行。接管会写入不可覆盖的审计记录，不会把技术失败记为受试者作答。"
+      body="服务器确认老人端麦克风已关闭后才会放行；接管会留下记录，技术故障不会算作老人答错。"
       confirmLabel="确认转为人工处置"
       onCancel={() => setConfirmTakeover(false)}
       onConfirm={() => { void takeover(); }}

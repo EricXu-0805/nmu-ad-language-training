@@ -42,7 +42,7 @@ test("caregiver workspace contains only the approved bedside capabilities", () =
 
 test("patient view remains a separate-window instruction rather than a mounted overlay", () => {
   assert.match(source, /两个窗口都要保持打开/);
-  assert.match(source, /老人画面应单独打开在另一个窗口/);
+  assert.match(source, /老人画面在另一个窗口，两个窗口都不要关/);
   assert.doesNotMatch(source, /PATIENT_VIEW_EVENT|PatientViewHost|PatientShell/);
 });
 
@@ -63,12 +63,12 @@ test("the screen offers no way to claim delivery, only arrival and completion", 
 });
 
 test("the local synthetic boundary stays visible in the header, alert, and every plan", () => {
-  assert.match(source, /<strong>本机20题合成模拟<\/strong>/);
+  assert.match(source, /<strong>语言训练 · 演练模式<\/strong>/);
   assert.match(source, /CAREGIVER_DEMO_BOUNDARY_MESSAGE/);
-  assert.match(source, /<StatusPill tone="warn">本机20题合成模拟<\/StatusPill>/);
+  assert.match(source, /<StatusPill tone="warn">演练<\/StatusPill>/);
   assert.match(source, /today\.withheldCount > 0/);
-  assert.match(source, /有安排未通过模拟门禁/);
-  assert.match(source, /照护员不能在本页开始/);
+  assert.match(source, /有安排暂不能开始/);
+  assert.match(source, /条安排暂时不能开始，请联系负责人/);
 });
 
 test("a non-ready current session exposes only safe closeout and never renders start", () => {
@@ -78,8 +78,8 @@ test("a non-ready current session exposes only safe closeout and never renders s
   );
   assert.match(source, /const safeCloseoutOnly = !session\.operationalDemoReady/);
   assert.match(source, /safeCloseoutOnly && \(/);
-  assert.match(source, /仅可安全收口/);
-  assert.match(source, /不会显示“开始练习”/);
+  assert.match(source, /本次只能暂停或结束/);
+  assert.match(source, /本次不能开始练习，只能暂停、求助、接管或结束/);
   assert.match(source, /const showStart = operationalDemoReady/);
   assert.match(source, /if \(!current\.operationalDemoReady \|\| !actions\.startPractice\) return/);
 });

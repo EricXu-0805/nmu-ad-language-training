@@ -7,6 +7,7 @@ import type { AuditEntry, AuditVerify, AudioAsset, AttemptEvent, InteractionEven
 import { AuthenticatedAudio } from "./AuthenticatedAudio";
 import {
   buildEvidenceTimeline,
+  processingStatusLabel,
   type EvidenceIssue,
   type ParsedInteraction,
   type TurnEvidence,
@@ -80,7 +81,7 @@ function IntegrityBadge() {
   if (v.ok) return <StatusPill tone="ok" size="sm">审计链完整 · {v.count} 条</StatusPill>;
   if (v.problem === "chain_broken") return <StatusPill tone="danger" size="sm">⚠ 审计链在 #{v.broken_at} 处被改</StatusPill>;
   if (v.problem === "truncated") return <StatusPill tone="danger" size="sm">⚠ 审计疑似被删({v.count}/{v.expected_count} 条)</StatusPill>;
-  return <StatusPill tone="warn" size="sm">⚠ 审计链异常({v.problem})</StatusPill>;
+  return <StatusPill tone="warn" size="sm" title={String(v.problem)}>⚠ 审计记录异常,请联系数据管理员</StatusPill>;
 }
 
 // 某场次的操作审计(只读元数据:谁/何时/做了什么,无患者作答文本)。
@@ -101,11 +102,11 @@ function AuditPanel({ sessionId }: { sessionId: string }) {
     <section className="form-section">
       <div className="form-section-header"><div>
         <h3>操作审计(本场)</h3>
-        <p className="muted">只追加、哈希链防篡改;仅记元数据,不含患者作答文本。</p>
+        <p className="muted">只记录操作人、时间和动作,不含患者作答内容,记录不可修改。</p>
       </div></div>
       {forbidden && (
-        <Alert tone="info" title="审计元数据由数据管理员查看">
-          当前账号可复核 AI 与研究真值，但不显示全局审计账本。
+        <Alert tone="info" title="审计记录由数据管理员查看">
+          审计记录需数据管理员账号查看。
         </Alert>
       )}
       {err && <Alert tone="danger" title="审计读取失败">{err}</Alert>}
@@ -248,7 +249,7 @@ export function AnalysisScreen() {
         <div>
           <p className="page-kicker">分析后台 · 受试者</p>
           <h2 className="page-title">数据回看与核查</h2>
-          <p className="page-description">按受试者编号进入,回看每场次逐环节的 AI 判定、提示层级、人工锁分和录音,用于核查 AI 判得准不准、指引对不对。</p>
+          <p className="page-description">点受试者编号,回看每场的 AI 判定、提示、锁分和录音。</p>
         </div>
         <IntegrityBadge />
       </header>
@@ -256,7 +257,7 @@ export function AnalysisScreen() {
         <div className="form-section-header">
           <div>
             <h3>去标识研究数据</h3>
-            <p className="muted">跨受试者的三张长表：受试者、场次、逐环节。可在屏上翻页，也可导出 CSV 直接给 SPSS/R。只向数据管理员与管理员开放。</p>
+            <p className="muted">受试者、场次、逐环节三张表,可翻页查看、可导出 CSV,只向数据管理员与管理员开放。</p>
           </div>
           <Button onClick={() => setResearchDataOpen(true)}>打开研究数据总览</Button>
         </div>
@@ -268,13 +269,13 @@ export function AnalysisScreen() {
           <div className="form-section-header">
             <div>
               <h3>分析数据分区</h3>
-              <p className="muted">默认只进入真实研究分区；模拟与历史未知数据必须单独查看，不会进入默认研究汇总。</p>
+              <p className="muted">默认显示真实研究数据;模拟与历史数据需切换查看。</p>
             </div>
             <DataBoundaryBadge classification={classificationFilter} entity="patient" />
           </div>
           <DataBoundaryFilter value={classificationFilter} counts={classificationCounts} onChange={setClassificationFilter} label="分析后台数据分区" />
           {classificationFilter === "simulation" && (
-            <Alert tone="warn" title="专用模拟数据分析区">本区结果只用于流程和模型调试，不得并入真实研究结果。</Alert>
+            <Alert tone="warn" title="专用模拟数据分析区">模拟数据,不计入研究结果。</Alert>
           )}
           {classificationFilter === "legacy_unknown" && (
             <Alert tone="danger" title="历史/未知数据隔离区">分类缺失的数据只供迁移核查，不能纳入真实研究汇总或结论。</Alert>
@@ -283,12 +284,12 @@ export function AnalysisScreen() {
       )}
       {rows && rows.length > 0 && visibleRows.length === 0 && (
         <Alert tone="info" title={`${DATA_CLASSIFICATION_META[classificationFilter].label}分区暂无数据`}>
-          其他数据分区不会混入当前列表。
+          可在上方切换分区查看。
         </Alert>
       )}
       {qualityClassification === null && (
         <Alert tone="info" title="历史/未知分区不请求 AI 质量汇总">
-          该分区缺少可信分类，前端不会调用质量接口，也不会把历史数据混入真实或模拟 overall。
+          该分区数据分类缺失,不提供 AI 质量汇总。
         </Alert>
       )}
       {qualityClassification !== null
@@ -299,7 +300,7 @@ export function AnalysisScreen() {
       )}
       {currentQualityState?.status === "forbidden" && (
         <Alert tone="warn" title="当前账号无权查看 AI 质量汇总">
-          质量 overall 只向获授权研究账号开放；本页不会回退到患者、场次或录音明细拼接统计。
+          AI 质量汇总需授权研究账号查看。
         </Alert>
       )}
       {currentQualityState?.status === "error" && (
@@ -316,8 +317,14 @@ export function AnalysisScreen() {
           )}
         >
           {qualityRetrySeconds > 0
-            ? "服务器已要求暂缓质量查询；倒计时结束前不会重复请求，也不会沿用上一分区数据。"
-            : "服务器不可用或返回结果未通过 v2 聚合隐私契约；已拒绝显示，不会沿用上一分区数据。"}
+            ? "服务器繁忙,请等倒计时结束后重试。"
+            : "读取失败,已停止显示。请稍后重试。"}
+          <details className="muted">
+            <summary>技术详情</summary>
+            {qualityRetrySeconds > 0
+              ? "服务器已要求暂缓质量查询；倒计时结束前不会重复请求，也不会沿用上一分区数据。"
+              : "服务器不可用或返回结果未通过 v2 聚合隐私契约；已拒绝显示，不会沿用上一分区数据。"}
+          </details>
         </Alert>
       )}
       {currentQualityState?.status === "ready" && (
@@ -370,7 +377,6 @@ function PatientAnalysis({ patientId, patientClassification, onOpenSession, onBa
         <div>
           <p className="page-kicker">分析后台 · <span className="mono">{patientId}</span></p>
           <h2 className="page-title">场次与量表</h2>
-          <p className="page-description">当前档案和场次始终按数据分区单独回看，不生成跨分区默认汇总。</p>
         </div>
         <div className="toolbar">
           <DataBoundaryBadge classification={patientClassification} entity="patient" />
@@ -388,11 +394,11 @@ function PatientAnalysis({ patientId, patientClassification, onOpenSession, onBa
       <section className="form-section">
         <div className="form-section-header"><div>
           <h3>历史未验证量表迁移记录</h3>
-          <p className="muted">这里只回看旧自由字段容器，供迁移核查；它不是正式量表施测证据，也不进入正式研究结局。</p>
+          <p className="muted">旧系统迁移来的量表记录,仅供核查,不计入研究结果。</p>
         </div></div>
         {scales && scales.length > 0 && (
           <Alert tone="warn" title="历史记录未验证 · 不计正式结局">
-            旧记录缺少冻结定义、逐题响应、计分证据和服务器签发的施测身份；只能在当前档案内做迁移核查，不能与研究场次合并统计。
+            旧记录缺少完整施测证据,不能与研究数据合并统计。
           </Alert>
         )}
         {scales && scales.length === 0 && <p className="muted">暂无量表记录。</p>}
@@ -417,7 +423,6 @@ function PatientAnalysis({ patientId, patientClassification, onOpenSession, onBa
         <div className="form-section-header">
           <div>
             <h3>训练场次</h3>
-            <p className="muted">场次只按服务端 data_classification 分区；缺字段一律进入历史/未知。</p>
           </div>
           <DataBoundaryBadge classification={sessionFilter} />
         </div>
@@ -474,18 +479,18 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
         // exact-session fence:晚到的响应必须严格核对本次请求的 sid;撤回墓碑
         // 因隐私不携带 patient_id,只能核对 sid,不能与当前受试者做进一步核对。
         if (j.session.session_id !== sessionId) {
-          setErr("服务器返回了其他场次的 journal，已拒绝显示");
+          setErr("数据与当前场次不符,未显示。请返回重进。");
           return;
         }
         if (j.session.content_state !== "withdrawn_tombstone" && j.session.patient_id !== patientId) {
-          setErr("服务器返回的场次不属于当前受试者，已拒绝显示");
+          setErr("数据与当前受试者不符,未显示。请返回重进。");
           return;
         }
         const missing: string[] = [];
         if (!Array.isArray(j.attempts)) missing.push("attempts");
         if (!Array.isArray(j.interactions)) missing.push("interactions");
         setContractError(missing.length > 0
-          ? `场次 journal 缺少 ${missing.join("、")} 证据数组；已保留可读的研究真值，但不得宣称 AI 证据链完整。`
+          ? "本场部分 AI 过程记录缺失;人工锁定的研究数据仍可查看。"
           : null);
         setData({
           items: j.items,
@@ -600,7 +605,7 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
           <h2 className="page-title">
             {withdrawn ? "场次内容已撤回" : data ? `第 ${data.session.week_no} 周 · ${data.session.phase_type}` : "场次逐环节"}
           </h2>
-          <p className="page-description">按题目、环节和 attempt 回看录音引用、ASR、AI 运营判类、提示/反馈与技术暂停，再与人工锁定的研究真值对照。</p>
+          <p className="page-description">按题目和环节回看录音、转写、AI 判定与提示,并与人工锁分对照。</p>
         </div>
         <div className="toolbar">
           {classification && !withdrawn && <DataBoundaryBadge classification={classification} />}
@@ -610,8 +615,7 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
       {err && <Alert tone="danger" title="场次日志读取失败">{err}</Alert>}
       {withdrawn && (
         <Alert tone="warn" title="受试者内容已撤回">
-          该场次因受试者或录音撤回已关闭内容读取。逐次证据、TTS 服务证据、确认修订历史与 AI 使用汇总均不可用——
-          这是隐私关闭，不能据此推断是否发生或发生次数，也不会显示为空表。
+          受试者已撤回,本场内容依隐私要求关闭查看。
         </Alert>
       )}
       {!withdrawn && (
@@ -622,31 +626,30 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
           {classification === "legacy_unknown" && (
             <Alert tone="danger" title="历史场次分类未知">系统未推测该场次类型；完成迁移和人工核对前，不得纳入研究结果。</Alert>
           )}
-          <Alert tone="info" title="证据口径">
-            <strong>AI operational 判类是自动提示与推进的运营证据，不是研究真值。</strong>
-            只有研究者确认文本并锁定的分值才是研究真值；“数值一致”也不代表两者语义等同。
+          <Alert tone="info" title="怎么读本页数据">
+            AI 判定仅供参考;研究结果以人工确认并锁定的分值为准。
           </Alert>
           {audioAccess === "checking" && <StatusPill tone="muted">正在核对原声回放权限…</StatusPill>}
           {audioAccess === "denied" && (
             <Alert tone="warn" title="原声回放未授权">
-              证据元数据仍可核查，但共享 PIN、开放开发模式或无权角色不会显示播放按钮。请使用 researcher、data_steward 或 admin 具名账号登录。
+              当前登录方式不能播放录音。请用研究者或数据管理员的个人账号重新登录。
             </Alert>
           )}
-          {contractError && <Alert tone="danger" title="AI 证据契约不完整">{contractError}</Alert>}
+          {audioAccess === "allowed" && <p className="muted">播放录音需点击,每次播放都会记录审计。</p>}
+          {contractError && <Alert tone="danger" title="AI 过程记录不完整">{contractError}</Alert>}
           {timeline && timeline.issues.length > 0 && <EvidenceIssues issues={timeline.issues} title="场次级证据异常" />}
 
           {timeline && (
             <section className="form-section evidence-summary">
               <div className="form-section-header"><div>
                 <h3>本场证据概览</h3>
-                <p className="muted">仅统计当前数据分区中的这一场；不与模拟或历史未知数据混合。</p>
               </div></div>
               <div className="evidence-stat-grid">
-                <EvidenceStat label="AI attempts" value={timeline.summary.totalAttempts} />
+                <EvidenceStat label="AI 处理次数" value={timeline.summary.totalAttempts} />
                 <EvidenceStat label="已完成 AI" value={timeline.summary.completedAttempts} tone="ok" />
                 <EvidenceStat label="技术失败" value={timeline.summary.technicalFailures} tone={timeline.summary.technicalFailures ? "danger" : "muted"} />
                 <EvidenceStat label="未完成" value={timeline.summary.incompleteAttempts} tone={timeline.summary.incompleteAttempts ? "warn" : "muted"} />
-                <EvidenceStat label="已绑 source" value={timeline.summary.sourceBoundTurns} />
+                <EvidenceStat label="已关联来源" value={timeline.summary.sourceBoundTurns} />
                 <EvidenceStat label="人工真值" value={timeline.summary.lockedTruths} tone="ok" />
                 <EvidenceStat label="严重证据问题" value={timeline.summary.dangerIssues} tone={timeline.summary.dangerIssues ? "danger" : "ok"} />
                 <EvidenceStat label="待核查" value={timeline.summary.warningIssues} tone={timeline.summary.warningIssues ? "warn" : "muted"} />
@@ -656,16 +659,16 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
 
           {ttsSection && <TtsServeEvidenceSectionView section={ttsSection} />}
           {confirmationSection?.status === "contract-error" && (
-            <Alert tone="danger" title="确认修订契约异常">
-              {confirmationSection.message}
-              下方人工研究真值（确认文本、锁分）仍可读；但本场确认修订履历的完整性目前无法证明，已拒绝显示，不代表无修改。
+            <Alert tone="danger" title="修订历史无法核实">
+              修订历史未通过完整性检查,已停止显示;人工确认文本与锁分仍可查看。
+              <details className="muted"><summary>技术详情</summary>{confirmationSection.message}</details>
             </Alert>
           )}
           {data && <AiUsageSectionView state={aiUsageState} />}
 
           {timeline && timeline.turns.length === 0 && (timeline.unboundAudios.length === 0
-            ? <Alert tone="info" title="该场次暂无逐次证据">尚未产生 attempt、Turn 或定位到环节的 interaction。</Alert>
-            : <Alert tone="warn" title="只找到未绑定录音">未找到可与环节对齐的 attempt/Turn，下方仅列出原始音频资产。</Alert>)}
+            ? <Alert tone="info" title="该场次暂无逐次证据">本场尚未产生逐次作答记录。</Alert>
+            : <Alert tone="warn" title="只找到未对应的录音">录音未能对应到题目环节,下方仅列出原始录音。</Alert>)}
 
           {timeline?.turns.map((row) => (
             <EvidenceTurnCard
@@ -680,7 +683,7 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
             <section className="form-section">
               <div className="form-section-header"><div>
                 <h3>场次级交互事件</h3>
-                <p className="muted">这些事件未绑定到具体题目/环节，不会被静默塞入某个 attempt。</p>
+                <p className="muted">以下事件未对应到具体题目。</p>
               </div></div>
               <InteractionTimeline rows={timeline.sessionInteractions} />
             </section>
@@ -690,7 +693,7 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
             <section className="form-section">
               <div className="form-section-header"><div>
                 <h3>未配对录音</h3>
-                <p className="muted">已采集但没有被 attempt 或 Turn 引用，可能来自关系建立段或采集异常。</p>
+                <p className="muted">已录音但未对应到题目(可能来自关系建立环节)。</p>
               </div></div>
               {timeline.unboundAudios.map((audio) => <AudioEvidence key={audio.raw_audio_id} audio={audio} canPlay={audioAccess === "allowed"} />)}
             </section>
@@ -716,12 +719,17 @@ function EvidenceStat({ label, value, tone = "muted" }: {
 // 终端侧音频消费情况属于 T5 的 started/ended playback ACK，本区不涉及。
 export function TtsServeEvidenceSectionView({ section }: { section: TtsServeEvidenceSectionViewModel }) {
   return (
-    <section className="form-section" aria-label="TTS 服务端实际返回证据">
+    <section className="form-section" aria-label="本场语音返回记录">
       <div className="form-section-header"><div>
-        <h3>TTS 服务端实际返回/降级证据（场次级）</h3>
-        <p className="muted">这里只证明服务端响应事实；终端侧音频消费情况不在本证据范围，需另行核对播放回执（T5）。</p>
+        <h3>语音（TTS）返回记录（本场）</h3>
+        <p className="muted">这里只记录服务器是否返回了语音,不代表老人设备上已实际播放。</p>
       </div></div>
-      {section.status === "contract-error" && <Alert tone="danger" title="TTS 证据契约异常">{section.message}</Alert>}
+      {section.status === "contract-error" && (
+        <Alert tone="danger" title="语音返回记录异常">
+          数据未通过完整性检查,已停止显示。
+          <details className="muted"><summary>技术详情</summary>{section.message}</details>
+        </Alert>
+      )}
       {section.status === "empty" && <Alert tone="info" title="暂无 TTS 服务证据">{section.notice}</Alert>}
       {section.status === "ready" && (
         <>
@@ -774,7 +782,7 @@ export function ConfirmationRevisionHistory({ confirmation }: { confirmation: Co
           <li key={entry.key}>
             <span className="evidence-timeline-dot" aria-hidden />
             <div>
-              <span className="mono muted">revision {entry.revision} · {entry.time}</span>
+              <span className="mono muted">第 {entry.revision} 次修订 · {entry.time}</span>
               <strong>操作者 {entry.actorDisplayId}</strong>
             </div>
           </li>
@@ -787,21 +795,25 @@ export function ConfirmationRevisionHistory({ confirmation }: { confirmation: Co
 // 场次级 AI 实际使用汇总:后端聚合账本,不是 provider readiness、模型准确率或 autopilot 控制状态。
 export function AiUsageSectionView({ state }: { state: AiUsageViewModel }) {
   return (
-    <section className="form-section" aria-label="场次级 AI 实际使用汇总">
+    <section className="form-section" aria-label="本场 AI 使用汇总">
       <div className="form-section-header"><div>
-        <h3>场次级 AI 实际使用汇总</h3>
-        <p className="muted">服务端账本聚合的实际使用证据；不是配置可达性探针，也不是模型准确率或 autopilot 控制状态。</p>
-        <p className="muted">本区与上方逐次证据来自两次独立、非原子的服务端快照；活跃场次里两者出现短暂计数差异是正常的，不代表契约损坏，前端不会据此重算或强行对齐。</p>
+        <h3>本场 AI 使用汇总</h3>
+        <p className="muted">本场实际调用 AI 服务的次数汇总;进行中的场次,此处计数可能与上方略有延迟差异,属正常。</p>
       </div></div>
       {state.status === "loading" && <StatusPill role="status" tone="muted">正在加载 AI 使用汇总…</StatusPill>}
       {state.status === "forbidden" && (
         <Alert tone="warn" title="当前账号无权查看 AI 使用汇总">该证据仅向获授权账号开放。</Alert>
       )}
       {state.status === "withdrawn" && (
-        <Alert tone="warn" title="受试者内容已撤回">该场次 AI 使用汇总因隐私关闭已不可读，无法据此判断使用情况。</Alert>
+        <Alert tone="warn" title="受试者内容已撤回">受试者已撤回,本项依隐私要求关闭查看。</Alert>
       )}
       {state.status === "network-error" && <Alert tone="danger" title="AI 使用汇总读取失败">{state.message}</Alert>}
-      {state.status === "contract-error" && <Alert tone="danger" title="AI 使用汇总契约异常">{state.message}</Alert>}
+      {state.status === "contract-error" && (
+        <Alert tone="danger" title="AI 使用汇总数据异常">
+          数据未通过完整性检查,已停止显示。
+          <details className="muted"><summary>技术详情</summary>{state.message}</details>
+        </Alert>
+      )}
       {state.status === "ready" && (
         <>
           {!state.model.hasAnyRecords && <Alert tone="info" title="暂无实际使用证据">{sessionAiEvidenceEmptyNotice}</Alert>}
@@ -872,10 +884,10 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
         </div>
         <div className="row wrap" style={{ gap: 6 }}>
           {!turn
-            ? <StatusPill tone="warn" size="sm">未生成 Turn</StatusPill>
+            ? <StatusPill tone="warn" size="sm">未形成环节记录</StatusPill>
             : turn.source_attempt_id != null
-              ? <StatusPill tone="primary" size="sm">source attempt #{turn.source_attempt_id}</StatusPill>
-              : <StatusPill tone="danger" size="sm">Turn 无 source attempt</StatusPill>}
+              ? <StatusPill tone="primary" size="sm">来源记录 #{turn.source_attempt_id}</StatusPill>
+              : <StatusPill tone="danger" size="sm">环节缺少来源记录</StatusPill>}
           {turn?.score_locked
             ? <StatusPill tone="ok" size="sm">研究真值 {researchValue ?? "缺失"}</StatusPill>
             : <StatusPill tone="warn" size="sm">研究真值未锁定</StatusPill>}
@@ -890,24 +902,24 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
         </div>
         {turn ? (
           <div className="evidence-detail-grid">
-            <EvidenceValue label="Turn / source" value={`#${turn.id} / ${turn.source_attempt_id != null ? `#${turn.source_attempt_id}` : "缺失"}`} mono />
+            <EvidenceValue label="环节 / 来源" value={`#${turn.id} / ${turn.source_attempt_id != null ? `#${turn.source_attempt_id}` : "缺失"}`} mono />
             <EvidenceValue label="人工锁分" value={turn.score_locked ? String(researchValue ?? "分值缺失") : "尚未锁定"} />
             <EvidenceValue label="锁分人" value={turn.reviewer_id ?? "未记录"} />
             <EvidenceValue label="最高提示" value={turn.prompt_level != null ? `${turn.prompt_level} 级${turn.cue_type ? ` · ${turn.cue_type}` : ""}` : "未记录"} />
             <EvidenceValue label="权威 ASR 原文" value={turn.asr_text ?? "缺失"} />
             <EvidenceValue label="人工确认文本" value={turn.confirmed_response_text ?? "未确认"} marker={corrected ? "已校正 ASR" : undefined} />
           </div>
-        ) : <p className="muted">尚未生成 Turn，因此没有可用的人工研究真值。</p>}
+        ) : <p className="muted">尚未形成环节记录，因此没有可用的人工研究真值。</p>}
         <p className={`evidence-comparison is-${row.comparison.state}`}>{row.comparison.message}</p>
         {confirmation && <ConfirmationRevisionHistory confirmation={confirmation} />}
       </div>
 
       <div className="evidence-attempt-section">
         <div className="evidence-section-title">
-          <strong>AI operational 逐次证据</strong>
+          <strong>AI 逐次处理证据</strong>
           <span className="muted">{row.attempts.length} 次 · 不是研究真值</span>
         </div>
-        {row.attempts.length === 0 && <Alert tone="danger" title="缺少 attempt 证据">该环节没有可回溯的录音→ASR→AI operational 处理链。</Alert>}
+        {row.attempts.length === 0 && <Alert tone="danger" title="缺少 AI 处理证据">该环节缺少录音与 AI 处理记录。</Alert>}
         {row.attempts.map((entry) => {
           const attempt = entry.attempt;
           const statusTone = attempt.processing_status === "completed" ? "ok"
@@ -915,10 +927,10 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
           return (
             <article className={`evidence-attempt is-${attempt.processing_status}`} key={attempt.id}>
               <div className="analysis-turn-head">
-                <strong>Attempt #{attempt.attempt_seq} <span className="mono muted">ID {attempt.id}</span></strong>
+                <strong>第 {attempt.attempt_seq} 次处理 <span className="mono muted">ID {attempt.id}</span></strong>
                 <div className="row wrap" style={{ gap: 6 }}>
-                  {entry.isTurnSource && <StatusPill tone="primary" size="sm">Turn 终值来源</StatusPill>}
-                  <StatusPill tone={statusTone} size="sm">{attempt.processing_status}</StatusPill>
+                  {entry.isTurnSource && <StatusPill tone="primary" size="sm">环节终值来源</StatusPill>}
+                  <StatusPill tone={statusTone} size="sm">{processingStatusLabel(attempt.processing_status)}</StatusPill>
                   {attempt.operational_needs_review && <StatusPill tone="warn" size="sm">AI 建议复核</StatusPill>}
                 </div>
               </div>
@@ -927,15 +939,15 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
                 <span>完成 {formatEvidenceTime(attempt.processed_at)}</span>
                 <span>提示 {attempt.prompt_level} 级{attempt.cue_type ? ` · ${attempt.cue_type}` : ""}</span>
               </div>
-              <EvidenceIssues issues={entry.issues} title={attempt.processing_status === "technical_failure" ? "技术失败（非作答错误）" : "attempt 证据问题"} />
+              <EvidenceIssues issues={entry.issues} title={attempt.processing_status === "technical_failure" ? "技术失败（非作答错误）" : "这次处理的证据问题"} />
               <div className="evidence-detail-grid evidence-detail-grid--attempt">
                 <EvidenceValue label="录音引用" value={attempt.raw_audio_id} mono />
                 <EvidenceValue label="时长" value={attempt.duration_seconds != null ? `${attempt.duration_seconds.toFixed(1)}s` : "未记录"} />
                 <EvidenceValue label="ASR 引擎" value={attempt.asr_engine_version ?? "缺失"} mono />
                 <EvidenceValue label="ASR 置信度" value={attempt.asr_confidence != null ? String(attempt.asr_confidence) : "未记录"} />
                 <EvidenceValue label="ASR 原文" value={attempt.asr_text ?? "无权威转写"} />
-                <EvidenceValue label="AI operational 类型" value={attempt.operational_answer_type ?? "未形成"} marker="仅运营决策" />
-                <EvidenceValue label="AI operational 分" value={attempt.operational_score != null ? String(attempt.operational_score) : "不适用/缺失"} />
+                <EvidenceValue label="AI 判定类型" value={attempt.operational_answer_type ?? "未形成"} marker="仅运营决策" />
+                <EvidenceValue label="AI 判定分" value={attempt.operational_score != null ? String(attempt.operational_score) : "不适用/缺失"} />
                 <EvidenceValue label="判类引擎" value={[attempt.judge_mode, attempt.judge_engine_version].filter(Boolean).join(" · ") || "缺失"} mono />
                 <EvidenceValue label="理由" value={attempt.judge_reason ?? "未提供（规则引擎可为空）"} />
                 <EvidenceValue label="匹配依据" value={attempt.matched_on ?? "未记录"} mono />
@@ -943,7 +955,7 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
                 <EvidenceValue label="错误码" value={attempt.error_code ?? "无"} mono />
               </div>
               {entry.audio ? <AudioEvidence audio={entry.audio} compact canPlay={canPlayAudio} /> : <StatusPill tone="danger" size="sm">录音资产缺失</StatusPill>}
-              <InteractionTimeline rows={entry.interactions} empty="未找到与本 attempt 关联的 interaction 时间线。" />
+              <InteractionTimeline rows={entry.interactions} empty="未找到与这次处理关联的过程事件。" />
             </article>
           );
         })}
@@ -951,7 +963,7 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
 
       {row.interactions.length > 0 && (
         <div className="evidence-loose-events">
-          <div className="evidence-section-title"><strong>环节交互（未绑定 attempt）</strong></div>
+          <div className="evidence-section-title"><strong>环节交互（未对应到 AI 处理）</strong></div>
           <InteractionTimeline rows={row.interactions} />
         </div>
       )}
@@ -995,20 +1007,28 @@ function InteractionTimeline({ rows, empty }: { rows: ParsedInteraction[]; empty
   );
 }
 
+const AUDIO_STATUS_LABELS: Record<string, string> = {
+  recorded: "已录音",
+  exported: "已导出",
+  checksum_verified: "校验通过",
+  reliability_review_done: "信度复核完成",
+  deletable: "可删除",
+  deleted: "已删除",
+};
+
 function AudioEvidence({ audio, compact = false, canPlay }: { audio: AudioAsset; compact?: boolean; canPlay: boolean }) {
   return (
     <div className={`evidence-audio${compact ? " is-compact" : ""}`}>
       <div className="row wrap" style={{ gap: 6 }}>
         <DataBoundaryBadge classification={sessionDataClassification(audio)} />
-        <StatusPill tone="muted" size="sm">{audio.status}</StatusPill>
+        <StatusPill tone="muted" size="sm">{AUDIO_STATUS_LABELS[audio.status] ?? audio.status}</StatusPill>
         {audio.contains_direct_identifier && <StatusPill tone="warn" size="sm">含直接标识</StatusPill>}
         <span className="mono muted">{audio.raw_audio_id}</span>
       </div>
-      {!compact && <span className="muted">{audio.turn_key ?? "无 turn_key"} · {audio.audio_format}{audio.checksum ? " · checksum 已登记" : " · checksum 缺失"}</span>}
-      <p className="muted evidence-audio-note">原声仅在具名有权账号显式点击后临时请求；服务端每次重查权限并记审计，响应禁止缓存，离开组件即释放临时地址。</p>
+      {!compact && <span className="muted">{audio.turn_key ?? "未标注环节"} · {audio.audio_format}{audio.checksum ? " · 完整性校验已登记" : " · 完整性校验缺失"}</span>}
       {canPlay
         ? <AuthenticatedAudio rawAudioId={audio.raw_audio_id} lazy />
-        : <StatusPill tone="warn" size="sm">需具名授权账号才能显式点播</StatusPill>}
+        : <StatusPill tone="warn" size="sm">需授权账号登录后才能播放</StatusPill>}
     </div>
   );
 }

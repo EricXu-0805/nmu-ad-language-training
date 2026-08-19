@@ -65,7 +65,7 @@ test("visible actions remain the closed bedside-only set", () => {
 test("the local synthetic demo boundary is explicit and stable", () => {
   assert.equal(
     CAREGIVER_DEMO_BOUNDARY_MESSAGE,
-    "仅本机20题合成模拟，不得用于真实老人、养老院、正式研究，20题不等于80",
+    "演练模式：仅供操作练习，不得用于真实老人或正式研究。",
   );
 });
 
@@ -89,8 +89,8 @@ test("start practice fails closed and can never become a restart after pause", (
     end: true,
   });
   assert.deepEqual(caregiverStatusPresentation(historical), {
-    title: "仅可安全收口",
-    detail: "该场次未通过本机20题合成模拟门禁，不会显示开始练习。",
+    title: "本次只能暂停或结束",
+    detail: "本次不能开始练习，请联系负责人。",
     tone: "warn",
   });
   assert.equal(caregiverActionAvailability(status({
@@ -218,8 +218,8 @@ test("没配通知对象时，屏上必须要求当面叫人，不能暗示已�
   });
 
   assert.equal(prompt.tone, "warn");
-  assert.match(prompt.text, /当面联系负责人/);
-  assert.match(prompt.text, /不代表任何人已经收到消息/);
+  assert.match(prompt.text, /请立即去叫负责人/);
+  assert.match(prompt.text, /系统不会通知任何人/);
   // 反过来钉住：不能出现任何"已通知/已送达/正在等待"这类说法。
   assert.doesNotMatch(prompt.text, /已通知|已送达|等待工作人员/);
   assert.equal(prompt.canRecordArrival, true);
@@ -234,7 +234,7 @@ test("配了通道但尚未确认送达时，说的是「尚未确认」而不�
     reached: [],
   });
 
-  assert.match(prompt.text, /尚未确认送达/);
+  assert.match(prompt.text, /还没确认送到/);
   assert.doesNotMatch(prompt.text, /已送达/);
 });
 
@@ -250,7 +250,7 @@ test("有人到场之后不再重复要求叫人，也不再给「记到场」�
   assert.equal(prompt.tone, "info");
   assert.equal(prompt.canRecordArrival, false);
   assert.equal(prompt.canRecordResolved, true);
-  assert.doesNotMatch(prompt.text, /当面联系/);
+  assert.doesNotMatch(prompt.text, /当面联系|去叫负责人/);
 });
 
 test("处理完之后两个入口都关掉，避免同一态被记两次", () => {

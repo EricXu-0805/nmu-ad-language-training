@@ -970,7 +970,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     setSavingTurn(true);
     try {
       const au = pendingAudio[turnK];
-      if (!au) { toast("请先完成本环节录音，终值 Turn 必须引用已完成 attempt", "warn"); return; }
+      if (!au) { toast("请先完成本环节录音", "warn"); return; }
       const attempt = await processManualAudio(au, opK, fence);
       if (!attempt || !operationIsCurrent(fence)) return;
       const ieid = await ensureItemEvent(fence);
@@ -1006,7 +1006,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
           needsReview: te.ai_needs_review ?? attempt.operational_needs_review ?? false,
         },
       }));
-      toast("转写已从权威 attempt 冻结到终值环节", "ok");
+      toast("转写已保存，不可再修改", "ok");
     } catch (e) {
       if (operationIsCurrent(fence)) {
         await pauseManualEvidenceFailure(
@@ -1761,9 +1761,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
           <div>
             <div className="page-kicker">当前训练任务</div>
             <h2 className="page-title">{item?.item_id.replace(/^(SE|DE)_/, "") ?? "训练判分"}</h2>
-            <p className="page-description">
-              AI 自动干预由服务器驱动；服务器尚未取得控制权时，本页保持人工模式。服务器已取得控制权后，须先安全暂停并显式接管，才会重新开放下方人工流程。
-            </p>
+            <p className="page-description">{observerMode ? "AI 正在自动带练，你可以随时安全暂停并接管。" : "当前为人工模式，由你逐步操作。"}</p>
           </div>
           {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
           {!observerMode && (
@@ -1853,12 +1851,6 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
           />
         ) : (
           <>
-        <div className="toolbar training-toolbar" aria-label="训练设置">
-          <StatusPill tone="muted">复核身份由服务器签发</StatusPill>
-          <StatusPill tone="muted">收音仅保存记录，不会直接跳题</StatusPill>
-          <StatusPill tone="muted">浏览器本地自动驾驶已停用</StatusPill>
-        </div>
-
         {item && planTurn && (
           <div className={`card col training-work-card${manualInteractionBlocked ? " session-paused-surface" : ""}`}>
             <div className="training-work-header">
@@ -1908,21 +1900,21 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
                 <StatusPill tone="danger">录音资格未评，真实场次保持关麦</StatusPill>
               ) : recState === "armed" || patientMicOn ? (
                 <>
-                  <Button variant="danger" onClick={stopRecording}>停止老人端录音</Button>
+                  <Button variant="danger" size="lg" onClick={stopRecording}>停止老人端录音</Button>
                   {patientMicOn && recState !== "armed" && (
                     <StatusPill tone="danger">老人端麦克风开着(自助开录)</StatusPill>
                   )}
                 </>
               ) : (
                 <>
-                  <Button onClick={armRecording} disabled={work.locked}>开始老人端录音</Button>
+                  <Button variant="primary" size="lg" onClick={armRecording} disabled={work.locked}>开始老人端录音</Button>
                 </>
               )}
               {pendingAudio[turnK] && (
                 <>
                   <StatusPill tone="ok">已收到录音 {pendingAudio[turnK].duration.toFixed(1)}s</StatusPill>
                   <AuthenticatedAudio rawAudioId={pendingAudio[turnK].rawAudioId} />
-                  {!work.savedAsr && <Button onClick={tryLocalAsr} disabled={manualInteractionBlocked || busyOp !== null}>{busyOp === "asr" ? "AI 处理中…" : "AI 转写并登记证据"}</Button>}
+                  {!work.savedAsr && <Button variant="primary" size="lg" onClick={tryLocalAsr} disabled={manualInteractionBlocked || busyOp !== null}>{busyOp === "asr" ? "AI 处理中…" : "AI 转写并登记证据"}</Button>}
                 </>
               )}
             </div>
@@ -1933,7 +1925,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
                 <div><span className="workflow-panel-number">1</span><strong>记录与转写</strong></div>
                 {work.savedAsr && <StatusPill tone="ok">已冻结</StatusPill>}
               </div>
-              <Field label="受试者回答" hint="原始转写只来自当次录音的权威 attempt；如需校正，请在下一步人工确认中保留双轨证据。">
+              <Field label="受试者回答" hint="原始转写不可修改；如需校正，请在下一步人工确认里填写。">
                 <TextInput value={work.asrText} disabled
                   onChange={() => { /* 权威 ASR 不接受客户端改写 */ }}
                   placeholder={pendingAudio[turnK] ? "点击“AI 转写并登记证据”" : "请先完成本环节录音"} />
@@ -1972,12 +1964,12 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
               <section className={`workflow-panel${workflowStage === 3 ? " is-active" : ""}`}>
                 <div className="workflow-panel-header">
                   <div><span className="workflow-panel-number">3</span><strong>AI 运行证据</strong></div>
-                  <StatusPill tone="muted">attempt 权威证据</StatusPill>
+                  <StatusPill tone="muted">AI 初评</StatusPill>
                 </div>
-                <p className="muted">与原始转写来自同一次 attempt，不再发起第二次判类；用于复核自动干预是否按协议运行，不自动写入研究真值。</p>
+                <p className="muted">AI 对本次回答的初步判断，仅供参考，不会自动写入研究评分。</p>
                 {work.ai && (
                   <div className="row wrap">
-                    <StatusPill tone="muted">{work.ai.answerType ?? "纯人工(无确定式口径)"}</StatusPill>
+                    <StatusPill tone="muted">{work.ai.answerType ?? "纯人工判定"}</StatusPill>
                     <span>初评分:{work.ai.score ?? "—"}</span>
                     {work.ai.needsReview && <StatusPill tone="warn">需人工复核</StatusPill>}
                   </div>
@@ -2121,8 +2113,8 @@ function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
           const text = lookupCue(bundle, itemId, taskType, role, level);
           const isTell = taskType === "单要素" && level === 3;
           return (
-            <Button key={level} disabled={level !== cueLevel + 1 || text == null}
-              variant={isTell ? "danger" : "ghost"}
+            <Button key={level} size="lg" disabled={level !== cueLevel + 1 || text == null}
+              variant={isTell ? "danger" : "secondary"}
               title={text == null ? "题库缺此级线索文本(待内容组补)" : undefined}
               onClick={() => (isTell ? setConfirmTell(true) : onSend(level))}>
               {label}{text == null ? "(缺文本)" : ""}

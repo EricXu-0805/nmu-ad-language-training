@@ -20,14 +20,14 @@ export function ObserverConsole({ patientCode, phase, resyncStatus, resyncError,
 }) {
   const view = observerPhaseView(phase, resyncStatus);
   return (
-    <section className="card col training-observer-console" aria-label="服务端托管观察台">
+    <section className="card col training-observer-console" aria-label="AI 自动训练（只可观察）">
       <div className="row wrap" style={{ justifyContent: "space-between" }}>
         <div>
-          <div className="page-kicker">服务端托管观察台</div>
+          <div className="page-kicker">AI 自动训练（只可观察）</div>
           <strong>{view.label}</strong>
         </div>
         <StatusPill tone={view.tone}>
-          {view.proven ? "服务器已证实持有控制权" : "为安全暂缓人工控制 · 尚未证实"}
+          {view.proven ? "AI 控制中" : "等待服务器确认"}
         </StatusPill>
       </div>
       <p className="muted">{view.detail}</p>
@@ -40,10 +40,10 @@ export function ObserverConsole({ patientCode, phase, resyncStatus, resyncError,
             <span>计划位置：第 {position.itemOrdinal}/{position.itemTotal} 题 · 环节 {position.turnOrdinal}/{position.turnTotal}</span>
           </>
         ) : (
-          <span className="muted">服务器计划位置待同步，不显示估计进度。</span>
+          <span className="muted">进度同步中…</span>
         )}
       </div>
-      <p className="muted">进度取自服务器实时游标，仅供运营观察，不代表已完成的研究评分或完成率。暂停、中止与显式接管请使用本页上方既有控制。</p>
+      <p className="muted">此进度仅供观察，评分以事后复核为准。</p>
       {resyncStatus === "failed" && (
         <div className="row wrap">
           {resyncError && <span className="muted">{resyncError}</span>}

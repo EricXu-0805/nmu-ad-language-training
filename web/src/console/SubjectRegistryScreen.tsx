@@ -158,9 +158,12 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
           <h2 className="page-title">受试者档案与训练安排</h2>
           <p className="page-description">测试开始前一次完成受试者信息、同意与录音授权、量表协议就绪核对和训练安排。登记表只用研究编号，不含姓名。</p>
         </div>
-        <Button variant="primary" disabled={!canManagePlans}
-          title={!canManagePlans ? "当前账号为只读角色" : undefined}
-          onClick={() => setMode("new")}>登记新受试者</Button>
+        <span className="col" style={{ gap: "var(--sp-1)", alignItems: "flex-end" }}>
+          <Button variant="primary" disabled={!canManagePlans}
+            title={!canManagePlans ? "当前账号为只读角色" : undefined}
+            onClick={() => setMode("new")}>登记新受试者</Button>
+          {!canManagePlans && <span className="muted">当前账号只能查看，不能登记</span>}
+        </span>
       </header>
 
       {quickDrillEnabled && (
@@ -170,7 +173,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
               <h3>流程模式</h3>
               <p className="muted">
                 {flowMode === "quickDrill"
-                  ? `快速演练:对模拟档案一键 建档→创建安排→审核→开场（${QUICK_DRILL_CONTEXT_LABEL}）。全程仍逐步走服务端计划账本、不绕过任何门禁；真实受试者永远走规范多步流程。`
+                  ? `快速演练：只对模拟档案一键完成建档到开场（${QUICK_DRILL_CONTEXT_LABEL}）。真实受试者仍需逐步审核。`
                   : "研究规范（默认）：建档 → 创建训练安排 → 审核 → 训练台开场的多步流程。"}
               </p>
             </div>
@@ -189,7 +192,8 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
       {err && <Alert tone="danger" title="登记表加载失败" actions={<Button onClick={reload}>重试</Button>}>{err}</Alert>}
       {withdrawalReceipt && (
         <Alert tone="info" title={`已登记研究撤回：${withdrawalReceipt.patient_id}`}>
-          权威治理版本已更新为 {withdrawalReceipt.governance_revision}；系统已隔离 {withdrawalReceipt.affected_audio_count} 条录音并围栏 {withdrawalReceipt.affected_session_count} 个相关场次。
+          {withdrawalReceipt.affected_audio_count} 条录音已隔离，{withdrawalReceipt.affected_session_count} 个场次已停用。
+          <details><summary>技术详情</summary>治理版本已更新为 {withdrawalReceipt.governance_revision}。</details>
         </Alert>
       )}
       {rows && rows.length === 0 && !err && (
@@ -201,7 +205,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
           <div className="form-section-header">
             <div>
               <h3>档案数据分区</h3>
-              <p className="muted">默认只显示真实研究档案；专用模拟和历史未知档案必须显式切换查看，不参与研究名单。</p>
+              <p className="muted">默认只显示真实研究档案；模拟和历史档案请切换分区查看。</p>
             </div>
             <DataBoundaryBadge classification={classificationFilter} entity="patient" />
           </div>
@@ -213,7 +217,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
           )}
           {classificationFilter === "legacy_unknown" && (
             <Alert tone="danger" title="当前是历史/未知隔离分区">
-              这些档案缺少可信分类，必须完成迁移和人工核对；系统不会把它们猜成真实研究数据。
+              这些历史档案尚未核对分类，暂不能安排训练。
             </Alert>
           )}
         </section>
@@ -257,17 +261,15 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
                 <span className="registry-cell-label">授权与准入</span>
                 {recordingLabel(r.recording_allowed)}
                 {eligibilityLabel(r, classification)}
-                {r.withdrawal_status && <StatusPill tone="danger" size="sm">
-                  撤回终态 · 治理版本 {r.governance_revision}
-                </StatusPill>}
+                {r.withdrawal_status && <StatusPill tone="danger" size="sm">已撤回</StatusPill>}
                 {r.withdrawal_status && r.withdrawal_reason_code && (
                   <span className="muted">
-                    权威原因：{WITHDRAWAL_REASON_LABELS[r.withdrawal_reason_code]}
+                    撤回原因：{WITHDRAWAL_REASON_LABELS[r.withdrawal_reason_code]}
                     {r.withdrawal_occurred_at ? ` · ${r.withdrawal_occurred_at.slice(0, 10)}` : ""}
                   </span>
                 )}
                 {r.withdrawal_status && !r.withdrawal_event_id && (
-                  <span className="muted">历史撤回状态缺少新账本回执，继续保持隔离</span>
+                  <span className="muted">历史撤回记录待核对，暂不可操作</span>
                 )}
               </span>
               <span role="cell">
@@ -285,25 +287,28 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
                       setWithdrawalFor(r);
                     }}>登记研究撤回</Button>
                   )}
-                  <Button variant="primary" disabled={cannotPlan}
-                    title={r.withdrawal_status
-                      ? `撤回/退出状态为「${r.withdrawal_status}」，不可安排训练`
-                      : classification === "legacy_unknown" ? "档案分类未知，完成迁移核对前不可安排训练"
-                        : !canManagePlans ? "当前账号为只读角色" : undefined}
+                  <Button disabled={cannotPlan}
                     onClick={() => { setPlanPatientId(r.patient_id); setMode("plan"); }}>
                     {classification === "simulation" ? "安排模拟演练" : "安排训练"}
                   </Button>
+                  {cannotPlan && (
+                    <span className="muted" style={{ flexBasis: "100%" }}>
+                      {r.withdrawal_status ? "已撤回，不能再安排训练"
+                        : classification === "legacy_unknown" ? "档案分类未核对，暂不能安排训练"
+                          : "当前账号只能查看，不能安排训练"}
+                    </span>
+                  )}
                   {flowMode === "quickDrill" && quickDrillEnabled
                     && classification === "simulation" && !r.withdrawal_status && (
                     <Button variant="primary" disabled={quickDrillBusy !== null}
-                      title={`系统推导下一项任务：回原场 → 开已审核安排 → 新建（${QUICK_DRILL_CONTEXT_LABEL}）；不绕过服务端计划账本`}
+                      title="自动接着上次的进度开始"
                       onClick={() => { void startNextTask(r.patient_id, true); }}>
                       {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
                     </Button>
                   )}
                   {quickDrillEnabled && classification === "research" && !r.withdrawal_status && (
                     <Button variant="primary" disabled={quickDrillBusy !== null}
-                      title="系统推导下一项任务：回原场 → 开已审核到期安排；草稿审核与新建仍走规范多步流程，系统不代批"
+                      title="自动接着上次的进度开始；待审核的安排仍需人工审核"
                       onClick={() => { void startNextTask(r.patient_id, false); }}>
                       {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
                     </Button>
@@ -354,8 +359,8 @@ function eligibilityLabel(row: PatientSummary, classification: DataClassificatio
   if (classification === "simulation") return <StatusPill tone="warn" size="sm">不进入真实研究准入</StatusPill>;
   if (classification === "legacy_unknown") return <StatusPill tone="danger" size="sm">分类未知 · 禁止开场</StatusPill>;
   if (row.research_eligible === true) {
-    return <span title="仅表示受试者级资料门禁已核对，不代表内容、量表、伦理或平台已获正式研究放行">
-      <StatusPill tone="ok" size="sm">受试者级准入已核对</StatusPill>
+    return <span title="仅指本人资料已核对完毕">
+      <StatusPill tone="ok" size="sm">准入已核对</StatusPill>
     </span>;
   }
   if (row.research_eligible === false) {
@@ -364,7 +369,9 @@ function eligibilityLabel(row: PatientSummary, classification: DataClassificatio
     return (
       <span className="muted" title={detail}>
         <StatusPill tone="warn" size="sm">准入待补 {issues.length || ""} 项</StatusPill>
-        {issues.length > 0 && <span style={{ display: "block", marginTop: 2 }}>缺项：{researchEligibilityIssueText(issues)}</span>}
+        <span style={{ display: "block", marginTop: 2 }}>
+          {issues.length > 0 ? `缺项：${researchEligibilityIssueText(issues)}` : "准入未通过，服务器未返回具体缺项"}
+        </span>
       </span>
     );
   }

@@ -40,7 +40,7 @@ export function SessionAbortControl({ sessionId, expectedRevision, disabled = fa
     try {
       const runtime = await api.abortSession(sessionId, operation);
       if (runtime.status !== "aborted") {
-        throw new Error("服务器未返回可核对的中止终态");
+        throw new Error("服务器未确认中止，请重试");
       }
       setOpen(false);
       setIntent(null);
@@ -56,12 +56,15 @@ export function SessionAbortControl({ sessionId, expectedRevision, disabled = fa
 
   return (
     <>
-      <Button variant="danger" disabled={disabled || busy || expectedRevision == null} onClick={() => {
-        setError(null);
-        setOpen(true);
-      }}>
-        中止本场
-      </Button>
+      <div className="col" style={{ gap: "var(--sp-1)", alignItems: "flex-end" }}>
+        <Button variant="danger" disabled={disabled || busy || expectedRevision == null} onClick={() => {
+          setError(null);
+          setOpen(true);
+        }}>
+          中止本场
+        </Button>
+        <span className="field__hint">中止会立即结束本场，需选择原因并再次确认。</span>
+      </div>
       <ConfirmDialog
         open={open}
         title="确认中止本场？"
@@ -72,7 +75,7 @@ export function SessionAbortControl({ sessionId, expectedRevision, disabled = fa
           <div>
             <p className="muted">中止后题目推进、录音和 AI 干预会立即关闭，已保存证据保留为只读。</p>
             <label className="field">
-              <span className="field-label">中止原因（必选）</span>
+              <span className="field__label">中止原因（必选）</span>
               <select value={intent?.reason_code ?? reasonCode} disabled={busy || intent !== null} onChange={(event) => {
                 setReasonCode(event.target.value as SessionAbortReasonCode | "");
                 setError(null);
@@ -84,11 +87,11 @@ export function SessionAbortControl({ sessionId, expectedRevision, disabled = fa
               </select>
             </label>
             <Alert tone="warn" title="本次访问位保留">
-              场次中止后不会自动释放或重排训练访问；是否补做由协议负责人决定。
+              中止后本次训练是否补做，由研究负责人决定。
             </Alert>
             {error && <Alert tone="danger" title="服务器尚未确认中止">{error}</Alert>}
             {intent && error && (
-              <p className="muted">再次确认会复用同一幂等键与原运行修订，不会改写中止原因。</p>
+              <p className="muted">重试不会重复提交，也不会改动已选原因。</p>
             )}
           </div>
         )}

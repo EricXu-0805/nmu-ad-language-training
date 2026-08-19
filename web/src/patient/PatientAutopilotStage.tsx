@@ -28,10 +28,16 @@ export function PatientAutopilotStage({
   if (autopilot.mode === "probing") {
     return (
       <Centered>
-        <div className="target">正在确认安全连接</div>
+        <div className="target">正在准备</div>
         <p className="question" role="status">
-          {autopilot.reason ?? "正在准备今天的练习…"}
+          {autopilot.reason ? "请稍等一下" : "正在准备今天的练习…"}
         </p>
+        {autopilot.reason && (
+          <details className="muted" style={{ maxWidth: "72ch", fontSize: "var(--text-lg)" }}>
+            <summary>工作人员点这里看原因</summary>
+            <p style={{ margin: "var(--sp-2) 0 0", textAlign: "left" }}>{autopilot.reason}</p>
+          </details>
+        )}
       </Centered>
     );
   }
@@ -42,8 +48,14 @@ export function PatientAutopilotStage({
       <Centered>
         <div className="target">我们先等一下</div>
         <p className="question" role={autopilot.blockedCalm ? "status" : "alert"}>
-          {autopilot.reason ?? "请研究者查看设备状态"}
+          {autopilot.blockedCalm ? autopilot.reason ?? "练习已暂停，请稍候" : "请找工作人员"}
         </p>
+        {!autopilot.blockedCalm && autopilot.reason && (
+          <details className="muted" style={{ maxWidth: "72ch", fontSize: "var(--text-lg)" }}>
+            <summary>工作人员点这里看原因</summary>
+            <p style={{ margin: "var(--sp-2) 0 0", textAlign: "left" }}>{autopilot.reason}</p>
+          </details>
+        )}
       </Centered>
     );
   }
@@ -61,8 +73,14 @@ export function PatientAutopilotStage({
       <Centered>
         <div className="target">我们先休息一下</div>
         <p className="question" role={calm ? "status" : "alert"}>
-          {calm ? "练习已暂停，请稍候" : "自动流程已安全停止，请研究者处置"}
+          {calm ? "练习已暂停，请稍候" : "练习先停一下，请找工作人员"}
         </p>
+        {!calm && (
+          <details className="muted" style={{ maxWidth: "72ch", fontSize: "var(--text-lg)" }}>
+            <summary>工作人员点这里看原因</summary>
+            <p style={{ margin: "var(--sp-2) 0 0", textAlign: "left" }}>自动流程已安全停止，请研究者处置</p>
+          </details>
+        )}
       </Centered>
     );
   }
@@ -70,7 +88,7 @@ export function PatientAutopilotStage({
     return (
       <Centered>
         <div className="target">声音还没有开启</div>
-        <p className="question" role="alert">请研究者点右上角“朗读 开”后继续</p>
+        <p className="question" role="alert">请工作人员打开右上角的「朗读」开关</p>
       </Centered>
     );
   }
@@ -84,7 +102,7 @@ export function PatientAutopilotStage({
   }
 
   const speechText = displayRef.current?.text
-    ?? "请稍候，研究者正在核对当前提示。";
+    ?? "请稍等一下";
   // 两端都以浏览器自己的事实为准，不等服务器 runtime。
   // 开录那一端：真实 onstart 之后 record_started 还要走一整个网络往返，服务器
   // 此刻仍是 waiting_recording；等它才显示"正在听您说"，就是白白吃掉老人的
@@ -102,7 +120,7 @@ export function PatientAutopilotStage({
         || autopilot.assetReadiness.readiness === "loading"
       ? "正在准备题目图片"
     : persisting
-      ? "已收音，正在保存，请稍候"
+      ? "录好了，正在保存"
     : listening
       ? "正在听您说"
     : runtime?.phase === "tts_playing"

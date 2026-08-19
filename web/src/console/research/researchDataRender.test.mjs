@@ -84,7 +84,7 @@ test("导出按钮说清导的是当前这一页，不是全量", async () => {
 
 test("零行时明说是真的零行，且不渲染空表格骨架", async () => {
   const markup = await render({ page: page({ rows: [], rowCount: 0, hasMore: false, nextCursor: null }) });
-  assert.match(markup, /零行是真的零行/);
+  assert.match(markup, /目前确实没有数据/);
   assert.ok(!markup.includes("<table"), "零行不应渲染表格");
 });
 

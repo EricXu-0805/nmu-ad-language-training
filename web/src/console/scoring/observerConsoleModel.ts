@@ -69,7 +69,7 @@ export function observerPhaseView(
   if (resync === "pending") {
     return {
       label: "正在恢复人工控制",
-      detail: "已证实服务器没有控制权；正用服务器最新进度与证据账本重新同步，完成前人工操作保持关闭。",
+      detail: "正在同步最新进度，完成前暂不能操作。",
       tone: "warn",
       proven: false,
     };
@@ -104,7 +104,7 @@ export function observerPhaseView(
     case "waiting_recording":
       return { label: "正在等待老人回答", detail: "服务器已签发录音命令，等待老人端完成收音回报。", tone: "ok", proven: true };
     case "processing_attempt":
-      return { label: "正在转写并判断", detail: "录音已交服务器做权威 ASR 与 operational 判类。", tone: "ok", proven: true };
+      return { label: "正在转写并判断", detail: "服务器正在处理刚才的回答。", tone: "ok", proven: true };
     case "manual_draining":
       return { label: "正在完成当前收麦并准备人工接管", detail: "服务器正在安全结束当前命令；收麦证明完成前不放行人工操作。", tone: "warn", proven: true };
     case "paused":

@@ -89,7 +89,7 @@ export async function runNextTask(
     return {
       kind: "blocked",
       reason: dueDraft
-        ? "下一项任务已有草稿安排，需先在训练安排页人工审核通过后再开场"
+        ? "该受试者已有草稿安排，需先在训练安排页人工审核通过，才能开始训练"
         : "没有已审核且到期的训练安排；请先创建并审核训练安排",
     };
   }

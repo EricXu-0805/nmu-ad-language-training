@@ -63,7 +63,7 @@ test("real observer console markup shows server truth and mounts no manual step 
     assert.match(markup, /受试者编号 SIM-001/);
     assert.match(markup, /当前任务：胡萝卜 · 命名/);
     assert.match(markup, /计划位置：第 3\/12 题 · 环节 1\/2/);
-    assert.match(markup, /不代表已完成的研究评分/);
+    assert.match(markup, /此进度仅供观察，评分以事后复核为准/);
   }
 
   // 「服务端已证实拥有」与「为安全锁定但尚未证实」必须可区分。
@@ -71,7 +71,7 @@ test("real observer console markup shows server truth and mounts no manual step 
     patientCode: "SIM-001", phase: "running", resyncStatus: "idle",
     resyncError: null, position: POSITION, onRetryResync: () => {},
   }));
-  assert.match(running, /服务器已证实持有控制权/);
+  assert.match(running, /AI 控制中/);
   assert.match(running, /服务端托管执行中/);
   assert.match(running, /status-pill--ok/);
   for (const phase of ["checking", "starting", "uncertain"]) {
@@ -79,8 +79,8 @@ test("real observer console markup shows server truth and mounts no manual step 
       patientCode: "SIM-001", phase, resyncStatus: "idle",
       resyncError: null, position: POSITION, onRetryResync: () => {},
     }));
-    assert.match(markup, /为安全暂缓人工控制 · 尚未证实/, phase);
-    assert.doesNotMatch(markup, /服务器已证实持有控制权|服务端托管执行中/, phase);
+    assert.match(markup, /等待服务器确认/, phase);
+    assert.doesNotMatch(markup, /AI 控制中|服务端托管执行中/, phase);
   }
   const uncertain = renderToStaticMarkup(React.createElement(ObserverConsole, {
     patientCode: "SIM-001", phase: "uncertain", resyncStatus: "idle",
@@ -100,7 +100,7 @@ test("real observer console markup shows server truth and mounts no manual step 
     patientCode: "SIM-001", phase: "waiting_recording", resyncStatus: "idle",
     resyncError: null, position: null, onRetryResync: () => {},
   }));
-  assert.match(unsynced, /服务器计划位置待同步，不显示估计进度/);
+  assert.match(unsynced, /进度同步中/);
   assert.doesNotMatch(unsynced, /计划位置：第/);
 
   // 重同步中与失败：保持锁定叙述；失败提供重试且仍不出现人工控件。

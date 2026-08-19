@@ -30,6 +30,17 @@ function startKey(plan: VisitPlanReceipt): string {
   return `vp-start-${plan.revision}-${crypto.randomUUID()}`;
 }
 
+const PLAN_STATUS_LABELS: Record<string, string> = {
+  draft: "草稿",
+  approved: "已审核",
+  started: "已开始",
+  cancelled: "已取消",
+};
+
+function planStatusLabel(status: string): string {
+  return PLAN_STATUS_LABELS[status] ?? status;
+}
+
 function plannedTime(plan: VisitPlanReceipt): string {
   return plan.scheduled_time ? plan.scheduled_time.slice(0, 5) : "时间待定";
 }
@@ -167,7 +178,7 @@ export function RunPickerScreen({
           rememberPending(
             plan,
             idempotencyKey,
-            `服务端已确认启动，但场次还未通过安全校验：${errorText(sessionError)}`,
+            `已启动，但进入训练页前的检查未通过：${errorText(sessionError)}。请点「继续确认」。`,
             receipt,
             generation,
           );
@@ -177,19 +188,19 @@ export function RunPickerScreen({
       if (current && !isSameApprovedVisitPlan(plan, current)) {
         startKeys.current.delete(`${plan.plan_id}:${plan.revision}`);
         setPendingStart(null);
-        setStartError(`训练安排的服务端状态已变为“${current.status}”，已禁止使用旧队列继续启动。`);
+        setStartError(`该安排状态已变化（${planStatusLabel(current.status)}），请刷新队列后再操作。`);
         return false;
       }
       if (!uncertain && current && isSameApprovedVisitPlan(plan, current)) {
         startKeys.current.delete(`${plan.plan_id}:${plan.revision}`);
         setPendingStart(null);
-        setStartError(`服务器拒绝了本次启动，当前权威状态仍为已审核：${errorText(requestError)}`);
+        setStartError(`服务器拒绝了本次启动：${errorText(requestError)}。安排未受影响，可重试。`);
         return false;
       }
       rememberPending(
         plan,
         idempotencyKey,
-        `尚无法确认启动是否已落库：${errorText(requestError)}。系统已保留原幂等键，不会重复建场。`,
+        `还没确认启动是否成功：${errorText(requestError)}。放心重试，不会重复建立场次。`,
         null,
         generation,
       );
@@ -199,7 +210,7 @@ export function RunPickerScreen({
       rememberPending(
         plan,
         idempotencyKey,
-        `启动请求后自动对账也未完成：${errorText(reconcileError)}。系统已保留原幂等键。`,
+        `仍未确认启动结果：${errorText(reconcileError)}。可再次点击确认。`,
         null,
         generation,
       );
@@ -230,7 +241,7 @@ export function RunPickerScreen({
           rememberPending(
             plan,
             idempotencyKey,
-            `服务端已确认启动，但场次还未通过安全校验：${errorText(sessionError)}`,
+            `已启动，但进入训练页前的检查未通过：${errorText(sessionError)}。请点「继续确认」。`,
             receipt,
             generation,
           );
@@ -293,7 +304,7 @@ export function RunPickerScreen({
           rememberPending(
             pending.plan,
             pending.idempotencyKey,
-            `场次仍未通过安全校验：${errorText(error)}`,
+            `进入训练页前的检查仍未通过：${errorText(error)}。可再试一次。`,
             pending.confirmedReceipt,
             generation,
           );
@@ -334,7 +345,7 @@ export function RunPickerScreen({
         <div className="row wrap">
           {!presentation.completedOnly && (
             <Button disabled={queueLoading || Boolean(startingPlanId)} onClick={() => { void loadQueue(); }}>
-              {queueLoading ? "正在刷新…" : "刷新队列"}
+              {queueLoading ? "正在刷新…" : "刷新今日队列"}
             </Button>
           )}
           <Button disabled={Boolean(startingPlanId)} onClick={onGoPrep}>{presentation.prepActionLabel}</Button>
@@ -352,20 +363,20 @@ export function RunPickerScreen({
         </Alert>
       )}
       {!presentation.completedOnly && startError && (
-        <Alert tone="danger" title="开训未完整进入训练页">
+        <Alert tone="danger" title="本次启动未完成">
           {startError}
         </Alert>
       )}
       {!presentation.completedOnly && pendingStart && (
         <Alert
           tone="warn"
-          title="开训结果待确认"
+          title="启动结果待确认"
           actions={(
             <Button
               disabled={Boolean(startingPlanId)}
               onClick={() => { void confirmPendingStart(); }}
             >
-              {startingPlanId ? "正在用原请求对账…" : "继续安全对账"}
+              {startingPlanId ? "正在确认…" : "继续确认启动结果"}
             </Button>
           )}
         >
@@ -373,14 +384,14 @@ export function RunPickerScreen({
         </Alert>
       )}
       {!presentation.completedOnly && !today && !queueError && queueLoading && (
-        <StatusPill tone="muted">正在读取今日已审核安排…</StatusPill>
+        <StatusPill tone="muted">正在读取今日安排…</StatusPill>
       )}
 
       {!presentation.completedOnly && <AssessmentQueuePanel />}
 
       {!presentation.completedOnly && today && plans.length === 0 && (
-        <Alert tone="info" title="今天没有待开始的已审核安排" actions={<Button variant="primary" disabled={Boolean(startingPlanId)} onClick={onGoPrep}>创建训练安排</Button>}>
-          草稿、未来日期、已开始和已取消的安排不会出现在这里。若刚才启动后页面中断，请使用下方异常恢复入口。
+        <Alert tone="info" title="今天没有待开始的安排" actions={<Button variant="primary" disabled={Boolean(startingPlanId)} onClick={onGoPrep}>创建训练安排</Button>}>
+          只显示已审核、今天到期的安排。刚才启动时页面中断的，请用下方恢复入口。
         </Alert>
       )}
 
@@ -389,7 +400,7 @@ export function RunPickerScreen({
           <div className="form-section-header">
             <div>
               <h3>今日训练队列</h3>
-              <p className="muted">队列日期 {today.as_of_date}；逾期但尚未开始的已审核安排也会保留在此处。</p>
+              <p className="muted">{today.as_of_date} · 含逾期未开始的安排</p>
             </div>
             <DataBoundaryBadge classification={classificationFilter} />
           </div>
@@ -400,15 +411,13 @@ export function RunPickerScreen({
             label="今日训练数据分区"
           />
           {classificationFilter === "simulation" && (
-            <Alert tone="danger" title="当前是专用模拟演练队列">
-              只能由工作人员本人或合成数据演练；真实患者、老人和受试者不得进入。
+            <Alert tone="danger" title="当前是模拟演练队列">
+              演练队列仅供工作人员练习，禁止真实老人参加。
             </Alert>
           )}
           {today.withheld_count > 0 && (
-            <Alert tone="warn" title="部分已审核安排未通过门禁复验">
-              有 {today.withheld_count} 条已审核到期安排在读取时未通过受试者准入或题库门禁复验
-              （如已撤回、同意失效、题库或协议变化），已按 fail-closed 从今日队列隐藏。
-              请回到该受试者的训练安排页核对具体原因。
+            <Alert tone="warn" title="有安排暂不能开始">
+              有 {today.withheld_count} 条今日安排暂不能开始（可能因同意撤回、题库或方案更新），已自动隐藏。请到该受试者的训练安排页查看原因。
             </Alert>
           )}
           {visiblePlans.length === 0 && (
@@ -419,6 +428,8 @@ export function RunPickerScreen({
               const starting = startingPlanId === plan.plan_id;
               const reconciling = pendingStart?.plan.plan_id === plan.plan_id;
               const overdue = today.as_of_date > plan.scheduled_date;
+              const blockedByOther = canStart && !starting && !reconciling
+                && (Boolean(startingPlanId) || Boolean(pendingStart));
               return (
                 <article className="run-picker-card" role="listitem" key={plan.plan_id}>
                   <div className="run-picker-head">
@@ -444,11 +455,14 @@ export function RunPickerScreen({
                           else void start(plan);
                         }}>
                         {starting
-                          ? "正在安全对账…"
+                          ? "正在确认…"
                           : reconciling
                             ? "继续确认启动结果"
                             : plan.is_simulation ? "开始模拟演练" : "开始训练"}
                       </Button>
+                      {blockedByOther && (
+                        <span className="muted" style={{ fontSize: "0.85em" }}>另一条安排正在启动，请先完成确认</span>
+                      )}
                     </div>
                   </div>
                 </article>
@@ -556,8 +570,8 @@ function RecoveryPicker({ canResume, canViewCompleted, completedOnly, onResume }
         onChange={(value) => { setClassificationFilter(value); setExpanded(null); }}
         label={completedOnly ? "已完成场次数据分区" : "异常恢复数据分区"} />
       {classificationFilter === "legacy_unknown" && (
-        <Alert tone="danger" title="历史分类未知场次只读">
-          完成迁移和人工核对前，系统不会猜测数据归属，也不会允许续做。
+        <Alert tone="danger" title="历史场次待核对">
+          这些历史场次待人工核对，暂时只读。
         </Alert>
       )}
       {visibleRows.length === 0 && <p className="muted">当前分区没有可核查的既有场次。</p>}
@@ -670,8 +684,8 @@ function ResumeList({ patientId, patientClassification, canResume, canViewComple
         onChange={setClassificationFilter}
         label={completedOnly ? "最终完成场次数据分区" : "既有场次数据分区"} />
       {classificationFilter === "legacy_unknown" && (
-        <Alert tone="danger" title="分类未知的历史场次只读">
-          系统不会依据旧字段猜测分类，完成迁移前不可续做。
+        <Alert tone="danger" title="历史场次待核对">
+          历史场次待人工核对，暂时只读。
         </Alert>
       )}
       {visibleSessions.length === 0 && <p className="muted">当前分区暂无场次。</p>}

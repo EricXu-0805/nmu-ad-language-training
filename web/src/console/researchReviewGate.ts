@@ -106,7 +106,7 @@ export function resolveResearchScoringContract(
   if (contract) return { ok: true, contract };
   return {
     ok: false,
-    reason: `未识别评分合同：task_type=${taskType || "（空）"}，scoring_key=${scoringKey ?? "null"}，response_role=${responseRole || "（空）"}。`,
+    reason: "该题的评分规则与系统不匹配，暂不能保存或锁分，请联系管理员。",
   };
 }
 
@@ -173,24 +173,24 @@ export function evaluateResearchReviewGate(
   if (!Number.isInteger(input.promptLevel) || ![0, 1, 2, 3].includes(input.promptLevel as number)) {
     blockers.push({
       code: "missing_prompt_level",
-      message: "服务器没有返回有效的权威提示等级（0–3）。",
+      message: "服务器没有返回有效的提示等级（0–3）。",
     });
   }
 
   if (!input.rawAudioId?.trim()) {
     blockers.push({
       code: "missing_audio_reference",
-      message: "计划环节缺少原始录音引用，禁止锁分。",
+      message: "该环节缺少原始录音，暂不能锁分。",
     });
   } else if (input.audioStatus === "error") {
     blockers.push({
       code: "audio_load_failed",
-      message: "原始录音鉴权加载失败，禁止锁分。",
+      message: "原始录音加载失败，暂不能锁分。",
     });
   } else if (input.audioStatus !== "ready") {
     blockers.push({
       code: "audio_not_loaded",
-      message: "请先鉴权加载并核对原始录音，再锁分。",
+      message: "请先加载并听一遍原始录音，再锁分。",
     });
   }
 
@@ -199,7 +199,7 @@ export function evaluateResearchReviewGate(
   } else if (!contract.ok || !contract.contract.options.some((option) => option.value === input.selectedScore)) {
     blockers.push({
       code: "invalid_score",
-      message: "所选分值不属于当前冻结评分合同。",
+      message: "所选分值不在本题可选评分内。",
     });
   }
 

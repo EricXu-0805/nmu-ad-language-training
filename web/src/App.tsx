@@ -98,11 +98,14 @@ class Boundary extends Component<{ variant: "console" | "patient"; children: Rea
           <h2 className="page-title">界面遇到问题，操作已停止</h2>
           <p className="page-description">已保存到服务器的研究数据不受影响。</p>
         </div>
-        <p className="muted" style={{ wordBreak: "break-all" }}>{this.state.error}</p>
+        <details>
+          <summary>查看技术详情</summary>
+          <p className="muted" style={{ wordBreak: "break-all" }}>{this.state.error}</p>
+        </details>
         <div className="form-actions">
-          <button type="button" onClick={() => location.reload()} style={btn}>重新载入</button>
+          <button type="button" onClick={() => location.reload()} className="button button--secondary">重新载入</button>
           {/* 只清屏幕位置状态;判分作业日志(journal)是研究记录,绝不在这里清 */}
-          <button type="button" onClick={() => { clearConsoleWorkspaceState(); location.reload(); }} style={btn}>
+          <button type="button" onClick={() => { clearConsoleWorkspaceState(); location.reload(); }} className="button button--secondary">
             重置屏幕状态并重载
           </button>
         </div>
@@ -258,33 +261,26 @@ function Landing() {
       <div className="landing-brand" aria-hidden>语</div>
       <div className="page-kicker">南京医科大学 · 研究开发版</div>
       <h1>语言沟通训练系统</h1>
-      <p className="landing-lead">AI 可辅助收音、转写、判类、提示和推进；研究者随时接管，并对正式研究分异步复核锁定。</p>
+      <p className="landing-lead">AI 帮助录音、转写和判断；研究者可以随时接管。</p>
       <div className="landing-grid">
         <Link to="/console" className="landing-card">
           <span className="landing-card-label">研究者操作端</span>
           <strong>准备、AI 训练与研究复核</strong>
-          <span>用于测试前建档、监看或接管训练、回看录音，并完成人工研究真值锁定。</span>
+          <span>建档、开始训练、回看录音与人工复核。</span>
         </Link>
         <Link to="/patient" className="landing-card patient">
-          <span className="landing-card-label">受试者呈现端</span>
+          <span className="landing-card-label">受试者端</span>
           <strong>题目呈现与回答</strong>
           <span>建议在外接触摸屏或另一窗口打开，由研究者协助开始。</span>
         </Link>
       </div>
-      <p className="landing-note">
-        一台设备即可完成全程：进入操作端建好场次，点「受试者画面」全屏切给受试者，研究者按住角落按钮返回。
-        也支持双窗/双设备同步运行。
-        首次在新设备或新房间使用，先跑一遍<Link to="/device-check">设备基础检查</Link>（约 20 秒，测麦克风、噪声、网络与播放），
-        再按<Link to="/acceptance">真机验收八项</Link>逐项记录。
-      </p>
-      <p className="landing-note">
-        当前仅限模拟预演和受控技术验证，不得用于正式受试者采集。启用云服务后，固定话术、回答音频或回答文本会按所用能力发送至第三方云端；AI 实时判断不是正式研究评分。
-      </p>
+      <p className="landing-note">首次在新设备使用，请先做一次设备检查（约 20 秒）。</p>
+      <div className="row" style={{ marginTop: "var(--sp-3)", justifyContent: "center", flexWrap: "wrap" }}>
+        <Link to="/device-check" className="button button--sm">开始设备检查</Link>
+        <Link to="/acceptance" className="button button--sm">打开验收记录</Link>
+      </div>
+      <p className="landing-note">当前为测试版本，不得用于正式受试者。</p>
     </main>
   );
 }
 
-const btn: React.CSSProperties = {
-  minHeight: 44, padding: "8px 18px", borderRadius: 10, border: "1px solid var(--c-line)",
-  background: "var(--c-surface)", cursor: "pointer", fontWeight: 600,
-};

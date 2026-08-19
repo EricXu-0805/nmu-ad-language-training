@@ -25,10 +25,10 @@ import {
 } from "./acceptanceProtocol.ts";
 
 const VERDICT_TONE = {
-  "incomplete-header": "#b26a00",
-  "incomplete-steps": "#b26a00",
-  "recorded-with-failures": "#c62828",
-  "recorded-all-pass": "#2e7d32",
+  "incomplete-header": "var(--c-warn)",
+  "incomplete-steps": "var(--c-warn)",
+  "recorded-with-failures": "var(--c-danger)",
+  "recorded-all-pass": "var(--c-ok)",
 } as const;
 
 function machineFacts(): { userAgent: string; buildId: string; screen: string } {
@@ -42,6 +42,8 @@ function machineFacts(): { userAgent: string; buildId: string; screen: string } 
 export function AcceptanceScreen() {
   const [draft, setDraft] = useState<AcceptanceDraft>(emptyDraft);
   const [copied, setCopied] = useState(false);
+  // 旧 WebView 上剪贴板会静默失败；失败时把纯文本直接摆出来让人长按复制。
+  const [copyFallbackText, setCopyFallbackText] = useState<string | null>(null);
   const facts = useMemo(machineFacts, []);
 
   const verdict = summarizeAcceptance(draft);
@@ -51,14 +53,17 @@ export function AcceptanceScreen() {
 
   const setHeader = (key: string, value: string) => {
     setCopied(false);
+    setCopyFallbackText(null);
     setDraft((prev) => ({ ...prev, header: { ...prev.header, [key]: value } }));
   };
   const setOutcome = (key: string, value: ItemOutcome) => {
     setCopied(false);
+    setCopyFallbackText(null);
     setDraft((prev) => ({ ...prev, outcomes: { ...prev.outcomes, [key]: value } }));
   };
   const setNote = (key: string, value: string) => {
     setCopied(false);
+    setCopyFallbackText(null);
     setDraft((prev) => ({ ...prev, notes: { ...prev.notes, [key]: value } }));
   };
 
@@ -81,11 +86,14 @@ export function AcceptanceScreen() {
   };
 
   const copy = async () => {
+    const text = formatAcceptanceText(receipt());
     try {
-      await navigator.clipboard.writeText(formatAcceptanceText(receipt()));
+      await navigator.clipboard.writeText(text);
       setCopied(true);
+      setCopyFallbackText(null);
     } catch {
       setCopied(false);
+      setCopyFallbackText(text);
     }
   };
 
@@ -94,23 +102,21 @@ export function AcceptanceScreen() {
       <header className="page-header-block">
         <div>
           <p className="page-kicker">真机验收 · 八项</p>
-          <h1 className="page-title">目标设备验收记录</h1>
+          <h1 className="page-title">真机验收记录</h1>
           <p className="page-description">
-            在<strong>目标设备、目标浏览器、真实房间、真实网络</strong>上填，
-            全程只用虚构受试者和合成语音。这一页只记录，不判定；
-            任何一项不清楚都按未通过处理。
+            在<strong>正式使用的设备、浏览器和房间</strong>里填写，
+            只用虚构受试者。不确定的项一律勾「未通过」。
           </p>
         </div>
       </header>
 
       <section className="form-section">
         <p className="muted">
-          先跑一遍<Link to="/device-check">设备基础检查</Link>。
-          它全绿只代表基础检查通过，<strong>不代表这台设备已可用于养老院</strong>。
+          请先完成<Link to="/device-check">设备基础检查</Link>。
         </p>
         <p className="muted">屏幕 {facts.screen}</p>
         <p className="muted">
-          本页构建编号（回执里记的就是这一串，抄的时候整串抄）：
+          页面版本号（自动记入记录）：
         </p>
         <p className="mono acceptance-build-id">{facts.buildId}</p>
       </section>
@@ -120,7 +126,7 @@ export function AcceptanceScreen() {
           <div>
             <h2>先填这台设备的基本情况</h2>
             <p className="muted">
-              这些机器猜不出来，少填一格整份记录就不能归档——设备矩阵靠的就是这几格。
+              每一格都必须填，缺一格记录不能归档。
             </p>
           </div>
         </div>
@@ -207,17 +213,27 @@ export function AcceptanceScreen() {
         )}
         <div className="form-actions">
           <button className="button button--primary button--md" onClick={download}>
-            下载 JSON 回执
+            保存记录文件
           </button>
           <button className="button button--ghost button--md" onClick={() => void copy()}>
-            {copied ? "已复制纯文本" : "复制纯文本"}
+            {copied ? "已复制纯文本" : copyFallbackText !== null ? "复制失败，长按下方文本" : "复制纯文本"}
           </button>
         </div>
+        {copyFallbackText !== null && (
+          <pre style={{ whiteSpace: "pre-wrap", background: "var(--c-surface)",
+                        padding: "var(--sp-3)", borderRadius: "var(--radius)",
+                        border: "1px solid var(--c-line)", fontSize: 12 }}>
+            {copyFallbackText}
+          </pre>
+        )}
         <p className="muted">
-          未完成的记录也可以下载——半份真实记录比一份补齐的漂亮记录有用。
-          回执里会写明它未完成。
+          没填完也可以保存，记录里会注明未完成。
         </p>
       </section>
+
+      <p style={{ marginTop: "var(--sp-5)" }}>
+        <Link to="/" className="muted">← 返回首页</Link>
+      </p>
     </div>
   );
 }

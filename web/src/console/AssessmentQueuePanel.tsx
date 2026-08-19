@@ -31,6 +31,8 @@ export function AssessmentQueuePanel() {
   const [assessmentLoading, setAssessmentLoading] = useState(false);
   const [classificationFilter, setClassificationFilter] = useState<DataClassification>("research");
   const [readiness, setReadiness] = useState<ScaleProtocolReadiness | null>(null);
+  const [readinessError, setReadinessError] = useState<string | null>(null);
+  const [readinessRetry, setReadinessRetry] = useState(0);
   const [executionEvent, setExecutionEvent] = useState<AssessmentEvent | null>(null);
   const assessmentRequest = useRef(0);
 
@@ -59,11 +61,16 @@ export function AssessmentQueuePanel() {
 
   useEffect(() => {
     let active = true;
+    setReadinessError(null);
     api.scaleProtocol()
       .then((next) => { if (active) setReadiness(next); })
-      .catch(() => { if (active) setReadiness(null); });
+      .catch((error) => {
+        if (!active) return;
+        setReadiness(null);
+        setReadinessError(assessmentErrorText(error));
+      });
     return () => { active = false; };
-  }, []);
+  }, [readinessRetry]);
 
   const executionOpen = readiness?.ready_for_research === true;
 
@@ -86,9 +93,9 @@ export function AssessmentQueuePanel() {
     >
       <div className="form-section-header">
         <div>
-          <p className="page-kicker">正式评估·独立工作流</p>
-          <h3 id="formal-assessment-queue-title">今日正式评估只读队列</h3>
-          <p className="muted">与每周训练并列展示，优先核对未收尾的评估；本区不是量表执行界面。</p>
+          <p className="page-kicker">正式评估</p>
+          <h3 id="formal-assessment-queue-title">今日正式评估队列</h3>
+          <p className="muted">先处理未收尾的评估。</p>
         </div>
         <Button
           disabled={assessmentLoading}
@@ -98,10 +105,18 @@ export function AssessmentQueuePanel() {
         </Button>
       </div>
 
-      {!executionOpen && (
-        <Alert tone="warn" title="只读排班投影·量表尚未全链就绪">
-          正式定义、授权制品与工作流政策通过全链路批准前，这里只显示服务端待办；
-          就绪(ready_for_research)后每行出现「打开执行」入口。
+      {!executionOpen && readinessError && (
+        <Alert tone="danger" title="就绪状态读取失败"
+          actions={<Button onClick={() => setReadinessRetry((value) => value + 1)}>重新读取</Button>}>
+          {readinessError}。读取成功前，这里先不开放量表执行入口。
+        </Alert>
+      )}
+      {!executionOpen && !readinessError && readiness === null && (
+        <StatusPill tone="muted">正在核对量表就绪状态…</StatusPill>
+      )}
+      {!executionOpen && !readinessError && readiness !== null && (
+        <Alert tone="warn" title="量表流程尚未开通">
+          正式量表还没开放录入，暂时只能查看待办；开放后每行会出现「打开执行」。
         </Alert>
       )}
       {executionOpen && <AssessmentEventCreateForm
@@ -116,6 +131,10 @@ export function AssessmentQueuePanel() {
             void loadAssessmentQueue();
           }}
           onDismiss={() => setExecutionEvent(null)}
+          onConflictRefresh={() => {
+            setExecutionEvent(null);
+            void loadAssessmentQueue();
+          }}
         />
       )}
 
@@ -145,7 +164,7 @@ export function AssessmentQueuePanel() {
                 队列日期 {view.asOfDate}；先收尾，再继续进行中评估，最后核对待开始安排。
               </p>
             </div>
-            <StatusPill tone="primary">只读待办 {view.events.length} 项</StatusPill>
+            <StatusPill tone="primary">待办 {view.events.length} 项</StatusPill>
           </div>
           <DataBoundaryFilter
             value={classificationFilter}
@@ -155,7 +174,7 @@ export function AssessmentQueuePanel() {
           />
           {classificationFilter === "simulation" && (
             <Alert tone="danger" title="当前是专用模拟评估队列">
-              不得把模拟评估、模拟证据或排班状态并入真实研究结局。
+              模拟评估不计入研究结果。
             </Alert>
           )}
           {visibleEvents.length === 0 && (

@@ -21,18 +21,18 @@ export function AIQualityDashboard({
         <div>
           <h2 id={resolvedHeadingId}>AI 质量后台</h2>
           <p className="muted">
-            首版只显示当前数据分区的 overall 聚合计数、覆盖诊断与隐私状态；
-            不显示受试者标识、录音、作答、转写或自由文本版本维度。
+            只显示汇总计数，不含任何受试者个人内容。
           </p>
         </div>
         <p className="muted quality-generated-at">
-          生成时间：<time dateTime={model.generatedAt}>{model.generatedAt}</time>
+          生成时间：<time dateTime={model.generatedAt}>{model.generatedAt.replace("T", " ").slice(0, 19)}</time>
         </p>
       </header>
 
       <Alert role="note" tone="info" title="两套口径严格分开">
-        “AI 运行质量”只描述系统覆盖、录音尝试所处提示上下文、安全和 AI 处理延迟。真实研究区仅以人工锁定真值核查 AI；
-        模拟区仅显示不可用于研究结论的复核参考。没有相应复核参考时，准确性一律保持未知。
+        “AI 运行质量”只说明系统是否正常运转和处理速度，不代表判分准确。
+        准确性只以人工核对的结果为准；没有人工核对时，一律显示“未知”。
+        模拟区的数据只作调试参考，不用于研究结论。
       </Alert>
 
       {model.groups.length === 0 && (
@@ -74,13 +74,26 @@ export function AIQualityDashboard({
             <section aria-label="当前聚合分组维度">
               <h4>分组维度</h4>
               <dl className="quality-dimension-list">
-                {group.dimensions.map((dimension) => (
-                  <div key={dimension.key} data-state={dimension.known ? "known" : "unknown"}>
+                {group.dimensions.filter((dimension) => dimension.known).map((dimension) => (
+                  <div key={dimension.key} data-state="known">
                     <dt>{dimension.label}</dt>
                     <dd>{dimension.value}</dd>
                   </div>
                 ))}
               </dl>
+              {group.dimensions.some((dimension) => !dimension.known) && (
+                <details>
+                  <summary>查看未拆分的维度</summary>
+                  <dl className="quality-dimension-list">
+                    {group.dimensions.filter((dimension) => !dimension.known).map((dimension) => (
+                      <div key={dimension.key} data-state="unknown">
+                        <dt>{dimension.label}</dt>
+                        <dd>{dimension.value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </details>
+              )}
             </section>
 
             <QualityMetricList headingId={coverageHeadingId} title="公开范围与证据覆盖" metrics={group.coverageMetrics} />

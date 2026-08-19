@@ -148,7 +148,7 @@ export function SessionCloseoutPanel({
       }
       setPendingRequest(request);
       setReconciliationState("confirmed_missing");
-      setSaveFailure(`${reason}。服务器当前尚无该记录；只能用原内容和原幂等键重试。`);
+      setSaveFailure(`${reason}。服务器上还没有这份记录，请点「用原内容安全重试」。`);
     } catch (cause) {
       setPendingRequest(request);
       setReconciliationState("required");
@@ -264,7 +264,6 @@ export function SessionCloseoutPanel({
           )}
 
           <div className="form-actions">
-            <p className="muted grow">保存使用版本号核对；若记录已被他人更新，服务器应拒绝旧版本覆盖。</p>
             <Button type="submit" variant="primary" disabled={effectiveBusy || reconciliationState !== null}>
               {effectiveBusy ? "正在保存现场收尾…" : "保存现场收尾"}
             </Button>
@@ -274,25 +273,25 @@ export function SessionCloseoutPanel({
 
       <details className="card col">
         <summary style={{ cursor: "pointer", fontWeight: 650 }}>
-          查看 AI、终值与录音自动汇总
+          查看本场自动汇总
         </summary>
-        <p className="muted">以下计数由服务器权威记录提供，仅描述本场数据完整度；现场收尾不会改写这些结果。</p>
+        <p className="muted">以下为本场自动统计，仅供查看。</p>
         <div className="metric-grid" aria-label="服务器权威场次结果概览">
           <OutcomeMetric label="计划环节" value={outcomeSummary.expected_turns} />
           <OutcomeMetric label="匹配终值" value={outcomeSummary.matched_turns} />
           <OutcomeMetric label="AI 完成环节" value={outcomeSummary.completed_attempt_turns} />
           <OutcomeMetric label="录音证据环节" value={outcomeSummary.audio_evidenced_turns} />
           {outcomeSummary.total_attempts != null && (
-            <OutcomeMetric label="全部 attempt" value={outcomeSummary.total_attempts} />
+            <OutcomeMetric label="AI 处理总次数" value={outcomeSummary.total_attempts} />
           )}
           {outcomeSummary.completed_attempts != null && (
-            <OutcomeMetric label="已完成 attempt" value={outcomeSummary.completed_attempts} />
+            <OutcomeMetric label="处理成功次数" value={outcomeSummary.completed_attempts} />
           )}
           {outcomeSummary.needs_review_attempts != null && (
             <OutcomeMetric label="AI 标记待复核" value={outcomeSummary.needs_review_attempts} />
           )}
           {outcomeSummary.technical_failure_attempts != null && (
-            <OutcomeMetric label="技术失败 attempt" value={outcomeSummary.technical_failure_attempts} />
+            <OutcomeMetric label="技术失败次数" value={outcomeSummary.technical_failure_attempts} />
           )}
           {outcomeSummary.technical_pause_count != null && (
             <OutcomeMetric label="技术安全暂停" value={outcomeSummary.technical_pause_count} />
@@ -301,16 +300,16 @@ export function SessionCloseoutPanel({
             <OutcomeMetric label="人工接管" value={outcomeSummary.researcher_takeover_count} />
           )}
           {outcomeSummary.prompt_level_0_count != null && (
-            <OutcomeMetric label="0 级提示 attempt" value={outcomeSummary.prompt_level_0_count} />
+            <OutcomeMetric label="无提示作答数" value={outcomeSummary.prompt_level_0_count} />
           )}
           {outcomeSummary.prompt_level_1_count != null && (
-            <OutcomeMetric label="1 级提示 attempt" value={outcomeSummary.prompt_level_1_count} />
+            <OutcomeMetric label="1 级提示作答数" value={outcomeSummary.prompt_level_1_count} />
           )}
           {outcomeSummary.prompt_level_2_count != null && (
-            <OutcomeMetric label="2 级提示 attempt" value={outcomeSummary.prompt_level_2_count} />
+            <OutcomeMetric label="2 级提示作答数" value={outcomeSummary.prompt_level_2_count} />
           )}
           {outcomeSummary.prompt_level_3_count != null && (
-            <OutcomeMetric label="3 级提示 attempt" value={outcomeSummary.prompt_level_3_count} />
+            <OutcomeMetric label="3 级提示作答数" value={outcomeSummary.prompt_level_3_count} />
           )}
         </div>
       </details>

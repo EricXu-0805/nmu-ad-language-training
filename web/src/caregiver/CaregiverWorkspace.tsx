@@ -72,8 +72,8 @@ function CaregiverHeader({ identity, disabled, exiting, onLogout }: {
       <div className="app-brand">
         <div className="app-brand-mark" aria-hidden>护</div>
         <div className="col" style={{ gap: 0 }}>
-          <strong>本机20题合成模拟</strong>
-          <span className="muted" style={{ fontSize: "0.82em" }}>照护员操作台 · 本机床旁支持</span>
+          <strong>语言训练 · 演练模式</strong>
+          <span className="muted" style={{ fontSize: "0.82em" }}>床旁操作台</span>
         </div>
       </div>
       <div className="toolbar-account">
@@ -101,7 +101,6 @@ function TodayScreen({ today, loading, onStart, startingPlanId, busy }: {
         <div>
           <p className="page-kicker">今天任务</p>
           <h1 className="page-title" id="caregiver-today-title">今天要做的练习</h1>
-          <p className="page-description">只显示已经安排好、现在可以开始的内容。</p>
         </div>
         {today && <StatusPill tone="primary">{today.asOfDateLabel}</StatusPill>}
       </header>
@@ -110,13 +109,13 @@ function TodayScreen({ today, loading, onStart, startingPlanId, busy }: {
 
       {!loading && today?.plans.length === 0 && (
         <Alert tone="ok" title="现在没有待开始任务">
-          请保持页面打开。如果负责人新增了安排，页面会自动重新查看。
+          有新安排会自动显示。
         </Alert>
       )}
 
       {today && today.withheldCount > 0 && (
-        <Alert tone="warn" compact title="有安排未通过模拟门禁">
-          另有 {today.withheldCount} 条安排未显示，照护员不能在本页开始。请联系负责人核对。
+        <Alert tone="warn" compact title="有安排暂不能开始">
+          另有 {today.withheldCount} 条安排暂时不能开始，请联系负责人。
         </Alert>
       )}
 
@@ -128,7 +127,7 @@ function TodayScreen({ today, loading, onStart, startingPlanId, busy }: {
               <article className="run-picker-card" role="listitem" key={plan.planId}>
                 <div className="run-picker-head">
                   <div className="col" style={{ gap: 6 }}>
-                    <StatusPill tone="warn">本机20题合成模拟</StatusPill>
+                    <StatusPill tone="warn">演练</StatusPill>
                     <strong style={{ fontSize: "1.15em" }}>{plan.participantLabel}</strong>
                     <span>{scheduleText(plan)}</span>
                     <span className="muted">{plan.weekLabel} · {plan.phaseLabel}</span>
@@ -156,6 +155,7 @@ function SessionScreen({
   session,
   status,
   busy,
+  busyAction,
   onStartPractice,
   onPause,
   onHelp,
@@ -165,6 +165,7 @@ function SessionScreen({
   session: CaregiverSessionSummary;
   status: CaregiverSessionStatus | null;
   busy: boolean;
+  busyAction: BusyAction;
   onStartPractice: () => void;
   onPause: () => void;
   onHelp: () => void;
@@ -210,8 +211,8 @@ function SessionScreen({
         )}
 
         {safeCloseoutOnly && (
-          <Alert tone="warn" title="仅可安全收口">
-            该场次未通过本机20题合成模拟门禁。本页只保留暂停、请求协助、接管和结束，不会显示“开始练习”。
+          <Alert tone="warn" title="本次只能暂停或结束">
+            本次不能开始练习，只能暂停、求助、接管或结束。如有疑问请联系负责人。
           </Alert>
         )}
 
@@ -219,14 +220,14 @@ function SessionScreen({
           <div className="form-section-header">
             <div>
               <h2 id="two-window-title">两个窗口都要保持打开</h2>
-              <p className="muted">这个窗口留给工作人员；老人画面应单独打开在另一个窗口。</p>
+              <p className="muted">老人画面在另一个窗口，两个窗口都不要关。</p>
             </div>
           </div>
           {waitingForPatient && (
-            <p>请先打开老人画面。页面显示“老人画面已打开”后，才能开始练习。</p>
+            <p>请先打开老人画面，连上后才能开始。</p>
           )}
           {status?.patientPresence === "online" && (
-            <p>老人画面已连接。开始后请留在老人旁边，不要离开。</p>
+            <p>老人画面已打开。请留在老人旁边。</p>
           )}
         </section>
 
@@ -238,26 +239,14 @@ function SessionScreen({
             </div>
           </div>
 
+          {/* 固定两列、暂停恒在第一格：按钮位置不随状态漂移，肌肉记忆才有效。 */}
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
               gap: "var(--sp-3)",
             }}
           >
-            {showStart && (
-              <Button
-                type="button"
-                variant="primary"
-                size="lg"
-                fullWidth
-                disabled={busy || !actions?.startPractice}
-                title={waitingForPatient ? "请先打开老人画面" : undefined}
-                onClick={onStartPractice}
-              >
-                开始练习
-              </Button>
-            )}
             {showPause && (
               <Button
                 type="button"
@@ -267,8 +256,28 @@ function SessionScreen({
                 disabled={busy || (actions !== null && !actions.pause)}
                 onClick={onPause}
               >
-                暂停练习
+                {busyAction === "pause" ? "正在暂停…" : "暂停练习"}
               </Button>
+            )}
+            {showStart && (
+              <div className="col" style={{ gap: "var(--sp-1)" }}>
+                <Button
+                  type="button"
+                  variant="primary"
+                  size="lg"
+                  fullWidth
+                  disabled={busy || !actions?.startPractice}
+                  title={waitingForPatient ? "老人画面打开后才能开始" : undefined}
+                  onClick={onStartPractice}
+                >
+                  {busyAction === "start-practice" ? "正在开始…" : "开始练习"}
+                </Button>
+                {waitingForPatient && (
+                  <span className="muted" style={{ fontSize: "var(--text-sm)" }}>
+                    老人画面打开后才能开始
+                  </span>
+                )}
+              </div>
             )}
             <Button
               type="button"
@@ -281,17 +290,24 @@ function SessionScreen({
               请求协助
             </Button>
             {showTakeOver && (
-              <Button
-                type="button"
-                variant="secondary"
-                size="lg"
-                fullWidth
-                disabled={busy || !actions?.takeOver}
-                title={!actions?.takeOver ? "正在安全停止声音和交互" : undefined}
-                onClick={onTakeOver}
-              >
-                接管练习
-              </Button>
+              <div className="col" style={{ gap: "var(--sp-1)" }}>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="lg"
+                  fullWidth
+                  disabled={busy || !actions?.takeOver}
+                  title={!actions?.takeOver ? "正在停止声音，请稍候" : undefined}
+                  onClick={onTakeOver}
+                >
+                  {busyAction === "take-over" ? "正在接管…" : "接管练习"}
+                </Button>
+                {!actions?.takeOver && (
+                  <span className="muted" style={{ fontSize: "var(--text-sm)" }}>
+                    正在停止声音，请稍候
+                  </span>
+                )}
+              </div>
             )}
             <Button
               type="button"
@@ -306,8 +322,8 @@ function SessionScreen({
           </div>
 
           {status?.runtimeState === "paused" && (
-            <Alert tone="warn" compact title="暂停后不会自动重新开始">
-              如果需要继续处理，请接管或联系负责人；也可根据实际情况结束本次。
+            <Alert tone="warn" compact title="暂停后不会自动继续">
+              可接管、结束，或联系负责人。
             </Alert>
           )}
         </section>
@@ -498,7 +514,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
   }, [current, loadToday, status]);
 
   const reportUnconfirmed = (label: string) => {
-    setOperationProblem(`还没有确认“${label}”是否成功。请保持页面打开，系统会自动重新检查。`);
+    setOperationProblem(`“${label}”还没确认成功，页面会自动重新检查，请稍候。`);
   };
 
   const startPlan = async (plan: CaregiverPlan) => {
@@ -518,7 +534,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
       setToday((previous) => previous
         ? { ...previous, plans: previous.plans.filter((candidate) => candidate.planId !== plan.planId) }
         : previous);
-      setNotice("本次已开始。请确认另一个窗口的老人画面已打开。");
+      setNotice("已开始。请确认老人画面已打开。");
     } catch (error) {
       if (isProviderReadinessPrewriteConflict(error)) {
         setOperationProblem(PROVIDER_NOT_READY_MESSAGE);
@@ -567,7 +583,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
     try {
       const next = await api.pauseSession(current.sessionId);
       adoptStatus(next);
-      setNotice("练习已暂停。请先照顾好老人，再选择请求协助、接管或结束本次。");
+      setNotice("已暂停。请先照顾老人，再选择下一步。");
     } catch {
       reportUnconfirmed("暂停练习");
     } finally {
@@ -640,7 +656,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
       });
       clearKey(scope);
       adoptStatus(next);
-      setNotice("已由工作人员接管。系统不会再自动向下进行。");
+      setNotice("已接管。系统已停止自动练习。");
     } catch {
       reportUnconfirmed("接管练习");
     } finally {
@@ -666,7 +682,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
       setEndSelection(null);
       adoptStatus(next);
       if (!caregiverSessionIsTerminal(next)) {
-        setOperationProblem("服务器还没有确认本次已结束。请留在本页，等待状态自动更新。");
+        setOperationProblem("正在确认结束，请留在本页稍候。");
       }
     } catch {
       setEndOpen(false);
@@ -685,7 +701,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
     try {
       if (current) {
         if (!status) {
-          setOperationProblem("正在确认本次是否已安全停下，现在还不能退出。请稍等。");
+          setOperationProblem("正在确认安全暂停，请稍候再退出。");
           return;
         }
         if (status.runtimeState === "active") {
@@ -736,12 +752,12 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
             </Alert>
             {todayProblem && !current && !ended && (
               <Alert tone="danger" title="还没有读到今天的安排">
-                请保持页面打开。系统会每隔几秒自动重试，确认成功前不会开始任何练习。
+                正在自动重试，请保持页面打开。
               </Alert>
             )}
             {syncProblem && current && (
               <Alert tone="warn" title="正在重新确认状态">
-                请不要关闭页面或重复操作。如果老人不适，先停止当前设备的声音，并立即联系负责人。
+                请勿重复操作。如老人不适，先关掉设备声音，并立即联系负责人。
               </Alert>
             )}
             {operationProblem && (
@@ -766,14 +782,14 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
                         type="button" variant="secondary"
                         disabled={busyAction !== null}
                         onClick={() => { void recordHelpDisposition("acknowledged"); }}
-                      >记：已有人到场</Button>
+                      >已有人到场</Button>
                     )}
                     {prompt.canRecordResolved && (
                       <Button
                         type="button" variant="secondary"
                         disabled={busyAction !== null}
                         onClick={() => { void recordHelpDisposition("resolved"); }}
-                      >记：已处理完</Button>
+                      >已处理完成</Button>
                     )}
                   </div>
                 </Alert>
@@ -786,7 +802,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
                   <p className="page-kicker">已结束</p>
                   <h1 className="page-title" id="caregiver-ended-title">{ended.title}</h1>
                   <p>{ended.session.participantLabel} · {ended.session.weekLabel} · {ended.session.phaseLabel}</p>
-                  <Alert tone="ok">{ended.detail}工作人员不需要在本页做其他整理。</Alert>
+                  <Alert tone="ok">{ended.detail}</Alert>
                   <div className="form-actions">
                     <Button type="button" variant="primary" size="lg" onClick={showToday}>查看今天任务</Button>
                   </div>
@@ -797,6 +813,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
                 session={current}
                 status={status}
                 busy={anyBusy}
+                busyAction={busyAction}
                 onStartPractice={() => { void startPractice(); }}
                 onPause={() => { void pausePractice(); }}
                 onHelp={() => { setHelpReason(null); setHelpOpen(true); }}
@@ -821,7 +838,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         title="请求协助"
         body={(
           <div className="stack">
-            <p>提交后会先暂停练习，并在本机留下记录。还需要您按院内现行方式亲自联系负责人。</p>
+            <p>提交后练习会暂停并留下记录。请再当面通知负责人。</p>
             <ReasonChoices
               legend="请选择最符合的情况"
               options={CAREGIVER_HELP_REASONS}
@@ -844,7 +861,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         title="结束本次"
         body={(
           <div className="stack">
-            <p>结束后，照护员页面不能再重新开始本次练习。请根据现场实际情况选择。</p>
+            <p>结束后，本页不能重新开始本次练习。</p>
             <ReasonChoices
               legend="本次为什么结束？"
               options={CAREGIVER_END_REASONS}

@@ -104,6 +104,16 @@ export function assessmentTimepointLabel(timepoint: AssessmentTimepoint): string
   return "随访";
 }
 
+export function assessmentEventStatusLabel(status: AssessmentEvent["status"]): string {
+  return {
+    due: "待施测",
+    in_progress: "施测中",
+    awaiting_closeout: "待现场收尾",
+    closed: "已收尾",
+    cancelled: "已取消",
+  }[status];
+}
+
 export function assessmentCategoryLabel(category: AssessmentCategoryKey): string {
   return category === "untrained_standardized_naming"
     ? "未训练标准化命名"

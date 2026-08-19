@@ -29,7 +29,7 @@ export function runPickerPresentation(input: {
       readOnlyTitle: "当前账号用于数据查看与治理",
       readOnlyDescription: "不能启动、续做或复核训练；下方“已完成场次与受控导出”已自动展开。",
       historyTitle: "已完成场次与受控导出",
-      historyDescription: "按受试者查看已最终完成的场次。进入后训练与研究真值保持只读，导出仍须通过服务器完整性门禁。",
+      historyDescription: "按受试者查看已最终完成的场次，进入后只能查看，不能修改。",
       historyOpenLabel: "查看已完成场次",
       historyCloseLabel: "收起已完成场次",
     };
@@ -37,13 +37,13 @@ export function runPickerPresentation(input: {
   return {
     completedOnly: false,
     kicker: "工作台 · 今日已审核安排",
-    title: "到场后的今日工作",
-    description: "正式评估待办与每周训练分区展示。先核对未收尾或进行中的评估；新训练仍只能从已审核且日期已到的安排一键开始。",
+    title: "今日训练",
+    description: "先处理待办评估；训练从下方今日队列一键开始。",
     prepActionLabel: input.canStart ? "去准备区安排" : "查看受试者档案",
     readOnlyTitle: "当前账号为只读角色",
     readOnlyDescription: "可以核对今日安排与历史场次，但不能启动或续做训练。",
     historyTitle: "异常恢复与未完复核",
-    historyDescription: "用于已经启动但因刷新、断网或设备中断未能继续的场次，以及干预结束后尚未完成的研究复核。新训练必须从上方已审核安排开始。",
+    historyDescription: "训练中断后从这里继续，也可找到待复核的场次。",
     historyOpenLabel: "打开恢复入口",
     historyCloseLabel: "收起恢复入口",
   };

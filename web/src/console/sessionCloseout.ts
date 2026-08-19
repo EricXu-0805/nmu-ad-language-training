@@ -160,7 +160,7 @@ export function buildSessionCloseoutRequest(
   const validation = validateSessionCloseoutDraft(draft);
   const normalizedIdempotencyKey = idempotencyKey.trim();
   if (!normalizedIdempotencyKey) {
-    validation.errors.push("保存意图缺少幂等键，已禁止提交。");
+    validation.errors.push("保存请求缺少防重复标识，请刷新页面后重试。");
     validation.valid = false;
   }
   if (!validation.valid || draft.report_status === null) {

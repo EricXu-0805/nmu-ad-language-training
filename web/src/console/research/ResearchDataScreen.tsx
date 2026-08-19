@@ -119,18 +119,23 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
           <p className="page-kicker">分析后台 · 研究数据</p>
           <h2 className="page-title">去标识研究数据总览</h2>
           <p className="page-description">
-            这里看到的每一行都已经去标识：受试者与场次用分域假名，绝对时间、转写原文、
-            AI 理由、录音一律不出现。导出的 CSV 就是屏上这一页的同一份投影。
+            所有数据已去标识：受试者与场次只用编号代替，不含姓名、绝对时间、转写原文和录音。
+            导出的 CSV 与屏上显示完全一致。
           </p>
         </div>
         <Button variant="ghost" onClick={onBack}>返回受试者列表</Button>
       </header>
 
       {metaError?.forbidden && (
-        <Alert tone="warn" title="当前账号无权读取研究数据接口">
-          只有 <strong>data_steward</strong>（数据管理员）和 <strong>admin</strong> 能读这一面。
-          研究者账号被 trainer 隔离约束，看不到跨受试者的汇总——这是设计。找系统负责人开一个
-          数据管理员账号，不要共用别人的账号。
+        <Alert tone="warn" title="当前账号无权查看研究数据">
+          <p>此页仅数据管理员和系统管理员可见。请让系统负责人为你开通数据管理员账号，不要共用别人的账号。</p>
+          <details>
+            <summary>技术详情</summary>
+            <p className="muted">
+              需要 <code>data_steward</code>（数据管理员）或 <code>admin</code>（系统管理员）角色；
+              研究者账号受隔离约束，看不到跨受试者的汇总。
+            </p>
+          </details>
         </Alert>
       )}
       {metaError && !metaError.forbidden && (
@@ -139,13 +144,17 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
       {!meta && !metaError && <StatusPill tone="muted">正在读取接口状态…</StatusPill>}
 
       {meta?.configured === false && (
-        <Alert tone="warn" title="研究数据接口尚未开启">
-          <p>{meta.reason}</p>
-          <p className="muted">
-            这不是故障：在服务器配置去标识密钥之前，本接口一行数据也不会返回，
-            也<strong>绝不会</strong>退化成返回明文受试者编号。配置由数据管理员在服务器完成，
-            密钥不要贴进聊天或邮件。
-          </p>
+        <Alert tone="warn" title="研究数据尚未开放">
+          <p>服务器还没有完成去标识配置，配置完成前这里不显示任何数据。请联系数据管理员。</p>
+          <details>
+            <summary>技术详情</summary>
+            <p className="muted">{meta.reason}</p>
+            <p className="muted">
+              在服务器配置去标识密钥之前，本接口一行数据也不会返回，
+              也不会退化成返回明文受试者编号。配置由数据管理员在服务器完成，
+              密钥不要贴进聊天或邮件。
+            </p>
+          </details>
         </Alert>
       )}
 
@@ -156,7 +165,7 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
               <div>
                 <h3>选数据集与分区</h3>
                 <p className="muted">
-                  三张长表可按受试者编号相互 join；分区一次只看一个，真实与模拟永不混。
+                  三张表可按受试者编号相互对照；真实与模拟数据分开查看，不会混在一起。
                 </p>
               </div>
             </div>
@@ -194,15 +203,19 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
             )}
             {classification === "research" && meta.release.bound === false && (
               <Alert tone="warn" title="真实研究分区还没有可发布的冻结版本">
-                <p>{meta.release.reason}</p>
-                <p className="muted">
-                  这不是故障。真实研究分区只发**冻结纪元**里的那批场次：由数据管理员与
-                  管理员两个具名的人各跑一次
-                  <code>scripts/cut_quality_release.py</code>（一个提议、另一个拿着
-                  sha256 批准）之后，这里才会有数据。这样做是为了让同一版数据反复拉取
-                  逐字节相同——否则两次拉取之差里装着这期间新入组那几个人的全部明细。
-                  拒绝码 <code>{meta.release.code}</code>。
+                <p>
+                  这不是故障：研究数据需先由数据管理员发布一个冻结版本，发布后这里才会显示数据。
                 </p>
+                <details>
+                  <summary>技术详情</summary>
+                  <p className="muted">{meta.release.reason}</p>
+                  <p className="muted">
+                    冻结版本由数据管理员与管理员两个具名的人各跑一次
+                    <code>scripts/cut_quality_release.py</code>（一个提议、另一个拿着
+                    sha256 批准）生成，保证同一版数据反复拉取逐字节相同。
+                    拒绝码 <code>{meta.release.code}</code>。
+                  </p>
+                </details>
               </Alert>
             )}
           </section>
@@ -235,21 +248,27 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
           )}
 
           <footer className="form-section">
-            <p className="muted">
-              数据字典版本 <code>{meta.schemaVersion}</code> · 假名版本{" "}
-              <code>{meta.pseudonymVersion}</code> · 假名密钥编号{" "}
-              <code>{meta.pseudonymKeyId}</code>
-            </p>
             {meta.release.bound && (
               <p className="muted">
-                冻结发布纪元 <code>第 {meta.release.epochSeq} 版</code> · 队列
-                {meta.release.frozenSessionCount} 个场次 · 截止时刻{" "}
-                <code>{meta.release.asOf}</code> · 聚合载荷指纹{" "}
-                <code>{meta.release.aggregatePayloadSha256.slice(0, 12)}</code>
-                。两份导出只有纪元号相同才能直接比对。
+                数据版本：第 {meta.release.epochSeq} 版 · {meta.release.frozenSessionCount} 个场次 ·
+                截止 {meta.release.asOf}。两份导出的版本号相同才能直接比对。
               </p>
             )}
-            <p className="muted">{meta.note}</p>
+            <details>
+              <summary>技术详情</summary>
+              <p className="muted">
+                数据字典版本 <code>{meta.schemaVersion}</code> · 假名版本{" "}
+                <code>{meta.pseudonymVersion}</code> · 假名密钥编号{" "}
+                <code>{meta.pseudonymKeyId}</code>
+              </p>
+              {meta.release.bound && (
+                <p className="muted">
+                  冻结发布纪元 <code>第 {meta.release.epochSeq} 版</code> · 聚合载荷指纹{" "}
+                  <code>{meta.release.aggregatePayloadSha256.slice(0, 12)}</code>
+                </p>
+              )}
+              <p className="muted">{meta.note}</p>
+            </details>
           </footer>
         </>
       )}

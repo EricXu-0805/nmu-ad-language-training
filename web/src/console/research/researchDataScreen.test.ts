@@ -28,8 +28,8 @@ test("总览屏是只读的：不发任何写请求", () => {
 });
 
 test("密钥没配时给出可自诊的原因，并明说不会退化成明文", () => {
-  assert.match(screen, /研究数据接口尚未开启/);
-  assert.match(screen, /绝不会<\/strong>退化成返回明文受试者编号/);
+  assert.match(screen, /研究数据尚未开放/);
+  assert.match(screen, /不会退化成返回明文受试者编号/);
   assert.match(screen, /meta\?\.configured === false/);
 });
 

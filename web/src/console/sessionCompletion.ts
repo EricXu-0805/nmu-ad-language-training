@@ -33,20 +33,20 @@ function rapportGate(rapport: RapportGateStatus | null | undefined): LocalComple
     return {
       canRequest: false,
       label: "正在核对关系建立位置",
-      detail: "第 1 周须先核对服务端关系建立位置与冻结脚本，才能请求结束。",
+      detail: "第 1 周需先与服务器核对关系建立位置，才能结束本场。",
     };
   }
   if (!rapport.atFarewell) {
     return {
       canRequest: false,
       label: "须先播报道别话术",
-      detail: "关系建立须停在道别节才能结束本场；提前结束请使用中止流程。",
+      detail: "完成道别后才能结束本场；要提前结束请走中止流程。",
     };
   }
   return {
     canRequest: true,
-    label: "可请求服务器完成核验",
-    detail: "服务器会核对道别位置、录音指令收回、录音红线标记与零评分行后才宣布结束。",
+    label: "可以请求结束本场",
+    detail: "服务器会核对道别位置和录音后确认结束。",
   };
 }
 
@@ -116,7 +116,7 @@ export function localCompletionGate({
     return {
       canRequest: false,
       label: "正在核对服务器记录",
-      detail: "服务器记录和冻结计划均加载完成后，才能请求完成本场次。",
+      detail: "服务器记录加载完成后，才能完成本场。",
     };
   }
   if (weekNo === 1) {
@@ -126,7 +126,7 @@ export function localCompletionGate({
     return {
       canRequest: false,
       label: "场次计划没有可核对环节",
-      detail: "冻结计划为空或异常，系统已保持本场未完成，请检查场次安排。",
+      detail: "本场题目清单为空或异常，暂不能完成，请检查场次安排。",
     };
   }
   if (lockedTurns < totalTurns) {
@@ -140,13 +140,13 @@ export function localCompletionGate({
     return {
       canRequest: false,
       label: "场次记录数量与计划不一致",
-      detail: `当前有 ${lockedTurns} 个已锁定记录，但冻结计划只有 ${totalTurns} 个环节，须先核查重复或计划外记录。`,
+      detail: `当前有 ${lockedTurns} 个已锁定记录，但计划只有 ${totalTurns} 个环节，请先核查是否有重复记录。`,
     };
   }
   return {
     canRequest: true,
-    label: "可请求服务器完成核验",
-    detail: "本地完整度已对齐；服务器仍会逐项核对冻结计划与唯一锁定研究真值。",
+    label: "可以请求最终完成",
+    detail: "全部环节已锁定；服务器确认后本场最终完成。",
   };
 }
 
@@ -161,7 +161,7 @@ export function localInterventionCompletionGate({
     return {
       canRequest: false,
       label: "正在核对服务器证据",
-      detail: "服务器记录和冻结计划均加载完成后，才能请求结束床旁干预。",
+      detail: "服务器记录加载完成后，才能结束现场训练。",
     };
   }
   if (weekNo === 1) {
@@ -171,13 +171,13 @@ export function localInterventionCompletionGate({
     return {
       canRequest: false,
       label: "场次计划没有可核对环节",
-      detail: "冻结计划为空或异常，系统保持当前场次，请检查场次安排。",
+      detail: "本场题目清单为空或异常，暂不能结束，请检查场次安排。",
     };
   }
   return {
     canRequest: true,
-    label: "可请求 AI 证据完整性核验",
-    detail: "服务器会逐环节核对权威 AI attempt、原始录音及绑定关系；不要求床旁等待人工确认或锁分。",
+    label: "可以结束现场训练",
+    detail: "服务器会核对每题的 AI 记录和录音；人工确认和评分可事后再做。",
   };
 }
 

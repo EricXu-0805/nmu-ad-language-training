@@ -86,6 +86,18 @@ interface MutableTurn {
   interactions: ParsedInteraction[];
 }
 
+const PROCESSING_STATUS_LABELS: Record<string, string> = {
+  completed: "已完成",
+  technical_failure: "技术失败",
+  received: "已收音待处理",
+  asr_completed: "转写完成待判类",
+};
+
+// 后端英文枚举不直接上屏;未知值原样返回以免掩盖异常。
+export function processingStatusLabel(status: string): string {
+  return PROCESSING_STATUS_LABELS[status] ?? status;
+}
+
 const FEEDBACK_LABELS: Record<string, string> = {
   self: "自发正确反馈",
   cued1_unknown: "一级提示后成功（未提及路径）",
@@ -150,7 +162,7 @@ export function interactionSummary(eventType: string, payload: Record<string, un
     case "asr_failed":
       return `ASR 技术失败${engine ? ` · ${engine}` : ""}${error ? ` · ${error}` : ""}`;
     case "judgement_completed":
-      return `AI operational 判类完成 · ${value(payload, "answer_type") ?? "类型缺失"}${engine ? ` · ${engine}` : ""}`;
+      return `AI 判类完成 · ${value(payload, "answer_type") ?? "类型缺失"}${engine ? ` · ${engine}` : ""}`;
     case "judgement_failed":
       return `AI 判类技术失败${engine ? ` · ${engine}` : ""}${error ? ` · ${error}` : ""}`;
     case "cue_selected":
@@ -223,12 +235,12 @@ export function compareOperationalToResearch(turn: TurnEvent | null, source: Att
     return { state: "unavailable", aiScore, researchScore, message: "尚未形成人工锁定的研究真值，不可宣称 AI 判定正确或错误。" };
   }
   if (aiScore === null) {
-    return { state: "unavailable", aiScore, researchScore, message: "AI operational 分缺失；只能展示人工研究真值。" };
+    return { state: "unavailable", aiScore, researchScore, message: "AI 判定分缺失；只能展示人工研究真值。" };
   }
   if (aiScore === researchScore) {
     return { state: "same", aiScore, researchScore, message: `数值一致（AI ${aiScore} / 研究真值 ${researchScore}），但两者语义仍不等同。` };
   }
-  return { state: "different", aiScore, researchScore, message: `数值不一致：AI operational ${aiScore}，人工研究真值 ${researchScore}。` };
+  return { state: "different", aiScore, researchScore, message: `数值不一致：AI 判定 ${aiScore}，人工研究真值 ${researchScore}。` };
 }
 
 export function buildEvidenceTimeline(input: EvidenceJournalInput): EvidenceTimeline {
@@ -350,7 +362,7 @@ export function buildEvidenceTimeline(input: EvidenceJournalInput): EvidenceTime
       if (attempt.processing_status === "technical_failure") {
         attemptIssues.push(issue("technical_failure", "danger", `AI 处理技术失败${attempt.error_code ? `：${attempt.error_code}` : "，错误码缺失"}。这不代表受试者回答错误。`));
       } else if (attempt.processing_status !== "completed") {
-        attemptIssues.push(issue("attempt_incomplete", "warn", `attempt 停在 ${attempt.processing_status}，不可用于推进或研究结论。`));
+        attemptIssues.push(issue("attempt_incomplete", "warn", `AI 处理停在「${processingStatusLabel(attempt.processing_status)}」，不可用于推进或研究结论。`));
       } else {
         if (typeof attempt.asr_text !== "string") attemptIssues.push(issue("asr_text_missing", "danger", "completed attempt 缺少权威 ASR 原文。"));
         if (!attempt.asr_engine_version) attemptIssues.push(issue("asr_engine_missing", "danger", "completed attempt 缺少 ASR 引擎版本。"));

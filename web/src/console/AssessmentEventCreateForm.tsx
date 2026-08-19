@@ -4,6 +4,7 @@ import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { Field, TextInput } from "../components/Field";
 import type { AssessmentEvent, ScaleProtocolReadiness } from "../types";
+import { assessmentTimepointLabel } from "./assessmentQueue";
 import {
   ASSESSMENT_TIMEPOINTS,
   checkAssessmentCreateDraft,
@@ -39,7 +40,7 @@ export function AssessmentEventCreateForm({ readiness, onCreated }: {
         idempotency_key: idempotencyKey,
       }, readiness);
       setUnknownOutcome(null);
-      setCreated(`${event.timepoint} · ${event.scheduled_date}`);
+      setCreated(`${assessmentTimepointLabel(event.timepoint)} · ${event.scheduled_date}`);
       setIdempotencyKey(newAssessmentIdempotencyKey());
       setRawDraftCleared();
       onCreated(event);
@@ -68,7 +69,7 @@ export function AssessmentEventCreateForm({ readiness, onCreated }: {
     <div className="form-section" aria-label="新建正式评估事件">
       <h4>新建正式评估</h4>
       <p className="muted">
-        排期只是建立待办；能不能真的施测由服务端的冻结政策与就绪状态决定，这里不做预判。
+        这里只安排日期；能否施测以当天系统状态为准。
       </p>
       {localError && <Alert tone="warn" title="未提交">{localError}</Alert>}
       {unknownOutcome && (
@@ -76,18 +77,18 @@ export function AssessmentEventCreateForm({ readiness, onCreated }: {
           <p>{unknownOutcome}</p>
           <p>
             这次请求可能已经在服务器上建成了事件。<strong>不要改动上面的内容</strong>，
-            先点「刷新评估队列」核对；确实没有再点一次「建立评估事件」——
+            先点「刷新评估队列」核对；确实没有再点一次「新建评估事件」——
             同一个操作重复提交不会建出第二个。
           </p>
         </Alert>
       )}
       {created && <Alert tone="ok" title="已建立">{created}</Alert>}
       <div className="row wrap" style={{ alignItems: "flex-end" }}>
-        <Field label="受试者研究编号">
+        <Field label="受试者研究编号" required>
           <TextInput value={patientId} disabled={busy}
-            onChange={(entry) => setPatientId(entry.target.value)} placeholder="例:P-001" />
+            onChange={(entry) => setPatientId(entry.target.value)} placeholder="例如 P-001" />
         </Field>
-        <Field label="评估时点">
+        <Field label="评估时点" required>
           <select className="form-control" value={timepoint} disabled={busy}
             onChange={(entry) => setTimepoint(entry.target.value)}>
             <option value="">（未选）</option>
@@ -96,12 +97,12 @@ export function AssessmentEventCreateForm({ readiness, onCreated }: {
             ))}
           </select>
         </Field>
-        <Field label="排期日期">
+        <Field label="排期日期" required>
           <input className="form-control" type="date" value={scheduledDate} disabled={busy}
             onChange={(entry) => setScheduledDate(entry.target.value)} />
         </Field>
         <Button variant="primary" disabled={busy} onClick={() => { void submit(); }}>
-          {busy ? "提交中…" : "建立评估事件"}
+          {busy ? "提交中…" : "新建评估事件"}
         </Button>
       </div>
     </div>

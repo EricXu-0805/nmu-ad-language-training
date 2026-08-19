@@ -10,7 +10,7 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   fullWidth?: boolean;
 }
 
-export function Button({ variant = "ghost", size = "md", fullWidth = false, className, ...rest }: ButtonProps) {
+export function Button({ variant = "secondary", size = "md", fullWidth = false, className, ...rest }: ButtonProps) {
   const classes = [
     "button",
     `button--${variant}`,

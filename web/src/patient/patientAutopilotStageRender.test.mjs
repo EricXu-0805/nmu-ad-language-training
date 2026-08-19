@@ -146,7 +146,7 @@ test("物理收麦之后立刻改说正在保存，并收起可选按钮与提�
     view.localCapturePhase = PERSISTING;
   });
 
-  assert.match(markup, /已收音，正在保存，请稍候/);
+  assert.match(markup, /录好了，正在保存/);
   // 麦克风已经关了，再说"正在听您说"就是在骗老人继续讲。
   assert.doesNotMatch(markup, /正在听您说/);
   assert.doesNotMatch(markup, /说完了可以点这里/);
@@ -159,7 +159,7 @@ test("服务器 runtime 还没追上时也不许闪回监听态", async (context
     view.runtime = { ...view.runtime, phase: "waiting_server_after_record" };
   });
 
-  assert.match(markup, /已收音，正在保存，请稍候/);
+  assert.match(markup, /录好了，正在保存/);
   assert.doesNotMatch(markup, /正在听您说/);
   assert.doesNotMatch(markup, /说完了可以点这里/);
 });
@@ -180,14 +180,14 @@ test("旧场次或旧命令的本地事件一律不驱动屏显，也不给出�
   const staleSession = await stageMarkup(context, (view) => {
     view.localCapturePhase = { ...LISTENING, sessionId: "S-OLD" };
   });
-  assert.doesNotMatch(staleSession, /已收音，正在保存，请稍候/);
+  assert.doesNotMatch(staleSession, /录好了，正在保存/);
   assert.doesNotMatch(staleSession, /正在听您说/);
   assert.doesNotMatch(staleSession, /说完了可以点这里/);
 
   const staleCommand = await stageMarkup(context, (view) => {
     view.localCapturePhase = { ...PERSISTING, commandKey: "cmd-record-stage-0000" };
   });
-  assert.doesNotMatch(staleCommand, /已收音，正在保存，请稍候/);
+  assert.doesNotMatch(staleCommand, /录好了，正在保存/);
   assert.doesNotMatch(staleCommand, /正在听您说/);
   assert.doesNotMatch(staleCommand, /说完了可以点这里/);
 });

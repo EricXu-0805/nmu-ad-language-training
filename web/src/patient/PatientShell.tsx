@@ -507,7 +507,7 @@ export function PatientShell() {
         className={`patient-pause-button${patientPauseStopped ? " is-latched" : ""}`}
         aria-pressed={patientPauseStopped}
         aria-label={patientPauseStorageFailed
-          ? "本机已停止，暂停信息无法保存，请立即呼唤身边工作人员"
+          ? "已经停下了，请马上喊工作人员"
           : patientPauseStopped ? "练习已停止，请等待工作人员" : "暂停练习"}
         disabled={patientPauseStopped}
         onPointerDown={requestPatientPause}
@@ -517,15 +517,15 @@ export function PatientShell() {
       >
         <span>{session.paused === true
           ? "练习已暂停"
-          : patientPauseStopped ? "本机已停止" : "暂停练习"}</span>
+          : patientPauseStopped ? "已经停下了" : "暂停练习"}</span>
         <small>{patientPauseStorageFailed
-          ? "暂停信息无法保存，请立即呼唤身边工作人员"
+          ? "没能通知到系统，请马上喊工作人员"
           : session.paused === true
           ? "请等待工作人员处理"
           : patientPauseLatched
             ? patientPauseLatch?.state === "server_resolution_required"
-                ? "本机已停止，请等待工作人员确认"
-                : "正在同步，请呼唤身边工作人员"
+                ? "已经停下了，请等工作人员来"
+                : "已经停下了，请喊工作人员"
             : safetyPaused
               ? "请等待工作人员处理"
               : "需要休息或帮助时点这里"}</small>
@@ -534,7 +534,7 @@ export function PatientShell() {
     <TapToStart tapped={patientActivated} onTap={() => {
       activatedForSession.current = session?.sessionId ?? null;
       setPatientActivated(true);
-      // 按钮明示"准备声音播放":这一次点击同时把朗读打开,主流程不再需要第二次触碰。
+      // 这一次点击同时把朗读打开,主流程不再需要第二次触碰。
       // 角落的朗读钮仍可随时关掉。
       if (!ttsOn) {
         setTtsEnabled(true);
@@ -553,11 +553,11 @@ export function PatientShell() {
 function TapToStart({ tapped, onTap }: { tapped: boolean; onTap(): void }) {
   if (tapped) return null;
   return (
-    <button type="button" className="tap-overlay" aria-label="点一下，开始并准备声音播放" onClick={onTap}>
+    <button type="button" className="tap-overlay" aria-label="点一下，开始" onClick={onTap}>
       <div className="tap-overlay-inner">
         <div className="tap-overlay-mark" aria-hidden="true">语</div>
         <div>点一下，开始</div>
-        <div className="tap-overlay-sub">准备声音播放</div>
+        <div className="tap-overlay-sub">开始后会听到声音</div>
       </div>
     </button>
   );

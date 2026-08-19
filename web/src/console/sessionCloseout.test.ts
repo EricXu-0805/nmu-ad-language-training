@@ -130,7 +130,7 @@ test("builder rejects a missing idempotency key", () => {
     report_status: "no_additional_observation",
   }), 2, "   ");
   assert.equal(result.ok, false);
-  if (!result.ok) assert.match(result.errors.join(" "), /幂等键/);
+  if (!result.ok) assert.match(result.errors.join(" "), /防重复标识/);
 });
 
 test("network parsers bind summary and closeout to the requested session", () => {

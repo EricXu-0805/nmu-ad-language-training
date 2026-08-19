@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { api } from "../api";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
@@ -19,7 +19,12 @@ import {
   performAssessmentMutation,
   type AssessmentMutationFailure,
 } from "./assessmentExecution";
-import { assessmentCategoryLabel, assessmentInstanceStatusLabel } from "./assessmentQueue";
+import {
+  assessmentCategoryLabel,
+  assessmentEventStatusLabel,
+  assessmentInstanceStatusLabel,
+  assessmentTimepointLabel,
+} from "./assessmentQueue";
 
 const CANCEL_REASONS: [AssessmentCancellationReason, string][] = [
   ["schedule_changed", "排期变更"],
@@ -55,9 +60,21 @@ function key(scope: string): string {
   return `assess-${scope}-${crypto.randomUUID()}`;
 }
 
-function FailureAlert({ failure }: { failure: AssessmentMutationFailure }) {
+function FailureAlert({ failure, onConflictRefresh }: {
+  failure: AssessmentMutationFailure;
+  onConflictRefresh?: () => void;
+}) {
+  if (failure.code === "assessment_item_revision_conflict") {
+    return (
+      <Alert tone="warn" title="该条目刚被别人改过，请刷新后重试"
+        actions={onConflictRefresh
+          && <Button onClick={onConflictRefresh}>刷新评估队列</Button>}>
+        <p>刷新后重新打开这项评估，再保存一次。</p>
+      </Alert>
+    );
+  }
   return (
-    <Alert tone="danger" title="服务器拒绝了该评估操作">
+    <Alert tone="danger" title="服务器没有接受这次操作">
       <p>{failure.message}</p>
       {failure.hint && <p>{failure.hint}</p>}
       {failure.blockingHints.length > 0 && (
@@ -69,11 +86,12 @@ function FailureAlert({ failure }: { failure: AssessmentMutationFailure }) {
 
 // 正式评估执行抽屉(收据 150 S5):条目键由 PI 冻结施测表载明,线上契约有意
 // 不携带条目清单(不透明键),故按键录入;进度以服务端 required/answered 计数为准。
-export function AssessmentExecutionDrawer({ event, readiness, onReceipt, onDismiss }: {
+export function AssessmentExecutionDrawer({ event, readiness, onReceipt, onDismiss, onConflictRefresh }: {
   event: AssessmentEvent;
   readiness: ScaleProtocolReadiness;
   onReceipt: (next: AssessmentEvent) => void;
   onDismiss: () => void;
+  onConflictRefresh?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<AssessmentMutationFailure | null>(null);
@@ -107,15 +125,17 @@ export function AssessmentExecutionDrawer({ event, readiness, onReceipt, onDismi
       <div className="form-section-header">
         <div>
           <p className="page-kicker">正式评估·执行</p>
-          <h3>{event.patient_id} · {event.timepoint} · {event.scheduled_date}</h3>
+          <h3>{event.patient_id} · {assessmentTimepointLabel(event.timepoint)} · {event.scheduled_date}</h3>
           <p className="muted">{gates.nextStep}</p>
         </div>
         <div className="row wrap">
-          <StatusPill tone={event.status === "in_progress" ? "ok" : "muted"}>{event.status}</StatusPill>
+          <StatusPill tone={event.status === "in_progress" ? "ok" : "muted"}>
+            {assessmentEventStatusLabel(event.status)}
+          </StatusPill>
           <Button onClick={onDismiss} disabled={busy}>收起</Button>
         </div>
       </div>
-      {failure && <FailureAlert failure={failure} />}
+      {failure && <FailureAlert failure={failure} onConflictRefresh={onConflictRefresh} />}
 
       {gates.canStart && (
         <div className="row wrap">
@@ -133,7 +153,7 @@ export function AssessmentExecutionDrawer({ event, readiness, onReceipt, onDismi
               expected_event_revision: event.revision,
               idempotency_key: key("cancel"),
               reason_code: cancelReason,
-            }, readiness))}>取消(未开始)</Button>
+            }, readiness))}>取消（未开始）</Button>
         </div>
       )}
 
@@ -162,6 +182,8 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
   const [itemKey, setItemKey] = useState("");
   const [rawValue, setRawValue] = useState("");
   const [expectedItemRevision, setExpectedItemRevision] = useState(0);
+  // 同条目的修订计数由授权回执与保存回执自动维护，不再要求现场手填。
+  const knownItemRevisions = useRef<Record<string, number>>({});
   const [grant, setGrant] = useState<{ itemKey: string; digest: string; revision: number } | null>(null);
   const [grantBusy, setGrantBusy] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -170,7 +192,7 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
 
   async function issueGrant() {
     const trimmed = itemKey.trim();
-    if (!trimmed) { setLocalError("先填写条目键再签发录音授权"); return; }
+    if (!trimmed) { setLocalError("先填写条目编号，再签发录音授权"); return; }
     setGrantBusy(true);
     setLocalError(null);
     try {
@@ -186,6 +208,7 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
             digest: issued.authorizedArtifactDigest,
             revision: issued.itemRevision,
           });
+          knownItemRevisions.current[trimmed] = issued.itemRevision - 1;
           setExpectedItemRevision(issued.itemRevision - 1);
         });
       if (!outcome.ok) {
@@ -198,21 +221,24 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
 
   async function submitResponse() {
     const trimmed = itemKey.trim();
-    if (!trimmed) { setLocalError("请填写 PI 施测表上的条目键"); return; }
+    if (!trimmed) { setLocalError("请先填写施测表上的条目编号"); return; }
     const parsed = parseResponseInput(rawValue);
     if (!parsed.ok) { setLocalError(parsed.reason ?? "作答无效"); return; }
     setLocalError(null);
     const artifact = grant && grant.itemKey === trimmed ? grant.digest : undefined;
+    const expectedRevision = Math.max(
+      expectedItemRevision, knownItemRevisions.current[trimmed] ?? 0);
     const saved = await run(() => api.submitAssessmentItemResponse(event, instance, trimmed, {
       response: artifact === undefined
         ? { value: parsed.value }
         : { value: parsed.value, authorized_artifact_digest: artifact },
       expected_event_revision: event.revision,
       expected_instance_revision: instance.revision,
-      expected_item_revision: expectedItemRevision,
+      expected_item_revision: expectedRevision,
       idempotency_key: key("response"),
     }, readiness));
     if (saved !== true) return;
+    knownItemRevisions.current[trimmed] = expectedRevision + 1;
     setGrant(null);
     setRawValue("");
     setExpectedItemRevision(0);
@@ -230,26 +256,30 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
         {localError && <Alert tone="warn" title="本地未通过">{localError}</Alert>}
         {enabled.canRespond && (
           <div className="row wrap" style={{ alignItems: "flex-end" }}>
-            <Field label="条目键(见 PI 施测表)">
-              <TextInput value={itemKey} onChange={(entry) => { setItemKey(entry.target.value); setExpectedItemRevision(0); }} placeholder="例:naming_01" />
+            <Field label="条目编号（见施测表）">
+              <TextInput value={itemKey} onChange={(entry) => {
+                const next = entry.target.value;
+                setItemKey(next);
+                setExpectedItemRevision(knownItemRevisions.current[next.trim()] ?? 0);
+              }} placeholder="例如 naming_01" />
             </Field>
             <Field label="作答值">
               <TextInput value={rawValue} onChange={(entry) => setRawValue(entry.target.value)} placeholder="数值" />
             </Field>
-            <Field label="同条目已有修订数(冲突时按服务端提示刷新)">
-              <TextInput value={String(expectedItemRevision)}
-                onChange={(entry) => setExpectedItemRevision(Math.max(0, Number(entry.target.value) || 0))} />
-            </Field>
             <Button disabled={busy || grantBusy} onClick={() => void issueGrant()}>
               {grantBusy ? "签发中…" : grant ? "重签录音授权" : "签发录音授权"}
             </Button>
-            <Button variant="primary" disabled={busy} onClick={submitResponse}>保存作答</Button>
+            <Button variant="primary" disabled={busy} onClick={() => { void submitResponse(); }}>保存作答</Button>
           </div>
         )}
         {grant && (
-          <p className="muted mono">
-            录音授权已签发:{grant.itemKey} · 第 {grant.revision} 修订 · {grant.digest.slice(0, 20)}…
-          </p>
+          <div className="col" style={{ gap: "var(--sp-1)" }}>
+            <p className="muted">录音授权已签发（{grant.itemKey}）。</p>
+            <details>
+              <summary>技术详情</summary>
+              <p className="muted mono">第 {grant.revision} 修订 · {grant.digest}</p>
+            </details>
+          </div>
         )}
         {enabled.canComplete && (
           <div className="row wrap">
@@ -258,7 +288,7 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
                 expected_event_revision: event.revision,
                 expected_instance_revision: instance.revision,
                 idempotency_key: key("complete"),
-              }, readiness))}>服务端计分并完成本表</Button>
+              }, readiness))}>完成本表并计分</Button>
             <select className="form-control" value={deferReason} disabled={busy}
               onChange={(entry) => setDeferReason(entry.target.value as AssessmentDeferralReason)}>
               {DEFER_REASONS.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
@@ -276,10 +306,15 @@ function InstanceCard({ event, instance, readiness, busy, enabled, run }: {
           </div>
         )}
         {instance.scoring_evidence && (
-          <p className="muted">
-            服务端得分 {instance.scoring_evidence.score}(作答 {instance.scoring_evidence.answered_item_count} 条,
-            引擎 {instance.scoring_evidence.scoring_algorithm_id})
-          </p>
+          <div className="col" style={{ gap: "var(--sp-1)" }}>
+            <p className="muted">
+              得分 {instance.scoring_evidence.score}（已作答 {instance.scoring_evidence.answered_item_count} 条）
+            </p>
+            <details>
+              <summary>技术详情</summary>
+              <p className="muted">计分引擎 {instance.scoring_evidence.scoring_algorithm_id}</p>
+            </details>
+          </div>
         )}
       </div>
     </article>
@@ -311,14 +346,14 @@ function CloseoutForm({ event, readiness, busy, run }: {
       <h4>现场收尾并关闭事件</h4>
       <div className="row wrap">
         {CLOSE_FLAGS.map(([field, label]) => (
-          <label key={field} className="row" style={{ gap: 4 }}>
+          <label key={field} className="toggle-field">
             <input type="checkbox" checked={flags[field]} disabled={busy}
               onChange={(entry) => setFlags({ ...flags, [field]: entry.target.checked })} />
             {label}
           </label>
         ))}
       </div>
-      <Field label="备注(有观察项时必填)">
+      <Field label="备注（有观察项时必填）">
         <TextInput value={note} onChange={(entry) => setNote(entry.target.value)} placeholder="现场观察备注" />
       </Field>
       <Button variant="primary" disabled={busy}

@@ -144,7 +144,7 @@ export interface AcceptanceHeaderField {
 export const ACCEPTANCE_HEADER_FIELDS: readonly AcceptanceHeaderField[] = Object.freeze([
   { key: "device", label: "设备型号", placeholder: "例：iPad 第 10 代 / 联想小新 Pro 14" },
   { key: "os", label: "操作系统与版本", placeholder: "例：iPadOS 18.5" },
-  { key: "browser", label: "浏览器与版本", placeholder: "例：Safari 18.5（下面自动记的 UA 不能代替这一格）" },
+  { key: "browser", label: "浏览器与版本", placeholder: "例：Safari 18.5（要人工填，自动记录不能代替）" },
   { key: "microphone", label: "麦克风（内置/外接型号）", placeholder: "例：内置 / 得胜 PCM-390" },
   { key: "speaker", label: "扬声器（内置/外接型号）", placeholder: "例：内置 / 漫步者 R1000" },
   { key: "room", label: "房间与网络", placeholder: "例：三楼活动室，Wi-Fi「YLY-5G」，有轻微回声" },
@@ -217,8 +217,8 @@ export interface AcceptanceReceipt {
   caveat: string;
 }
 
-const CAVEAT = "这份回执只是现场记录，不构成任何批准。八项全部通过也不等于这台设备"
-  + "可以在养老院投入使用——那要由具名负责人依据门禁书判定。任何一项未通过或未勾，"
+const CAVEAT = "这份文件只是现场记录，不构成任何批准。八项全部通过也不等于这台设备"
+  + "可以在养老院投入使用——要由具名负责人另行判定。任何一项未通过或未勾，"
   + "修复后必须重新验收该项，不得沿用本次结果。";
 
 export function buildAcceptanceReceipt(
@@ -255,7 +255,7 @@ export function formatAcceptanceText(receipt: AcceptanceReceipt): string {
     "",
     ...ACCEPTANCE_HEADER_FIELDS.map(
       (f) => `${f.label}：${receipt.header[f.key] || "（未填）"}`),
-    `构建编号：${receipt.machine.buildId}`,
+    `页面版本号：${receipt.machine.buildId}`,
     `屏幕：${receipt.machine.screen}`,
     `UA：${receipt.machine.userAgent}`,
     "",

@@ -52,10 +52,11 @@ test("bedside direction and manual-mode explanation match the rendered controls"
   const patientStage = source("../patient/PatientAutopilotStage.tsx");
   const trainingConsole = source("../console/scoring/TrainingConsoleScreen.tsx");
 
-  assert.match(patientStage, /右上角“朗读 开”/);
-  assert.doesNotMatch(patientStage, /右下角“朗读 开”/);
-  assert.match(trainingConsole, /服务器尚未取得控制权时，本页保持人工模式/);
-  assert.match(trainingConsole, /服务器已取得控制权后，须先安全暂停并显式接管/);
+  assert.match(patientStage, /右上角的「朗读」开关/);
+  assert.doesNotMatch(patientStage, /右下角/);
+  // 2026-08-19 UI 整改:页头说明由整段机制解释改为随 observerMode 切换的两句短句,
+  // 钉「屏上说明与真实控制权模式一致」——两个分支都必须在。
+  assert.match(trainingConsole, /observerMode \? "AI 正在自动带练，你可以随时安全暂停并接管。" : "当前为人工模式，由你逐步操作。"/);
 });
 
 test("research review identity and evidence context are server-owned", () => {
@@ -63,7 +64,8 @@ test("research review identity and evidence context are server-owned", () => {
   const researchReview = source("../console/ResearchReviewPanel.tsx");
   const api = source("../api.ts");
 
-  assert.match(trainingConsole, /复核身份由服务器签发/);
+  // 2026-08-19 UI 整改删除了「复核身份由服务器签发」免责 pill;
+  // 身份服务器所有的真正保护是下面三条负钉 + api.lockTurn 载荷形状,全部保留。
   assert.doesNotMatch(trainingConsole, /启用辅助初评|完全由人工判分|评分人/);
   assert.doesNotMatch(trainingConsole, /reviewer_id\s*:/);
   assert.doesNotMatch(researchReview, /reviewer_id\s*:/);

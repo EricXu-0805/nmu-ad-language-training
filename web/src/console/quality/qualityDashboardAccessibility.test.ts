@@ -10,13 +10,13 @@ test("quality dashboard exposes operational, privacy, coverage, and classificati
   const dashboard = source("./AIQualityDashboard.tsx");
 
   assert.match(dashboard, /AI 运行质量（非研究真值）/);
-  assert.match(dashboard, /模拟区仅显示不可用于研究结论的复核参考/);
+  assert.match(dashboard, /模拟区的数据只作调试参考，不用于研究结论/);
   assert.match(dashboard, /公开范围与证据覆盖/);
   assert.match(dashboard, /固定覆盖诊断/);
   assert.match(dashboard, /group\.suppressionNotice/);
   assert.match(dashboard, /group\.visibilityNotice/);
   assert.match(dashboard, /group\.diagnosticsNotice/);
-  assert.match(dashboard, /不显示受试者标识、录音、作答、转写或自由文本版本维度/);
+  assert.match(dashboard, /只显示汇总计数，不含任何受试者个人内容/);
   assert.match(dashboard, /<time dateTime=\{model\.generatedAt\}>/);
   assert.match(dashboard, /quality-generated-at/);
   assert.match(dashboard, /AI 处理延迟（录音已上传→判类完成）/);

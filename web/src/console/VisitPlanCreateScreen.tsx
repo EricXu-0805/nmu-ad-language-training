@@ -163,7 +163,7 @@ function VisitPlanCancelDialog({
           <h3 id={titleId}>确认取消这条训练安排</h3>
         </div>
         <p id={descriptionId} className="muted">
-          {scheduleLabel(plan)} · 第 {plan.week_no} 周。取消不会删除历史事实，但会释放该协议槽位以便重新安排。
+          {scheduleLabel(plan)} · 第 {plan.week_no} 周。取消后可以重新安排；取消记录会保留。
         </p>
         {!historyFresh && (
           <Alert tone="danger" title="历史记录尚未核对">
@@ -459,7 +459,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
         <div>
           <p className="page-kicker">准备区 · 测试前安排</p>
           <h2 className="page-title">受试者 {patientId} · 创建训练安排</h2>
-          <p className="page-description">日期、周次和任务线在老人到场前完成并审核。这里不会创建场次；到场后只需在训练台点一次“开始训练”。</p>
+          <p className="page-description">到场前定好日期和周次并完成审核；到场后在训练台点一次“开始训练”即可。</p>
         </div>
         <Button disabled={mutationBusy} onClick={onBack}>返回登记表</Button>
       </header>
@@ -470,18 +470,18 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
         </Alert>
       )}
       {canManage && historyState === "stale" && (
-        <Alert tone="danger" title="旧安排已锁定">
-          最新历史读取失败。在刷新成功前，不能创建、审核或取消安排，避免用旧版本覆盖服务器事实。
+        <Alert tone="danger" title="安排列表读取失败">
+          刷新成功前，不能创建、审核或取消安排。请点下方「刷新」重试。
         </Alert>
       )}
       {patientLoadError && (
-        <Alert tone="danger" title="受试者档案分区核对失败">
+        <Alert tone="danger" title="受试者档案核对失败">
           {patientLoadError}。核对成功前不能保存或审核训练安排。
         </Alert>
       )}
       {readinessError && (
-        <Alert tone="danger" title="题库结构化/质控状态核对失败">
-          {readinessError}。核对成功前所有分区的安排都不能审核；排期草稿仍可保存。
+        <Alert tone="danger" title="题库状态核对失败">
+          {readinessError}。核对成功前不能审核安排；草稿仍可保存。
         </Alert>
       )}
 
@@ -490,7 +490,6 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
           <div className="form-section-header">
             <div>
               <h3>本次训练安排</h3>
-              <p className="muted">场次编号和题库版本由服务器固定且不展示；数据分区同样由服务器固定，并以只读标识呈现。</p>
             </div>
             <StatusPill tone="primary">测试前完成</StatusPill>
           </div>
@@ -529,18 +528,18 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
                 <TextInput value="正式训练" readOnly aria-readonly />
               </Field>
             )}
-            <Field label="任务线（系统绑定）" hint="避免周次、阶段和任务线互相矛盾">
+            <Field label="任务线（系统自动匹配）" hint="根据周次和阶段自动确定，无需填写">
               <TextInput value={eventLine} readOnly aria-readonly />
             </Field>
           </div>
           {!currentAdmission.allowed && !currentAdmission.draftAllowed && (
-            <Alert tone="danger" title="当前协议组合尚不能安排">
-              {currentAdmission.reason}系统已在保存前禁用安排，不会等到审核或老人到场后才报错。
+            <Alert tone="danger" title="这个组合还不能安排">
+              {currentAdmission.reason}
             </Alert>
           )}
           {!currentAdmission.allowed && currentAdmission.draftAllowed && (
-            <Alert tone="warn" title="只能先保存排期草稿">
-              {currentAdmission.reason}草稿不占用审核结论；条件满足后再在下方列表审核。
+            <Alert tone="warn" title="只能先保存草稿">
+              {currentAdmission.reason}可以先保存草稿，条件满足后再到下方列表审核。
             </Alert>
           )}
           {currentAdmission.allowed && patientSimulation === true && (
@@ -554,11 +553,11 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
           )}
           {currentAdmission.allowed && patientSimulation === false && (
             <Alert tone="info" title="真实研究安排">
-              题库已通过真实研究冻结质控。审核与开场时服务端仍会逐项复验受试者准入、题库与协议绑定。
+              题库已通过研究质控，可以安排。
             </Alert>
           )}
           <div className="form-actions">
-            <p className="muted grow">蓝图内的组合都可留排期草稿；“保存并审核通过”只对已实现独立完成合同且通过数据分区门禁的组合开放。</p>
+            <p className="muted grow">条件不满足时只能先保存草稿；满足后才能保存并审核通过。</p>
             <Button disabled={!canManage || mutationBusy || historyLocked || !currentAdmission.draftAllowed} onClick={() => { void create(false); }}>
               {busy ? "正在保存…" : "保存草稿"}
             </Button>
@@ -572,13 +571,12 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
           <div className="form-section-header">
             <div>
               <h3>既有训练安排</h3>
-              <p className="muted">只显示研究编号和协议安排；后台的计划号、场次号不在床旁工作流中呈现。</p>
             </div>
             <Button size="sm" disabled={historyState === "loading" || mutationBusy}
               onClick={() => { void reload(); }}>刷新</Button>
           </div>
           {loadError && (
-            <Alert tone="danger" title="最新训练安排读取失败 · 旧记录不可操作">
+            <Alert tone="danger" title="安排读取失败，已暂停操作">
               {loadError}
             </Alert>
           )}

@@ -13,7 +13,7 @@ export const CAREGIVER_DEMO_PROFILE_VERSION = "week2-single20-demo-v1" as const;
 export const CAREGIVER_DEMO_COMPLETION_SCOPE = "demo_plan_only" as const;
 export const CAREGIVER_DEMO_POSITION_COUNT = 20 as const;
 export const CAREGIVER_DEMO_BOUNDARY_MESSAGE =
-  "仅本机20题合成模拟，不得用于真实老人、养老院、正式研究，20题不等于80" as const;
+  "演练模式：仅供操作练习，不得用于真实老人或正式研究。" as const;
 
 export type CaregiverDataClassification = "research" | "simulation";
 export type CaregiverCompletionScope = "canonical_full_source" | "demo_plan_only";
@@ -233,8 +233,7 @@ export function caregiverHelpPrompt(status: CaregiverHelpStatus): {
   if (!status.deliveryReachable) {
     return {
       tone: "warn",
-      text: "本机已记录。本机构尚未配置自动通知对象，请立即当面联系负责人——"
-        + "本页不代表任何人已经收到消息。",
+      text: "已记录，但系统不会通知任何人。请立即去叫负责人。",
       canRecordArrival: true,
       canRecordResolved: true,
     };
@@ -243,7 +242,7 @@ export function caregiverHelpPrompt(status: CaregiverHelpStatus): {
     tone: "warn",
     text: status.state === "delivered"
       ? "通知已送达，正在等待工作人员到场。"
-      : "本机已记录，通知尚未确认送达。请同时按院内现行方式联系负责人。",
+      : "已记录，通知还没确认送到。请同时自己去联系负责人。",
     canRecordArrival: true,
     canRecordResolved: true,
   };
@@ -345,15 +344,15 @@ export function caregiverStatusPresentation(status: CaregiverSessionStatus): Car
   }
   if (!status.operationalDemoReady) {
     return {
-      title: "仅可安全收口",
-      detail: "该场次未通过本机20题合成模拟门禁，不会显示开始练习。",
+      title: "本次只能暂停或结束",
+      detail: "本次不能开始练习，请联系负责人。",
       tone: "warn",
     };
   }
   if (status.practiceState === "taken_over") {
     return {
       title: "已由工作人员接管",
-      detail: "系统不会再自动向下进行。",
+      detail: "系统已停止自动练习。",
       tone: "warn",
     };
   }

@@ -287,7 +287,7 @@ export function SessionWrapupScreen({
       const runtime = await api.finishIntervention(session.session_id);
       if (!mountedRef.current || requestId !== transitionRequest.current) return;
       if (runtime.status !== "intervention_completed") {
-        setTransitionFailure({ message: "服务器未返回床旁干预已结束终态，本场仍保留在当前页。" });
+        setTransitionFailure({ message: "服务器未确认结束，本场仍保留在当前页。" });
         return;
       }
       setRuntimeOverride(runtime);
@@ -340,7 +340,7 @@ export function SessionWrapupScreen({
       const runtime = await api.completeSession(session.session_id);
       if (!mountedRef.current || requestId !== transitionRequest.current) return;
       if (runtime.status !== "completed") {
-        setTransitionFailure({ message: "服务器未返回最终完成态，本场仍保留在研究复核页。" });
+        setTransitionFailure({ message: "服务器未确认最终完成，本场仍保留在本页。" });
         return;
       }
       setRuntimeOverride(runtime);
@@ -357,7 +357,7 @@ export function SessionWrapupScreen({
 
   async function doExport() {
     if (!exportAllowed || exportBusy) {
-      toast("只有最终完成、严格门禁通过的场次才允许由数据管理员导出", "danger");
+      toast("只有已最终完成的场次能由数据管理员导出", "danger");
       return;
     }
     setExportBusy(true);
@@ -456,54 +456,41 @@ export function SessionWrapupScreen({
       </header>
 
       {isDemo20 && (
-        <Alert tone="info" title="本次完成的是 20 题本机模拟演练">
-          这份结果只代表本次 20 题模拟计划已走完，不代表第 2 周源协议 80 个环节已全部完成，也不是真人训练结果。
-        </Alert>
+        <p className="muted">本次是 20 题模拟演练，不代表真人训练结果。</p>
       )}
 
       {runtimeControl.error && (
         <Alert tone="danger" title="无法核对服务器场次状态"
           actions={<Button onClick={() => { void runtimeControl.refresh(); }}>重新同步</Button>}>
-          {runtimeControl.error}。状态未恢复前不会开放结束、锁分、完成或导出操作。
+          {runtimeControl.error}。恢复前不能结束或完成本场。
         </Alert>
       )}
 
       {mode === "bedside" && (
-        <Alert tone="info" title="现场结束不等待人工锁分">
-          系统只核对每个计划环节是否已有权威 AI attempt、绑定的终值 Turn 和可追溯录音。通过后立即让老人端停麦并生成不可变自动汇总；保存独立现场收尾后即可切换，人工确认与锁分留到事后研究复核。
-        </Alert>
+        <p className="muted">结束前系统会自动核对每题都有 AI 记录和录音；人工确认和评分可事后再做。</p>
       )}
       {mode === "review" && (
-        <Alert tone="warn" title="床旁干预已经结束 · 禁止返回训练">
-          老人端、题目推进、提示、录音、暂停与恢复均已关闭。先完成独立现场收尾；保存成功后再核对 AI 原文、确认并锁定研究真值。
-        </Alert>
-      )}
-      {mode === "completed" && (
-        <Alert tone="ok" title="场次已最终完成">
-          训练记录与研究真值均为只读。只有数据管理员可在严格完成门禁再次核对通过后执行去标识导出。
-        </Alert>
+        <p className="muted">老人端已结束，不能返回训练。</p>
       )}
       {mode === "closed" && (
         <Alert tone="danger" title={`${terminalStatusLabel(runtimeStatus)} · 只读`}>
           {runtimeStatus === "aborted" ? (
             <>
-              <p>受控中止原因：{sessionAbortReasonLabel(currentRuntime?.endReason)}。已保存证据保持只读，不开放物理删除。</p>
-              <p>本次访问位已保留，不会自动释放或重排；是否补做由协议负责人决定。</p>
+              <p>中止原因：{sessionAbortReasonLabel(currentRuntime?.endReason)}。已保存的记录保持只读。</p>
+              <p>本次训练是否补做，由研究负责人决定。</p>
             </>
           ) : (
-            "该场次不能继续训练、研究锁分或导出，请由研究负责人核查异常终态。"
+            "本场已异常结束，不能继续；请联系研究负责人核查。"
           )}
         </Alert>
       )}
 
       {session.week_no === 1 && (
-        <Alert tone="info" title="第 1 周关系建立独立完成口径">
-          本场按关系建立合同收口：停在道别节、收回录音、录音红线核验、零评分行；不按训练计划核对环节。
-        </Alert>
+        <p className="muted">第 1 周为关系建立场：完成道别并停止录音即可结束，无需逐题评分。</p>
       )}
       {session.week_no === 1 && week1ScriptError && (
         <Alert tone="danger" title="第 1 周脚本核对失败">
-          {week1ScriptError}。道别位置无法本地核对，完成入口保持关闭；请刷新页面重试。
+          {week1ScriptError}。暂时不能结束本场，请刷新页面重试。
         </Alert>
       )}
 
@@ -514,30 +501,26 @@ export function SessionWrapupScreen({
       {journalRecovery === "error" && (
         <Alert tone="danger" title="无法恢复服务器中的完整场次记录"
           actions={<Button onClick={() => setJournalRetry((value) => value + 1)}>重新加载记录</Button>}>
-          {journalRecoveryError}。恢复前所有终态转换与导出保持关闭。
+          {journalRecoveryError}。恢复前不能结束或导出本场。
         </Alert>
       )}
       {journalRecovery === "loading" && (
-        <Alert tone="info" title="正在恢复服务器记录">
-          正在合并已提交环节、研究真值与录音证据；完成前所有门禁保持关闭。
-        </Alert>
+        <p className="muted">正在恢复本场记录，请稍候。</p>
       )}
 
       {mode === "review" && !closeoutReadyForLeave && (
         <Alert tone="warn" title="离开本场前，请先完成现场收尾">
-          明确选择“无额外观察”或记录可观察事实并保存。服务器确认后，切换下一位、退出账号和切换工作区才会开放；研究分析与锁分也会显示在下方。
+          请选择「无额外观察」或记录观察并保存；保存后才能切换下一位。
         </Alert>
       )}
 
       {(mode === "review" || mode === "completed") && closeoutLoadState === "loading" && (
-        <Alert tone="info" title="正在恢复自动汇总与现场收尾">
-          服务器记录确认前不会开放切换受试者或最终完成。
-        </Alert>
+        <p className="muted">正在加载自动汇总与现场收尾…</p>
       )}
       {(mode === "review" || mode === "completed") && closeoutLoadState === "error" && (
         <Alert tone="danger" title="无法恢复自动汇总或现场收尾"
           actions={<Button onClick={() => setCloseoutRetryNonce((value) => value + 1)}>重新加载收尾</Button>}>
-          {closeoutLoadError}。系统不会用浏览器本地计数代替服务器权威汇总。
+          {closeoutLoadError}。请重试加载。
         </Alert>
       )}
       {(mode === "review" || mode === "completed") && outcomeSummary && closeoutLoadState === "ready" && (
@@ -558,8 +541,8 @@ export function SessionWrapupScreen({
               <h3>{mode === "bedside" ? "床旁证据概览" : "研究复核完整度"}</h3>
               <p className="muted">
                 {mode === "bedside"
-                  ? "最终是否可结束由服务器逐环节核对 AI attempt 与录音字节，前端不会用人工锁分冒充现场完成。"
-                  : "最终完成要求冻结计划的每个环节都有唯一人工确认与锁定研究真值。"}
+                  ? "能否结束由服务器逐环节核对，缺项会明确列出。"
+                  : "最终完成前，每个环节都需人工确认并锁定评分。"}
               </p>
             </div>
             <StatusPill tone={!journalReady || !planReady ? "muted" : primaryGate.canRequest ? "ok" : "warn"}>
@@ -583,14 +566,14 @@ export function SessionWrapupScreen({
           </div>
 
           {planErr && (
-            <Alert tone="danger" title="无法核对冻结计划"
+            <Alert tone="danger" title="无法加载本场计划"
               actions={<Button onClick={() => setRetryNonce((value) => value + 1)}>重新加载</Button>}>
-              {planErr}。计划未知时不会开放终态转换或导出。
+              {planErr}。恢复前不能结束或导出本场。
             </Alert>
           )}
           {journalReady && untouched.length > 0 && (
             <Alert tone="warn" title={`有 ${untouched.length} 题没有终值记录`}>
-              服务器证据门禁会逐项核对并拒绝缺失位置；本页不会提供不完整导出绕过。
+              缺少记录的题目会阻止结束，明细见下方折叠。
               <details style={{ marginTop: 8 }}>
                 <summary>查看缺失题目</summary>
                 <ul>{untouched.map((item) => <li key={item.item_id}>{item.item_id} · {item.task_type}</li>)}</ul>
@@ -617,7 +600,7 @@ export function SessionWrapupScreen({
           <div className="form-section-header">
             <div>
               <h3>研究评分结果</h3>
-              <p className="muted">只汇总已由研究者人工确认并锁定的环节；AI operational 判类不作为研究真值。</p>
+              <p className="muted">只统计已人工锁定的环节；AI 初评不计入。</p>
             </div>
           </div>
           {scoresErr ? (
@@ -634,7 +617,7 @@ export function SessionWrapupScreen({
               </div>
               {scores.excluded_items.length > 0 && (
                 <Alert tone="warn" title={`${scores.excluded_items.length} 项尚未计入研究评分`}>
-                  这些项目仍缺人工锁定，严格完成门禁与导出均保持关闭。
+                  这些题还没人工锁定，锁定后才能最终完成。
                 </Alert>
               )}
             </>
@@ -647,25 +630,24 @@ export function SessionWrapupScreen({
           <div className="form-section-header">
             <div>
               <h3>数据管理员导出、保全与治理</h3>
-              <p className="muted">这里只处理 completed 后的数据治理生命周期，不会重新编辑床旁训练或评分真值；角色、最终终态和严格完成门禁缺一不可。</p>
+              <p className="muted">本区仅供数据管理员导出与管理录音，不能修改训练记录。</p>
             </div>
           </div>
 
           {!completionGate.canRequest && (
-            <Alert tone="danger" title="最终终态与本地严格门禁不一致 · 导出已关闭">
-              {completionGate.detail}。请先由研究负责人核查服务器记录，不能用不完整导出绕过。
+            <Alert tone="danger" title="记录核对不一致 · 导出已关闭">
+              {completionGate.detail}。请联系研究负责人核查。
             </Alert>
           )}
           {!canExport && (
             <Alert tone="info" title="当前账号不能执行数据导出">
-              研究者可以只读查看最终记录；去标识导出、录音副本校验与后续保全操作由 admin 或 data_steward 执行。
+              研究者可查看；导出与录音管理需系统管理员或数据管理员账号。
             </Alert>
           )}
 
           {exportAllowed && (
             <>
               <div className="form-actions">
-                <p className="muted grow">服务器会再次核对最终完成态与完整性，并记录数据导出审计事件。</p>
                 <Button variant="primary" disabled={exportBusy} onClick={() => { void doExport(); }}>
                   {exportBusy ? "正在生成导出批次…" : "导出本场次（去标识）"}
                 </Button>
@@ -676,7 +658,7 @@ export function SessionWrapupScreen({
                     <StatusPill tone="ok">导出批次 {exp.batch_id}</StatusPill>
                     <StatusPill tone={exp.deidentified ? "ok" : "danger"}>{exp.deidentified ? "已去标识" : "包含标识信息"}</StatusPill>
                   </div>
-                  <p>已生成：{Object.entries(exp.sheet_counts).map(([key, value]) => `${key}（${value}）`).join("、")}</p>
+                  <p>已生成：{Object.entries(exp.sheet_counts).map(([key, value]) => `${sheetLabels[key] ?? key}（${value}）`).join("、")}</p>
                   <p className="muted">共 {exp.files.length} 个文件 · 纳入 {exp.audio_touched.length} 条研究录音</p>
                 </div>
               )}
@@ -734,20 +716,20 @@ function headerForMode(
     return {
       kicker: "数据后台 · 最终完成",
       title: "只读查看与受控导出",
-      description: "训练与研究真值均已冻结；只有数据管理员可执行去标识导出。",
+      description: "本场记录已只读；导出由数据管理员执行。",
     };
   }
   if (mode === "closed") {
     return {
-      kicker: "异常终态 · 只读",
+      kicker: "已关闭 · 只读",
       title: "本场次已关闭",
       description: "系统不会恢复题目推进、录音或锁分。",
     };
   }
   return {
     kicker: "场次状态核对",
-    title: "正在确认服务器终态",
-    description: "状态确认完成前不开放任何终态转换或导出操作。",
+    title: "正在确认场次状态",
+    description: "确认完成前暂不能进行任何操作。",
   };
 }
 
@@ -824,12 +806,25 @@ function ScoreCard({
   );
 }
 
+const sheetLabels: Record<string, string> = {
+  session: "场次信息",
+  turns: "环节记录",
+  attempts: "AI 处理记录",
+  interactions: "交互记录",
+  item_scores: "题目评分",
+  scales: "评估量表",
+  legacy_unverified_scales: "待核对历史量表",
+  abnormal: "异常记录",
+  audio_manifest: "录音清单",
+  repeat_audio_manifest: "重复录音清单",
+};
+
 const audioStatusLabel: Record<AudioAsset["status"], string> = {
   recorded: "待整场导出",
   exported: "已导出，待校验",
   checksum_verified: "校验通过，待信度复核",
   reliability_review_done: "信度复核完成",
-  deletable: "全部保全闸门通过",
+  deletable: "可删除采集原件",
   deleted: "采集原件已删（受控副本按策略保留）",
 };
 
@@ -918,7 +913,7 @@ function AudioGateRow({ rawAudioId, sessionId, gateEpoch = 0, canDelete = false 
           <Button variant="danger" disabled={rowBusy} onClick={() => setConfirmDelete(true)}>删除采集原件</Button>
         )}
         {audio.status === "deletable" && !canDelete && (
-          <span className="muted">已满足闸门；物理删除需由系统管理员执行</span>
+          <span className="muted">删除需由系统管理员执行</span>
         )}
       </div>
       <ConfirmDialog open={canDelete && confirmDelete} title="删除这条研究录音采集原件？"

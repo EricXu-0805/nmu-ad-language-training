@@ -96,13 +96,13 @@ export function usePatientPresence(sessionId?: string | null): PatientPresenceVi
   return useMemo(() => {
     void clock;
     if (!sessionId) return { state: "unseen", screenLabel: "尚未建立场次", lastSeenLabel: null };
-    if (checking) return { state: "checking", screenLabel: "正在确认患者端", lastSeenLabel: null };
-    if (unsupported) return { state: "unsupported", screenLabel: "该版本不支持患者端在线状态", lastSeenLabel: null };
+    if (checking) return { state: "checking", screenLabel: "正在确认受试者端", lastSeenLabel: null };
+    if (unsupported) return { state: "unsupported", screenLabel: "该版本不支持受试者端在线状态", lastSeenLabel: null };
     if (unavailable) return { state: "unavailable", screenLabel: "暂时无法读取双端状态", lastSeenLabel: relativeSeen(presence?.last_seen_at) };
-    if (!presence) return { state: "unseen", screenLabel: "等待患者端打开本场次", lastSeenLabel: null };
+    if (!presence) return { state: "unseen", screenLabel: "等待受试者端打开本场次", lastSeenLabel: null };
     return {
       state: presence.online ? "online" : "offline",
-      screenLabel: SCREEN_LABELS[presence.screen ?? ""] ?? "患者端已打开",
+      screenLabel: SCREEN_LABELS[presence.screen ?? ""] ?? "受试者端已打开",
       lastSeenLabel: relativeSeen(presence.last_seen_at),
     };
   }, [checking, clock, presence, sessionId, unavailable, unsupported]);

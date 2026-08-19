@@ -34,7 +34,7 @@ export function LoginScreen({ onLoggedIn }: { onLoggedIn: () => void | Promise<v
         <div className="login-brand" aria-hidden>语</div>
         <div className="page-kicker">南京医科大学 · 工作人员操作端</div>
         <h1 className="login-title">登录</h1>
-        <p className="muted">请用管理员为您开通的工作人员账号登录。老人画面无需登录。</p>
+        <p className="muted">请用工作人员账号登录。受试者端无需登录。</p>
         {err && <Alert tone="danger" title="无法登录">{err}</Alert>}
         <Field label="用户名">
           <TextInput value={username} onChange={(e) => setUsername(e.target.value)}

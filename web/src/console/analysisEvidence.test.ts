@@ -137,7 +137,7 @@ test("a complete source attempt and locked human truth form a traceable timeline
   assert.equal(timeline.summary.completedAttempts, 1);
   assert.equal(timeline.summary.lockedTruths, 1);
   assert.equal(timeline.summary.dangerIssues, 0);
-  assert.match(timeline.turns[0]?.attempts[0]?.interactions[2]?.summary ?? "", /operational/);
+  assert.match(timeline.turns[0]?.attempts[0]?.interactions[2]?.summary ?? "", /AI 判类完成/);
 });
 
 test("technical failure stays distinct from a wrong answer and requires safe-pause evidence", () => {
@@ -192,7 +192,7 @@ test("classification, source and ledger mismatches are surfaced rather than repa
 test("AI operational and locked research scores are compared without equating their meaning", () => {
   const different = compareOperationalToResearch(turn({ element_value: 0, reviewed_score: 0 }), attempt());
   assert.equal(different.state, "different");
-  assert.match(different.message, /AI operational 1/);
+  assert.match(different.message, /AI 判定 1/);
   const unlocked = compareOperationalToResearch(turn({ score_locked: false, element_value: null, reviewed_score: null }), attempt());
   assert.equal(unlocked.state, "unavailable");
   assert.match(unlocked.message, /不可宣称/);

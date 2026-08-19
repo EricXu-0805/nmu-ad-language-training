@@ -120,7 +120,7 @@ test("view model derives operational, prompt, safety, and latency metrics withou
   assert.equal(metric(group.promptMetrics, "prompt-escalation-rate").value, "50.0%");
   assert.equal(metric(group.promptMetrics, "tell-answer-rate").value, "未知");
   assert.equal(metric(group.promptMetrics, "prompt-level-3").value, "未知");
-  assert.match(metric(group.promptMetrics, "tell-answer-rate").detail, /尚无持久呈现回执/);
+  assert.match(metric(group.promptMetrics, "tell-answer-rate").detail, /旧版本未记录此项/);
   assert.match(metric(group.promptMetrics, "prompt-level-0").detail, /录音尝试所处提示上下文/);
   assert.equal(metric(group.safetyMetrics, "technical-failure-rate").value, "10.0%");
   assert.equal(metric(group.latencyMetrics, "latency-p50").value, "800 毫秒");
@@ -212,7 +212,7 @@ test("partial evidence explains unknown through diagnostics instead of calling e
 
   const coverage = metric(group.operationalMetrics, "coverage");
   assert.equal(coverage.value, "未知");
-  assert.match(coverage.detail, /覆盖与固定诊断原因/);
+  assert.match(coverage.detail, /证据不足，暂无法计算/);
   assert.doesNotMatch(coverage.detail, /源数据缺失/);
   assert.equal(group.researchTruth.availability, "unknown");
   assert.equal(group.diagnosticsNotice.tone, "warn");
@@ -240,7 +240,7 @@ test("privacy-suppressed rows render suppressed rather than zero or generic miss
 
   assert.equal(group.suppressionNotice.tone, "warn");
   assert.match(group.suppressionNotice.title, /隐私抑制/);
-  assert.match(group.suppressionNotice.text, /本次质量聚合的合格不同受试者数/);
+  assert.match(group.suppressionNotice.text, /受试者数与各项计数暂不显示/);
   assert.doesNotMatch(group.suppressionNotice.text, /不发布任何人数/);
   assert.equal(metric(group.coverageMetrics, "source-turns").state, "suppressed");
   assert.equal(metric(group.coverageMetrics, "source-turns").value, "已抑制");
@@ -269,7 +269,7 @@ test("unfrozen research release explains the durable privacy gate", () => {
   };
   const group = buildAIQualityDashboardViewModel(parseAIQualityDashboard(value)).groups[0]!;
   assert.match(group.suppressionNotice.text, /发布批次尚未冻结/);
-  assert.match(group.suppressionNotice.text, /cohort\/release epoch/);
+  assert.match(group.suppressionNotice.text, /待研究数据冻结版本发布后开放/);
   assert.doesNotMatch(group.suppressionNotice.text, /通过隐私门槛/);
 });
 

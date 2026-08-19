@@ -23,17 +23,17 @@ test("observer lock is derived from the shared ownership state plus the synchron
   assert.match(source, /manualResyncRequired\(previousOwned, next, transition\.automationExposure\)/);
 });
 
-test("observer mode unmounts the item rail, manual toolbar, wrapup entry, and work card", () => {
+test("observer mode unmounts the item rail, wrapup entry, and work card", () => {
   const railGate = indexOfOrFail(source, "{!observerMode && (");
   assert.ok(indexOfOrFail(source, "<ItemRail", railGate) - railGate < 120,
     "ItemRail 必须由 !observerMode 直接守门");
   const ternary = indexOfOrFail(source, "{observerMode ? (");
   const observerUse = indexOfOrFail(source, "<ObserverConsole", ternary);
   const elseBranch = indexOfOrFail(source, ") : (", observerUse);
-  // 人工工具栏与完整 training-work-card 都只能出现在 else 分支之后。
-  const toolbar = indexOfOrFail(source, "toolbar training-toolbar");
+  // 完整 training-work-card 只能出现在 else 分支之后。
+  // (2026-08-19 UI 整改删除了纯免责 training-toolbar,原「工具栏在 else 内」钉随之退役。)
   const workCard = indexOfOrFail(source, "training-work-card");
-  assert.ok(toolbar > elseBranch, "人工工具栏必须在观察台 else 分支内");
+  assert.equal(source.includes("training-toolbar"), false, "纯免责工具栏不得回归");
   assert.ok(workCard > elseBranch, "training-work-card 必须在观察台 else 分支内");
   assert.equal(source.split("training-work-card").length, 2, "work card 只能有一个挂载点");
   const wrapupButton = indexOfOrFail(source, "进入场次收尾");

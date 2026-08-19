@@ -69,6 +69,19 @@ function scaleReadinessExplanation(readiness: ScaleProtocolReadiness): string {
   return "通用结果与工作流合同已存在，但尚未证明冻结定义制品、逐题录音证据和冻结工作流政策由服务器真正强制执行。可信执行验证完成前不会创建正式实例或自动计分。";
 }
 
+function scaleReadinessSummary(readiness: ScaleProtocolReadiness): string {
+  if (readiness.status === "awaiting_pi_definition") {
+    return "等待研究负责人确定量表工具和计分规则。";
+  }
+  if (readiness.status === "awaiting_workflow_policy") {
+    return "量表工具已确定，施测流程规则还没批准。";
+  }
+  if (readiness.status === "awaiting_definition_artifacts") {
+    return "规则已批准，系统配置还没通过最终核对。";
+  }
+  return "平台核验还没完成。";
+}
+
 // PI 尚未冻结具体工具时只展示可核查的就绪状态与历史未验证记录。
 // 自由填写的量表名/分数不能伪装成正式研究结局。
 export function ScaleDrawer({ patientId, open, onClose }: {
@@ -139,41 +152,25 @@ export function ScaleDrawer({ patientId, open, onClose }: {
         </div>
 
         {error && (
-          <Alert tone="danger" title="无法核对量表协议状态"
+          <Alert tone="danger" title="量表状态读取失败"
             actions={<Button onClick={() => setRetry((value) => value + 1)}>重新加载</Button>}>
-            {error}。读取失败不会伪装成“暂无记录”，也不会开放自由录入。
+            {error}。请点「重新加载」重试。
           </Alert>
         )}
         {!error && (!readiness || assessmentEvents === null || rows === null) && (
-          <Alert tone="info" title="正在核对定义、正式评估事件与历史记录">
-            服务器确认前保持只读。
+          <Alert tone="info" title="正在读取量表状态">
+            读取完成后会显示就绪状态和评估记录。
           </Alert>
         )}
 
         {readiness && (
           <div className="card col">
             <div className="row wrap" style={{ justifyContent: "space-between" }}>
-              <h3>协议要求的两类结局工具</h3>
+              <h3>正式量表工具</h3>
               <StatusPill tone={readiness.ready_for_research ? "ok" : "warn"}>
-                {scaleReadinessLabel(readiness)}
+                {readiness.ready_for_research ? "正式量表流程已就绪" : "量表流程尚未开通"}
               </StatusPill>
             </div>
-            {([
-              ["定义清单", readiness.definition_ready],
-              ["定义/逐题证据可信执行",
-                readiness.definition_artifact_enforcement_ready],
-              ["运行时定义制品", readiness.definition_artifacts_ready],
-              ["工作流政策", readiness.workflow_policy_ready],
-              ["工作流政策可信执行",
-                readiness.workflow_policy_enforcement_ready],
-              ["平台结果与工作流合同",
-                readiness.formal_result_contract_ready && readiness.workflow_contract_ready],
-            ] as const).map(([label, ready]) => (
-              <div className="row wrap" key={label} style={{ justifyContent: "space-between" }}>
-                <span>{label}</span>
-                <StatusPill tone={ready ? "ok" : "muted"}>{ready ? "已核验" : "未就绪"}</StatusPill>
-              </div>
-            ))}
             {readiness.categories.map((category) => (
               <div className="row wrap" key={category.category_key}
                 style={{ justifyContent: "space-between", borderBottom: "1px solid var(--c-line)", paddingBottom: 8 }}>
@@ -181,43 +178,61 @@ export function ScaleDrawer({ patientId, open, onClose }: {
                 <StatusPill tone={category.scoring_ready ? "ok" : "muted"}>
                   {category.instrument_name && category.instrument_version
                     ? `${category.instrument_name} · ${category.instrument_version}`
-                    : "具体工具/版本未冻结"}
+                    : "工具和版本还未确定"}
                 </StatusPill>
               </div>
             ))}
             {!readiness.ready_for_research && (
-              <Alert tone="warn" title="当前禁止正式量表录入与自动计分">
-                {scaleReadinessExplanation(readiness)}
-                {` 服务端 instance_creation_enabled=${String(readiness.instance_creation_enabled)}；训练正确率、AI 运营判分和 legacy 自由分数仍不是正式结果。`}
+              <Alert tone="warn" title="现在还不能录入正式量表分数">
+                {scaleReadinessSummary(readiness)}
               </Alert>
             )}
-            {readiness.blocking_issues.length > 0 && (
-              <details>
-                <summary>查看 {readiness.blocking_issues.length} 个阻断项</summary>
+            <details>
+              <summary>技术详情</summary>
+              <p className="muted">
+                {scaleReadinessLabel(readiness)}
+                {readiness.ready_for_research ? "" : `：${scaleReadinessExplanation(readiness)}`}
+              </p>
+              {([
+                ["定义清单", readiness.definition_ready],
+                ["定义/逐题证据可信执行",
+                  readiness.definition_artifact_enforcement_ready],
+                ["运行时定义制品", readiness.definition_artifacts_ready],
+                ["工作流政策", readiness.workflow_policy_ready],
+                ["工作流政策可信执行",
+                  readiness.workflow_policy_enforcement_ready],
+                ["平台结果与工作流合同",
+                  readiness.formal_result_contract_ready && readiness.workflow_contract_ready],
+              ] as const).map(([label, ready]) => (
+                <div className="row wrap" key={label} style={{ justifyContent: "space-between" }}>
+                  <span>{label}</span>
+                  <StatusPill tone={ready ? "ok" : "muted"}>{ready ? "已核验" : "未就绪"}</StatusPill>
+                </div>
+              ))}
+              {!readiness.ready_for_research && (
                 <p className="muted">
-                  阻断项分别覆盖 PI/临床定义、运行时制品、工作流政策与平台合同；任一层缺失都不会放行。
+                  {`服务端 instance_creation_enabled=${String(readiness.instance_creation_enabled)}；训练正确率、AI 运营判分和 legacy 自由分数仍不是正式结果。`}
                 </p>
+              )}
+              {readiness.blocking_issues.length > 0 && (
                 <ul>{readiness.blocking_issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}</ul>
-              </details>
-            )}
+              )}
+            </details>
           </div>
         )}
 
         {assessmentEvents && (
           <div className="card col">
             <div className="row wrap" style={{ justifyContent: "space-between" }}>
-              <h3>服务端正式评估事件</h3>
+              <h3>正式评估记录</h3>
               <StatusPill tone={assessmentEvents.some((event) =>
                 event.status === "in_progress" || event.status === "awaiting_closeout")
                 ? "warn" : "muted"}>
                 {assessmentEvents.length} 个事件
               </StatusPill>
             </div>
-            <p className="muted">
-              只读显示服务端绑定的事件、两类实例与证据状态。训练正确率和旧自由分数不会出现在这里。
-            </p>
             {assessmentEvents.length === 0 && (
-              <p className="muted">当前没有服务端签发的正式评估事件。</p>
+              <p className="muted">还没有正式评估记录。</p>
             )}
             {assessmentEvents.map((event) => (
               <div className="col" key={event.event_id}
@@ -240,8 +255,8 @@ export function ScaleDrawer({ patientId, open, onClose }: {
                 ))}
                 <small className="muted">
                   {event.formal_outcome_eligible
-                    ? "创建时已冻结正式研究资格；仍以各实例 ScoringEvidence 是否存在判定有无正式结果。"
-                    : "模拟或未批准定义：不计入正式研究结局。"}
+                    ? "是否已有正式分数，以上面每项的完成状态为准。"
+                    : "模拟或未批准的记录，不计入研究结果。"}
                 </small>
               </div>
             ))}
@@ -251,7 +266,7 @@ export function ScaleDrawer({ patientId, open, onClose }: {
         {rows && (
           <div className="card col">
             <h3>历史未验证记录 · {rows.length} 条</h3>
-            <p className="muted">这些是旧通用容器中的记录，没有冻结量表版本和逐条目来源；只供迁移核查，不计入正式研究结局。</p>
+            <p className="muted">以下是旧系统的历史记录，仅供核查，不计入研究结果。</p>
             {rows.length === 0 && <p className="muted">没有历史未验证记录。</p>}
             {rows.map((row) => (
               <div key={row.id} className="row wrap"

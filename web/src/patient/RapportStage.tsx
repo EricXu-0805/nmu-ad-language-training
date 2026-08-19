@@ -98,7 +98,7 @@ export function RapportStage({
     return (
       <Centered className="patient-rapport">
         <div className="target">我们先休息一下</div>
-        <p className="question">准备好后，研究者会继续</p>
+        <p className="question">休息好了，工作人员会继续</p>
       </Centered>
     );
   }
@@ -118,8 +118,7 @@ export function RapportStage({
 
   return (
     <div className="patient-stage patient-rapport" style={{ background: "#F3ECD9" }}>
-      <div className="patient-stage-body rapport-body"
-        style={{ flex: "1 1 auto", minHeight: 0, width: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "var(--sp-4)" }}>
+      <div className="patient-stage-body rapport-body">
         <div className="rapport-brand" aria-hidden="true">语</div>
         <p className="question" aria-live="polite" aria-atomic="true" style={{ maxWidth: "80vw" }}>{text}</p>
         {rapportStep?.assentGate && (
@@ -134,9 +133,10 @@ export function RapportStage({
               ? (
                 <div className="col" style={{ alignItems: "center", gap: "var(--sp-3)" }} role="alert">
                   <p className="patient-status">{blockCopy.patient}</p>
-                  <p className="muted" style={{ maxWidth: "72ch", textAlign: "center" }}>
-                    研究者处置：{blockCopy.researcher}
-                  </p>
+                  <details className="muted" style={{ maxWidth: "72ch", fontSize: "var(--text-lg)" }}>
+                    <summary>工作人员点这里看原因</summary>
+                    <p style={{ margin: "var(--sp-2) 0 0", textAlign: "left" }}>{blockCopy.researcher}</p>
+                  </details>
                 </div>
               )
             : (
@@ -147,7 +147,7 @@ export function RapportStage({
                 {saveError && (
                   <div className="col" style={{ alignItems: "center", gap: "var(--sp-3)" }} role="alert">
                     <p className="patient-status">
-                      {canRetry ? "刚才的回答还在本机，请再保存一次" : "刚才的回答没有完整保存，请找研究者看一看"}
+                      {canRetry ? "刚才的回答已经录好，请再点一次保存" : "刚才的回答没保存上，请找工作人员"}
                     </p>
                     {canRetry && (
                       <button type="button" className="patient-primary-action patient-primary-action--secondary"

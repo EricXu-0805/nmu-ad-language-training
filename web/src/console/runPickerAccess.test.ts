@@ -27,8 +27,8 @@ test("data steward presentation opens a completed-session governance entry", () 
 test("training roles keep the reviewed queue and recovery wording", () => {
   const presentation = runPickerPresentation({ canStart: true, canViewCompleted: true });
   assert.equal(presentation.completedOnly, false);
-  assert.equal(presentation.title, "到场后的今日工作");
-  assert.match(presentation.description, /先核对未收尾或进行中的评估/);
+  assert.equal(presentation.title, "今日训练");
+  assert.match(presentation.description, /先处理待办评估/);
   assert.equal(presentation.historyTitle, "异常恢复与未完复核");
 });
 

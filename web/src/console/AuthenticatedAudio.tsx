@@ -42,5 +42,5 @@ export function AuthenticatedAudio({ rawAudioId, lazy = false }: { rawAudioId: s
     );
   }
   if (!src) return <StatusPill tone="muted">正在准备回放…</StatusPill>;
-  return <audio controls preload="metadata" src={src} style={{ height: 36 }} />;
+  return <audio controls preload="metadata" src={src} style={{ height: 44 }} />;
 }

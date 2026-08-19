@@ -28,8 +28,8 @@ export function ResearchTable({
         <div>
           <h3>第 {pageNo} 页 · {page.rowCount} 行 · 粒度 {page.grain}</h3>
           <p className="muted">
-            分页是 keyset 而不是页码偏移，所以并发写入时不会漏行或重行。
-            导出的是<strong>当前这一页</strong>；要全量请照《研究数据接口使用说明》按游标逐页拉。
+            导出的是<strong>当前这一页</strong>；需要全部数据请逐页导出，
+            或参照《研究数据接口使用说明》。
           </p>
         </div>
         <div className="form-actions">
@@ -44,10 +44,15 @@ export function ResearchTable({
 
       {page.rowCount === 0 ? (
         <Alert tone="info" title="本分区暂无数据">
-          零行是真的零行，不是被过滤掉了——其它分区的数据不会混进来。
+          这个分区目前确实没有数据，不是被筛掉了；其它分区的数据也不会混进来。
         </Alert>
       ) : (
-        <div className="research-table-region" tabIndex={0}>
+        <div
+          className="research-table-region"
+          tabIndex={0}
+          role="region"
+          aria-label="研究数据表，可横向滚动"
+        >
           <table className="research-table">
             <thead>
               <tr>{page.columns.map((column) => (

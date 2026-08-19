@@ -232,7 +232,7 @@ function suppressionNotice(group: QualityDashboardGroup): QualityNoticeViewModel
     return {
       tone: "info",
       title: "真实研究 overall 已通过隐私门槛",
-      text: `至少要求 ${String(suppression.minimum_distinct_subjects)} 名不同受试者；本次聚合覆盖 ${String(suppression.distinct_subjects)} 名。通过隐私门槛不代表样本量足以形成研究结论。`,
+      text: `本次汇总覆盖 ${String(suppression.distinct_subjects)} 名受试者（隐私要求至少 ${String(suppression.minimum_distinct_subjects)} 名）。样本量是否足够需另行评估。`,
     };
   }
   const reasonText = {
@@ -242,12 +242,12 @@ function suppressionNotice(group: QualityDashboardGroup): QualityNoticeViewModel
     research_release_not_frozen: "真实研究质量发布批次尚未冻结",
   }[suppression.reason!];
   const releaseBoundary = suppression.reason === "research_release_not_frozen"
-    ? "待持久化冻结 cohort/release epoch 与逐单元互补抑制上线后再开放。"
+    ? "待研究数据冻结版本发布后开放。"
     : "";
   return {
     tone: "warn",
     title: "真实研究 overall 已做隐私抑制",
-    text: `${reasonText}；当前不发布本次质量聚合的合格不同受试者数，也不发布该行的覆盖、运行或真值计数。${releaseBoundary}`,
+    text: `${reasonText}；为保护隐私，本组的受试者数与各项计数暂不显示。${releaseBoundary}`,
   };
 }
 
@@ -256,20 +256,20 @@ function diagnosticsNotice(group: QualityDashboardGroup): QualityNoticeViewModel
     return {
       tone: "warn",
       title: "覆盖诊断已随隐私汇总抑制",
-      text: "固定原因计数也保持隐藏，不能把“已抑制”解释成 0 个问题。",
+      text: "“已抑制”表示因隐私要求而隐藏，不等于 0。",
     };
   }
   if (group.diagnostics.status === "complete") {
     return {
       tone: "info",
       title: "当前固定覆盖诊断为完整",
-      text: "固定原因计数均为 0；这只描述证据覆盖，不等于 AI 准确或研究有效。",
+      text: "证据覆盖完整（不代表 AI 判定准确）。",
     };
   }
   return {
     tone: "warn",
     title: "存在证据排除或覆盖不足",
-    text: "请结合下列固定原因计数解释未知指标；不得把被排除轮次当成正确、错误或 0。",
+    text: "部分数据被排除，未知指标的原因见下列计数；被排除的数据不等于正确、错误或 0。",
   };
 }
 
@@ -277,7 +277,7 @@ function unavailableContext(group: QualityDashboardGroup): MetricUnavailableCont
   if (group.suppression.status === "suppressed") {
     return { state: "suppressed", detail: "已按真实研究小单元隐私规则抑制，不能解释为 0" };
   }
-  return { state: "unknown", detail: "当前指标不适用或证据覆盖不足；请查看覆盖与固定诊断原因" };
+  return { state: "unknown", detail: "证据不足，暂无法计算" };
 }
 
 function buildResearchTruth(
@@ -323,7 +323,7 @@ function buildResearchTruth(
           tone: "info",
           title: isResearch ? "人工研究真值已释放（样本量仍需审阅）" : "模拟复核参考已生成",
           text: isResearch
-            ? "仅用于核查 AI 判定；前端不以绿色标记，也不声称样本量足以形成结论。"
+            ? "仅用于核查 AI 判定；样本量是否足够需另行评估。"
             : "仅用于模拟流程与模型调试，不得并入真实研究结果。",
         };
   const positiveActual = truth.true_positive !== null && truth.false_negative !== null
@@ -395,7 +395,7 @@ function buildGroup(group: QualityDashboardGroup): QualityDashboardGroupViewMode
     ? unavailable
     : {
       state: "unknown",
-      detail: "旧驱动的告知答案是终止 TTS 动作，尚无持久呈现回执，不能解释为 0",
+      detail: "旧版本未记录此项，显示“未知”而非 0",
     };
   const coverage = group.coverage;
   const classification = group.dimensions.data_classification;
@@ -443,7 +443,7 @@ function buildGroup(group: QualityDashboardGroup): QualityDashboardGroupViewMode
       countMetric("prompt-level-0", "0 级：无提示", operational.prompt_level_0_count, "录音尝试所处提示上下文：自发作答", unavailable),
       countMetric("prompt-level-1", "1 级：轻提示", operational.prompt_level_1_count, "录音尝试所处提示上下文：轻提示后作答", unavailable),
       countMetric("prompt-level-2", "2 级：明确提示", operational.prompt_level_2_count, "录音尝试所处提示上下文：明确提示后作答", unavailable),
-      countMetric("prompt-level-3", "3 级：告知答案呈现", operational.prompt_level_3_count, "告知答案终止 TTS 动作", tellAnswerUnavailable),
+      countMetric("prompt-level-3", "3 级：告知答案呈现", operational.prompt_level_3_count, "录音尝试所处提示上下文：已告知答案", tellAnswerUnavailable),
     ],
     safetyMetrics: [
       ratioMetric("technical-failure-rate", "技术失败率", operational.technical_failure_attempts, operational.total_attempts, "技术失败尝试/全部尝试；技术失败不代表回答错误", unavailable),

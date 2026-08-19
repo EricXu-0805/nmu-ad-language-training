@@ -108,9 +108,9 @@ test("AnalysisScreen: the AI usage section only renders once the journal has ver
 
 test("AnalysisScreen: a confirmation-revision contract violation surfaces a page-level danger alert, not a silent disappearance", () => {
   const block = sliceBetween(screenSource, 'confirmationSection?.status === "contract-error"', "</Alert>\n          )}");
-  assert.match(block, /确认修订契约异常/);
+  assert.match(block, /修订历史无法核实/);
   assert.match(block, /confirmationSection\.message/);
-  assert.match(block, /人工研究真值.*仍可读/);
+  assert.match(block, /人工确认文本与锁分仍可查看/);
 });
 
 test("AnalysisScreen: TTS evidence and confirmation revisions run through the strict fail-closed parsers, not a TypeScript cast", () => {
@@ -127,7 +127,7 @@ test("AnalysisScreen: parser failures for TTS/confirmation sections degrade to a
   assert.match(confirmBlock, /status: "contract-error"/);
 });
 
-test("AnalysisScreen: the AI-usage independence note is present so short-lived cross-snapshot count drift is not read as contract damage", () => {
-  assert.match(screenSource, /两次独立、非原子的服务端快照/);
-  assert.match(screenSource, /前端不会据此重算或强行对齐/);
+test("AnalysisScreen: the AI-usage drift note is present so short-lived cross-snapshot count drift is not read as data damage", () => {
+  assert.match(screenSource, /本场实际调用 AI 服务的次数汇总/);
+  assert.match(screenSource, /此处计数可能与上方略有延迟差异/);
 });

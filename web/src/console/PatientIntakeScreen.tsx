@@ -51,6 +51,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
   const [cloudPolicyError, setCloudPolicyError] = useState<string | null>(null);
   const [duplicateReview, setDuplicateReview] = useState<DuplicateReview | null>(null);
   const [duplicateConfirm, setDuplicateConfirm] = useState<"reuse" | "cloud" | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<{ patientId?: string; purpose?: string; simulationAck?: string }>({});
   const set = <K extends keyof Patient>(k: K, v: Patient[K]) => {
     setDuplicateReview(null);
     setDuplicateConfirm(null);
@@ -69,12 +70,21 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
 
   async function submit(then: (patientId: string) => void) {
     if (busy) return;
-    if (!p.patient_id.trim()) { toast("请填写受试者研究编号", "warn"); return; }
-    if (purposeConfirmed == null) { toast("请先明确选择“真实研究档案”或“专用模拟档案”", "warn"); return; }
-    if (p.is_simulation_subject && !simulationAcknowledged) {
-      toast("请确认专用模拟档案不会录入任何真实患者或受试者数据", "danger");
+    const errors: { patientId?: string; purpose?: string; simulationAck?: string } = {};
+    if (purposeConfirmed == null) errors.purpose = "请选择“真实研究档案”或“专用模拟档案”";
+    if (p.is_simulation_subject && !simulationAcknowledged) errors.simulationAck = "保存前请勾选此项确认";
+    if (!p.patient_id.trim()) errors.patientId = "请填写受试者研究编号";
+    if (errors.purpose || errors.simulationAck || errors.patientId) {
+      setFieldErrors(errors);
+      if (errors.purpose) toast("请先明确选择“真实研究档案”或“专用模拟档案”", "warn");
+      else if (errors.simulationAck) toast("请确认专用模拟档案不会录入任何真实患者或受试者数据", "danger");
+      else toast("请填写受试者研究编号", "warn");
+      const targetId = errors.purpose ? "intake-purpose-section"
+        : errors.simulationAck ? "intake-simulation-ack" : "intake-patient-id";
+      document.getElementById(targetId)?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
+    setFieldErrors({});
     const cloudIssue = cloudProcessingChoiceIssue(p.cloud_processing_allowed, cloudPolicy);
     if (cloudIssue) { toast(cloudIssue, "danger"); return; }
     const submitted = capturePatientIntakeSubmission(p);
@@ -257,11 +267,11 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
         style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
       >
         <div className="form-layout">
-        <section className="form-section">
+        <section className="form-section" id="intake-purpose-section">
           <div className="form-section-header">
             <div>
               <h3>档案用途（必须明确选择）</h3>
-              <p className="muted">档案类型会决定后续场次的数据边界；保存后不得把真实数据和模拟演练混用。</p>
+              <p className="muted">保存后档案类型不能混用，请选准。</p>
             </div>
             <StatusPill tone={purposeConfirmed == null ? "danger" : p.is_simulation_subject ? "warn" : "ok"}>
               {purposeConfirmed == null ? "尚未选择" : p.is_simulation_subject ? "专用模拟档案" : "真实研究档案"}
@@ -276,6 +286,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
                 set("is_simulation_subject", false);
                 setPurposeConfirmed("research");
                 setSimulationAcknowledged(false);
+                setFieldErrors((prev) => prev.purpose ? { ...prev, purpose: undefined } : prev);
               }}
             >
               真实研究档案
@@ -288,27 +299,33 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
                 set("is_simulation_subject", true);
                 setPurposeConfirmed("simulation");
                 setSimulationAcknowledged(false);
+                setFieldErrors((prev) => prev.purpose ? { ...prev, purpose: undefined } : prev);
               }}
             >
               专用模拟档案
             </button>
           </div>
+          {fieldErrors.purpose && <p className="field__error" role="alert">{fieldErrors.purpose}</p>}
           {p.is_simulation_subject && purposeConfirmed === "simulation" && (
             <Alert tone="danger" title="专用模拟档案：严禁录入真人数据">
               <p>这里只能使用虚构资料、合成语音，或由工作人员本人进行流程演练。真实患者、老人或其他受试者不得标记为模拟，也不得把真人录音、回答或量表放入此档案。</p>
-              <label className="toggle-field">
+              <label className="toggle-field" id="intake-simulation-ack">
                 <input
                   type="checkbox"
                   checked={simulationAcknowledged}
-                  onChange={(event) => setSimulationAcknowledged(event.target.checked)}
+                  onChange={(event) => {
+                    setSimulationAcknowledged(event.target.checked);
+                    setFieldErrors((prev) => prev.simulationAck ? { ...prev, simulationAck: undefined } : prev);
+                  }}
                 />
                 我确认本档案仅用于合成数据或工作人员演练，不包含真人受试者数据
               </label>
+              {fieldErrors.simulationAck && <p className="field__error" role="alert">{fieldErrors.simulationAck}</p>}
             </Alert>
           )}
           {purposeConfirmed === "research" && (
             <Alert tone="info" title="真实研究数据边界">
-              该档案只能创建真实研究场次；若题库尚未通过研究质控，系统会明确阻断，不会把真人数据自动降格为模拟数据。
+              该档案只用于真实研究训练。
             </Alert>
           )}
         </section>
@@ -322,8 +339,14 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
             <StatusPill tone={p.patient_id.trim() ? "ok" : "muted"}>{p.patient_id.trim() ? "编号已填写" : "等待填写"}</StatusPill>
           </div>
           <div className="form-grid">
-            <Field label="受试者研究编号" hint="使用课题内部编号；请勿填写姓名、手机号或身份证号" required>
-              <TextInput value={p.patient_id} onChange={(e) => set("patient_id", e.target.value)} placeholder="例如 P001" autoComplete="off" required />
+            <Field label="受试者研究编号" hint="使用课题内部编号；请勿填写姓名、手机号或身份证号" required
+              error={fieldErrors.patientId}>
+              <TextInput id="intake-patient-id" value={p.patient_id}
+                onChange={(e) => {
+                  set("patient_id", e.target.value);
+                  setFieldErrors((prev) => prev.patientId ? { ...prev, patientId: undefined } : prev);
+                }}
+                placeholder="例如 P001" autoComplete="off" required />
             </Field>
             <Field label="认知障碍程度（如已评估）" hint="按当前研究记录填写，可暂时留空">
               <TextInput value={p.dementia_severity ?? ""} onChange={(e) => set("dementia_severity", e.target.value || null)} placeholder="例如：轻度 / 中度" />
@@ -359,7 +382,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
           </div>
           {!p.is_simulation_subject && p.secondary_use_allowed !== true && (
             <Alert tone="warn" title="去标识导出未授权">
-              二次使用授权未明确为“是”时，该受试者的数据不能进入去标识研究导出；训练本身不受影响。
+              未明确同意时，数据不进入研究导出；训练不受影响。
             </Alert>
           )}
           {!p.is_simulation_subject && p.consent_status !== "已同意" && (
@@ -369,7 +392,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
           )}
           {p.recording_allowed === false && (
             <Alert tone="danger" title="录音已明确禁止">
-              该档案不能进入依赖录音、语音识别和 AI 判定的训练流程；系统不会用研究者现场听记替代自动化证据链。若授权文件发生变化，必须走独立授权核对后再安排训练。
+              禁止录音时不能使用需要录音的训练。授权变化后请重新核对再安排。
             </Alert>
           )}
         </section>
@@ -386,8 +409,8 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
           </div>
           <Alert tone={cloudPolicy?.configured ? "warn" : "danger"} title="会发送哪些数据">
             <p>{cloudProcessingDisclosure(cloudPolicy)}</p>
-            <p>云 ASR 会处理回答原始音频；云判类可能处理题目上下文与回答文本。不同意或版本不匹配时，服务器会阻止外发并安全暂停或改用本地确定式规则。</p>
-            {cloudPolicyError && <p>服务器 policy 读取失败：{cloudPolicyError}</p>}
+            <p>允许后，回答录音和文字会发给上述服务方处理；不允许时一律不外发。</p>
+            {cloudPolicyError && <p>云处理告知条款读取失败：{cloudPolicyError}</p>}
           </Alert>
           <TriStateField
             label="是否明确允许上述第三方云处理"
@@ -423,7 +446,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
               <div><strong>既有云处理依据</strong><p>处理方：{duplicateReview.existing.cloud_processing_provider_id ?? "未记录"}<br />告知版本：{duplicateReview.existing.cloud_processing_notice_version ?? "未记录"}</p></div>
             </div>
             {duplicateReview.assessment.existingCloudRevocationRecorded && (
-              <p><strong>既有档案保留了拒绝/撤销事实。</strong>只有现场已重新完成独立云处理告知并取得新授权，才可进入下面的单独二次确认。</p>
+              <p><strong>此前已拒绝或撤销过云处理。</strong>须现场重新取得授权后才能变更。</p>
             )}
           </Alert>
           <div className="form-actions">
@@ -481,7 +504,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
         open={duplicateConfirm === "cloud"}
         title={duplicateReview?.assessment.cloudChangeDirection === "grant" ? "单独确认重新授权云处理" : "单独确认撤销云处理授权"}
         body={duplicateReview?.assessment.cloudChangeDirection === "grant"
-          ? `既有状态：${duplicateReview ? formatCloudAuthorization(duplicateReview.existing) : "未知"}。只有已重新完成独立告知并取得明确授权才可确认；确认后原始回答音频和转写文本可能按当前 policy 发往第三方。`
+          ? `既有状态：${duplicateReview ? formatCloudAuthorization(duplicateReview.existing) : "未知"}。确认后，回答录音和文字将按最新告知条款发给第三方。请确保已重新取得授权。`
           : "确认后服务器将撤销第三方云处理授权；后续云端 ASR 或判类会被阻止并安全暂停。"}
         confirmLabel={busy ? "正在核对…" : duplicateReview?.assessment.cloudChangeDirection === "grant" ? "已重新取得授权，确认变更" : "确认撤销授权"}
         onConfirm={() => { if (!busy) void confirmCloudChange(); }}

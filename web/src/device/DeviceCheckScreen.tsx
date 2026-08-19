@@ -6,6 +6,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { Button } from "../components/Button";
 import {
   classifyNoiseFloor,
   classifySpeakerConfirmation,
@@ -21,9 +22,9 @@ import { createBrowserDeviceCheckDependencies } from "./browserDeviceCheckDepend
 type Stage = "idle" | "auto" | "quiet" | "speech" | "beep" | "done";
 
 const STATUS_MARK = { pass: "✓", warn: "△", fail: "✗" } as const;
-const STATUS_COLOR = { pass: "#2e7d32", warn: "#b26a00", fail: "#c62828" } as const;
+const STATUS_COLOR = { pass: "var(--c-ok)", warn: "var(--c-warn)", fail: "var(--c-danger)" } as const;
 const VERDICT_LABEL: Record<Verdict, string> = {
-  "basic-pass": "✓ 基础检查通过，还需目标设备验收",
+  "basic-pass": "✓ 基础检查通过，下一步做真机验收",
   "basic-pass-with-warnings": "△ 基础检查有警告，不得直接投入使用",
   "basic-fail": "✗ 基础检查不通过，不得使用这台设备",
   incomplete: "✗ 检查未完成，不得使用这台设备",
@@ -71,17 +72,17 @@ export function DeviceCheckScreen() {
         try {
           push(classifyNoiseFloor(await deps.sampleNoise(3)));
         } catch (error) {
-          push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: `采样失败:${String(error)}` });
+          push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: `采样失败：${String(error)}` });
         }
         setStage("speech");
         try {
           push(classifySpeechLevel(await deps.sampleNoise(4)));
         } catch (error) {
-          push({ id: "speech-level", title: "人声拾取", status: "fail", detail: `采样失败:${String(error)}` });
+          push({ id: "speech-level", title: "人声拾取", status: "fail", detail: `采样失败：${String(error)}` });
         }
       } else {
-        push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: "麦克风不可用,未采样。" });
-        push({ id: "speech-level", title: "人声拾取", status: "fail", detail: "麦克风不可用,未采样。" });
+        push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: "麦克风不可用，未采样。" });
+        push({ id: "speech-level", title: "人声拾取", status: "fail", detail: "麦克风不可用，未采样。" });
       }
       setStage("beep");
       setBeepPlayed(deps.playBeep());
@@ -110,43 +111,41 @@ export function DeviceCheckScreen() {
     <main className="page-shell narrow">
       <div className="page-header-block">
         <div className="page-kicker">现场准备 · 由工作人员测试</div>
-        <h2 className="page-title">设备基础检查</h2>
+        <h1 className="page-title">设备基础检查</h1>
         <p className="page-description">
-          训练开始前,用受试者将要使用的这台设备打开本页,在训练房间里跑一遍。
-          约需 20 秒,期间会请你保持安静、说一句话、听一声提示音。
-          请务必由工作人员说测试句；声音只做瞬时电平采样，不保存、不上传。
+          在训练用的设备和房间里做，约 20 秒。只测音量，不保存、不上传录音。
+          请由工作人员操作。
         </p>
       </div>
 
-      <p style={{ margin: "0 0 12px" }}>
-        <span style={{ fontWeight: 600 }}>联网状态:</span>{" "}
+      <p style={{ margin: "0 0 var(--sp-3)" }}>
+        <span style={{ fontWeight: 600 }}>联网状态：</span>{" "}
         <span style={{ color: online ? STATUS_COLOR.pass : STATUS_COLOR.fail, fontWeight: 600 }}>
           {online ? "在线" : "离线"}
         </span>
-        <span className="muted">(断网演练:关掉 Wi-Fi,这里应变红;重新联网应变绿)</span>
       </p>
 
       {stage === "idle" && (
-        <button type="button" style={primaryBtn} onClick={() => { void start(); }}>
+        <Button variant="primary" size="lg" onClick={() => { void start(); }}>
           开始检查
-        </button>
+        </Button>
       )}
       {stage === "auto" && <p className="muted">正在检查运行环境、麦克风、网络…</p>}
       {stage === "quiet" && (
-        <p style={stagePrompt}>请保持安静 3 秒,正在测环境噪声…</p>
+        <p style={stagePrompt}>请保持安静 3 秒，正在测环境噪声…</p>
       )}
       {stage === "speech" && (
-        <p style={stagePrompt}>请对着设备正常说一句话(比如"今天天气很好")…</p>
+        <p style={stagePrompt}>请对着设备正常说一句话（比如「今天天气很好」）…</p>
       )}
       {stage === "beep" && (
         <div>
           <p style={stagePrompt}>
-            {beepPlayed ? "刚才有一声提示音,你听到了吗?" : "提示音播放失败,视为没听到。"}
+            {beepPlayed ? "刚才有一声提示音，你听到了吗？" : "提示音播放失败，视为没听到。"}
           </p>
           <div className="form-actions">
-            <button type="button" style={primaryBtn} disabled={!beepPlayed}
-              onClick={() => confirmBeep(true)}>听到了</button>
-            <button type="button" style={plainBtn} onClick={() => confirmBeep(false)}>没听到</button>
+            <Button variant="primary" size="lg" disabled={!beepPlayed}
+              onClick={() => confirmBeep(true)}>听到了</Button>
+            <Button variant="secondary" size="lg" onClick={() => confirmBeep(false)}>没听到</Button>
           </div>
         </div>
       )}
@@ -172,18 +171,21 @@ export function DeviceCheckScreen() {
             {VERDICT_LABEL[verdict]}
           </p>
           <p className="muted">
-            本页只是基础技术检查，不代表已通过真实麦克风、真实扬声器、目标房间、
-            断网关麦或养老院现场验收。浏览器、系统或设备更新后必须重新检查。
+            这只是基础检查，正式启用前还要做真机验收。设备或系统更新后请重测。
           </p>
           <p className="muted">
-            断网演练(人工):关掉 Wi-Fi → 顶部指示变红、训练页会提示网络中断且录音落本地暂存;
-            重新联网 → 指示变绿。这两步请在真机上顺手验一次。
+            断网测试：关掉 Wi-Fi，顶部指示应变红；重新联网应变绿。
           </p>
+          {(verdict === "basic-pass" || verdict === "basic-pass-with-warnings") && (
+            <p>
+              <Link to="/acceptance">去做真机验收 →</Link>
+            </p>
+          )}
           <div className="form-actions">
-            <button type="button" style={primaryBtn} onClick={() => { void start(); }}>重新检查</button>
-            <button type="button" style={plainBtn} onClick={copy}>
+            <Button variant="primary" size="lg" onClick={() => { void start(); }}>重新检查</Button>
+            <Button variant="secondary" size="lg" onClick={copy}>
               {copied ? "已复制" : "复制检查记录"}
-            </button>
+            </Button>
           </div>
           <pre style={{ whiteSpace: "pre-wrap", background: "var(--c-surface)", padding: 12,
                         borderRadius: 10, border: "1px solid var(--c-line)", fontSize: 12 }}>
@@ -192,19 +194,11 @@ export function DeviceCheckScreen() {
         </div>
       )}
 
-      <p style={{ marginTop: 24 }}>
+      <p style={{ marginTop: "var(--sp-5)" }}>
         <Link to="/" className="muted">← 返回首页</Link>
       </p>
     </main>
   );
 }
 
-const primaryBtn: React.CSSProperties = {
-  minHeight: 48, padding: "10px 26px", borderRadius: 10, border: "1px solid var(--c-line)",
-  background: "var(--c-ink, #1a1a1a)", color: "#fff", cursor: "pointer", fontWeight: 600, fontSize: 16,
-};
-const plainBtn: React.CSSProperties = {
-  minHeight: 48, padding: "10px 26px", borderRadius: 10, border: "1px solid var(--c-line)",
-  background: "var(--c-surface)", cursor: "pointer", fontWeight: 600, fontSize: 16,
-};
 const stagePrompt: React.CSSProperties = { fontSize: 18, fontWeight: 600 };

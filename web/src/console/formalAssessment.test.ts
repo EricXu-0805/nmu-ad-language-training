@@ -433,7 +433,7 @@ test("formal assessment write gate rejects truthy flag spoofing", () => {
 test("ScaleDrawer loads the read-only formal projection before legacy rows", () => {
   const source = readFileSync(new URL("./ScaleDrawer.tsx", import.meta.url), "utf8");
   assert.match(source, /api\.listPatientAssessmentEvents\(patientId\)/);
-  assert.ok(source.indexOf("<h3>服务端正式评估事件</h3>")
+  assert.ok(source.indexOf("<h3>正式评估记录</h3>")
     < source.indexOf("<h3>历史未验证记录"));
   assert.doesNotMatch(source, /api\.(create|start|cancel|submit|complete|approve|close)Assessment/);
   assert.equal(source.includes("scoring_evidence.score"), false);
