@@ -74,11 +74,16 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
     if (purposeConfirmed == null) errors.purpose = "请选择“真实研究档案”或“专用模拟档案”";
     if (p.is_simulation_subject && !simulationAcknowledged) errors.simulationAck = "保存前请勾选此项确认";
     if (!p.patient_id.trim()) errors.patientId = "请填写受试者研究编号";
+    else if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(p.patient_id.trim())) {
+      // 训练安排契约(visit_plan_contract)只认这个格式;中文/空格编号建了档
+      // 也排不了训练,必须在建档口挡住并把原因说人话。
+      errors.patientId = "编号只能用字母、数字、点、横线，例如 NMU-001——不要用中文或姓名";
+    }
     if (errors.purpose || errors.simulationAck || errors.patientId) {
       setFieldErrors(errors);
       if (errors.purpose) toast("请先明确选择“真实研究档案”或“专用模拟档案”", "warn");
       else if (errors.simulationAck) toast("请确认专用模拟档案不会录入任何真实患者或受试者数据", "danger");
-      else toast("请填写受试者研究编号", "warn");
+      else toast(errors.patientId ?? "请填写受试者研究编号", "warn");
       const targetId = errors.purpose ? "intake-purpose-section"
         : errors.simulationAck ? "intake-simulation-ack" : "intake-patient-id";
       document.getElementById(targetId)?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -339,7 +344,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
             <StatusPill tone={p.patient_id.trim() ? "ok" : "muted"}>{p.patient_id.trim() ? "编号已填写" : "等待填写"}</StatusPill>
           </div>
           <div className="form-grid">
-            <Field label="受试者研究编号" hint="使用课题内部编号；请勿填写姓名、手机号或身份证号" required
+            <Field label="受试者研究编号" hint="只用字母/数字/点/横线，例如 NMU-001；请勿填写姓名、中文、手机号或身份证号" required
               error={fieldErrors.patientId}>
               <TextInput id="intake-patient-id" value={p.patient_id}
                 onChange={(e) => {

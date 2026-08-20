@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 import hashlib
 import ipaddress
+import re
 import json as _json
 import math
 import secrets
@@ -1033,6 +1034,11 @@ def _require_research_eligible(patient: Patient) -> None:
 
 @app.post("/patients", response_model=Patient)
 def create_patient(p: Patient, s: DBSession = Depends(get_session)):
+    if not re.fullmatch(visit_plan_contract.PATIENT_ID_PATTERN, p.patient_id or ""):
+        raise HTTPException(
+            422,
+            "研究编号只能用字母、数字、点、横线（例如 NMU-001），不要用中文或姓名；"
+            "训练安排契约不接受其他字符")
     if s.get(Patient, p.patient_id):
         raise HTTPException(409, f"patient_id {p.patient_id} 已存在")
     server_owned_cloud_fields = (

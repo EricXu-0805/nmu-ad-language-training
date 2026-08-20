@@ -41,6 +41,8 @@ function knownProfileVersion(value: unknown): value is typeof WEEK2_SINGLE20_DEM
 const RECOVERY_SESSION_KEYS = [...SESSION_KEYS, "runtime_status"] as const;
 const PLAN_ID = /^vp_[A-Za-z0-9_-]{24}$/;
 const SESSION_ID = /^s_[A-Za-z0-9_-]{24}$/;
+// 受试者编号契约 = 后端 visit_plan_contract._PATIENT_ID_PATTERN(ASCII 编号)。
+// 建档口负责把非编号字符挡在门外;这里保持与训练安排契约同宽,不放宽。
 const PATIENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const VERSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;

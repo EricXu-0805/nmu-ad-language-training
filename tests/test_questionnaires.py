@@ -664,3 +664,19 @@ def test_locked_record_is_immutable_and_undeletable_at_the_orm_layer(api_env):
                            match="QuestionnaireItemValue 永不删除"):
             session.commit()
         session.rollback()
+
+
+def test_patient_registration_rejects_non_ascii_research_code(api_env):
+    """建档口与训练安排契约同宽:中文/空格编号 422 且给中文指引。
+
+    回退验证:把 create_patient 的 re.fullmatch 闸删掉,本测试必须变红
+    (2026-08-21 首测实录:『测试1』建档成功却永远排不了训练)。
+    """
+    client = _client("research-a")
+    denied = client.post("/patients", json={
+        "patient_id": "测试1", "name": "x"})
+    assert denied.status_code == 422, denied.text
+    assert "字母、数字" in denied.text
+    accepted = client.post("/patients", json={
+        "patient_id": "TEST-OK-01", "name": "x"})
+    assert accepted.status_code == 200, accepted.text

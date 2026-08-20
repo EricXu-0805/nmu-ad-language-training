@@ -242,6 +242,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
           {visibleRows.map((r) => {
             const classification = patientDataClassification(r);
             const cannotPlan = Boolean(r.withdrawal_status) || classification === "legacy_unknown" || !canManagePlans;
+            const idInvalid = !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(r.patient_id);
             return (
             <div className="registry-row" role="row" key={r.patient_id}>
               <span className="col" style={{ gap: 4 }} role="cell">
@@ -287,18 +288,19 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
                       setWithdrawalFor(r);
                     }}>登记研究撤回</Button>
                   )}
-                  <Button disabled={cannotPlan}
+                  <Button disabled={cannotPlan || idInvalid}
                     onClick={() => { setPlanPatientId(r.patient_id); setMode("plan"); }}>
                     {classification === "simulation" ? "安排模拟演练" : "安排训练"}
                   </Button>
-                  {cannotPlan && (
+                  {(cannotPlan || idInvalid) && (
                     <span className="muted" style={{ flexBasis: "100%" }}>
-                      {r.withdrawal_status ? "已撤回，不能再安排训练"
-                        : classification === "legacy_unknown" ? "档案分类未核对，暂不能安排训练"
-                          : "当前账号只能查看，不能安排训练"}
+                      {idInvalid ? "这个编号含中文或特殊字符，训练流程不接受——请用字母数字编号（如 NMU-001）重新登记一份档案"
+                        : r.withdrawal_status ? "已撤回，不能再安排训练"
+                          : classification === "legacy_unknown" ? "档案分类未核对，暂不能安排训练"
+                            : "当前账号只能查看，不能安排训练"}
                     </span>
                   )}
-                  {flowMode === "quickDrill" && quickDrillEnabled
+                  {flowMode === "quickDrill" && quickDrillEnabled && !idInvalid
                     && classification === "simulation" && !r.withdrawal_status && (
                     <Button variant="primary" disabled={quickDrillBusy !== null}
                       title="自动接着上次的进度开始"
@@ -306,7 +308,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
                       {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
                     </Button>
                   )}
-                  {quickDrillEnabled && classification === "research" && !r.withdrawal_status && (
+                  {quickDrillEnabled && !idInvalid && classification === "research" && !r.withdrawal_status && (
                     <Button variant="primary" disabled={quickDrillBusy !== null}
                       title="自动接着上次的进度开始；待审核的安排仍需人工审核"
                       onClick={() => { void startNextTask(r.patient_id, false); }}>

@@ -10,7 +10,10 @@ from .enums import EventLine, PhaseType
 
 
 _OPAQUE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
-_PATIENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+# 建档口(create_patient)与本契约共用同一格式:编号在建档时漏进非 ASCII,
+# 到安排训练必然 422,非技术用户会卡死在中途(2026-08-21 首测实录)。
+PATIENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+_PATIENT_ID_PATTERN = PATIENT_ID_PATTERN
 _PROFILE_VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 
 
