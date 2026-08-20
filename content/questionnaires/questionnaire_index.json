@@ -5,7 +5,7 @@
     {
       "questionnaire_id": "sfacs_v1",
       "file": "sfacs_v1.json",
-      "content_sha256": "34798fc0a925ba71cac61936b655361b3ddd66a805fa91bfa14abe32b4eed8e8"
+      "content_sha256": "1477e5c464ce0789852ceca86f0d041a3eecbca46a67ac4b3f19e8cdd06dde32"
     },
     {
       "questionnaire_id": "gds15_v1",
@@ -15,7 +15,7 @@
     {
       "questionnaire_id": "npiq_v1",
       "file": "npiq_v1.json",
-      "content_sha256": "12e9521c658d7f01fa18867fce95e4fa5ecdbcdf05196372fb1ecbbfb09fc836"
+      "content_sha256": "b04277aa5b2dc4601c2159eaa46eb544501b6c5cf61619482ced5769bb8c7ef3"
     }
   ]
 }
