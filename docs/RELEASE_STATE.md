@@ -106,7 +106,7 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**无。生产 = `7d70cce` = origin/main。**
+**无。生产 = `92040ac` = origin/main（2026-08-21 01:3x 编号契约收口：中文编号建档口 422+表单拦截+存量行可见原因；含 systemctl restart；MATCH 87/87）。**
 （2026-08-21 00:5x–01:0x 两次零迁移热更新：`70f2fec` 量表定义包勘误 v2——Eric 拍板
 修正 NPI-Q 五处笔误+SFACS 四处空格，定义按请求装载免重启；`7d70cce` 前端 UX——
 toast 底部居中+warn 8s、安排屏未完成计划前置横幅+锚点滚动、槽位 409 人话翻译。
