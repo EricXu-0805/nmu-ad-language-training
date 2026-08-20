@@ -7,7 +7,12 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
-> **已上线（2026-08-19 00:2x–00:4x 上海 / 08-18 16:2x–16:4x UTC）。**
+> **最新上线（2026-08-20 18:58–18:59 上海 / 10:58 UTC）**：`b1765c0` → **`3ccb86d`**，
+> **含迁移** `6f2a9c4d8e17` → **`b6d4f8a2c917`**（量表电子记录两张新表）。
+> Eric 本人执行一键窗口脚本（`219-上线命令_3ccb86d.sh`），全程 8 步闸全过，
+> 逐文件核树 `MATCH revision=3ccb86d files=87 identical=87`。详见下方上线记录。
+>
+> **上一次（2026-08-19 00:2x–00:4x 上海 / 08-18 16:2x–16:4x UTC）。**
 > 本次把生产从 `167273f` / `b3e7c5a9d214` 推到 **`10c90e4` / `6f2a9c4d8e17`**，
 > 一次跨三个结构版本。按 `docs/上线runbook_受控技术环境更新.md` 逐条执行。
 >
@@ -21,12 +26,12 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `10c90e4`（2026-08-19 00:3x 上线；此前 `167273f` 08-15 06:05、`f813af0` 08-14 20:28） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 10c90e4` 应输出 `MATCH … identical=84` |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff f813af0..main -- app web alembic` 应为空 |
-| 数据库结构版本 | `6f2a9c4d8e17` | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
-| 备份校验器指纹（前 20 位） | `7d434d792eacb3a4d692` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
-| 回滚存档 | `/opt/nmu/app-before-deploy-20260815-0605.tar.gz`（退到 `f813af0`）；更早的存档按 `ls -t` 逐级回退，跨结构退回 `9c34dcb` 用 `app-before-deploy-20260814-015250.tar.gz` | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
-| 回滚锚点快照 | 退到 `f813af0`：`20260814-220517`（同结构，新校验器验过，直接可用）。**跨结构**退回 `9c34dcb` 才用 `20260814-015251`（旧结构，现在 `legacy-unvalidated/`），那时要连**旧代码树 + 旧校验器**一起放回 |
+| 应用代码版本 | `3ccb86d`（2026-08-20 18:58 上线；此前 `b1765c0` 08-20 00:10、`10c90e4` 08-19） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 3ccb86d` 应输出 `MATCH … identical=87`（2026-08-20 19:0x 实测通过） |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff 3ccb86d..main -- app web alembic` 应为空 |
+| 数据库结构版本 | `b6d4f8a2c917`（2026-08-20 18:58 由 `6f2a9c4d8e17` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
+| 备份校验器指纹（前 20 位） | `79aea62e1a1ed4c6e01e` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
+| 回滚存档 | `/opt/nmu/app-before-deploy-20260820-185806.tar.gz`（退到 `b1765c0`）；更早按 `ls -t` 逐级回退。⚠️ `…170248-语法错疑含data勿用.tar.gz` 是失败残留已改名标记，勿用 | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
+| 回滚锚点快照 | **跨结构**退回 `b1765c0`/`6f2a9c4d8e17` 用停写锚点 `20260820-105812`（旧头，现按 §8.1 在 `legacy-unvalidated/`），必须连**旧代码树 + 旧校验器（7d434d79…）**一起放回；同结构回退直接用最新 `daily/` 快照 |
 | 起服前闸门 | 已装（`ExecStartPre` 验库头，以 `User=nmu` 身份跑） | `systemctl cat nmu.service \| grep ExecStartPre`；journal 里 `OK database_at_head` 应在 `Started` 之前 |
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
 | 库里数据 | 1 个受试者、1 个场次、0 条云语音使用记录 | 这台机器**从未被真实使用过** |
@@ -101,17 +106,29 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**有，且下次窗口含迁移。** 生产 = `b1765c0` / 库头 `6f2a9c4d8e17`；main 领先的增量 =
-量表电子记录原型道（SFACS / GDS-15 / NPI-Q + AI 初评，收据 219）：
+**无。生产 = `3ccb86d` = origin/main（2026-08-20 18:58 上线，含迁移）。**
 
-- **新迁移头 `b6d4f8a2c917`**（两张新表，空表 downgrade 可逆、有行拒绝）——
-  下次窗口必须走 runbook 的**迁移分支**：停 backup timer → 停服 → 最终停写快照
-  （旧校验器）→ 同步代码 → `check_database_head` 期望 exit 78 → `alembic upgrade
-  head` → 起服 → 预检 → **立刻 `systemctl start nmu-backup.service` 拍新头快照**
-  → 重装异地校验器（`verify_backup_snapshot.py` 本次改了：头钉+表清单+恢复指纹
-  `36c97917…`）→ 恢复 timer。依赖锁零变化，venv 不碰。
-- 新内容目录 `content/questionnaires/`（rsync 会带上，无需另置）。
-- 前端 dist 重建（同步后照常跑 `verify_browser_dist --source-root`）。
+## 2026-08-20 晚上线记录（3ccb86d：量表电子记录原型道，含迁移 b6d4f8a2c917）
+
+受控技术环境更新，Eric 本人执行一键窗口脚本（`项目综合审计_20260717/
+PM_20260730_自动对话/219-上线命令_3ccb86d.sh`），Claude 只读预检与收尾核验。
+（Claude 曾按 Eric 口头授权尝试自行执行，被 auto 模式分类器在第 2 步拦下；
+服务当场恢复原状、health 200 后改走"脚本交 Eric"路径——分类器边界与三十四轮一致。）
+
+| 步骤 | 结果 |
+| --- | --- |
+| 前提 | 依赖锁零变化（venv 不碰）；`verify_backup_snapshot.py` 本次有变（头钉/表清单/恢复指纹 `36c979…`）→ 窗口内拍新头快照 + 窗口后重装异地校验器 |
+| 锚点 | 停 timer → 停服 → 停写快照 `20260820-105812` **ok**（旧校验器·旧头） |
+| 回滚存档 | `/opt/nmu/app-before-deploy-20260820-185806.tar.gz`（排除 data/） |
+| 同步 | 旧 dist 隔离进 `/opt/nmu/dist-stale-20260820-185806`；`RSYNC EXIT=0`；权限规范化后不可读 0 |
+| 校验器 | 部署树与本地同为 `79aea62e…` ✓ |
+| dist 绑定 | `--source-root` 15 个受管文件通过 |
+| 迁移 | 前闸 **退 78**（正确的待迁移态）→ `alembic upgrade head` EXIT=0（`6f2a9c4d8e17 → b6d4f8a2c917`）→ 后闸退 0 |
+| 起服 | 本地/公网 `/health` 200；`/docs` 404 |
+| 新头快照 | **立刻拍**：`20260820-105854` **ok**（新校验器·新头，备份链未断）→ timer 恢复 active |
+| 预检 | `--require-all` 7/8 PASS；唯一 FAIL = OS 安全补丁积压 12 个（curl/nginx 等，与本次上线无关，待 Eric 批 `apt-get upgrade`） |
+| 异地 | 校验器重装为 `79aea62e…`；launchd 真跑一轮 `partial snapshots=37 pulled=1 held=8`，新头快照 `20260820-105854` 落入**已验证** `daily/`；旧头快照（含两份停写锚点）按 §8.1 进 `legacy-unvalidated/` 等运维处置——**迁移头前进后的预期形态，不是故障**；两条 08-14 旧快照 FAIL `snapshot_unresolved_evidence` 为历史遗留 |
+| 收尾核验 | `verify_deployed_tree.py --revision 3ccb86d` → **MATCH files=87 identical=87**；`last-deploy.state` 已写本次事实 |
 
 ## 2026-08-20 上线记录（b1765c0：内容交付 + 快速演练修复 + UI 迭代，零迁移）
 
