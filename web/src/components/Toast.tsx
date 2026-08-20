@@ -14,7 +14,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const held = useRef<Toast[]>([]);
   const expire = useCallback((id: number, tone: ToastTone) => {
     // danger 驻留 12s(丢录音级警告 4 秒就消失必然错过);其余 4s。点击可立即关。
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), tone === "danger" ? 12000 : 4000);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), tone === "danger" ? 12000 : tone === "warn" ? 8000 : 4000);
   }, []);
   const push = useCallback((text: string, tone: ToastTone = "info") => {
     const id = seq++;

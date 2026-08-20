@@ -221,6 +221,8 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   const [cancelTarget, setCancelTarget] = useState<VisitPlanReceipt | null>(null);
   const [cancelReason, setCancelReason] = useState<VisitPlanCancelReason>("schedule_changed");
   // 只在结果未知时复用键；严格收据确认成功后删除，下一条相同事实也是新命令。
+  const openPlans = (plans ?? []).filter(
+    (plan) => plan.status === "draft" || plan.status === "approved");
   const commandKeys = useRef<PendingVisitPlanCommandKeys | null>(null);
   const historyRequests = useRef<LatestVisitPlanHistoryRequest | null>(null);
   if (commandKeys.current === null) commandKeys.current = new PendingVisitPlanCommandKeys();
@@ -364,8 +366,10 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
       const created = await api.createVisitPlan(command.body);
       settleKey("create", command.fingerprint, command.key);
       if (!approveImmediately) {
-        toast("训练安排草稿已保存", "ok");
+        toast("草稿已保存，见下方列表——点「审核通过」它才会生效", "ok");
         await reload();
+        document.getElementById("visit-plan-history")?.scrollIntoView(
+          { behavior: "smooth", block: "start" });
         return;
       }
       const approveFingerprint = `${created.plan_id}:${created.revision}`;
@@ -384,8 +388,15 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
       await reload();
     } catch (error) {
       releaseKnownFailure("create", command.fingerprint, command.key, error);
-      toast(errorText(error), "danger");
+      const text = errorText(error);
+      toast(text.includes("同一协议槽位")
+        ? "这位受试者同一周次已有一份安排还没处理——在下方列表先「审核通过」或「取消安排」，不要重复创建"
+        : text, "danger");
       await reload();
+      if (text.includes("同一协议槽位")) {
+        document.getElementById("visit-plan-history")?.scrollIntoView(
+          { behavior: "smooth", block: "start" });
+      }
     } finally {
       setBusy(false);
     }
@@ -484,6 +495,18 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
           {readinessError}。核对成功前不能审核安排；草稿仍可保存。
         </Alert>
       )}
+      {openPlans.length > 0 && (
+        <Alert tone="info" title={`下方已有 ${openPlans.length} 份未完成的训练安排`}>
+          <p style={{ margin: 0 }}>
+            先在「既有训练安排」里处理它——草稿点「审核通过」，不用的点「取消安排」。
+            同一周次重复创建会被拒绝。
+          </p>
+          <Button size="sm" onClick={() => {
+            document.getElementById("visit-plan-history")?.scrollIntoView(
+              { behavior: "smooth", block: "start" });
+          }}>查看已有安排</Button>
+        </Alert>
+      )}
 
       <div className="form-layout">
         <section className="form-section">
@@ -567,7 +590,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
           </div>
         </section>
 
-        <section className="form-section">
+        <section className="form-section" id="visit-plan-history">
           <div className="form-section-header">
             <div>
               <h3>既有训练安排</h3>

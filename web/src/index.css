@@ -1150,7 +1150,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .drawer-header h2 { margin: 0; }
 .drawer-actions { position: sticky; bottom: calc(-1 * var(--sp-5)); margin-top: auto; padding: var(--sp-3) 0 var(--sp-5); display: flex; justify-content: flex-end; background: linear-gradient(180deg, rgba(247,245,240,0), var(--c-bg) 28%); }
 
-.toast-stack { position: fixed; left: var(--sp-4); bottom: var(--sp-4); z-index: var(--z-toast); display: flex; flex-direction: column; gap: var(--sp-2); pointer-events: none; }
+.toast-stack { position: fixed; left: 50%; transform: translateX(-50%); bottom: var(--sp-6); z-index: var(--z-toast); display: flex; flex-direction: column; align-items: center; gap: var(--sp-2); pointer-events: none; }
 .toast { max-width: min(420px, calc(100vw - 32px)); padding: var(--sp-3) var(--sp-4); border: 1px solid transparent; border-radius: var(--radius); background: var(--c-surface); color: var(--c-fg); box-shadow: var(--shadow-lg); cursor: pointer; pointer-events: auto; }
 .toast-info { border-color: var(--c-primary-line); background: var(--c-primary-soft); color: var(--c-primary); }
 .toast-ok { border-color: var(--c-ok-line); background: var(--c-ok-bg); color: var(--c-ok-text); }
