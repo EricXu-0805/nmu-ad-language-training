@@ -232,6 +232,21 @@ _ROUTE_RULES = (
            roles=TRAINING_OPERATION_ROLES, label="更新受试者云处理授权"),
     _route({"POST"}, r"/patients/[^/]+/scales", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="录入临床量表"),
+    # 量表电子记录（原型道）：定义含逐题词，读也必须具名；写只属于施测角色。
+    _route({"GET", "HEAD"}, r"/questionnaires/definitions", AccessKind.ACCOUNT,
+           roles=KNOWN_ACCOUNT_ROLES, label="读取量表定义（原型）"),
+    _route({"GET", "HEAD"}, r"/patients/[^/]+/questionnaire-records",
+           AccessKind.ACCOUNT, roles=KNOWN_ACCOUNT_ROLES,
+           label="读取受试者量表电子记录"),
+    _route({"POST"}, r"/patients/[^/]+/questionnaire-records",
+           AccessKind.ACCOUNT, roles=TRAINING_OPERATION_ROLES,
+           label="建立量表电子记录"),
+    _route({"PUT"}, r"/questionnaire-records/[^/]+/values", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="保存量表作答草稿"),
+    _route({"POST"}, r"/questionnaire-records/[^/]+/ai-draft", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="生成量表 AI 初评草稿"),
+    _route({"POST"}, r"/questionnaire-records/[^/]+/lock", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="锁定量表电子记录"),
     _route({"POST"}, r"/patients/[^/]+/assessment-events", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="建立正式评估事件"),
     _route({"POST"}, r"/assessment-events/[^/]+/(?:start|close|cancel)",
@@ -309,6 +324,8 @@ _API_ROOTS = frozenset({
     # 只读研究数据面。登记在这里，等于给它一个 fail-closed 的默认：
     # 忘了写显式规则也要具名账号，而不是匿名可读。
     "research",
+    # 量表电子记录（原型道）：定义接口携带逐题词，命名空间必须整体具名。
+    "questionnaires", "questionnaire-records",
 })
 
 # These roots are permanently reserved for server-controlled APIs.  Static SPA

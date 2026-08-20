@@ -5,6 +5,7 @@ import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
 import { useDialogFocusTrap } from "../components/useDialogFocusTrap";
 import type { AssessmentEvent, ScaleProtocolReadiness, ScaleResult } from "../types";
+import { QuestionnairePanel } from "./QuestionnairePanel";
 import { createScaleDrawerRefreshGate, requireScaleRowsForPatient } from "./scaleDrawerRefresh";
 
 function assessmentTimepointLabel(timepoint: AssessmentEvent["timepoint"]): string {
@@ -220,6 +221,8 @@ export function ScaleDrawer({ patientId, open, onClose }: {
             </details>
           </div>
         )}
+
+        <QuestionnairePanel patientId={patientId} />
 
         {assessmentEvents && (
           <div className="card col">

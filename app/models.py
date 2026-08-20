@@ -3021,3 +3021,87 @@ class AssessmentCommand(SQLModel, table=True):
 @sa_event.listens_for(AssessmentCommand, "before_delete")
 def _reject_assessment_command_mutation(*_args) -> None:
     raise RuntimeError("AssessmentCommand 是只追加幂等/CAS账本")
+
+
+class QuestionnaireRecord(SQLModel, table=True):
+    """量表电子记录（原型道）：AI 初评永不覆盖人工终值，锁定后整行不可变。
+
+    与正式结局契约（AssessmentInstance 系）是两条道：这里承载临床提供、待
+    终确认的人工评价量表；status 只有 draft/locked，锁定即终态，改错走新记录。
+    """
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft','locked')",
+            name="ck_questionnaire_record_status"),
+        CheckConstraint(
+            "(status = 'draft' AND locked_by IS NULL AND locked_at IS NULL) OR "
+            "(status = 'locked' AND locked_by IS NOT NULL AND locked_at IS NOT NULL)",
+            name="ck_questionnaire_record_lock_complete"),
+        CheckConstraint(
+            "ai_draft_status IN ('none','not_applicable','generated',"
+            "'unavailable_no_data','unavailable_not_authorized','failed')",
+            name="ck_questionnaire_record_ai_draft_status"),
+        CheckConstraint(
+            "phase_label IN ('前测','后测','随访','其他')",
+            name="ck_questionnaire_record_phase_label"),
+    )
+    record_id: str = Field(primary_key=True)
+    patient_id: str = Field(foreign_key="patient.patient_id", index=True)
+    questionnaire_id: str
+    definition_sha256: str                        # 创建时定义包字节指纹
+    phase_label: str
+    status: str = "draft"
+    created_by: str
+    created_at: datetime = Field(default_factory=_utc_now_naive)
+    locked_by: Optional[str] = None
+    locked_at: Optional[datetime] = None
+    ai_draft_status: str = "none"
+    ai_draft_engine: Optional[str] = None
+    ai_draft_at: Optional[datetime] = None
+    computed_total: Optional[float] = None        # 锁定时按源表计分说明计算
+    cutoff_met: Optional[bool] = None
+    computed_flag: Optional[str] = None
+    scoring_rule_id: Optional[str] = None
+    note: Optional[str] = None                    # 施测备注（自由文本，永不进导出）
+
+
+@sa_event.listens_for(QuestionnaireRecord, "before_update")
+def _reject_locked_questionnaire_record_update(_mapper, _connection, target) -> None:
+    from sqlalchemy import inspect as _sa_inspect
+    history = _sa_inspect(target).attrs.status.history
+    previous_status = history.deleted[0] if history.deleted else target.status
+    if previous_status == "locked":
+        raise RuntimeError("QuestionnaireRecord 锁定后不可变；改错走新记录")
+
+
+@sa_event.listens_for(QuestionnaireRecord, "before_delete")
+def _reject_questionnaire_record_delete(*_args) -> None:
+    raise RuntimeError("QuestionnaireRecord 永不删除")
+
+
+class QuestionnaireItemValue(SQLModel, table=True):
+    """问卷逐条目值：AI 初评列与人工终值列并排永久留存（一致性课题的原始数据）。"""
+    __table_args__ = (
+        UniqueConstraint(
+            "record_id", "item_key", "field_key",
+            name="uq_questionnaire_item_value_slot"),
+        CheckConstraint(
+            "value_source IS NULL OR value_source IN "
+            "('human_direct','ai_accepted','ai_overridden')",
+            name="ck_questionnaire_item_value_source"),
+    )
+    id: Optional[int] = Field(default=None, primary_key=True)
+    record_id: str = Field(
+        foreign_key="questionnairerecord.record_id", index=True)
+    item_key: str
+    field_key: str
+    ai_draft_value: Optional[str] = None
+    ai_draft_rationale: Optional[str] = None      # 自由文本，永不进导出
+    final_value: Optional[str] = None
+    value_source: Optional[str] = None
+    updated_at: datetime = Field(default_factory=_utc_now_naive)
+
+
+@sa_event.listens_for(QuestionnaireItemValue, "before_delete")
+def _reject_questionnaire_item_value_delete(*_args) -> None:
+    raise RuntimeError("QuestionnaireItemValue 永不删除；清值=终值置空")

@@ -1416,12 +1416,12 @@ def test_publish_parent_fsync_failure_rolls_back_to_staging(monkeypatch, tmp_pat
 
 
 # --------------------------------------------------------------------------
-# Current head: 6f2a9c4d8e17 (frozen research row snapshot) recovery
+# Current head: b6d4f8a2c917 (questionnaire prototype records) recovery
 # contract, plus the quality-release/patient-pause/assessment layers beneath it.
 # --------------------------------------------------------------------------
 
 
-CURRENT_HEAD = "6f2a9c4d8e17"
+CURRENT_HEAD = "b6d4f8a2c917"
 QUALITY_RELEASE_HEAD = "141bc30e4580"
 DISPOSAL_HEAD = "f7c2e8a4d105"
 PROFILE_HEAD = "e4a7c1d9b206"

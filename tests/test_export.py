@@ -217,7 +217,7 @@ def test_export_ledger_migration_roundtrip_includes_staging_lease(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version"
-            )).scalar_one() == "6f2a9c4d8e17"
+            )).scalar_one() == "b6d4f8a2c917"
 
 
 def test_mask_redacts_all_free_text_without_trusting_client_flag():
@@ -1840,3 +1840,123 @@ def test_published_repeat_batch_with_drifted_classification_is_an_integrity_erro
         asset = probe.get(AudioAssetRow, ids["raw_audio_id"])
         assert (asset.status, asset.export_batch_id,
                 asset.exported_at) == asset_state
+
+
+# ---------------------------------------------------------------------------
+# 量表电子记录（QuestionnaireRecord / QuestionnaireItemValue）去标识导出面
+# ---------------------------------------------------------------------------
+
+QUESTIONNAIRE_RATIONALE_SENTINEL = "AI初评推理哨兵-RATIONALE-9f2c7e"
+QUESTIONNAIRE_NOTE_SENTINEL = "施测备注哨兵-NOTE-患者张三电话13800001111-4b8d"
+
+
+def _seed_locked_questionnaire_record(db, record_id="QR-locked-1"):
+    from app.models import QuestionnaireItemValue, QuestionnaireRecord
+    db.add(QuestionnaireRecord(
+        record_id=record_id, patient_id="P77",
+        questionnaire_id="gds15_v1", definition_sha256="d" * 64,
+        phase_label="前测", status="locked", created_by="R1",
+        locked_by="R1", locked_at=datetime(2026, 1, 2, 10, 0, 0),
+        ai_draft_status="generated", ai_draft_engine="qwen-plus",
+        ai_draft_at=datetime(2026, 1, 2, 9, 30, 0),
+        computed_total=8.0, cutoff_met=True, computed_flag="≥8 提示抑郁",
+        scoring_rule_id="gds15_total_v1",
+        note=QUESTIONNAIRE_NOTE_SENTINEL,
+    ))
+    db.add(QuestionnaireItemValue(
+        record_id=record_id, item_key="gds_01", field_key="value",
+        ai_draft_value="1", ai_draft_rationale=QUESTIONNAIRE_RATIONALE_SENTINEL,
+        final_value="1", value_source="ai_accepted"))
+    db.add(QuestionnaireItemValue(
+        record_id=record_id, item_key="gds_02", field_key="value",
+        ai_draft_value="0", ai_draft_rationale=QUESTIONNAIRE_RATIONALE_SENTINEL,
+        final_value="1", value_source="ai_overridden"))
+    db.commit()
+    return record_id
+
+
+def test_locked_questionnaire_record_exports_two_joined_deidentified_sheets(
+        db, tmp_path):
+    _seed(db)
+    record_id = _seed_locked_questionnaire_record(db)
+
+    res = _export_bundle(db, "S9", deidentify=True, write_dir=tmp_path)
+
+    records = res["sheets"]["questionnaire_records"]
+    values = res["sheets"]["questionnaire_item_values"]
+    assert len(records) == 1
+    record_row = records[0]
+    assert set(record_row) == {
+        "subject_code", "record_code", "questionnaire_id", "definition_sha256",
+        "phase_label", "status", "ai_draft_status", "ai_draft_engine",
+        "computed_total", "cutoff_met", "computed_flag", "scoring_rule_id"}
+    assert record_row["subject_code"] == pseudonymize("P77")
+    assert re.fullmatch(
+        r"QREC-v1-test-2026-[0-9a-f]{20}", record_row["record_code"])
+    assert record_id not in record_row["record_code"]
+    assert record_row["questionnaire_id"] == "gds15_v1"
+    assert record_row["definition_sha256"] == "d" * 64
+    assert record_row["phase_label"] == "前测"
+    assert record_row["status"] == "locked"
+    assert record_row["ai_draft_status"] == "generated"
+    assert record_row["ai_draft_engine"] == "qwen-plus"
+    assert record_row["computed_total"] == 8.0
+    assert record_row["cutoff_met"] is True
+    assert record_row["computed_flag"] == "≥8 提示抑郁"
+    assert record_row["scoring_rule_id"] == "gds15_total_v1"
+
+    assert [(v["item_key"], v["field_key"], v["ai_draft_value"],
+             v["final_value"], v["value_source"]) for v in values] == [
+        ("gds_01", "value", "1", "1", "ai_accepted"),
+        ("gds_02", "value", "0", "1", "ai_overridden")]
+    for value_row in values:
+        assert set(value_row) == {
+            "record_code", "item_key", "field_key",
+            "ai_draft_value", "final_value", "value_source"}
+        assert value_row["record_code"] == record_row["record_code"]
+
+    assert res["sheets"]["scales"] == []
+
+
+def test_questionnaire_export_never_leaks_rationale_note_or_raw_record_id(
+        db, tmp_path):
+    _seed(db)
+    record_id = _seed_locked_questionnaire_record(db)
+
+    res = _export_bundle(db, "S9", deidentify=True, write_dir=tmp_path)
+
+    flat = str(res["sheets"])
+    assert QUESTIONNAIRE_RATIONALE_SENTINEL not in flat
+    assert QUESTIONNAIRE_NOTE_SENTINEL not in flat
+    assert record_id not in flat
+    for row in (res["sheets"]["questionnaire_records"]
+                + res["sheets"]["questionnaire_item_values"]):
+        assert "ai_draft_rationale" not in row
+        assert "created_by" not in row
+        assert "locked_by" not in row
+        assert "record_id" not in row
+        assert row.get("note") in (None, export_security.REDACTED_TEXT)
+        assert not any(key.endswith("_at") for key in row)
+        assert not any(
+            isinstance(value, (date, datetime)) for value in row.values())
+
+    csv_paths = list(tmp_path.rglob("*.csv"))
+    assert "questionnaire_records" in {p.stem for p in csv_paths}
+    assert "questionnaire_item_values" in {p.stem for p in csv_paths}
+    written = "\n".join(p.read_text(encoding="utf-8-sig") for p in csv_paths)
+    assert QUESTIONNAIRE_RATIONALE_SENTINEL not in written
+    assert QUESTIONNAIRE_NOTE_SENTINEL not in written
+    assert record_id not in written
+
+
+def test_withdrawn_subject_questionnaire_records_never_export(db, tmp_path):
+    _seed(db)
+    _seed_locked_questionnaire_record(db)
+    patient = db.get(Patient, "P77")
+    patient.withdrawal_status = "withdrawn"
+    db.add(patient)
+    db.commit()
+
+    with pytest.raises(ValueError, match="受试者已撤回"):
+        _export_bundle(db, "S9", deidentify=True, write_dir=tmp_path)
+    assert not list(tmp_path.rglob("*.csv"))

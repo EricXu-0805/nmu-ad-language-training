@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 
-GLOBAL_HEAD = "6f2a9c4d8e17"
+GLOBAL_HEAD = "b6d4f8a2c917"
 #: 本迁移自身的版本。它已不再是全局 head(求助处置转移在其上),所以下面一律
 #: 显式升到 THIS 而不是 "head"——升到 head 会把后代表也建起来,再往下降时
 #: 后代的 downgrade 先执行、先提交,schema 快照就对不上了。

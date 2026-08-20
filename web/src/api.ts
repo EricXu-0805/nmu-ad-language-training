@@ -58,6 +58,15 @@ import {
 } from "./console/sessionCloseout";
 import { parseScaleProtocolReadiness } from "./console/scaleProtocol";
 import {
+  parseQuestionnaireCatalog,
+  parseQuestionnaireRecord,
+  parseQuestionnaireRecordList,
+  type QuestionnaireCatalogEntry,
+  type QuestionnairePhaseLabel,
+  type QuestionnaireRecord,
+  type QuestionnaireValueWrite,
+} from "./console/questionnaires";
+import {
   assertFormalAssessmentMutationReady,
   parseAssessmentEvent,
   parseAssessmentEventList,
@@ -777,6 +786,46 @@ export const api = {
     "GET", "/content/scale-protocol", undefined,
     DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
   )),
+  // 量表电子记录(原型道):定义含逐题词,只经这些认证接口下发,永不进前端构建产物。
+  listQuestionnaireDefinitions: async (): Promise<QuestionnaireCatalogEntry[]> =>
+    parseQuestionnaireCatalog(await req<unknown>(
+      "GET", "/questionnaires/definitions", undefined,
+      DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
+    )),
+  listQuestionnaireRecords: async (patientId: string): Promise<QuestionnaireRecord[]> =>
+    parseQuestionnaireRecordList(await req<unknown>(
+      "GET", `/patients/${encodeURIComponent(patientId)}/questionnaire-records`,
+      undefined, DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
+    ), { patientId }),
+  createQuestionnaireRecord: async (
+    patientId: string,
+    body: { questionnaire_id: string; phase_label: QuestionnairePhaseLabel; note?: string },
+  ): Promise<QuestionnaireRecord> =>
+    parseQuestionnaireRecord(await req<unknown>(
+      "POST", `/patients/${encodeURIComponent(patientId)}/questionnaire-records`, body,
+    ), { patientId }),
+  putQuestionnaireValues: async (
+    record: QuestionnaireRecord,
+    values: QuestionnaireValueWrite[],
+  ): Promise<QuestionnaireRecord> =>
+    parseQuestionnaireRecord(await req<unknown>(
+      "PUT", `/questionnaire-records/${encodeURIComponent(record.record_id)}/values`,
+      { values },
+    ), { patientId: record.patient_id, recordId: record.record_id }),
+  // AI 初评要等云端 LLM 一轮往返,超时对齐 probeProviderReadiness。
+  generateQuestionnaireAiDraft: async (
+    record: QuestionnaireRecord,
+  ): Promise<QuestionnaireRecord> =>
+    parseQuestionnaireRecord(await req<unknown>(
+      "POST", `/questionnaire-records/${encodeURIComponent(record.record_id)}/ai-draft`,
+      undefined, 75_000,
+    ), { patientId: record.patient_id, recordId: record.record_id }),
+  lockQuestionnaireRecord: async (
+    record: QuestionnaireRecord,
+  ): Promise<QuestionnaireRecord> =>
+    parseQuestionnaireRecord(await req<unknown>(
+      "POST", `/questionnaire-records/${encodeURIComponent(record.record_id)}/lock`,
+    ), { patientId: record.patient_id, recordId: record.record_id }),
   listPatientAssessmentEvents: async (patientId: string): Promise<AssessmentEvent[]> =>
     parseAssessmentEventList(await req<unknown>(
       "GET", `/patients/${encodeURIComponent(patientId)}/assessment-events`, undefined,

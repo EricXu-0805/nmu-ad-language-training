@@ -1,0 +1,21 @@
+{
+  "schema_version": "questionnaire-index.v1",
+  "note": "量表电子记录（原型）索引。字节钉：改任何数据包必须同步改本索引，单文件静默漂移不可能。来源与终确认状态见各包 provenance。",
+  "questionnaires": [
+    {
+      "questionnaire_id": "sfacs_v1",
+      "file": "sfacs_v1.json",
+      "content_sha256": "34798fc0a925ba71cac61936b655361b3ddd66a805fa91bfa14abe32b4eed8e8"
+    },
+    {
+      "questionnaire_id": "gds15_v1",
+      "file": "gds15_v1.json",
+      "content_sha256": "e3f7b61f042a9fb3e626bc5298ee1f4e29f9eeef915904947a0cfa505c069196"
+    },
+    {
+      "questionnaire_id": "npiq_v1",
+      "file": "npiq_v1.json",
+      "content_sha256": "12e9521c658d7f01fa18867fce95e4fa5ecdbcdf05196372fb1ecbbfb09fc836"
+    }
+  ]
+}

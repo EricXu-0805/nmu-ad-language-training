@@ -37,7 +37,8 @@ from .models import (
     AbnormalEvent, AttemptCaptureProcessing, AttemptEvent, AudioAssetRow,
     AudioCaptureReceipt, AutopilotRepeatRequest, InteractionEvent, ItemEvent,
     AutopilotControlEvent, Patient, PatientDeviceCapability,
-    PatientWithdrawalEvent, RuntimeCommand, RuntimeCommandAck,
+    PatientWithdrawalEvent, QuestionnaireItemValue, QuestionnaireRecord,
+    RuntimeCommand, RuntimeCommandAck,
     ExportArtifact, ExportBatch, ScaleResult, Session as TrainSession, SessionCloseoutReport,
     SessionOutcomeSummary, SessionRuntimeState, TurnEvent,
 )
@@ -1338,6 +1339,52 @@ def export_session_bundle(
         "source_schema": "legacy_free_form_scale_result",
     } for s in scale_rows]
 
+    # --- 量表电子记录（原型道）---
+    # 撤回口径与 ScaleResult 相同：本函数入口已对撤回受试者整体拒绝导出，
+    # 记录按 patient_id 归属取数，不设旁路。note / ai_draft_rationale /
+    # created_by / locked_by 与全部绝对时间列一律不产；两表用同一域的
+    # HMAC 假名 record_code 连接，裸 record_id 不出。
+    def questionnaire_record_code(record_id: str) -> str:
+        return export_security._tokenize_identifier(
+            record_id, domain="questionnaire-record", prefix="QREC",
+            config=deidentification_config)
+
+    questionnaire_records = list(db.exec(
+        select(QuestionnaireRecord)
+        .where(QuestionnaireRecord.patient_id == sess.patient_id)
+        .order_by(QuestionnaireRecord.record_id)))
+    questionnaire_record_sheet = [{
+        **subject_cols(),
+        "record_code": questionnaire_record_code(record.record_id),
+        "questionnaire_id": record.questionnaire_id,
+        "definition_sha256": record.definition_sha256,
+        "phase_label": record.phase_label,
+        "status": record.status,
+        "ai_draft_status": record.ai_draft_status,
+        "ai_draft_engine": record.ai_draft_engine,
+        "computed_total": record.computed_total,
+        "cutoff_met": record.cutoff_met,
+        "computed_flag": record.computed_flag,
+        "scoring_rule_id": record.scoring_rule_id,
+    } for record in questionnaire_records]
+    questionnaire_item_value_sheet: list[dict] = []
+    if questionnaire_records:
+        questionnaire_values = list(db.exec(
+            select(QuestionnaireItemValue)
+            .where(QuestionnaireItemValue.record_id.in_(
+                [record.record_id for record in questionnaire_records]))
+            .order_by(QuestionnaireItemValue.record_id,
+                      QuestionnaireItemValue.item_key,
+                      QuestionnaireItemValue.field_key)))
+        questionnaire_item_value_sheet = [{
+            "record_code": questionnaire_record_code(value.record_id),
+            "item_key": value.item_key,
+            "field_key": value.field_key,
+            "ai_draft_value": value.ai_draft_value,
+            "final_value": value.final_value,
+            "value_source": value.value_source,
+        } for value in questionnaire_values]
+
     # --- 异常/介入 ---
     abn_rows = list(db.exec(select(AbnormalEvent).where(AbnormalEvent.session_id == session_id)))
     abn_sheet = [{**session_cols(), "phase_type": _v(a.phase_type),
@@ -1469,6 +1516,8 @@ def export_session_bundle(
               "interactions": interaction_sheet, "item_scores": score_sheet,
               "scales": scale_sheet,
               "legacy_unverified_scales": legacy_unverified_scale_sheet,
+              "questionnaire_records": questionnaire_record_sheet,
+              "questionnaire_item_values": questionnaire_item_value_sheet,
               "abnormal": abn_sheet, "audio_manifest": audio_sheet,
               "repeat_audio_manifest": repeat_audio_sheet}
     for row in repeat_audio_sheet:

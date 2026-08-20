@@ -14,7 +14,10 @@ from sqlmodel import Session, SQLModel, select
 from app.models import QualityReleaseEpoch, QualityReleaseEpochRowSnapshot
 
 
-HEAD = "6f2a9c4d8e17"
+HEAD = "b6d4f8a2c917"
+# 被测层（研究行快照迁移）自身的修订边界：拒绝断言必须钉在这一层，
+# 全局头再往前走也不许把上层空表 DDL 混进「本层 DDL 前拒绝」的观察窗。
+SNAPSHOT_REV = "6f2a9c4d8e17"
 PARENT = "141bc30e4580"
 
 
@@ -235,6 +238,8 @@ def test_downgrade_refuses_any_snapshot_evidence_before_any_ddl(
         )
         if evidence_kind == "row":
             _insert_snapshot_row(connection, epoch_id="EPOCH-EVIDENCE")
+    # 先合法退掉上层（问卷原型层，空表），把观察窗对准被测层边界。
+    command.downgrade(config, SNAPSHOT_REV)
     schema_before = _schema_rows(engine)
 
     with pytest.raises(RuntimeError, match="quality-release evidence prevents"):
@@ -243,7 +248,7 @@ def test_downgrade_refuses_any_snapshot_evidence_before_any_ddl(
     assert _schema_rows(engine) == schema_before
     with engine.connect() as connection:
         assert connection.execute(text(
-            "SELECT version_num FROM alembic_version")).scalar_one() == HEAD
+            "SELECT version_num FROM alembic_version")).scalar_one() == SNAPSHOT_REV
         expected_rows = 1 if evidence_kind == "row" else 0
         assert connection.execute(text(
             "SELECT count(*) FROM qualityreleaseepochrowsnapshot"

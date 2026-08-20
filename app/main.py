@@ -46,6 +46,7 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                resource_limits, patient_asset, patient_presentation,
                provider_readiness, quality_release, repeat_evidence, repeat_intent,
                research_dataset, research_read,
+               questionnaire_ai_draft, questionnaires,
                scale_protocol,
                session_admission, session_closeout, tts,
                visit_plan_contract, visit_plan_service)
@@ -63,6 +64,7 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
                      Patient, PatientDeviceCapability, PatientPauseReceipt,
                      PatientWithdrawalEvent,
+                     QuestionnaireItemValue, QuestionnaireRecord,
                      RuntimeCommand, ScaleResult,
                      SessionAutopilotState,
                      SessionCloseoutReport, SessionOutcomeSummary,
@@ -13351,6 +13353,342 @@ def list_scales(patient_id: str, request: Request, response: Response,
             "patient_id": patient_id,
         })
     return list(s.exec(_select(ScaleResult, ScaleResult.patient_id == patient_id)))
+
+
+# ---------------- 量表电子记录（原型道）：AI 初评 + 人工二次核验 ----------------
+# 与正式结局契约（assessment_*）是两条道：这里承载临床提供、待终确认的
+# 人工评价量表（SFACS/GDS-15/NPI-Q）。AI 初评永不覆盖人工终值；锁定即终态。
+
+_QUESTIONNAIRE_READ_ROLES = {"researcher", "data_steward", "admin"}
+_QUESTIONNAIRE_WRITE_ROLES = {"researcher", "admin"}
+
+
+def _questionnaire_registry_or_503():
+    try:
+        return questionnaires.load_questionnaire_registry()
+    except content.FrozenContentUnavailable as exc:
+        raise HTTPException(status_code=503, detail={
+            "code": "questionnaire_content_unavailable",
+            "message": f"量表定义包不可用：{exc}",
+        })
+
+
+def _questionnaire_patient_or_reject(s: DBSession, patient_id: str) -> Patient:
+    patient = s.get(Patient, patient_id)
+    if not patient:
+        raise HTTPException(404, "患者不存在,先建档")
+    if ((patient.withdrawal_status or "").strip()
+            or (patient.consent_status or "").strip().casefold()
+            in _CONSENT_DENIED_STATUSES):
+        raise HTTPException(409, "受试者已撤回或拒绝，禁止量表记录读写")
+    return patient
+
+
+def _questionnaire_record_or_404(s: DBSession, record_id: str) -> QuestionnaireRecord:
+    record = s.get(QuestionnaireRecord, record_id)
+    if not record:
+        raise HTTPException(404, "量表记录不存在")
+    return record
+
+
+def _questionnaire_values(s: DBSession, record_id: str) -> list[QuestionnaireItemValue]:
+    return list(s.exec(_select(
+        QuestionnaireItemValue,
+        QuestionnaireItemValue.record_id == record_id)))
+
+
+def _questionnaire_record_out(record: QuestionnaireRecord,
+                              values: list[QuestionnaireItemValue]) -> dict:
+    return {
+        "schema_version": "questionnaire-record.v1",
+        "record_id": record.record_id,
+        "patient_id": record.patient_id,
+        "questionnaire_id": record.questionnaire_id,
+        "definition_sha256": record.definition_sha256,
+        "phase_label": record.phase_label,
+        "status": record.status,
+        "created_by": record.created_by,
+        "created_at": record.created_at,
+        "locked_by": record.locked_by,
+        "locked_at": record.locked_at,
+        "ai_draft_status": record.ai_draft_status,
+        "ai_draft_engine": record.ai_draft_engine,
+        "ai_draft_at": record.ai_draft_at,
+        "computed_total": record.computed_total,
+        "cutoff_met": record.cutoff_met,
+        "computed_flag": record.computed_flag,
+        "scoring_rule_id": record.scoring_rule_id,
+        "note": record.note,
+        "values": [
+            {
+                "item_key": value.item_key,
+                "field_key": value.field_key,
+                "ai_draft_value": value.ai_draft_value,
+                "ai_draft_rationale": value.ai_draft_rationale,
+                "final_value": value.final_value,
+                "value_source": value.value_source,
+            }
+            for value in sorted(values, key=lambda v: (v.item_key, v.field_key))
+        ],
+    }
+
+
+@app.get("/questionnaires/definitions")
+def list_questionnaire_definitions(request: Request, response: Response):
+    """定义含逐题词，只经认证接口下发，永不进前端构建产物。"""
+    _require_account_identity(
+        request, "读取量表定义", roles=_QUESTIONNAIRE_READ_ROLES,
+        allow_local_m0=True)
+    response.headers["Cache-Control"] = "private, no-store"
+    registry = _questionnaire_registry_or_503()
+    return {
+        "schema_version": "questionnaire-catalog.v1",
+        "questionnaires": [
+            {
+                "content_sha256": loaded.content_sha256,
+                "definition": loaded.definition.model_dump(mode="json"),
+            }
+            for _, loaded in sorted(registry.items())
+        ],
+    }
+
+
+class QuestionnaireRecordCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    questionnaire_id: str = PydanticField(min_length=1, max_length=64)
+    phase_label: Literal["前测", "后测", "随访", "其他"]
+    note: str | None = PydanticField(default=None, max_length=2000)
+
+
+@app.post("/patients/{patient_id}/questionnaire-records")
+def create_questionnaire_record(patient_id: str, body: QuestionnaireRecordCreateIn,
+                                request: Request,
+                                s: DBSession = Depends(get_session)):
+    operator = _require_account_identity(
+        request, "建立量表电子记录", roles=_QUESTIONNAIRE_WRITE_ROLES,
+        allow_local_m0=True)
+    _questionnaire_patient_or_reject(s, patient_id)
+    registry = _questionnaire_registry_or_503()
+    loaded = registry.get(body.questionnaire_id)
+    if loaded is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "questionnaire_unknown",
+            "message": f"量表 {body.questionnaire_id} 未注册",
+            "registered": sorted(registry),
+        })
+    record = QuestionnaireRecord(
+        record_id=f"qr_{secrets.token_hex(12)}",
+        patient_id=patient_id,
+        questionnaire_id=body.questionnaire_id,
+        definition_sha256=loaded.content_sha256,
+        phase_label=body.phase_label,
+        created_by=operator,
+        note=body.note,
+    )
+    s.add(record)
+    s.commit()
+    s.refresh(record)
+    _audit(s, request, "questionnaire_record",
+           f"建立量表记录 {body.questionnaire_id}/{body.phase_label}",
+           patient_id=patient_id)
+    return _questionnaire_record_out(record, [])
+
+
+@app.get("/patients/{patient_id}/questionnaire-records")
+def list_questionnaire_records(patient_id: str, request: Request,
+                               response: Response,
+                               s: DBSession = Depends(get_session)):
+    _require_account_identity(
+        request, "读取量表电子记录", roles=_QUESTIONNAIRE_READ_ROLES,
+        allow_local_m0=True)
+    response.headers["Cache-Control"] = "private, no-store"
+    _questionnaire_patient_or_reject(s, patient_id)
+    records = list(s.exec(_select(
+        QuestionnaireRecord, QuestionnaireRecord.patient_id == patient_id)))
+    return {
+        "schema_version": "questionnaire-record-list.v1",
+        "records": [
+            _questionnaire_record_out(
+                record, _questionnaire_values(s, record.record_id))
+            for record in sorted(records, key=lambda r: r.created_at)
+        ],
+    }
+
+
+class QuestionnaireValueIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_key: str = PydanticField(min_length=1, max_length=64)
+    field_key: str = PydanticField(min_length=1, max_length=64)
+    value: str | None = PydanticField(default=None, max_length=16)
+
+
+class QuestionnaireValuesPutIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    values: list[QuestionnaireValueIn] = PydanticField(min_length=1, max_length=200)
+
+
+def _questionnaire_definition_for_record(record: QuestionnaireRecord):
+    registry = _questionnaire_registry_or_503()
+    loaded = registry.get(record.questionnaire_id)
+    if loaded is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "questionnaire_unknown",
+            "message": f"量表 {record.questionnaire_id} 已不在注册表内",
+        })
+    if loaded.content_sha256 != record.definition_sha256:
+        # 记录创建后定义包字节变了：草稿必须对着当初那份定义收口，拒绝混写。
+        raise HTTPException(status_code=409, detail={
+            "code": "questionnaire_definition_drifted",
+            "message": "定义包与记录创建时不一致；请新建记录",
+        })
+    return loaded.definition
+
+
+@app.put("/questionnaire-records/{record_id}/values")
+def put_questionnaire_values(record_id: str, body: QuestionnaireValuesPutIn,
+                             request: Request,
+                             s: DBSession = Depends(get_session)):
+    _require_account_identity(
+        request, "保存量表作答", roles=_QUESTIONNAIRE_WRITE_ROLES,
+        allow_local_m0=True)
+    record = _questionnaire_record_or_404(s, record_id)
+    _questionnaire_patient_or_reject(s, record.patient_id)
+    if record.status != "draft":
+        raise HTTPException(status_code=409, detail={
+            "code": "questionnaire_record_locked",
+            "message": "记录已锁定，不可再改；改错请新建记录",
+        })
+    definition = _questionnaire_definition_for_record(record)
+    problems: list[str] = []
+    for entry in body.values:
+        try:
+            questionnaires.validate_value_write(
+                definition, entry.item_key, entry.field_key, entry.value)
+        except questionnaires.QuestionnaireValidationError as exc:
+            problems.append(str(exc))
+    if problems:
+        raise HTTPException(status_code=409, detail={
+            "code": "questionnaire_value_invalid",
+            "message": "作答值未通过定义校验",
+            "problems": problems,
+        })
+    existing = {
+        (value.item_key, value.field_key): value
+        for value in _questionnaire_values(s, record_id)
+    }
+    for entry in body.values:
+        slot = existing.get((entry.item_key, entry.field_key))
+        if slot is None:
+            slot = QuestionnaireItemValue(
+                record_id=record_id, item_key=entry.item_key,
+                field_key=entry.field_key)
+            existing[(entry.item_key, entry.field_key)] = slot
+        slot.final_value = entry.value
+        if entry.value is None:
+            slot.value_source = None
+        elif slot.ai_draft_value is None:
+            slot.value_source = "human_direct"
+        elif entry.value == slot.ai_draft_value:
+            slot.value_source = "ai_accepted"
+        else:
+            slot.value_source = "ai_overridden"
+        slot.updated_at = utc_now_naive()
+        s.add(slot)
+    s.commit()
+    s.refresh(record)
+    return _questionnaire_record_out(record, _questionnaire_values(s, record_id))
+
+
+@app.post("/questionnaire-records/{record_id}/ai-draft")
+def generate_questionnaire_ai_draft(record_id: str, request: Request,
+                                    s: DBSession = Depends(get_session)):
+    _require_account_identity(
+        request, "生成量表 AI 初评", roles=_QUESTIONNAIRE_WRITE_ROLES,
+        allow_local_m0=True)
+    record = _questionnaire_record_or_404(s, record_id)
+    patient = _questionnaire_patient_or_reject(s, record.patient_id)
+    if record.status != "draft":
+        raise HTTPException(status_code=409, detail={
+            "code": "questionnaire_record_locked",
+            "message": "记录已锁定，AI 初评只在草稿期可用",
+        })
+    definition = _questionnaire_definition_for_record(record)
+    outcome = questionnaire_ai_draft.generate_draft(s, patient, definition)
+    record.ai_draft_status = outcome.status
+    record.ai_draft_engine = outcome.engine
+    record.ai_draft_at = utc_now_naive()
+    s.add(record)
+    if outcome.status == "generated":
+        existing = {
+            (value.item_key, value.field_key): value
+            for value in _questionnaire_values(s, record_id)
+        }
+        for item_key, draft in outcome.items.items():
+            slot = existing.get((item_key, questionnaires.FIELD_VALUE))
+            if slot is None:
+                slot = QuestionnaireItemValue(
+                    record_id=record_id, item_key=item_key,
+                    field_key=questionnaires.FIELD_VALUE)
+            slot.ai_draft_value = draft.value
+            slot.ai_draft_rationale = draft.rationale
+            slot.updated_at = utc_now_naive()
+            s.add(slot)
+    s.commit()
+    s.refresh(record)
+    _audit(s, request, "questionnaire_ai_draft",
+           f"AI 初评 {record.questionnaire_id} 状态={outcome.status}",
+           patient_id=record.patient_id)
+    return _questionnaire_record_out(record, _questionnaire_values(s, record_id))
+
+
+@app.post("/questionnaire-records/{record_id}/lock")
+def lock_questionnaire_record(record_id: str, request: Request,
+                              s: DBSession = Depends(get_session)):
+    operator = _require_account_identity(
+        request, "锁定量表电子记录", roles=_QUESTIONNAIRE_WRITE_ROLES,
+        allow_local_m0=True)
+    record = _questionnaire_record_or_404(s, record_id)
+    _questionnaire_patient_or_reject(s, record.patient_id)
+    if record.status != "draft":
+        raise HTTPException(status_code=409, detail={
+            "code": "questionnaire_record_locked",
+            "message": "记录已锁定",
+        })
+    definition = _questionnaire_definition_for_record(record)
+    values = _questionnaire_values(s, record_id)
+    final_map = {
+        (value.item_key, value.field_key): value.final_value
+        for value in values
+        if value.final_value is not None
+    }
+    try:
+        questionnaires.assert_lock_complete(definition, final_map)
+        scoring = questionnaires.compute_scoring(definition, final_map)
+    except questionnaires.QuestionnaireValidationError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": exc.code,
+            "message": str(exc),
+            "problems": exc.problems,
+        })
+    if scoring is not None:
+        record.computed_total = scoring["computed_total"]
+        record.cutoff_met = scoring["cutoff_met"]
+        record.computed_flag = scoring["computed_flag"]
+        record.scoring_rule_id = scoring["scoring_rule_id"]
+    record.status = "locked"
+    record.locked_by = operator
+    record.locked_at = utc_now_naive()
+    s.add(record)
+    s.commit()
+    s.refresh(record)
+    _audit(s, request, "questionnaire_lock",
+           f"锁定量表记录 {record.questionnaire_id}/{record.phase_label}"
+           + (f" 总分={record.computed_total}" if record.computed_total is not None else ""),
+           patient_id=record.patient_id)
+    return _questionnaire_record_out(record, _questionnaire_values(s, record_id))
 
 
 # ---------------- 评分重建（只读）+ 去标识化导出 ----------------

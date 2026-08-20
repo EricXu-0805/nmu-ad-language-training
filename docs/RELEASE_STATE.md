@@ -101,7 +101,17 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**无。生产 = `b1765c0` = origin/main（2026-08-20 00:10 上线）。**
+**有，且下次窗口含迁移。** 生产 = `b1765c0` / 库头 `6f2a9c4d8e17`；main 领先的增量 =
+量表电子记录原型道（SFACS / GDS-15 / NPI-Q + AI 初评，收据 219）：
+
+- **新迁移头 `b6d4f8a2c917`**（两张新表，空表 downgrade 可逆、有行拒绝）——
+  下次窗口必须走 runbook 的**迁移分支**：停 backup timer → 停服 → 最终停写快照
+  （旧校验器）→ 同步代码 → `check_database_head` 期望 exit 78 → `alembic upgrade
+  head` → 起服 → 预检 → **立刻 `systemctl start nmu-backup.service` 拍新头快照**
+  → 重装异地校验器（`verify_backup_snapshot.py` 本次改了：头钉+表清单+恢复指纹
+  `36c97917…`）→ 恢复 timer。依赖锁零变化，venv 不碰。
+- 新内容目录 `content/questionnaires/`（rsync 会带上，无需另置）。
+- 前端 dist 重建（同步后照常跑 `verify_browser_dist --source-root`）。
 
 ## 2026-08-20 上线记录（b1765c0：内容交付 + 快速演练修复 + UI 迭代，零迁移）
 

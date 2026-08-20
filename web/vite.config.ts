@@ -25,7 +25,7 @@ const prefixProxyPaths = [
   '/health', '/auth', '/patients', '/sessions', '/cloud-processing',
   '/score', '/judge', '/audio', '/items', '/turns', '/asr', '/live', '/tts',
   '/audit', '/ai', '/visit-plans', '/assessment-events', '/assessment-instances',
-  '/exports', '/governance',
+  '/exports', '/governance', '/questionnaires', '/questionnaire-records',
 ]
 const exactContentProxyPaths = [
   '/content/item-bank',

@@ -1,0 +1,52 @@
+{
+  "schema_version": "questionnaire-definition.v1",
+  "questionnaire_id": "gds15_v1",
+  "title": "简版老年抑郁量表（GDS-15）",
+  "short_name": "GDS-15",
+  "respondent": "patient_reported",
+  "status": "prototype",
+  "provenance": {
+    "provided_by": "钱凯（南医大）",
+    "provided_via": "微信文件",
+    "provided_on": "2026-08-20",
+    "source_file": "简版老年抑郁量表（GDS-15）.pdf",
+    "source_sha256": "60f1057b03ed89d47e661e58bd3dd13ad9e512f97751fe69534982e58f05c7b6",
+    "final_confirmation": "待钱凯与丁老师终确认；确认前本表按原型使用，不作为正式研究结局"
+  },
+  "instruction": "选择最切合您一周来的感受的答案，在每题后[ ]内答“是”或“否”。",
+  "response_kind": "binary_scored",
+  "value_field": {
+    "allowed": ["是", "否"],
+    "anchors": { "是": "是", "否": "否" }
+  },
+  "items": [
+    { "item_key": "gds_01", "no": 1, "text": "你对生活基本上满意吗？", "score_when": "否" },
+    { "item_key": "gds_02", "no": 2, "text": "你是否放弃了许多活动和兴趣爱好？", "score_when": "是" },
+    { "item_key": "gds_03", "no": 3, "text": "你是否觉得生活空虚？", "score_when": "是" },
+    { "item_key": "gds_04", "no": 4, "text": "你是否常感到厌倦？", "score_when": "是" },
+    { "item_key": "gds_05", "no": 5, "text": "你是否大部分时间感觉精神好？", "score_when": "否" },
+    { "item_key": "gds_06", "no": 6, "text": "你是否害怕会有不幸的事落到你头上？", "score_when": "是" },
+    { "item_key": "gds_07", "no": 7, "text": "你是否大部分时间感到快乐？", "score_when": "否" },
+    { "item_key": "gds_08", "no": 8, "text": "你是否常感有无助的感觉？", "score_when": "是" },
+    { "item_key": "gds_09", "no": 9, "text": "你是否愿意呆在家里而不愿去做些新鲜事？", "score_when": "是" },
+    { "item_key": "gds_10", "no": 10, "text": "你是否觉得记忆力比大多数人差？", "score_when": "是" },
+    { "item_key": "gds_11", "no": 11, "text": "你是否认为现在活着很惬意？", "score_when": "否" },
+    { "item_key": "gds_12", "no": 12, "text": "你是否觉得像现在这样活着毫无意义？", "score_when": "是" },
+    { "item_key": "gds_13", "no": 13, "text": "你是否觉得你的处境没有帮助？", "score_when": "是" },
+    { "item_key": "gds_14", "no": 14, "text": "你是否觉得大多数人处境比你好？", "score_when": "是" },
+    { "item_key": "gds_15", "no": 15, "text": "你集中精力有困难吗？", "score_when": "是" }
+  ],
+  "scoring": {
+    "kind": "binary_sum",
+    "scoring_rule_id": "gds15.source_scoring.v1",
+    "max_score": 15,
+    "cutoff_value": 8,
+    "cutoff_operator": ">=",
+    "cutoff_label": "有抑郁症状",
+    "rule_verbatim": "计分说明：量表共 15 个条目，每一句话代表一个条目，要求受试者回答“是”或“否”。1，5，7，11 答‘否’者记 1 分，其他题答‘是’者记 1 分。最高分为 15 分，分数越高，表示抑郁症状越明显，分数≥8 分为有抑郁症状。"
+  },
+  "transcription_notes": [
+    "逐字来源：钱凯 2026-08-20 微信提供的 PDF（source_sha256 见上），未改任何字。",
+    "计分赋值（1、5、7、11 反向计分）逐字来自源件计分说明，锁定时由平台自动计算并与逐项作答一并留存。"
+  ]
+}
