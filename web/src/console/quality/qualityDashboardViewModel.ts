@@ -57,6 +57,8 @@ export interface QualityDashboardGroupViewModel {
   dimensions: QualityDimensionViewModel[];
   visibilityNotice: QualityNoticeViewModel;
   suppressionNotice: QualityNoticeViewModel;
+  /** 隐私公开阈值未配置或无效：整组统计不渲染,只保留顶部说明。 */
+  metricsWithheld: boolean;
   diagnosticsNotice: QualityNoticeViewModel;
   coverageMetrics: QualityMetricViewModel[];
   diagnosticMetrics: QualityMetricViewModel[];
@@ -105,7 +107,7 @@ const DIAGNOSTIC_META: ReadonlyArray<{
   { key: "restricted_or_withdrawn_sessions", label: "受限或已退出场次", detail: "因治理状态未进入质量聚合的场次" },
   { key: "classification_inconsistent_sessions", label: "分区矛盾场次", detail: "数据分区证据不一致的场次" },
   { key: "protocol_binding_invalid_sessions", label: "方案绑定无效场次", detail: "未能验证冻结题库或自动化方案绑定的场次" },
-  { key: "structural_invalid_evidence_records", label: "结构无效证据记录", detail: "字段不完整、状态矛盾或缺少配对回执的记录" },
+  { key: "structural_invalid_evidence_records", label: "结构无效证据记录", detail: "字段不完整、状态矛盾或缺少配对确认的记录" },
   { key: "lineage_invalid_turns", label: "证据链路无效轮次", detail: "与场次、题目位置或轮次归属不一致" },
   { key: "audio_evidence_unavailable_turns", label: "录音证据不可用轮次", detail: "无法证明录音证据完整的轮次" },
   { key: "ai_attempt_status_unknown_turns", label: "AI 尝试状态未知轮次", detail: "无法确认是否进入 AI 处理链" },
@@ -120,17 +122,17 @@ const VISIBILITY_SCOPE_COPY: Readonly<Record<QualityVisibilityScope, QualityNoti
   owner_sessions: {
     tone: "info",
     title: "当前账号可见范围：本人负责场次",
-    text: "overall 仅聚合当前账号负责且有权访问的场次；不可与其他角色的 overall 直接对比。",
+    text: "总览仅聚合当前账号负责且有权访问的场次；不可与其他角色的总览直接对比。",
   },
   terminal_sessions: {
     tone: "info",
     title: "当前账号可见范围：已进入终态的场次",
-    text: "overall 仅聚合当前数据管理账号可查看的已完成、已中止或已失败场次；不可与其他角色的 overall 直接对比。",
+    text: "总览仅聚合当前数据管理账号可查看的已完成、已中止或已失败场次；不可与其他角色的总览直接对比。",
   },
   all_sessions: {
     tone: "info",
     title: "当前账号可见范围：全部授权场次",
-    text: "overall 聚合当前账号有权访问的全部场次；不可与范围更窄的 overall 直接对比。",
+    text: "总览聚合当前账号有权访问的全部场次；不可与范围更窄的总览直接对比。",
   },
 };
 
@@ -204,10 +206,10 @@ function latencyMetric(
 }
 
 function dimensionValue(key: keyof QualityDashboardDimensions, value: string | number | null): string {
-  if (value !== null) return value === "research" ? "真实研究 overall" : "模拟演练 overall";
+  if (value !== null) return value === "research" ? "真实研究总览" : "模拟演练总览";
   if (key === "device_profile") return "v2 首版未发布（设备画像覆盖未知）";
   if (key === "provider_id") return "v2 首版未发布（提供方覆盖未知）";
-  return "overall 首版不按此维度分组";
+  return "总览首版不按此维度分组";
 }
 
 function buildDimensions(dimensions: QualityDashboardDimensions): QualityDimensionViewModel[] {
@@ -224,29 +226,35 @@ function suppressionNotice(group: QualityDashboardGroup): QualityNoticeViewModel
   if (suppression.status === "not_applicable") {
     return {
       tone: "info",
-      title: "模拟分区不适用真实研究小单元门槛",
+      title: "模拟分区不设隐私公开门槛",
       text: "本区只用于流程与模型调试；任何复核比较都不可并入真实研究结论。",
     };
   }
   if (suppression.status === "released") {
     return {
       tone: "info",
-      title: "真实研究 overall 已通过隐私门槛",
+      title: "真实研究总览已通过隐私门槛",
       text: `本次汇总覆盖 ${String(suppression.distinct_subjects)} 名受试者（隐私要求至少 ${String(suppression.minimum_distinct_subjects)} 名）。样本量是否足够需另行评估。`,
     };
   }
-  const reasonText = {
-    research_threshold_unconfigured: "不同受试者最小公开阈值尚未配置",
-    research_threshold_invalid: "不同受试者最小公开阈值配置无效",
-    research_small_cell: `未达到至少 ${String(suppression.minimum_distinct_subjects)} 名不同受试者的公开阈值`,
-    research_release_not_frozen: "真实研究质量发布批次尚未冻结",
-  }[suppression.reason!];
+  if (suppression.reason === "research_threshold_unconfigured" || suppression.reason === "research_threshold_invalid") {
+    return {
+      tone: "warn",
+      title: "真实研究统计暂不显示",
+      text: suppression.reason === "research_threshold_unconfigured"
+        ? "隐私公开阈值还没设置，所有统计暂不显示；请数据管理员配置后查看。"
+        : "隐私公开阈值配置无效，所有统计暂不显示；请数据管理员修正配置后查看。",
+    };
+  }
+  const reasonText = suppression.reason === "research_small_cell"
+    ? `未达到至少 ${String(suppression.minimum_distinct_subjects)} 名不同受试者的公开阈值`
+    : "真实研究质量发布批次尚未冻结";
   const releaseBoundary = suppression.reason === "research_release_not_frozen"
     ? "待研究数据冻结版本发布后开放。"
     : "";
   return {
     tone: "warn",
-    title: "真实研究 overall 已做隐私抑制",
+    title: "真实研究总览已做隐私抑制",
     text: `${reasonText}；为保护隐私，本组的受试者数与各项计数暂不显示。${releaseBoundary}`,
   };
 }
@@ -275,7 +283,7 @@ function diagnosticsNotice(group: QualityDashboardGroup): QualityNoticeViewModel
 
 function unavailableContext(group: QualityDashboardGroup): MetricUnavailableContext {
   if (group.suppression.status === "suppressed") {
-    return { state: "suppressed", detail: "已按真实研究小单元隐私规则抑制，不能解释为 0" };
+    return { state: "suppressed", detail: "已按隐私规则隐藏，不等于 0" };
   }
   return { state: "unknown", detail: "证据不足，暂无法计算" };
 }
@@ -299,12 +307,12 @@ function buildResearchTruth(
         ? "empty"
         : "available";
   const sectionTitle = isResearch
-    ? "人工锁定研究真值（复核口径）"
+    ? "人工锁定研究评分（复核口径）"
     : "模拟复核参考（不可用于研究结论）";
   const notice: QualityNoticeViewModel = availability === "suppressed"
     ? {
       tone: "warn",
-      title: "研究真值已做隐私抑制",
+      title: "研究评分已做隐私抑制",
       text: "小单元内的复核计数和混淆矩阵均不发布，不能从运行指标反推。",
     }
     : availability === "empty"
@@ -316,12 +324,12 @@ function buildResearchTruth(
       : availability === "unknown"
         ? {
           tone: "warn",
-          title: isResearch ? "人工研究真值不可用" : "模拟复核参考不可用",
+          title: isResearch ? "人工研究评分不可用" : "模拟复核参考不可用",
           text: "请结合覆盖与固定诊断原因；不得由 AI 运行结果推断准确性。",
         }
         : {
           tone: "info",
-          title: isResearch ? "人工研究真值已释放（样本量仍需审阅）" : "模拟复核参考已生成",
+          title: isResearch ? "人工研究评分已可查看（样本量仍需审阅）" : "模拟复核参考已生成",
           text: isResearch
             ? "仅用于核查 AI 判定；样本量是否足够需另行评估。"
             : "仅用于模拟流程与模型调试，不得并入真实研究结果。",
@@ -336,18 +344,18 @@ function buildResearchTruth(
     ? truth.true_positive + truth.true_negative
     : null;
   const reviewedLabel = isResearch ? "人工已锁定研究判定" : "模拟复核判定";
-  const comparisonLabel = isResearch ? "AI 与人工研究真值一致率" : "AI 与模拟复核一致率";
+  const comparisonLabel = isResearch ? "AI 与人工研究评分一致率" : "AI 与模拟复核一致率";
   return {
     availability,
     sectionTitle,
-    metricsTitle: isResearch ? "人工研究真值比较指标" : "模拟复核比较指标",
+    metricsTitle: isResearch ? "人工研究评分比较指标" : "模拟复核比较指标",
     notice,
     comparisonKind: isResearch ? "research" : "simulation",
     reviewedDecisions: countMetric(
       "reviewed-decisions",
       reviewedLabel,
       truth.reviewed_decisions,
-      isResearch ? "仅统计已锁定的人工研究真值" : "只统计模拟复核参考",
+      isResearch ? "仅统计已锁定的人工研究评分" : "只统计模拟复核参考",
       unavailable,
     ),
     agreementRate: ratioMetric("agreement-rate", comparisonLabel, agreements, matrixTotal, "一致判定/完整混淆矩阵", unavailable),
@@ -401,11 +409,14 @@ function buildGroup(group: QualityDashboardGroup): QualityDashboardGroupViewMode
   const classification = group.dimensions.data_classification;
   return {
     key: classification,
-    heading: classification === "research" ? "真实研究 overall" : "模拟演练 overall",
+    heading: classification === "research" ? "真实研究总览" : "模拟演练总览",
     classification,
     dimensions: buildDimensions(group.dimensions),
     visibilityNotice: VISIBILITY_SCOPE_COPY[group.visibility_scope],
     suppressionNotice: suppressionNotice(group),
+    metricsWithheld: group.suppression.status === "suppressed"
+      && (group.suppression.reason === "research_threshold_unconfigured"
+        || group.suppression.reason === "research_threshold_invalid"),
     diagnosticsNotice: diagnosticsNotice(group),
     coverageMetrics: [
       countMetric("visible-sessions", "当前分区可见场次", coverage.visible_sessions, "访问治理后可见的场次", unavailable),
@@ -434,11 +445,11 @@ function buildGroup(group: QualityDashboardGroup): QualityDashboardGroupViewMode
       ratioMetric("coverage", "AI 判定覆盖率", operational.ai_judged_turns, operational.eligible_turns, "完成 AI 判定的轮次/可评估轮次", unavailable),
       countMetric("eligible-turns", "可评估轮次", operational.eligible_turns, "按冻结方案应评估的轮次", unavailable),
       countMetric("ai-attempted-turns", "AI 已尝试轮次", operational.ai_attempted_turns, "进入 AI 处理链的轮次", unavailable),
-      countMetric("ai-judged-turns", "AI 已完成判定", operational.ai_judged_turns, "AI 运行判定；不是复核真值", unavailable),
+      countMetric("ai-judged-turns", "AI 已完成判定", operational.ai_judged_turns, "AI 运行判定；不是人工复核结果", unavailable),
       ratioMetric("asr-correction-rate", "ASR 人工修正率", operational.asr_corrected_turns, operational.asr_reviewed_turns, "人工修正/人工已复核 ASR", unavailable),
     ],
     promptMetrics: [
-      ratioMetric("prompt-escalation-rate", "录音尝试提示上下文升级率", promptEscalations, promptAttemptContextTotal, "处于轻提示或明确提示上下文的录音尝试 / 0..2 级上下文已知的录音尝试；不包含未落账的告知答案呈现", unavailable),
+      ratioMetric("prompt-escalation-rate", "录音尝试提示上下文升级率", promptEscalations, promptAttemptContextTotal, "处于轻提示或明确提示上下文的录音尝试 / 0..2 级上下文已知的录音尝试；不包含未记录的告知答案呈现", unavailable),
       ratioMetric("tell-answer-rate", "告知答案率", operational.prompt_level_3_count, operational.total_attempts, "告知答案呈现 / 全部录音尝试", tellAnswerUnavailable),
       countMetric("prompt-level-0", "0 级：无提示", operational.prompt_level_0_count, "录音尝试所处提示上下文：自发作答", unavailable),
       countMetric("prompt-level-1", "1 级：轻提示", operational.prompt_level_1_count, "录音尝试所处提示上下文：轻提示后作答", unavailable),

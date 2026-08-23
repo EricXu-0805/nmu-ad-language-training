@@ -80,7 +80,12 @@ export function useSessionRuntime(sessionId: string) {
   const setPaused = useCallback(async (paused: boolean) => {
     if (busy) return null;
     if (runtime && isSessionTerminalStatus(runtime.status)) {
-      setError(`场次已进入终态 ${runtime.status}，只能查看，不能再暂停或恢复`);
+      const statusLabel = runtime.status === "completed" ? "已完成"
+        : runtime.status === "aborted" ? "已中止"
+        : runtime.status === "intervention_completed" ? "现场训练已结束"
+        : runtime.status === "failed" ? "已失败"
+        : runtime.status;
+      setError(`本场训练${statusLabel}，只能查看，不能再暂停或恢复`);
       return null;
     }
     setBusy(true);

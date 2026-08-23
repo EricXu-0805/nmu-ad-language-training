@@ -30,8 +30,8 @@ from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
 from . import (autopilot_ledger, autopilot_plan_profiles, autopilot_positions,
-               content, evidence_ledger, patient_presentation, repeat_intent,
-               runtime)
+               cloud_processing, content, evidence_ledger, patient_presentation,
+               repeat_intent, runtime)
 from .autopilot_contract import (
     AutopilotAckIn,
     RecordCommandPayload,
@@ -66,7 +66,31 @@ from .models import (
 P0A_SCOPE_KEY = "p0a_sim_first_single_v1"
 P0A_FEATURE_ENV = "ENABLE_AUTOPILOT_P0A_SIMULATION"
 SIMULATION_DATA_ENV = "ALLOW_SIMULATION_DATA"
+# Real research sessions ride the same frozen engine but through their own
+# explicit deployment switch.  The two simulation switches above keep their
+# exact historical semantics; neither channel ever implies the other.
+REAL_SESSIONS_ENV = "ENABLE_AUTOPILOT_REAL_SESSIONS"
 P0A_SOURCE = "p0a_domain_service"
+# Interaction-package consumption (autopilot-interaction.v1): the one gap /
+# failure code for "this week's package is missing, unbound or uncovering",
+# kept identical to the positions-module gap code so pauses and admission
+# context stay precisely attributable.
+INTERACTION_PACKAGE_GAP_CODE = "interaction_package_unavailable"
+# AttemptEvent.cue_type for the one package-driven level-1 retry prompt.  The
+# interaction packages freeze prompt text per turn but no bank cue_type label
+# exists for them; this closed literal keeps the evidence column honest without
+# inventing per-turn taxonomy the source never defined.
+INTERACTION_CUE_TYPE = "交互提示"
+# Frozen level-1 branch bookkeeping between the closed ResponsePath vocabulary
+# and the interaction package's branch categories.  "close" (相关不准确) is the
+# partial-concept branch, "unknown" (未提及/不知道) the wrong branch; silence is
+# silence.  "full" deliberately has no path: a hit never issues a cue.
+_INTERACTION_PATH_TO_CATEGORY: dict[str, str] = {
+    "close": "partial", "unknown": "wrong", "silence": "silence",
+}
+_INTERACTION_CATEGORY_TO_PATH: dict[str, ResponsePath] = {
+    category: path for path, category in _INTERACTION_PATH_TO_CATEGORY.items()
+}
 
 _TRUE_VALUES = frozenset({"1", "true", "yes"})
 _DENIED_CONSENT = frozenset({
@@ -261,6 +285,10 @@ class AutopilotStatusReceipt(BaseModel):
     server_owned: bool
     takeover_ready: bool
     current_command_kind: Literal["tts", "record"] | None = None
+    # 只读展示投影:自动驾驶当前/最后触及的计划位置(当前命令,否则最后一条已
+    # 签发命令)。不参与任何状态机/CAS 判定;disabled 收据恒为 null。
+    position_item_id: str | None = Field(default=None, min_length=1, max_length=128)
+    position_turn_seq: int | None = Field(default=None, ge=1)
     last_error_code: str | None = Field(
         default=None,
         min_length=1,
@@ -297,16 +325,22 @@ class RouteTtsEndedResult(BaseModel):
 
 
 class RouteCompletedAttemptResult(BaseModel):
-    """The next frozen speech selected from one terminal operational attempt."""
+    """The routed outcome of one terminal operational attempt.
+
+    Speaking outcomes stay ``waiting_tts`` with the staged command.  The
+    interaction hit path advances silently: the command is the *next
+    position's* question, or — at a plan boundary — the scope pauses at a
+    content gap or completes, with no command at all.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     scope_key: Literal["p0a_sim_first_single_v1"] = P0A_SCOPE_KEY
-    status: Literal["waiting_tts"] = "waiting_tts"
+    status: Literal["waiting_tts", "paused", "scope_completed"] = "waiting_tts"
     attempt_id: int = Field(ge=1)
     replayed: bool
     state_revision: int = Field(ge=0)
-    command: NextCommandProjection
+    command: NextCommandProjection | None
 
 
 class ApplyDeviceAckResult(BaseModel):
@@ -396,6 +430,55 @@ class _P0aContent:
     allowed_tts_lines: frozenset[str]
     max_duration_seconds: int
 
+    @property
+    def task_type(self) -> str:
+        return "单要素"
+
+
+@dataclass(frozen=True)
+class _InteractionBranch:
+    """One resolved (kind, spoken text) branch of a frozen interaction turn."""
+
+    kind: Literal["advance_silent", "speak_then_advance", "speak_then_rerecord"]
+    text: str | None
+
+
+@dataclass(frozen=True)
+class _InteractionContent:
+    """One executable double/multi-element turn frozen by the week's package.
+
+    Duck-type compatible with :class:`_P0aContent` for every shared consumer
+    (identity binding, projection, allowlist, record duration); the naming
+    ladder fields deliberately do not exist here, so any single-element code
+    path reaching an interaction turn fails loudly instead of guessing.
+    """
+
+    item_bank_version_id: str
+    item_bank_definition_digest: str
+    autopilot_protocol_version_id: str
+    autopilot_protocol_definition_digest: str
+    item_index: int
+    item_id: str
+    turn_seq: int
+    response_role: str
+    task_type: str
+    image_id: str
+    question_text: str
+    max_recordings: int
+    branches: dict[str, _InteractionBranch]
+    after_rerecord: dict[str, _InteractionBranch] | None
+    target_word: str | None
+    allowed_tts_lines: frozenset[str]
+    max_duration_seconds: int
+
+    @property
+    def initial_prompt(self) -> str:
+        """The position-opening question line (shared advance/start contract)."""
+        return self.question_text
+
+
+_SelectedContent = _P0aContent | _InteractionContent
+
 
 @dataclass(frozen=True)
 class _P0aGate:
@@ -408,8 +491,12 @@ class _P0aGate:
 
 @dataclass(frozen=True)
 class _AttemptRouteDecision:
-    purpose: Literal["cue", "feedback", "tell_answer"]
-    speech_text: str
+    """One judged-attempt outcome.  ``advance_silent`` is the interaction
+    packages' hit path: the turn is terminal but no speech is issued — the
+    route advances the frozen plan and directly stages the next question."""
+
+    purpose: Literal["cue", "feedback", "tell_answer", "advance_silent"]
+    speech_text: str | None
     prompt_level: int
     attempt_seq: int
     response_path: ResponsePath | None = None
@@ -449,6 +536,11 @@ def _enabled(name: str) -> bool:
 def p0a_feature_enabled() -> bool:
     """Both deployment switches must be explicit; the default is always off."""
     return _enabled(P0A_FEATURE_ENV) and _enabled(SIMULATION_DATA_ENV)
+
+
+def real_sessions_enabled() -> bool:
+    """Autopilot on real research sessions requires its own explicit switch."""
+    return _enabled(REAL_SESSIONS_ENV)
 
 
 def _enum_value(value: object) -> str:
@@ -720,6 +812,203 @@ def _require_active_device(
     return row
 
 
+def _load_interaction_package(
+    train_session: TrainSession,
+    bank: content.ItemBank,
+    protocol: dict,
+) -> dict:
+    """Load and bind this session-week's frozen interaction package, or fail.
+
+    The byte-pinned loader and the bank/protocol binding gate both live in
+    ``content``; every failure collapses to the one independent gap code so a
+    missing, tampered or unbound package pauses with a precise attribution
+    instead of degrading into the single-element protocol codes.
+    """
+    week_no = train_session.week_no
+    try:
+        package = content.load_autopilot_interaction_package(
+            week_no, protocol=protocol)
+    except content.FrozenContentUnavailable as exc:
+        raise AutopilotServiceError(
+            INTERACTION_PACKAGE_GAP_CODE,
+            f"第{week_no}周自动交互数据包不可用：{exc}",
+        ) from exc
+    issues = content.validate_autopilot_interaction_package(
+        package, bank, protocol)
+    if issues:
+        _fail(
+            INTERACTION_PACKAGE_GAP_CODE,
+            f"第{week_no}周自动交互数据包未通过题库/协议绑定校验："
+            + "；".join(issues[:5]),
+        )
+    return package
+
+
+def _interaction_package_or_none(
+    train_session: TrainSession,
+    bank: content.ItemBank,
+    protocol: dict,
+) -> dict | None:
+    """Gap-accounting variant: an unavailable package is a gap, not an error."""
+    try:
+        return _load_interaction_package(train_session, bank, protocol)
+    except AutopilotServiceError:
+        return None
+
+
+def _plan_has_interaction_positions(
+    positions: tuple[autopilot_positions.ProtocolPosition, ...],
+) -> bool:
+    return any(
+        position.task_type in {"双要素", "多要素"} for position in positions)
+
+
+def _resolve_interaction_branch(
+    branch_row: object,
+    bank_item: dict,
+    protocol: dict,
+    *,
+    where: str,
+) -> _InteractionBranch:
+    kind = branch_row.get("kind") if isinstance(branch_row, dict) else None
+    if kind not in {"advance_silent", "speak_then_advance", "speak_then_rerecord"}:
+        _fail("autopilot_content_incomplete", f"{where} 分支 kind 非法")
+    speech = branch_row.get("speech")
+    if kind == "advance_silent":
+        if speech is not None:
+            _fail("autopilot_content_incomplete", f"{where} 静默推进分支不得携带话术")
+        return _InteractionBranch(kind=kind, text=None)
+    text = content.interaction_speech_text(speech, bank_item, protocol)
+    if not isinstance(text, str) or not text.strip():
+        _fail("autopilot_content_incomplete", f"{where} 分支话术引用解析不出文本")
+    return _InteractionBranch(kind=kind, text=text.strip())
+
+
+def _select_interaction_content(
+    train_session: TrainSession,
+    bank: content.ItemBank,
+    protocol: dict,
+    *,
+    position: autopilot_positions.ProtocolPosition,
+    package: dict,
+    binding: _DefinitionBinding,
+) -> _InteractionContent:
+    rows = {
+        "双要素": bank.double_element,
+        "多要素": bank.multi_element,
+    }[position.task_type]
+    matches = [row for row in rows if row.get("item_id") == position.item_id]
+    if len(matches) != 1:
+        _fail("autopilot_content_incomplete", "训练计划与题库位置不一致")
+    raw = matches[0]
+    image_id = _required_text(raw.get("image_id"), "image_id")
+    target_word: str | None = None
+    if position.task_type == "双要素" and position.response_role in {
+        "左命名", "右命名",
+    }:
+        target_key = (
+            "left_word" if position.response_role == "左命名" else "right_word")
+        target_word = _required_text(raw.get(target_key), target_key)
+    else:
+        rubric = content.operational_rubric_for(
+            bank, position.item_id, position.response_role)
+        if rubric is None:
+            _fail(
+                "operational_rubric_unavailable",
+                f"{position.position_key}:{position.response_role} "
+                "缺版本化 operational rubric",
+            )
+    turn = autopilot_positions.interaction_turn(package, position)
+    if turn is None:
+        _fail(
+            INTERACTION_PACKAGE_GAP_CODE,
+            f"{position.position_key}:{position.response_role} "
+            "不在本周自动交互数据包冻结环节内",
+        )
+    where = f"{position.position_key}:{position.response_role}"
+    question_row = turn.get("question")
+    question_text = _required_text(
+        question_row.get("text") if isinstance(question_row, dict) else None,
+        "question.text",
+    )
+    branch_rows = turn.get("branches")
+    if (not isinstance(branch_rows, dict)
+            or not {"full", "wrong", "silence"} <= set(branch_rows)
+            or not set(branch_rows) <= {"full", "partial", "wrong", "silence"}):
+        _fail("autopilot_content_incomplete", f"{where} 分支集合非法")
+    branches = {
+        key: _resolve_interaction_branch(
+            row, raw, protocol, where=f"{where}.branches.{key}")
+        for key, row in branch_rows.items()
+    }
+    if branches["full"].kind == "speak_then_rerecord":
+        _fail("autopilot_content_incomplete", f"{where} full 分支不得要求重录")
+    has_rerecord = any(
+        branch.kind == "speak_then_rerecord" for branch in branches.values())
+    after_rows = turn.get("after_rerecord")
+    max_recordings = turn.get("max_recordings")
+    if (max_recordings not in (1, 2)
+            or has_rerecord != (after_rows is not None)
+            or max_recordings != (2 if has_rerecord else 1)):
+        _fail(
+            "autopilot_content_incomplete",
+            f"{where} 分支结构与 max_recordings/after_rerecord 不一致",
+        )
+    after_rerecord: dict[str, _InteractionBranch] | None = None
+    if after_rows is not None:
+        if not isinstance(after_rows, dict) or set(after_rows) != {
+            "full", "otherwise",
+        }:
+            _fail("autopilot_content_incomplete", f"{where} after_rerecord 集合非法")
+        after_rerecord = {
+            key: _resolve_interaction_branch(
+                row, raw, protocol, where=f"{where}.after_rerecord.{key}")
+            for key, row in after_rows.items()
+        }
+        if any(branch.kind == "speak_then_rerecord"
+               for branch in after_rerecord.values()):
+            _fail(
+                "autopilot_content_incomplete",
+                f"{where} after_rerecord 分支必须终止本环节",
+            )
+    allowed = content.tts_allowlist(
+        bank, autopilot_protocol=protocol, interaction_package=package)
+    required_lines = {question_text}
+    required_lines |= {
+        branch.text for branch in branches.values() if branch.text}
+    if after_rerecord is not None:
+        required_lines |= {
+            branch.text for branch in after_rerecord.values() if branch.text}
+    if not required_lines.issubset(allowed):
+        _fail(
+            "autopilot_tts_not_allowlisted",
+            f"{where} 话术未全部进入 TTS 白名单",
+        )
+    silence_seconds = protocol.get("silence_seconds")
+    if not isinstance(silence_seconds, int) or isinstance(silence_seconds, bool):
+        _fail("autopilot_protocol_invalid", "P0a 协议沉默阈值格式非法")
+    return _InteractionContent(
+        item_bank_version_id=binding.item_bank_version_id,
+        item_bank_definition_digest=binding.item_bank_definition_digest,
+        autopilot_protocol_version_id=binding.autopilot_protocol_version_id,
+        autopilot_protocol_definition_digest=(
+            binding.autopilot_protocol_definition_digest),
+        item_index=position.item_index,
+        item_id=position.item_id,
+        turn_seq=position.turn_seq,
+        response_role=position.response_role,
+        task_type=position.task_type,
+        image_id=image_id,
+        question_text=question_text,
+        max_recordings=max_recordings,
+        branches=branches,
+        after_rerecord=after_rerecord,
+        target_word=target_word,
+        allowed_tts_lines=allowed,
+        max_duration_seconds=silence_seconds + 5,
+    )
+
+
 def _select_p0a_content(
     train_session: TrainSession,
     bank: content.ItemBank,
@@ -727,15 +1016,15 @@ def _select_p0a_content(
     *,
     item_id: str | None = None,
     turn_seq: int | None = None,
-) -> _P0aContent:
+    interaction_package: dict | None = None,
+) -> _SelectedContent:
     binding = _require_session_definition_binding(train_session, bank, protocol)
     protocol_weeks = tuple(protocol["supported_training_weeks"])
-    if (train_session.week_no != 2
-            or train_session.week_no not in bank.supported_training_weeks
+    if (train_session.week_no not in bank.supported_training_weeks
             or train_session.week_no not in protocol_weeks):
         _fail(
             "autopilot_scope_unsupported",
-            "P0a 只允许题库与自动化协议共同明确支持的第 2 周模拟场次",
+            "自动执行只允许题库与自动化协议共同明确支持的训练周模拟场次",
         )
     resolved = _resolved_profile_plan(train_session, bank, protocol)
     positions = resolved.positions
@@ -753,6 +1042,17 @@ def _select_p0a_content(
                 "autopilot_position_invalid", "当前命令不属于冻结计划位置") from exc
     else:
         _fail("autopilot_position_invalid", "自动驾驶位置必须同时绑定题号与环节")
+    if position.task_type in {"双要素", "多要素"}:
+        package = interaction_package
+        if package is None:
+            package = _load_interaction_package(train_session, bank, protocol)
+        gap = autopilot_positions.readiness_gap(
+            bank, position, interaction_package=package)
+        if gap is not None:
+            _fail(gap.code, gap.detail)
+        return _select_interaction_content(
+            train_session, bank, protocol,
+            position=position, package=package, binding=binding)
     gap = autopilot_positions.readiness_gap(bank, position)
     if gap is not None:
         _fail(gap.code, gap.detail)
@@ -890,10 +1190,16 @@ def _require_entire_plan_supported(
         positions = resolved.positions
         if not positions:
             _fail("autopilot_content_incomplete", "自动驾驶冻结计划没有可执行位置")
+        interaction_package = (
+            _interaction_package_or_none(train_session, bank, protocol)
+            if _plan_has_interaction_positions(positions) else None
+        )
         gaps = tuple(
             gap
             for position in positions
-            if (gap := autopilot_positions.readiness_gap(bank, position)) is not None
+            if (gap := autopilot_positions.readiness_gap(
+                bank, position,
+                interaction_package=interaction_package)) is not None
         )
         if gaps:
             first = gaps[0]
@@ -925,6 +1231,7 @@ def _require_entire_plan_supported(
                 protocol,
                 item_id=position.item_id,
                 turn_seq=position.turn_seq,
+                interaction_package=interaction_package,
             )
         return
 
@@ -943,10 +1250,16 @@ def _require_entire_plan_supported(
     if not positions:
         _fail("autopilot_content_incomplete", "自动驾驶冻结计划没有可执行位置")
 
+    interaction_package = (
+        _interaction_package_or_none(train_session, bank, protocol)
+        if _plan_has_interaction_positions(positions) else None
+    )
     gaps = tuple(
         gap
         for position in positions
-        if (gap := autopilot_positions.readiness_gap(bank, position)) is not None
+        if (gap := autopilot_positions.readiness_gap(
+            bank, position,
+            interaction_package=interaction_package)) is not None
     )
     source_count = bank.meta.get("source_protocol_position_count")
     raw_unstructured = bank.meta.get("source_unstructured_positions")
@@ -1036,6 +1349,7 @@ def _require_entire_plan_supported(
             protocol,
             item_id=position.item_id,
             turn_seq=position.turn_seq,
+            interaction_package=interaction_package,
         )
 
 
@@ -1051,7 +1365,17 @@ def _require_gate(
     position_turn_seq: int | None = None,
     require_entire_plan_supported: bool = False,
 ) -> _P0aGate:
-    if not p0a_feature_enabled():
+    if not p0a_feature_enabled() and not real_sessions_enabled():
+        # 分类先行:真实研究场次缺的是 REAL_SESSIONS_ENV,双通道全关时报
+        # p0a_disabled 会教人去开两个模拟开关。场次缺失/不可分类仍走旧码。
+        gate_session = db.get(TrainSession, session_id)
+        if (gate_session is not None
+                and gate_session.is_simulation is False
+                and gate_session.data_classification == "research"):
+            _fail(
+                "autopilot_real_sessions_disabled",
+                f"真实研究场次自动带练必须显式启用 {REAL_SESSIONS_ENV}",
+            )
         _fail(
             "autopilot_p0a_disabled",
             f"P0a 必须显式启用 {P0A_FEATURE_ENV} 和 {SIMULATION_DATA_ENV}",
@@ -1069,17 +1393,39 @@ def _require_gate(
     # directly, so the enforcement point is unchanged.
     session_repeat_protocol(train_session)
     _require_plan_session_binding(db, train_session)
-    if train_session.is_simulation is not True:
-        _fail("autopilot_simulation_required", "P0a 禁止用于真实研究场次")
-    if train_session.data_classification != "simulation":
-        _fail("autopilot_classification_invalid", "P0a 场次必须明确归类为 simulation")
+    if train_session.is_simulation is True:
+        if not p0a_feature_enabled():
+            _fail(
+                "autopilot_p0a_disabled",
+                f"P0a 必须显式启用 {P0A_FEATURE_ENV} 和 {SIMULATION_DATA_ENV}",
+            )
+        if train_session.data_classification != "simulation":
+            _fail(
+                "autopilot_classification_invalid",
+                "P0a 场次必须明确归类为 simulation")
+    elif (train_session.is_simulation is False
+            and train_session.data_classification == "research"):
+        if not real_sessions_enabled():
+            _fail(
+                "autopilot_real_sessions_disabled",
+                f"真实研究场次自动带练必须显式启用 {REAL_SESSIONS_ENV}",
+            )
+    else:
+        _fail(
+            "autopilot_classification_invalid",
+            "场次 is_simulation 与 data_classification 组合不可证明")
     if (_enum_value(train_session.phase_type) != "正式训练"
             or _enum_value(train_session.event_line) != "正式训练"):
         _fail("autopilot_scope_unsupported", "P0a 只允许正式训练事件线")
 
     patient = db.get(Patient, train_session.patient_id)
-    if patient is None or patient.is_simulation_subject is not True:
-        _fail("autopilot_simulation_subject_required", "P0a 必须绑定专用模拟受试者")
+    if train_session.is_simulation is True:
+        if patient is None or patient.is_simulation_subject is not True:
+            _fail("autopilot_simulation_subject_required", "P0a 必须绑定专用模拟受试者")
+    elif patient is None or patient.is_simulation_subject is True:
+        _fail(
+            "autopilot_simulation_subject_forbidden",
+            "模拟受试者档案不得进入真实研究场次自动带练")
     consent_status = (patient.consent_status or "").strip().casefold()
     if consent_status in _DENIED_CONSENT:
         _fail("autopilot_consent_denied", "受试者存在明确拒绝或撤回状态")
@@ -1087,6 +1433,21 @@ def _require_gate(
         _fail("autopilot_recording_not_allowed", "P0a 录音授权必须明确为 true")
     if (patient.withdrawal_status or "").strip():
         _fail("autopilot_subject_withdrawn", "已撤回受试者不能启动或继续 P0a")
+    if train_session.is_simulation is False:
+        policy = cloud_processing.current_policy()
+        cloud_authorized = (
+            policy.configured
+            and patient.cloud_processing_allowed is True
+            and patient.cloud_processing_provider_id == policy.provider_id
+            and patient.cloud_processing_notice_version == policy.notice_version
+            and patient.cloud_processing_consented_at is not None
+            and patient.cloud_processing_revoked_at is None
+        )
+        if not cloud_authorized:
+            _fail(
+                "autopilot_cloud_processing_required",
+                "AI 判分要用云端转写；请先在受试者档案完成云处理授权，再启动自动带练",
+            )
 
     _require_live_binding(db, train_session)
     runtime_state = db.get(SessionRuntimeState, session_id)
@@ -1229,10 +1590,95 @@ def _cue1_success_line(
     }[response_path]
 
 
+def _interaction_tell_lines(selected: _InteractionContent) -> frozenset[str]:
+    """The closed set of first-recording answer-disclosure lines for one turn."""
+    return frozenset(
+        branch.text
+        for category, branch in selected.branches.items()
+        if category != "full"
+        and branch.kind == "speak_then_advance"
+        and branch.text
+    )
+
+
+def _validate_interaction_tts_semantics(
+    command: RuntimeCommand,
+    payload: TtsCommandPayload,
+    selected: _InteractionContent,
+) -> None:
+    """Shape-aware (purpose, prompt_level, attempt_seq) table for one frozen
+    interaction turn.  Every legal cell is enumerated explicitly; anything
+    outside the table is rejected, exactly like the single-element ladder:
+
+      question    (0,1): the turn's frozen question line
+      cue         (1,2): the source-selected rerecord branch, response_path-bound
+      feedback    (0,1): branches.full speak_then_advance line
+      feedback    (1,2): after_rerecord.full line, response_path-bound to the cue
+      tell_answer (3,1): one non-full speak_then_advance branch line
+      tell_answer (3,2): after_rerecord.otherwise line
+    """
+    stage = (command.prompt_level, command.attempt_seq)
+    if payload.purpose == "question":
+        if stage != (0, 1):
+            _fail("autopilot_command_invalid", "question 只能是首次零级提问")
+        expected_line = selected.question_text
+    elif payload.purpose == "cue":
+        if stage != (1, 2):
+            _fail("autopilot_command_invalid", "交互环节 cue 只能是一级重录提示")
+        if payload.response_path is None:  # contract postcondition
+            _fail("autopilot_command_invalid", "一级 cue 缺少冻结 response_path")
+        category = _INTERACTION_PATH_TO_CATEGORY.get(payload.response_path)
+        branch = selected.branches.get(category) if category else None
+        if (branch is None or branch.kind != "speak_then_rerecord"
+                or branch.text is None):
+            _fail("autopilot_command_invalid", "cue 分支不属于该环节冻结重录分支")
+        expected_line = branch.text
+    elif payload.purpose == "feedback":
+        if stage == (0, 1):
+            full = selected.branches.get("full")
+            if full is None or full.kind != "speak_then_advance" or not full.text:
+                _fail("autopilot_command_invalid", "该环节 full 分支没有口头成功反馈")
+            expected_line = full.text
+        elif stage == (1, 2):
+            if payload.response_path is None:  # contract postcondition
+                _fail("autopilot_command_invalid", "一级 feedback 缺少冻结 response_path")
+            category = _INTERACTION_PATH_TO_CATEGORY.get(payload.response_path)
+            rerecord = selected.branches.get(category) if category else None
+            after = selected.after_rerecord or {}
+            after_full = after.get("full")
+            if (rerecord is None or rerecord.kind != "speak_then_rerecord"
+                    or after_full is None
+                    or after_full.kind != "speak_then_advance"
+                    or not after_full.text):
+                _fail("autopilot_command_invalid", "重录后 feedback 与冻结结构不一致")
+            expected_line = after_full.text
+        else:
+            _fail("autopilot_command_invalid", "feedback 提示等级非法")
+    else:
+        if command.prompt_level != 3 or command.attempt_seq not in {1, 2}:
+            _fail("autopilot_command_invalid", "tell_answer 必须终止一次已判定录音")
+        if command.attempt_seq == 1:
+            tell_lines = _interaction_tell_lines(selected)
+            if not tell_lines or payload.speech_text not in tell_lines:
+                _fail("autopilot_command_invalid", "tell_answer 不在该环节冻结告知话术集内")
+            expected_line = payload.speech_text
+        else:
+            after = selected.after_rerecord or {}
+            otherwise = after.get("otherwise")
+            if (otherwise is None or otherwise.kind != "speak_then_advance"
+                    or not otherwise.text):
+                _fail("autopilot_command_invalid", "重录后 tell_answer 与冻结结构不一致")
+            expected_line = otherwise.text
+    if payload.speech_text != expected_line:
+        _fail("autopilot_command_invalid", "TTS purpose 与冻结话术不一致")
+    if payload.speech_text not in selected.allowed_tts_lines:
+        _fail("autopilot_command_invalid", "TTS 话术未进入冻结白名单")
+
+
 def _validate_tts_semantics(
     command: RuntimeCommand,
     payload: TtsCommandPayload,
-    selected: _P0aContent,
+    selected: _SelectedContent,
 ) -> None:
     """Bind purpose to the exact frozen line and cue level.
 
@@ -1244,6 +1690,9 @@ def _validate_tts_semantics(
             or payload.turn_seq != command.turn_seq
             or payload.cue_level != command.prompt_level):
         _fail("autopilot_command_invalid", "TTS 命令与冻结环节不一致")
+    if isinstance(selected, _InteractionContent):
+        _validate_interaction_tts_semantics(command, payload, selected)
+        return
     expected_line: str
     if payload.purpose == "question":
         if command.prompt_level != 0 or command.attempt_seq != 1:
@@ -1368,8 +1817,8 @@ def _project_command(
         asset = db.get(AudioAssetRow, payload.raw_audio_id)
         if (asset is None or asset.session_id != command.session_id
                 or asset.turn_key != command.turn_key
-                or asset.data_classification != "simulation"
-                or asset.is_simulation is not True
+                or asset.data_classification != owning_session.data_classification
+                or asset.is_simulation != owning_session.is_simulation
                 or asset.status != AudioStatus.recorded
                 or asset.withdrawn or asset.delete_gate_passed):
             _fail("autopilot_command_invalid", "预分配录音资产不可用于当前命令")
@@ -1462,6 +1911,29 @@ def _default_bank() -> content.ItemBank:
     return content.load_item_bank_for_week(2)
 
 
+def _session_week_bank(db: Session, session_id: str) -> content.ItemBank:
+    """Default bank resolution follows the session's own training week.
+
+    The definition-binding gate still rejects any wrong bank afterwards; this
+    only decides *which* frozen weekly bank a caller without an explicit bank
+    gets, so weeks 3-8 stop silently resolving to the week-2 file.  A missing
+    or out-of-range session falls back to week 2 and then fails on the session
+    gate itself.
+    """
+    train_session = db.get(TrainSession, session_id)
+    week_no = getattr(train_session, "week_no", None)
+    if (not isinstance(week_no, int) or isinstance(week_no, bool)
+            or not 2 <= week_no <= 8):
+        week_no = 2
+    try:
+        return content.load_item_bank_for_week(week_no)
+    except content.FrozenContentUnavailable as exc:
+        raise AutopilotServiceError(
+            "autopilot_content_unavailable",
+            f"第{week_no}周冻结题库不可用",
+        ) from exc
+
+
 def _default_protocol() -> dict:
     return content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
@@ -1491,7 +1963,7 @@ def start_p0a(
     if len(actor_id) > 128:
         _fail("autopilot_input_invalid", "actor_id 过长")
     observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
-    resolved_bank = bank or _default_bank()
+    resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
     resolved_protocol = protocol or _default_protocol()
     gate = _require_gate(
         db,
@@ -1691,7 +2163,7 @@ def get_next_command(
     gate = _require_gate(
         db,
         session_id,
-        bank=bank or _default_bank(),
+        bank=bank if bank is not None else _session_week_bank(db, session_id),
         protocol=protocol or _default_protocol(),
         now=observed_at,
         expected_token_hash=capability_token_hash,
@@ -1721,7 +2193,7 @@ def _authorize_pending_device_command(
     gate = _require_gate(
         db,
         session_id,
-        bank=bank or _default_bank(),
+        bank=bank if bank is not None else _session_week_bank(db, session_id),
         protocol=protocol or _default_protocol(),
         now=observed_at,
         expected_token_hash=capability_token_hash,
@@ -2327,9 +2799,23 @@ def _scope_completion_proves_media_terminal(
             or event.from_mode != "autonomous"
             or event.to_mode != "autonomous"
             or event.to_status != "scope_completed"
-            or command.kind != "tts"
             or command.state != "succeeded"
             or command.succeeded_at is None):
+        return False
+    if event.payload_json != autopilot_ledger.encode_control_event_payload(
+            "scope_complete", {"completed_command_seq": command.command_seq}):
+        return False
+    if command.kind == "record":
+        # Interaction silent-advance completion: the final plan position ended
+        # on a judged hit, so the closing command is its succeeded recording.
+        # The stopped-capture chain is the media-terminal proof, exactly as the
+        # system-failure safety close accepts it.
+        try:
+            autopilot_ledger.verify_terminal_record_capture(db, command.id)
+        except autopilot_ledger.AutopilotProofError:
+            return False
+        return True
+    if command.kind != "tts":
         return False
     ack = db.exec(select(RuntimeCommandAck).where(
         RuntimeCommandAck.command_id == command.id,
@@ -2350,8 +2836,6 @@ def _scope_completion_proves_media_terminal(
     return (
         isinstance(payload, dict)
         and payload.get("media_ended") is True
-        and event.payload_json == autopilot_ledger.encode_control_event_payload(
-            "scope_complete", {"completed_command_seq": command.command_seq})
     )
 
 
@@ -2417,7 +2901,8 @@ def legacy_expected_attempt_facts(
     here, ``response_role``/``cue_type``/``duration_seconds`` could be rewritten
     after judgement and still yield a valid drain target.
     """
-    resolved_bank = bank or _default_bank()
+    resolved_bank = (bank if bank is not None
+                     else _session_week_bank(db, record.session_id))
     resolved_protocol = protocol or _default_protocol()
     train_session = db.get(TrainSession, record.session_id)
     if train_session is None:
@@ -3305,6 +3790,8 @@ def get_autopilot_status(
             server_owned=False,
             takeover_ready=False,
             current_command_kind=None,
+            position_item_id=None,
+            position_turn_seq=None,
             last_error_code=None,
         )
     if state.scope_key != P0A_SCOPE_KEY:
@@ -3313,6 +3800,7 @@ def get_autopilot_status(
         _fail("autopilot_state_invalid", "自动驾驶控制模式非法")
     current_kind: Literal["tts", "record"] | None = None
     current_state: str | None = None
+    position_command: RuntimeCommand | None = None
     if state.current_command_id is not None:
         command = db.get(RuntimeCommand, state.current_command_id)
         if (command is None or command.session_id != session_id
@@ -3323,6 +3811,18 @@ def get_autopilot_status(
             _fail("autopilot_state_invalid", "自动驾驶状态的当前命令不一致")
         current_kind = command.kind  # type: ignore[assignment]
         current_state = command.state
+        position_command = command
+    else:
+        # paused/scope_completed/failed/manual 无当前命令:最后一条已签发命令
+        # 就是自动带练最后触及的位置(观察面与接管恢复的只读展示来源)。
+        position_command = db.exec(
+            select(RuntimeCommand)
+            .where(
+                RuntimeCommand.session_id == session_id,
+                RuntimeCommand.scope_key == state.scope_key,
+            )
+            .order_by(RuntimeCommand.command_seq.desc())  # type: ignore[union-attr]
+        ).first()
     expected = _STATUS_CURRENT_COMMAND_CONTRACT.get(state.status)
     if expected is None:
         if current_kind is not None:
@@ -3351,6 +3851,10 @@ def get_autopilot_status(
         server_owned=state.mode == "autonomous",
         takeover_ready=_takeover_is_ready(db, state=state),
         current_command_kind=current_kind,
+        position_item_id=(
+            position_command.item_id if position_command is not None else None),
+        position_turn_seq=(
+            position_command.turn_seq if position_command is not None else None),
         last_error_code=state.last_error_code,
     )
 
@@ -3459,11 +3963,10 @@ def _existing_scope_completion(
 
 
 def _next_position_command_key(
-        tts: RuntimeCommand, ack_key: str,
-        position: autopilot_positions.ProtocolPosition) -> str:
+        tts: RuntimeCommand, ack_key: str, position_key: str) -> str:
     return _derived_key(
         "cmd-next-position", tts.session_id, tts.idempotency_key, ack_key,
-        position.position_key)
+        position_key)
 
 
 def _existing_position_advance(
@@ -3472,21 +3975,11 @@ def _existing_position_advance(
     state: SessionAutopilotState,
     tts: RuntimeCommand,
     ack_key: str,
-    selected: _P0aContent,
+    selected: _SelectedContent,
     active_capability: PatientDeviceCapability,
 ) -> RuntimeCommand | None:
     key = _next_position_command_key(
-        tts,
-        ack_key,
-        autopilot_positions.ProtocolPosition(
-            item_index=selected.item_index,
-            item_id=selected.item_id,
-            task_type="单要素",
-            image_id=selected.image_id,
-            turn_seq=selected.turn_seq,
-            response_role=selected.response_role,
-        ),
-    )
+        tts, ack_key, f"{selected.item_id}#{selected.turn_seq}")
     command = _command_by_key(db, tts.session_id, key)
     if command is None:
         return None
@@ -3559,7 +4052,7 @@ def route_tts_ended(
     ack_idempotency_key = _validate_idempotency_key(
         ack_idempotency_key, "ack_idempotency_key")
     observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
-    resolved_bank = bank or _default_bank()
+    resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
     resolved_protocol = protocol or _default_protocol()
     tts = _command_by_key(db, session_id, command_key)
     gate = _require_gate(
@@ -3603,7 +4096,8 @@ def route_tts_ended(
                 expected_capability=gate.active_capability),
         )
     next_decision: autopilot_positions.PositionDecision | None = None
-    next_selected: _P0aContent | None = None
+    next_selected: _SelectedContent | None = None
+    next_package: dict | None = None
     if effect == "advance":
         try:
             resolved_plan = _resolved_profile_plan(
@@ -3619,8 +4113,13 @@ def route_tts_ended(
                 next_decision = autopilot_positions.PositionDecision(
                     completed=True)
             else:
+                next_position = positions[current_index + 1]
+                if next_position.task_type in {"双要素", "多要素"}:
+                    next_package = _interaction_package_or_none(
+                        gate.train_session, resolved_bank, resolved_protocol)
                 next_decision = autopilot_positions.decision_for_position(
-                    resolved_bank, positions[current_index + 1])
+                    resolved_bank, next_position,
+                    interaction_package=next_package)
         except ValueError as exc:
             raise AutopilotServiceError(
                 "autopilot_position_invalid", "当前命令无法在冻结计划中推进") from exc
@@ -3631,6 +4130,7 @@ def route_tts_ended(
                 resolved_protocol,
                 item_id=next_decision.position.item_id,
                 turn_seq=next_decision.position.turn_seq,
+                interaction_package=next_package,
             )
             existing_next = _existing_position_advance(
                 db,
@@ -3675,8 +4175,8 @@ def route_tts_ended(
         db.add(AudioAssetRow(
             raw_audio_id=raw_audio_id,
             session_id=session_id,
-            is_simulation=True,
-            data_classification="simulation",
+            is_simulation=gate.train_session.is_simulation,
+            data_classification=gate.train_session.data_classification,
             turn_key=tts.turn_key,
             audio_format="webm",
             status=AudioStatus.recorded,
@@ -3754,7 +4254,7 @@ def route_tts_ended(
         assert next_selected is not None
         command = RuntimeCommand(
             idempotency_key=_next_position_command_key(
-                tts, ack_idempotency_key, next_decision.position),
+                tts, ack_idempotency_key, next_decision.position.position_key),
             session_id=session_id,
             command_seq=state.next_command_seq,
             item_id=next_selected.item_id,
@@ -4023,8 +4523,13 @@ def _require_completed_operational_attempt(
             or attempt.processing_lease_expires_at is not None
             or attempt.error_code is not None):
         _fail("autopilot_attempt_not_completed", "attempt 尚未完成或以技术失败收口")
-    if attempt.is_simulation is not True or attempt.judge_portrait_used is not False:
-        _fail("autopilot_attempt_boundary_invalid", "P0a attempt 必须是无画像的模拟运行证据")
+    owning_session = db.get(TrainSession, attempt.session_id)
+    if (owning_session is None
+            or attempt.is_simulation != owning_session.is_simulation
+            or attempt.judge_portrait_used is not False):
+        _fail(
+            "autopilot_attempt_boundary_invalid",
+            "P0a attempt 必须是无画像、与场次分类一致的运行证据")
     if (not isinstance(attempt.operational_answer_type, str)
             or not isinstance(attempt.contains_target, bool)):
         _fail("autopilot_attempt_judgement_invalid", "completed attempt 缺少完整运行判类")
@@ -4039,7 +4544,7 @@ def _require_completed_operational_attempt(
     event = judgement_rows[0]
     if (event.item_id != attempt.item_id or event.turn_seq != attempt.turn_seq
             or event.attempt_seq != attempt.attempt_seq
-            or event.is_simulation is not True):
+            or event.is_simulation != attempt.is_simulation):
         _fail("autopilot_attempt_judgement_invalid", "attempt 判类证据位置不一致")
     try:
         payload = evidence_ledger.validate_stored_payload(
@@ -4121,7 +4626,19 @@ def _initial_response_path_for_cued_attempt(
         _fail("autopilot_attempt_sequence_invalid", "首次作答与录音证据不一致")
     if first.contains_target is True:
         _fail("autopilot_attempt_sequence_invalid", "首次已命中冻结目标却又进入一级提示")
-    expected_path = _failed_response_path(first)
+    if isinstance(selected, _InteractionContent):
+        category = _interaction_category(first, selected)
+        branch = selected.branches.get(category)
+        path = _INTERACTION_CATEGORY_TO_PATH.get(category)
+        if (path is None or branch is None
+                or branch.kind != "speak_then_rerecord"):
+            _fail(
+                "autopilot_attempt_sequence_invalid",
+                "首次作答判类与冻结重录分支不一致",
+            )
+        expected_path = path
+    else:
+        expected_path = _failed_response_path(first)
 
     if record.predecessor_command_id is None:
         _fail("autopilot_attempt_sequence_invalid", "一级录音缺提示命令前件")
@@ -4151,17 +4668,135 @@ def _initial_response_path_for_cued_attempt(
     return expected_path
 
 
+def _interaction_category(
+    attempt: AttemptEvent,
+    selected: _InteractionContent,
+) -> str:
+    """Map one judged attempt to the package's closed branch category.
+
+    Advancement is binary: only ``contains_target`` (lexical target hit for
+    naming turns, rubric-binary correct for open answers) selects ``full``.
+    ``partial`` exists only when the rubric classifier said 部分正确 *and* the
+    frozen turn carries a partial branch; otherwise the answer is ``wrong``.
+    An operational no-transcript attempt is ``silence``.  ai_score 0.5 alone
+    never drives a success advance (关系识别锁分 0/1 口径, 2026-08-19).
+    """
+    if attempt.contains_target is True:
+        return "full"
+    if attempt.operational_answer_type == "沉默":
+        return "silence"
+    if (attempt.operational_answer_type == AnswerType.部分正确.value
+            and "partial" in selected.branches):
+        return "partial"
+    return "wrong"
+
+
+def _terminal_interaction_decision(
+    branch: _InteractionBranch,
+    *,
+    category: str,
+    prompt_level: int,
+    attempt_seq: int,
+    response_path: ResponsePath | None,
+) -> _AttemptRouteDecision:
+    if branch.kind == "advance_silent":
+        return _AttemptRouteDecision(
+            purpose="advance_silent",
+            speech_text=None,
+            prompt_level=prompt_level,
+            attempt_seq=attempt_seq,
+        )
+    if branch.kind != "speak_then_advance" or not branch.text:
+        _fail("autopilot_attempt_mismatch", "冻结分支不能终止本环节")
+    if category == "full":
+        return _AttemptRouteDecision(
+            purpose="feedback",
+            speech_text=branch.text,
+            prompt_level=prompt_level,
+            attempt_seq=attempt_seq,
+            response_path=response_path,
+        )
+    return _AttemptRouteDecision(
+        purpose="tell_answer",
+        speech_text=branch.text,
+        prompt_level=3,
+        attempt_seq=attempt_seq,
+    )
+
+
+def _interaction_route_decision(
+    db: Session,
+    *,
+    attempt: AttemptEvent,
+    record: RuntimeCommand,
+    selected: _InteractionContent,
+) -> _AttemptRouteDecision:
+    if attempt.prompt_level == 0:
+        category = _interaction_category(attempt, selected)
+        branch = selected.branches.get(category)
+        if branch is None:
+            _fail("autopilot_attempt_mismatch", "attempt 判类没有对应冻结分支")
+        if branch.kind == "speak_then_rerecord":
+            path = _INTERACTION_CATEGORY_TO_PATH.get(category)
+            if (category == "full" or path is None
+                    or selected.after_rerecord is None or not branch.text):
+                _fail(
+                    "autopilot_attempt_mismatch",
+                    "重录分支与冻结环节结构不一致",
+                )
+            return _AttemptRouteDecision(
+                purpose="cue",
+                speech_text=branch.text,
+                prompt_level=1,
+                attempt_seq=2,
+                response_path=path,
+            )
+        return _terminal_interaction_decision(
+            branch,
+            category=category,
+            prompt_level=attempt.prompt_level,
+            attempt_seq=attempt.attempt_seq,
+            response_path=None,
+        )
+    if attempt.prompt_level == 1:
+        if selected.after_rerecord is None:
+            _fail("autopilot_attempt_mismatch", "该环节没有第二次录音")
+        # Even a second recording must prove it followed the source-selected
+        # first cue; a forged/tampered cue command must not silently converge.
+        path = _initial_response_path_for_cued_attempt(
+            db, attempt=attempt, record=record, selected=selected)
+        if attempt.contains_target is True:
+            return _terminal_interaction_decision(
+                selected.after_rerecord["full"],
+                category="full",
+                prompt_level=attempt.prompt_level,
+                attempt_seq=attempt.attempt_seq,
+                response_path=path,
+            )
+        return _terminal_interaction_decision(
+            selected.after_rerecord["otherwise"],
+            category="otherwise",
+            prompt_level=attempt.prompt_level,
+            attempt_seq=attempt.attempt_seq,
+            response_path=None,
+        )
+    _fail("autopilot_attempt_mismatch", "交互环节只处理零/一级录音 attempt")
+
+
 def _attempt_route_decision(
     db: Session,
     *,
     attempt: AttemptEvent,
     record: RuntimeCommand,
-    selected: _P0aContent,
+    selected: _SelectedContent,
 ) -> _AttemptRouteDecision:
     if attempt.prompt_level not in {0, 1, 2}:
         _fail("autopilot_attempt_mismatch", "P0a 只处理零至二级录音 attempt")
     if attempt.attempt_seq != attempt.prompt_level + 1:
         _fail("autopilot_attempt_sequence_invalid", "attempt_seq 与分级提示序列不单调")
+    if isinstance(selected, _InteractionContent):
+        return _interaction_route_decision(
+            db, attempt=attempt, record=record, selected=selected)
     # Source completion is lexical: only a server-frozen target/acceptable hit
     # may advance.  A semantic/LLM "正确" without that hit remains a failed
     # operational attempt and must not bypass the cue path.
@@ -4244,7 +4879,7 @@ def _materialize_terminal_attempt_evidence(
     its recovery route.  Existing exact rows are an idempotent replay; duplicate or
     contradictory rows are never guessed through.
     """
-    if decision.purpose not in {"feedback", "tell_answer"}:
+    if decision.purpose not in {"feedback", "tell_answer", "advance_silent"}:
         return None
     if attempt.id is None:
         _fail("autopilot_terminal_evidence_invalid", "terminal attempt 缺少主键")
@@ -4252,10 +4887,27 @@ def _materialize_terminal_attempt_evidence(
     try:
         proof = autopilot_ledger.verify_record_capture_for_attempt(db, record.id)
     except autopilot_ledger.AutopilotProofError as exc:
-        raise AutopilotServiceError(
-            "autopilot_terminal_evidence_invalid",
-            "terminal attempt 缺少完整的录音采集证据",
-        ) from exc
+        # A replay after the scope already advanced (interaction silent-advance
+        # or a routed terminal speech) no longer has this record as the live
+        # attempt-processing target.  Only an already-projected attempt may take
+        # the immutable-proof route; a fresh write must still prove the live
+        # target, so this never widens first-time materialization.
+        already_projected = db.exec(select(TurnEvent).where(
+            TurnEvent.source_attempt_id == attempt.id,
+        )).first()
+        if already_projected is None:
+            raise AutopilotServiceError(
+                "autopilot_terminal_evidence_invalid",
+                "terminal attempt 缺少完整的录音采集证据",
+            ) from exc
+        try:
+            proof = autopilot_ledger.verify_terminal_record_capture(
+                db, record.id)
+        except autopilot_ledger.AutopilotProofError as replay_exc:
+            raise AutopilotServiceError(
+                "autopilot_terminal_evidence_invalid",
+                "terminal attempt 缺少完整的录音采集证据",
+            ) from replay_exc
     if (
         proof.session_id != attempt.session_id
         or proof.item_id != attempt.item_id
@@ -4316,7 +4968,7 @@ def _materialize_terminal_attempt_evidence(
     if (
         train_session.item_bank_version_id != plan.item_bank_version_id
         or plan_item.item_id != attempt.item_id
-        or plan_item.task_type != "单要素"
+        or plan_item.task_type != gate.selected.task_type
         or plan_item.image_id != gate.selected.image_id
         or len(plan_turns) != 1
     ):
@@ -4469,7 +5121,7 @@ def materialize_terminal_attempt_evidence(
             or attempt_id < 1):
         _fail("autopilot_input_invalid", "attempt_id 必须是正整数")
     observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
-    resolved_bank = bank or _default_bank()
+    resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
     resolved_protocol = protocol or _default_protocol()
     state = db.exec(select(SessionAutopilotState).where(
         SessionAutopilotState.session_id == session_id,
@@ -4558,6 +5210,420 @@ def _validate_existing_attempt_route(
         db, command, selected, expected_capability=active_capability)
 
 
+def _require_attempt_route_current(
+    state: SessionAutopilotState,
+    record: RuntimeCommand,
+) -> None:
+    if (state.mode != "autonomous" or state.status != "processing_attempt"
+            or state.current_command_id != record.id
+            or record.kind != "record" or record.state != "succeeded"
+            or record.control_generation != state.control_generation
+            or record.runner_generation != state.runner_generation):
+        _fail("autopilot_attempt_not_current", "completed attempt 已不是当前处理目标")
+
+
+def _require_attempt_capture_proof(
+    db: Session,
+    *,
+    record: RuntimeCommand,
+    attempt: AttemptEvent,
+) -> None:
+    try:
+        proof = autopilot_ledger.verify_record_capture_for_attempt(db, record.id)
+    except autopilot_ledger.AutopilotProofError as exc:
+        raise AutopilotServiceError(
+            "autopilot_record_capture_invalid", "attempt 路由前录音采集证据复核失败") from exc
+    if (proof.session_id != attempt.session_id
+            or proof.raw_audio_id != attempt.raw_audio_id
+            or proof.item_id != attempt.item_id
+            or proof.turn_seq != attempt.turn_seq
+            or proof.attempt_seq != attempt.attempt_seq
+            or proof.prompt_level != attempt.prompt_level):
+        _fail("autopilot_attempt_mismatch", "attempt 与 capture proof 不精确匹配")
+
+
+def _validate_existing_silent_advance(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+    record: RuntimeCommand,
+    command: RuntimeCommand,
+    next_selected: _SelectedContent,
+    active_capability: PatientDeviceCapability,
+) -> NextCommandProjection:
+    if (state.mode != "autonomous" or state.status != "waiting_tts"
+            or state.current_command_id != command.id
+            or command.kind != "tts" or command.state not in {"pending", "started"}
+            or command.scope_key != P0A_SCOPE_KEY
+            or command.control_generation != state.control_generation
+            or command.runner_generation != state.runner_generation
+            or command.control_generation != record.control_generation
+            or command.runner_generation != record.runner_generation
+            or command.command_seq + 1 != state.next_command_seq
+            or command.item_id != next_selected.item_id
+            or command.turn_seq != next_selected.turn_seq
+            or command.turn_key
+            != f"{next_selected.item_id}#{next_selected.turn_seq}"
+            or command.attempt_seq != 1 or command.prompt_level != 0
+            or command.predecessor_command_id is not None
+            or command.trigger_ack_idempotency_key is not None
+            or command.expected_raw_audio_id is not None):
+        _fail("autopilot_idempotency_conflict", "attempt 静默推进幂等事实不一致")
+    try:
+        payload = TtsCommandPayload.model_validate_json(command.payload_json)
+    except (TypeError, ValueError) as exc:
+        raise AutopilotServiceError(
+            "autopilot_idempotency_conflict", "attempt 静默推进 TTS 载荷非法") from exc
+    if (payload.purpose != "question"
+            or payload.speech_text != next_selected.initial_prompt
+            or payload.response_path is not None):
+        _fail("autopilot_idempotency_conflict", "attempt 静默推进的冻结话术已冲突")
+    _validate_tts_semantics(command, payload, next_selected)
+    return _project_command(
+        db, command, next_selected, expected_capability=active_capability)
+
+
+def _cas_attempt_route_terminal(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+    record: RuntimeCommand,
+    values: dict,
+    observed_at: datetime,
+) -> None:
+    """One CAS write from processing_attempt to a no-command terminal status."""
+    if (state.lease_owner is not None and state.lease_expires_at is not None
+            and state.lease_expires_at > observed_at):
+        _fail("autopilot_attempt_route_cas_conflict", "attempt 路由状态正被其他 worker 占用")
+    result = db.execute(
+        update(SessionAutopilotState)
+        .where(
+            SessionAutopilotState.session_id == state.session_id,
+            SessionAutopilotState.scope_key == state.scope_key,
+            SessionAutopilotState.mode == "autonomous",
+            SessionAutopilotState.status == "processing_attempt",
+            SessionAutopilotState.current_command_id == record.id,
+            SessionAutopilotState.control_generation == state.control_generation,
+            SessionAutopilotState.runner_generation == state.runner_generation,
+            SessionAutopilotState.revision == state.revision,
+        )
+        .values(
+            current_command_id=None,
+            revision=SessionAutopilotState.revision + 1,
+            lease_owner=None,
+            lease_acquired_at=None,
+            lease_expires_at=None,
+            updated_at=observed_at,
+            **values,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        _fail("autopilot_attempt_route_cas_conflict", "attempt 路由状态 CAS 已失效")
+
+
+def _silent_advance_gap_event_key(
+    record: RuntimeCommand, attempt: AttemptEvent,
+    gap: autopilot_positions.PositionGap,
+) -> str:
+    return _derived_key(
+        "attempt-position-gap", record.session_id, record.id, attempt.id,
+        gap.position.position_key, gap.code)
+
+
+def _silent_advance_completion_event_key(
+    record: RuntimeCommand, attempt: AttemptEvent,
+) -> str:
+    return _derived_key(
+        "attempt-scope-complete", record.session_id, record.id, attempt.id)
+
+
+def _route_silent_advance(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+    gate: _P0aGate,
+    record: RuntimeCommand,
+    attempt: AttemptEvent,
+    bank: content.ItemBank,
+    protocol: dict,
+    observed_at: datetime,
+) -> RouteCompletedAttemptResult:
+    """Advance the frozen plan after a silent-hit terminal attempt.
+
+    A hit on an interaction turn issues no speech: the plan cursor moves one
+    position and the next question is staged directly — or, at the plan
+    boundary, the scope pauses on a content gap / completes.  Same CAS/fenced
+    discipline as the speaking route; the new terminal statuses are explicit
+    result states, never a bypass.
+    """
+    session_id = record.session_id
+    next_package: dict | None = None
+    try:
+        resolved_plan = _resolved_profile_plan(gate.train_session, bank, protocol)
+        positions = resolved_plan.positions
+        current_position = autopilot_positions.find_position(
+            positions, item_id=record.item_id, turn_seq=record.turn_seq)
+        current_index = positions.index(current_position)
+        if current_index + 1 >= len(positions):
+            next_decision = autopilot_positions.PositionDecision(completed=True)
+        else:
+            next_position = positions[current_index + 1]
+            if next_position.task_type in {"双要素", "多要素"}:
+                next_package = _interaction_package_or_none(
+                    gate.train_session, bank, protocol)
+            next_decision = autopilot_positions.decision_for_position(
+                bank, next_position, interaction_package=next_package)
+    except ValueError as exc:
+        raise AutopilotServiceError(
+            "autopilot_position_invalid", "当前命令无法在冻结计划中推进") from exc
+
+    if next_decision.position is not None:
+        next_selected = _select_p0a_content(
+            gate.train_session, bank, protocol,
+            item_id=next_decision.position.item_id,
+            turn_seq=next_decision.position.turn_seq,
+            interaction_package=next_package,
+        )
+        active_capability = _lock_active_attempt_route_device(
+            db,
+            session_id=session_id,
+            expected=gate.active_capability,
+            now=observed_at,
+        )
+        route_key = _derived_key(
+            "cmd-attempt", session_id, record.id, attempt.id)
+        existing = db.exec(select(RuntimeCommand).where(
+            RuntimeCommand.session_id == session_id,
+            RuntimeCommand.idempotency_key == route_key,
+        ).with_for_update()).first()
+        if existing is not None:
+            projection = _validate_existing_silent_advance(
+                db,
+                state=state,
+                record=record,
+                command=existing,
+                next_selected=next_selected,
+                active_capability=active_capability,
+            )
+            return RouteCompletedAttemptResult(
+                attempt_id=attempt.id,
+                status="waiting_tts",
+                replayed=True,
+                state_revision=state.revision,
+                command=projection,
+            )
+        _require_attempt_route_current(state, record)
+        _require_attempt_capture_proof(db, record=record, attempt=attempt)
+        owner = "attempt-route-" + autopilot_ledger.new_lease_owner()
+        if not autopilot_ledger.try_recover_processing_attempt_state(
+            db,
+            session_id,
+            current_record_command_id=record.id,
+            owner=owner,
+            expected_revision=state.revision,
+            expected_control_generation=state.control_generation,
+            expected_runner_generation=state.runner_generation,
+            now=observed_at,
+        ):
+            _fail("autopilot_attempt_route_cas_conflict", "attempt 路由状态 CAS 已失效")
+        db.expire(state)
+        claimed_state = db.get(SessionAutopilotState, session_id)
+        if claimed_state is None:  # pragma: no cover - locked-row invariant
+            _fail("autopilot_state_invalid", "自动驾驶状态已消失")
+        try:
+            claim = autopilot_ledger.claim_from_autopilot_state(claimed_state)
+        except ValueError as exc:  # pragma: no cover - helper postcondition
+            raise AutopilotServiceError(
+                "autopilot_attempt_route_cas_conflict",
+                "attempt 路由租约事实不完整") from exc
+        payload = TtsCommandPayload(
+            speech_key=f"p0a.question.{claimed_state.next_command_seq}",
+            speech_text=next_selected.initial_prompt,
+            purpose="question",
+            item_id=next_selected.item_id,
+            turn_seq=next_selected.turn_seq,
+            cue_level=0,
+        )
+        command = RuntimeCommand(
+            idempotency_key=route_key,
+            session_id=session_id,
+            command_seq=claimed_state.next_command_seq,
+            item_id=next_selected.item_id,
+            turn_seq=next_selected.turn_seq,
+            turn_key=f"{next_selected.item_id}#{next_selected.turn_seq}",
+            attempt_seq=1,
+            prompt_level=0,
+            **_command_definition_fields(next_selected),
+            **_command_repeat_binding_fields(gate.train_session),
+            scope_key=P0A_SCOPE_KEY,
+            control_generation=claim.control_generation,
+            runner_generation=claim.runner_generation,
+            issued_capability_token_hash=active_capability.token_hash,
+            issued_device_id_hash=active_capability.device_id_hash,
+            issued_at=observed_at,
+            kind="tts",
+            state="pending",
+            payload_json=payload.model_dump_json(exclude_none=True),
+            created_at=observed_at,
+            updated_at=observed_at,
+        )
+        db.add(command)
+        db.flush()
+        if command.id is None:  # pragma: no cover - SQLAlchemy invariant
+            _fail("autopilot_state_invalid", "attempt 静默推进 TTS 命令未能持久化")
+        if not autopilot_ledger.fenced_autopilot_update(
+            db,
+            claim,
+            values={
+                "status": "waiting_tts",
+                "current_command_id": command.id,
+                "next_command_seq": claimed_state.next_command_seq + 1,
+                "last_error_code": None,
+            },
+            release_lease=True,
+            now=observed_at,
+        ):
+            _fail("autopilot_attempt_route_cas_conflict", "attempt 路由发行 CAS 已失效")
+        db.flush()
+        db.expire(claimed_state)
+        final_state = db.get(SessionAutopilotState, session_id)
+        if final_state is None:  # pragma: no cover - locked-row invariant
+            _fail("autopilot_state_invalid", "自动驾驶状态已消失")
+        projection = _project_command(
+            db, command, next_selected, expected_capability=active_capability)
+        return RouteCompletedAttemptResult(
+            attempt_id=attempt.id,
+            status="waiting_tts",
+            replayed=False,
+            state_revision=final_state.revision,
+            command=projection,
+        )
+
+    if next_decision.gap is not None:
+        gap = next_decision.gap
+        event_key = _silent_advance_gap_event_key(record, attempt, gap)
+        prior = db.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.idempotency_key == event_key,
+        )).first()
+        if prior is not None:
+            if (state.status != "paused" or state.current_command_id is not None
+                    or state.last_error_code != gap.code
+                    or prior.session_id != session_id
+                    or prior.event_type != "pause"
+                    or prior.command_id != record.id
+                    or prior.control_generation != state.control_generation
+                    or prior.runner_generation != state.runner_generation):
+                _fail("autopilot_idempotency_conflict", "协议位置缺口幂等事实不一致")
+            return RouteCompletedAttemptResult(
+                attempt_id=attempt.id,
+                status="paused",
+                replayed=True,
+                state_revision=state.revision,
+                command=None,
+            )
+        _require_attempt_route_current(state, record)
+        _require_attempt_capture_proof(db, record=record, attempt=attempt)
+        _cas_attempt_route_terminal(
+            db,
+            state=state,
+            record=record,
+            values={"status": "paused", "last_error_code": gap.code},
+            observed_at=observed_at,
+        )
+        db.add(AutopilotControlEvent(
+            idempotency_key=event_key,
+            session_id=session_id,
+            event_seq=_next_control_event_seq(db, session_id),
+            event_type="pause",
+            scope_key=P0A_SCOPE_KEY,
+            control_generation=state.control_generation,
+            runner_generation=state.runner_generation,
+            command_id=record.id,
+            actor_type="system",
+            reason_code=gap.code,
+            from_mode="autonomous",
+            to_mode="autonomous",
+            from_status="processing_attempt",
+            to_status="paused",
+            payload_json=autopilot_ledger.encode_control_event_payload(
+                "pause", {
+                    "reason_code": gap.code,
+                    "source": "protocol_position_gap",
+                }),
+            created_at=observed_at,
+        ))
+        db.flush()
+        db.expire(state)
+        final_state = db.get(SessionAutopilotState, session_id)
+        return RouteCompletedAttemptResult(
+            attempt_id=attempt.id,
+            status="paused",
+            replayed=False,
+            state_revision=final_state.revision if final_state else 0,
+            command=None,
+        )
+
+    assert next_decision.completed
+    event_key = _silent_advance_completion_event_key(record, attempt)
+    prior = db.exec(select(AutopilotControlEvent).where(
+        AutopilotControlEvent.idempotency_key == event_key,
+    )).first()
+    if prior is not None:
+        if (state.status != "scope_completed"
+                or state.current_command_id is not None
+                or prior.session_id != session_id
+                or prior.event_type != "scope_complete"
+                or prior.command_id != record.id
+                or prior.control_generation != state.control_generation
+                or prior.runner_generation != state.runner_generation):
+            _fail("autopilot_idempotency_conflict", "scope 完成幂等事实不一致")
+        return RouteCompletedAttemptResult(
+            attempt_id=attempt.id,
+            status="scope_completed",
+            replayed=True,
+            state_revision=state.revision,
+            command=None,
+        )
+    _require_attempt_route_current(state, record)
+    _require_attempt_capture_proof(db, record=record, attempt=attempt)
+    _cas_attempt_route_terminal(
+        db,
+        state=state,
+        record=record,
+        values={"status": "scope_completed"},
+        observed_at=observed_at,
+    )
+    db.add(AutopilotControlEvent(
+        idempotency_key=event_key,
+        session_id=session_id,
+        event_seq=_next_control_event_seq(db, session_id),
+        event_type="scope_complete",
+        scope_key=P0A_SCOPE_KEY,
+        control_generation=state.control_generation,
+        runner_generation=state.runner_generation,
+        command_id=record.id,
+        actor_type="system",
+        from_mode="autonomous",
+        to_mode="autonomous",
+        from_status="processing_attempt",
+        to_status="scope_completed",
+        payload_json=autopilot_ledger.encode_control_event_payload(
+            "scope_complete", {"completed_command_seq": record.command_seq}),
+        created_at=observed_at,
+    ))
+    db.flush()
+    db.expire(state)
+    final_state = db.get(SessionAutopilotState, session_id)
+    return RouteCompletedAttemptResult(
+        attempt_id=attempt.id,
+        status="scope_completed",
+        replayed=False,
+        state_revision=final_state.revision if final_state else 0,
+        command=None,
+    )
+
+
 def route_completed_attempt(
     db: Session,
     *,
@@ -4577,7 +5643,7 @@ def route_completed_attempt(
             or attempt_id < 1):
         _fail("autopilot_input_invalid", "attempt_id 必须是正整数")
     observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
-    resolved_bank = bank or _default_bank()
+    resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
     resolved_protocol = protocol or _default_protocol()
     # Shared control-path lock order starts with the state row.  The current record
     # is locked before any state claim or command issuance on the first route.
@@ -4632,6 +5698,17 @@ def route_completed_attempt(
         bank=resolved_bank,
         protocol=resolved_protocol,
     )
+    if decision.purpose == "advance_silent":
+        return _route_silent_advance(
+            db,
+            state=state,
+            gate=gate,
+            record=record,
+            attempt=attempt,
+            bank=resolved_bank,
+            protocol=resolved_protocol,
+            observed_at=observed_at,
+        )
     active_capability = _lock_active_attempt_route_device(
         db,
         session_id=session_id,
@@ -4884,7 +5961,7 @@ def route_explicit_repeat(
     commits, and the caller must roll back on :class:`AutopilotServiceError`.
     """
     observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
-    resolved_bank = bank or _default_bank()
+    resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
     resolved_protocol = protocol or _default_protocol()
 
     state = db.exec(select(SessionAutopilotState).where(
@@ -5633,7 +6710,7 @@ def apply_device_ack(
 
     # Exact transport replay remains side-effect free, but it may not revive a
     # command whose Session/content/protocol contract has drifted in place.
-    resolved_bank = bank or _default_bank()
+    resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
     resolved_protocol = protocol or _default_protocol()
     train_session = db.get(TrainSession, session_id)
     if train_session is None:

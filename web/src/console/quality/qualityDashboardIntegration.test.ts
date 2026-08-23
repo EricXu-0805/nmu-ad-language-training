@@ -45,9 +45,9 @@ test("analysis screen never requests legacy quality data and never flashes the p
 test("analysis screen exposes loading, forbidden, contract error, retry, and ready states", () => {
   const analysis = source("../AnalysisScreen.tsx");
 
-  assert.match(analysis, /正在加载当前分区 AI 质量 overall/);
+  assert.match(analysis, /正在加载当前分区 AI 质量总览/);
   assert.match(analysis, /当前账号无权查看 AI 质量汇总/);
-  assert.match(analysis, /服务器不可用或返回结果未通过 v2 聚合隐私契约/);
+  assert.match(analysis, /或返回的数据未通过隐私校验/);
   assert.match(analysis, /重试质量汇总/);
   assert.match(analysis, /disabled=\{qualityRetrySeconds > 0\}/);
   assert.match(analysis, /秒后可重试/);

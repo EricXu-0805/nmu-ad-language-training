@@ -269,7 +269,7 @@ export function useCursorWriter(sessionId: string) {
       return;
     }
     if (liveWriteRetryDecision(failure.kind) === "restart_context") {
-      setSyncError("场次握手结果不确定，已阻止重放；请安全退出当前场次后重新进入");
+      setSyncError("场次连接未完成确认，旧指令已停止执行；请安全退出本场训练后重新进入");
       return;
     }
     setSyncError(null);

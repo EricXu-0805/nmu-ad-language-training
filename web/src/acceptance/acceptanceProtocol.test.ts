@@ -11,6 +11,7 @@ import {
   formatAcceptanceText,
   missingHeaderFields,
   receiptFilename,
+  shortBuildId,
   summarizeAcceptance,
   type AcceptanceDraft,
   type MachineFacts,
@@ -86,6 +87,19 @@ test("全部通过也只说「现场记录已齐」，不说这台设备可以�
   assert.match(receipt.caveat, /不构成任何批准/);
   assert.match(receipt.caveat, /不等于这台设备/);
   assert.match(receipt.caveat, /不得沿用本次结果/);
+});
+
+test("屏上显示 8 位短版本号，回执与纯文本保留完整编号", () => {
+  // 1755100000000 = 0x198a41caf00，短号取十六进制前 8 位。
+  assert.equal(shortBuildId("1755100000000"), "198a41ca");
+  const longDecimal = BigInt("0x" + "ab".repeat(32)).toString(10); // 77 位十进制
+  assert.equal(shortBuildId(longDecimal), "abababab");
+  assert.equal(shortBuildId(longDecimal).length, 8);
+  // 短号只改显示：回执和可粘贴纯文本里仍是完整编号。
+  const draft = allPass(filledHeader(emptyDraft()));
+  const receipt = buildAcceptanceReceipt(draft, MACHINE);
+  assert.equal(receipt.machine.buildId, "1755100000000");
+  assert.match(formatAcceptanceText(receipt), /页面版本号：1755100000000/);
 });
 
 test("回执带上机器说得出的事实，尤其是构建编号", () => {

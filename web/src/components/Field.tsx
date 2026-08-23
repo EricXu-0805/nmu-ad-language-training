@@ -51,16 +51,25 @@ export function EnumSelect({ options, value, onChange, placeholder = "（未选�
 }
 
 // 三态 是/否/未评 —— 禁止把"未评"静默当"否"(护栏2:合规字段 nullable 一等公民)。
-export function TriStateField({ label, value, onChange }: {
+// nullLabel 可换成场景化说法(如"暂不选择"),含义不变仍是 null。
+// yesDisabled + yesDisabledReason:当"是"注定无效(如服务器未接入云服务)时
+// 当场禁用并给可见原因,不让人保存时才撞错。
+export function TriStateField({ label, value, onChange, nullLabel = "未评",
+  yesDisabled = false, yesDisabledReason }: {
   label: string;
   value: boolean | null | undefined;
   onChange: (v: boolean | null) => void;
+  nullLabel?: string;
+  yesDisabled?: boolean;
+  yesDisabledReason?: ReactNode;
 }) {
   const labelId = useId();
-  const opts: { k: string; v: boolean | null }[] = [
-    { k: "是", v: true }, { k: "否", v: false }, { k: "未评", v: null },
+  const opts: { k: string; v: boolean | null; disabled?: boolean }[] = [
+    { k: "是", v: true, disabled: yesDisabled },
+    { k: "否", v: false },
+    { k: nullLabel, v: null },
   ];
-  const cur = value === true ? "是" : value === false ? "否" : "未评";
+  const cur = value === true ? "是" : value === false ? "否" : nullLabel;
   return (
     <div className="field">
       <span className="field__label" id={labelId}>{label}</span>
@@ -69,11 +78,15 @@ export function TriStateField({ label, value, onChange }: {
           <button key={o.k} type="button" onClick={() => onChange(o.v)}
             aria-label={o.k}
             aria-pressed={cur === o.k}
+            disabled={o.disabled || undefined}
             className="segmented-control__button">
             {o.k}
           </button>
         ))}
       </div>
+      {yesDisabled && yesDisabledReason && (
+        <span className="field__hint">{yesDisabledReason}</span>
+      )}
     </div>
   );
 }

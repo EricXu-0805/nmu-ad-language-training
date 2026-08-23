@@ -9,7 +9,8 @@ function source(path: string): string {
 test("quality dashboard exposes operational, privacy, coverage, and classification-aware comparison regions", () => {
   const dashboard = source("./AIQualityDashboard.tsx");
 
-  assert.match(dashboard, /AI 运行质量（非研究真值）/);
+  assert.match(dashboard, /AI 运行质量（不是研究评分）/);
+  assert.match(dashboard, /!group\.metricsWithheld/);
   assert.match(dashboard, /模拟区的数据只作调试参考，不用于研究结论/);
   assert.match(dashboard, /公开范围与证据覆盖/);
   assert.match(dashboard, /固定覆盖诊断/);
@@ -42,7 +43,7 @@ test("group dimensions and metric collections use semantic description lists", (
 test("confusion matrix has a caption, row and column headers, and a named scroll region", () => {
   const matrix = source("./QualityConfusionMatrix.tsx");
 
-  assert.match(matrix, /comparisonKind === "research" \? "人工锁定研究真值" : "模拟复核参考"/);
+  assert.match(matrix, /comparisonKind === "research" \? "人工锁定研究评分" : "模拟复核参考"/);
   assert.match(matrix, /aria-label=\{`AI 判定与\$\{referenceLabel\}混淆矩阵，可横向滚动`\}/);
   assert.match(matrix, /<caption>AI 判定与\{referenceLabel\}混淆矩阵<\/caption>/);
   assert.equal((matrix.match(/scope="col"/g) ?? []).length, 3);

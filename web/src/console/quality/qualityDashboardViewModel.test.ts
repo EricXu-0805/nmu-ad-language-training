@@ -141,7 +141,7 @@ test("role-derived visibility scope is explicit and warns against cross-role com
     firstRow(value).visibility_scope = scope;
     const notice = buildAIQualityDashboardViewModel(parseAIQualityDashboard(value)).groups[0]!.visibilityNotice;
     assert.match(notice.title, title);
-    assert.match(notice.text, /overall/);
+    assert.match(notice.text, /总览/);
     assert.match(notice.text, /不可.*直接对比/);
   }
 });
@@ -161,7 +161,7 @@ test("research comparison computes confusion, FP, and FN rates but never uses a 
 
   assert.equal(truth.availability, "available");
   assert.equal(truth.comparisonKind, "research");
-  assert.equal(truth.sectionTitle, "人工锁定研究真值（复核口径）");
+  assert.equal(truth.sectionTitle, "人工锁定研究评分（复核口径）");
   assert.equal(truth.notice.tone, "info");
   assert.equal(truth.matrix.falsePositive.value, "1");
   assert.equal(truth.matrix.falseNegative.value, "2");
@@ -244,9 +244,37 @@ test("privacy-suppressed rows render suppressed rather than zero or generic miss
   assert.doesNotMatch(group.suppressionNotice.text, /不发布任何人数/);
   assert.equal(metric(group.coverageMetrics, "source-turns").state, "suppressed");
   assert.equal(metric(group.coverageMetrics, "source-turns").value, "已抑制");
-  assert.match(metric(group.operationalMetrics, "coverage").detail, /隐私规则抑制/);
+  assert.match(metric(group.operationalMetrics, "coverage").detail, /隐私规则/);
   assert.equal(group.researchTruth.availability, "suppressed");
   assert.equal(group.researchTruth.notice.tone, "warn");
+  assert.equal(group.metricsWithheld, false);
+});
+
+test("unconfigured privacy threshold collapses the group to one top notice instead of repeating per cell", () => {
+  const value = payload();
+  const row = firstRow(value);
+  row.suppression = {
+    status: "suppressed",
+    reason: "research_threshold_unconfigured",
+    minimum_distinct_subjects: null,
+    distinct_subjects: null,
+  };
+  for (const section of ["coverage", "operational", "research_truth"] as const) {
+    for (const key of Object.keys(row[section] as Record<string, unknown>)) {
+      (row[section] as Record<string, unknown>)[key] = null;
+    }
+  }
+  row.diagnostics = {
+    status: "suppressed",
+    reason_counts: Object.fromEntries(Object.keys(REASONS).map((key) => [key, null])),
+  };
+  const group = buildAIQualityDashboardViewModel(parseAIQualityDashboard(value)).groups[0]!;
+
+  assert.equal(group.metricsWithheld, true);
+  assert.match(group.suppressionNotice.text, /隐私公开阈值还没设置/);
+  assert.match(group.suppressionNotice.text, /请数据管理员配置后查看/);
+  // 只收敛呈现:数据仍是 null→「已抑制」,抑制逻辑本身未放宽。
+  assert.equal(metric(group.coverageMetrics, "source-turns").value, "已抑制");
 });
 
 test("unfrozen research release explains the durable privacy gate", () => {
@@ -303,5 +331,5 @@ test("overall null dimensions are described as intentionally unpublished, not si
 
   assert.match(dimensions.find((item) => item.key === "device_profile")!.value, /设备画像覆盖未知/);
   assert.match(dimensions.find((item) => item.key === "provider_id")!.value, /提供方覆盖未知/);
-  assert.match(dimensions.find((item) => item.key === "protocol_version")!.value, /overall 首版不按此维度分组/);
+  assert.match(dimensions.find((item) => item.key === "protocol_version")!.value, /总览首版不按此维度分组/);
 });

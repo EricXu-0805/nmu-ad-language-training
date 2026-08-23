@@ -198,15 +198,15 @@ def test_lock_incomplete_lists_every_missing_slot():
     with pytest.raises(QuestionnaireValidationError) as excinfo:
         assert_lock_complete(GDS, partial)
     assert excinfo.value.code == "questionnaire_lock_incomplete"
-    assert sorted(excinfo.value.problems) == [
-        "缺少 (gds_03, value)", "缺少 (gds_12, value)"]
+    assert sorted(excinfo.value.problems) == sorted([
+        "第 3 题未作答", "第 12 题未作答"])
 
     # 全空作答：SFACS 必填面 = 21 条目值 + 2 节 × 4 要素 = 29 槽位，缺项要列全。
     with pytest.raises(QuestionnaireValidationError) as excinfo:
         assert_lock_complete(SFACS, {})
     assert len(excinfo.value.problems) == 29
-    assert "缺少 (sfacs_01, value)" in excinfo.value.problems
-    assert "缺少 (section:social, element:accuracy)" in excinfo.value.problems
+    assert "第 1 题未作答" in excinfo.value.problems
+    assert "「一、简单社交沟通」的「准确程度」未评" in excinfo.value.problems
 
 
 def test_npiq_absent_symptom_with_severity_is_a_contradiction():
@@ -215,7 +215,7 @@ def test_npiq_absent_symptom_with_severity_is_a_contradiction():
     with pytest.raises(QuestionnaireValidationError) as excinfo:
         assert_lock_complete(NPIQ, final)
     assert excinfo.value.problems == [
-        "条目 npiq_01 记为“无”却带严重度/频率——先清除再锁定"]
+        "第 1 题记为“无”却带严重度/频率——先清除再锁定"]
 
 
 def test_npiq_present_symptom_missing_frequency_or_severity_is_rejected():
@@ -224,14 +224,14 @@ def test_npiq_present_symptom_missing_frequency_or_severity_is_rejected():
     missing_frequency[("npiq_02", "severity")] = "1"
     with pytest.raises(QuestionnaireValidationError) as excinfo:
         assert_lock_complete(NPIQ, missing_frequency)
-    assert excinfo.value.problems == ["条目 npiq_02 记为“有”但缺频率"]
+    assert excinfo.value.problems == ["第 2 题记为“有”但缺频率"]
 
     missing_severity = _npiq_all_absent()
     missing_severity[("npiq_03", "present")] = "有"
     missing_severity[("npiq_03", "frequency")] = "4"
     with pytest.raises(QuestionnaireValidationError) as excinfo:
         assert_lock_complete(NPIQ, missing_severity)
-    assert excinfo.value.problems == ["条目 npiq_03 记为“有”但缺严重度"]
+    assert excinfo.value.problems == ["第 3 题记为“有”但缺严重度"]
 
     complete = _npiq_all_absent()
     complete[("npiq_04", "present")] = "有"
@@ -245,7 +245,7 @@ def test_lock_rejects_answer_keys_outside_the_definition():
     final[("npiq_99", "present")] = "无"
     with pytest.raises(QuestionnaireValidationError) as excinfo:
         assert_lock_complete(NPIQ, final)
-    assert excinfo.value.problems == ["存在定义外的作答键 ('npiq_99', 'present')"]
+    assert excinfo.value.problems == ["出现了定义之外的作答记录 (npiq_99, present)，请联系管理员核查"]
 
 
 def test_gds15_reverse_items_are_pinned_verbatim_to_the_source_rule():
@@ -509,7 +509,7 @@ def test_lock_refuses_incomplete_answers_with_the_full_missing_list(api_env):
     detail = lock.json()["detail"]
     assert detail["code"] == "questionnaire_lock_incomplete"
     assert len(detail["problems"]) == 14
-    assert "缺少 (gds_02, value)" in detail["problems"]
+    assert "第 2 题未作答" in detail["problems"]
 
 
 def test_out_of_domain_value_write_is_rejected_with_problems(api_env):

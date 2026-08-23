@@ -213,11 +213,13 @@ function parseTtsPayload(value: unknown, row: UnknownRecord): DeviceTtsPayload |
   // 与服务端 _validate_tts_semantics 同一张 (prompt_level, attempt_seq) 矩阵。
   // 只绑 prompt_level 不够：例如 cue(2,2) 的等级合法而尝试序号不合法，冻结语义里
   // 根本不存在这一格，放过去等于承认一条服务端拒绝签发的话术。
+  // tell_answer(3,1)/(3,2) = 交互数据包环节(双/多要素)在第 1/2 次录音后的
+  // 告知句;(3,3) = 单要素三级直接告知。与服务端 shape 感知表保持同一并集。
   const FROZEN_STAGES: Record<AutopilotTtsPurpose, readonly (readonly [number, number])[]> = {
     question: [[0, 1]],
     cue: [[1, 2], [2, 3]],
     feedback: [[0, 1], [1, 2], [2, 3]],
-    tell_answer: [[3, 3]],
+    tell_answer: [[3, 1], [3, 2], [3, 3]],
   };
   const stageAllowed = FROZEN_STAGES[payload.purpose as AutopilotTtsPurpose]
     .some(([level, attempt]) => row.prompt_level === level && row.attempt_seq === attempt);

@@ -66,6 +66,6 @@ test("真实分区没有冻结版本时，屏上解释这不是故障并说清�
 });
 
 test("屏上与导出都说得出这份数据是哪一版", () => {
-  assert.match(screen, /meta\.release\.bound &&[\s\S]{0,400}冻结发布纪元/);
+  assert.match(screen, /meta\.release\.bound &&[\s\S]{0,400}数据版本/);
   assert.match(screen, /researchCsvFilename\(\s*dataset, classification,\s*\n\s*pageState\.status === "ready" \? pageState\.page\.release : null\)/);
 });

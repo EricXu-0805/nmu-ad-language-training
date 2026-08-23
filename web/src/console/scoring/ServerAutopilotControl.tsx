@@ -6,6 +6,7 @@ import {
   AutopilotControlOperationEpoch,
   completePlanAllowsAutopilotStart,
   initialAutopilotConsoleState,
+  isPrewriteStartRejection,
   p0aConsoleEligibility,
   receiptAllowsAutopilotTakeover,
   sameAutopilotStatusReceipt,
@@ -41,6 +42,7 @@ export function ServerAutopilotControl({
   patientMicOn,
   planPositionReady,
   onOwnershipChange,
+  onReceiptPosition,
   prepareOwnership,
 }: {
   session: Session;
@@ -51,6 +53,8 @@ export function ServerAutopilotControl({
   patientMicOn: boolean;
   planPositionReady: boolean;
   onOwnershipChange: (owned: boolean, phase: AutopilotConsoleState["phase"]) => void;
+  /** 权威回执里的只读位置投影(观察面/接管恢复展示用),无位置时回报 null。 */
+  onReceiptPosition?: (position: { itemId: string; turnSeq: number } | null) => void;
   prepareOwnership: () => Promise<boolean>;
 }) {
   const [state, dispatch] = useReducer(
@@ -63,9 +67,13 @@ export function ServerAutopilotControl({
     operationalAutopilotReady,
   );
   const exactDemoProfile = hasExactWeek2Single20Profile(session);
-  const resolvedPlanLabel = exactDemoProfile ? "20 题模拟计划" : "完整冻结计划";
+  const resolvedPlanLabel = exactDemoProfile ? "20 题模拟计划" : "完整训练计划";
   const isSimulation = session.is_simulation === true
     && session.data_classification === "simulation";
+  const isRealResearch = session.is_simulation === false
+    && session.data_classification === "research";
+  // 分类不可证明（legacy_unknown/缺失/错配）时整个控件不渲染，也不轮询。
+  const classificationProven = isSimulation || isRealResearch;
   const startInFlight = useRef(false);
   const controlWriteInFlight = useRef(false);
   const statusInFlight = useRef(false);
@@ -97,6 +105,11 @@ export function ServerAutopilotControl({
     latestRevision.current = receipt.stateRevision;
     latestReceipt.current = receipt;
     dispatch({ type: "status_received", sessionId: session.session_id, receipt });
+    onReceiptPosition?.(
+      receipt.positionItemId !== null && receipt.positionTurnSeq !== null
+        ? { itemId: receipt.positionItemId, turnSeq: receipt.positionTurnSeq }
+        : null,
+    );
     onOwnershipChange(
       receipt.serverOwned,
       receipt.serverOwned ? receipt.status : "idle",
@@ -111,12 +124,13 @@ export function ServerAutopilotControl({
       lastWakeToken.current = autopilotWakeToken(wake);
       window.dispatchEvent(new CustomEvent(PATIENT_AUTOPILOT_WAKE_EVENT, { detail: wake }));
     }
-  }, [onOwnershipChange, session.session_id]);
+  }, [onOwnershipChange, onReceiptPosition, session.session_id]);
 
   useEffect(() => {
     dispatch({ type: "reset", sessionId: session.session_id });
     latestRevision.current = -1;
     latestReceipt.current = null;
+    onReceiptPosition?.(null);
     operationEpoch.current.invalidate();
     startInFlight.current = false;
     controlWriteInFlight.current = false;
@@ -126,7 +140,7 @@ export function ServerAutopilotControl({
     lastWakeToken.current = null;
     setConfirmTakeover(false);
     setTakeoverBusy(false);
-    if (!isSimulation) {
+    if (!classificationProven) {
       onOwnershipChange(false, "idle");
       return undefined;
     }
@@ -161,13 +175,14 @@ export function ServerAutopilotControl({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [acceptReceipt, isSimulation, onOwnershipChange, session.session_id]);
+  }, [acceptReceipt, classificationProven, onOwnershipChange, onReceiptPosition,
+    session.session_id]);
 
   useEffect(() => {
     setProviderReadiness(null);
     setProviderReadinessError(null);
     setCanProbeProvider(false);
-    if (!isSimulation || !hasNamedAccount) return undefined;
+    if (!classificationProven || !hasNamedAccount) return undefined;
     let cancelled = false;
     let inFlight = false;
     const refreshReadiness = async () => {
@@ -200,7 +215,7 @@ export function ServerAutopilotControl({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [hasNamedAccount, isSimulation, session.session_id]);
+  }, [classificationProven, hasNamedAccount, session.session_id]);
 
   const runProviderProbe = async () => {
     if (!canProbeProvider || providerProbeBusy || autopilotServerOwnsConsole(state)) return;
@@ -249,11 +264,14 @@ export function ServerAutopilotControl({
             : refreshError instanceof Error ? refreshError.message : String(refreshError));
         }
       }
-      // 400/401/403/404/422 都在写入前失败；409 可能表示服务器已经有 owner，
-      // timeout/5xx 也可能是“已提交但回执丢失”，必须保持锁定等待权威查询。
+      // 400/401/403/404/422 都在写入前失败；确定性门禁 409(部署开关/授权/范围)
+      // 同样在写入前拒绝(D1:拒因要常驻,不折成会被轮询抹掉的 uncertain)。
+      // 幂等/revision/CAS 类 409 可能表示服务器已经有 owner，timeout/5xx 也可能
+      // 是“已提交但回执丢失”，必须保持锁定等待权威查询。
       const rejectedBeforeWrite = error instanceof ApiError
         && ([400, 401, 403, 404, 422].includes(error.status)
-          || readinessPrewrite);
+          || readinessPrewrite
+          || isPrewriteStartRejection(error));
       dispatch({
         type: rejectedBeforeWrite ? "start_rejected" : "status_uncertain",
         sessionId: session.session_id,
@@ -305,7 +323,7 @@ export function ServerAutopilotControl({
     patientMicOn, planPositionReady, providerReadiness, session.session_id,
     state.phase, state.receipt]);
 
-  if (!isSimulation) return null;
+  if (!classificationProven) return null;
 
   const takeover = async () => {
     const receipt = state.receipt;
@@ -361,15 +379,15 @@ export function ServerAutopilotControl({
   const canTakeover = receiptAllowsAutopilotTakeover(state.receipt)
     && (paused || completed || serverFailed);
   const title = manual ? "AI 自动干预已完成审计接管"
-    : active ? "当前冻结位置由服务器 AI 控制"
+    : active ? "AI 正在控制当前环节"
     : processing ? "AI 正在处理当前回答"
-      : contentGap ? "AI 已停在缺少冻结内容的边界"
+      : contentGap ? "下一题内容不全，AI 已停下"
       : paused ? "AI 自动干预已安全暂停"
         : completed ? "当前可自动范围已完成"
           : serverFailed ? "AI 自动干预已进入失败锁定"
             : checking ? "正在核对服务器控制权"
           : uncertain ? "服务器状态待核实 · 人工控制已锁定"
-            : "AI 自动带练（仅限演练场次）";
+            : isSimulation ? "AI 自动带练（演练）" : "AI 自动带练";
 
   return (
     <>
@@ -387,7 +405,7 @@ export function ServerAutopilotControl({
             onClick={() => { void start(); }}
           >
             {manual ? "已转为人工处置"
-              : state.phase === "starting" ? "正在核对服务器门禁…"
+              : state.phase === "starting" ? "正在核对启动条件…"
               : checking ? "正在恢复服务器状态…"
               : active ? "服务器正在控制当前位置"
                 : processing ? "服务器正在处理回答"
@@ -397,7 +415,7 @@ export function ServerAutopilotControl({
                       : uncertain ? "等待权威状态核实"
                 : completePlanBlocked ? operationalAutopilotReady === null
                   ? `正在核对${resolvedPlanLabel}`
-                  : `${resolvedPlanLabel}仍有自动协议缺口`
+                  : `${resolvedPlanLabel}的题目内容未配齐`
                 : providerBlocked ? providerReadiness === null
                   ? "正在核对 AI 服务实测"
                   : "AI 服务实测未通过或已过期"
@@ -405,7 +423,8 @@ export function ServerAutopilotControl({
                   : accountBlocked ? "需要具名研究账号"
                   : runtimeBlocked ? "场次未处于可启动状态"
                     : rejected ? "重新核对并启动"
-                      : "启动模拟 AI 自动干预"}
+                      : isSimulation ? "启动模拟 AI 自动干预"
+                        : "启动 AI 自动带练"}
           </Button>
           {canTakeover && (
             <Button type="button" variant="danger" disabled={takeoverBusy}
@@ -435,7 +454,7 @@ export function ServerAutopilotControl({
           <>AI 已暂停，题目停在当前位置；要继续人工操作，请点「收麦后转为人工处置」。</>
         )
       ) : completed ? (
-        <>本次模拟训练的自动部分已完成；如需继续，请点「收麦后转为人工处置」。</>
+        <>{isSimulation ? "本次模拟训练" : "本场训练"}的自动部分已完成；如需继续，请点「收麦后转为人工处置」。</>
       ) : serverFailed ? (
         <>
           AI 自动训练出错停止，页面保持锁定；请联系研究团队处置。
@@ -467,10 +486,15 @@ export function ServerAutopilotControl({
           <details style={{ marginTop: "var(--sp-2)" }}>
             <summary>技术详情</summary>
             <div style={{ marginTop: "var(--sp-1)" }}>
-              启动时服务器会自动核对：研究账号、模拟档案与开关、录音授权、场次状态、配对设备；缺少内容的环节会自动停下，不会跳题。
+              启动时服务器会自动核对：研究账号、{isSimulation ? "模拟档案与开关" : "研究档案、部署开关与云处理授权"}、录音授权、场次状态、配对设备；缺少内容的环节会自动停下，不会跳题。
             </div>
           </details>
         </>
+      )}
+      {isRealResearch && (
+        <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.85 }}>
+          带练话术为原型版，未经临床终审。
+        </div>
       )}
       {providerReadiness && (
         <details style={{ marginTop: 8 }}>
@@ -490,6 +514,13 @@ export function ServerAutopilotControl({
         {uncertain ? "状态核实失败" : "启动未通过"}：{state.error}。
         {uncertain ? " 人工入口继续锁定，避免与可能已启动的服务器流程并行。" : " 服务器在写入前拒绝了请求。"}
       </div>}
+      {/* D1:拒因不许无痕消失——权威 no-owner 回执把强横幅降级为持久提示,
+          直到再次点启动或服务器真的持有。 */}
+      {!state.error && state.lastStartRejection && (
+        <div role="alert" style={{ marginTop: 6 }}>
+          上次启动被拒：{state.lastStartRejection}。处理后可重新点「启动」。
+        </div>
+      )}
     </Alert>
     <ConfirmDialog
       open={confirmTakeover}

@@ -460,6 +460,8 @@ export function QuestionnaireDrawer({
 
         <ConfirmDialog open={confirmLock} title="锁定这份量表记录？"
           confirmLabel="锁定" busy={lockBusy}
+          // 预检已知必被服务器拒绝时,确认钮直接禁用(P2-5)——不给"点了也白点"的按钮。
+          confirmDisabled={missing.length > 0}
           onConfirm={() => void lockNow()}
           onCancel={() => setConfirmLock(false)}
           body={(
@@ -467,7 +469,7 @@ export function QuestionnaireDrawer({
               <p>锁定后不能再修改；发现错误只能新建记录重新录入。</p>
               {missing.length > 0 ? (
                 <>
-                  <p>还有 {missing.length} 处未完成，服务器会拒绝锁定：</p>
+                  <p>还有 {missing.length} 处未完成，暂不能锁定——请先补齐：</p>
                   <ul>
                     {missing.slice(0, 12).map((entry) => <li key={entry}>{entry}</li>)}
                     {missing.length > 12 && <li>……共 {missing.length} 处</li>}

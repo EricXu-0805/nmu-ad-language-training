@@ -6,8 +6,10 @@ import {
   manualResyncRequired,
   manualSurfaceLocked,
   observerPhaseView,
+  observerAuthoritativePosition,
   observerPlanPosition,
   observerResyncResultCurrent,
+  planCursorForReceiptPosition,
   ownershipImpliesAutomationExposure,
   type ObserverOwnershipPhase,
 } from "./observerConsoleModel.ts";
@@ -198,4 +200,38 @@ test("stale, foreign, or out-of-range positions fail closed to null", () => {
   assert.equal(observerPlanPosition(runtimeAt(0, 1), "S-a", PLAN), null);
   assert.equal(observerPlanPosition(runtimeAt(-1, 0), "S-a", PLAN), null);
   assert.equal(observerPlanPosition(runtimeAt(0.5, 0), "S-a", PLAN), null);
+});
+
+// D3/D4:自动带练不写 live cursor,serverOwnership 期间权威位置只来自状态回执。
+test("D3:receipt position maps into the frozen plan, and anything unprovable is null", () => {
+  assert.deepEqual(planCursorForReceiptPosition(PLAN, "DE_牙刷_牙膏", 2), { itemIdx: 1, turnIdx: 1 });
+  assert.deepEqual(planCursorForReceiptPosition(PLAN, "SE_胡萝卜", 1), { itemIdx: 0, turnIdx: 0 });
+  assert.equal(planCursorForReceiptPosition(PLAN, "SE_不在计划里", 1), null);
+  assert.equal(planCursorForReceiptPosition(PLAN, "SE_胡萝卜", 9), null);
+  assert.equal(planCursorForReceiptPosition(PLAN, "SE_胡萝卜", 0), null);
+  assert.equal(planCursorForReceiptPosition(PLAN, "SE_胡萝卜", 1.5), null);
+  assert.equal(planCursorForReceiptPosition(null, "SE_胡萝卜", 1), null);
+  assert.equal(planCursorForReceiptPosition(PLAN, null, null), null);
+  assert.equal(planCursorForReceiptPosition(PLAN, "", 1), null);
+});
+
+test("D3:receipt position wins over the stale runtime cursor, and its change moves the view", () => {
+  const staleRuntime = runtimeAt(0, 0);
+  const fromReceipt = observerAuthoritativePosition(
+    { itemId: "DE_牙刷_牙膏", turnSeq: 2 }, staleRuntime, "S-a", PLAN);
+  assert.equal(fromReceipt?.itemOrdinal, 2);
+  assert.equal(fromReceipt?.turnOrdinal, 2);
+  assert.equal(fromReceipt?.itemLabel, "牙刷_牙膏");
+  // 回执位置变化 → 观察位置变化(9 分钟 26 采样全 pos=1 的病根)。
+  const moved = observerAuthoritativePosition(
+    { itemId: "SE_胡萝卜", turnSeq: 1 }, staleRuntime, "S-a", PLAN);
+  assert.equal(moved?.itemOrdinal, 1);
+  // 无回执位置(如尚未拿到权威回执)→ 回退既有 runtime 判定。
+  assert.equal(
+    observerAuthoritativePosition(null, staleRuntime, "S-a", PLAN)?.itemOrdinal, 1);
+  assert.equal(observerAuthoritativePosition(null, null, "S-a", PLAN), null);
+  // 回执位置不可证明 → null(显示待同步),绝不回退到可能更旧的 cursor 冒充权威。
+  assert.equal(
+    observerAuthoritativePosition({ itemId: "SE_不在计划里", turnSeq: 1 }, staleRuntime, "S-a", PLAN),
+    null);
 });

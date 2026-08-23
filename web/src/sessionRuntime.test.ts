@@ -64,11 +64,11 @@ test("runtime parser binds the exact path session and normalizes safe recovery c
 });
 
 test("runtime parser rejects cross-session, unknown, unsafe-microphone and contradictory data", () => {
-  assert.throws(() => parseSessionRuntimeState(runtime({ sessionId: "S-OTHER" }), SID), /严格契约/);
-  assert.throws(() => parseSessionRuntimeState({ ...runtime(), injected: true }, SID), /严格契约/);
-  assert.throws(() => parseSessionRuntimeState(runtime({ revision: -1 }), SID), /严格契约/);
-  assert.throws(() => parseSessionRuntimeState(runtime({ updatedAt: "2026-02-30T01:00:00" }), SID), /严格契约/);
-  assert.throws(() => parseSessionRuntimeState(runtime({ updatedAt: "2026-07-19T01:00:00+14:30" }), SID), /严格契约/);
+  assert.throws(() => parseSessionRuntimeState(runtime({ sessionId: "S-OTHER" }), SID), /版本不匹配/);
+  assert.throws(() => parseSessionRuntimeState({ ...runtime(), injected: true }, SID), /版本不匹配/);
+  assert.throws(() => parseSessionRuntimeState(runtime({ revision: -1 }), SID), /版本不匹配/);
+  assert.throws(() => parseSessionRuntimeState(runtime({ updatedAt: "2026-02-30T01:00:00" }), SID), /版本不匹配/);
+  assert.throws(() => parseSessionRuntimeState(runtime({ updatedAt: "2026-07-19T01:00:00+14:30" }), SID), /版本不匹配/);
   assert.throws(() => parseSessionRuntimeState(runtime({
     revision: 1,
     cursor: {

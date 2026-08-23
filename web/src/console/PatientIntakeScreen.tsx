@@ -8,7 +8,11 @@ import { StatusPill } from "../components/StatusPill";
 import { useToast } from "../components/ToastContext";
 import { CONSENT_TYPES } from "../types";
 import type { CloudProcessingPolicy, Patient } from "../types";
-import { cloudProcessingChoiceIssue, cloudProcessingDisclosure } from "./cloudProcessingPolicy";
+import {
+  cloudProcessingAllowDisabledReason,
+  cloudProcessingChoiceIssue,
+  cloudProcessingDisclosure,
+} from "./cloudProcessingPolicy";
 import {
   assessDuplicateIntake,
   capturePatientIntakeSubmission,
@@ -409,18 +413,24 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
               <p className="muted">这不是录音授权，也不是二次使用授权；撤销它不会自动退出整个研究或删除原声。</p>
             </div>
             <StatusPill tone={p.cloud_processing_allowed === true ? "warn" : p.cloud_processing_allowed === false ? "ok" : "muted"}>
-              {p.cloud_processing_allowed === true ? "允许云处理" : p.cloud_processing_allowed === false ? "不允许云处理" : "尚未选择"}
+              {p.cloud_processing_allowed === true ? "允许云处理" : p.cloud_processing_allowed === false ? "不允许云处理" : "暂未选择"}
             </StatusPill>
           </div>
-          <Alert tone={cloudPolicy?.configured ? "warn" : "danger"} title="会发送哪些数据">
+          <Alert tone={cloudPolicy?.configured ? "warn" : "info"}
+            title={cloudPolicy?.configured ? "会发送哪些数据" : "云端 AI 服务尚未接入"}>
             <p>{cloudProcessingDisclosure(cloudPolicy)}</p>
-            <p>允许后，回答录音和文字会发给上述服务方处理；不允许时一律不外发。</p>
-            {cloudPolicyError && <p>云处理告知条款读取失败：{cloudPolicyError}</p>}
+            {cloudPolicy?.configured && (
+              <p>允许后，这位受试者的回答录音和回答文字会发给上述服务方处理；不允许时一律不外发。</p>
+            )}
+            {cloudPolicyError && <p>云端服务配置没有读到：{cloudPolicyError}</p>}
           </Alert>
           <TriStateField
             label="是否明确允许上述第三方云处理"
             value={p.cloud_processing_allowed}
             onChange={(value) => set("cloud_processing_allowed", value)}
+            nullLabel="暂不选择"
+            yesDisabled={cloudProcessingAllowDisabledReason(cloudPolicy, cloudPolicyError) !== null}
+            yesDisabledReason={cloudProcessingAllowDisabledReason(cloudPolicy, cloudPolicyError)}
           />
         </section>
         </div>

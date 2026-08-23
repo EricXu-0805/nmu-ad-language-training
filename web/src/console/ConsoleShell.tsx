@@ -5,7 +5,7 @@ import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { StatusPill } from "../components/StatusPill";
-import { ToastProvider } from "../components/Toast";
+import { ToastProvider, TOAST_SCREEN_CHANGED_EVENT } from "../components/Toast";
 import { AbnormalDrawer } from "./abnormal/AbnormalDrawer";
 import { AnalysisScreen } from "./AnalysisScreen";
 import {
@@ -190,7 +190,11 @@ function ConsoleWorkspace({ identity, onLogout }: {
     if (document.fullscreenElement) document.exitFullscreen().catch(() => { /* 已不在全屏 */ });
   };
   useEffect(() => { persistConsoleState(state, identity); }, [identity, state]);
-  useEffect(() => { window.scrollTo({ top: 0, behavior: "auto" }); }, [state.screen, state.area]);
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: "auto" });
+    // 主屏切换即清掉上一屏残留的非危险提示(P2-1);danger 级留到读完或点掉。
+    window.dispatchEvent(new Event(TOAST_SCREEN_CHANGED_EVENT));
+  }, [state.screen, state.area]);
 
   // 切区:训练中(training/relationship)切走要确认——防误触离开正在进行的现场。
   // 拒绝切换时把原因写进 logoutSafetyError 提示条:tab 用 aria-disabled 而非 disabled,
@@ -344,6 +348,7 @@ function ConsoleWorkspace({ identity, onLogout }: {
           {state.area === "run" && state.screen === "training" && state.session && (
             <TrainingConsoleScreen key={state.session.session_id} session={state.session}
               hasNamedAccount={identity !== null}
+              presence={patientPresence}
               onWrapup={() => dispatch({ t: "goWrapup" })} onExit={requestSessionExit}
               onItemEventChange={setCurrentItemEventId} />
           )}

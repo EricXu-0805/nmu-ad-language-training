@@ -41,10 +41,10 @@ export function ResearchReviewPanel({
     <section className="form-section">
       <div className="form-section-header">
         <div>
-          <h3>{readOnly ? "研究真值（已锁定）" : "事后研究复核与锁分"}</h3>
+          <h3>{readOnly ? "研究评分（已锁定）" : "事后研究复核与锁分"}</h3>
           <p className="muted">
             {readOnly
-              ? "最终完成态只展示服务器已锁定的研究真值，不能再修改。"
+              ? "最终完成态只展示服务器已锁定的研究评分，不能再修改。"
               : "逐环节核对转写、确认文本后锁分。"}
           </p>
         </div>
@@ -336,7 +336,7 @@ function ReviewTurnRow({
       });
       setConfirmLock(false);
       onChanged?.();
-      toast("研究真值已锁定；该环节不可再修改", "ok");
+      toast("研究评分已锁定；该环节不可再修改", "ok");
     } catch (error) {
       toast(error instanceof ApiError ? error.detail : String(error), "danger");
     } finally {
@@ -354,7 +354,7 @@ function ReviewTurnRow({
             : <StatusPill tone="danger">未关联 AI 处理记录</StatusPill>}
           {row.aiNeedsReview && <StatusPill tone="warn">AI 标记需复核</StatusPill>}
         </div>
-        <StatusPill tone={row.locked ? "ok" : "warn"}>{row.locked ? "研究真值已锁定" : "待人工复核"}</StatusPill>
+        <StatusPill tone={row.locked ? "ok" : "warn"}>{row.locked ? "研究评分已锁定" : "待人工复核"}</StatusPill>
       </div>
 
       {!scoringContract.ok && (
@@ -457,18 +457,18 @@ function ReviewTurnRow({
                 onClick={() => { void saveConfirmation(); }}>
                 {busy === "confirm" ? "正在保存…" : "保存人工确认"}
               </Button>
-              <Button variant="primary" aria-label={`锁定 ${itemId} · ${role} 的研究真值`}
+              <Button variant="primary" aria-label={`锁定 ${itemId} · ${role} 的研究评分`}
                 disabled={busy !== null || !gate.contract.ok
                   || gate.blockers.some((blocker) => blocker.code !== "missing_score" && blocker.code !== "invalid_score")}
                 onClick={requestLock}>
-                锁定研究真值
+                锁定研究评分
               </Button>
             </div>
           </div>
         )}
       </div>
 
-      <ConfirmDialog open={confirmLock} title="确认锁定研究真值？"
+      <ConfirmDialog open={confirmLock} title="确认锁定研究评分？"
         body={`题目 ${itemId} · ${role} 将锁定为“${selectedScoreOption?.label ?? "未选"}”（提示等级 ${authoritativePromptLevel == null ? "未返回" : `${authoritativePromptLevel} 级`}）。锁定后不可修改。`}
         confirmLabel={busy === "lock" ? "正在锁定…" : "确认锁定"}
         onConfirm={() => { if (!busy) void lockScore(); }}

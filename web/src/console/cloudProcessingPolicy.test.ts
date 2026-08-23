@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { cloudProcessingChoiceIssue, cloudProcessingDisclosure } from "./cloudProcessingPolicy.ts";
+import {
+  cloudProcessingAllowDisabledReason,
+  cloudProcessingChoiceIssue,
+  cloudProcessingDisclosure,
+} from "./cloudProcessingPolicy.ts";
 import {
   assessDuplicateIntake,
   capturePatientIntakeSubmission,
@@ -55,6 +59,46 @@ test("允许云处理时服务器 policy 缺失必须 fail closed", () => {
   assert.match(cloudProcessingChoiceIssue(true, null) ?? "", /不能记录允许/);
   assert.equal(cloudProcessingChoiceIssue(false, null), null);
   assert.equal(cloudProcessingChoiceIssue(null, null), null);
+});
+
+test("未接入时的文案是人话:不出现英文 policy,并给出可执行的下一步", () => {
+  const unconfigured = { configured: false, provider_id: null, notice_version: null, data_categories: [] };
+  for (const text of [
+    cloudProcessingDisclosure(null),
+    cloudProcessingDisclosure(unconfigured),
+    cloudProcessingChoiceIssue(true, null) ?? "",
+    cloudProcessingAllowDisabledReason(unconfigured, null) ?? "",
+  ]) {
+    assert.doesNotMatch(text, /policy/i, text);
+  }
+  assert.match(cloudProcessingAllowDisabledReason(unconfigured, null) ?? "", /暂不选择/);
+});
+
+test("『是』按钮禁用原因:未接入/读取中/读取失败给原因,配置齐全为 null", () => {
+  const configured = {
+    configured: true,
+    provider_id: "aliyun-dashscope",
+    notice_version: "notice-2026-01",
+    data_categories: [],
+  };
+  assert.equal(cloudProcessingAllowDisabledReason(configured, null), null);
+  assert.match(cloudProcessingAllowDisabledReason(null, null) ?? "", /正在读取/);
+  assert.match(cloudProcessingAllowDisabledReason(null, "网络错误") ?? "", /无法授权/);
+  assert.match(
+    cloudProcessingAllowDisabledReason(
+      { configured: false, provider_id: null, notice_version: null, data_categories: [] },
+      null,
+    ) ?? "", /无法授权/);
+});
+
+test("建档屏云区块:『是』按预检禁用、第三态叫暂不选择、说明随配置切换", () => {
+  const source = readFileSync(new URL("./PatientIntakeScreen.tsx", import.meta.url), "utf8");
+  assert.match(source, /nullLabel="暂不选择"/);
+  assert.match(source, /yesDisabled=\{cloudProcessingAllowDisabledReason\(cloudPolicy, cloudPolicyError\) !== null\}/);
+  assert.match(source, /yesDisabledReason=\{cloudProcessingAllowDisabledReason\(cloudPolicy, cloudPolicyError\)\}/);
+  assert.match(source, /云端 AI 服务尚未接入/);
+  // 未接入不再顶着红色警示框吓人;配置齐全才用 warn 提示要外发数据。
+  assert.match(source, /tone=\{cloudPolicy\?\.configured \? "warn" : "info"\}/);
 });
 
 test("文案明确声纹、回答文本、provider 与告知版本", () => {

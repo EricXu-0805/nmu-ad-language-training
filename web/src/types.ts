@@ -144,6 +144,28 @@ export interface PatientSummary {
   session_count: number;
   unfinished_session_count?: number;
   last_training_date?: string | null;
+  // 老人端专属配对码:仅训练操作角色可见;撤回/编号不合规档案恒为 null。
+  pairing_code?: string | null;
+}
+
+// PATCH /patients/{id} 的可编辑面(非治理字段)。省略字段=不改;null=显式清空。
+// new_patient_id 仅零关联数据时被服务器接受。
+export interface PatientProfilePatch {
+  new_patient_id?: string;
+  dementia_severity?: string | null;
+  mandarin_eligible?: boolean | null;
+  language_eligibility?: string | null;
+  consent_status?: string | null;
+  consent_type?: ConsentType | null;
+  consent_time?: string | null;
+  consent_person?: string | null;
+  proxy_consent?: boolean | null;
+  capacity_assessment_status?: string | null;
+  assent_obtained?: boolean | null;
+  recording_allowed?: boolean | null;
+  secondary_use_allowed?: boolean | null;
+  ethics_approval_no?: string | null;
+  registration_no?: string | null;
 }
 
 export type WithdrawalReasonCode =

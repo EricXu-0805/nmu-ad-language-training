@@ -33,7 +33,7 @@ export function assessmentActionGates(event: AssessmentEvent): AssessmentActionG
       ? "逐条录入作答;两类实例都计分或获批延期后进入收尾"
       : event.status === "awaiting_closeout"
         ? "填写现场收尾记录并关闭事件"
-        : "事件已终态,只读";
+        : "该测评已结束,只能查看";
   return {
     canStart: event.status === "due",
     canCancel: event.status === "due",

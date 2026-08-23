@@ -18,6 +18,8 @@ import { useSessionRuntime } from "../../hooks/useSessionRuntime";
 import { shouldAutoRouteTrainingToWrapup } from "../../sessionLifecycle";
 import { flushLiveWrites, useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
 import { isPatientRecFailure } from "../../sync/messages";
+import type { PatientPresenceView } from "../../sync/usePatientPresence";
+import { formatRecordingClock, watchdogSecondsLeft } from "../../recordingClock";
 import {
   buildExactTechnicalPauseRequest,
   exactTechnicalPauseRequestMatchesDraft,
@@ -37,7 +39,7 @@ import { ObserverConsole } from "./ObserverConsole.tsx";
 import {
   manualResyncRequired,
   manualSurfaceLocked,
-  observerPlanPosition,
+  observerAuthoritativePosition,
   observerResyncResultCurrent,
   type ManualResyncStatus,
   type ObserverResyncFence,
@@ -76,8 +78,11 @@ function loadAutopilotFailure(sessionId: string): AutopilotFailure | null {
 
 // week≥2 判分主屏:左题目游标列 + 右环节工作卡(转写→确认→AI初评→锁分)。
 // 唯一游标写者,推进老人端;★本文件及本目录禁 import 任何画像源(oxlint 守卫 + vm 运行时断言)。
-export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onExit, onItemEventChange }: {
-  session: Session; hasNamedAccount: boolean; onWrapup: () => void; onExit?: () => void; onItemEventChange?: (id: number | null) => void;
+export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWrapup, onExit, onItemEventChange }: {
+  session: Session; hasNamedAccount: boolean;
+  // 由 ConsoleShell 的既有 usePatientPresence 轮询传入,本屏不新增网络轮询器。
+  presence: PatientPresenceView;
+  onWrapup: () => void; onExit?: () => void; onItemEventChange?: (id: number | null) => void;
 }) {
   const toast = useToast();
   const exactDemoProfile = hasExactWeek2Single20Profile(session);
@@ -269,6 +274,17 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [manualResync.status, serverOwnership, session.session_id]);
+  // D3:自动带练期间的权威位置只来自状态回执(服务端自动推进不写 live cursor);
+  // 观察面与页首都用它,runtime cursor 只作无回执时的回退。
+  const [apReceiptPosition, setApReceiptPosition] =
+    useState<{ itemId: string; turnSeq: number } | null>(null);
+  const onAutopilotReceiptPosition = useCallback(
+    (position: { itemId: string; turnSeq: number } | null) => {
+      setApReceiptPosition((current) => (
+        current?.itemId === position?.itemId && current?.turnSeq === position?.turnSeq
+          ? current : position
+      ));
+    }, []);
   const [operationalAutopilotReady, setOperationalAutopilotReady] = useState<boolean | null>(null);
   const [unsupportedOperationalPositions, setUnsupportedOperationalPositions] = useState<string[]>([]);
   const [operationalGapSummary, setOperationalGapSummary] = useState({
@@ -317,11 +333,29 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   const recordingEligible = recStatus === "allowed";
   const selfStart = recordingEligible;
   const [recState, setRecState] = useState<"idle" | "armed">("idle");
+  // P0-3:老人端在场状态是录音入口的前置事实——不在线时示意录音必然落空,
+  // 按钮禁用并给可见原因,不再让研究者对着空气录 18 秒。
+  const patientLinkDown = presence.state === "offline" || presence.state === "unseen";
+  // D5②:患者暂停闩未解开时患者端锁在暂停屏,此刻开录只会静默等到看门狗过期。
+  const patientScreenPaused = presence.state === "online" && presence.screen === "paused";
+  // P1-9:录音可见计时(arm 起计,回执/超时清零)与看门狗屏上倒计时。
+  const [recArmedAt, setRecArmedAt] = useState<number | null>(null);
+  const [watchdogUntil, setWatchdogUntil] = useState<number | null>(null);
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    if (recArmedAt === null && watchdogUntil === null) return;
+    const timer = window.setInterval(() => setClockTick((n) => n + 1), 500);
+    return () => window.clearInterval(timer);
+  }, [recArmedAt, watchdogUntil]);
   const patientRec = usePatientRec(session.session_id);
+  // 计时器与 armed 态同生共死:任何一处把 recState 收回 idle,计时即归零。
+  useEffect(() => { if (recState !== "armed") setRecArmedAt(null); }, [recState]);
   const patientDeviceFailure = isPatientRecFailure(patientRec)
     && patientRec.sessionId === session.session_id ? patientRec : null;
   const recSeq = useRef(0);
   const watchdog = useSaveWatchdog(() => {
+    setWatchdogUntil(null);
+    setRecArmedAt(null);
     if (autoPilotRef.current) {
       failAutopilotRef.current("upload", "8 秒未收到录音保存回报，可能是麦克风、音频保存或上传失败。");
     } else {
@@ -336,7 +370,11 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   const cueWritePending = useRef(false);
   const bedsideOperationEpoch = useRef(0);
   const bedsideOperationBlocked = useRef(true);
-  const armWatchdog = (tk: string | null) => { watchdogFor.current = tk; watchdog.start(); };
+  const armWatchdog = (tk: string | null) => {
+    watchdogFor.current = tk;
+    setWatchdogUntil(Date.now() + 8000);
+    watchdog.start();
+  };
   const [cueLevel, setCueLevel] = useState<0 | 1 | 2 | 3>(0);      // 已发给老人端的线索等级(只升不降)
   const [savingTurn, setSavingTurn] = useState(false);
   // 当前环节工作态
@@ -421,7 +459,10 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
           const counts = bank.unsupported_operational_position_counts_by_code ?? {};
           setOperationalGapSummary({
             rubric: counts.operational_rubric_unavailable ?? 0,
-            protocol: counts.operational_protocol_unavailable ?? 0,
+            // interaction_package_unavailable(2026-08-21 交互数据包缺失/无效)对
+            // 操作者同义于「缺自动交互协议」,并入同一句解释。
+            protocol: (counts.operational_protocol_unavailable ?? 0)
+              + (counts.interaction_package_unavailable ?? 0),
             sourceField: counts.source_field_unavailable ?? 0,
             unstructured: bank.source_unstructured_position_count ?? unstructuredGaps.length,
             sourceTotal: bank.source_protocol_position_count ?? p.items.reduce(
@@ -573,6 +614,9 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
   const item: PlanItem | undefined = plan?.items[itemIdx];
   const planTurn: PlanTurn | undefined = item?.turns[turnIdx];
   const turnK = item && planTurn ? `${item.item_id}#${planTurn.turn_seq}` : "";
+  // 观察面权威位置:回执优先,runtime 回退;映射不进冻结计划显示待同步。
+  const observerPosition = observerAuthoritativePosition(
+    apReceiptPosition, runtimeControl.runtime, session.session_id, plan);
   // 在途异步续体的环节身份校验:自动推进可在任何请求在途时跳环节,续体不校验会把
   // turnId/结果写进"下一环节"的工作卡——确认/锁分随之落到错误的 turn。
   const turnKRef = useRef(turnK);
@@ -732,6 +776,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     if (!isReplay && m.turnKey === watchdogFor.current) {
       watchdog.clear();
       watchdogFor.current = null;
+      setWatchdogUntil(null);
     }
     if (!isCurrent || isReplay) return;
     if (planTurn && !manualInteractionBlocked) {
@@ -740,7 +785,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
       postCursor({ screen: "present", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "idle", recSeq: recSeq.current, selfStart: selfStartOut });
     }
     setRecState("idle");
-    toast(`老人端录音已保存(${m.durationSeconds.toFixed(1)}s)`, "info");
+    toast(`已收到老人端录音（${m.durationSeconds.toFixed(1)} 秒），可在下方试听`, "info");
     // audioSaved 只证明录音已持久化。它最多启动判定链；不能直接改变题位、提示或结束状态。
     if (automationAction === "adjudicate") void runAutoPilotOnAudio(m);
   });
@@ -771,9 +816,17 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
       if (!recordingEligible) toast("录音资格尚未明确允许，系统保持麦克风关闭", "warn");
       return;
     }
+    // 自动驾驶的 arm 不拦:它有自己的失败通道;人工点按钮时设备不在线直接说明白。
+    if (!autoPilotRef.current && (patientLinkDown || patientScreenPaused)) {
+      toast(patientScreenPaused
+        ? "老人端还停在暂停画面——等它恢复显示题目后再开始录音"
+        : "老人端未连接——请先在老人端完成配对", "warn");
+      return;
+    }
     recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
     lastArmedTurnK.current = turnK;
     setRecState("armed");
+    setRecArmedAt(Date.now());
     postCursor({ screen: "record", itemIdx, turnIdx, responseRole: planTurn.response_role, cueLevel, recording: "armed", recSeq: recSeq.current, selfStart: selfStartOut });
   };
   const stopRecording = () => {
@@ -1010,7 +1063,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
     } catch (e) {
       if (operationIsCurrent(fence)) {
         await pauseManualEvidenceFailure(
-          `Turn 证据收口失败：${e instanceof ApiError ? e.detail : String(e)}`,
+          `本环节证据没有保存成功：${e instanceof ApiError ? e.detail : String(e)}`,
           "client_turn_persistence_failed",
         );
       }
@@ -1238,7 +1291,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
         attemptId: evidence?.attemptId,
       },
     ).catch((error) => {
-      const ledgerMessage = `原子技术暂停未确认：${error instanceof ApiError ? error.detail : String(error)}`;
+      const ledgerMessage = `安全暂停还没有得到服务器确认：${error instanceof ApiError ? error.detail : String(error)}`;
       setApFailure((current) => current ? { ...current, message: `${current.message}；${ledgerMessage}` } : current);
       toast(ledgerMessage, "danger");
     });
@@ -1760,9 +1813,23 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
         <div className="training-page-header">
           <div>
             <div className="page-kicker">当前训练任务</div>
-            <h2 className="page-title">{item?.item_id.replace(/^(SE|DE)_/, "") ?? "训练判分"}</h2>
+            <h2 className="page-title">{observerMode
+              ? observerPosition?.itemLabel ?? "同步中…"
+              : item?.item_id.replace(/^(SE|DE)_/, "") ?? "训练判分"}</h2>
             <p className="page-description">{observerMode ? "AI 正在自动带练，你可以随时安全暂停并接管。" : "当前为人工模式，由你逐步操作。"}</p>
           </div>
+          <div className="row wrap" style={{ gap: 8, alignItems: "center" }}>
+            {/* 常驻的老人端连接状态点:研究者不用翻顶栏就能知道设备在不在。 */}
+            {presence.state !== "unsupported" && (
+              <StatusPill tone={presence.state === "online" ? "ok"
+                : presence.state === "offline" ? "danger"
+                  : presence.state === "unseen" ? "warn" : "muted"}>
+                {presence.state === "online" ? "老人端在线"
+                  : presence.state === "offline" ? "老人端已断开"
+                    : presence.state === "unseen" ? "老人端未连接"
+                      : presence.state === "checking" ? "正在确认老人端" : "老人端状态未知"}
+              </StatusPill>
+            )}
           {/* 收尾前必先停录:否则本屏卸载后无人发 idle,老人端麦克风持续开着 */}
           {!observerMode && (
             <Button variant="ghost" disabled={manualInteractionBlocked}
@@ -1770,6 +1837,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
               {wrapupPending ? "正在确认收麦…" : "进入场次收尾"}
             </Button>
           )}
+          </div>
         </div>
 
         <SessionControlBar paused={paused} loading={recoveryPending} busy={runtimeControl.busy || pausePending || wrapupPending}
@@ -1835,6 +1903,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
           patientMicOn={patientMicOn}
           planPositionReady={Boolean(planTurn)}
           onOwnershipChange={onServerOwnershipChange}
+          onReceiptPosition={onAutopilotReceiptPosition}
           prepareOwnership={prepareServerOwnership}
         />
 
@@ -1846,7 +1915,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
             phase={serverOwnership.phase}
             resyncStatus={manualResync.status}
             resyncError={manualResync.error}
-            position={observerPlanPosition(runtimeControl.runtime, session.session_id, plan)}
+            position={observerPosition}
             onRetryResync={() => { void runManualResync(); }}
           />
         ) : (
@@ -1864,6 +1933,9 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
                 {/* 常驻导航:每个环节都能一键前进/回退(老人端随游标同步),不必等锁分或翻左侧题列 */}
                 <Button onClick={retreat} disabled={manualInteractionBlocked || atFirstTurn}>上一环节</Button>
                 <Button onClick={advance} disabled={manualInteractionBlocked || atLastTurn}>下一环节</Button>
+                {/* 禁用原因可见短句:iPad 无 hover,title 等于没说 */}
+                {atFirstTurn && !manualInteractionBlocked && <span className="muted">已是第一个环节</span>}
+                {atLastTurn && !manualInteractionBlocked && <span className="muted">已是最后一个环节</span>}
               </div>
             </div>
 
@@ -1874,7 +1946,10 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
             {/* 分级线索(0→3 只升不降;内容取版本锁定题库,推老人端显示) */}
             {!manualInteractionBlocked && !work.locked && (
               <CueButtons bundle={bundle} itemId={item.item_id} taskType={item.task_type}
-                role={planTurn.response_role} cueLevel={cueLevel} onSend={sendCue} />
+                role={planTurn.response_role} cueLevel={cueLevel} onSend={sendCue}
+                patientOnline={presence.state === "online"}
+                patientScreenPaused={patientScreenPaused}
+                patientLinkDown={patientLinkDown} />
             )}
 
             {/* 录音示意(老人端 VOX)——fail-closed:资格未确认不放行 */}
@@ -1901,18 +1976,36 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
               ) : recState === "armed" || patientMicOn ? (
                 <>
                   <Button variant="danger" size="lg" onClick={stopRecording}>停止老人端录音</Button>
+                  {recArmedAt !== null && (
+                    <StatusPill tone="warn">录音中 {formatRecordingClock(Date.now() - recArmedAt)}</StatusPill>
+                  )}
                   {patientMicOn && recState !== "armed" && (
                     <StatusPill tone="danger">老人端麦克风开着(自助开录)</StatusPill>
                   )}
                 </>
               ) : (
                 <>
-                  <Button variant="primary" size="lg" onClick={armRecording} disabled={work.locked}>开始老人端录音</Button>
+                  <Button variant="primary" size="lg" onClick={armRecording} disabled={work.locked || patientLinkDown || patientScreenPaused}>开始老人端录音</Button>
+                  {patientLinkDown && !work.locked && (
+                    <span className="muted">老人端未连接——请先在老人端完成配对</span>
+                  )}
+                  {patientScreenPaused && !patientLinkDown && !work.locked && (
+                    <span className="muted">老人端还停在暂停画面——等它恢复显示题目后再开始录音</span>
+                  )}
                 </>
+              )}
+              {watchdogUntil !== null && recState !== "armed" && (
+                <StatusPill tone="warn">
+                  正在等老人端回传录音…还剩 {watchdogSecondsLeft(watchdogUntil, Date.now())} 秒
+                </StatusPill>
               )}
               {pendingAudio[turnK] && (
                 <>
-                  <StatusPill tone="ok">已收到录音 {pendingAudio[turnK].duration.toFixed(1)}s</StatusPill>
+                  <StatusPill tone="ok">
+                    已收到录音 {Math.max(1, Object.values(journal.audios)
+                      .filter((a) => a.turnKey === turnK).length)} 条{pendingAudio[turnK].duration > 0
+                      ? `（最新 ${pendingAudio[turnK].duration.toFixed(1)} 秒）` : ""}
+                  </StatusPill>
                   <AuthenticatedAudio rawAudioId={pendingAudio[turnK].rawAudioId} />
                   {!work.savedAsr && <Button variant="primary" size="lg" onClick={tryLocalAsr} disabled={manualInteractionBlocked || busyOp !== null}>{busyOp === "asr" ? "AI 处理中…" : "AI 转写并登记证据"}</Button>}
                 </>
@@ -1932,8 +2025,11 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, onWrapup, onEx
               </Field>
               {!work.savedAsr && <Button variant="primary" onClick={saveTranscription}
                 disabled={manualInteractionBlocked || savingTurn || busyOp !== null || !pendingAudio[turnK]}>
-                {savingTurn ? "正在收口证据…" : "冻结已核验转写"}
+                {savingTurn ? "正在登记证据…" : "冻结已核验转写"}
               </Button>}
+              {!work.savedAsr && !pendingAudio[turnK] && !manualInteractionBlocked && (
+                <span className="muted">要先完成本环节录音，才能冻结转写</span>
+              )}
             </section>
 
             {/* 阶段B 确认 */}
@@ -2087,10 +2183,11 @@ function ItemReference({ item, bundle }: { item: PlanItem; bundle: ReturnType<ty
 }
 
 // ---------------- 分级线索控件(推老人端;文本只来自题库,缺文本禁发) ----------------
-function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
+function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend, patientOnline, patientScreenPaused, patientLinkDown }: {
   bundle: ReturnType<typeof useItemBankBundle>["bundle"];
   itemId: string; taskType: string; role: string;
   cueLevel: 0 | 1 | 2 | 3; onSend: (level: 1 | 2 | 3) => void;
+  patientOnline: boolean; patientScreenPaused: boolean; patientLinkDown: boolean;
 }) {
   // 告知答案=最高提示级,发出即不可逆(prompt_level 只升不降):红色区分 + 二次确认防误触
   const [confirmTell, setConfirmTell] = useState(false);
@@ -2104,6 +2201,22 @@ function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
   if (levels.length === 0) return null;
   const current = lookupCue(bundle, itemId, taskType, role, cueLevel);
   const tellText = lookupCue(bundle, itemId, taskType, role, 3);
+  // 禁用原因可见短句(iPad 无 hover,不用 title):只解释"此刻按不下去的那颗"。
+  const maxLevel = levels[levels.length - 1].level;
+  const nextEntry = levels.find(({ level }) => level === cueLevel + 1) ?? null;
+  const nextText = nextEntry
+    ? lookupCue(bundle, itemId, taskType, role, nextEntry.level)
+    : null;
+  const lockedLabels = levels
+    .filter(({ level }) => level > cueLevel + 1)
+    .map(({ label }) => `「${label}」`);
+  const disabledNote = cueLevel >= maxLevel
+    ? "已是最高提示级，不能再升"
+    : nextEntry && nextText == null
+      ? `「${nextEntry.label}」暂缺题库文本(待内容组补齐)，暂不能发送`
+      : lockedLabels.length > 0
+        ? `提示只能逐级升：先发「${nextEntry?.label}」，${lockedLabels.join("")}才会解锁`
+        : null;
   return (
     <div className="cue-panel">
       <div className="row wrap">
@@ -2115,14 +2228,24 @@ function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend }: {
           return (
             <Button key={level} size="lg" disabled={level !== cueLevel + 1 || text == null}
               variant={isTell ? "danger" : "secondary"}
-              title={text == null ? "题库缺此级线索文本(待内容组补)" : undefined}
               onClick={() => (isTell ? setConfirmTell(true) : onSend(level))}>
               {label}{text == null ? "(缺文本)" : ""}
             </Button>
           );
         })}
       </div>
-      {current && <p className="muted">老人端正在显示：{current}</p>}
+      {disabledNote && <p className="muted">{disabledNote}</p>}
+      {/* 「正在显示」只有设备在线时才可断言;不在线时如实说没送到。
+          在线但停在暂停屏时(D4②),患者看到的是暂停画面,不是线索。 */}
+      {current && (
+        <p className="muted">{patientScreenPaused
+          ? `老人端正在显示暂停画面；恢复后会显示：${current}`
+          : patientOnline
+          ? `老人端正在显示：${current}`
+          : patientLinkDown
+            ? `已发送，但老人端此刻不在线，连接后会显示：${current}`
+            : `已发送线索（老人端连接状态待确认）：${current}`}</p>
+      )}
       <ConfirmDialog open={confirmTell} title="告知答案?"
         body={`老人端将显示并朗读:「${tellText ?? ""}」。这是最高提示级,发出后本环节提示等级不可再降。`}
         confirmLabel="告知答案"

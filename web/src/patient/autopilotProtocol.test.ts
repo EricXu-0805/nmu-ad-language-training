@@ -596,11 +596,13 @@ function stagedTts(
 }
 
 test("every frozen purpose/level/attempt cell still parses", () => {
+  // tell_answer(3,1)/(3,2):交互数据包环节(双/多要素)在第 1/2 次录音后的
+  // 告知句;(3,3) 是单要素三级告知。三格同为服务端冻结矩阵成员。
   const legal: readonly (readonly ["question" | "cue" | "feedback" | "tell_answer", number, number])[] = [
     ["question", 0, 1],
     ["cue", 1, 2], ["cue", 2, 3],
     ["feedback", 0, 1], ["feedback", 1, 2], ["feedback", 2, 3],
-    ["tell_answer", 3, 3],
+    ["tell_answer", 3, 1], ["tell_answer", 3, 2], ["tell_answer", 3, 3],
   ];
   for (const [purpose, level, attempt] of legal) {
     const parsed = parseNextCommandProjection(stagedTts(purpose, level, attempt));
@@ -612,7 +614,7 @@ test("every frozen purpose/level/attempt cell still parses", () => {
 test("cells outside the frozen matrix are refused even when the level alone looks right", () => {
   // 审查点名的四格：等级像对的，但服务端从不签发这些 (level, attempt) 组合。
   for (const [purpose, level, attempt] of [
-    ["cue", 2, 2], ["feedback", 0, 2], ["feedback", 2, 2], ["tell_answer", 3, 1],
+    ["cue", 2, 2], ["feedback", 0, 2], ["feedback", 2, 2], ["tell_answer", 2, 3],
   ] as const) {
     assert.throws(
       () => parseNextCommandProjection(stagedTts(purpose, level, attempt)),
@@ -621,7 +623,8 @@ test("cells outside the frozen matrix are refused even when the level alone look
   // 完整矩阵扫描：合法格之外一律拒绝。
   const legal = new Set([
     "question|0|1", "cue|1|2", "cue|2|3",
-    "feedback|0|1", "feedback|1|2", "feedback|2|3", "tell_answer|3|3",
+    "feedback|0|1", "feedback|1|2", "feedback|2|3",
+    "tell_answer|3|1", "tell_answer|3|2", "tell_answer|3|3",
   ]);
   for (const purpose of ["question", "cue", "feedback", "tell_answer"] as const) {
     for (let level = 0; level <= 3; level += 1) {

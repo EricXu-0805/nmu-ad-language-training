@@ -23,6 +23,7 @@ GapCode = Literal[
     "source_field_unavailable",
     "operational_rubric_unavailable",
     "operational_protocol_unavailable",
+    "interaction_package_unavailable",
 ]
 
 
@@ -120,17 +121,65 @@ def _text(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def interaction_turn(
+    interaction_package: dict | None,
+    position: ProtocolPosition,
+) -> dict | None:
+    """The one package turn frozen for this exact plan position, or None."""
+    if not isinstance(interaction_package, dict):
+        return None
+    for item in interaction_package.get("items") or []:
+        if not isinstance(item, dict) or item.get("item_id") != position.item_id:
+            continue
+        for turn in item.get("turns") or []:
+            if (isinstance(turn, dict)
+                    and turn.get("turn_seq") == position.turn_seq
+                    and turn.get("response_role") == position.response_role):
+                return turn
+    return None
+
+
+def _interaction_coverage_gap(
+    interaction_package: dict | None,
+    position: ProtocolPosition,
+) -> PositionGap | None:
+    """Fail closed unless a validated interaction package covers this turn.
+
+    The package's structure/binding gates live in ``content``; this check only
+    answers "does the frozen package speak for this exact position".  A missing
+    or uncovering package is an independent, precisely attributable gap — never
+    a silent fallback to the naming state machine or generic prompts.
+    """
+    if interaction_package is None:
+        return PositionGap(
+            position,
+            "interaction_package_unavailable",
+            f"{position.position_key}:{position.response_role} "
+            "缺本周自动交互数据包（未装载或未通过绑定校验）",
+        )
+    if interaction_turn(interaction_package, position) is None:
+        return PositionGap(
+            position,
+            "interaction_package_unavailable",
+            f"{position.position_key}:{position.response_role} "
+            "不在本周自动交互数据包冻结环节内",
+        )
+    return None
+
+
 def readiness_gap(
     bank: content.ItemBank,
     position: ProtocolPosition,
+    *,
+    interaction_package: dict | None = None,
 ) -> PositionGap | None:
     """Return why a position cannot use the current automatic protocol.
 
     Single-element naming has an explicit target and the complete two-cue/tell
-    sequence consumed by the existing state machine.  For open answers, the
-    versioned operational rubric is checked first.  Even a future valid rubric is
-    insufficient by itself: automatic question/success/transition content must
-    also be frozen before this service may execute it.
+    sequence consumed by the existing state machine.  Double/multi-element turns
+    additionally require the week's validated automatic interaction package
+    (question/branch/after-rerecord structure); open answers also require the
+    versioned operational rubric that drives their branch classification.
     """
     raw = _bank_item(bank, position)
     if raw is None:
@@ -205,17 +254,10 @@ def readiness_gap(
                 f"{position.position_key}:{position.response_role} 缺冻结命名目标字段: "
                 + ",".join(missing),
             )
-        # The target word is a closed operational rubric, but the source script
-        # has not yet been represented as an executable protocol: correct answers
-        # advance without a spoken success line, while incorrect answers receive
-        # one direct correction.  The current two-cue naming state machine must
-        # not silently invent or substitute that transition contract.
-        return PositionGap(
-            position,
-            "operational_protocol_unavailable",
-            f"{position.position_key}:{position.response_role} 已有冻结目标词与图片，"
-            "但缺逐字结构化的问句、一次性纠正与无反馈推进协议",
-        )
+        # The target word is a closed operational rubric; the executable
+        # question/one-shot-correction/silent-advance contract comes only from
+        # the week's frozen interaction package.
+        return _interaction_coverage_gap(interaction_package, position)
 
     rubric = content.operational_rubric_for(
         bank, position.item_id, position.response_role)
@@ -226,19 +268,16 @@ def readiness_gap(
             f"{position.position_key}:{position.response_role} "
             "缺版本化 operational rubric",
         )
-    return PositionGap(
-        position,
-        "operational_protocol_unavailable",
-        f"{position.position_key}:{position.response_role} 已有 rubric，"
-        "但缺冻结的自动问句、成功反馈与推进协议",
-    )
+    return _interaction_coverage_gap(interaction_package, position)
 
 
 def decision_for_position(
     bank: content.ItemBank,
     position: ProtocolPosition,
+    *,
+    interaction_package: dict | None = None,
 ) -> PositionDecision:
-    gap = readiness_gap(bank, position)
+    gap = readiness_gap(bank, position, interaction_package=interaction_package)
     return PositionDecision(gap=gap) if gap else PositionDecision(position=position)
 
 
@@ -247,11 +286,13 @@ def first_position_decision(
     *,
     week_no: int,
     event_line: str,
+    interaction_package: dict | None = None,
 ) -> PositionDecision:
     positions = build_positions(bank, week_no=week_no, event_line=event_line)
     if not positions:
         return PositionDecision(completed=True)
-    return decision_for_position(bank, positions[0])
+    return decision_for_position(
+        bank, positions[0], interaction_package=interaction_package)
 
 
 def next_position_decision(
@@ -261,6 +302,7 @@ def next_position_decision(
     event_line: str,
     current_item_id: str,
     current_turn_seq: int,
+    interaction_package: dict | None = None,
 ) -> PositionDecision:
     """Advance exactly one turn; never jump over an unsupported position."""
     positions = build_positions(bank, week_no=week_no, event_line=event_line)
@@ -269,4 +311,5 @@ def next_position_decision(
     index = positions.index(current)
     if index + 1 >= len(positions):
         return PositionDecision(completed=True)
-    return decision_for_position(bank, positions[index + 1])
+    return decision_for_position(
+        bank, positions[index + 1], interaction_package=interaction_package)

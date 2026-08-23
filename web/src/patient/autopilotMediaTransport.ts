@@ -304,17 +304,21 @@ function parseExactRecordingAuthorization(value: unknown): RecordingAuthorizatio
     throw new Error("自动驾驶录音授权响应不是对象");
   }
   const row = value as Record<string, unknown>;
+  // 键闭集精确：新契约四键。旧后端的三键形状（无 recording_authorized 肯定授权）
+  // 一律拒绝——新前端配旧后端绝不静默开麦。
   const keys = Object.keys(row).sort();
-  if (keys.length !== 3
-      || keys[0] !== "allowed" || keys[1] !== "is_simulation" || keys[2] !== "runtime_status"
+  if (keys.length !== 4
+      || keys[0] !== "allowed" || keys[1] !== "is_simulation"
+      || keys[2] !== "recording_authorized" || keys[3] !== "runtime_status"
       || row.allowed !== true || row.runtime_status !== "active"
-      || row.is_simulation !== true) {
+      || row.recording_authorized !== true
+      || typeof row.is_simulation !== "boolean") {
     throw new Error("自动驾驶录音授权未证明当前命令可开麦");
   }
   return {
     allowed: true,
     runtime_status: "active",
-    is_simulation: true,
+    is_simulation: row.is_simulation,
   };
 }
 

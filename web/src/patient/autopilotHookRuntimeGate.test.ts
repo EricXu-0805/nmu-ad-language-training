@@ -8,6 +8,7 @@ import {
   canStartAutopilotRunner,
   isAutopilotRuntimeTerminal,
   shouldBootstrapAutopilotRunner,
+  shouldReprobeAfterServerResume,
   shouldSchedulePassiveAutopilotPoll,
 } from "./autopilotHookRuntimeGate.ts";
 import {
@@ -142,4 +143,51 @@ test("源码接线守卫：usePatientAutopilot 确实调用了 bootstrap/should-
   // 自己的 restoreAutopilotRuntime(null) 重建成 waiting_command。
   assert.match(source, /initialRuntime:\s*restored\.runtime/);
   assert.doesNotMatch(source, /initialCommand:\s*restored\.current/);
+});
+
+// ---------------- D5①:服务端 resume 事实要能解开终态死角 ----------------
+
+test("D5①:session.paused 真→假的权威下降沿,在 server-终态或 blocked-平静档时恰好放行一次重探", () => {
+  // 病根:一次 owner load 落到 paused 后,本次挂载再无任何轮询——接管+resume
+  // 之后患者端永远停在「我们先休息一下」。resume 下降沿是唯一的权威解锁信号。
+  const base = {
+    previousServerPaused: true,
+    serverPaused: false,
+    mode: "server" as const,
+    runtimePhase: "paused" as const,
+    blockedCalm: false,
+  };
+  assert.equal(shouldReprobeAfterServerResume(base), true);
+  assert.equal(shouldReprobeAfterServerResume({
+    ...base, runtimePhase: "scope_completed",
+  }), true);
+  // blocked 平静档(runtime 被服务器收走)同样等这次 resume 醒来。
+  assert.equal(shouldReprobeAfterServerResume({
+    ...base, mode: "blocked", runtimePhase: null, blockedCalm: true,
+  }), true);
+  // 非下降沿不放行:一直暂停/一直活跃都不是 resume 事实。
+  assert.equal(shouldReprobeAfterServerResume({ ...base, previousServerPaused: false }), false);
+  assert.equal(shouldReprobeAfterServerResume({ ...base, serverPaused: true }), false);
+  // 活跃 server runner(非终态)自有轮询,不额外重探。
+  assert.equal(shouldReprobeAfterServerResume({ ...base, runtimePhase: "recording" }), false);
+  assert.equal(shouldReprobeAfterServerResume({ ...base, runtimePhase: null }), false);
+  // blocked 告警档(设备侧判死)必须留给研究者处置,不自动醒。
+  assert.equal(shouldReprobeAfterServerResume({
+    ...base, mode: "blocked", runtimePhase: null, blockedCalm: false,
+  }), false);
+  // legacy/probing 不需要:legacy 本来就跟 live 通道走,probing 已在探测。
+  assert.equal(shouldReprobeAfterServerResume({ ...base, mode: "legacy" }), false);
+  assert.equal(shouldReprobeAfterServerResume({ ...base, mode: "probing" }), false);
+});
+
+test("D5① 源码接线守卫:usePatientAutopilot 用 serverPaused 下降沿消费 shouldReprobeAfterServerResume", () => {
+  const hookPath = join(dirname(fileURLToPath(import.meta.url)), "usePatientAutopilot.ts");
+  const source = readFileSync(hookPath, "utf8");
+  assert.match(source, /shouldReprobeAfterServerResume\(/);
+  // 输入必须是权威 session.paused(serverPaused),不是含本地闩的 effectivePaused。
+  assert.match(source, /serverPaused: input\.serverPaused/);
+  assert.match(source, /setProbeEpoch\(\(value\) => value \+ 1\)/);
+  const shellPath = join(dirname(fileURLToPath(import.meta.url)), "PatientShell.tsx");
+  const shell = readFileSync(shellPath, "utf8");
+  assert.match(shell, /serverPaused: session\?\.paused === true/);
 });

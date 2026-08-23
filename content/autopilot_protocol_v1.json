@@ -1,33 +1,73 @@
 {
-  "protocol_schema_version": "autopilot-protocol.v1",
-  "protocol_version_id": "autopilot-v1-20260729",
-  "qc_status": "draft",
-  "draft_revision": "2026-07-29.1",
-  "supported_training_weeks": [2],
-  "source_document_sha256": "b3310b61bdc6afb437cbc05785bd6f4e1f6c30dd53ad0999eb2c0fea10c3891a",
-  "source_normalized_text_sha256": "b7f2ad1d4389ee6193721402b1d39d9c3cc7a15d2341807471a5fc4627d06c55",
-  "source": "20260629/第2-8周训练内容.docx 通用话术逐字抽取(2026-07-17,8文档并行抽取+跨周合并核对)。状态机:命名训练四分支(正确/未提及或不知道/相关不准确/沉默>10s)→两级提示→告知答案,永不卡题;双要素命名答错一次性纠正不升级;成功反馈按进入路径选变体,不可混用。",
-  "silence_seconds": 10,
-  "naming": {
-    "success_after_cue1": {
-      "unknown": "很好，经过提醒您马上就想起来了，我们继续下一个。",
-      "close": "很好，您已经说出来了，这就是【物品名】。我们继续下一个。",
-      "silence": "很好，您想起来了，这就是【物品名】。我们继续下一个。"
-    },
-    "success_after_cue2": "很好，经过提示您说出来了，这就是【物品名】。我们继续下一个。"
+ "protocol_schema_version": "autopilot-protocol.v1",
+ "protocol_version_id": "autopilot-v2-20260821",
+ "qc_status": "draft",
+ "draft_revision": "2026-08-22.1",
+ "supported_training_weeks": [
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8
+ ],
+ "source_document_sha256": "b3310b61bdc6afb437cbc05785bd6f4e1f6c30dd53ad0999eb2c0fea10c3891a",
+ "source_normalized_text_sha256": "b7f2ad1d4389ee6193721402b1d39d9c3cc7a15d2341807471a5fc4627d06c55",
+ "source": "20260629/第2-8周训练内容.docx 通用话术逐字抽取(2026-07-17,8文档并行抽取+跨周合并核对)。状态机:命名训练四分支(正确/未提及或不知道/相关不准确/沉默>10s)→两级提示→告知答案,永不卡题;双要素命名答错一次性纠正不升级;成功反馈按进入路径选变体,不可混用。",
+ "silence_seconds": 10,
+ "naming": {
+  "success_after_cue1": {
+   "unknown": "很好，经过提醒您马上就想起来了，我们继续下一个。",
+   "close": "很好，您已经说出来了，这就是【物品名】。我们继续下一个。",
+   "silence": "很好，您想起来了，这就是【物品名】。我们继续下一个。"
   },
-  "double": {
-    "namefix_left": "这个我们刚刚见过，它叫【物品名】。",
-    "namefix_right": "这个我们刚刚也见过，它叫【物品名】。"
+  "success_after_cue2": "很好，经过提示您说出来了，这就是【物品名】。我们继续下一个。"
+ },
+ "double": {
+  "namefix_left": "这个我们刚刚见过，它叫【物品名】。",
+  "namefix_right": "这个我们刚刚也见过，它叫【物品名】。"
+ },
+ "interaction_packages": {
+  "2": {
+   "file": "autopilot_interaction_week2_v1.json",
+   "sha256": "99e75e498eca008119d6d26b9f2e01f3b297df3b32456b03259f4307402500ab"
   },
-  "notes": [
-    "【物品名】槽位=本题预置目标词(题库字段),非 ASR 回填——文档明文口径。",
-    "自发正确的反馈=题库逐题 success_line;第1次提示后成功按进入路径选变体:未提及/不知道→unknown(不含物品名)、相关不准确→close、沉默→silence;第2次提示后成功→success_after_cue2。",
-    "Week 2 单要素完成条件按源稿执行:必须抓取到完整目标词，或将来由 PI 逐题冻结的 acceptable_expressions；LLM 的宽泛语义正确不得单独触发成功推进。仅目标词子串(如'萝卜'对'胡萝卜')不算目标词命中。",
-    "作答窗口(v1):无 VAD,无法测'说完后的沉默'。窗口是固定的 沉默阈值(10s)+5s,到点自动收麦;'我说好了'只是提前结束,不点也照常收麦推进,不点本身不构成任何判定。收麦后一律按转写文本判分支:有文本就按文本判(即使收麦原因是 max_duration),只有 provider 明确返回 200、转写结构合法且没有任何转写文本,才映射成运营层'本轮无转写'并走冻结的 silence 提示;provider 异常/非 200/响应损坏是技术失败,安全暂停,不得当成沉默。运营层'本轮无转写'不等于声学静音,也不得作为研究口径的静音证据(音量过低/设备问题/模型漏识都会落到这里)。真机应加 VAD 或由研究者把关,长句作答的老人可能被窗口截断。",
-    "2026-07-19 已从指定 Week 2 源稿恢复全部20题 unknown/close/silence 三条第1次提示并绑定段落索引；源文件或规范化文本摘要变化时必须重新人工核对。",
-    "双要素左右命名虽有目标词和一次纠正模板，但沉默、成功反馈和推进规则未冻结；30个开放回答缺版本化 rubric/完整协议；不得用本协议中的模板越过全计划门禁。",
-    "Week 2 源稿另有动物园/公园共10个多要素位置尚未结构化，涉及图片文字泄题、整体描述 rubric 缺失和公园人物接受口径冲突。",
-    "已知待批准勘误包括烟的二级提示后反馈串为衬衫、兔子缺该处口头反馈，以及斧子+树右命名纠正串为衬衫；通用模拟反馈不等于正式临床批准。"
-  ]
+  "3": {
+   "file": "autopilot_interaction_week3_v1.json",
+   "sha256": "1b4bc6b40e808ca763aacf8d16e9e3bf1d15e640b1d8464855888809f8fb3db1"
+  },
+  "4": {
+   "file": "autopilot_interaction_week4_v1.json",
+   "sha256": "3a0496af467996280f1b3eb7a40c1392a49bf51e0b71dc9a232579cf33720617"
+  },
+  "5": {
+   "file": "autopilot_interaction_week5_v1.json",
+   "sha256": "6ea842d690ba33dc109d77362d373ac98c2623cb7e397aec678ed2246d1e31eb"
+  },
+  "6": {
+   "file": "autopilot_interaction_week6_v1.json",
+   "sha256": "1516b9886a4d667dc0904c54d54725bc93b060181d8b1172c31b314cc7871ee9"
+  },
+  "7": {
+   "file": "autopilot_interaction_week7_v1.json",
+   "sha256": "99477c16bd3ea112c5668a6792e04d3c4fafbd0ae0f9247bcd591f46af7601c7"
+  },
+  "8": {
+   "file": "autopilot_interaction_week8_v1.json",
+   "sha256": "2ef7f52b7a6b75d459d74bf748929b0ad7920a7e3430d1915633899352330607"
+  }
+ },
+ "notes": [
+  "【物品名】槽位=本题预置目标词(题库字段),非 ASR 回填——文档明文口径。",
+  "自发正确的反馈=题库逐题 success_line;第1次提示后成功按进入路径选变体:未提及/不知道→unknown(不含物品名)、相关不准确→close、沉默→silence;第2次提示后成功→success_after_cue2。",
+  "Week 2 单要素完成条件按源稿执行:必须抓取到完整目标词，或将来由 PI 逐题冻结的 acceptable_expressions；LLM 的宽泛语义正确不得单独触发成功推进。仅目标词子串(如'萝卜'对'胡萝卜')不算目标词命中。",
+  "作答窗口(v1):无 VAD,无法测'说完后的沉默'。窗口是固定的 沉默阈值(10s)+5s,到点自动收麦;'我说好了'只是提前结束,不点也照常收麦推进,不点本身不构成任何判定。收麦后一律按转写文本判分支:有文本就按文本判(即使收麦原因是 max_duration),只有 provider 明确返回 200、转写结构合法且没有任何转写文本,才映射成运营层'本轮无转写'并走冻结的 silence 提示;provider 异常/非 200/响应损坏是技术失败,安全暂停,不得当成沉默。运营层'本轮无转写'不等于声学静音,也不得作为研究口径的静音证据(音量过低/设备问题/模型漏识都会落到这里)。真机应加 VAD 或由研究者把关,长句作答的老人可能被窗口截断。",
+  "2026-07-19 已从指定 Week 2 源稿恢复全部20题 unknown/close/silence 三条第1次提示并绑定段落索引；源文件或规范化文本摘要变化时必须重新人工核对。",
+  "双要素左右命名虽有目标词和一次纠正模板，但沉默、成功反馈和推进规则未冻结；30个开放回答缺版本化 rubric/完整协议；不得用本协议中的模板越过全计划门禁。",
+  "Week 2 源稿另有动物园/公园共10个多要素位置尚未结构化，涉及图片文字泄题、整体描述 rubric 缺失和公园人物接受口径冲突。",
+  "已知待批准勘误包括烟的二级提示后反馈串为衬衫、兔子缺该处口头反馈，以及斧子+树右命名纠正串为衬衫；通用模拟反馈不等于正式临床批准。",
+  "v2 新增 interaction_packages：第2-8周双要素/多要素交互协议数据包按周登记，身份=数据包文件字节 sha256（协议 digest 链式覆盖全部新话术）；数据包内话术来源闭集=源 docx 逐字句/冻结题库字段/本协议纠正模板展开，结构冻结清单在各数据包 structure_freezes，待钱凯/丁老师书面确认。",
+  "v2 起 v1 notes 中「双要素…推进规则未冻结」「多要素位置尚未结构化」两条的工程缺口由 interaction_packages 承接（临床批准状态不变，qc 仍为 draft）。"
+ ]
 }

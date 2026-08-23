@@ -21,6 +21,11 @@ function exact(code: string): ApiError {
 test("legacy is admitted only by the two exact canonical 409 proofs", () => {
   assert.equal(classifyAutopilotProbeError(exact("autopilot_not_active")), "legacy-inactive");
   assert.equal(classifyAutopilotProbeError(exact("autopilot_p0a_disabled")), "legacy-disabled");
+  // D2 分类先行后,真实场次全关的门禁码是 real_sessions_disabled:同样是稳定的
+  // 部署开关事实,患者端应挂载人工平面而不是吓人的 blocked 屏。
+  assert.equal(
+    classifyAutopilotProbeError(exact("autopilot_real_sessions_disabled")),
+    "legacy-disabled");
   for (const error of [
     exact("autopilot_state_invalid"),
     new ApiError(500, "down"),

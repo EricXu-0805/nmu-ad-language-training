@@ -12,6 +12,7 @@ import {
 import {
   canStartAutopilotRunner,
   shouldBootstrapAutopilotRunner,
+  shouldReprobeAfterServerResume,
   shouldSchedulePassiveAutopilotPoll,
 } from "./autopilotHookRuntimeGate.ts";
 import { autopilotHttpTransport } from "./autopilotHttpTransport.ts";
@@ -152,6 +153,8 @@ export function usePatientAutopilot(input: {
   ttsOn: boolean;
   connectionReady: boolean;
   sessionPaused: boolean;
+  /** 权威 live 通道的 session.paused(不含本地暂停闩)——resume 下降沿的唯一来源。 */
+  serverPaused: boolean;
   sessionTerminal: boolean;
 }): PatientAutopilotView {
   const [capabilityRevision, setCapabilityRevision] = useState(0);
@@ -427,6 +430,26 @@ export function usePatientAutopilot(input: {
       setProbeEpoch((value) => value + 1);
     }
   }, [wakeNonce, visibleMode, probeKey, resolvedProbeKey]);
+
+  // D5①:owner load 落到 paused/scope_completed(或 blocked 平静档)后本次挂载
+  // 再无轮询——接管+研究者 resume 之后患者端会永远停在「我们先休息一下」。
+  // 权威 session.paused 真→假下降沿恰好放行一次重探,走同一个 probeEpoch 门:
+  // 服务器仍持有则回到同一终态(无环);已释放则 autopilot_not_active 走既有
+  // stop-legacy 收口,回到 live 游标平面继续人工流程。
+  const lastServerPaused = useRef(input.serverPaused);
+  useEffect(() => {
+    const previousServerPaused = lastServerPaused.current;
+    lastServerPaused.current = input.serverPaused;
+    if (shouldReprobeAfterServerResume({
+      previousServerPaused,
+      serverPaused: input.serverPaused,
+      mode: visibleMode,
+      runtimePhase: serverContextRef.current?.runtime.phase ?? null,
+      blockedCalm,
+    })) {
+      setProbeEpoch((value) => value + 1);
+    }
+  }, [input.serverPaused, visibleMode, blockedCalm]);
 
   // 每个 owner generation 恰好装一次页面事件监听，owner 一换就按序摘掉。
   // 摘监听本身不是失败：普通的 session/gate/所有权变化走各自的 shutdown。

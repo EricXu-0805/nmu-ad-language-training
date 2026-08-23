@@ -908,16 +908,14 @@ def test_content_contract_and_production_gate(tmp_path):
     root = _private_root(tmp_path, "content-root")
     payload = _payload(_run_script(_subprocess_env(root), _CONTENT_CONTRACT_SCRIPT))
 
-    # 生产题库仍然被 58 结构化缺口门禁拒绝——这条红线不因 harness 存在而松动。
-    # (2026-08-19 内容交付后源协议全量结构化:78 位置,无 source-only 缺口。)
-    assert payload["production_refusal"]["code"] == (
-        "autopilot_plan_not_fully_supported")
-    assert payload["production_refusal"]["context"][
-        "unsupported_position_count"] == 58
+    # 2026-08-21 交互数据包闭合全部 58 个协议缺口后,canonical 整计划通过生产门。
+    # 门函数本身未松动:拆掉数据包时 _require_entire_plan_supported 仍拒
+    # (tests/test_autopilot_interaction.py 与 autopilot service 套件双向钉住)。
+    assert payload["production_refusal"] == {}
     assert payload["production_positions"] == 20
     assert payload["production_source_count"] == 78
     assert payload["canonical_resolved_positions"] == 78
-    assert payload["canonical_unsupported_positions"] == 58
+    assert payload["canonical_unsupported_positions"] == 0
     assert payload["canonical_completion_scope"] == "canonical_full_source"
 
     # 同一份 canonical 题库只经 exact profile 选位，20 位置完整通过。

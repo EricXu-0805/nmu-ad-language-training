@@ -30,6 +30,8 @@ function ownedReceipt(stateRevision: number, status = "waiting_tts", kind: strin
     server_owned: true,
     takeover_ready: false,
     current_command_kind: kind,
+    position_item_id: "SE_花",
+    position_turn_seq: 1,
     last_error_code: null,
   });
 }

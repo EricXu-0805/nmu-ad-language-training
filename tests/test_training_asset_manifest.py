@@ -196,7 +196,8 @@ def test_existing_week2_item_bank_image_ids_are_a_manifest_subset():
     } | {"wk2-multi-01", "wk2-multi-02"}
     assert bank_ids <= manifest_ids
     assert bank["supported_training_weeks"] == [2]
-    assert _load(PROTOCOL_PATH)["supported_training_weeks"] == [2]
+    # 2026-08-21 自动交互协议 v2 覆盖 week2-8(交互数据包逐周钉);week2 题库本身仍只声明自己。
+    assert _load(PROTOCOL_PATH)["supported_training_weeks"] == [2, 3, 4, 5, 6, 7, 8]
     assert manifest["safety_boundary"]["runtime_weeks_changed"] is False
 
 

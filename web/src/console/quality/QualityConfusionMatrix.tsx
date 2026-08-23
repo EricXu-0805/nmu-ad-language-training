@@ -8,7 +8,7 @@ interface QualityConfusionMatrixProps {
 const SCROLL_REGION_STYLE = { overflowX: "auto" } as const;
 
 export function QualityConfusionMatrix({ matrix, comparisonKind }: QualityConfusionMatrixProps) {
-  const referenceLabel = comparisonKind === "research" ? "人工锁定研究真值" : "模拟复核参考";
+  const referenceLabel = comparisonKind === "research" ? "人工锁定研究评分" : "模拟复核参考";
   return (
     <div
       className="quality-confusion-matrix-region"

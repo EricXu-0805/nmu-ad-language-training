@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { api, DEVICE_CAPABILITY_UPDATED_EVENT } from "../api";
-import { PinPrompt } from "../components/PinPrompt";
+import { api, DEVICE_CAPABILITY_UPDATED_EVENT, getDeviceCapability } from "../api";
+import { PinPrompt, PIN_PROMPT_MANUAL_OPEN_EVENT } from "../components/PinPrompt";
 import { bus } from "../sync/bus";
 import { PATIENT_ACTIVATION_EVENT } from "../sync/messages";
 import { useLiveCursor } from "../sync/useLiveCursor";
@@ -45,6 +45,7 @@ import {
 } from "./tts";
 import type { TtsPlaybackContextKey } from "./ttsContext";
 import { usePatientAutopilot, type PatientAutopilotView } from "./usePatientAutopilot";
+import { usePatientBinding } from "./usePatientBinding";
 
 function withPatientPauseStorageLock<T>(
   operation: () => T,
@@ -64,6 +65,7 @@ function withPatientPauseStorageLock<T>(
 // 无 session 超时、无自动黑屏、对沉默与错误宽容(永不报错、永不闪红)。
 export function PatientShell() {
   const { session, cursor, rapportStep, connection } = useLiveCursor();
+  const { bound: patientBindingActive } = usePatientBinding();
   const terminal = isSessionTerminalStatus(session?.runtimeStatus);
   const connectionReady = connection === "connected";
   const [patientActivated, setPatientActivated] = useState(false);
@@ -89,6 +91,7 @@ export function PatientShell() {
     ttsOn,
     connectionReady,
     sessionPaused: effectivePaused,
+    serverPaused: session?.paused === true,
     sessionTerminal: terminal,
   });
   const stopAutopilotMediaRef = useRef(autopilot.stopMediaNow);
@@ -458,12 +461,30 @@ export function PatientShell() {
     }
   }, [connectionReady, currentScreen]);
 
+  // capabilityEpoch 每次能力变化都会自增触发重渲染,这里读到的配对状态因此新鲜。
+  void capabilityEpoch;
+  const devicePaired = patientBindingActive || getDeviceCapability() !== null;
+
   let body: React.ReactNode;
   if (!session) {
     body = (
       <Centered>
         <div className="target">您好</div>
         <p className="question">准备好了我们就开始</p>
+        {patientBindingActive && (
+          <p className="question" role="status" aria-live="polite">
+            已连接 · 等待训练开始
+          </p>
+        )}
+        {!devicePaired && (
+          // 「暂不配对」之后的可见找回路径:不弹错、不吓老人,一个安静的入口,
+          // 工作人员点它重新打开配对框——绝不依赖整页刷新。
+          <button type="button" className="patient-pair-entry"
+            onClick={() => window.dispatchEvent(new Event(PIN_PROMPT_MANUAL_OPEN_EVENT))}>
+            连接这台平板
+            <small>请工作人员点这里完成配对</small>
+          </button>
+        )}
       </Centered>
     );
   } else if (terminal) {

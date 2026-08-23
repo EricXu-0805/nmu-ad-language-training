@@ -13,8 +13,10 @@ import type {
   VisitPlanReceipt,
 } from "../types";
 import { LatestVisitPlanHistoryRequest, PendingVisitPlanCommandKeys } from "../visitPlans";
+import { nextUnplannedWeek, plannedWeeksSummary } from "./visitPlanWeekDefaults";
 import { DataBoundaryBadge } from "./DataBoundaryFilter";
 import { assessVisitPlanProtocol, type TrainingContentStatus } from "./protocolAdmission";
+import { humanizeEligibilityText } from "./researchEligibility";
 import { demoProfileVersionForVisitPlan } from "../autopilot/demoProfile.ts";
 
 const WEEK_ONE_PHASES = ["关系建立", "基线测评", "前测"] as const;
@@ -46,8 +48,11 @@ function eventLineFor(weekNo: number, phase: PhaseType): EventLine {
   return phase === "关系建立" ? "关系建立环节" : "基线测评窗";
 }
 
+// P1-1:审核/准入失败的服务器消息可能带字段名(consent_type 等),Alert 与 toast
+// 都从这里出——统一先翻成人话。
 function errorText(error: unknown): string {
-  return error instanceof ApiError ? error.detail : String(error);
+  return humanizeEligibilityText(
+    error instanceof ApiError ? error.detail : String(error));
 }
 
 function statusMeta(status: VisitPlanReceipt["status"]): {
@@ -206,8 +211,11 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   const [scheduledTime, setScheduledTime] = useState("09:00");
   const [queueOrder, setQueueOrder] = useState(0);
   const [sittingNo, setSittingNo] = useState(1);
-  const [weekNo, setWeekNo] = useState(2);
-  const [phase, setPhase] = useState<PhaseType>("正式训练");
+  // P1-2:周次默认值由既有安排推导(下一个空缺周次),推导不了默认 1;
+  // 用户手动改过之后不再被推导覆盖。
+  const [weekNo, setWeekNo] = useState(1);
+  const weekTouched = useRef(false);
+  const [phase, setPhase] = useState<PhaseType>("关系建立");
   const [patientSimulation, setPatientSimulation] = useState<boolean | null>(null);
   const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
   // 服务端权威逐周题库信号(structured/ready_for_research);null=尚未核对成功,fail-closed。
@@ -255,9 +263,20 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   useEffect(() => {
     setPlans(null);
     setCancelTarget(null);
+    weekTouched.current = false;
     void reload();
     return () => { historyRequests.current?.invalidate(); };
   }, [reload]);
+
+  // 既有安排到位后套用推导默认;研究者动过周次就不再打扰。
+  useEffect(() => {
+    if (plans === null || weekTouched.current) return;
+    const derived = nextUnplannedWeek(plans);
+    setWeekNo(derived);
+    setPhase((current) => derived >= 2
+      ? "正式训练"
+      : (WEEK_ONE_PHASES as readonly string[]).includes(current) ? current : "关系建立");
+  }, [plans]);
 
   useEffect(() => {
     let active = true;
@@ -533,9 +552,10 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
               <TextInput type="number" min={1} max={1000} value={sittingNo} disabled={!canManage || busy}
                 onChange={(event) => setSittingNo(Math.max(1, Math.min(1000, Number(event.target.value) || 1)))} />
             </Field>
-            <Field label="训练周次（1–8 周）" required>
+            <Field label="训练周次（1–8 周）" required hint={plannedWeeksSummary(plans)}>
               <TextInput type="number" min={1} max={8} value={weekNo} required disabled={!canManage || busy}
                 onChange={(event) => {
+                  weekTouched.current = true;
                   const next = Math.max(1, Math.min(8, Number(event.target.value) || 1));
                   setWeekNo(next);
                   setPhase(normalizePhase(next));

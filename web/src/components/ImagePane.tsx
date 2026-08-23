@@ -23,7 +23,7 @@ function fit(nw: number, nh: number, vw: number, vh: number, compact: boolean): 
     ? (compact ? 0.23 : 0.31)
     : vh > vw
       ? (compact ? 0.26 : 0.34)
-      : (compact ? 0.30 : 0.40);
+      : (compact ? 0.24 : 0.40);
   const scale = Math.min((vw * IMG_VW) / nw, (vh * imgVh) / nh);
   return { width: Math.round(nw * scale), height: Math.round(nh * scale) };
 }

@@ -44,15 +44,15 @@ test("TTS serve evidence section states never overclaim playback, and stay disti
         },
         {
           key: "tts-2", time: "2026-07-28 10:05:00", sourceLabel: "现场朗读",
-          commandLabel: "无绑定指令", engineVersion: "qwen-tts-v1", resultLabel: "已降级(无服务端音频)",
-          resultTone: "warn", cacheLabel: "缓存不适用(无服务端音频)", byteLabel: "—", isSimulation: false,
+          commandLabel: "无绑定指令", engineVersion: "qwen-tts-v1", resultLabel: "已改用本机语音(服务器未返回音频)",
+          resultTone: "warn", cacheLabel: "缓存不适用(服务器未返回音频)", byteLabel: "—", isSimulation: false,
         },
       ],
     },
   }));
   assert.match(ready, /已实际返回音频/);
-  assert.match(ready, /已降级\(无服务端音频\)/);
-  assert.match(ready, /缓存不适用\(无服务端音频\)/);
+  assert.match(ready, /已改用本机语音\(服务器未返回音频\)/);
+  assert.match(ready, /缓存不适用\(服务器未返回音频\)/);
   for (const markup of [contractError, empty, ready]) {
     for (const phrase of FORBIDDEN_PLAYBACK_CLAIMS) {
       assert.equal(markup.includes(phrase), false, `不该出现「${phrase}」`);
@@ -140,7 +140,7 @@ test("AI usage section distinguishes loading/forbidden/withdrawn/network-error/c
       status: "ready",
       model: {
         hasAnyRecords: true,
-        ttsRows: [{ key: "tts-qwen-tts-v1", label: "qwen-tts-v1", detail: "实际返回 3 次(缓存命中 1) · 降级 1 次" }],
+        ttsRows: [{ key: "tts-qwen-tts-v1", label: "qwen-tts-v1", detail: "实际返回 3 次(缓存命中 1) · 改用本机语音 1 次" }],
         asrRows: [{ key: "asr-asr-v1", label: "asr-v1", detail: "尝试 5 次" }],
         judgeRows: [{ key: "judge-规则确定式-rule-1", label: "规则确定式 · rule-1", detail: "5 次" }],
       },

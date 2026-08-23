@@ -169,6 +169,13 @@ export function observerPlanPosition(
 ): ObserverPlanPosition | null {
   const cursor = exactPlanCursor(runtime, sessionId, plan);
   if (!cursor || !plan) return null;
+  return positionFromPlanCursor(plan, cursor);
+}
+
+function positionFromPlanCursor(
+  plan: SessionPlan,
+  cursor: ExactPlanCursor,
+): ObserverPlanPosition {
   const item = plan.items[cursor.itemIdx];
   const turn = item.turns[cursor.turnIdx];
   return {
@@ -180,4 +187,43 @@ export function observerPlanPosition(
     taskType: item.task_type,
     responseRole: turn.response_role,
   };
+}
+
+/**
+ * 权威状态回执里的位置(item_id, turn_seq)映射进冻结计划。任何不可证明的
+ * 输入(计划缺失、item 不在计划、turn_seq 非法或不在该题)都返回 null——
+ * 与 exactPlanCursor 同一条纪律:不默认、不 clamp、不猜。
+ */
+export function planCursorForReceiptPosition(
+  plan: SessionPlan | null,
+  itemId: string | null | undefined,
+  turnSeq: number | null | undefined,
+): ExactPlanCursor | null {
+  if (!plan || typeof itemId !== "string" || !itemId) return null;
+  if (typeof turnSeq !== "number" || !Number.isSafeInteger(turnSeq) || turnSeq < 1) return null;
+  const itemIdx = plan.items.findIndex((item) => item.item_id === itemId);
+  if (itemIdx < 0) return null;
+  const turnIdx = plan.items[itemIdx].turns.findIndex((turn) => turn.turn_seq === turnSeq);
+  if (turnIdx < 0) return null;
+  return { itemIdx, turnIdx };
+}
+
+/**
+ * 观察面位置的唯一权威序:服务端自动推进不写 live/runtime cursor,所以
+ * serverOwnership 期间回执位置优先;回执位置存在但映射不进冻结计划时显示
+ * 待同步(null),绝不回退到必然更旧的 cursor 冒充权威;尚无回执位置时才用
+ * 既有 runtime 判定(如 checking 首帧)。
+ */
+export function observerAuthoritativePosition(
+  receiptPosition: { itemId: string; turnSeq: number } | null,
+  runtime: SessionRuntimeState | null,
+  sessionId: string,
+  plan: SessionPlan | null,
+): ObserverPlanPosition | null {
+  if (receiptPosition) {
+    const cursor = planCursorForReceiptPosition(
+      plan, receiptPosition.itemId, receiptPosition.turnSeq);
+    return cursor && plan ? positionFromPlanCursor(plan, cursor) : null;
+  }
+  return observerPlanPosition(runtime, sessionId, plan);
 }

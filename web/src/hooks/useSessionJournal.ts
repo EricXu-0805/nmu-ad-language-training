@@ -507,6 +507,14 @@ export function mergeServerJournal(local: SessionJournal, remote: ServerSessionJ
   }
 
   const audios: Record<string, JournalAudio> = {};
+  // 无 turn 的音频(如自动带练录音)时长以设备采集回执为准;有 turn 仍以 turn 为准。
+  const receiptDurationByAudioId = new Map<string, number>();
+  for (const receipt of remote.audio_receipts ?? []) {
+    if (typeof receipt.duration_seconds === "number"
+        && Number.isFinite(receipt.duration_seconds) && receipt.duration_seconds >= 0) {
+      receiptDurationByAudioId.set(receipt.raw_audio_id, receipt.duration_seconds);
+    }
+  }
   for (const audio of remote.audios) {
     const linkedTurn = turnByAudioId.get(audio.raw_audio_id);
     const derivedTurnKey = linkedTurn ? remoteTurnKey.get(linkedTurn.id) : undefined;
@@ -522,7 +530,9 @@ export function mergeServerJournal(local: SessionJournal, remote: ServerSessionJ
       containsDirectIdentifier: audio.contains_direct_identifier,
       isReliabilitySample: audio.is_reliability_sample,
       lastStatus: audio.status,
-      durationSeconds: linkedTurn?.duration_seconds ?? undefined,
+      durationSeconds: linkedTurn?.duration_seconds
+        ?? receiptDurationByAudioId.get(audio.raw_audio_id)
+        ?? undefined,
       provenance: {
         source: "server_committed",
         sessionId: sid,

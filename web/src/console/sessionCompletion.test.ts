@@ -23,12 +23,30 @@ test("intervention completion waits for evidence loading but not human score loc
     planReady: true,
     weekNo: 3,
     totalTurns: 12,
+    itemsMissingRecords: 0,
   }).canRequest, false);
   assert.equal(localInterventionCompletionGate({
     journalReady: true,
     planReady: true,
     weekNo: 3,
     totalTurns: 12,
+    itemsMissingRecords: 0,
+  }).canRequest, true);
+});
+
+test("P0-5:缺 N 题记录时收尾屏不亮绿灯,label 写明还差几题、暂不能结束", () => {
+  const gate = localInterventionCompletionGate({
+    journalReady: true, planReady: true, weekNo: 2, totalTurns: 78,
+    itemsMissingRecords: 32,
+  });
+  assert.equal(gate.canRequest, false);
+  assert.equal(gate.label, "还差 32 题记录，暂不能结束");
+  assert.match(gate.detail, /服务器拒绝|会被服务器拒绝/);
+  assert.doesNotMatch(gate.label, /可以结束/);
+  // 补齐后才亮绿灯。
+  assert.equal(localInterventionCompletionGate({
+    journalReady: true, planReady: true, weekNo: 2, totalTurns: 78,
+    itemsMissingRecords: 0,
   }).canRequest, true);
 });
 
@@ -36,6 +54,7 @@ test("intervention completion keeps empty plans closed for training weeks", () =
   const common = { journalReady: true, planReady: true };
   assert.equal(localInterventionCompletionGate({
     ...common, weekNo: 3, totalTurns: 0,
+    itemsMissingRecords: 0,
   }).canRequest, false);
 });
 
@@ -49,6 +68,7 @@ test("week one follows the rapport farewell gate, never the empty scoring plan",
   assert.match(unknown.label, /关系建立位置/);
   assert.equal(localInterventionCompletionGate({
     journalReady: true, planReady: true, weekNo: 1, totalTurns: 0, rapport: null,
+    itemsMissingRecords: 0,
   }).canRequest, false);
   // 未停在道别节 → 指路道别/中止,不放行。
   const early = localCompletionGate({ ...common, rapport: { atFarewell: false } });
@@ -61,6 +81,7 @@ test("week one follows the rapport farewell gate, never the empty scoring plan",
   assert.match(ready.detail, /道别位置/);
   assert.equal(localInterventionCompletionGate({
     journalReady: true, planReady: true, weekNo: 1, totalTurns: 0,
+    itemsMissingRecords: 0,
     rapport: { atFarewell: true },
   }).canRequest, true);
   // 记录未加载完成时仍先等加载。
@@ -72,7 +93,7 @@ test("week one follows the rapport farewell gate, never the empty scoring plan",
 test("rapport rejection surfaces the rapport-shaped server assessment", () => {
   const failure = parseCompletionFailure({
     detailData: {
-      message: "床旁干预结束门禁未通过；保持当前位置，不切换受试者",
+      message: "还有环节没有记录，暂不能结束现场训练；本场保持当前位置，不会切换受试者",
       assessment: {
         ready: false,
         protocol: "rapport",

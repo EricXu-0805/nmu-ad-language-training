@@ -192,6 +192,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
    放不下走父级滚动,绝不重叠。 */
 .patient-stage > * { flex-shrink: 0; }
 .patient-stage .stage-image { display: flex; align-items: center; justify-content: center; min-height: 30dvh; }
+/* V2:线索级话术长,题图收紧档同时收紧占位下限,长文本三行内完整可见不被折缝裁半 */
+.patient-stage .stage-image[data-compact="true"] { min-height: 20dvh; }
 .patient-stage .question { margin: 0; }
 .patient-stage .stage-mic {
   margin-top: auto; display: flex; flex-direction: column; align-items: center;
@@ -220,6 +222,32 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   box-shadow: var(--shadow-sm); opacity: 0.9; z-index: var(--z-floating);
 }
 .tts-toggle:hover { opacity: 1; }
+
+/* 未配对问候页的常驻找回入口：给工作人员用的安静按钮，
+   点它重新弹配对框——「暂不配对」之后不再依赖整页刷新。 */
+.patient-pair-entry {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  margin-top: 28px;
+  padding: 14px 30px;
+  border: 2px solid var(--c-border, #b8b2a8);
+  border-radius: 20px;
+  background: var(--c-bg-elevated, #fffdf9);
+  color: var(--c-fg, #3a352d);
+  font: inherit;
+  font-size: clamp(20px, 3vw, 28px);
+  font-weight: var(--weight-bold, 600);
+  cursor: pointer;
+  touch-action: manipulation;
+  box-shadow: var(--shadow-sm, 0 2px 8px rgba(60, 50, 30, 0.12));
+}
+.patient-pair-entry small {
+  font-size: clamp(14px, 2vw, 18px);
+  font-weight: normal;
+  color: var(--c-fg-muted, #6e675c);
+}
 
 /* 老人自己的安全暂停：一直在主视线下方，比“点一下开始”和
    断线提示更高，因为断网/未激活时也必须能立即物理关麦。PIN 对话仍在其上。 */
@@ -803,6 +831,9 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 }
 
 .training-layout { display: grid; grid-template-columns: 224px minmax(0, 1fr); align-items: start; gap: var(--sp-5); }
+/* V1:观察模式不挂载左侧题列,training-main 成唯一子元素——必须占满整行,
+   否则掉进 224px 窄轨,整页被压成一字一行竖排。 */
+.training-layout > .training-main:only-child { grid-column: 1 / -1; }
 .training-main { min-width: 0; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--sp-3); }
 .toolbar__group { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
@@ -906,8 +937,18 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   align-items: center;
   justify-content: flex-start;
   gap: 1.2dvh;
+  /* V2:body 可收缩而子项不收缩——放不下时必须走内部滚动,绝不让长线索
+     溢出到贴底的「正在听您说」胶囊与按钮底下被盖住。 */
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 .patient-stage-body > * { flex-shrink: 0; }
+/* V2:收音区自己是不透明底色的贴底条,即使极端情况下仍与正文相邻也不透字。 */
+.patient-stage .stage-mic {
+  width: 100%;
+  background: var(--c-bg);
+  z-index: 1;
+}
 .rapport-body { justify-content: center; }
 .rapport-brand,
 .tap-overlay-mark {

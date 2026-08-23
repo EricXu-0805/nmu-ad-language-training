@@ -71,6 +71,7 @@ export function AIQualityDashboard({
               {group.suppressionNotice.text}
             </Alert>
 
+            {!group.metricsWithheld && (<>
             <section aria-label="当前聚合分组维度">
               <h4>分组维度</h4>
               <dl className="quality-dimension-list">
@@ -111,7 +112,7 @@ export function AIQualityDashboard({
             </section>
 
             <section aria-labelledby={operationalHeadingId}>
-              <h4 id={operationalHeadingId}>AI 运行质量（非研究真值）</h4>
+              <h4 id={operationalHeadingId}>AI 运行质量（不是研究评分）</h4>
               <QualityMetricList
                 headingId={`${operationalHeadingId}-coverage`}
                 title="覆盖与 ASR"
@@ -137,6 +138,7 @@ export function AIQualityDashboard({
                 comparisonKind={group.researchTruth.comparisonKind}
               />
             </section>
+            </>)}
           </article>
         );
       })}

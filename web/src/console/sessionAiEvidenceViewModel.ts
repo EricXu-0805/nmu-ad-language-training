@@ -45,10 +45,10 @@ function buildTtsServeRow(record: TtsServeEvidenceRecord): TtsServeEvidenceRowVi
     sourceLabel: record.source === "autopilot_command" ? "自动驾驶指令" : "现场朗读",
     commandLabel: record.commandId != null ? `指令 #${record.commandId}` : "无绑定指令",
     engineVersion: record.engineVersion,
-    resultLabel: record.result === "served" ? "已实际返回音频" : "已降级(无服务端音频)",
+    resultLabel: record.result === "served" ? "已实际返回音频" : "已改用本机语音(服务器未返回音频)",
     resultTone: record.result === "served" ? "ok" : "warn",
     // 降级行没有返回任何字节，缓存命中/未命中的说法不适用，不能写成"未命中"。
-    cacheLabel: record.result === "degraded" ? "缓存不适用(无服务端音频)" : record.cacheHit ? "缓存命中" : "缓存未命中",
+    cacheLabel: record.result === "degraded" ? "缓存不适用(服务器未返回音频)" : record.cacheHit ? "缓存命中" : "缓存未命中",
     byteLabel: record.byteCount != null ? `${record.byteCount} 字节` : "—",
     isSimulation: record.isSimulation,
   };
@@ -98,7 +98,7 @@ export function buildConfirmationRevisionTurnViewModel(
       turnId: record.turnId,
       status: "no_ledger",
       notice: hasConfirmedText
-        ? "已存在确认文本，但无可追溯修订履历（历史兼容记录，修订账本未回填）"
+        ? "已存在确认文本，但无可追溯修订履历（历史兼容记录，修订记录未补录）"
         : "当前无可追溯修订履历，可能为历史兼容记录",
     };
   }
@@ -157,7 +157,7 @@ export function buildAiUsageSection(contract: SessionAiUsageContract): AiUsageSe
   const ttsRows = contract.tts.engines.map((engine): AiUsageRowViewModel => ({
     key: `tts-${engine.engineVersion}`,
     label: engine.engineVersion,
-    detail: `实际返回 ${engine.served} 次(缓存命中 ${engine.cacheHits}) · 降级 ${engine.degraded} 次`,
+    detail: `实际返回 ${engine.served} 次(缓存命中 ${engine.cacheHits}) · 改用本机语音 ${engine.degraded} 次`,
   }));
   const asrRows: AiUsageRowViewModel[] = contract.asr.engines.map((engine) => ({
     key: `asr-${engine.engineVersion}`,
@@ -167,8 +167,8 @@ export function buildAiUsageSection(contract: SessionAiUsageContract): AiUsageSe
   if (contract.asr.degradedAttempts > 0 || asrRows.length > 0) {
     asrRows.push({
       key: "asr-degraded",
-      label: "ASR 降级",
-      detail: `${contract.asr.degradedAttempts} 次尝试记为 ASR 降级`,
+      label: "ASR 改用本机识别",
+      detail: `${contract.asr.degradedAttempts} 次尝试改用本机识别`,
     });
   }
   const judgeRows = contract.judge.modes.map((mode): AiUsageRowViewModel => ({

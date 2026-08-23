@@ -97,6 +97,7 @@ test("exact recording authorization sends no client facts and parses a closed re
     observed = init;
     return new Response(JSON.stringify({
       allowed: true,
+      recording_authorized: true,
       runtime_status: "active",
       is_simulation: true,
     }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -111,21 +112,61 @@ test("exact recording authorization sends no client facts and parses a closed re
   assert.ok(observed);
   assert.equal(Object.hasOwn(observed, "body"), false);
 
+  // 真实研究场次:is_simulation:false + 显式肯定授权照样放行。
+  const research = dependencies(async () => new Response(JSON.stringify({
+    allowed: true,
+    recording_authorized: true,
+    runtime_status: "active",
+    is_simulation: false,
+  }), { status: 200 }));
+  assert.deepEqual(
+    await authorizeExactAutopilotRecording(
+      "S/ONE", "cmd-record-0001", new AbortController().signal, research.deps),
+    { allowed: true, runtime_status: "active", is_simulation: false },
+  );
+
   const extra = dependencies(async () => new Response(JSON.stringify({
     allowed: true,
+    recording_authorized: true,
     runtime_status: "active",
     is_simulation: true,
     command_key: "leak",
   }), { status: 200 }));
   await assert.rejects(() => authorizeExactAutopilotRecording(
     "S/ONE", "cmd-record-0001", new AbortController().signal, extra.deps), /未证明/);
-  const notSimulation = dependencies(async () => new Response(JSON.stringify({
+
+  // 旧后端三键形状（没有 recording_authorized 肯定授权）必须拒绝:
+  // 新前端配旧后端绝不静默开麦。
+  const legacyShape = dependencies(async () => new Response(JSON.stringify({
     allowed: true,
     runtime_status: "active",
-    is_simulation: false,
+    is_simulation: true,
   }), { status: 200 }));
   await assert.rejects(() => authorizeExactAutopilotRecording(
-    "S/ONE", "cmd-record-0001", new AbortController().signal, notSimulation.deps), /未证明/);
+    "S/ONE", "cmd-record-0001", new AbortController().signal, legacyShape.deps), /未证明/);
+
+  for (const spoiledAuthorization of [false, "true", 1, null]) {
+    const spoiled = dependencies(async () => new Response(JSON.stringify({
+      allowed: true,
+      recording_authorized: spoiledAuthorization,
+      runtime_status: "active",
+      is_simulation: true,
+    }), { status: 200 }));
+    await assert.rejects(() => authorizeExactAutopilotRecording(
+      "S/ONE", "cmd-record-0001", new AbortController().signal, spoiled.deps), /未证明/);
+  }
+
+  // is_simulation 必须是严格布尔——字符串/缺失/null 全拒。
+  for (const spoiledSimulation of ["false", 0, null]) {
+    const spoiled = dependencies(async () => new Response(JSON.stringify({
+      allowed: true,
+      recording_authorized: true,
+      runtime_status: "active",
+      is_simulation: spoiledSimulation,
+    }), { status: 200 }));
+    await assert.rejects(() => authorizeExactAutopilotRecording(
+      "S/ONE", "cmd-record-0001", new AbortController().signal, spoiled.deps), /未证明/);
+  }
 });
 
 test("drain ACK is exact, bodyless, and waits for the caller's physical-stop boundary", async () => {

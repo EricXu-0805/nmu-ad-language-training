@@ -8,8 +8,8 @@
  "event_line": "正式训练",
  "parent_item_bank_version_id": "wk2-v1-20260707",
  "parent_item_bank_definition_digest": "0666e8f581141f66cb2eb666766c80a13c14b75a98591f81586db8be1993603d",
- "parent_autopilot_protocol_version_id": "autopilot-v1-20260729",
- "parent_autopilot_protocol_definition_digest": "51fe62990cc0bc6934b4fbe7c8d902369c0b9fd7e092136572da3fa375b989d9",
+ "parent_autopilot_protocol_version_id": "autopilot-v2-20260821",
+ "parent_autopilot_protocol_definition_digest": "d12276510d1eeb9b5deb9eab9ab5258ebd6374cbd2cb3da33eee797161d3240c",
  "parent_source_document_sha256": "b3310b61bdc6afb437cbc05785bd6f4e1f6c30dd53ad0999eb2c0fea10c3891a",
  "parent_source_normalized_text_sha256": "b7f2ad1d4389ee6193721402b1d39d9c3cc7a15d2341807471a5fc4627d06c55",
  "ordered_position_keys": [
@@ -39,6 +39,6 @@
  ],
  "plan_position_count": 20,
  "completion_scope": "demo_plan_only",
- "profile_definition_digest": "089c44fc5f20b541b374b24289693e066550acf6999e0b5dc382cd5f10ba71fc",
+ "profile_definition_digest": "655e60c654405526a91dce02e3c06403951f3762a018e65c02ecf29541dfbdec",
  "qc_status": "draft"
 }

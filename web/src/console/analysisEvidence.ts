@@ -134,12 +134,12 @@ function parsePayload(event: InteractionEvent): ParsedInteraction {
   try {
     const decoded: unknown = JSON.parse(event.payload_json);
     if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
-      payloadError = "payload_json 不是对象";
+      payloadError = "过程记录内容格式不对";
     } else {
       payload = decoded as Record<string, unknown>;
     }
   } catch {
-    payloadError = "payload_json 无法解析";
+    payloadError = "过程记录内容无法解析";
   }
   return { event, payload, payloadError, summary: interactionSummary(event.event_type, payload) };
 }
@@ -184,18 +184,18 @@ function requiredEvents(attempt: AttemptEvent, interactions: ParsedInteraction[]
   const types = new Set(interactions.map((row) => row.event.event_type));
   const issues: EvidenceIssue[] = [];
   if (!types.has("attempt_received")) {
-    issues.push(issue("attempt_received_missing", "danger", "缺少 attempt_received，这次处理的起点证据不完整。"));
+    issues.push(issue("attempt_received_missing", "danger", "缺少「收到作答录音」事件，这次处理的起点证据不完整。"));
   }
   if (attempt.processing_status === "completed") {
-    if (!types.has("asr_completed")) issues.push(issue("asr_event_missing", "danger", "状态为 completed，但缺少 asr_completed 事件。"));
-    if (!types.has("judgement_completed")) issues.push(issue("judge_event_missing", "danger", "状态为 completed，但缺少 judgement_completed 事件。"));
+    if (!types.has("asr_completed")) issues.push(issue("asr_event_missing", "danger", "处理已标记完成，但缺少「ASR 完成」事件。"));
+    if (!types.has("judgement_completed")) issues.push(issue("judge_event_missing", "danger", "处理已标记完成，但缺少「AI 判类完成」事件。"));
     const judgement = interactions.find((row) => row.event.event_type === "judgement_completed");
     if (judgement?.payload?.truth_scope !== "operational_only") {
-      issues.push(issue("truth_scope_invalid", "danger", "AI 判类未明确标注 operational_only，不能视为研究真值。"));
+      issues.push(issue("truth_scope_invalid", "danger", "AI 判类未标明只作运行参考，不能当作研究评分。"));
     }
   }
   if (attempt.processing_status === "technical_failure") {
-    if (!types.has("technical_pause")) issues.push(issue("technical_pause_missing", "danger", "技术失败缺少 technical_pause 安全暂停证据。"));
+    if (!types.has("technical_pause")) issues.push(issue("technical_pause_missing", "danger", "技术失败缺少「安全暂停」事件证据。"));
     if (!types.has("asr_failed") && !types.has("judgement_failed")) {
       issues.push(issue("failure_stage_missing", "danger", "技术失败未标明发生在 ASR 还是 AI 判类阶段。"));
     }
@@ -219,7 +219,7 @@ function turnAttemptConsistency(turn: TurnEvent, attempt: AttemptEvent): Evidenc
   if (!nullableEqual(turn.ai_needs_review, attempt.operational_needs_review)) mismatches.push("需复核标记");
   if (!nullableEqual(turn.ai_judge_mode, attempt.judge_mode)) mismatches.push("判类模式");
   if (mismatches.length > 0) {
-    issues.push(issue("turn_attempt_mismatch", "danger", `Turn 与 source attempt 不一致：${mismatches.join("、")}。`));
+    issues.push(issue("turn_attempt_mismatch", "danger", `环节最终记录与来源处理记录不一致：${mismatches.join("、")}。`));
   }
   if (turn.judge_portrait_used || attempt.judge_portrait_used) {
     issues.push(issue("portrait_leak", "danger", "证据标记为使用了画像数据，违反判分禁入约束。"));
@@ -232,15 +232,15 @@ export function compareOperationalToResearch(turn: TurnEvent | null, source: Att
   const researchValue = turn?.element_value ?? turn?.reviewed_score;
   const researchScore = typeof researchValue === "number" ? researchValue : null;
   if (!turn?.score_locked || researchScore === null) {
-    return { state: "unavailable", aiScore, researchScore, message: "尚未形成人工锁定的研究真值，不可宣称 AI 判定正确或错误。" };
+    return { state: "unavailable", aiScore, researchScore, message: "尚未有人工锁定的研究评分，不可宣称 AI 判定正确或错误。" };
   }
   if (aiScore === null) {
-    return { state: "unavailable", aiScore, researchScore, message: "AI 判定分缺失；只能展示人工研究真值。" };
+    return { state: "unavailable", aiScore, researchScore, message: "AI 判定分缺失；只能展示人工研究评分。" };
   }
   if (aiScore === researchScore) {
-    return { state: "same", aiScore, researchScore, message: `数值一致（AI ${aiScore} / 研究真值 ${researchScore}），但两者语义仍不等同。` };
+    return { state: "same", aiScore, researchScore, message: `数值一致（AI ${aiScore} / 人工评分 ${researchScore}），但两者含义仍不等同。` };
   }
-  return { state: "different", aiScore, researchScore, message: `数值不一致：AI 判定 ${aiScore}，人工研究真值 ${researchScore}。` };
+  return { state: "different", aiScore, researchScore, message: `数值不一致：AI 判定 ${aiScore}，人工研究评分 ${researchScore}。` };
 }
 
 export function buildEvidenceTimeline(input: EvidenceJournalInput): EvidenceTimeline {
@@ -248,18 +248,18 @@ export function buildEvidenceTimeline(input: EvidenceJournalInput): EvidenceTime
   const sessionIssues: EvidenceIssue[] = [];
   const expectedSimulation = sessionExpectedSimulation(session);
   if (expectedSimulation === null) {
-    sessionIssues.push(issue("classification_unknown", "danger", "场次 data_classification 缺失或未知，证据只能在隔离区核查。"));
+    sessionIssues.push(issue("classification_unknown", "danger", "场次数据分区缺失或未知，证据只能在隔离区核查。"));
   } else if (session.is_simulation !== expectedSimulation) {
-    sessionIssues.push(issue("session_boundary_mismatch", "danger", "场次 is_simulation 与 data_classification 不一致。"));
+    sessionIssues.push(issue("session_boundary_mismatch", "danger", "场次的模拟标记与数据分区不一致。"));
   }
 
   const orderedInteractions = [...interactions].sort((a, b) => a.event_seq - b.event_seq);
   orderedInteractions.forEach((event, index) => {
     if (!Number.isInteger(event.event_seq) || event.event_seq !== index + 1) {
-      sessionIssues.push(issue("event_sequence_gap", "danger", "场次 interaction event_seq 不连续或重复，时间线完整性需核查。"));
+      sessionIssues.push(issue("event_sequence_gap", "danger", "场次过程事件序号不连续或重复，时间线完整性需核查。"));
     }
     if (event.session_id !== session.session_id || (expectedSimulation !== null && event.is_simulation !== expectedSimulation)) {
-      sessionIssues.push(issue("interaction_boundary_mismatch", "danger", `interaction #${event.event_seq} 与当前场次或数据分区不一致。`));
+      sessionIssues.push(issue("interaction_boundary_mismatch", "danger", `过程事件 #${event.event_seq} 与当前场次或数据分区不一致。`));
     }
   });
 
@@ -317,31 +317,31 @@ export function buildEvidenceTimeline(input: EvidenceJournalInput): EvidenceTime
     row.attempts.sort((a, b) => a.attempt_seq - b.attempt_seq || a.id - b.id);
     row.interactions.sort((a, b) => a.event.event_seq - b.event.event_seq);
     const rowIssues: EvidenceIssue[] = [];
-    if (row.turns.length > 1) rowIssues.push(issue("duplicate_turn", "danger", "同一题目环节存在多条 Turn 研究真值记录。"));
+    if (row.turns.length > 1) rowIssues.push(issue("duplicate_turn", "danger", "同一题目环节存在多条最终评分记录。"));
     const turn = row.turns[0] ?? null;
     if (turn?.raw_audio_id) usedAudioIds.add(turn.raw_audio_id);
     const source = turn?.source_attempt_id != null ? attemptById.get(turn.source_attempt_id) ?? null : null;
-    if (turn && turn.source_attempt_id == null) rowIssues.push(issue("source_attempt_missing", "danger", "Turn 未指向 source_attempt_id，无法证明终值来自哪次 AI 证据。"));
-    if (turn?.source_attempt_id != null && !source) rowIssues.push(issue("source_attempt_not_found", "danger", `Turn 指向的 attempt #${turn.source_attempt_id} 不在场次账本中。`));
-    if (!turn && row.attempts.length > 0) rowIssues.push(issue("turn_not_closed", "warn", "已有逐次 AI 证据，但尚未收口为 Turn 研究环节。"));
-    if (turn?.judge_portrait_used) rowIssues.push(issue("turn_portrait_used", "danger", "Turn 标记为使用了画像数据，违反判分禁入约束。"));
+    if (turn && turn.source_attempt_id == null) rowIssues.push(issue("source_attempt_missing", "danger", "环节最终记录未标明来源，无法证明最终记录来自哪次 AI 处理。"));
+    if (turn?.source_attempt_id != null && !source) rowIssues.push(issue("source_attempt_not_found", "danger", `环节最终记录指向的处理记录 #${turn.source_attempt_id} 不在本场证据中。`));
+    if (!turn && row.attempts.length > 0) rowIssues.push(issue("turn_not_closed", "warn", "已有逐次 AI 证据，但尚未形成环节最终记录。"));
+    if (turn?.judge_portrait_used) rowIssues.push(issue("turn_portrait_used", "danger", "环节最终记录标记为使用了画像数据，违反判分禁入约束。"));
     if (turn && source) {
-      if (source.processing_status !== "completed") rowIssues.push(issue("source_not_completed", "danger", "Turn 指向的 source attempt 不是 completed。"));
+      if (source.processing_status !== "completed") rowIssues.push(issue("source_not_completed", "danger", "环节最终记录指向的来源处理未完成。"));
       if (source.item_id !== row.itemId || source.turn_seq !== row.turnSeq) {
-        rowIssues.push(issue("source_attempt_location_mismatch", "danger", "Turn 指向了其他题目或环节的 source attempt。"));
+        rowIssues.push(issue("source_attempt_location_mismatch", "danger", "环节最终记录指向了其他题目或环节的处理记录。"));
       }
       rowIssues.push(...turnAttemptConsistency(turn, source));
     }
     if (turn?.score_locked) {
-      if ((turn.element_value ?? turn.reviewed_score) == null) rowIssues.push(issue("locked_score_missing", "danger", "Turn 标记已锁分，但研究分值缺失。"));
-      if (!turn.reviewer_id) rowIssues.push(issue("reviewer_missing", "danger", "研究真值已锁定，但缺少锁分人身份。"));
-      if (turn.confirmed_response_text == null) rowIssues.push(issue("confirmed_text_missing", "danger", "研究真值已锁定，但缺少人工确认文本。"));
+      if ((turn.element_value ?? turn.reviewed_score) == null) rowIssues.push(issue("locked_score_missing", "danger", "环节已标记锁分，但研究分值缺失。"));
+      if (!turn.reviewer_id) rowIssues.push(issue("reviewer_missing", "danger", "研究评分已锁定，但缺少锁分人身份。"));
+      if (turn.confirmed_response_text == null) rowIssues.push(issue("confirmed_text_missing", "danger", "研究评分已锁定，但缺少人工确认文本。"));
     }
     for (const interaction of row.interactions) {
       if (interaction.event.attempt_id != null && !attemptById.has(interaction.event.attempt_id)) {
-        rowIssues.push(issue("interaction_attempt_missing", "danger", `interaction #${interaction.event.event_seq} 指向不存在的 attempt #${interaction.event.attempt_id}。`));
+        rowIssues.push(issue("interaction_attempt_missing", "danger", `过程事件 #${interaction.event.event_seq} 指向不存在的处理记录 #${interaction.event.attempt_id}。`));
       }
-      if (interaction.payloadError) rowIssues.push(issue("payload_invalid", "danger", `interaction #${interaction.event.event_seq} ${interaction.payloadError}。`));
+      if (interaction.payloadError) rowIssues.push(issue("payload_invalid", "danger", `过程事件 #${interaction.event.event_seq} ${interaction.payloadError}。`));
     }
 
     const attemptEvidence = row.attempts.map((attempt): AttemptEvidence => {
@@ -353,29 +353,29 @@ export function buildEvidenceTimeline(input: EvidenceJournalInput): EvidenceTime
         attemptIssues.push(issue("audio_missing", "danger", `录音引用 ${attempt.raw_audio_id} 缺少对应音频资产。`));
       } else {
         if (!audioMatchesSession(audio, session)) attemptIssues.push(issue("audio_boundary_mismatch", "danger", "音频资产与场次归属或数据分区不一致。"));
-        if (audio.turn_key !== keyFor(attempt.item_id, attempt.turn_seq)) attemptIssues.push(issue("audio_turn_mismatch", "danger", `音频 turn_key ${audio.turn_key ?? "缺失"} 与 attempt 位置不一致。`));
+        if (audio.turn_key !== keyFor(attempt.item_id, attempt.turn_seq)) attemptIssues.push(issue("audio_turn_mismatch", "danger", `音频的环节标识 ${audio.turn_key ?? "缺失"} 与处理记录位置不一致。`));
       }
       if (attempt.session_id !== session.session_id || (expectedSimulation !== null && attempt.is_simulation !== expectedSimulation)) {
-        attemptIssues.push(issue("attempt_boundary_mismatch", "danger", "attempt 与当前场次或数据分区不一致。"));
+        attemptIssues.push(issue("attempt_boundary_mismatch", "danger", "处理记录与当前场次或数据分区不一致。"));
       }
-      if (attempt.judge_portrait_used) attemptIssues.push(issue("attempt_portrait_used", "danger", "attempt 标记为使用画像数据，不得用于运营判类或研究。"));
+      if (attempt.judge_portrait_used) attemptIssues.push(issue("attempt_portrait_used", "danger", "处理记录标记为使用画像数据，不得用于运营判类或研究。"));
       if (attempt.processing_status === "technical_failure") {
         attemptIssues.push(issue("technical_failure", "danger", `AI 处理技术失败${attempt.error_code ? `：${attempt.error_code}` : "，错误码缺失"}。这不代表受试者回答错误。`));
       } else if (attempt.processing_status !== "completed") {
         attemptIssues.push(issue("attempt_incomplete", "warn", `AI 处理停在「${processingStatusLabel(attempt.processing_status)}」，不可用于推进或研究结论。`));
       } else {
-        if (typeof attempt.asr_text !== "string") attemptIssues.push(issue("asr_text_missing", "danger", "completed attempt 缺少权威 ASR 原文。"));
-        if (!attempt.asr_engine_version) attemptIssues.push(issue("asr_engine_missing", "danger", "completed attempt 缺少 ASR 引擎版本。"));
-        if (!attempt.operational_answer_type) attemptIssues.push(issue("operational_type_missing", "danger", "completed attempt 缺少 AI operational 类型。"));
-        if (typeof attempt.operational_needs_review !== "boolean") attemptIssues.push(issue("review_flag_missing", "danger", "completed attempt 缺少需复核标记。"));
-        if (!attempt.judge_mode || !attempt.judge_engine_version) attemptIssues.push(issue("judge_provenance_missing", "danger", "completed attempt 缺少 AI 判类模式或引擎版本。"));
+        if (typeof attempt.asr_text !== "string") attemptIssues.push(issue("asr_text_missing", "danger", "已完成的处理缺少权威 ASR 原文。"));
+        if (!attempt.asr_engine_version) attemptIssues.push(issue("asr_engine_missing", "danger", "已完成的处理缺少 ASR 引擎版本。"));
+        if (!attempt.operational_answer_type) attemptIssues.push(issue("operational_type_missing", "danger", "已完成的处理缺少 AI 判定类型。"));
+        if (typeof attempt.operational_needs_review !== "boolean") attemptIssues.push(issue("review_flag_missing", "danger", "已完成的处理缺少需复核标记。"));
+        if (!attempt.judge_mode || !attempt.judge_engine_version) attemptIssues.push(issue("judge_provenance_missing", "danger", "已完成的处理缺少 AI 判类模式或引擎版本。"));
       }
       for (const interaction of linked) {
-        if (interaction.payloadError) attemptIssues.push(issue("payload_invalid", "danger", `interaction #${interaction.event.event_seq} ${interaction.payloadError}。`));
+        if (interaction.payloadError) attemptIssues.push(issue("payload_invalid", "danger", `过程事件 #${interaction.event.event_seq} ${interaction.payloadError}。`));
         if (interaction.event.item_id !== attempt.item_id
           || interaction.event.turn_seq !== attempt.turn_seq
           || interaction.event.attempt_seq !== attempt.attempt_seq) {
-          attemptIssues.push(issue("interaction_attempt_mismatch", "danger", `interaction #${interaction.event.event_seq} 的题目/环节/次序与 attempt 不一致。`));
+          attemptIssues.push(issue("interaction_attempt_mismatch", "danger", `过程事件 #${interaction.event.event_seq} 的题目/环节/次序与处理记录不一致。`));
         }
       }
       attemptIssues.push(...requiredEvents(attempt, linked));

@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import copy
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import threading
@@ -127,7 +128,9 @@ def api_clients(monkeypatch, tmp_path) -> ApiClients:
         lambda session_id, _worker: scheduled_attempts.append(session_id) or True,
     )
     SQLModel.metadata.create_all(engine)
-    now = datetime.now()
+    # 就绪闸按 naive-UTC 比较;naive 本地时刻在 UTC 以西的机器上(如 PDT)会让
+    # expires_at 恒在过去、start 全 409(机器时区从上海切到美国后现形)。
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     readiness_config = provider_readiness.capture_configuration()
     monkeypatch.setattr(
         provider_readiness, "capture_configuration",
@@ -749,8 +752,10 @@ def test_start_over_http_fails_closed_on_exact_stale_protocol_version_with_zero_
     assert after == before
 
 
-def test_default_draft_week2_plan_returns_structured_gap_before_ownership(
+def test_default_week2_plan_admits_full_interaction_coverage_over_http(
         api_clients: ApiClients, monkeypatch):
+    """2026-08-21 交互数据包交付后:完整 78 位置周计划经 HTTP 准入放行,
+    首条命令仍是第一题(单要素)的冻结问句。"""
     _enable_p0a(monkeypatch)
     monkeypatch.setattr(content, "load_item_bank", lambda _path: BANK)
     with Session(api_clients.engine) as session:
@@ -761,26 +766,48 @@ def test_default_draft_week2_plan_returns_structured_gap_before_ownership(
         session.add(training)
         session.commit()
 
+    accepted = _start(api_clients)
+    assert accepted.status_code == 200, accepted.text
+    payload = accepted.json()
+    assert payload["status"] == "waiting_tts"
+    assert payload["server_owned"] is True
+    with Session(api_clients.engine) as session:
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "waiting_tts"
+        command = session.get(RuntimeCommand, state.current_command_id)
+        assert command is not None and command.kind == "tts"
+        assert command.item_id == BANK.single_element[0]["item_id"]
+        assert command.response_role == "命名"
+
+
+def test_default_week2_plan_still_refuses_when_interaction_package_missing(
+        api_clients: ApiClients, monkeypatch):
+    _enable_p0a(monkeypatch)
+    monkeypatch.setattr(content, "load_item_bank", lambda _path: BANK)
+
+    def unavailable(week_no, content_dir=None, protocol=None):
+        raise content.FrozenContentUnavailable("测试:数据包不可用")
+
+    monkeypatch.setattr(
+        content, "load_autopilot_interaction_package", unavailable)
+    with Session(api_clients.engine) as session:
+        training = session.get(TrainSession, SESSION_ID)
+        assert training is not None
+        training.item_bank_definition_digest = (
+            content.item_bank_definition_digest(BANK))
+        session.add(training)
+        session.commit()
+
     denied = _start(api_clients)
     assert denied.status_code == 409, denied.text
-    assert denied.json()["detail"] == {
-        "code": "autopilot_plan_not_fully_supported",
-        "message": (
-            "完整源协议仍有 58 个位置不受当前自动协议支持；"
-            "首个缺口为 DE_烟灰缸+烟#1:左命名"
-        ),
-        # 2026-08-19 内容交付后源协议全量结构化(78 位置,无 source-only 缺口);
-        # 剩余 58 个缺口全部是 operational_protocol_unavailable 类结构化缺口。
-        "unsupported_position_count": 58,
-        "structured_unsupported_position_count": 58,
-        "source_unstructured_position_count": 0,
-        "source_protocol_position_count": 78,
-        "first_gap": {
-            "code": "operational_protocol_unavailable",
-            "item_id": "DE_烟灰缸+烟",
-            "turn_seq": 1,
-            "response_role": "左命名",
-        },
+    detail = denied.json()["detail"]
+    assert detail["code"] == "autopilot_plan_not_fully_supported"
+    assert detail["unsupported_position_count"] == 58
+    assert detail["first_gap"] == {
+        "code": "interaction_package_unavailable",
+        "item_id": "DE_烟灰缸+烟",
+        "turn_seq": 1,
+        "response_role": "左命名",
     }
     with Session(api_clients.engine) as session:
         assert session.get(SessionAutopilotState, SESSION_ID) is None
@@ -852,6 +879,8 @@ def test_account_start_and_exact_device_get_are_separate_principals(
         "server_owned": True,
         "takeover_ready": False,
         "current_command_kind": "tts",
+        "position_item_id": BANK.single_element[0]["item_id"],
+        "position_turn_seq": 1,
         "last_error_code": None,
     }
     assert _all_keys(payload).isdisjoint({
@@ -1413,6 +1442,7 @@ def test_preallocated_record_upload_receipt_and_stopped_ack_form_one_exact_chain
     assert exact_auth.status_code == 200, exact_auth.text
     assert exact_auth.json() == {
         "allowed": True,
+        "recording_authorized": True,
         "runtime_status": "active",
         "is_simulation": True,
     }
@@ -5003,6 +5033,8 @@ def test_exact_drain_then_explicit_takeover_is_strict_idempotent_and_releases_ma
         "server_owned": False,
         "takeover_ready": False,
         "current_command_kind": None,
+        "position_item_id": BANK.single_element[0]["item_id"],
+        "position_turn_seq": 1,
         "last_error_code": None,
     }
     exact_retry = api_clients.account.post(takeover_url, json=takeover_body)
@@ -5561,3 +5593,188 @@ def test_account_status_stays_readable_after_the_api_record_stop_chain(
         "raw_audio_id", "checksum", "stop_reason", "receipt_server_seq",
         "issued_capability_token_hash", "issued_device_id_hash", "issued_at",
     })
+
+
+# ---------------------------------------------------------------------------
+# 交互数据包(双要素 Shape B)全链 worker 走查:判分→静默推进→scope 完成→自动收尾。
+# ---------------------------------------------------------------------------
+
+INTERACTION_DOUBLE_BANK = replace(
+    BANK,
+    single_element=[],
+    double_element=copy.deepcopy(BANK.double_element[:1]),
+    multi_element=[],
+    meta={
+        **BANK.meta,
+        "source_protocol_position_count": 5,
+        "source_unstructured_positions": [],
+    },
+)
+
+
+def _interaction_subset_package(bank) -> dict:
+    protocol = content.load_autopilot_protocol(
+        content.CONTENT_DIR / "autopilot_protocol_v1.json")
+    package = content.load_autopilot_interaction_package(2, protocol=protocol)
+    keep = {row["item_id"]
+            for row in (*bank.double_element, *bank.multi_element)}
+    package["items"] = [
+        item for item in package["items"] if item["item_id"] in keep]
+    package["parent_item_bank_definition_digest"] = (
+        content.item_bank_definition_digest(bank))
+    return package
+
+
+class _SequencedAsr:
+    version = "sequenced-asr-test"
+    data_boundary = "local"
+
+    def __init__(self, texts):
+        self.texts = list(texts)
+        self.calls = 0
+
+    def transcribe(self, _audio_bytes, _hotwords):
+        self.calls += 1
+        return asr.AsrResult(self.texts.pop(0), 0.9, self.version,
+                             hotword_hit=False)
+
+
+def test_worker_drives_full_double_item_and_autofinishes_scope(
+        api_clients: ApiClients, monkeypatch):
+    """五环节全命中:worker 判分→每环节静默推进→最后一环节完成 scope 并自动收尾。"""
+    _enable_p0a(monkeypatch)
+    bank = INTERACTION_DOUBLE_BANK
+    package = _interaction_subset_package(bank)
+    monkeypatch.setattr(content, "load_item_bank", lambda _path: bank)
+    monkeypatch.setattr(
+        content, "load_autopilot_interaction_package",
+        lambda week_no, content_dir=None, protocol=None: copy.deepcopy(
+            package))
+    digest = content.item_bank_definition_digest(bank)
+    with Session(api_clients.engine) as session:
+        training = session.get(TrainSession, SESSION_ID)
+        assert training is not None
+        training.item_bank_definition_digest = digest
+        session.add(training)
+        session.commit()
+
+    row = bank.double_element[0]
+    rubrics = row["operational_rubrics"]
+    transcripts = [
+        row["left_word"],
+        rubrics["左作用"]["acceptable_expressions"][0],
+        row["right_word"],
+        rubrics["右作用"]["acceptable_expressions"][0],
+        rubrics["关系识别"]["acceptable_expressions"][0],
+    ]
+    fake_asr = _SequencedAsr(transcripts)
+    monkeypatch.setattr(asr, "get_engine", lambda: fake_asr)
+
+    started = _start(api_clients)
+    assert started.status_code == 200, started.text
+    device_event_seq = 0
+    for turn_seq in range(1, 6):
+        tts = _device_next(api_clients)
+        assert tts is not None and tts["kind"] == "tts", tts
+        assert tts["turn_seq"] == turn_seq
+        assert tts["payload"]["purpose"] == "question"
+        device_event_seq += 1
+        ended = api_clients.device.post(
+            f"/sessions/{SESSION_ID}/autopilot/commands/"
+            f"{tts['command_key']}/acks",
+            headers=api_clients.device_headers,
+            json=_ack_body(
+                tts,
+                ack_type="tts_ended",
+                ack_key=f"ack-ix-worker-tts-{turn_seq:02d}",
+                device_event_seq=device_event_seq,
+                media_ended=True,
+                media_duration_ms=700,
+            ),
+        )
+        assert ended.status_code == 200, ended.text
+        record = ended.json()["command"]
+        assert record["kind"] == "record"
+        raw_audio_id = record["payload"]["raw_audio_id"]
+        blob = b"\x1a\x45\xdf\xa3interaction-worker-" + bytes(
+            str(turn_seq), "ascii")
+        uploaded = api_clients.device.put(
+            f"/audio/{raw_audio_id}/blob",
+            headers={**api_clients.device_headers,
+                     "content-type": "audio/webm"},
+            content=blob,
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        upload_fact = uploaded.json()
+        saved = api_clients.device.put(
+            "/live/state",
+            headers=api_clients.device_headers,
+            json={
+                "kind": "audioSaved",
+                "payload": {
+                    "rawAudioId": raw_audio_id,
+                    "durationSeconds": 1.5,
+                    "byteCount": upload_fact["bytes"],
+                    "checksum": upload_fact["checksum"],
+                    "turnKey": record["payload"]["turn_ref"],
+                    "sessionId": SESSION_ID,
+                    "containsDirectIdentifier": False,
+                },
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        receipt = saved.json()["audioReceipt"]
+        device_event_seq += 1
+        stopped = api_clients.device.post(
+            f"/sessions/{SESSION_ID}/autopilot/commands/"
+            f"{record['command_key']}/acks",
+            headers=api_clients.device_headers,
+            json=_ack_body(
+                record,
+                ack_type="record_stopped",
+                ack_key=f"ack-ix-worker-rec-{turn_seq:02d}",
+                device_event_seq=device_event_seq,
+                stop_reason="user_done",
+                raw_audio_id=raw_audio_id,
+                receipt_server_seq=receipt["serverSeq"],
+                checksum=upload_fact["checksum"],
+                byte_count=upload_fact["bytes"],
+                duration_seconds=1.5,
+            ),
+        )
+        assert stopped.status_code == 200, stopped.text
+        assert stopped.json()["status"] == "processing_attempt"
+        _run_p0a_attempt_worker(SESSION_ID)
+
+    assert fake_asr.calls == 5
+    with Session(api_clients.engine) as session:
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        assert state.status == "scope_completed"
+        assert state.current_command_id is None
+        commands = list(session.exec(select(RuntimeCommand).order_by(
+            RuntimeCommand.command_seq)))
+        # 全命中:5×(question TTS + record),没有任何反馈/告知 TTS。
+        assert [(row.kind, json.loads(row.payload_json).get("purpose"))
+                for row in commands] == [
+            ("tts", "question"), ("record", None),
+        ] * 5
+        assert all(row.state == "succeeded" for row in commands)
+        attempts = list(session.exec(select(AttemptEvent)))
+        assert len(attempts) == 5
+        assert all(attempt.contains_target is True for attempt in attempts)
+        items = list(session.exec(select(ItemEvent)))
+        turns = list(session.exec(select(TurnEvent)))
+        assert len(items) == 1 and len(turns) == 5
+        assert all(turn.score_locked is False for turn in turns)
+        assert all(turn.reviewed_score is None for turn in turns)
+        scope_events = list(session.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.event_type == "scope_complete")))
+        assert len(scope_events) == 1
+        # worker 侧自动收尾:runtime 终态 + 不可变汇总在同一提交里可见。
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None
+        assert runtime_state.status == "intervention_completed"
+        assert runtime_state.intervention_ended_by == "SERVER-AUTOPILOT"
+        from app.models import SessionOutcomeSummary
+        assert session.get(SessionOutcomeSummary, SESSION_ID) is not None

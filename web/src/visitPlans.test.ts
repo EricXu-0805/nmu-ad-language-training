@@ -116,7 +116,7 @@ function directSession() {
 // a test that shares its constant with the parser proves only self-consistency.
 const DEMO_VERSION = "week2-single20-demo-v1";
 const DEMO_DIGEST =
-  "089c44fc5f20b541b374b24289693e066550acf6999e0b5dc382cd5f10ba71fc";
+  "655e60c654405526a91dce02e3c06403951f3762a018e65c02ecf29541dfbdec";
 
 /** The immutable simulation-only D1B demo lifecycle. */
 function demoDraft(planId = PLAN_A) {

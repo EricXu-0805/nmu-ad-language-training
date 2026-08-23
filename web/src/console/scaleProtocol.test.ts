@@ -622,5 +622,7 @@ test("ScaleDrawer explains six independent v4 readiness layers without overstati
   assert.match(source, /工作流政策可信执行/);
   assert.match(source, /平台结果与工作流合同/);
   assert.match(source, /等待平台可信执行能力/);
-  assert.match(source, /instance_creation_enabled/);
+  // 配置字段名不上屏（产品可用性审计 P0）；免责声明必须保留。
+  assert.equal(source.includes("instance_creation_enabled="), false);
+  assert.match(source, /不是正式量表结果/);
 });

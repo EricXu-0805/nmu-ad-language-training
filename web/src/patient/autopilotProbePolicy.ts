@@ -19,12 +19,15 @@ export function exactAutopilotApiCode(error: unknown): string | null {
   return typeof row.code === "string" && typeof row.message === "string" ? row.code : null;
 }
 
-/** Only these two exact 409s prove that mounting the legacy runner is safe. */
+/** Only these exact 409s prove that mounting the legacy runner is safe. */
 export function classifyAutopilotProbeError(error: unknown): AutopilotProbeDisposition {
   if (!(error instanceof ApiError) || error.status !== 409) return "blocked";
   const code = exactAutopilotApiCode(error);
   if (code === "autopilot_not_active") return "legacy-inactive";
-  if (code === "autopilot_p0a_disabled") return "legacy-disabled";
+  // 两个部署开关码都是稳定事实:真实场次全关时门禁按分类报
+  // autopilot_real_sessions_disabled(D2),与模拟开关关闭同样安全地放行人工平面。
+  if (code === "autopilot_p0a_disabled"
+      || code === "autopilot_real_sessions_disabled") return "legacy-disabled";
   return "blocked";
 }
 

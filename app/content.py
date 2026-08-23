@@ -498,6 +498,11 @@ class _DoubleProtocolSchema(_FrozenContentSchema):
     namefix_right: str = Field(min_length=1)
 
 
+class _InteractionPackageRefSchema(_FrozenContentSchema):
+    file: str = Field(pattern=r"^[A-Za-z0-9._\-]+\.json$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class _AutopilotProtocolSchema(_FrozenContentSchema):
     protocol_schema_version: Literal["autopilot-protocol.v1"]
     protocol_version_id: str = Field(min_length=1)
@@ -510,6 +515,7 @@ class _AutopilotProtocolSchema(_FrozenContentSchema):
     silence_seconds: int
     naming: _NamingProtocolSchema
     double: _DoubleProtocolSchema
+    interaction_packages: dict[str, _InteractionPackageRefSchema] | None = None
     notes: list[str]
     definition_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     protocol_definition_digest: str | None = Field(
@@ -531,6 +537,149 @@ class _AutopilotProtocolSchema(_FrozenContentSchema):
     def _notes_are_non_blank(cls, value: list[str]) -> list[str]:
         if any(not note.strip() for note in value):
             raise ValueError("notes must not contain blank strings")
+        return value
+
+    @field_validator("interaction_packages")
+    @classmethod
+    def _interaction_keys_are_weeks(
+        cls, value: dict[str, _InteractionPackageRefSchema] | None,
+    ) -> dict[str, _InteractionPackageRefSchema] | None:
+        if value is not None and any(
+                key not in {"2", "3", "4", "5", "6", "7", "8"} for key in value):
+            raise ValueError("interaction_packages keys must be '2'..'8'")
+        return value
+
+
+# 交互数据包内话术的封闭来源集：verbatim=源 docx 逐字句；bank_field=同题冻结
+# 题库字段；protocol_namefix=协议纠正模板+题库目标词展开。三者之外没有话术
+# 来源——引擎与 TTS 白名单都据此解析，数据包自身永远不携带新写的临床措辞。
+_INTERACTION_BANK_FIELDS = ("left_function_cue", "right_function_cue", "relation_cue")
+
+
+class _InteractionSpeechSchema(_FrozenContentSchema):
+    source: Literal["verbatim", "bank_field", "protocol_namefix"]
+    text: str | None = Field(default=None, min_length=1)
+    source_paragraph_index: int | None = Field(default=None, ge=0)
+    field: Literal[
+        "left_function_cue", "right_function_cue", "relation_cue"] | None = None
+    side: Literal["left", "right"] | None = None
+
+    @model_validator(mode="after")
+    def _shape_matches_source(self) -> "_InteractionSpeechSchema":
+        shapes = {
+            "verbatim": (self.text is not None
+                         and self.source_paragraph_index is not None
+                         and self.field is None and self.side is None),
+            "bank_field": (self.field is not None and self.text is None
+                           and self.source_paragraph_index is None
+                           and self.side is None),
+            "protocol_namefix": (self.side is not None and self.text is None
+                                 and self.source_paragraph_index is None
+                                 and self.field is None),
+        }
+        if not shapes[self.source]:
+            raise ValueError(f"speech fields do not match source={self.source}")
+        return self
+
+
+class _InteractionQuestionSchema(_FrozenContentSchema):
+    source: Literal["verbatim"]
+    text: str = Field(min_length=1)
+    source_paragraph_index: int = Field(ge=0)
+
+
+class _InteractionBranchSchema(_FrozenContentSchema):
+    kind: Literal["advance_silent", "speak_then_advance", "speak_then_rerecord"]
+    speech: _InteractionSpeechSchema | None = None
+
+    @model_validator(mode="after")
+    def _speech_presence_matches_kind(self) -> "_InteractionBranchSchema":
+        if (self.speech is None) != (self.kind == "advance_silent"):
+            raise ValueError("speech must be present iff the branch speaks")
+        return self
+
+
+class _InteractionAfterRerecordSchema(_FrozenContentSchema):
+    full: _InteractionBranchSchema
+    otherwise: _InteractionBranchSchema
+
+    @model_validator(mode="after")
+    def _second_recording_is_terminal(self) -> "_InteractionAfterRerecordSchema":
+        if "speak_then_rerecord" in (self.full.kind, self.otherwise.kind):
+            raise ValueError("after_rerecord branches must be terminal")
+        return self
+
+
+class _InteractionTurnSchema(_FrozenContentSchema):
+    turn_seq: int = Field(ge=1)
+    response_role: str = Field(min_length=1)
+    max_recordings: Literal[1, 2]
+    question: _InteractionQuestionSchema
+    branches: dict[str, _InteractionBranchSchema]
+    after_rerecord: _InteractionAfterRerecordSchema | None = None
+
+    @model_validator(mode="after")
+    def _branches_are_closed_and_consistent(self) -> "_InteractionTurnSchema":
+        keys = set(self.branches)
+        if not {"full", "wrong", "silence"} <= keys or not keys <= {
+                "full", "partial", "wrong", "silence"}:
+            raise ValueError(
+                "branches must be full/wrong/silence plus optional partial")
+        has_rerecord = any(
+            branch.kind == "speak_then_rerecord"
+            for branch in self.branches.values())
+        if has_rerecord != (self.after_rerecord is not None):
+            raise ValueError(
+                "after_rerecord must exist iff a branch rerecords")
+        if self.max_recordings != (2 if has_rerecord else 1):
+            raise ValueError("max_recordings must match the branch structure")
+        return self
+
+
+class _InteractionItemSchema(_FrozenContentSchema):
+    item_id: str = Field(min_length=1)
+    task_type: Literal["双要素", "多要素"]
+    turns: list[_InteractionTurnSchema] = Field(min_length=1)
+
+    @field_validator("turns")
+    @classmethod
+    def _turn_seqs_are_dense(
+        cls, value: list[_InteractionTurnSchema],
+    ) -> list[_InteractionTurnSchema]:
+        if [turn.turn_seq for turn in value] != list(range(1, len(value) + 1)):
+            raise ValueError("turn_seq must be dense from 1")
+        return value
+
+
+class _FrozenOutSourceLineSchema(_FrozenContentSchema):
+    item_id: str = Field(min_length=1)
+    turn_seq: int = Field(ge=1)
+    source_paragraph_index: int = Field(ge=0)
+    reason: str = Field(min_length=1)
+
+
+class _AutopilotInteractionSchema(_FrozenContentSchema):
+    interaction_schema_version: Literal["autopilot-interaction.v1"]
+    package_version_id: str = Field(min_length=1)
+    week_no: int
+    qc_status: Literal["draft", "reviewed", "frozen"]
+    draft_revision: str = Field(min_length=1)
+    source_file: str = Field(min_length=1)
+    source_document_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_normalized_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    parent_item_bank_version_id: str = Field(min_length=1)
+    parent_item_bank_definition_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    silence_seconds: int
+    items: list[_InteractionItemSchema] = Field(min_length=1)
+    structure_freezes: list[str] = Field(min_length=1)
+    frozen_out_source_lines: list[_FrozenOutSourceLineSchema]
+    notes: list[str]
+
+    @field_validator("week_no")
+    @classmethod
+    def _week_is_bounded(cls, value: int) -> int:
+        if not 2 <= value <= 8:
+            raise ValueError("week_no must be in 2..8")
         return value
 
 
@@ -815,6 +964,196 @@ def validate_autopilot_protocol(p: dict) -> list[str]:
                      ("cue2", naming.get("success_after_cue2"))):
         if tpl and "【物品名】" not in tpl:
             issues.append(f"success_after_cue1.{key} 模板缺【物品名】槽位")
+    packages = p.get("interaction_packages")
+    if not isinstance(packages, dict):
+        issues.append("缺 interaction_packages（逐周交互数据包登记）")
+    else:
+        declared_weeks = set(packages)
+        supported_weeks = {
+            str(week) for week in weeks
+            if isinstance(week, int) and not isinstance(week, bool)
+        } if isinstance(weeks, list) else set()
+        if declared_weeks != supported_weeks:
+            issues.append(
+                "interaction_packages 登记周次必须与 supported_training_weeks 一致")
+        for week_key in sorted(declared_weeks):
+            entry = packages.get(week_key)
+            entry = entry if isinstance(entry, dict) else {}
+            file_name = entry.get("file")
+            if (not isinstance(file_name, str)
+                    or Path(file_name).name != file_name
+                    or not file_name.endswith(".json")):
+                issues.append(f"interaction_packages.{week_key} 缺合法数据包文件名")
+            sha = entry.get("sha256")
+            if not isinstance(sha, str) or _HEX64_RE.fullmatch(sha) is None:
+                issues.append(f"interaction_packages.{week_key} 缺合法字节摘要")
+    return issues
+
+
+def load_autopilot_interaction_package(
+    week_no: int,
+    content_dir: str | Path | None = None,
+    protocol: dict | None = None,
+) -> dict:
+    """按协议声明的字节摘要装载一个训练周的自动交互数据包。
+
+    数据包身份 = 文件字节 sha256，钉在协议 interaction_packages 里（协议
+    digest 因而链式覆盖全部话术）。未登记的周 / 摘要不一致一律 fail-closed。
+    """
+    base = Path(content_dir) if content_dir is not None else CONTENT_DIR
+    try:
+        if protocol is None:
+            protocol = load_autopilot_protocol(base / "autopilot_protocol_v1.json")
+        packages = protocol.get("interaction_packages")
+        declared = packages.get(str(week_no)) if isinstance(packages, dict) else None
+        if not isinstance(declared, dict):
+            raise FrozenContentUnavailable(
+                f"第{week_no}周自动交互数据包未在协议登记")
+        file_name = declared.get("file")
+        if not isinstance(file_name, str) or Path(file_name).name != file_name:
+            raise FrozenContentUnavailable(
+                f"第{week_no}周自动交互数据包文件名不合法")
+        path = base / file_name
+        raw_bytes = path.read_bytes()
+        if hashlib.sha256(raw_bytes).hexdigest() != declared.get("sha256"):
+            raise FrozenContentUnavailable(
+                f"第{week_no}周自动交互数据包字节摘要与协议钉不一致")
+        data = _load_strict_json_object(path, label="自动交互数据包")
+        _validate_frozen_schema(
+            data, _AutopilotInteractionSchema, label="自动交互数据包")
+        if data["week_no"] != week_no:
+            raise FrozenContentUnavailable(
+                f"自动交互数据包声明周次 {data['week_no']} 与请求周次 {week_no} 不一致")
+        return data
+    except FrozenContentUnavailable:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise FrozenContentUnavailable(f"自动交互数据包不可用：{exc}") from exc
+
+
+def interaction_speech_text(
+    speech: dict, bank_item: dict, protocol: dict,
+) -> str | None:
+    """把一条 speech 引用解析成实际话术文本；解析不出返回 None（fail-closed）。"""
+    if not isinstance(speech, dict):
+        return None
+    source = speech.get("source")
+    if source == "verbatim":
+        text = speech.get("text")
+        return text if isinstance(text, str) and text.strip() else None
+    if source == "bank_field":
+        field_name = speech.get("field")
+        if field_name not in _INTERACTION_BANK_FIELDS:
+            return None
+        value = bank_item.get(field_name) if isinstance(bank_item, dict) else None
+        return value if isinstance(value, str) and value.strip() else None
+    if source == "protocol_namefix":
+        side = speech.get("side")
+        if side not in ("left", "right"):
+            return None
+        template = (protocol.get("double") or {}).get(f"namefix_{side}")
+        word = (bank_item.get(f"{side}_word")
+                if isinstance(bank_item, dict) else None)
+        if (not isinstance(template, str) or "【物品名】" not in template
+                or not isinstance(word, str) or not word.strip()):
+            return None
+        return template.replace("【物品名】", word)
+    return None
+
+
+def _iter_interaction_speeches(package: dict):
+    """Yield (item_id, turn_seq, where, speech_dict) across one package."""
+    for item in package.get("items") or []:
+        item_id = item.get("item_id")
+        for turn in item.get("turns") or []:
+            turn_seq = turn.get("turn_seq")
+            branches = turn.get("branches")
+            for key, branch in (branches or {}).items():
+                speech = (branch or {}).get("speech") if isinstance(branch, dict) else None
+                if speech is not None:
+                    yield item_id, turn_seq, f"branches.{key}", speech
+            after = turn.get("after_rerecord")
+            if isinstance(after, dict):
+                for key, branch in after.items():
+                    speech = (branch or {}).get("speech") if isinstance(branch, dict) else None
+                    if speech is not None:
+                        yield item_id, turn_seq, f"after_rerecord.{key}", speech
+
+
+# 多概念判定策略：只有这些策略下引擎才可能产出 partial 类别，
+# partial 分支的存在性必须与题库冻结 rubric 严格对齐。
+_MULTI_CONCEPT_POLICIES = frozenset({
+    "all_required_concepts", "all_concept_groups", "hybrid",
+})
+
+
+def validate_autopilot_interaction_package(
+    package: dict, bank: ItemBank, protocol: dict,
+) -> list[str]:
+    """交互数据包语义闸：结构由 schema 保证，这里校验与题库/协议的绑定。
+
+    缺任何一条＝该周自动带练在对应分支哑掉或说错题的话，fail-closed 不兜底。
+    """
+    issues: list[str] = []
+    week_no = package.get("week_no")
+    if bank.meta.get("training_week_no") != week_no:
+        issues.append("数据包周次与题库声明周次不一致")
+    if package.get("parent_item_bank_version_id") != bank.version_id:
+        issues.append("parent_item_bank_version_id 与当前题库不一致")
+    if (package.get("parent_item_bank_definition_digest")
+            != item_bank_definition_digest(bank)):
+        issues.append("parent_item_bank_definition_digest 与当前题库定义摘要不一致")
+    for key in ("source_document_sha256", "source_normalized_text_sha256"):
+        if package.get(key) != bank.meta.get(key):
+            issues.append(f"{key} 与题库记录的源文摘要不一致")
+    if package.get("silence_seconds") != protocol.get("silence_seconds"):
+        issues.append("silence_seconds 与协议不一致")
+    bank_items = {
+        it.get("item_id"): (it, task_type)
+        for rows, task_type in (
+            (bank.double_element, "双要素"), (bank.multi_element, "多要素"))
+        for it in rows
+    }
+    package_items = {it.get("item_id"): it for it in package.get("items") or []}
+    if set(package_items) != set(bank_items):
+        issues.append("数据包条目集合必须恰好等于题库双要素+多要素条目集合")
+        return issues
+    for item_id, package_item in package_items.items():
+        bank_item, task_type = bank_items[item_id]
+        if package_item.get("task_type") != task_type:
+            issues.append(f"{item_id} task_type 与题库不一致")
+            continue
+        turns = package_item.get("turns") or []
+        if task_type == "双要素":
+            expected_roles = ["左命名", "左作用", "右命名", "右作用", "关系识别"]
+        else:
+            expected_roles = []
+            for index, raw in enumerate(bank_item.get("key_elements") or [],
+                                        start=1):
+                if isinstance(raw, str):
+                    expected_roles.append(raw)
+                else:
+                    expected_roles.append(
+                        str(raw.get("label") or raw.get("key") or f"key_{index}"))
+        if [turn.get("response_role") for turn in turns] != expected_roles:
+            issues.append(f"{item_id} 环节角色序列与题库计划位置不一致")
+            continue
+        for turn in turns:
+            role = turn.get("response_role")
+            where = f"{item_id}#{turn.get('turn_seq')}"
+            branches = turn.get("branches") or {}
+            if task_type == "多要素":
+                rubric = (bank_item.get("operational_rubrics") or {}).get(role)
+                policy = (rubric or {}).get("decision_policy")
+                if (policy in _MULTI_CONCEPT_POLICIES) != ("partial" in branches):
+                    issues.append(
+                        f"{where} partial 分支存在性与 rubric 策略 {policy} 不符")
+            elif "partial" in branches:
+                issues.append(f"{where} 双要素环节不得有 partial 分支")
+    for item_id, turn_seq, where, speech in _iter_interaction_speeches(package):
+        bank_item, _ = bank_items.get(item_id, ({}, None))
+        if interaction_speech_text(speech, bank_item, protocol) is None:
+            issues.append(f"{item_id}#{turn_seq} {where} 话术引用解析不出文本")
     return issues
 
 
@@ -1211,7 +1550,8 @@ def _expand_slots(line: str, zodiac: list[str]):
 
 
 def tts_allowlist(bank: ItemBank, week1_script: dict | None = None,
-                  autopilot_protocol: dict | None = None) -> frozenset[str]:
+                  autopilot_protocol: dict | None = None,
+                  interaction_package: dict | None = None) -> frozenset[str]:
     """云 TTS 允许合成的全部文本（闭集）。
 
     红线：发往云端的文本只能来自题库/脚本/固定 UI 话术，永不携带患者字段。
@@ -1275,6 +1615,21 @@ def tts_allowlist(bank: ItemBank, week1_script: dict | None = None,
                 lines.update(tpl.replace("【物品名】", w) for w in words)
             else:
                 lines.add(tpl)
+    if interaction_package:
+        by_id = {it.get("item_id"): it
+                 for rows in (bank.double_element, bank.multi_element)
+                 for it in rows}
+        for item in interaction_package.get("items") or []:
+            for turn in item.get("turns") or []:
+                t = (turn.get("question") or {}).get("text")
+                if t:
+                    lines.add(t)
+        for item_id, _turn_seq, _where, speech in _iter_interaction_speeches(
+                interaction_package):
+            t = interaction_speech_text(
+                speech, by_id.get(item_id) or {}, autopilot_protocol or {})
+            if t:
+                lines.add(t)
     return frozenset(s.strip() for s in lines if s and s.strip())
 
 

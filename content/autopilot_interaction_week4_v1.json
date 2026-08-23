@@ -1,0 +1,1975 @@
+{
+ "interaction_schema_version": "autopilot-interaction.v1",
+ "package_version_id": "wk4-interaction-v1-20260821",
+ "week_no": 4,
+ "qc_status": "draft",
+ "draft_revision": "2026-08-22.1",
+ "source_file": "20260629/第四周训练内容.docx",
+ "source_document_sha256": "0061fc7979ca25bf35f2b12cfa5ecf17598db554823c64ab8e3130e0040179d1",
+ "source_normalized_text_sha256": "c3273f3c3cd00b1290421b6aef0f8ae4f2e4944ee8a7f7a8466e51524074dbc3",
+ "parent_item_bank_version_id": "wk4-v1-20260819",
+ "parent_item_bank_definition_digest": "aba9fa12c72a2dbc92c9deaa41e8f90898094d74ec785bd3d03a629050832cd4",
+ "silence_seconds": 10,
+ "items": [
+  {
+   "item_id": "DE_窗户+窗帘",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 507
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 510
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 513
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 515
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 518
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_信封+信箱",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 524
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 527
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 530
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 532
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 535
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_书包+书",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 541
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 544
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 547
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 549
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 552
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_花+花瓶",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 558
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 561
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 564
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 566
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 568
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_太阳+向日葵",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 575
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 578
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 581
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 583
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 585
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_刀子+叉子",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 593
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 596
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 599
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 601
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 603
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_鞭子+马",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 610
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 613
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的动物是什么吗？",
+      "source_paragraph_index": 616
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 618
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 620
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_开关+灯泡",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 627
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 630
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 633
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 635
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 638
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_电脑+鼠标",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 644
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 647
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 650
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 652
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 655
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "DE_钥匙+锁",
+   "task_type": "双要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "左命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请看这张图片，您能告诉我图上左边的物品是什么吗？",
+      "source_paragraph_index": 661
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "left"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "左作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 664
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "left_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "右命名",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您能告诉我图上右边的物品是什么吗？",
+      "source_paragraph_index": 667
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "protocol_namefix",
+        "side": "right"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "右作用",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "请告诉我它有什么作用或特点？",
+      "source_paragraph_index": 669
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "right_function_cue"
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 5,
+     "response_role": "关系识别",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "这两个东西之间有什么关系呢？",
+      "source_paragraph_index": 672
+     },
+     "branches": {
+      "full": {
+       "kind": "advance_silent"
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "bank_field",
+        "field": "relation_cue"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "ME_窗户",
+   "task_type": "多要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "情境",
+     "max_recordings": 2,
+     "question": {
+      "source": "verbatim",
+      "text": "您好，您看看这张图片，这是哪个位置？",
+      "source_paragraph_index": 679
+     },
+     "branches": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "很好，您观察得很准确。",
+        "source_paragraph_index": 680
+       }
+      },
+      "wrong": {
+       "kind": "speak_then_rerecord",
+       "speech": {
+        "source": "verbatim",
+        "text": "您再看看后面透明的玻璃格子，还有两边挂着的布，您再想想这是哪里？",
+        "source_paragraph_index": 681
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "您看这里有玻璃和窗台，所以这里应该是窗户边。",
+        "source_paragraph_index": 682
+       }
+      }
+     },
+     "after_rerecord": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "很好，您观察得很准确。",
+        "source_paragraph_index": 680
+       }
+      },
+      "otherwise": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "您看这里有玻璃和窗台，所以这里应该是窗户边。",
+        "source_paragraph_index": 682
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "事物",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您好，您再仔细看看，图片里挂在窗户两边的是什么？",
+      "source_paragraph_index": 684
+     },
+     "branches": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "非常好，窗户两边挂着漂亮的窗帘。",
+        "source_paragraph_index": 687
+       }
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片里窗户两边挂着带有花纹的窗帘。",
+        "source_paragraph_index": 686
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片里窗户两边挂着带有花纹的窗帘。",
+        "source_paragraph_index": 686
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "人物",
+     "max_recordings": 2,
+     "question": {
+      "source": "verbatim",
+      "text": "您好，您看看图片正中间的窗台上放着什么？",
+      "source_paragraph_index": 689
+     },
+     "branches": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片正中间的窗台上放着一个花瓶，里面插着一朵花。",
+        "source_paragraph_index": 692
+       }
+      },
+      "wrong": {
+       "kind": "speak_then_rerecord",
+       "speech": {
+        "source": "verbatim",
+        "text": "您看看这个带花纹的罐子，还有里面长着叶子和花瓣的是什么？",
+        "source_paragraph_index": 691
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片正中间的窗台上放着一个花瓶，里面插着一朵花。",
+        "source_paragraph_index": 692
+       }
+      },
+      "partial": {
+       "kind": "speak_then_rerecord",
+       "speech": {
+        "source": "verbatim",
+        "text": "对，很好，这里有花（或花瓶）。您再看看，花是插在哪里的（或花瓶里插着什么）？",
+        "source_paragraph_index": 690
+       }
+      }
+     },
+     "after_rerecord": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片正中间的窗台上放着一个花瓶，里面插着一朵花。",
+        "source_paragraph_index": 692
+       }
+      },
+      "otherwise": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片正中间的窗台上放着一个花瓶，里面插着一朵花。",
+        "source_paragraph_index": 692
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "动作",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您好，您看看两边的窗帘现在是什么样的状态？",
+      "source_paragraph_index": 694
+     },
+     "branches": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "很好，窗帘是被拉开挂在两边的。",
+        "source_paragraph_index": 695
+       }
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "两边的窗帘被拉开了，分别挂在窗户的两侧。",
+        "source_paragraph_index": 697
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "两边的窗帘被拉开了，分别挂在窗户的两侧。",
+        "source_paragraph_index": 697
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "item_id": "ME_书房",
+   "task_type": "多要素",
+   "turns": [
+    {
+     "turn_seq": 1,
+     "response_role": "情境",
+     "max_recordings": 2,
+     "question": {
+      "source": "verbatim",
+      "text": "您好，您看看这张图片，这里像是什么地方？",
+      "source_paragraph_index": 705
+     },
+     "branches": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "很好，您观察得很准确。",
+        "source_paragraph_index": 706
+       }
+      },
+      "wrong": {
+       "kind": "speak_then_rerecord",
+       "speech": {
+        "source": "verbatim",
+        "text": "您再看看前面的书桌，上面还放着一台大电脑，您再想想这是哪里？",
+        "source_paragraph_index": 707
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "您看这里有书桌和电脑，所以这里应该是一间书房（或房间）。",
+        "source_paragraph_index": 708
+       }
+      }
+     },
+     "after_rerecord": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "很好，您观察得很准确。",
+        "source_paragraph_index": 706
+       }
+      },
+      "otherwise": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "您看这里有书桌和电脑，所以这里应该是一间书房（或房间）。",
+        "source_paragraph_index": 708
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 2,
+     "response_role": "事物",
+     "max_recordings": 2,
+     "question": {
+      "source": "verbatim",
+      "text": "您好，您再仔细看看，图片里有哪些主要的东西？",
+      "source_paragraph_index": 710
+     },
+     "branches": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "非常好，房间里有桌子，桌子上放着一台电脑。",
+        "source_paragraph_index": 713
+       }
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片里有一张书桌，桌上放着一台电脑，地上还有一个书包。",
+        "source_paragraph_index": 712
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片里有一张书桌，桌上放着一台电脑，地上还有一个书包。",
+        "source_paragraph_index": 712
+       }
+      },
+      "partial": {
+       "kind": "speak_then_rerecord",
+       "speech": {
+        "source": "verbatim",
+        "text": "非常好，图中有桌子。您再看看，桌子上放着什么机器，地上的桌腿边还有一个什么？",
+        "source_paragraph_index": 711
+       }
+      }
+     },
+     "after_rerecord": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "非常好，房间里有桌子，桌子上放着一台电脑。",
+        "source_paragraph_index": 713
+       }
+      },
+      "otherwise": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片里有一张书桌，桌上放着一台电脑，地上还有一个书包。",
+        "source_paragraph_index": 712
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 3,
+     "response_role": "人物",
+     "max_recordings": 2,
+     "question": {
+      "source": "verbatim",
+      "text": "您好，您看看图片中坐在电脑前的是谁？",
+      "source_paragraph_index": 715
+     },
+     "branches": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "对，很好，这里有一个正坐在桌前的学生。",
+        "source_paragraph_index": 716
+       }
+      },
+      "wrong": {
+       "kind": "speak_then_rerecord",
+       "speech": {
+        "source": "verbatim",
+        "text": "您看看椅子上坐着的是谁？",
+        "source_paragraph_index": 717
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片里电脑前坐着一个学生。",
+        "source_paragraph_index": 718
+       }
+      }
+     },
+     "after_rerecord": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "对，很好，这里有一个正坐在桌前的学生。",
+        "source_paragraph_index": 716
+       }
+      },
+      "otherwise": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "图片里电脑前坐着一个学生。",
+        "source_paragraph_index": 718
+       }
+      }
+     }
+    },
+    {
+     "turn_seq": 4,
+     "response_role": "动作",
+     "max_recordings": 1,
+     "question": {
+      "source": "verbatim",
+      "text": "您好，您看看图片里的这个人在做什么？",
+      "source_paragraph_index": 720
+     },
+     "branches": {
+      "full": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "很好，他正在专心地使用电脑。",
+        "source_paragraph_index": 722
+       }
+      },
+      "wrong": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "这个人正坐在椅子上，双手放在键盘上用电脑。",
+        "source_paragraph_index": 724
+       }
+      },
+      "silence": {
+       "kind": "speak_then_advance",
+       "speech": {
+        "source": "verbatim",
+        "text": "这个人正坐在椅子上，双手放在键盘上用电脑。",
+        "source_paragraph_index": 724
+       }
+      }
+     }
+    }
+   ]
+  }
+ ],
+ "structure_freezes": [
+  "分支闭集冻结：branches 键 ∈ {full, partial, wrong, silence}=引擎判分结果类别；partial 仅存在于题库 rubric 为多概念策略的多要素环节。",
+  "阶梯深度冻结：双要素每环节恰 1 次录音；多要素每环节至多 2 次录音，第 2 次录音后 full→成功反馈推进、其余（含沉默）→告知句推进。",
+  "双要素命中冻结为无口头反馈直接推进；未命中与沉默共用同一纠正/讲解句后推进（源稿只写「回答错误/不能回答」分支，沉默并入为结构冻结）。",
+  "双要素命名纠正句优先逐字取源稿该题专属句（verbatim 入包）；仅当专属句与协议 namefix 模板+题库目标词展开逐字一致、或差异恰为题库登记勘误（逐处另列冻结条目）时引用模板。作用/关系讲解句引用题库冻结字段（随题库勘误口径，勘误本身仍待书面批准），不在本包重复冻结字节。",
+  "多要素沉默分支冻结为告知句后推进（源稿沉默>10秒告知口径）。",
+  "DE_太阳+向日葵#3 命名纠正句引用协议模板展开：与源稿专属句的差异恰为题库登记勘误（right_word 花→向日葵），随题库勘误口径（勘误本身仍待书面批准）",
+  "ME_窗户#2(事物) 源稿无回答错误定向提示句，wrong 分支冻结为复用告知句后推进（不再二次录音）",
+  "ME_窗户#3(人物) 源稿无专属成功反馈句，full 分支冻结为复用告知句",
+  "ME_窗户#4(动作) 源稿无回答错误定向提示句，wrong 分支冻结为复用告知句后推进（不再二次录音）",
+  "ME_书房#2(事物) 源稿无回答错误定向提示句，wrong 分支冻结为复用告知句后推进（不再二次录音）",
+  "ME_书房#4(动作) 源稿无回答错误定向提示句，wrong 分支冻结为复用告知句后推进（不再二次录音）"
+ ],
+ "frozen_out_source_lines": [
+  {
+   "item_id": "ME_窗户",
+   "turn_seq": 2,
+   "source_paragraph_index": 685,
+   "reason": "单概念 rubric 下引擎不产出 partial 类别，源稿只回答分支无法进入类别驱动协议"
+  },
+  {
+   "item_id": "ME_窗户",
+   "turn_seq": 4,
+   "source_paragraph_index": 696,
+   "reason": "按完成条件词重合度冻结成功反馈选句，此句未入选"
+  },
+  {
+   "item_id": "ME_书房",
+   "turn_seq": 4,
+   "source_paragraph_index": 721,
+   "reason": "追问式反馈（句尾提问要求继续作答），类别驱动分支无法表达"
+  },
+  {
+   "item_id": "ME_书房",
+   "turn_seq": 4,
+   "source_paragraph_index": 723,
+   "reason": "按完成条件词重合度冻结成功反馈选句，此句未入选"
+  }
+ ],
+ "notes": [
+  "本数据包不含任何新写临床措辞：verbatim 句逐字取自源 docx（构建时强制子串断言），bank_field/protocol_namefix 引用既有冻结题库字段与协议模板。structure_freezes 为工程结构冻结清单，待钱凯/丁老师书面确认。",
+  "frozen_out_source_lines 是源稿中按具体关键词选反馈、类别驱动分支表达不了的句子清单（未丢弃，留待临床复核扩展协议）。",
+  "已知源稿勘误沿用题库 errata_fixed 口径：引用题库字段/模板展开的话术随题库勘误口径（勘误本身仍待钱凯/丁老师书面批准），本包不复制也不另立勘误。"
+ ]
+}

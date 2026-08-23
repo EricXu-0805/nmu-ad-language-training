@@ -235,7 +235,7 @@ export function parseSessionRuntimeState(
       || !nullableActor(row.endedBy)
       || !(row.endReason === null || boundedText(row.endReason, 500))
       || !nullableDateTime(row.updatedAt)) {
-    throw new Error("服务端场次运行态响应不符合严格契约");
+    throw new Error("服务端场次运行态响应与本系统版本不匹配，请刷新后重试");
   }
   const status = row.status as SessionRuntimeStatus;
   const revision = row.revision as number;

@@ -32,6 +32,8 @@ const STATUS = {
     server_owned: false,
     takeover_ready: false,
     current_command_kind: null,
+    position_item_id: null,
+    position_turn_seq: null,
     last_error_code: null,
   },
 };

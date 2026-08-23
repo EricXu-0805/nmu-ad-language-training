@@ -16,6 +16,7 @@ import {
   classifySpeechLevel,
   classifyStorage,
   formatReport,
+  describeSampleFailure,
   mapMicrophoneError,
   runAutoChecks,
   summarize,
@@ -98,6 +99,14 @@ test("permission denial maps to an actionable message", () => {
   assert.match(mapMicrophoneError({ name: "NotFoundError" }), /找不到麦克风/);
   assert.match(mapMicrophoneError({ name: "NotReadableError" }), /占用/);
   assert.match(mapMicrophoneError(new Error("weird")), /weird/);
+  // 采样中途失败同样要给中文说明，不能把英文异常名直接摆给现场人员。
+  assert.match(describeSampleFailure({ name: "NotAllowedError" }), /权限被拒/);
+  assert.doesNotMatch(describeSampleFailure({ name: "NotAllowedError" }), /NotAllowedError/);
+  assert.match(describeSampleFailure({ name: "NotFoundError" }), /找不到麦克风/);
+  assert.match(describeSampleFailure({ name: "NotReadableError" }), /占用/);
+  // 未知错误保留原文，但前面必须有中文说明。
+  assert.match(describeSampleFailure(new Error("weird")), /^采样失败/);
+  assert.match(describeSampleFailure(new Error("weird")), /weird/);
 });
 
 test("microphone check reports the track processing switches", async () => {

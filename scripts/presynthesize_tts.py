@@ -28,7 +28,8 @@ def collect_lines() -> list[str]:
     # 预合成缓存覆盖索引里的全部训练周,新周登记后重跑本脚本即可获得同等缓冲。
     for week in sorted(content.load_item_bank_index()):
         bank = content.load_item_bank_for_week(week)
-        lines |= content.tts_allowlist(bank, script, proto)
+        package = content.load_autopilot_interaction_package(week, protocol=proto)
+        lines |= content.tts_allowlist(bank, script, proto, package)
     return sorted(lines)
 
 

@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import content, runtime  # noqa: E402
+from app import autopilot_positions, content, runtime  # noqa: E402
 
 
 CONTENT_TEAM = "PI / 内容组（工程侧不得代笔）"
@@ -27,33 +27,51 @@ ENGINEERING = "工程侧"
 
 
 
+def _interaction_package_or_none(
+        bank: content.ItemBank, week_no: int) -> dict | None:
+    try:
+        protocol = content.load_autopilot_protocol(
+            content.CONTENT_DIR / "autopilot_protocol_v1.json")
+        package = content.load_autopilot_interaction_package(
+            week_no, protocol=protocol)
+    except content.FrozenContentUnavailable:
+        return None
+    if content.validate_autopilot_interaction_package(package, bank, protocol):
+        return None
+    return package
+
+
 def delivery_gap(bank: content.ItemBank) -> dict[str, object]:
     """算出 README/DEPLOY 里那个「交付缺口」总数，别让它只活在措辞里。
 
     口径：**计划内跑不动的题位 + 源协议里还没结构化的题位**。
-    "跑不动"的判据与自动驾驶实际用的那一条完全相同——冻结自动协议目前只覆盖
-    单要素/命名，其余题位（双要素命名缺自动协议、开放回答缺 rubric）在开场时
-    一律 fail-closed。
+    "跑不动"的判据与自动驾驶实际用的那一条完全相同——直接问
+    ``autopilot_positions.readiness_gap``（含本周交互数据包装载与绑定校验），
+    不再用「单要素/命名」的措辞近似。开场准入用的是同一条判据。
 
     这个数以前只写在六份文档的正文里，靠人手同步；任何一次内容交付都可能让
     它悄悄失真。现在它由题库自己算出来。
     """
     readiness = content.content_readiness(bank)
     unstructured = int(readiness["source_unstructured_position_count"])
-    plan = runtime.build_session_plan(bank, 2, "正式训练")
+    week_no = bank.meta.get("training_week_no")
+    if not isinstance(week_no, int) or isinstance(week_no, bool) \
+            or not 2 <= week_no <= 8:
+        week_no = 2
+    plan = runtime.build_session_plan(bank, week_no, "正式训练")
+    package = _interaction_package_or_none(bank, week_no)
+    positions = autopilot_positions.plan_positions(plan)
     runnable = 0
-    in_plan = 0
     breakdown: dict[str, int] = {}
-    for item in plan.items:
-        task_type = getattr(item.task_type, "value", item.task_type)
-        for turn in item.turns:
-            role = getattr(turn.response_role, "value", turn.response_role)
-            in_plan += 1
-            if task_type == "单要素" and role == "命名":
-                runnable += 1
-            else:
-                breakdown[f"{task_type}:{role}"] = (
-                    breakdown.get(f"{task_type}:{role}", 0) + 1)
+    for position in positions:
+        gap = autopilot_positions.readiness_gap(
+            bank, position, interaction_package=package)
+        if gap is None:
+            runnable += 1
+        else:
+            key = f"{position.task_type}:{position.response_role}:{gap.code}"
+            breakdown[key] = breakdown.get(key, 0) + 1
+    in_plan = len(positions)
     return {
         "in_plan_positions": in_plan,
         "runnable_by_frozen_automation": runnable,

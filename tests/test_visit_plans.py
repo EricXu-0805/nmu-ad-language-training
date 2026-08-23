@@ -10,7 +10,7 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -302,9 +302,13 @@ LEGACY_BANK_VERSION = "wk2-v1-20260707"
 # 是账本哈希算法的字节兼容，不是把测试钉在 2026-07 的题库内容上。
 LEGACY_BANK_DIGEST = content.item_bank_definition_digest(
     content.load_item_bank_for_week(2))
-LEGACY_PROTOCOL_VERSION = "autopilot-v1-20260729"
-LEGACY_PROTOCOL_DIGEST = (
-    "51fe62990cc0bc6934b4fbe7c8d902369c0b9fd7e092136572da3fa375b989d9")
+# 协议对同理：这两个值只出现在种子行的内容绑定列上，不进任何冻结请求哈希
+# （_legacy_mutation_hash 载荷可证），所以必须跟随当前协议——2026-07 的字面值
+# 只是恰好当时协议未升版。真正不许动的字面收据是下面的 LEGACY_*_HASH。
+LEGACY_PROTOCOL_VERSION = "autopilot-v2-20260821"
+LEGACY_PROTOCOL_DIGEST = content.autopilot_protocol_definition_digest(
+    content.load_autopilot_protocol(
+        content.CONTENT_DIR / "autopilot_protocol_v1.json"))
 LEGACY_REPEAT_VERSION = "repeat-intent-v1-20260730-proposal"
 LEGACY_REPEAT_DIGEST = (
     "51e8ce30d6273df52fc25011ed00ebc5fba15b30c9ed98b4ccc146b72e05484f")
@@ -860,7 +864,9 @@ def test_demo_profile_real_http_start_reaches_the_first_tts(
     assert started.status_code == 200, started.text
     session_id = started.json()["session_id"]
 
-    checked_at = datetime.now()
+    # 就绪闸用 naive-UTC 比较（provider_readiness._utcnow）；这里必须同刻度，
+    # 否则机器时区在 UTC 以西时 expires_at 恒在过去，测试假红（2026-08-22 实踩）。
+    checked_at = datetime.now(timezone.utc).replace(tzinfo=None)
     readiness_config = provider_readiness.capture_configuration()
     monkeypatch.setattr(
         provider_readiness,

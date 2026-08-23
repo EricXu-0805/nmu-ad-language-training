@@ -18,6 +18,9 @@ from urllib.parse import unquote
 class AccessKind(str, Enum):
     PUBLIC = "public"
     DEVICE_PAIR = "device_pair"
+    # 自带受试者绑定令牌的自动跟场口。不是 PUBLIC:响应含设备能力凭据,必须
+    # 走非公开缓存策略;也不是 DEVICE:令牌只能换场次能力,不是任何路由凭据。
+    DEVICE_ATTACH = "device_attach"
     DEVICE = "device"
     DEVICE_LIVE_WRITE = "device_live_write"
     ACCOUNT = "account"
@@ -78,6 +81,9 @@ _ROUTE_RULES = (
 
     # PIN 只能进入这个配对口；配对后 PIN 不再是设备 API 凭据。
     _route({"POST"}, r"/device/pair", AccessKind.DEVICE_PAIR, label="配对受试者端设备"),
+    # 绑定令牌只能进入这个跟场口；令牌校验在处理器内完成,与配对共用失败限速。
+    _route({"POST"}, r"/device/attach", AccessKind.DEVICE_ATTACH,
+           label="按受试者绑定自动跟场"),
 
     # 老人端设备最小权限。具名账号可以进入这些双用途路由的认证层，但这
     # 不是场次对象授权：处理器仍须按 trainer owner / admin / 终态 steward
@@ -230,6 +236,9 @@ _ROUTE_RULES = (
            roles=DATA_GOVERNANCE_ROLES, label="读取研究撤回回执"),
     _route({"PATCH"}, r"/patients/[^/]+/cloud-processing", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="更新受试者云处理授权"),
+    # 档案编辑只覆盖非治理字段;撤回/云授权/模拟身份各有专属流程,处理器内再拒。
+    _route({"PATCH"}, r"/patients/[^/]+", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="编辑受试者档案"),
     _route({"POST"}, r"/patients/[^/]+/scales", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="录入临床量表"),
     # 量表电子记录（原型道）：定义含逐题词，读也必须具名；写只属于施测角色。

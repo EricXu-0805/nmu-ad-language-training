@@ -119,9 +119,33 @@ def _frozen_attempt_context(
     except ValueError as exc:
         raise AutopilotOrchestrationError(
             "autopilot_attempt_plan_mismatch", "录音命令不属于冻结计划") from exc
-    gap = autopilot_positions.readiness_gap(bank, position)
+    interaction_package: dict | None = None
+    if position.task_type in {"双要素", "多要素"}:
+        try:
+            interaction_package = autopilot_service._load_interaction_package(  # noqa: SLF001
+                train_session, bank, protocol)
+        except autopilot_service.AutopilotServiceError as exc:
+            raise AutopilotOrchestrationError(exc.code, exc.message) from exc
+    gap = autopilot_positions.readiness_gap(
+        bank, position, interaction_package=interaction_package)
     if gap is not None:
         _fail(gap.code, gap.detail)
+    if position.task_type in {"双要素", "多要素"}:
+        # Interaction turns: recording #1 is (L0,a1); recording #2 exists only
+        # when the frozen turn carries a rerecord branch, is (L1,a2), and its
+        # cue_type is the closed package-retry literal — bank cues never apply.
+        if record.prompt_level == 0:
+            return position.response_role, None
+        if record.prompt_level != 1:
+            _fail("autopilot_attempt_plan_mismatch", "交互环节录音提示等级非法")
+        turn = autopilot_positions.interaction_turn(
+            interaction_package, position)
+        if not isinstance(turn, dict) or turn.get("max_recordings") != 2:
+            _fail(
+                "autopilot_attempt_plan_mismatch",
+                "该交互环节没有第二次录音",
+            )
+        return position.response_role, autopilot_service.INTERACTION_CUE_TYPE
     if (position.task_type != "单要素"
             or position.response_role != "命名"):
         _fail("autopilot_attempt_plan_mismatch", "录音命令与 P0a 冻结环节不一致")
@@ -254,7 +278,7 @@ def derive_authoritative_attempt_input(
         autopilot_service._utc_naive(now)  # noqa: SLF001 - sibling domain clock
         if now is not None else autopilot_service._utc_now_naive()  # noqa: SLF001
     )
-    bank = content.load_item_bank_for_week(2)
+    bank = autopilot_service._session_week_bank(db, session_id)  # noqa: SLF001
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     _state, record = _lock_pending_command(db, session_id=session_id)
@@ -284,10 +308,20 @@ def derive_authoritative_attempt_input(
     except autopilot_ledger.AutopilotProofError as exc:
         raise AutopilotOrchestrationError(
             "autopilot_attempt_capture_invalid", "P0a attempt 采集证据链不完整") from exc
-    if (gate.train_session.is_simulation is not True
-            or gate.train_session.data_classification != "simulation"
-            or gate.patient.is_simulation_subject is not True):
-        _fail("autopilot_attempt_boundary_invalid", "attempt orchestration 仅允许 P0a 模拟数据")
+    classification_pair = (
+        gate.train_session.is_simulation,
+        gate.train_session.data_classification,
+    )
+    if classification_pair == (True, "simulation"):
+        subject_consistent = gate.patient.is_simulation_subject is True
+    elif classification_pair == (False, "research"):
+        subject_consistent = gate.patient.is_simulation_subject is not True
+    else:
+        subject_consistent = False
+    if not subject_consistent:
+        _fail(
+            "autopilot_attempt_boundary_invalid",
+            "attempt orchestration 场次分类与受试者身份不一致")
     if proof.attempt_seq != proof.prompt_level + 1:
         _fail("autopilot_attempt_sequence_invalid", "capture attempt_seq 与提示序列不单调")
 
@@ -317,7 +351,7 @@ def derive_authoritative_attempt_input(
             existing.cue_type == derived.cue_type,
             existing.duration_seconds == derived.duration_seconds,
             existing.attempt_seq == proof.attempt_seq,
-            existing.is_simulation is True,
+            existing.is_simulation == gate.train_session.is_simulation,
         )
         if not all(exact):
             _fail("autopilot_attempt_existing_conflict", "已有 attempt 与 capture proof 不一致")
@@ -788,6 +822,9 @@ def verify_legacy_pre_repeat_recovery(
         autopilot_service._utc_naive(now)  # noqa: SLF001 - sibling domain clock
         if now is not None else autopilot_service._utc_now_naive()  # noqa: SLF001
     )
+    # 旧协议恢复通道有意保持仅模拟：legacy_pre_repeat 标记只由 d3 迁移写入，
+    # 真实研究场次结构上不存在这种前协议采集；ENABLE_AUTOPILOT_REAL_SESSIONS
+    # 永远不为这条路径开门。
     if not autopilot_service.p0a_feature_enabled():
         _legacy_fail("P0a 未显式启用，旧协议采集不进入恢复通道")
     state, record = _lock_pending_command(db, session_id=session_id)
@@ -839,7 +876,8 @@ def verify_legacy_pre_repeat_recovery(
     # Frozen content identity is recomputed from the deployed definitions and
     # compared to every stored binding; comparing the stored rows only to each
     # other would accept a chain frozen against content that no longer exists.
-    bank = content.load_item_bank_for_week(2)
+    bank = autopilot_service._session_week_bank(  # noqa: SLF001
+        db, train_session.session_id)
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     live_content = {
@@ -1511,7 +1549,10 @@ def submit(session_id: str, worker: Callable[[str], object]) -> bool:
     Database attempt/state leases remain authoritative across processes.  This map
     only prevents needless duplicate provider work in one API process.
     """
-    if not autopilot_service.p0a_feature_enabled():
+    # 任一通道开着都可能有需要处理的 attempt；per-session 的分类判定在
+    # worker 内部的 _require_gate 里 fail-closed，这里只挡两通道全关的部署。
+    if (not autopilot_service.p0a_feature_enabled()
+            and not autopilot_service.real_sessions_enabled()):
         return False
     with _INFLIGHT_LOCK:
         existing = _INFLIGHT.get(session_id)

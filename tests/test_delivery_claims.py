@@ -21,7 +21,10 @@ def test_delivery_docs_keep_research_autopilot_scope_fail_closed():
     regression = _read("项目综合审计_20260717/交付级回归记录_20260719.md")
     security = _read("项目综合审计_20260717/安全审查_20260719.md")
 
-    assert "正式研究级 autopilot scope 尚未实现" in readme
+    # 2026-08-21 真实研究场次通道落地后,README 的红线改为「双通道各自显式开启、
+    # 不得放宽」;两份 2026-07-19 的审计文档是历史快照,保留当时的表述。
+    assert "开启真实通道的唯一途径是显式开关加全部前置" in readme
+    assert "ENABLE_AUTOPILOT_REAL_SESSIONS" in readme
     assert "不得删除 simulation guard" in deploy
     assert "当前仅 P0a 模拟 scope，不得移除 simulation guard 放行" in regression
     assert "当前唯一的 autopilot 服务范围是 P0a 模拟切片" in security

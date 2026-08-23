@@ -99,7 +99,7 @@ def _seed(
         phase_type="正式训练", event_line="正式训练",
         item_bank_version_id="wk2-v1-20260707",
         item_bank_definition_digest="c" * 64,
-        autopilot_protocol_version_id="autopilot-v1-20260729",
+        autopilot_protocol_version_id="autopilot-v2-20260821",
         autopilot_protocol_definition_digest="e" * 64,
         repeat_protocol_version_id=repeat_intent.ACTIVE_REPEAT_INTENT_VERSION_ID,
         repeat_protocol_definition_digest=(
@@ -855,7 +855,7 @@ def _seed_repeat_capture(s, *, raw_audio_id="a_repeat"):
     binding = dict(
         item_bank_version_id="wk2-v1-20260707",
         item_bank_definition_digest="c" * 64,
-        autopilot_protocol_version_id="autopilot-v1-20260729",
+        autopilot_protocol_version_id="autopilot-v2-20260821",
         autopilot_protocol_definition_digest="e" * 64,
         response_role="命名",
         repeat_protocol_version_id=REPEAT_VERSION,

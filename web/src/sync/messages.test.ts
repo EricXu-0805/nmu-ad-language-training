@@ -116,3 +116,20 @@ test("patientRec rejects extra, partial, contradictory or unknown failure fields
   const { failureId: _failureId, ...withoutId } = patientRecFailure;
   assert.equal(parseSyncMsg(withoutId), null);
 });
+
+test("P0-4 回归:服务端诊断键 sourceWseq 会让 session 槽整槽被拒——console-state 必须在服务端剥掉它", () => {
+  // 2026-08-21 审计 P0-4 的真实存储载荷:录音入库、收据在账本里,
+  // 但 console-state 原样返回带 sourceWseq 的 session_json,这里解析为 null,
+  // useAudioSaved 因此永远不去拉收据账本。服务端读边界(_console_live_projection)
+  // 剥掉诊断键之后,同一载荷必须能解析成功。
+  const stored = {
+    sessionId: "s_q1L5S5INYnz6IXzVO_h6W-xy", weekNo: 2, eventLine: "正式训练",
+    mode: "task", itemBankVersionId: "wk2-v1-20260707",
+    wseq: 1787249821167, sourceWseq: 1787249791385, paused: true,
+  };
+  assert.equal(parseSyncPayload("session", stored), null);
+  const { sourceWseq: _diagnostic, ...projected } = stored;
+  const parsed = parseSyncPayload("session", projected);
+  assert.equal(parsed?.sessionId, stored.sessionId);
+  assert.equal(parsed?.paused, true);
+});

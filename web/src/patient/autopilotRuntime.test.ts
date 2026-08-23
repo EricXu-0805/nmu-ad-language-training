@@ -80,3 +80,39 @@ test("external_runtime_released 不覆盖已有暂停与完成判定", async () 
   } as const;
   assert.equal(autopilotRuntimeReducer(completed, { type: "external_runtime_released" }), completed);
 });
+
+test("交互静默推进:收麦后服务器直接下发下一题问句,跨题 record→tts 是合法接续", async () => {
+  const { autopilotRuntimeReducer } = await import("./autopilotRuntime.ts");
+  const record = command({
+    kind: "record",
+    command_key: "cmd-runtime-rec-0001",
+    command_seq: 4,
+    payload: {
+      raw_audio_id: "raw-runtime-0001",
+      turn_ref: "itm-0001#1",
+      max_duration_seconds: 15,
+      contains_direct_identifier: false,
+      presentation_speech_key: "wk2.01.question",
+      presentation_speech_text: "问题",
+      presentation_purpose: "question",
+    },
+  } as Partial<NextCommandProjection>);
+  const waiting = {
+    phase: "waiting_server_after_record",
+    command: record,
+    last_device_event_seq: 5,
+    last_ack: null,
+    pause_reason: null,
+  } as const;
+  const nextQuestion = command({
+    command_key: "cmd-runtime-next-q-0001",
+    command_seq: 5,
+    item_ref: "itm-0002",
+    turn_seq: 1,
+  });
+  const reduced = autopilotRuntimeReducer(
+    waiting, { type: "server_command", command: nextQuestion });
+  assert.equal(reduced.phase, "tts_ready");
+  assert.equal(reduced.command?.command_key, "cmd-runtime-next-q-0001");
+  assert.equal(reduced.pause_reason, null);
+});

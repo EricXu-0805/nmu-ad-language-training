@@ -18,6 +18,12 @@ import {
 import { researchEligibilityIssueText } from "./researchEligibility";
 import { ScaleDrawer } from "./ScaleDrawer";
 import { SubjectWithdrawalPanel } from "./SubjectWithdrawalPanel";
+import { PatientEditDrawer } from "./PatientEditDrawer";
+import {
+  archivedRowReason,
+  patientIdInvalid,
+  presentRegistryRows,
+} from "./registryPresentation";
 import {
   applyWithdrawalReceiptToRegistry,
   createSubjectRegistryRefreshGate,
@@ -52,6 +58,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
   const [scaleFor, setScaleFor] = useState<string | null>(null);
   const [classificationFilter, setClassificationFilter] = useState<DataClassification>("research");
   const [withdrawalFor, setWithdrawalFor] = useState<PatientSummary | null>(null);
+  const [editFor, setEditFor] = useState<PatientSummary | null>(null);
   const [withdrawalReceipt, setWithdrawalReceipt] = useState<PatientWithdrawalReceipt | null>(null);
   const [refreshGate] = useState(() => createSubjectRegistryRefreshGate());
   const [flowMode, setFlowMode] = useState<PrepFlowMode>(loadPrepFlowMode);
@@ -150,6 +157,105 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
     );
   }
 
+  const registryView = presentRegistryRows(visibleRows);
+
+  const renderRegistryRow = (r: PatientSummary) => {
+    const classification = patientDataClassification(r);
+    const archived = Boolean(r.withdrawal_status) || patientIdInvalid(r);
+    const cannotPlan = Boolean(r.withdrawal_status) || classification === "legacy_unknown" || !canManagePlans;
+    const idInvalid = patientIdInvalid(r);
+    return (
+      <div className="registry-row" role="row" key={r.patient_id}>
+        <span className="col" style={{ gap: 4 }} role="cell">
+          <span className="registry-cell-label">研究编号</span>
+          <strong className="mono">{r.patient_id}</strong>
+          <DataBoundaryBadge classification={classification} entity="patient" />
+          {r.pairing_code && (
+            <span className="muted" title="老人端一次输入这位老人的专属配对码，之后每次开场自动连接">
+              配对码 <strong className="mono">{r.pairing_code}</strong>
+            </span>
+          )}
+        </span>
+        <span role="cell">
+          <span className="registry-cell-label">认知障碍程度</span>
+          {r.dementia_severity || <span className="muted">未填</span>}
+        </span>
+        <span role="cell">
+          <span className="registry-cell-label">普通话</span>
+          {triLabel(r.mandarin_eligible)}
+        </span>
+        <span role="cell" className="col" style={{ gap: 4 }}>
+          <span className="registry-cell-label">授权与准入</span>
+          {recordingLabel(r.recording_allowed)}
+          {eligibilityLabel(r, classification)}
+          {r.withdrawal_status && <StatusPill tone="danger" size="sm">已撤回</StatusPill>}
+          {r.withdrawal_status && r.withdrawal_reason_code && (
+            <span className="muted">
+              撤回原因：{WITHDRAWAL_REASON_LABELS[r.withdrawal_reason_code]}
+              {r.withdrawal_occurred_at ? ` · ${r.withdrawal_occurred_at.slice(0, 10)}` : ""}
+            </span>
+          )}
+          {r.withdrawal_status && !r.withdrawal_event_id && (
+            <span className="muted">历史撤回记录待核对，暂不可操作</span>
+          )}
+        </span>
+        <span role="cell">
+          <span className="registry-cell-label">场次数</span>
+          {r.session_count}{r.last_training_date ? ` · 最近 ${r.last_training_date}` : ""}
+        </span>
+        <span role="cell" className="registry-actions-cell">
+          <span className="registry-cell-label">操作</span>
+          <Button
+            title={!canManagePlans ? "当前账号可只读核对协议状态与历史未验证记录" : undefined}
+            onClick={() => setScaleFor(r.patient_id)}>量表就绪状态</Button>
+            {!r.withdrawal_status && canManagePlans && (
+              <Button onClick={() => setEditFor(r)}>编辑档案</Button>
+            )}
+            {!r.is_simulation_subject && !r.withdrawal_status && canRegisterWithdrawal && (
+              <Button variant="danger" onClick={() => {
+                setWithdrawalReceipt(null);
+                setWithdrawalFor(r);
+              }}>登记研究撤回</Button>
+            )}
+            {!archived && (
+              <Button disabled={cannotPlan || idInvalid}
+                onClick={() => { setPlanPatientId(r.patient_id); setMode("plan"); }}>
+                {classification === "simulation" ? "安排模拟演练" : "安排训练"}
+              </Button>
+            )}
+            {archived && (
+              <span className="muted" style={{ flexBasis: "100%" }}>
+                {idInvalid && !r.withdrawal_status
+                  ? "编号含中文或特殊字符，训练流程不接受——点「编辑档案」把编号改成字母数字（如 NMU-001）即可继续用"
+                  : archivedRowReason(r)}
+              </span>
+            )}
+            {!archived && (cannotPlan || idInvalid) && (
+              <span className="muted" style={{ flexBasis: "100%" }}>
+                {classification === "legacy_unknown" ? "档案分类未核对，暂不能安排训练"
+                  : "当前账号只能查看，不能安排训练"}
+              </span>
+            )}
+            {!archived && flowMode === "quickDrill" && quickDrillEnabled && !idInvalid
+              && classification === "simulation" && !r.withdrawal_status && (
+              <Button variant="primary" disabled={quickDrillBusy !== null}
+                title="自动接着上次的进度开始"
+                onClick={() => { void startNextTask(r.patient_id, true); }}>
+                {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
+              </Button>
+            )}
+            {!archived && quickDrillEnabled && !idInvalid && classification === "research" && !r.withdrawal_status && (
+              <Button variant="primary" disabled={quickDrillBusy !== null}
+                title="自动接着上次的进度开始；待审核的安排仍需人工审核"
+                onClick={() => { void startNextTask(r.patient_id, false); }}>
+                {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
+              </Button>
+            )}
+        </span>
+      </div>
+    );
+  };
+
   return (
     <div className="page-shell page-shell--wide">
       <header className="page-header-block">
@@ -229,7 +335,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
         </Alert>
       )}
 
-      {rows && visibleRows.length > 0 && (
+      {rows && registryView.active.length > 0 && (
         <div className="registry-table" role="table" aria-label="受试者登记表">
           <div className="registry-row registry-head" role="row">
             <span role="columnheader">研究编号</span>
@@ -239,91 +345,48 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
             <span role="columnheader">场次数</span>
             <span role="columnheader">操作</span>
           </div>
-          {visibleRows.map((r) => {
-            const classification = patientDataClassification(r);
-            const cannotPlan = Boolean(r.withdrawal_status) || classification === "legacy_unknown" || !canManagePlans;
-            const idInvalid = !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(r.patient_id);
-            return (
-            <div className="registry-row" role="row" key={r.patient_id}>
-              <span className="col" style={{ gap: 4 }} role="cell">
-                <span className="registry-cell-label">研究编号</span>
-                <strong className="mono">{r.patient_id}</strong>
-                <DataBoundaryBadge classification={classification} entity="patient" />
-              </span>
-              <span role="cell">
-                <span className="registry-cell-label">认知障碍程度</span>
-                {r.dementia_severity || <span className="muted">未填</span>}
-              </span>
-              <span role="cell">
-                <span className="registry-cell-label">普通话</span>
-                {triLabel(r.mandarin_eligible)}
-              </span>
-              <span role="cell" className="col" style={{ gap: 4 }}>
-                <span className="registry-cell-label">授权与准入</span>
-                {recordingLabel(r.recording_allowed)}
-                {eligibilityLabel(r, classification)}
-                {r.withdrawal_status && <StatusPill tone="danger" size="sm">已撤回</StatusPill>}
-                {r.withdrawal_status && r.withdrawal_reason_code && (
-                  <span className="muted">
-                    撤回原因：{WITHDRAWAL_REASON_LABELS[r.withdrawal_reason_code]}
-                    {r.withdrawal_occurred_at ? ` · ${r.withdrawal_occurred_at.slice(0, 10)}` : ""}
-                  </span>
-                )}
-                {r.withdrawal_status && !r.withdrawal_event_id && (
-                  <span className="muted">历史撤回记录待核对，暂不可操作</span>
-                )}
-              </span>
-              <span role="cell">
-                <span className="registry-cell-label">场次数</span>
-                {r.session_count}{r.last_training_date ? ` · 最近 ${r.last_training_date}` : ""}
-              </span>
-              <span role="cell" className="registry-actions-cell">
-                <span className="registry-cell-label">操作</span>
-                <Button
-                  title={!canManagePlans ? "当前账号可只读核对协议状态与历史未验证记录" : undefined}
-                  onClick={() => setScaleFor(r.patient_id)}>量表就绪状态</Button>
-                  {!r.is_simulation_subject && !r.withdrawal_status && canRegisterWithdrawal && (
-                    <Button variant="danger" onClick={() => {
-                      setWithdrawalReceipt(null);
-                      setWithdrawalFor(r);
-                    }}>登记研究撤回</Button>
-                  )}
-                  <Button disabled={cannotPlan || idInvalid}
-                    onClick={() => { setPlanPatientId(r.patient_id); setMode("plan"); }}>
-                    {classification === "simulation" ? "安排模拟演练" : "安排训练"}
-                  </Button>
-                  {(cannotPlan || idInvalid) && (
-                    <span className="muted" style={{ flexBasis: "100%" }}>
-                      {idInvalid ? "这个编号含中文或特殊字符，训练流程不接受——请用字母数字编号（如 NMU-001）重新登记一份档案"
-                        : r.withdrawal_status ? "已撤回，不能再安排训练"
-                          : classification === "legacy_unknown" ? "档案分类未核对，暂不能安排训练"
-                            : "当前账号只能查看，不能安排训练"}
-                    </span>
-                  )}
-                  {flowMode === "quickDrill" && quickDrillEnabled && !idInvalid
-                    && classification === "simulation" && !r.withdrawal_status && (
-                    <Button variant="primary" disabled={quickDrillBusy !== null}
-                      title="自动接着上次的进度开始"
-                      onClick={() => { void startNextTask(r.patient_id, true); }}>
-                      {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
-                    </Button>
-                  )}
-                  {quickDrillEnabled && !idInvalid && classification === "research" && !r.withdrawal_status && (
-                    <Button variant="primary" disabled={quickDrillBusy !== null}
-                      title="自动接着上次的进度开始；待审核的安排仍需人工审核"
-                      onClick={() => { void startNextTask(r.patient_id, false); }}>
-                      {quickDrillBusy === r.patient_id ? "正在开场…" : "开始下一项任务"}
-                    </Button>
-                  )}
-              </span>
-            </div>
-            );
-          })}
+          {registryView.active.map(renderRegistryRow)}
         </div>
       )}
+      {rows && visibleRows.length > 0 && registryView.active.length === 0 && (
+        <Alert tone="info" title="本分区没有可训练的档案">
+          已撤回或编号不合规的档案收在下方「已归档 / 不可训练」里。
+        </Alert>
+      )}
+
+      {rows && registryView.archived.length > 0 && (
+        <details className="form-section" style={{ padding: "var(--sp-3) var(--sp-4)" }}>
+          <summary style={{ cursor: "pointer", minHeight: 44, display: "flex", alignItems: "center", gap: "var(--sp-2)" }}>
+            <strong>已归档 / 不可训练（{registryView.archived.length}）</strong>
+            <span className="muted">已撤回或编号不合规的档案，默认收起</span>
+          </summary>
+          <div className="registry-table" role="table" aria-label="已归档受试者"
+            style={{ marginTop: "var(--sp-3)" }}>
+            <div className="registry-row registry-head" role="row">
+              <span role="columnheader">研究编号</span>
+              <span role="columnheader">认知障碍程度</span>
+              <span role="columnheader">普通话</span>
+              <span role="columnheader">授权与准入</span>
+              <span role="columnheader">场次数</span>
+              <span role="columnheader">操作</span>
+            </div>
+            {registryView.archived.map(renderRegistryRow)}
+          </div>
+        </details>
+      )}
+
       {!rows && !err && <StatusPill tone="muted">正在加载登记表…</StatusPill>}
 
       {scaleFor && <ScaleDrawer patientId={scaleFor} open onClose={() => setScaleFor(null)} />}
+      {editFor && (
+        <PatientEditDrawer patientId={editFor.patient_id}
+          sessionCount={editFor.session_count}
+          onClose={() => setEditFor(null)}
+          onSaved={() => {
+            setEditFor(null);
+            setNonce((value) => value + 1);
+          }} />
+      )}
       {actorRole === "admin" && <WithdrawnAudioGovernancePanel />}
       {withdrawalFor && (
         <SubjectWithdrawalPanel patient={withdrawalFor}
@@ -361,8 +424,8 @@ function eligibilityLabel(row: PatientSummary, classification: DataClassificatio
   if (classification === "simulation") return <StatusPill tone="warn" size="sm">不进入真实研究准入</StatusPill>;
   if (classification === "legacy_unknown") return <StatusPill tone="danger" size="sm">分类未知 · 禁止开场</StatusPill>;
   if (row.research_eligible === true) {
-    return <span title="仅指本人资料已核对完毕">
-      <StatusPill tone="ok" size="sm">准入已核对</StatusPill>
+    return <span title="仅指本人资料已核对，不代表研究已正式放行">
+      <StatusPill tone="ok" size="sm">本人资料已核对</StatusPill>
     </span>;
   }
   if (row.research_eligible === false) {

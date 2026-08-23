@@ -295,7 +295,7 @@ export function AnalysisScreen() {
       {qualityClassification !== null
         && (currentQualityState === null || currentQualityState.status === "loading") && (
         <section className="form-section" aria-label="AI 质量汇总加载状态">
-          <StatusPill role="status" tone="muted">正在加载当前分区 AI 质量 overall…</StatusPill>
+          <StatusPill role="status" tone="muted">正在加载当前分区 AI 质量总览…</StatusPill>
         </section>
       )}
       {currentQualityState?.status === "forbidden" && (
@@ -323,7 +323,7 @@ export function AnalysisScreen() {
             <summary>技术详情</summary>
             {qualityRetrySeconds > 0
               ? "服务器已要求暂缓质量查询；倒计时结束前不会重复请求，也不会沿用上一分区数据。"
-              : "服务器不可用或返回结果未通过 v2 聚合隐私契约；已拒绝显示，不会沿用上一分区数据。"}
+              : "服务器不可用，或返回的数据未通过隐私校验；已拒绝显示，不会沿用上一分区数据。"}
           </details>
         </Alert>
       )}
@@ -650,7 +650,7 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
                 <EvidenceStat label="技术失败" value={timeline.summary.technicalFailures} tone={timeline.summary.technicalFailures ? "danger" : "muted"} />
                 <EvidenceStat label="未完成" value={timeline.summary.incompleteAttempts} tone={timeline.summary.incompleteAttempts ? "warn" : "muted"} />
                 <EvidenceStat label="已关联来源" value={timeline.summary.sourceBoundTurns} />
-                <EvidenceStat label="人工真值" value={timeline.summary.lockedTruths} tone="ok" />
+                <EvidenceStat label="人工锁分" value={timeline.summary.lockedTruths} tone="ok" />
                 <EvidenceStat label="严重证据问题" value={timeline.summary.dangerIssues} tone={timeline.summary.dangerIssues ? "danger" : "ok"} />
                 <EvidenceStat label="待核查" value={timeline.summary.warningIssues} tone={timeline.summary.warningIssues ? "warn" : "muted"} />
               </div>
@@ -889,15 +889,15 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
               ? <StatusPill tone="primary" size="sm">来源记录 #{turn.source_attempt_id}</StatusPill>
               : <StatusPill tone="danger" size="sm">环节缺少来源记录</StatusPill>}
           {turn?.score_locked
-            ? <StatusPill tone="ok" size="sm">研究真值 {researchValue ?? "缺失"}</StatusPill>
-            : <StatusPill tone="warn" size="sm">研究真值未锁定</StatusPill>}
+            ? <StatusPill tone="ok" size="sm">研究评分 {researchValue ?? "缺失"}</StatusPill>
+            : <StatusPill tone="warn" size="sm">研究评分未锁定</StatusPill>}
         </div>
       </div>
       <EvidenceIssues issues={row.issues} />
 
       <div className="evidence-truth-panel">
         <div className="evidence-section-title">
-          <strong>人工研究真值</strong>
+          <strong>人工研究评分</strong>
           <StatusPill tone={turn?.score_locked ? "ok" : "warn"} size="sm">{turn?.score_locked ? "已锁定" : "未锁定"}</StatusPill>
         </div>
         {turn ? (
@@ -909,7 +909,7 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
             <EvidenceValue label="权威 ASR 原文" value={turn.asr_text ?? "缺失"} />
             <EvidenceValue label="人工确认文本" value={turn.confirmed_response_text ?? "未确认"} marker={corrected ? "已校正 ASR" : undefined} />
           </div>
-        ) : <p className="muted">尚未形成环节记录，因此没有可用的人工研究真值。</p>}
+        ) : <p className="muted">尚未形成环节记录，因此没有可用的人工研究评分。</p>}
         <p className={`evidence-comparison is-${row.comparison.state}`}>{row.comparison.message}</p>
         {confirmation && <ConfirmationRevisionHistory confirmation={confirmation} />}
       </div>
@@ -917,7 +917,7 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
       <div className="evidence-attempt-section">
         <div className="evidence-section-title">
           <strong>AI 逐次处理证据</strong>
-          <span className="muted">{row.attempts.length} 次 · 不是研究真值</span>
+          <span className="muted">{row.attempts.length} 次 · 不作为研究评分</span>
         </div>
         {row.attempts.length === 0 && <Alert tone="danger" title="缺少 AI 处理证据">该环节缺少录音与 AI 处理记录。</Alert>}
         {row.attempts.map((entry) => {
@@ -929,7 +929,7 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
               <div className="analysis-turn-head">
                 <strong>第 {attempt.attempt_seq} 次处理 <span className="mono muted">ID {attempt.id}</span></strong>
                 <div className="row wrap" style={{ gap: 6 }}>
-                  {entry.isTurnSource && <StatusPill tone="primary" size="sm">环节终值来源</StatusPill>}
+                  {entry.isTurnSource && <StatusPill tone="primary" size="sm">最终记录来源</StatusPill>}
                   <StatusPill tone={statusTone} size="sm">{processingStatusLabel(attempt.processing_status)}</StatusPill>
                   {attempt.operational_needs_review && <StatusPill tone="warn" size="sm">AI 建议复核</StatusPill>}
                 </div>
@@ -997,7 +997,7 @@ function InteractionTimeline({ rows, empty }: { rows: ParsedInteraction[]; empty
             <span className="evidence-timeline-dot" aria-hidden />
             <div>
               <span className="mono muted">#{row.event.event_seq} · {formatEvidenceTime(row.event.created_at)}</span>
-              <strong>{row.payloadError ? `${row.summary}（载荷损坏）` : row.summary}</strong>
+              <strong>{row.payloadError ? `${row.summary}（记录损坏）` : row.summary}</strong>
               <small className="mono">{row.event.event_type}</small>
             </div>
           </li>

@@ -212,7 +212,7 @@ export function ScaleDrawer({ patientId, open, onClose }: {
               ))}
               {!readiness.ready_for_research && (
                 <p className="muted">
-                  {`服务端 instance_creation_enabled=${String(readiness.instance_creation_enabled)}；训练正确率、AI 运营判分和 legacy 自由分数仍不是正式结果。`}
+                  训练正确率、AI 判分和历史自由填写分数都不是正式量表结果。
                 </p>
               )}
               {readiness.blocking_issues.length > 0 && (

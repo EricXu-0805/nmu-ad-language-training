@@ -241,6 +241,7 @@ export function SessionWrapupScreen({
     planReady,
     weekNo: session.week_no,
     totalTurns,
+    itemsMissingRecords: untouched.length,
     rapport: rapportStatus,
   });
   const completionGate = localCompletionGate({
@@ -345,7 +346,7 @@ export function SessionWrapupScreen({
       }
       setRuntimeOverride(runtime);
       onRuntimeStatusChange?.(runtime.status);
-      toast("服务器已核对全部锁定研究真值；场次已最终完成", "ok");
+      toast("服务器已核对全部已锁定的评分；本场已最终完成", "ok");
     } catch (error) {
       if (mountedRef.current && requestId === transitionRequest.current) {
         setTransitionFailure(parseCompletionFailure(error));
@@ -552,7 +553,7 @@ export function SessionWrapupScreen({
           </div>
           <div className="metric-grid">
             <div className="metric-card">
-              <span className="metric-card__label">终值环节记录</span>
+              <span className="metric-card__label">已有最终记录的环节</span>
               <strong className="metric-card__value">{Object.keys(journal.turns).length}<small> / {totalTurns || "—"}</small></strong>
             </div>
             <div className="metric-card">
@@ -572,7 +573,7 @@ export function SessionWrapupScreen({
             </Alert>
           )}
           {journalReady && untouched.length > 0 && (
-            <Alert tone="warn" title={`有 ${untouched.length} 题没有终值记录`}>
+            <Alert tone="warn" title={`有 ${untouched.length} 题还没有记录`}>
               缺少记录的题目会阻止结束，明细见下方折叠。
               <details style={{ marginTop: 8 }}>
                 <summary>查看缺失题目</summary>
@@ -708,7 +709,7 @@ function headerForMode(
     }
     return {
       kicker: "事后流程 · 研究复核",
-      title: "人工确认研究真值并锁分",
+      title: "人工确认回答并锁定评分",
       description: "老人端已经结束；研究者在后台逐环节复核 AI 证据，全部锁定后才最终完成。",
     };
   }

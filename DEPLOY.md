@@ -247,7 +247,7 @@ qwen-plus；如切龙媛还需 cosyvoice-v2——`cosyvoice-v3-plus` 需单独�
    合成检查是付费高成本操作，应用内每个管理员/IP 限制为最多每分钟一次；反向代理仍应设置第二层配额。
 
 当前 `autopilot/start` 所能进入的唯一服务范围是 **P0a 模拟切片**。正式研究级 autopilot scope 尚未实现，这是代码内部阻断项，不是部署开关；不得删除 simulation guard、修改受试者分类或放宽启动门禁来“启用正式研究”。
-受控模拟环境必须同时显式设置 `ALLOW_SIMULATION_DATA=1` 与 `ENABLE_AUTOPILOT_P0A_SIMULATION=1`；后者默认关闭。两者都不会绕过 VisitPlan、provider readiness 或设备 capability。精确绑定的 `week2-single20-demo-v1` 可在双开关下运行 20 题合成模拟计划；默认 canonical 整计划仍有 58 个交付缺口并在接管前 fail-closed。这不是真人或正式研究的放行开关。
+受控模拟环境必须同时显式设置 `ALLOW_SIMULATION_DATA=1` 与 `ENABLE_AUTOPILOT_P0A_SIMULATION=1`；后者默认关闭。两者都不会绕过 VisitPlan、provider readiness 或设备 capability。精确绑定的 `week2-single20-demo-v1` 可在双开关下运行 20 题合成模拟计划；默认 canonical 整计划（78 题位，2026-08-21 交互数据包闭合后 `content_freeze_report` 实算 0 个交付缺口）在双开关下同样可跑。这不是真人或正式研究的放行开关——真实场次自动带练由 `ENABLE_AUTOPILOT_REAL_SESSIONS=1` 独立控制，并要求云处理 policy（`CLOUD_PROCESSING_PROVIDER_ID`/`CLOUD_PROCESSING_NOTICE_VERSION`）与逐受试者云授权在案。
 
 ### 7.2 去标识导出 HMAC 密钥
 
@@ -635,7 +635,7 @@ FAIL 或 SKIP 都非零退出。
 - [ ] AI 质量接口已按角色复核可见范围：researcher=本人场次、data steward=已进入终态的场次、admin=全部授权场次；前端明确显示范围且未跨权限比较；反向代理未缓存响应，非 JSON 429 仍保留可验证的 `Retry-After`；PostgreSQL/SQLite 稳定快照、加载后总预算及 hash 前事务释放已用目标后端并发测试验收；固定资源预算和模拟查询限速保持启用
 - [ ] AI 质量口径已确认：`prompt_level=3` 只表示录音尝试所处提示上下文；在床旁答案呈现收据实现前，告知答案次数/比例必须保持未知；延迟只称“录音上传完成→判类完成”，不得包装成完整交互时延
 - [ ] 双真相已执行：AI 只驱动实时流程/初评；人工确认和锁分只发生在 `intervention_completed` 复核窗，现场 closeout 已独立保存，最终完成时与研究真值一起锁定
-- [ ] 第 2 周源脚本的 58 个交付缺口（78-position 运行计划内 58 个，全部是冻结自动流程只覆盖单要素·命名造成的自动执行协议缺口）已全部清零，`operational_autopilot_ready=true`；否则 canonical AI 启动必须保持拒绝。当前可运行的 20 题只是 `week2-single20-demo-v1` 合成模拟演示，不满足此正式发布清单
+- [ ] 58 个自动执行协议缺口已于 2026-08-21 由交互数据包清零（`operational_autopilot_ready=true`，工程侧达成），但数据包 qc_status=draft——本条在正式发布口径下要求**结构冻结获钱凯/丁老师书面双签**后才能勾选
 - [ ] 正式研究级 autopilot scope 已独立实现、审核并在合成研究切片验收；当前 P0a 模拟实现不得通过移除 simulation guard 获得放行
 - [ ] 两类正式结局工具的具体名称、版本、授权、条目、施测/缺失/中止规则、计分算法和批准事实已由 PI/临床团队冻结；已实现的通用 `AssessmentEvent` / `AssessmentInstance` / `ItemResponse` / `ScoringEvidence` / `approved-deferred` / `closeout` / `switch` / 幂等命令合同已在目标环境验收；真实定义与计分制品、逐题录音服务端收据（绑定 patient/event/instance/item/revision 且不可复用）及冻结工作流政策均已安装为可信执行适配器。definitions 完整本身不得显示为“已冻结可用”
 - [ ] 逐次录音、转写、AI 判断、提示和接管可追溯

@@ -364,3 +364,63 @@ test("13: a background poll's own continuation ratchets the shared floor before 
   const result = await outcome;
   assert.equal(result.kind, "failed", "r9 早于已经同步棘轮的 r10，必须拒绝，不得 hydrate/unlock");
 });
+
+// D4①:接管收口后人工位置要落到自动带练最后位置——服务端自动推进不写
+// runtime cursor,恢复真值必须优先用状态回执(接管收据同投影)里的位置。
+const TWO_ITEM_PLAN: SessionPlan = {
+  ...PLAN,
+  total_items: 2,
+  total_turns: 2,
+  items: [
+    ...PLAN.items,
+    {
+      item_id: "SE_熨斗", task_type: "单要素", image_id: null, presentation_order: 2,
+      display: {}, turns: [{ turn_seq: 1, response_role: "命名", scoring_key: null }],
+    },
+  ],
+};
+
+test("D4a: a takeover receipt position overrides the stale runtime cursor on apply", async () => {
+  const { begin } = makeWorld("S-a");
+  const deps = baseDeps({
+    fetchStatus: async () => ({
+      serverOwned: false, stateRevision: 4,
+      positionItemId: "SE_熨斗", positionTurnSeq: 1,
+    }),
+    // runtime cursor 停在第 1 题:自动带练从来没写过它。
+    fetchRuntime: async (sid) => runtimeAt(sid, 0, 0),
+    getPlan: () => TWO_ITEM_PLAN,
+  });
+  const outcome = await runManualResyncTransaction("S-a", begin(1), deps);
+  assert.equal(outcome.kind, "applied");
+  assert.ok(outcome.kind === "applied");
+  assert.deepEqual(outcome.cursor, { itemIdx: 1, turnIdx: 0 });
+});
+
+test("D4a: a snapshot without receipt position falls back to the exact runtime cursor", async () => {
+  const { begin } = makeWorld("S-a");
+  const deps = baseDeps({
+    fetchRuntime: async (sid) => runtimeAt(sid, 0, 0),
+    getPlan: () => TWO_ITEM_PLAN,
+  });
+  const outcome = await runManualResyncTransaction("S-a", begin(1), deps);
+  assert.equal(outcome.kind, "applied");
+  assert.ok(outcome.kind === "applied");
+  assert.deepEqual(outcome.cursor, { itemIdx: 0, turnIdx: 0 });
+});
+
+test("D4a: an unmappable receipt position fails closed instead of silently rolling back", async () => {
+  const { begin } = makeWorld("S-a");
+  const deps = baseDeps({
+    fetchStatus: async () => ({
+      serverOwned: false, stateRevision: 4,
+      positionItemId: "SE_不在计划里", positionTurnSeq: 1,
+    }),
+    fetchRuntime: async (sid) => runtimeAt(sid, 0, 0),
+    getPlan: () => TWO_ITEM_PLAN,
+  });
+  const outcome = await runManualResyncTransaction("S-a", begin(1), deps);
+  assert.equal(outcome.kind, "failed");
+  assert.ok(outcome.kind === "failed");
+  assert.match(String((outcome as { error: unknown }).error), /回执位置|冻结计划/);
+});

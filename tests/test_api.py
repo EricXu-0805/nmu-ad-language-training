@@ -437,40 +437,35 @@ def test_legacy_unknown_session_is_visible_but_blocked_from_new_processing(clien
 
 
 def test_item_bank_endpoint(client):
-    # 2026-08-19 内容交付后的现实:week2 题库 20单+10双+2多、qc frozen、
-    # 零 error 零 warning、全部开放环节有 operational_rubrics;自动执行协议
-    # 仍只覆盖单要素命名,故 10双×5 + 2多×4 = 58 个题位不可自动驾驶。
+    # 2026-08-21 交互数据包交付后的现实:week2 题库 20单+10双+2多、qc frozen、
+    # 零 error 零 warning、全部开放环节有 operational_rubrics;第2-8周交互
+    # 数据包按周登记,10双×5 + 2多×4 = 58 个题位全部由数据包驱动,78/78 可自动执行。
     d = client.get("/content/item-bank").json()
     assert d["single_count"] == 20 and d["double_count"] == 10
     assert d["multi_count"] == 2 and d["supported_training_weeks"] == [2]
     assert d["structured_training_weeks"] == [2, 3, 4, 5, 6, 7, 8]
     assert d["qc_status"] == "frozen" and d["ready_for_research"] is True
-    assert d["operational_autopilot_ready"] is False
+    assert d["operational_autopilot_ready"] is True
     assert len(d["item_bank_definition_digest"]) == 64
-    assert d["autopilot_protocol_version_id"] == "autopilot-v1-20260729"
+    assert d["autopilot_protocol_version_id"] == "autopilot-v2-20260821"
     assert len(d["autopilot_protocol_definition_digest"]) == 64
     assert d["protocol_validation_issues"] == []
     assert d["selector_validation_issues"] == []
-    assert d["autopilot_admission_validation_issue"]["code"] == (
-        "autopilot_plan_not_fully_supported")
-    assert d["autopilot_admission_validation_issue"]["context"][
-        "unsupported_position_count"] == 58
+    assert d["autopilot_admission_validation_issue"] is None
     assert d["operational_position_count"] == 78
-    assert d["unsupported_operational_position_count"] == 58
-    assert len(d["unsupported_operational_positions"]) == 58
-    assert "SE_花:命名" not in d["unsupported_operational_positions"]
-    assert "DE_斧子+树:左命名" in d["unsupported_operational_positions"]
-    assert "ME_动物园:情境" in d["unsupported_operational_positions"]
+    assert d["unsupported_operational_position_count"] == 0
+    assert d["unsupported_operational_positions"] == []
     assert d["unsupported_operational_position_counts_by_code"] == {
         "source_field_unavailable": 0,
         "operational_rubric_unavailable": 0,
-        "operational_protocol_unavailable": 58,
+        "operational_protocol_unavailable": 0,
+        "interaction_package_unavailable": 0,
     }
-    assert len(d["unsupported_operational_position_gaps"]) == 58
+    assert d["unsupported_operational_position_gaps"] == []
     assert d["source_protocol_position_count"] == 78
     assert d["source_unstructured_position_count"] == 0
     assert d["source_unstructured_positions"] == []
-    assert d["delivery_unsupported_position_count"] == 58
+    assert d["delivery_unsupported_position_count"] == 0
     assert d["source_document_sha256"] == (
         "b3310b61bdc6afb437cbc05785bd6f4e1f6c30dd53ad0999eb2c0fea10c3891a"
     )

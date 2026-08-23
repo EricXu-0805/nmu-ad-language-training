@@ -23,6 +23,8 @@ export interface LocalInterventionCompletionGateInput {
   planReady: boolean;
   weekNo: number;
   totalTurns: number;
+  /** 计划内还没有任何现场记录的题目数;服务器会按它拒绝结束,本地如实镜像。 */
+  itemsMissingRecords: number;
   rapport?: RapportGateStatus | null;
 }
 
@@ -155,6 +157,7 @@ export function localInterventionCompletionGate({
   planReady,
   weekNo,
   totalTurns,
+  itemsMissingRecords,
   rapport,
 }: LocalInterventionCompletionGateInput): LocalCompletionGate {
   if (!journalReady || !planReady) {
@@ -172,6 +175,14 @@ export function localInterventionCompletionGate({
       canRequest: false,
       label: "场次计划没有可核对环节",
       detail: "本场题目清单为空或异常，暂不能结束，请检查场次安排。",
+    };
+  }
+  // 缺记录时服务器必拒;绿灯与"缺少记录会阻止结束"同屏说反话是 P0 级混乱。
+  if (itemsMissingRecords > 0) {
+    return {
+      canRequest: false,
+      label: `还差 ${itemsMissingRecords} 题记录，暂不能结束`,
+      detail: "缺少记录的题目会被服务器拒绝；请返回训练补齐，或走中止流程提前结束。",
     };
   }
   return {

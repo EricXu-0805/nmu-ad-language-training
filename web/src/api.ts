@@ -3,6 +3,7 @@
 import type {
   AbnormalEvent, AttemptProcessRequest, AttemptProcessResult, AudioAsset, AudioCaptureReceipt, AuditEntry, AuditVerify, AuthConfig, AuthIdentity, ExportResult, InteractionAppendRequest, InteractionEvent, ItemBankInfo, ItemEvent,
   CloudProcessingPolicy, LiveStateResponse, Patient, PatientHeartbeatRequest, PatientHeartbeatResponse,
+  PatientProfilePatch,
   PatientSummary, ScaleResult, ScoreReconstruction, Session, SessionRuntimeState, SessionRuntimeStatus, TurnEvent,
   WithdrawalReasonCode,
   VisitPlanCancelRequest, VisitPlanCreateRequest, VisitPlanMutationRequest, VisitPlanReceipt, VisitPlanToday,
@@ -17,6 +18,14 @@ import {
   createDeviceCapabilityStore,
   type DeviceCapabilityRecord,
 } from "./security/deviceCapability";
+import {
+  createPatientBindingStore,
+  type PatientBindingRecord,
+} from "./security/patientBinding";
+import {
+  classifyAttachOutcome,
+  type AttachDisposition,
+} from "./patient/bindingAttachPolicy";
 import { csrfHeader } from "./security/csrf";
 import {
   parseResearchDictionary,
@@ -150,6 +159,17 @@ const deviceStore = createDeviceCapabilityStore(localStorage, sessionStorage);
 export const DEVICE_PAIR_REQUIRED_EVENT = "nmu:device-pair-required";
 export const DEVICE_CAPABILITY_UPDATED_EVENT = "nmu:device-capability-updated";
 export const ACCOUNT_REAUTH_REQUIRED_EVENT = "nmu:account-reauth-required";
+export const PATIENT_BINDING_UPDATED_EVENT = "nmu:patient-binding-updated";
+
+// 受试者绑定长期存 localStorage(它只能换本人场次能力,不是路由凭据);
+// 短时场次能力仍只在 sessionStorage,老规则不变。
+const patientBindingStore = createPatientBindingStore(localStorage);
+export const getPatientBinding = (): PatientBindingRecord | null =>
+  patientBindingStore.get();
+export const clearPatientBinding = (): void => {
+  patientBindingStore.clear();
+  queueMicrotask(() => window.dispatchEvent(new Event(PATIENT_BINDING_UPDATED_EVENT)));
+};
 
 export const getDeviceCapability = (): DeviceCapabilityRecord | null => deviceStore.get();
 export const getRecoveryDeviceCapability = (sessionId: string): DeviceCapabilityRecord | null =>
@@ -309,6 +329,114 @@ async function pairDevice(pin: string): Promise<DeviceCapabilityRecord> {
   }
 }
 
+// 配对响应的宽形状:全局 PIN 只回场次能力三元组;受试者配对码额外带 binding,
+// 且本人此刻没有 live 场次时只回 binding。
+export type PairWithCodeResult =
+  | { kind: "session"; record: DeviceCapabilityRecord }
+  | { kind: "binding" };
+
+async function pairDeviceWithCode(pin: string): Promise<PairWithCodeResult> {
+  const suppliedPin = pin.trim();
+  if (!suppliedPin) throw new ApiError(422, "请输入配对码");
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS);
+  try {
+    const deviceId = deviceStore.getOrCreateDeviceId();
+    const res = await fetch("/device/pair", {
+      method: "POST",
+      signal: controller.signal,
+      credentials: "omit",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Console-Pin": suppliedPin,
+      },
+      body: JSON.stringify({ deviceId }),
+    });
+    const text = await res.text();
+    const parsed = decodeJsonApiResponse({
+      status: res.status,
+      ok: res.ok,
+      statusText: res.statusText,
+      text,
+    }) as Record<string, unknown>;
+    const binding = parsed.binding;
+    const bindingSaved = typeof binding === "string";
+    if (bindingSaved) {
+      patientBindingStore.save({ binding, deviceId });
+    }
+    if (parsed.capability !== undefined) {
+      const record = deviceStore.save({
+        capability: parsed.capability,
+        sessionId: parsed.sessionId,
+        expiresAt: parsed.expiresAt,
+      });
+      queueMicrotask(() => {
+        window.dispatchEvent(new Event(DEVICE_CAPABILITY_UPDATED_EVENT));
+        if (bindingSaved) window.dispatchEvent(new Event(PATIENT_BINDING_UPDATED_EVENT));
+      });
+      return { kind: "session", record };
+    }
+    if (!bindingSaved) throw new ApiError(502, "服务器配对响应缺少凭据");
+    queueMicrotask(() => window.dispatchEvent(new Event(PATIENT_BINDING_UPDATED_EVENT)));
+    return { kind: "binding" };
+  } catch (error) {
+    if (controller.signal.aborted) throw new ApiError(408, "设备配对超时，请检查连接后重试");
+    throw apiNetworkError(error);
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+const ATTACH_REQUEST_TIMEOUT_MS = 8_000;
+
+// 自动跟场:绑定令牌换当前本人 live 场次能力。全部失败形态按纯策略层分派;
+// 老人端调用方只看处置结果,永不弹错误。
+async function attachPatientDevice(): Promise<AttachDisposition> {
+  const bindingRecord = patientBindingStore.get();
+  if (!bindingRecord) return "drop_binding";
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), ATTACH_REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch("/device/attach", {
+      method: "POST",
+      signal: controller.signal,
+      credentials: "omit",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        deviceId: bindingRecord.deviceId,
+        binding: bindingRecord.binding,
+      }),
+    });
+    const text = await res.text();
+    const disposition = classifyAttachOutcome(res.status, errorCodeFromText(text));
+    if (disposition === "attached") {
+      try {
+        deviceStore.save(JSON.parse(text) as unknown);
+      } catch {
+        // 响应损坏不等于绑定已死:保留绑定,下一轮再试。
+        return "quiet_retry";
+      }
+      queueMicrotask(() => window.dispatchEvent(new Event(DEVICE_CAPABILITY_UPDATED_EVENT)));
+      return "attached";
+    }
+    if (disposition === "drop_binding") {
+      patientBindingStore.clear();
+      queueMicrotask(() => {
+        window.dispatchEvent(new Event(PATIENT_BINDING_UPDATED_EVENT));
+        // 绑定死了又没有能力:回到人工配对入口,别让老人端悄悄卡死。
+        if (!deviceStore.get()) window.dispatchEvent(new Event(DEVICE_PAIR_REQUIRED_EVENT));
+      });
+    }
+    return disposition;
+  } catch {
+    return "quiet_retry";
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 12_000;
 // 研究取数一页最多 1000 行，还要在服务端过一遍去标识断言，比普通读慢。
 const RESEARCH_READ_TIMEOUT_MS = 45_000;
@@ -435,7 +563,7 @@ export function parseTurnConfirmationReceipt(
       || value.confirmed_response_text !== request.confirmed_response_text.trim()) {
     throw new ApiError(
       502,
-      "服务器未返回与本次 CAS 修订一致的确认回执，已保留原幂等键供重试",
+      "服务器的确认结果与本次提交不一致，这次修改没有生效——请直接重试，不会重复保存",
       value,
       "noncanonical-json",
     );
@@ -469,6 +597,8 @@ function requireAssessmentInstanceTarget(
 export const api = {
   health: () => req<{ status: string; service: string }>("GET", "/health"),
   pairDevice,
+  pairDeviceWithCode,
+  attachPatientDevice,
 
   // 账号认证(公网部署)。cookie 走同源自动携带;登录/登出/自查/配置。
   // authMe/authLogin 的 401 是预期结果(未登录/密码错),silent401 免触发重认证事件。
@@ -490,6 +620,8 @@ export const api = {
 
   // 患者 / 场次
   createPatient: (p: Patient) => req<Patient>("POST", "/patients", p),
+  updatePatient: (id: string, patch: PatientProfilePatch) =>
+    req<Patient>("PATCH", `/patients/${encodeURIComponent(id)}`, patch),
   getPatient: (id: string) => req<Patient>("GET", `/patients/${encodeURIComponent(id)}`),
   listPatients: () => req<PatientSummary[]>(
     "GET", "/patients", undefined, DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },

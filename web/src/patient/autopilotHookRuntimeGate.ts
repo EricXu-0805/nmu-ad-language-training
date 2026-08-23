@@ -1,3 +1,4 @@
+import type { PatientAutopilotMode } from "./autopilotAdmission.ts";
 import type { AutopilotRuntimePhase, AutopilotRuntimeState } from "./autopilotRuntime.ts";
 
 /**
@@ -35,4 +36,27 @@ export function shouldSchedulePassiveAutopilotPoll(phase: AutopilotRuntimePhase)
  */
 export function canStartAutopilotRunner(restored: AutopilotRuntimeState): boolean {
   return !isAutopilotRuntimeTerminal(restored.phase);
+}
+
+/**
+ * D5①:终态(paused/scope_completed)与 blocked 平静档是本次挂载的轮询死角——
+ * 接管+研究者 resume 之后没有任何信号能把患者端从「我们先休息一下」解出来。
+ * 权威 live 通道的 session.paused 真→假下降沿是唯一可信的 resume 事实:
+ * 此时恰好放行一次重探(走既有 probeEpoch 门,不建第二套执行器)。重探要么
+ * 发现服务器仍持有(回到同一终态,无环),要么拿到 autopilot_not_active 走
+ * 既有 stop-legacy 收口回到 live 游标平面。
+ * 活跃 runner 自有轮询;blocked 告警档是设备侧判死,留给研究者处置,不自动醒。
+ */
+export function shouldReprobeAfterServerResume(input: {
+  previousServerPaused: boolean;
+  serverPaused: boolean;
+  mode: PatientAutopilotMode;
+  runtimePhase: AutopilotRuntimePhase | null;
+  blockedCalm: boolean;
+}): boolean {
+  if (!input.previousServerPaused || input.serverPaused) return false;
+  if (input.mode === "server") {
+    return input.runtimePhase !== null && isAutopilotRuntimeTerminal(input.runtimePhase);
+  }
+  return input.mode === "blocked" && input.blockedCalm;
 }

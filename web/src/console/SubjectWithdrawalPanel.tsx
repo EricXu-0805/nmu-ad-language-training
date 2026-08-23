@@ -97,7 +97,7 @@ export function SubjectWithdrawalPanel({ patient, onCancel, onDone }: {
         {confirmOpen ? (
           <>
             <Alert tone="danger" title={`真实研究档案 ${patient.patient_id}`}>
-              档案将进入不可由普通接口恢复的 withdrawn 终态；相关录音只会先隔离，物理删除仍须管理员逐条执行。
+              退出后不可恢复。录音会先隔离，删除由管理员逐条执行。
             </Alert>
             <p className="muted">撤回原因：{WITHDRAWAL_REASON_LABELS[reason]}。</p>
             <div className="dialog-actions">
@@ -110,10 +110,10 @@ export function SubjectWithdrawalPanel({ patient, onCancel, onDone }: {
         ) : (
           <>
             <Alert tone="danger" title={`真实研究档案 ${patient.patient_id}`}>
-              这是受试者级治理终态：系统会停止在途训练与 AI、隔离该受试者全部录音，并关闭普通内容读取。普通“提前结束场次”不使用这里，也不会删除证据。
+              退出研究后：停止该受试者全部训练，隔离其全部录音，且不可恢复。只想提前结束本场训练的，请不要用这里。
             </Alert>
             <label className="field">
-              <span>权威原因（闭表）</span>
+              <span>原因（从固定选项中选择）</span>
               <select className="form-control" value={reason} disabled={busy}
                 onChange={(event) => setReason(event.target.value as WithdrawalReasonCode)}>
                 {(Object.entries(WITHDRAWAL_REASON_LABELS) as [WithdrawalReasonCode, string][])

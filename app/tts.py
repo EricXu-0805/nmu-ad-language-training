@@ -623,6 +623,12 @@ def cloud_text_allowed(text: str) -> bool:
                      content.CONTENT_DIR / "autopilot_protocol_v1.json"]
             paths += [content.CONTENT_DIR / week_files[week]
                       for week in sorted(week_files)]
+            proto = json.loads(paths[2].read_text(encoding="utf-8"))
+            interaction_files = proto.get("interaction_packages") or {}
+            paths += [content.CONTENT_DIR / entry["file"]
+                      for _week, entry in sorted(interaction_files.items())
+                      if isinstance(entry, dict)
+                      and isinstance(entry.get("file"), str)]
             key = tuple(
                 (str(p), st.st_mtime_ns, st.st_size) if (st := (
                     p.stat() if p.exists() else None)) is not None
@@ -631,7 +637,6 @@ def cloud_text_allowed(text: str) -> bool:
             )
             if _allow_cache is None or _allow_cache[0] != key:
                 wk = json.loads(paths[1].read_text(encoding="utf-8"))
-                proto = json.loads(paths[2].read_text(encoding="utf-8"))
                 allowed: frozenset[str] = frozenset()
                 # 白名单=全部已结构化训练周的并集:同一云引擎服务所有周。
                 # 单周坏档只让该周文本落回本地引擎(正集合缩小=fail-closed),
@@ -641,7 +646,12 @@ def cloud_text_allowed(text: str) -> bool:
                         bank = content.load_item_bank_for_week(week)
                     except ValueError:
                         continue
-                    allowed |= content.tts_allowlist(bank, wk, proto)
+                    try:
+                        package = content.load_autopilot_interaction_package(
+                            week, protocol=proto)
+                    except ValueError:
+                        package = None
+                    allowed |= content.tts_allowlist(bank, wk, proto, package)
                 _allow_cache = (key, allowed)
             return text.strip() in _allow_cache[1]
     except Exception:

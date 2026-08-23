@@ -18,6 +18,7 @@ import {
   formatAcceptanceText,
   missingHeaderFields,
   receiptFilename,
+  shortBuildId,
   summarizeAcceptance,
   unsetSteps,
   type AcceptanceDraft,
@@ -116,9 +117,9 @@ export function AcceptanceScreen() {
         </p>
         <p className="muted">屏幕 {facts.screen}</p>
         <p className="muted">
-          页面版本号（自动记入记录）：
+          页面版本号（短号；完整编号已自动写进提交记录）：
         </p>
-        <p className="mono acceptance-build-id">{facts.buildId}</p>
+        <p className="mono acceptance-build-id">{shortBuildId(facts.buildId)}</p>
       </section>
 
       <section className="form-section" aria-label="设备与场地">

@@ -172,6 +172,13 @@ export function QuestionnairePanel({ patientId }: { patientId: string }) {
               </button>
             ))}
           </div>
+          {selectedQuestionnaire && (
+            <small className="muted">
+              {catalog.find((entry) =>
+                entry.definition.questionnaire_id === selectedQuestionnaire)
+                ?.definition.title}
+            </small>
+          )}
           <div className="segmented-control" role="group" aria-label="选择期别">
             {QUESTIONNAIRE_PHASE_LABELS.map((phase) => (
               <button key={phase} type="button" className="segmented-control__button"

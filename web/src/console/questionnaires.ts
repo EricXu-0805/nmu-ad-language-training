@@ -592,7 +592,7 @@ export function aiDraftStatusLine(status: QuestionnaireAiDraftStatus): string | 
     case "not_applicable": return "此量表不提供 AI 初评。";
     case "unavailable_not_authorized": return "该受试者未授权云处理，AI 初评不可用。";
     case "unavailable_no_data": return "暂无训练数据可供参考。";
-    case "failed": return "AI 初评暂时不可用，请人工评定。";
+    case "failed": return "AI 初评没有成功——可能是服务器未接入云端 AI，或云端调用失败。请直接人工评定；反复出现请联系管理员。";
   }
 }
 

@@ -1063,6 +1063,37 @@ def test_live_payload_contract_rejects_extra_content_and_public_projection_is_mi
     assert "sourceWseq" not in public["cursor"] and "answerText" not in public["cursor"]
 
 
+def test_console_state_read_boundary_matches_frontend_exact_parsers(client):
+    """P0-4 回归:写路径故意把诊断键 sourceWseq 存进 session_json/cursor_json;
+    /live/console-state 若原样返回,前端 exactKeys 解析器会把 session 槽整槽拒收,
+    useAudioSaved 因此永远不去拉录音收据账本——录音明明入库,研究者屏零反馈。
+    console-state 的每个槽位都必须收敛到与 messages.ts 各解析器一致的白名单。"""
+    _patient(client, "P-CONSOLE-PROJ")
+    _training_session(client, "S-CONSOLE-PROJ", "P-CONSOLE-PROJ")
+    assert _handshake(client, "S-CONSOLE-PROJ").status_code == 200
+    assert client.put("/live/state", json={
+        "kind": "cursor", "payload": _cursor("S-CONSOLE-PROJ"),
+    }).status_code == 200
+
+    # 陷阱确实存在于存储层:诊断键留在 json 里,只有读边界能挡住它。
+    with Session(client.test_engine) as s:
+        row = s.get(models.LiveState, 1)
+        assert "sourceWseq" in json.loads(row.session_json)
+        assert "sourceWseq" in json.loads(row.cursor_json)
+
+    state = client.get("/live/console-state").json()
+    # 与 web/src/sync/messages.ts parseSession/parseCursor 的 exactKeys 完全对应。
+    session_allowed = {"sessionId", "weekNo", "eventLine", "mode",
+                       "itemBankVersionId", "paused", "runtimeStatus", "wseq"}
+    cursor_allowed = {"sessionId", "screen", "itemIdx", "turnIdx", "responseRole",
+                      "cueLevel", "recording", "recSeq", "rawAudioId", "selfStart",
+                      "fbKey", "fbItemId", "fbSeq", "wseq"}
+    assert set(state["session"]) <= session_allowed, state["session"]
+    assert set(state["cursor"]) <= cursor_allowed, state["cursor"]
+    assert "sourceWseq" not in state["session"]
+    assert "sourceWseq" not in state["cursor"]
+
+
 def test_runtime_recording_commands_obey_consent_and_review_window_gates(client):
     _patient(client, "P-NOREC", recording_allowed=False)
     denied = client.post("/sessions", json={

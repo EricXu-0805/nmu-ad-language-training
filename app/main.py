@@ -20,9 +20,9 @@ from urllib.parse import unquote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field as PydanticField, model_validator
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, select as sa_select, update as sa_update
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session as DBSession, select
+from sqlmodel import Session as DBSession, SQLModel, select
 
 import os
 from datetime import date, datetime, timedelta, timezone
@@ -44,7 +44,8 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                device_capability, evidence_ledger, export, http_security, judging,
                ai_quality_service, llm_judge, rule_judge, runtime, scoring,
                session_completion,
-               resource_limits, patient_asset, patient_presentation,
+               resource_limits, patient_asset, patient_pairing,
+               patient_presentation,
                provider_readiness, quality_release, repeat_evidence, repeat_intent,
                research_dataset, research_read,
                questionnaire_ai_draft, questionnaires,
@@ -450,11 +451,16 @@ async def console_auth_guard(request: Request, call_next):
         # 具名主体，避免原始录音/审计等高敏感读取因开发模式被自动放宽。
         if rule.kind == access_policy.AccessKind.ACCOUNT:
             request.state.auth_kind = "local_loopback"
+        elif rule.kind == access_policy.AccessKind.DEVICE_ATTACH:
+            # 让处理器给出诚实的"未启用按受试者配对"503,而不是笼统 403。
+            request.state.auth_kind = "device_attach"
         return await call_next(request)
 
     ip = _client_ip(request)
     pair_limit_key = f"pair:{ip}"
-    if (rule.kind == access_policy.AccessKind.DEVICE_PAIR
+    # 配对与自动跟场共用同一把失败锁:伪造绑定令牌和乱猜 PIN 是同一类攻击。
+    if (rule.kind in {access_policy.AccessKind.DEVICE_PAIR,
+                      access_policy.AccessKind.DEVICE_ATTACH}
             and auth.is_locked(pair_limit_key)):
         return JSONResponse(status_code=429, content={
             "detail": "尝试过多，暂时锁定，请稍后再试",
@@ -494,12 +500,41 @@ async def console_auth_guard(request: Request, call_next):
             "detail": "读请求来自跨站页面的跳转，已拒绝",
             "code": "request_origin_rejected",
         })
+    if rule.kind == access_policy.AccessKind.DEVICE_ATTACH:
+        # 绑定令牌在处理器内验签(HMAC,自带凭据);这里只挂上与配对同一套配额。
+        request.state.auth_kind = "device_attach"
+        limited = _expensive_rate_limit(request, f"device-pair:{ip}")
+        if limited is not None:
+            return limited
+        return await call_next(request)
+
     pin = os.environ.get("CONSOLE_PIN")
     pin_valid = bool(
         rule.kind == access_policy.AccessKind.DEVICE_PAIR
         and pin and supplied_pin is not None
         and secrets.compare_digest(supplied_pin.encode("utf-8"), pin.encode("utf-8"))
     )
+    # 全局 PIN 不匹配时,再在同一个配对口内比对按受试者派生配对码。派生码固定
+    # 6 位数字,其他形状直接跳过整轮比对;逐个恒定时间比较且不提前退出。
+    patient_pin_match: str | None = None
+    patient_pin_ambiguous = False
+    if (rule.kind == access_policy.AccessKind.DEVICE_PAIR and not pin_valid
+            and pin and supplied_pin is not None
+            and re.fullmatch(r"[0-9]{6}", supplied_pin)):
+        with DBSession(db.engine) as s:
+            roster = s.exec(
+                select(Patient.patient_id, Patient.withdrawal_status)).all()
+        candidates = [
+            patient_id for patient_id, withdrawal_status in roster
+            if not (withdrawal_status or "").strip()
+            and re.fullmatch(
+                visit_plan_contract.PATIENT_ID_PATTERN, patient_id or "")
+        ]
+        matched = patient_pairing.match_patient_pin(supplied_pin, candidates)
+        if len(matched) == 1:
+            patient_pin_match = matched[0]
+        elif matched:
+            patient_pin_ambiguous = True
 
     # 1) 会话 cookie(真实账号,携带审计身份)。display_id/role 必须在 session 打开时就取出:
     #    resolve_session 内部节流写 last_seen 会 commit,默认 expire_on_commit 令 user 过期,
@@ -688,6 +723,21 @@ async def console_auth_guard(request: Request, call_next):
     # bytes 比较避免非 ASCII 头触发 TypeError。
     if pin_valid and rule.kind == access_policy.AccessKind.DEVICE_PAIR:
         request.state.auth_kind = "device_pair"
+        auth.record_success(pair_limit_key)
+        limited = _expensive_rate_limit(request, f"device-pair:{ip}")
+        if limited is not None:
+            return limited
+        return await call_next(request)
+    if patient_pin_ambiguous:
+        # 配对码是对的却同时对应多位受试者(极小概率撞值):不能猜绑给谁,
+        # 也不算失败尝试。响应零 PII。
+        return JSONResponse(status_code=409, content={
+            "detail": "这个配对码同时对应多位受试者，请改用全局配对码并联系研究人员",
+            "code": "device_pair_pin_ambiguous",
+        })
+    if patient_pin_match and rule.kind == access_policy.AccessKind.DEVICE_PAIR:
+        request.state.auth_kind = "device_pair_patient"
+        request.state.device_pair_patient_id = patient_pin_match
         auth.record_success(pair_limit_key)
         limited = _expensive_rate_limit(request, f"device-pair:{ip}")
         if limited is not None:
@@ -1095,13 +1145,25 @@ def list_patients(request: Request, s: DBSession = Depends(get_session)):
     by_patient: dict[str, list] = {}
     for sess in sessions:
         by_patient.setdefault(sess.patient_id, []).append(sess)
+    # 配对码只对训练操作角色可见:它是让老人端设备绑到该受试者的凭据,
+    # 不进治理/照护角色的读面。撤回或编号不合规的档案永不派码。
+    pairing_codes_visible = (
+        patient_pairing.pairing_enabled()
+        and role in access_policy.TRAINING_OPERATION_ROLES)
     out = []
     for p in patients:
         rows = by_patient.get(p.patient_id, [])
         dates = [r.training_date for r in rows if r.training_date]
         eligibility_issues = _research_eligibility_issues(p)
         withdrawal_event = withdrawal_events.get(p.patient_id)
+        pairing_code = None
+        if (pairing_codes_visible
+                and not (p.withdrawal_status or "").strip()
+                and re.fullmatch(
+                    visit_plan_contract.PATIENT_ID_PATTERN, p.patient_id or "")):
+            pairing_code = patient_pairing.derive_patient_pin(p.patient_id)
         out.append({
+            "pairing_code": pairing_code,
             "patient_id": p.patient_id,
             "is_simulation_subject": p.is_simulation_subject,
             "dementia_severity": p.dementia_severity,
@@ -1137,6 +1199,111 @@ def get_patient(patient_id: str, s: DBSession = Depends(get_session)):
     p = s.get(Patient, patient_id)
     if not p:
         raise HTTPException(404, "患者不存在")
+    return p
+
+
+class PatientProfileUpdate(BaseModel):
+    """档案可编辑面(非治理字段)。撤回/云授权/模拟身份/治理版本各有专属流程。"""
+    model_config = ConfigDict(extra="forbid")
+
+    # 研究编号更正:仅零关联数据时允许(编号是全库数据关联键)。
+    new_patient_id: str | None = PydanticField(
+        default=None, min_length=1, max_length=128,
+        pattern=visit_plan_contract.PATIENT_ID_PATTERN)
+    dementia_severity: str | None = None
+    mandarin_eligible: bool | None = None
+    language_eligibility: str | None = None
+    consent_status: str | None = None
+    consent_type: ConsentType | None = None
+    consent_time: datetime | None = None
+    consent_person: str | None = None
+    proxy_consent: bool | None = None
+    capacity_assessment_status: str | None = None
+    assent_obtained: bool | None = None
+    recording_allowed: bool | None = None
+    secondary_use_allowed: bool | None = None
+    ethics_approval_no: str | None = None
+    registration_no: str | None = None
+
+
+def _patient_referencing_tables(s: DBSession, patient_id: str) -> list[str]:
+    """按外键图找出仍指向该受试者的表;将来新增关联表自动被盖住,改名门禁不腐化。"""
+    patient_table = Patient.__table__
+    referencing: list[str] = []
+    for table in SQLModel.metadata.tables.values():
+        if table is patient_table:
+            continue
+        for fk in table.foreign_keys:
+            if fk.column.table is not patient_table:
+                continue
+            column = fk.parent
+            row = s.execute(
+                sa_select(column).where(column == patient_id).limit(1)).first()
+            if row is not None:
+                referencing.append(table.name)
+                break
+    return sorted(set(referencing))
+
+
+@app.patch("/patients/{patient_id}", response_model=Patient)
+def update_patient_profile(patient_id: str, body: PatientProfileUpdate,
+                           request: Request, s: DBSession = Depends(get_session)):
+    p = s.get(Patient, patient_id)
+    if not p:
+        raise HTTPException(404, "患者不存在")
+    if (p.withdrawal_status or "").strip():
+        raise HTTPException(409, "该档案已登记研究撤回，由治理流程管理，不能再编辑")
+    provided = set(body.model_fields_set)
+    # 用与资格判定同一张否定态闭集(含中文「已撤回/未同意/拒绝」),不能只挡英文
+    # 字面量——否则界面下拉里的中文值会绕过治理流程直接落库。
+    if ("consent_status" in provided
+            and (body.consent_status or "").strip().casefold()
+            in _CONSENT_DENIED_STATUSES):
+        raise HTTPException(
+            422,
+            "撤回或否定知情同意不能在档案编辑里登记——研究撤回请使用“登记研究撤回”"
+            "流程；如属登记笔误，请联系研究负责人走纸质记录更正流程")
+    # 知情同意方式:补录空值允许(纠正遗漏),改写非空值拒绝(那是治理动作)。
+    # 与前端 patientEdit.consentTypeLockedReason 同则。
+    if ("consent_type" in provided
+            and p.consent_type is not None
+            and body.consent_type != p.consent_type):
+        raise HTTPException(
+            409,
+            f"知情同意方式已登记为「{p.consent_type.value}」。这里只能补录空缺，"
+            "不能改写已登记的同意方式；如确需更正，请联系研究负责人走纸质记录更正流程")
+
+    summary_parts: list[str] = []
+    new_id = body.new_patient_id if "new_patient_id" in provided else None
+    if new_id is not None and new_id != patient_id:
+        if s.get(Patient, new_id) is not None:
+            raise HTTPException(409, f"研究编号 {new_id} 已被使用，请换一个编号")
+        referencing = _patient_referencing_tables(s, patient_id)
+        if referencing:
+            raise HTTPException(
+                422,
+                "编号是数据关联键，这位受试者已有训练数据或安排，不能再改编号；"
+                "如确属登记错误，请新建一份档案")
+        s.execute(sa_update(Patient).where(
+            Patient.patient_id == patient_id).values(patient_id=new_id))
+        s.expire_all()
+        p = s.get(Patient, new_id)
+        summary_parts.append(f"renamed_from={patient_id}")
+        patient_id = new_id
+
+    field_names = sorted(provided - {"new_patient_id"})
+    for field in field_names:
+        setattr(p, field, getattr(body, field))
+    if field_names:
+        summary_parts.append("fields=" + ",".join(field_names))
+    if not summary_parts:
+        return p
+    s.add(p)
+    s.commit()
+    s.refresh(p)
+    # summary 只记字段名与编号,绝不记字段值(consent_person 可能是称谓/角色)。
+    _audit(s, request, "patient_profile_update", ";".join(summary_parts),
+           patient_id=patient_id)
     return p
 
 
@@ -3019,10 +3186,20 @@ def get_item_bank():
     # readiness from the smaller rubric subset while the server would refuse.
     positions = autopilot_positions.build_positions(
         bank, week_no=2, event_line="正式训练")
+    try:
+        interaction_package = content.load_autopilot_interaction_package(
+            2, protocol=protocol)
+        if content.validate_autopilot_interaction_package(
+                interaction_package, bank, protocol):
+            interaction_package = None
+    except content.FrozenContentUnavailable:
+        interaction_package = None
     position_gaps = tuple(
         gap
         for position in positions
-        if (gap := autopilot_positions.readiness_gap(bank, position)) is not None
+        if (gap := autopilot_positions.readiness_gap(
+            bank, position,
+            interaction_package=interaction_package)) is not None
     )
     gap_counts = {
         code: sum(gap.code == code for gap in position_gaps)
@@ -3030,6 +3207,7 @@ def get_item_bank():
             "source_field_unavailable",
             "operational_rubric_unavailable",
             "operational_protocol_unavailable",
+            "interaction_package_unavailable",
         )
     }
     source_unstructured = readiness["source_unstructured_positions"]
@@ -3061,7 +3239,9 @@ def get_item_bank():
         # supported position.  Known rubric/source gaps remain separately visible
         # and are not allowed to hide defects in the positions that look ready.
         for position in positions:
-            if autopilot_positions.readiness_gap(bank, position) is not None:
+            if autopilot_positions.readiness_gap(
+                    bank, position,
+                    interaction_package=interaction_package) is not None:
                 continue
             try:
                 autopilot_service._select_p0a_content(  # noqa: SLF001
@@ -3070,6 +3250,7 @@ def get_item_bank():
                     protocol,
                     item_id=position.item_id,
                     turn_seq=position.turn_seq,
+                    interaction_package=interaction_package,
                 )
             except autopilot_service.AutopilotServiceError as exc:
                 selector_issues.append({
@@ -3734,8 +3915,11 @@ def autopilot_recording_authorization(
         except autopilot_service.AutopilotServiceError as exc:
             s.rollback()
             _raise_autopilot_http_error(exc)
+    # recording_authorized 是显式肯定授权：所有闸全部通过才走到这里。老前端
+    # 的三键闭集解析器读到第四个键会 fail-closed，不会静默开麦。
     return {
         "allowed": True,
+        "recording_authorized": True,
         "runtime_status": "active",
         "is_simulation": effective_simulation,
     }
@@ -4690,15 +4874,19 @@ class DevicePairIn(BaseModel):
         min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
-@app.post("/device/pair")
-def device_pair(body: DevicePairIn, request: Request, response: Response,
-                s: DBSession = Depends(get_session)):
-    """当面用 PIN 配对；明文 capability 只在这一次响应中出现。"""
-    if getattr(request.state, "auth_kind", None) != "device_pair":
-        raise HTTPException(403, detail={
-            "code": "device_pair_forbidden",
-            "message": "此接口只接受当面设备配对",
-        })
+def _issue_live_session_capability(
+        s: DBSession, *, device_id: str,
+        required_patient_id: str | None = None,
+        allow_rotation: bool = True,
+) -> tuple[str, PatientDeviceCapability]:
+    """绑当前 live 场次签发设备能力(含同场次轮换围栏),配对与自动跟场共用。
+
+    required_patient_id 非空时,live 场次不属于该受试者一律按"没有可配对场次"
+    拒绝——绝不在响应里泄露当前是谁在训练。
+    allow_rotation=False(自动跟场):别的设备还持有未过期能力时拒绝而不轮换。
+    两台设备各持同一受试者的绑定令牌时,无此闸会以秒级节奏互相吊销对方、
+    每次轮换还强制暂停训练——轮换权只留给当面输码的人工配对。
+    """
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         live = _live_row_for_update(s)
         session_id = _live_session_id(live)
@@ -4707,6 +4895,9 @@ def device_pair(body: DevicePairIn, request: Request, response: Response,
         sess = s.get(TrainSession, session_id)
         if sess is None:
             _raise_device_conflict("device_pair_session_missing", "当前训练场次不存在")
+        if required_patient_id is not None and sess.patient_id != required_patient_id:
+            _raise_device_conflict(
+                "device_pair_no_live_session", "当前没有可配对的训练场次")
         _require_started_visit_plan_session(session_id, s, sess=sess)
         _require_classified_session(sess)
         state = s.get(SessionRuntimeState, session_id)
@@ -4721,13 +4912,22 @@ def device_pair(body: DevicePairIn, request: Request, response: Response,
         # to the newly paired device, and a failure anywhere in this combined
         # operation rolls back the capability rotation too — never a
         # committed new capability with a not-yet-fenced old claim.
-        had_active_capability = s.exec(select(PatientDeviceCapability).where(
+        active_rows = s.exec(select(PatientDeviceCapability).where(
             PatientDeviceCapability.session_id == session_id,
             PatientDeviceCapability.revoked_at.is_(None),
-        )).first() is not None
+        )).all()
+        had_active_capability = bool(active_rows)
+        if not allow_rotation:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            requester_hash = device_capability.device_id_hash(device_id)
+            if any(row.device_id_hash != requester_hash and row.expires_at > now
+                   for row in active_rows):
+                _raise_device_conflict(
+                    "device_attach_device_busy",
+                    "当前场次已有其他设备在用，自动跟场不抢占")
         try:
             token, capability = device_capability.create_capability(
-                s, session_id=session_id, device_id=body.deviceId)
+                s, session_id=session_id, device_id=device_id)
         except device_capability.DeviceCapabilityConfigurationError as exc:
             raise HTTPException(500, detail={
                 "code": "device_capability_configuration_invalid",
@@ -4759,9 +4959,10 @@ def device_pair(body: DevicePairIn, request: Request, response: Response,
         # atomic snapshot, or neither does.
         s.commit()
         s.refresh(capability)
-    # Bearer appears exactly once.  Do not rely on POST's usual cache behavior.
-    response.headers["Cache-Control"] = "private, no-store"
-    response.headers["Pragma"] = "no-cache"
+    return token, capability
+
+
+def _capability_receipt(token: str, capability: PatientDeviceCapability) -> dict:
     expires_at = capability.expires_at.replace(tzinfo=timezone.utc).isoformat().replace(
         "+00:00", "Z")
     return {
@@ -4769,6 +4970,103 @@ def device_pair(body: DevicePairIn, request: Request, response: Response,
         "sessionId": capability.session_id,
         "expiresAt": expires_at,
     }
+
+
+def _no_store(response: Response) -> None:
+    # Bearer appears exactly once.  Do not rely on POST's usual cache behavior.
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
+@app.post("/device/pair")
+def device_pair(body: DevicePairIn, request: Request, response: Response,
+                s: DBSession = Depends(get_session)):
+    """当面用 PIN 配对；明文 capability 只在这一次响应中出现。
+
+    全局 CONSOLE_PIN → 原行为:绑当前 live 场次。受试者专属配对码 → 额外
+    签发长期绑定令牌;若当前 live 恰是本人场次同时签发场次能力,否则只回
+    绑定令牌,由老人端 /device/attach 在本人开场后自动跟上。
+    """
+    auth_kind = getattr(request.state, "auth_kind", None)
+    if auth_kind not in {"device_pair", "device_pair_patient"}:
+        raise HTTPException(403, detail={
+            "code": "device_pair_forbidden",
+            "message": "此接口只接受当面设备配对",
+        })
+    if auth_kind == "device_pair_patient":
+        patient_id = request.state.device_pair_patient_id
+        binding = patient_pairing.issue_binding_token(patient_id, body.deviceId)
+        try:
+            token, capability = _issue_live_session_capability(
+                s, device_id=body.deviceId, required_patient_id=patient_id)
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            # 本人此刻没有可配对的 live 场次:配对仍算成功,先落绑定令牌。
+            _no_store(response)
+            return {"binding": binding}
+        _no_store(response)
+        return {"binding": binding, **_capability_receipt(token, capability)}
+    token, capability = _issue_live_session_capability(s, device_id=body.deviceId)
+    _no_store(response)
+    return _capability_receipt(token, capability)
+
+
+class DeviceAttachIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deviceId: str = PydanticField(
+        min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    binding: str = PydanticField(min_length=16, max_length=1024)
+
+
+@app.post("/device/attach")
+def device_attach(body: DeviceAttachIn, request: Request, response: Response,
+                  s: DBSession = Depends(get_session)):
+    """绑定令牌换当前本人 live 场次的设备能力(自动跟场)。
+
+    令牌不是其他任何接口的凭据;响应零 PII。所有"现在接不上"的情形——没有
+    live 场次、live 是别人的、场次不可配——一律同一个 409,不可区分。
+    """
+    if getattr(request.state, "auth_kind", None) != "device_attach":
+        raise HTTPException(403, detail={
+            "code": "device_attach_forbidden",
+            "message": "此接口只接受老人端自动跟场请求",
+        })
+    if not patient_pairing.pairing_enabled():
+        raise HTTPException(503, detail={
+            "code": "patient_binding_unavailable",
+            "message": "本部署未启用按受试者配对",
+        })
+    pair_limit_key = f"pair:{_client_ip(request)}"
+    claims = patient_pairing.verify_binding_token(body.binding)
+    if claims is None or not secrets.compare_digest(
+            claims.device_id.encode("ascii"), body.deviceId.encode("ascii")):
+        auth.record_failure(pair_limit_key)
+        raise HTTPException(401, detail={
+            "code": "device_binding_invalid",
+            "message": "设备绑定无效，请重新输入配对码",
+        })
+    patient = s.get(Patient, claims.patient_id)
+    if patient is None or (patient.withdrawal_status or "").strip():
+        raise HTTPException(401, detail={
+            "code": "device_binding_revoked",
+            "message": "设备绑定已失效，请联系工作人员",
+        })
+    try:
+        token, capability = _issue_live_session_capability(
+            s, device_id=body.deviceId, required_patient_id=claims.patient_id,
+            allow_rotation=False)
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+        raise HTTPException(409, detail={
+            "code": "device_attach_no_session",
+            "message": "当前没有可自动连接的训练场次",
+        }) from None
+    auth.record_success(pair_limit_key)
+    _no_store(response)
+    return _capability_receipt(token, capability)
 
 
 def _payload_session_id(payload: dict) -> str | None:
@@ -4797,6 +5095,29 @@ def _public_live_projection(kind: str, text: str | None) -> dict | None:
     if payload is None:
         return None
     allowed = _PUBLIC_LIVE_FIELDS[kind]
+    return {key: value for key, value in payload.items() if key in allowed}
+
+
+# 研究者端 console-state 的读边界白名单:与前端 messages.ts 各 parseSyncPayload
+# 的 exactKeys 逐一对应。写路径会往 session/cursor/rapportStep 存诊断键
+# sourceWseq(_stamp_command_source);若原样返回,前端严格解析器整槽拒收——
+# useAudioSaved 因 session 槽解析失败而永远不去拉录音收据账本,录音在研究者屏
+# 上"消失"(2026-08-21 审计 P0-4 根因)。新增字段必须两端同步。
+_CONSOLE_LIVE_FIELDS = {
+    "session": _PUBLIC_LIVE_FIELDS["session"],
+    "cursor": _PUBLIC_LIVE_FIELDS["cursor"] | {"rawAudioId", "fbItemId"},
+    "rapportStep": _PUBLIC_LIVE_FIELDS["rapportStep"] | {"rawAudioId"},
+    "audioSaved": {"rawAudioId", "durationSeconds", "byteCount", "checksum",
+                   "turnKey", "sessionId", "containsDirectIdentifier"},
+    "patientRec": {"active", "turnKey", "sessionId", "failureCode", "failureId"},
+}
+
+
+def _console_live_projection(kind: str, text: str | None) -> dict | None:
+    payload = _json_load(text)
+    if payload is None:
+        return None
+    allowed = _CONSOLE_LIVE_FIELDS[kind]
     return {key: value for key, value in payload.items() if key in allowed}
 
 
@@ -6277,11 +6598,12 @@ def live_console_get(request: Request, s: DBSession = Depends(get_session)):
         return {"seq": 0, "session": None, "cursor": None, "rapportStep": None,
                 "audioSaved": None, "patientRec": None,
                 "patientPresence": _presence_payload(None)}
-    return {"seq": row.seq, "session": _json_load(row.session_json),
-            "cursor": _json_load(row.cursor_json),
-            "rapportStep": _json_load(row.rapport_json),
-            "audioSaved": _json_load(row.audio_json),
-            "patientRec": _json_load(row.patient_rec_json),
+    return {"seq": row.seq,
+            "session": _console_live_projection("session", row.session_json),
+            "cursor": _console_live_projection("cursor", row.cursor_json),
+            "rapportStep": _console_live_projection("rapportStep", row.rapport_json),
+            "audioSaved": _console_live_projection("audioSaved", row.audio_json),
+            "patientRec": _console_live_projection("patientRec", row.patient_rec_json),
             "patientPresence": _presence_payload(row)}
 
 
@@ -6834,24 +7156,23 @@ def _project_terminal_to_live(live: LiveState | None, sess: TrainSession,
 _AUTOPILOT_AUTOFINISH_ERROR = "intervention_completion_evidence_incomplete"
 
 
-def _autofinalize_completed_autopilot_scope(
+def _finalize_completed_autopilot_scope_core(
         s: DBSession,
         *,
         session_id: str,
         live: LiveState | None,
-        ack_result: autopilot_service.ApplyDeviceAckResult,
-) -> tuple[autopilot_service.ApplyDeviceAckResult,
-           session_completion.InterventionCompletionAssessment | None]:
-    """Turn a proven final device ACK into the bedside terminal fact.
+) -> tuple[
+        Literal["already", "failed", "finished"],
+        SessionAutopilotState | None,
+        session_completion.InterventionCompletionAssessment | None]:
+    """Shared terminal half of a proven autopilot scope completion.
 
-    This runs before the ACK transaction commits.  If the independently derived
-    completion assessment is not ready, the already-real device ACK and
-    ``scope_complete`` event are retained while autonomous ownership moves to a
-    diagnosable failed state.  We never manufacture ``intervention_completed``.
+    Used by both completion triggers: the final device TTS ACK and the
+    interaction silent-advance route (the last plan position ends on a judged
+    hit with no closing speech).  Never manufactures ``intervention_completed``:
+    a not-ready assessment moves autonomous ownership to a diagnosable failed
+    state instead.
     """
-    if ack_result.status != "scope_completed":
-        return ack_result, None
-
     sess = s.get(TrainSession, session_id)
     runtime_state = s.exec(select(SessionRuntimeState).where(
         SessionRuntimeState.session_id == session_id,
@@ -6862,14 +7183,14 @@ def _autofinalize_completed_autopilot_scope(
             "自动范围已结束，但场次运行状态不存在",
         )
 
-    # Exact ACK replay after a successful auto-finish is an idempotent read.
+    # Exact replay after a successful auto-finish is an idempotent read.
     if runtime_state.status in {"intervention_completed", "completed"}:
         if s.get(SessionOutcomeSummary, session_id) is None:
             raise autopilot_service.AutopilotServiceError(
                 "autopilot_outcome_summary_missing",
                 "场次已结束但缺少不可变自动汇总",
             )
-        return ack_result, None
+        return "already", None, None
 
     plan, assessment = _assess_intervention_completion(sess, s)
     if not assessment.ready:
@@ -6883,11 +7204,7 @@ def _autofinalize_completed_autopilot_scope(
             audio_evidenced_turns=assessment.audio_evidenced_turns,
             issue_codes=tuple(issue.code for issue in assessment.issues),
         )
-        return ack_result.model_copy(update={
-            "status": "failed",
-            "state_revision": control.revision,
-            "command": None,
-        }), assessment
+        return "failed", control, assessment
 
     if runtime_state.status != "active":
         raise autopilot_service.AutopilotServiceError(
@@ -6909,6 +7226,35 @@ def _autofinalize_completed_autopilot_scope(
     if live_changed and live is not None:
         s.add(live)
     s.flush()
+    return "finished", None, assessment
+
+
+def _autofinalize_completed_autopilot_scope(
+        s: DBSession,
+        *,
+        session_id: str,
+        live: LiveState | None,
+        ack_result: autopilot_service.ApplyDeviceAckResult,
+) -> tuple[autopilot_service.ApplyDeviceAckResult,
+           session_completion.InterventionCompletionAssessment | None]:
+    """Turn a proven final device ACK into the bedside terminal fact.
+
+    This runs before the ACK transaction commits.  If the independently derived
+    completion assessment is not ready, the already-real device ACK and
+    ``scope_complete`` event are retained while autonomous ownership moves to a
+    diagnosable failed state.  We never manufacture ``intervention_completed``.
+    """
+    if ack_result.status != "scope_completed":
+        return ack_result, None
+    outcome, failed_control, assessment = _finalize_completed_autopilot_scope_core(
+        s, session_id=session_id, live=live)
+    if outcome == "failed":
+        assert failed_control is not None
+        return ack_result.model_copy(update={
+            "status": "failed",
+            "state_revision": failed_control.revision,
+            "command": None,
+        }), assessment
     return ack_result, assessment
 
 
@@ -6951,7 +7297,7 @@ def finish_intervention(session_id: str, request: Request,
                     "message": "系统还没有确认本次已按计划做完；请根据现场情况选择其他结束原因，或联系负责人",
                 })
             raise HTTPException(status_code=409, detail={
-                "message": "床旁干预结束门禁未通过；保持当前位置，不切换受试者",
+                "message": "还有环节没有记录，暂不能结束现场训练；本场保持当前位置，不会切换受试者",
                 "assessment": assessment.to_dict(),
             })
 
@@ -7243,7 +7589,7 @@ def complete_session(session_id: str, request: Request, s: DBSession = Depends(g
         plan, assessment = _assess_session_completion(sess, s)
         if not assessment.ready:
             raise HTTPException(status_code=409, detail={
-                "message": "场次完成门禁未通过；保持原位置，不宣布完成",
+                "message": "还有环节未通过核对，暂不能宣布本场最终完成；保持原位置",
                 "assessment": assessment.to_dict(),
             })
 
@@ -8299,7 +8645,7 @@ def _ensure_patient_capture_idle_for_autopilot(live: LiveState | None) -> None:
 def autopilot_start(
         session_id: str, body: AutopilotStartIn, request: Request,
         s: DBSession = Depends(get_session)):
-    """具名研究者只能启动显式开关下的模拟 P0a 窄范围。"""
+    """具名研究者启动服务器自动带练：模拟与真实场次各走各的显式开关。"""
     actor_id = _require_account_identity(
         request, "启动自动驾驶",
         roles={"researcher", "admin", "caregiver_operator"},
@@ -11580,12 +11926,18 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
         # short transaction under the same LiveState/device/control lock order as ACK.
         with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
             with DBSession(db.engine) as route_db:
-                _live_row_for_update(route_db)
-                autopilot_service.route_completed_attempt(
+                live_row = _live_row_for_update(route_db)
+                route_result = autopilot_service.route_completed_attempt(
                     route_db,
                     session_id=session_id,
                     attempt_id=attempt_id,
                 )
+                if route_result.status == "scope_completed":
+                    # The interaction silent-advance completion has no closing
+                    # TTS ACK, so the bedside terminal fact is finalized here,
+                    # in the same transaction as the scope completion route.
+                    _finalize_completed_autopilot_scope_core(
+                        route_db, session_id=session_id, live=live_row)
                 route_db.commit()
     except Exception:
         # If a concurrent worker already routed, this no-ops because state is no

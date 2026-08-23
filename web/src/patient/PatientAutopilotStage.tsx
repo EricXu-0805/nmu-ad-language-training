@@ -127,15 +127,18 @@ export function PatientAutopilotStage({
       ? "正在为您朗读"
       : command.kind === "record" ? "正在准备麦克风" : "正在准备朗读";
 
+  // V2:线索级(prompt_level>0)话术比首问长得多——题图收紧一档(与 legacy
+  // PatientStage 的 cueText 规则同义),长文本与贴底收音区互不遮挡。
+  const compactImage = (displayRef.current?.promptLevel ?? command.prompt_level) > 0;
   return (
     <div className="patient-stage">
       <div className="patient-stage-body">
-        <div className="stage-image">
+        <div className="stage-image" data-compact={compactImage ? "true" : "false"}>
           <ImagePane
             sessionId={sessionId}
             requestKey={command.command_key}
             spotlight="none"
-            compact={false}
+            compact={compactImage}
             alt="题目图片"
             onReadinessChange={autopilot.reportAssetReadiness}
           />

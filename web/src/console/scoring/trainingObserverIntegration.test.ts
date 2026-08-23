@@ -56,8 +56,14 @@ test("manual step controls still exist for the proven no-owner path, outside the
   }
 });
 
-test("observer position and identity come from the exact-session runtime, not local indexes", () => {
-  assert.match(source, /position=\{observerPlanPosition\(runtimeControl\.runtime, session\.session_id, plan\)\}/);
+test("observer position and identity come from the authoritative receipt first, never local indexes", () => {
+  // D3:服务端自动推进不写 live/runtime cursor——serverOwnership 期间观察位置
+  // 必须优先取自动驾驶权威状态回执里的只读位置投影,runtime 只是无回执时的回退。
+  assert.match(source, /const observerPosition = observerAuthoritativePosition\(\s*apReceiptPosition, runtimeControl\.runtime, session\.session_id, plan\)/);
+  assert.match(source, /position=\{observerPosition\}/);
+  assert.match(source, /onReceiptPosition=\{onAutopilotReceiptPosition\}/);
+  // 页首「当前训练任务」在观察模式下同样跟权威位置走,不用停在第 1 题的本地 itemIdx。
+  assert.match(source, /observerMode\s*\?\s*observerPosition\?\.itemLabel \?\? "同步中…"/);
   assert.match(source, /patientCode=\{session\.patient_id\}/);
   assert.match(source, /phase=\{serverOwnership\.phase\}/);
 });
@@ -200,8 +206,14 @@ test("session switch clears transient observer state and no new poller is introd
   // 不能带着旧场次的快照进新场次。
   assert.match(source, /ownershipRef\.current = \{ owned: true, phase: "checking" \};/);
   assert.match(source, /releaseNeedsResync\.current = false;/);
-  // 唯一的 setInterval 仍是既有录音授权周期核查；观察台不新增轮询器。
-  assert.equal((source.match(/setInterval/g) ?? []).length, 1);
+  // setInterval 只允许两个:既有录音授权周期核查 + P1-9 的本地录音计时秒针
+  // (纯渲染时钟,不发任何网络请求)。观察台与 presence 都不新增网络轮询器——
+  // presence 由 ConsoleShell 的既有轮询以 prop 传入。
+  assert.equal((source.match(/setInterval/g) ?? []).length, 2);
+  assert.match(source, /presence: PatientPresenceView;/);
+  const clockBlock = source.slice(source.indexOf("const timer = window.setInterval"),
+    source.indexOf("const timer = window.setInterval") + 120);
+  assert.match(clockBlock, /setClockTick/);
   // 恢复继续走既有 runtime 轮询与恢复门，不额外常驻请求。
   assert.match(source, /resumeBlocked=\{observerMode \|\| Boolean\(apFailure\)\}/);
 });

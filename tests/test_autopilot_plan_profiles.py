@@ -264,7 +264,8 @@ def test_resolution_is_frozen_but_plan_item_display_remains_shallow() -> None:
     assert isinstance(resolved.session_plan.items[0].display, dict)
 
 
-def test_paired_null_resolution_preserves_full_canonical_gap_accounting() -> None:
+def test_paired_null_resolution_preserves_full_canonical_gap_accounting(
+        monkeypatch) -> None:
     bank = _bank()
     resolved = profiles.resolve_requested_profile(
         None,
@@ -278,22 +279,38 @@ def test_paired_null_resolution_preserves_full_canonical_gap_accounting() -> Non
     assert resolved.profile_version_id is None
     assert resolved.profile_definition_digest is None
     assert resolved.completion_scope == "canonical_full_source"
-    # 2026-08-19 内容交付后源协议全量结构化:78 位置全入 canonical 计划,
-    # 无 source-only 缺口;58 个剩余缺口(双要素 10×5 + 多要素 2×4)全部结构化。
+    # 2026-08-21 交互数据包交付后:78 位置全部可执行,canonical 计划零缺口。
     assert resolved.resolved_position_count == 78
-    assert len(resolved.structured_readiness_gaps) == 58
+    assert len(resolved.structured_readiness_gaps) == 0
     assert len(resolved.source_unstructured_gaps) == 0
-    assert resolved.unsupported_position_count == 58
+    assert resolved.unsupported_position_count == 0
     assert resolved.source_protocol_position_count == 78
-    assert resolved.resolved_position_content_ready is False
-    assert resolved.source_unstructured_gaps == tuple(
-        row["source_position_key"]
-        for row in bank.meta["source_unstructured_positions"]
+    assert resolved.resolved_position_content_ready is True
+
+    # 数据包不可用时,58 个双/多要素位置回到独立缺口码(会计口径不撒谎)。
+    def unavailable(week_no, content_dir=None, protocol=None):
+        raise content.FrozenContentUnavailable("测试:数据包不可用")
+
+    monkeypatch.setattr(
+        content, "load_autopilot_interaction_package", unavailable)
+    degraded = profiles.resolve_requested_profile(
+        None,
+        bank=bank,
+        protocol=_protocol(),
+        is_simulation=True,
+        week_no=2,
+        phase_type="正式训练",
+        event_line="正式训练",
     )
+    assert len(degraded.structured_readiness_gaps) == 58
+    assert degraded.unsupported_position_count == 58
+    assert degraded.resolved_position_content_ready is False
+    assert {gap.code for gap in degraded.structured_readiness_gaps} == {
+        "interaction_package_unavailable"}
     assert len(bank.double_element) == 10
     assert [
         (gap.position.item_id, gap.position.turn_seq)
-        for gap in resolved.structured_readiness_gaps
+        for gap in degraded.structured_readiness_gaps
         if gap.position.task_type == "双要素"
     ] == [
         (row["item_id"], turn_seq)

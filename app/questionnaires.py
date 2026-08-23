@@ -305,6 +305,29 @@ class LoadedQuestionnaire(BaseModel):
     content_sha256: str
 
 
+def _slot_label(definition: QuestionnaireDefinition,
+                item_key: str, field_key: str) -> str:
+    """人读的作答位置(锁定拒绝与越域消息用):第 N 题 / 「节」的「要素」。
+
+    施测者屏幕上不出现 (gds_11, value) 这类内部元组;拼不出人话时才退回内部键。
+    """
+    for item in definition.all_items():
+        if item.item_key == item_key:
+            return f"第 {item.no} 题"
+    if item_key.startswith("section:") and field_key.startswith("element:"):
+        section_id = item_key[len("section:"):]
+        element_key = field_key[len("element:"):]
+        section = next((s for s in (definition.sections or [])
+                        if s.section_id == section_id), None)
+        element = None
+        if definition.element_field is not None:
+            element = next((e for e in definition.element_field.elements
+                            if e.element_key == element_key), None)
+        if section is not None and element is not None:
+            return f"「{section.title}」的「{element.label}」"
+    return f"({item_key}, {field_key})"
+
+
 def validate_value_write(
         definition: QuestionnaireDefinition,
         item_key: str, field_key: str, value: str | None) -> None:
@@ -320,20 +343,27 @@ def validate_value_write(
     if value not in set(domain.allowed):
         raise QuestionnaireValidationError(
             "questionnaire_value_out_of_domain",
-            f"({item_key}, {field_key}) 的值必须是 {domain.allowed} 之一")
+            f"{_slot_label(definition, item_key, field_key)}的档位必须是"
+            f" {'、'.join(domain.allowed)} 之一")
 
 
 def assert_lock_complete(
         definition: QuestionnaireDefinition,
         final_values: dict[tuple[str, str], str]) -> None:
-    """锁定完整性：必填全有、值全在域内、symptom_triplet 无矛盾。"""
+    """锁定完整性：必填全有、值全在域内、symptom_triplet 无矛盾。
+
+    problems 面向施测者屏幕(P1-3):写"第 N 题未作答",不写内部元组;
+    错误码字段保持不变,程序仍按 code 分支。
+    """
     problems: list[str] = []
     for (item_key, field_key), domain in definition.expected_fields().items():
         value = final_values.get((item_key, field_key))
+        label = _slot_label(definition, item_key, field_key)
         if value is None:
-            problems.append(f"缺少 ({item_key}, {field_key})")
+            problems.append(
+                f"{label}未评" if label.startswith("「") else f"{label}未作答")
         elif value not in set(domain.allowed):
-            problems.append(f"({item_key}, {field_key}) 值 {value!r} 越域")
+            problems.append(f"{label}的记录值 {value!r} 不在允许档位内")
     if definition.response_kind == "symptom_triplet":
         conditional = definition.conditional_fields()
         for item in definition.all_items():
@@ -342,28 +372,29 @@ def assert_lock_complete(
             frequency = final_values.get((item.item_key, FIELD_FREQUENCY))
             if present == "有":
                 if severity is None:
-                    problems.append(f"条目 {item.item_key} 记为“有”但缺严重度")
+                    problems.append(f"第 {item.no} 题记为“有”但缺严重度")
                 elif severity not in set(
                         conditional[(item.item_key, FIELD_SEVERITY)].allowed):
-                    problems.append(f"条目 {item.item_key} 严重度越域")
+                    problems.append(f"第 {item.no} 题的严重度不在允许档位内")
                 if frequency is None:
-                    problems.append(f"条目 {item.item_key} 记为“有”但缺频率")
+                    problems.append(f"第 {item.no} 题记为“有”但缺频率")
                 elif frequency not in set(
                         conditional[(item.item_key, FIELD_FREQUENCY)].allowed):
-                    problems.append(f"条目 {item.item_key} 频率越域")
+                    problems.append(f"第 {item.no} 题的频率不在允许档位内")
             elif present == "无":
                 if severity is not None or frequency is not None:
                     problems.append(
-                        f"条目 {item.item_key} 记为“无”却带严重度/频率——先清除再锁定")
+                        f"第 {item.no} 题记为“无”却带严重度/频率——先清除再锁定")
     # 域外键：终值集合里出现定义外的键 = 数据被绕过校验写入，锁定拒绝。
     known = set(definition.expected_fields()) | set(definition.conditional_fields())
     for key in final_values:
         if key not in known:
-            problems.append(f"存在定义外的作答键 {key}")
+            problems.append(
+                f"出现了定义之外的作答记录 ({key[0]}, {key[1]})，请联系管理员核查")
     if problems:
         raise QuestionnaireValidationError(
             "questionnaire_lock_incomplete",
-            "作答尚不满足锁定完整性合同", problems=problems)
+            "还有条目未完成或存在矛盾，暂不能锁定", problems=problems)
 
 
 def compute_scoring(

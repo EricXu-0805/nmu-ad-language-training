@@ -5,6 +5,7 @@ import copy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta
+from itertools import count as _itertools_count
 import json
 import threading
 
@@ -15,17 +16,21 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import (autopilot_ledger, autopilot_orchestration,
                  autopilot_plan_profiles, content, evidence_ledger,
-                 repeat_intent)
+                 repeat_intent, runtime)
 from app.autopilot_contract import (
     AutopilotAckIn,
     RecordCommandPayload,
     TtsCommandPayload,
 )
 from app.autopilot_service import (
+    INTERACTION_CUE_TYPE,
     P0A_FEATURE_ENV,
     P0A_SCOPE_KEY,
+    REAL_SESSIONS_ENV,
+    _select_p0a_content,
     AutopilotServiceError,
     acknowledge_device_drain,
+    authorize_recording_command,
     apply_device_ack,
     fence_autonomous_scope_for_external_stop,
     get_autopilot_status,
@@ -1012,27 +1017,47 @@ def test_legacy_runtime_command_binding_is_not_replayed(
         assert caught.value.code == "autopilot_command_binding_missing"
 
 
-def test_start_rejects_default_week2_plan_before_taking_control(
+def test_start_admits_default_week2_plan_with_interaction_packages(
         service_engine, monkeypatch):
-    """2026-08-19 内容交付后源协议全量结构化：剩余缺口全部是结构化协议缺口，
-    仍要求在取得控制权之前全量清点并拒绝。"""
+    """2026-08-21 交互数据包交付后：78 个位置全部可执行，完整周计划放行准入，
+    首条命令仍是第一题（单要素）的冻结问句。"""
     _enable_p0a(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=BANK)
+        created = _start(db, bank=BANK)
+        db.commit()
+        assert created.replayed is False
+        assert created.status == "waiting_tts"
+        assert created.command is not None
+        assert created.command.kind == "tts"
+        assert created.command.payload.purpose == "question"
+        assert created.command.payload.speech_text == (
+            BANK.single_element[0]["initial_prompt"])
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "waiting_tts"
+
+
+def test_start_still_rejects_full_plan_when_interaction_package_unavailable(
+        service_engine, monkeypatch):
+    """数据包装载被拆掉时，双/多要素位置回到独立缺口码并拒绝整周准入。"""
+    _enable_p0a(monkeypatch)
+
+    def unavailable(week_no, content_dir=None, protocol=None):
+        raise content.FrozenContentUnavailable("测试:数据包不可用")
+
+    monkeypatch.setattr(
+        content, "load_autopilot_interaction_package", unavailable)
     with Session(service_engine) as db:
         _seed_ready(db, bank=BANK)
         with pytest.raises(AutopilotServiceError) as caught:
             _start(db, bank=BANK)
         assert caught.value.code == "autopilot_plan_not_fully_supported"
-        assert caught.value.context == {
-            "unsupported_position_count": 58,
-            "structured_unsupported_position_count": 58,
-            "source_unstructured_position_count": 0,
-            "source_protocol_position_count": 78,
-            "first_gap": {
-                "code": "operational_protocol_unavailable",
-                "item_id": "DE_烟灰缸+烟",
-                "turn_seq": 1,
-                "response_role": "左命名",
-            },
+        assert caught.value.context["unsupported_position_count"] == 58
+        assert caught.value.context["first_gap"] == {
+            "code": "interaction_package_unavailable",
+            "item_id": "DE_烟灰缸+烟",
+            "turn_seq": 1,
+            "response_role": "左命名",
         }
         db.rollback()
         assert db.get(SessionAutopilotState, SESSION_ID) is None
@@ -1130,6 +1155,8 @@ def test_account_status_is_minimal_and_preserves_server_ownership(
             "server_owned": False,
             "takeover_ready": False,
             "current_command_kind": None,
+            "position_item_id": None,
+            "position_turn_seq": None,
             "last_error_code": None,
         }
 
@@ -1144,6 +1171,8 @@ def test_account_status_is_minimal_and_preserves_server_ownership(
             "server_owned": True,
             "takeover_ready": False,
             "current_command_kind": "tts",
+            "position_item_id": FIRST_ONLY_BANK.single_element[0]["item_id"],
+            "position_turn_seq": 1,
             "last_error_code": None,
         }
         assert _all_keys(active.model_dump()).isdisjoint({
@@ -1179,7 +1208,7 @@ def test_account_status_is_minimal_and_preserves_server_ownership(
 @pytest.mark.parametrize(
     ("mutation", "expected_code"),
     [
-        ("research_session", "autopilot_simulation_required"),
+        ("research_session", "autopilot_real_sessions_disabled"),
         ("wrong_classification", "autopilot_classification_invalid"),
         ("plain_patient", "autopilot_simulation_subject_required"),
         ("consent_denied", "autopilot_consent_denied"),
@@ -3441,6 +3470,8 @@ def test_account_status_disabled_is_canonical_and_active_state_is_consistent(
             "server_owned": False,
             "takeover_ready": False,
             "current_command_kind": None,
+            "position_item_id": None,
+            "position_turn_seq": None,
             "last_error_code": None,
         }
 
@@ -3715,3 +3746,1108 @@ def test_autopilot_state_cannot_persist_those_statuses_without_a_command(
         db.rollback()
         assert db.get(
             SessionAutopilotState, SESSION_ID).status == "waiting_recording"
+
+
+# ===========================================================================
+# 交互数据包驱动的双要素(Shape B)/多要素(Shape C)自动带练引擎。
+# ===========================================================================
+
+
+DOUBLE_ONLY_BANK = replace(
+    BANK,
+    single_element=[],
+    double_element=copy.deepcopy(BANK.double_element[:1]),
+    multi_element=[],
+    meta=_test_subset_meta(5),
+)
+MULTI_ONLY_BANK = replace(
+    BANK,
+    single_element=[],
+    double_element=[],
+    multi_element=copy.deepcopy(BANK.multi_element[:1]),
+    meta=_test_subset_meta(4),
+)
+REAL_WK2_PACKAGE = content.load_autopilot_interaction_package(
+    2, protocol=PROTOCOL)
+_IX_STEP = _itertools_count(1)
+
+
+def _ix_now() -> datetime:
+    """严格单调的驱动时钟:每步 60s,保证回执/收据永远晚于命令发行。"""
+    return NOW + timedelta(seconds=60 * next(_IX_STEP))
+
+
+def _subset_interaction_package(bank: content.ItemBank) -> dict:
+    package = copy.deepcopy(REAL_WK2_PACKAGE)
+    keep = {row["item_id"]
+            for row in (*bank.double_element, *bank.multi_element)}
+    package["items"] = [
+        item for item in package["items"] if item["item_id"] in keep]
+    package["parent_item_bank_definition_digest"] = (
+        content.item_bank_definition_digest(bank))
+    return package
+
+
+def _install_package(monkeypatch, bank: content.ItemBank) -> dict:
+    package = _subset_interaction_package(bank)
+    assert content.validate_autopilot_interaction_package(
+        package, bank, PROTOCOL) == []
+    monkeypatch.setattr(
+        content, "load_autopilot_interaction_package",
+        lambda week_no, content_dir=None, protocol=None: copy.deepcopy(package))
+    return package
+
+
+def _next_device_event_seq(db: Session) -> int:
+    latest = db.exec(select(RuntimeCommandAck).where(
+        RuntimeCommandAck.session_id == SESSION_ID,
+        RuntimeCommandAck.device_id_hash == DEVICE_HASH,
+    ).order_by(RuntimeCommandAck.device_event_seq.desc())).first()
+    return latest.device_event_seq + 1 if latest is not None else 1
+
+
+def _current_command(db: Session) -> RuntimeCommand:
+    state = db.get(SessionAutopilotState, SESSION_ID)
+    assert state is not None and state.current_command_id is not None
+    command = db.get(RuntimeCommand, state.current_command_id)
+    assert command is not None
+    return command
+
+
+def _ix_tts_ended(db: Session, tts: RuntimeCommand, *, bank: content.ItemBank):
+    now = _ix_now()
+    result = _apply_ack(db, tts, AutopilotAckIn(
+        idempotency_key=f"ack-ix-tts-ended-{now.timestamp():.0f}",
+        ack_type="tts_ended",
+        control_generation=tts.control_generation,
+        runner_generation=tts.runner_generation,
+        command_revision=tts.revision,
+        device_event_seq=_next_device_event_seq(db),
+        media_ended=True,
+    ), bank=bank, now=now)
+    db.commit()
+    return result
+
+
+def _ix_record_stopped(db: Session, record: RuntimeCommand,
+                       *, bank: content.ItemBank) -> None:
+    now = _ix_now()
+    step = next(_IX_STEP)
+    checksum = format(step, "x").rjust(64, "0")
+    byte_count = 4096 + step
+    raw_audio_id = record.expected_raw_audio_id
+    assert raw_audio_id is not None
+    asset = db.get(AudioAssetRow, raw_audio_id)
+    assert asset is not None
+    asset.checksum = checksum
+    asset.byte_count = byte_count
+    asset.uploaded_at = now + timedelta(seconds=1)
+    receipt = AudioCaptureReceipt(
+        raw_audio_id=raw_audio_id,
+        session_id=SESSION_ID,
+        turn_key=record.turn_key,
+        received_at=now + timedelta(seconds=1),
+        duration_seconds=2.5,
+        byte_count=byte_count,
+        checksum=checksum,
+        data_classification="simulation",
+        is_simulation=True,
+        contains_direct_identifier=False,
+    )
+    db.add(receipt)
+    db.commit()
+    assert receipt.server_seq is not None
+    result = _apply_ack(db, record, AutopilotAckIn(
+        idempotency_key=f"ack-ix-rec-stop-{step:04d}",
+        ack_type="record_stopped",
+        control_generation=record.control_generation,
+        runner_generation=record.runner_generation,
+        command_revision=record.revision,
+        device_event_seq=_next_device_event_seq(db),
+        raw_audio_id=raw_audio_id,
+        receipt_server_seq=receipt.server_seq,
+        checksum=checksum,
+        byte_count=byte_count,
+        duration_seconds=2.5,
+        stop_reason="user_done",
+    ), bank=bank, now=now + timedelta(seconds=2))
+    db.commit()
+    assert result.status == "processing_attempt"
+
+
+def _ix_seed_judged_attempt(
+    db: Session,
+    record: RuntimeCommand,
+    *,
+    answer_type: str,
+    target_hit: bool,
+    response_role: str,
+    cue_type: str | None = None,
+    asr_text: str = "测试回答",
+) -> AttemptEvent:
+    score = 1.0 if target_hit else 0.5 if answer_type == "部分正确" else 0.0
+    attempt = AttemptEvent(
+        session_id=SESSION_ID,
+        item_id=record.item_id,
+        turn_seq=record.turn_seq,
+        response_role=response_role,
+        attempt_seq=record.attempt_seq,
+        raw_audio_id=record.expected_raw_audio_id,
+        prompt_level=record.prompt_level,
+        cue_type=cue_type,
+        duration_seconds=2.5,
+        asr_text=asr_text,
+        asr_confidence=0.91,
+        asr_engine_version="test-asr-v1",
+        operational_answer_type=answer_type,
+        operational_score=score,
+        operational_needs_review=True,
+        judge_mode="版本化规则",
+        judge_engine_version="rubric/test-r1",
+        judge_reason=None,
+        matched_on="target" if target_hit else "none",
+        contains_target=target_hit,
+        judge_portrait_used=False,
+        processing_status="completed",
+        processing_generation=1,
+        processed_at=_ix_now(),
+        created_at=NOW + timedelta(seconds=2),
+        is_simulation=True,
+    )
+    db.add(attempt)
+    db.flush()
+    assert attempt.id is not None
+    latest_event = db.exec(select(InteractionEvent).where(
+        InteractionEvent.session_id == SESSION_ID,
+    ).order_by(InteractionEvent.event_seq.desc())).first()
+    db.add(InteractionEvent(
+        session_id=SESSION_ID,
+        event_seq=(latest_event.event_seq + 1 if latest_event else 1),
+        item_id=attempt.item_id,
+        turn_seq=attempt.turn_seq,
+        attempt_id=attempt.id,
+        attempt_seq=attempt.attempt_seq,
+        event_type="judgement_completed",
+        payload_json=evidence_ledger.encode_event_payload(
+            "judgement_completed", {
+                "answer_type": answer_type,
+                "score": score,
+                "needs_review": True,
+                "judge_mode": "版本化规则",
+                "judge_engine_version": "rubric/test-r1",
+                "matched_on": attempt.matched_on,
+                "contains_target": target_hit,
+                "truth_scope": "operational_only",
+            }),
+        created_at=NOW + timedelta(seconds=3),
+        is_simulation=True,
+    ))
+    db.commit()
+    stored = db.get(AttemptEvent, attempt.id)
+    assert stored is not None
+    return stored
+
+
+def _ix_route(db: Session, attempt_id: int, *, bank: content.ItemBank):
+    result = route_completed_attempt(
+        db,
+        session_id=SESSION_ID,
+        attempt_id=attempt_id,
+        bank=bank,
+        protocol=PROTOCOL,
+        now=_ix_now(),
+    )
+    db.commit()
+    return result
+
+
+def _ix_start(db: Session, *, bank: content.ItemBank):
+    # 每个用例自己的时钟从头走:全局累计会超过设备能力 1 小时有效期。
+    global _IX_STEP
+    _IX_STEP = _itertools_count(1)
+    created = _start(db, bank=bank)
+    db.commit()
+    return created
+
+
+def _ix_answer_current_record(
+    db: Session, *, bank: content.ItemBank, answer_type: str,
+    target_hit: bool, response_role: str, cue_type: str | None = None,
+    asr_text: str = "测试回答",
+) -> AttemptEvent:
+    record = _current_command(db)
+    assert record.kind == "record"
+    _ix_record_stopped(db, record, bank=bank)
+    record = db.get(RuntimeCommand, record.id)
+    return _ix_seed_judged_attempt(
+        db, record, answer_type=answer_type, target_hit=target_hit,
+        response_role=response_role, cue_type=cue_type, asr_text=asr_text)
+
+
+def _namefix(side: str, bank: content.ItemBank) -> str:
+    word = bank.double_element[0][f"{side}_word"]
+    return PROTOCOL["double"][f"namefix_{side}"].replace("【物品名】", word)
+
+
+def _command_stream(db: Session) -> list[tuple]:
+    rows = list(db.exec(select(RuntimeCommand).order_by(
+        RuntimeCommand.command_seq)))
+    stream = []
+    for row in rows:
+        if row.kind == "tts":
+            payload = json.loads(row.payload_json)
+            stream.append((
+                "tts", payload["purpose"], row.turn_key, row.prompt_level,
+                row.attempt_seq, payload["speech_text"],
+                payload.get("response_path")))
+        else:
+            stream.append((
+                "record", None, row.turn_key, row.prompt_level,
+                row.attempt_seq, None, None))
+    return stream
+
+
+def test_shape_b_full_hit_advances_silently_and_issues_next_question(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, DOUBLE_ONLY_BANK)
+    item_id = DOUBLE_ONLY_BANK.double_element[0]["item_id"]
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=DOUBLE_ONLY_BANK)
+        created = _ix_start(db, bank=DOUBLE_ONLY_BANK)
+        assert created.command is not None
+        assert created.command.payload.purpose == "question"
+        assert created.command.payload.speech_text == (
+            "请看这张图片，您能告诉我图上左边的物品是什么吗？")
+
+        tts = _current_command(db)
+        routed = _ix_tts_ended(db, tts, bank=DOUBLE_ONLY_BANK)
+        assert routed.status == "waiting_recording"
+        attempt = _ix_answer_current_record(
+            db, bank=DOUBLE_ONLY_BANK, answer_type="正确", target_hit=True,
+            response_role="左命名")
+        result = _ix_route(db, attempt.id, bank=DOUBLE_ONLY_BANK)
+        # 命中:无口头反馈,直接推进并下发下一环节问句。
+        assert result.status == "waiting_tts"
+        assert result.replayed is False
+        assert result.command is not None
+        assert result.command.kind == "tts"
+        assert result.command.payload.purpose == "question"
+        assert result.command.turn_seq == 2
+        assert result.command.payload.speech_text == "请告诉我它有什么作用或特点？"
+        # 命中环节仍然收口一条 TurnEvent(自动执行永不写研究真值)。
+        items = list(db.exec(select(ItemEvent)))
+        turns = list(db.exec(select(TurnEvent)))
+        assert len(items) == 1 and items[0].item_id == item_id
+        assert len(turns) == 1
+        assert turns[0].turn_seq == 1
+        assert turns[0].response_role == "左命名"
+        assert turns[0].ai_score == 1.0
+        assert turns[0].score_locked is False
+        assert turns[0].reviewed_score is None
+        # 重放同一 attempt:幂等返回同一条下一问命令。
+        replay = _ix_route(db, attempt.id, bank=DOUBLE_ONLY_BANK)
+        assert replay.replayed is True
+        assert replay.status == "waiting_tts"
+        assert replay.command.command_key == result.command.command_key
+        assert len(list(db.exec(select(TurnEvent)))) == 1
+
+
+def test_shape_b_miss_speaks_correction_then_advances(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, DOUBLE_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=DOUBLE_ONLY_BANK)
+        _ix_start(db, bank=DOUBLE_ONLY_BANK)
+        _ix_tts_ended(db, _current_command(db), bank=DOUBLE_ONLY_BANK)
+        attempt = _ix_answer_current_record(
+            db, bank=DOUBLE_ONLY_BANK, answer_type="偏题", target_hit=False,
+            response_role="左命名")
+        result = _ix_route(db, attempt.id, bank=DOUBLE_ONLY_BANK)
+        assert result.status == "waiting_tts"
+        assert result.command.payload.purpose == "tell_answer"
+        assert result.command.turn_seq == 1
+        assert result.command.prompt_level == 3
+        assert result.command.attempt_seq == 1
+        assert result.command.payload.speech_text == _namefix(
+            "left", DOUBLE_ONLY_BANK)
+        # 纠正句读完:tts_ended → advance → 下一环节问句。
+        tell = _current_command(db)
+        routed = _ix_tts_ended(db, tell, bank=DOUBLE_ONLY_BANK)
+        assert routed.status == "waiting_tts"
+        assert routed.command is not None
+        assert routed.command.payload.purpose == "question"
+        assert routed.command.turn_seq == 2
+        # 未命中也收口 TurnEvent。
+        turns = list(db.exec(select(TurnEvent)))
+        assert len(turns) == 1 and turns[0].ai_score == 0.0
+
+
+def test_shape_b_llm_semantic_correct_without_lexical_hit_does_not_advance(
+        service_engine, monkeypatch):
+    """推进成败只认二值 contains_target;语义"正确"但词法未命中仍走纠正。"""
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, DOUBLE_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=DOUBLE_ONLY_BANK)
+        _ix_start(db, bank=DOUBLE_ONLY_BANK)
+        _ix_tts_ended(db, _current_command(db), bank=DOUBLE_ONLY_BANK)
+        attempt = _ix_answer_current_record(
+            db, bank=DOUBLE_ONLY_BANK, answer_type="正确", target_hit=False,
+            response_role="左命名")
+        result = _ix_route(db, attempt.id, bank=DOUBLE_ONLY_BANK)
+        assert result.command.payload.purpose == "tell_answer"
+
+
+def test_shape_b_five_turns_complete_scope_with_one_item_five_turn_events(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, DOUBLE_ONLY_BANK)
+    item_id = DOUBLE_ONLY_BANK.double_element[0]["item_id"]
+    roles = ("左命名", "左作用", "右命名", "右作用", "关系识别")
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=DOUBLE_ONLY_BANK)
+        _ix_start(db, bank=DOUBLE_ONLY_BANK)
+        last_result = None
+        for index, role in enumerate(roles):
+            tts = _current_command(db)
+            assert tts.kind == "tts" and tts.turn_seq == index + 1
+            _ix_tts_ended(db, tts, bank=DOUBLE_ONLY_BANK)
+            attempt = _ix_answer_current_record(
+                db, bank=DOUBLE_ONLY_BANK, answer_type="正确",
+                target_hit=True, response_role=role)
+            last_result = _ix_route(db, attempt.id, bank=DOUBLE_ONLY_BANK)
+        assert last_result is not None
+        assert last_result.status == "scope_completed"
+        assert last_result.command is None
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        assert state.status == "scope_completed"
+        assert state.current_command_id is None
+        events = list(db.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.event_type == "scope_complete")))
+        assert len(events) == 1
+        # 研究行面:1 双要素题 = 1 ItemEvent + 5 TurnEvent,评分键与冻结计划一致。
+        items = list(db.exec(select(ItemEvent)))
+        assert len(items) == 1
+        assert items[0].item_id == item_id
+        assert getattr(items[0].task_type, "value", items[0].task_type) == "双要素"
+        turns = sorted(
+            db.exec(select(TurnEvent)), key=lambda turn: turn.turn_seq)
+        assert [turn.turn_seq for turn in turns] == [1, 2, 3, 4, 5]
+        assert [turn.response_role for turn in turns] == list(roles)
+        plan = runtime.build_session_plan(DOUBLE_ONLY_BANK, 2, "正式训练")
+        assert [
+            plan_turn.scoring_key for plan_turn in plan.items[0].turns
+        ] == ["left_name", "left_function", "right_name", "right_function",
+              "relation"]
+        assert all(turn.score_locked is False for turn in turns)
+        assert all(turn.reviewed_score is None for turn in turns)
+        # 全命中场次的完整命令流水:每环节 question+record,无反馈 TTS。
+        stream = _command_stream(db)
+        assert [entry[:2] for entry in stream] == [
+            ("tts", "question"), ("record", None),
+        ] * 5
+        # 幂等重放 scope 完成。
+        final_attempt = db.exec(select(AttemptEvent).where(
+            AttemptEvent.turn_seq == 5)).first()
+        replay = _ix_route(db, final_attempt.id, bank=DOUBLE_ONLY_BANK)
+        assert replay.replayed is True
+        assert replay.status == "scope_completed"
+        assert replay.command is None
+
+
+def test_shape_c_full_first_recording_speaks_feedback_then_advances(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, MULTI_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=MULTI_ONLY_BANK)
+        created = _ix_start(db, bank=MULTI_ONLY_BANK)
+        assert created.command.payload.speech_text == (
+            "您好，您看看这张图片，这里像是什么地方？")
+        _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        attempt = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="正确", target_hit=True,
+            response_role="情境")
+        result = _ix_route(db, attempt.id, bank=MULTI_ONLY_BANK)
+        assert result.status == "waiting_tts"
+        assert result.command.payload.purpose == "feedback"
+        assert result.command.prompt_level == 0
+        assert result.command.attempt_seq == 1
+        assert result.command.payload.speech_text == "很好，您观察得很准确。"
+        assert result.command.payload.response_path is None
+        routed = _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        assert routed.command.payload.purpose == "question"
+        assert routed.command.turn_seq == 2
+
+
+def test_shape_c_wrong_first_recording_cues_and_rerecords(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, MULTI_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=MULTI_ONLY_BANK)
+        _ix_start(db, bank=MULTI_ONLY_BANK)
+        _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        attempt = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="未识别", target_hit=False,
+            response_role="情境")
+        result = _ix_route(db, attempt.id, bank=MULTI_ONLY_BANK)
+        assert result.command.payload.purpose == "cue"
+        assert result.command.prompt_level == 1
+        assert result.command.attempt_seq == 2
+        assert result.command.payload.response_path == "unknown"
+        assert result.command.payload.speech_text == (
+            "您再看看上边的指示牌，上面写着什么？")
+        # cue 读完 → 第二次录音。
+        routed = _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        assert routed.status == "waiting_recording"
+        record = _current_command(db)
+        assert record.kind == "record"
+        assert record.prompt_level == 1 and record.attempt_seq == 2
+        # 第二次仍错(含沉默同路):告知句 → 推进。
+        attempt2 = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="未识别", target_hit=False,
+            response_role="情境", cue_type=INTERACTION_CUE_TYPE)
+        result2 = _ix_route(db, attempt2.id, bank=MULTI_ONLY_BANK)
+        assert result2.command.payload.purpose == "tell_answer"
+        assert result2.command.prompt_level == 3
+        assert result2.command.attempt_seq == 2
+        assert result2.command.payload.speech_text == (
+            "您看上面的这个牌子，上面写着‘动物园’，所以这里是动物园。")
+        # 只有第二次(终值)收口 TurnEvent,中间失败尝试只在逐次账本。
+        turns = list(db.exec(select(TurnEvent)))
+        assert len(turns) == 1
+        assert turns[0].prompt_level == 1
+        assert turns[0].cue_type == INTERACTION_CUE_TYPE
+
+
+def test_shape_c_full_after_rerecord_speaks_path_bound_feedback(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, MULTI_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=MULTI_ONLY_BANK)
+        _ix_start(db, bank=MULTI_ONLY_BANK)
+        _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        attempt = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="偏题", target_hit=False,
+            response_role="情境")
+        _ix_route(db, attempt.id, bank=MULTI_ONLY_BANK)
+        _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        attempt2 = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="正确", target_hit=True,
+            response_role="情境", cue_type=INTERACTION_CUE_TYPE)
+        result = _ix_route(db, attempt2.id, bank=MULTI_ONLY_BANK)
+        assert result.command.payload.purpose == "feedback"
+        assert result.command.prompt_level == 1
+        assert result.command.attempt_seq == 2
+        assert result.command.payload.response_path == "unknown"
+        assert result.command.payload.speech_text == "很好，您观察得很准确。"
+
+
+def test_shape_c_silence_first_recording_tells_and_advances(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, MULTI_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=MULTI_ONLY_BANK)
+        _ix_start(db, bank=MULTI_ONLY_BANK)
+        _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        attempt = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="沉默", target_hit=False,
+            response_role="情境", asr_text="")
+        result = _ix_route(db, attempt.id, bank=MULTI_ONLY_BANK)
+        assert result.command.payload.purpose == "tell_answer"
+        assert result.command.prompt_level == 3
+        assert result.command.attempt_seq == 1
+        assert result.command.payload.speech_text == (
+            "您看上面的这个牌子，上面写着‘动物园’，所以这里是动物园。")
+
+
+def test_shape_c_partial_maps_to_close_path_only_with_partial_branch(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, MULTI_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=MULTI_ONLY_BANK)
+        _ix_start(db, bank=MULTI_ONLY_BANK)
+        # 环节1(无 partial 分支):部分正确归 wrong → unknown 路。
+        _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        attempt = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="部分正确", target_hit=False,
+            response_role="情境")
+        result = _ix_route(db, attempt.id, bank=MULTI_ONLY_BANK)
+        assert result.command.payload.purpose == "cue"
+        assert result.command.payload.response_path == "unknown"
+        # 走完环节1(第二次命中)进入环节2(事物,有 partial 分支)。
+        _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        attempt2 = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="正确", target_hit=True,
+            response_role="情境", cue_type=INTERACTION_CUE_TYPE)
+        _ix_route(db, attempt2.id, bank=MULTI_ONLY_BANK)
+        _ix_tts_ended(db, _current_command(db), bank=MULTI_ONLY_BANK)
+        question2 = _current_command(db)
+        assert question2.turn_seq == 1 or question2.turn_seq == 2
+        # 上一步 tts_ended 是反馈(1,2) → advance → 环节2问句;再读问句开麦。
+        if question2.kind == "tts":
+            _ix_tts_ended(db, question2, bank=MULTI_ONLY_BANK)
+        record2 = _current_command(db)
+        assert record2.kind == "record" and record2.turn_seq == 2
+        attempt3 = _ix_answer_current_record(
+            db, bank=MULTI_ONLY_BANK, answer_type="部分正确", target_hit=False,
+            response_role="事物")
+        result3 = _ix_route(db, attempt3.id, bank=MULTI_ONLY_BANK)
+        assert result3.command.payload.purpose == "cue"
+        assert result3.command.payload.response_path == "close"
+        assert result3.command.payload.speech_text == (
+            "非常好，图中有小兔子。您再看看，栅栏后面还有什么动物？")
+
+
+def test_interaction_tts_semantics_reject_out_of_table_cells(
+        service_engine, monkeypatch):
+    _enable_p0a(monkeypatch)
+    package = _install_package(monkeypatch, DOUBLE_ONLY_BANK)
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=DOUBLE_ONLY_BANK)
+        train_session = db.get(TrainSession, SESSION_ID)
+        selected = _select_p0a_content(
+            train_session, DOUBLE_ONLY_BANK, PROTOCOL,
+            item_id=DOUBLE_ONLY_BANK.double_element[0]["item_id"],
+            turn_seq=1, interaction_package=package)
+        item_id = selected.item_id
+
+        def command_for(purpose, level, seq, speech, path=None):
+            fields = {
+                "speech_key": "p0a.test.1",
+                "speech_text": speech,
+                "purpose": purpose,
+                "item_id": item_id,
+                "turn_seq": 1,
+                "cue_level": level,
+            }
+            if path is not None:
+                fields["response_path"] = path
+            payload = TtsCommandPayload.model_validate(fields)
+            command = RuntimeCommand(
+                idempotency_key="cmd-semantics-probe",
+                session_id=SESSION_ID,
+                command_seq=1,
+                item_id=item_id,
+                turn_seq=1,
+                turn_key=f"{item_id}#1",
+                attempt_seq=seq,
+                prompt_level=level,
+                scope_key=P0A_SCOPE_KEY,
+                control_generation=1,
+                runner_generation=1,
+                issued_capability_token_hash=CAPABILITY_HASH,
+                issued_device_id_hash=DEVICE_HASH,
+                issued_at=NOW,
+                kind="tts",
+                state="pending",
+                payload_json=payload.model_dump_json(exclude_none=True),
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            return command, payload
+
+        from app.autopilot_service import _validate_tts_semantics
+
+        question = selected.question_text
+        tell = _namefix("left", DOUBLE_ONLY_BANK)
+        # 合法格:question(0,1) 与 tell_answer(3,1)。
+        _validate_tts_semantics(
+            *command_for("question", 0, 1, question), selected)
+        _validate_tts_semantics(
+            *command_for("tell_answer", 3, 1, tell), selected)
+        # Shape B 表外格全部拒绝。
+        for purpose, level, seq, speech, path in (
+            ("feedback", 0, 1, question, None),      # full 分支是静默推进
+            ("cue", 1, 2, tell, "unknown"),          # 本环节没有重录分支
+            ("cue", 2, 3, tell, None),               # 交互环节没有二级提示
+            ("tell_answer", 3, 3, tell, None),       # 交互环节没有第三次录音
+            ("question", 0, 1, tell, None),          # 话术与冻结问句不一致
+        ):
+            with pytest.raises(AutopilotServiceError) as caught:
+                _validate_tts_semantics(
+                    *command_for(purpose, level, seq, speech, path), selected)
+            assert caught.value.code == "autopilot_command_invalid"
+
+
+def test_shape_b_record_completed_scope_supports_drain_and_takeover(
+        service_engine, monkeypatch):
+    """静默推进收尾的 scope(最后命令是 record)也要能派生收麦目标/接管。"""
+    _enable_p0a(monkeypatch)
+    _install_package(monkeypatch, DOUBLE_ONLY_BANK)
+    roles = ("左命名", "左作用", "右命名", "右作用", "关系识别")
+    with Session(service_engine) as db:
+        _seed_ready(db, bank=DOUBLE_ONLY_BANK)
+        _ix_start(db, bank=DOUBLE_ONLY_BANK)
+        for role in roles:
+            _ix_tts_ended(db, _current_command(db), bank=DOUBLE_ONLY_BANK)
+            attempt = _ix_answer_current_record(
+                db, bank=DOUBLE_ONLY_BANK, answer_type="正确",
+                target_hit=True, response_role=role)
+            _ix_route(db, attempt.id, bank=DOUBLE_ONLY_BANK)
+        status = get_autopilot_status(db, session_id=SESSION_ID)
+        assert status.status == "scope_completed"
+        assert status.takeover_ready is True
+        last_record = db.exec(select(RuntimeCommand).where(
+            RuntimeCommand.kind == "record",
+        ).order_by(RuntimeCommand.command_seq.desc())).first()
+        target = get_drain_target(
+            db,
+            session_id=SESSION_ID,
+            capability_token_hash=CAPABILITY_HASH,
+        )
+        assert target.command_key == last_record.idempotency_key
+
+
+def test_frozen_attempt_context_generalizes_to_interaction_positions(
+        monkeypatch):
+    """orchestration 权威输入推导:双/多要素环节的角色与 cue_type 口径。"""
+    from types import SimpleNamespace
+
+    _install_package(monkeypatch, DOUBLE_ONLY_BANK)
+    session = TrainSession(
+        session_id="S-CTX",
+        patient_id="P-CTX",
+        week_no=2,
+        phase_type=PhaseType.正式训练,
+        event_line=EventLine.正式训练,
+        item_bank_version_id=DOUBLE_ONLY_BANK.version_id,
+        is_simulation=True,
+        data_classification="simulation",
+    )
+    item_id = DOUBLE_ONLY_BANK.double_element[0]["item_id"]
+    record = SimpleNamespace(item_id=item_id, turn_seq=1, prompt_level=0)
+    role, cue_type = autopilot_orchestration._frozen_attempt_context(
+        session, record, DOUBLE_ONLY_BANK, PROTOCOL)
+    assert (role, cue_type) == ("左命名", None)
+    # Shape B 环节没有第二次录音:一级录音命令是伪造链,拒绝。
+    forged = SimpleNamespace(item_id=item_id, turn_seq=1, prompt_level=1)
+    with pytest.raises(
+            autopilot_orchestration.AutopilotOrchestrationError) as caught:
+        autopilot_orchestration._frozen_attempt_context(
+            session, forged, DOUBLE_ONLY_BANK, PROTOCOL)
+    assert caught.value.code == "autopilot_attempt_plan_mismatch"
+
+    _install_package(monkeypatch, MULTI_ONLY_BANK)
+    multi_session = TrainSession(
+        session_id="S-CTX-M",
+        patient_id="P-CTX-M",
+        week_no=2,
+        phase_type=PhaseType.正式训练,
+        event_line=EventLine.正式训练,
+        item_bank_version_id=MULTI_ONLY_BANK.version_id,
+        is_simulation=True,
+        data_classification="simulation",
+    )
+    multi_id = MULTI_ONLY_BANK.multi_element[0]["item_id"]
+    first = SimpleNamespace(item_id=multi_id, turn_seq=1, prompt_level=0)
+    assert autopilot_orchestration._frozen_attempt_context(
+        multi_session, first, MULTI_ONLY_BANK, PROTOCOL) == ("情境", None)
+    second = SimpleNamespace(item_id=multi_id, turn_seq=1, prompt_level=1)
+    assert autopilot_orchestration._frozen_attempt_context(
+        multi_session, second, MULTI_ONLY_BANK, PROTOCOL) == (
+        "情境", INTERACTION_CUE_TYPE)
+    # 多要素环节4(动作)max_recordings=1:一级录音同样拒绝。
+    no_retry = SimpleNamespace(item_id=multi_id, turn_seq=4, prompt_level=1)
+    with pytest.raises(
+            autopilot_orchestration.AutopilotOrchestrationError) as caught:
+        autopilot_orchestration._frozen_attempt_context(
+            multi_session, no_retry, MULTI_ONLY_BANK, PROTOCOL)
+    assert caught.value.code == "autopilot_attempt_plan_mismatch"
+
+
+def test_week3_interaction_selection_works_with_real_weekly_content():
+    """周闸放宽到协议∩题库支持周:第 3 周真实题库+数据包可选出交互内容。"""
+    week3_bank = content.load_item_bank_for_week(3)
+    week3_package = content.load_autopilot_interaction_package(
+        3, protocol=PROTOCOL)
+    assert content.validate_autopilot_interaction_package(
+        week3_package, week3_bank, PROTOCOL) == []
+    session = TrainSession(
+        session_id="S-WK3",
+        patient_id="P-WK3",
+        week_no=3,
+        phase_type=PhaseType.正式训练,
+        event_line=EventLine.正式训练,
+        item_bank_version_id=week3_bank.version_id,
+        item_bank_definition_digest=(
+            content.item_bank_definition_digest(week3_bank)),
+        autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
+        autopilot_protocol_definition_digest=(
+            content.autopilot_protocol_definition_digest(PROTOCOL)),
+        is_simulation=True,
+        data_classification="simulation",
+    )
+    first_double = week3_bank.double_element[0]
+    selected = _select_p0a_content(
+        session, week3_bank, PROTOCOL,
+        item_id=first_double["item_id"], turn_seq=1,
+        interaction_package=week3_package)
+    assert selected.task_type == "双要素"
+    assert selected.response_role == "左命名"
+    assert selected.target_word == first_double["left_word"]
+    assert selected.question_text
+    assert selected.branches["full"].kind == "advance_silent"
+    # 第 9 周不存在:周闸拒绝。
+    session_bad = TrainSession(
+        session_id="S-WK9",
+        patient_id="P-WK9",
+        week_no=9,
+        phase_type=PhaseType.正式训练,
+        event_line=EventLine.正式训练,
+        item_bank_version_id=week3_bank.version_id,
+        item_bank_definition_digest=(
+            content.item_bank_definition_digest(week3_bank)),
+        autopilot_protocol_version_id=PROTOCOL["protocol_version_id"],
+        autopilot_protocol_definition_digest=(
+            content.autopilot_protocol_definition_digest(PROTOCOL)),
+        is_simulation=True,
+        data_classification="simulation",
+    )
+    with pytest.raises(AutopilotServiceError) as caught:
+        _select_p0a_content(
+            session_bad, week3_bank, PROTOCOL,
+            item_id=first_double["item_id"], turn_seq=1,
+            interaction_package=week3_package)
+    assert caught.value.code == "autopilot_scope_unsupported"
+
+
+# ---------------------------------------------------------------------------
+# Real research sessions: their own explicit channel, isolated from the two
+# simulation switches, with a hard cloud-processing precondition.
+# ---------------------------------------------------------------------------
+
+CLOUD_PROVIDER_ID = "aliyun-dashscope"
+CLOUD_NOTICE_VERSION = "notice-v1"
+
+
+def _enable_cloud_policy(monkeypatch) -> None:
+    monkeypatch.setenv("CLOUD_PROCESSING_PROVIDER_ID", CLOUD_PROVIDER_ID)
+    monkeypatch.setenv("CLOUD_PROCESSING_NOTICE_VERSION", CLOUD_NOTICE_VERSION)
+
+
+def _set_channels(monkeypatch, channels: str) -> None:
+    monkeypatch.delenv(P0A_FEATURE_ENV, raising=False)
+    monkeypatch.delenv("ALLOW_SIMULATION_DATA", raising=False)
+    monkeypatch.delenv(REAL_SESSIONS_ENV, raising=False)
+    if channels in {"simulation_only", "both"}:
+        _enable_p0a(monkeypatch)
+    if channels in {"real_only", "both"}:
+        monkeypatch.setenv(REAL_SESSIONS_ENV, "1")
+
+
+def _seed_research_ready(db: Session) -> None:
+    """Same ready topology as _seed_ready, reclassified as one real session."""
+    _seed_ready(db)
+    patient = db.get(Patient, PATIENT_ID)
+    patient.is_simulation_subject = False
+    patient.cloud_processing_allowed = True
+    patient.cloud_processing_provider_id = CLOUD_PROVIDER_ID
+    patient.cloud_processing_notice_version = CLOUD_NOTICE_VERSION
+    patient.cloud_processing_consented_at = NOW
+    patient.cloud_processing_revoked_at = None
+    train_session = db.get(TrainSession, SESSION_ID)
+    train_session.is_simulation = False
+    train_session.data_classification = "research"
+    db.add(patient)
+    db.add(train_session)
+    db.commit()
+
+
+@pytest.mark.parametrize(
+    ("channels", "session_kind", "expected"),
+    [
+        ("none", "simulation", "autopilot_p0a_disabled"),
+        # 真实研究场次缺的是 REAL_SESSIONS_ENV:双通道全关时也不得教人开模拟开关。
+        ("none", "research", "autopilot_real_sessions_disabled"),
+        ("simulation_only", "simulation", "started"),
+        ("simulation_only", "research", "autopilot_real_sessions_disabled"),
+        ("real_only", "simulation", "autopilot_p0a_disabled"),
+        ("real_only", "research", "started"),
+        ("both", "simulation", "started"),
+        ("both", "research", "started"),
+    ],
+)
+def test_channel_switch_matrix_keeps_simulation_and_real_sessions_apart(
+        service_engine, monkeypatch, channels, session_kind, expected):
+    _set_channels(monkeypatch, channels)
+    _enable_cloud_policy(monkeypatch)
+    with Session(service_engine) as db:
+        if session_kind == "research":
+            _seed_research_ready(db)
+        else:
+            _seed_ready(db)
+        if expected == "started":
+            result = _start(db)
+            db.commit()
+            assert result.status == "waiting_tts"
+            assert result.replayed is False
+        else:
+            with pytest.raises(AutopilotServiceError) as caught:
+                _start(db)
+            assert caught.value.code == expected
+            db.rollback()
+            assert db.get(SessionAutopilotState, SESSION_ID) is None
+            assert list(db.exec(select(RuntimeCommand))) == []
+
+
+@pytest.mark.parametrize(
+    ("spoil", ), [
+        ("policy_unconfigured", ),
+        ("not_allowed", ),
+        ("provider_mismatch", ),
+        ("notice_mismatch", ),
+        ("consent_missing_timestamp", ),
+        ("revoked", ),
+    ],
+)
+def test_real_session_start_requires_current_cloud_processing_authorization(
+        service_engine, monkeypatch, spoil):
+    _set_channels(monkeypatch, "real_only")
+    _enable_cloud_policy(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_research_ready(db)
+        patient = db.get(Patient, PATIENT_ID)
+        if spoil == "policy_unconfigured":
+            monkeypatch.delenv("CLOUD_PROCESSING_PROVIDER_ID")
+            monkeypatch.delenv("CLOUD_PROCESSING_NOTICE_VERSION")
+        elif spoil == "not_allowed":
+            patient.cloud_processing_allowed = False
+        elif spoil == "provider_mismatch":
+            patient.cloud_processing_provider_id = "some-other-provider"
+        elif spoil == "notice_mismatch":
+            patient.cloud_processing_notice_version = "notice-v0"
+        elif spoil == "consent_missing_timestamp":
+            patient.cloud_processing_consented_at = None
+        elif spoil == "revoked":
+            patient.cloud_processing_revoked_at = NOW
+        db.add(patient)
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as caught:
+            _start(db)
+        assert caught.value.code == "autopilot_cloud_processing_required"
+
+
+def test_real_session_start_rejects_simulation_subject_profile(
+        service_engine, monkeypatch):
+    _set_channels(monkeypatch, "both")
+    _enable_cloud_policy(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_research_ready(db)
+        patient = db.get(Patient, PATIENT_ID)
+        patient.is_simulation_subject = True
+        db.add(patient)
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as caught:
+            _start(db)
+        assert caught.value.code == "autopilot_simulation_subject_forbidden"
+
+
+@pytest.mark.parametrize(
+    ("is_simulation", "data_classification"),
+    [
+        (True, "research"),
+        (False, "simulation"),
+    ],
+)
+def test_unprovable_classification_pairs_are_rejected_with_both_channels_open(
+        service_engine, monkeypatch, is_simulation, data_classification):
+    _set_channels(monkeypatch, "both")
+    _enable_cloud_policy(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_research_ready(db)
+        train_session = db.get(TrainSession, SESSION_ID)
+        train_session.is_simulation = is_simulation
+        train_session.data_classification = data_classification
+        db.add(train_session)
+        db.commit()
+        with pytest.raises(AutopilotServiceError) as caught:
+            _start(db)
+        assert caught.value.code == "autopilot_classification_invalid"
+
+
+def test_real_session_record_chain_carries_research_classification(
+        service_engine, monkeypatch):
+    _set_channels(monkeypatch, "real_only")
+    _enable_cloud_policy(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_research_ready(db)
+        _start(db)
+        db.commit()
+        command = _current_tts(db)
+        ack_key = _complete_tts(db, command)
+        routed = route_tts_ended(
+            db,
+            session_id=SESSION_ID,
+            command_key=command.idempotency_key,
+            ack_idempotency_key=ack_key,
+            bank=FIRST_ONLY_BANK,
+            protocol=PROTOCOL,
+            now=NOW,
+        )
+        db.commit()
+        assert routed.status == "waiting_recording"
+        assert routed.command is not None and routed.command.kind == "record"
+        record = db.exec(select(RuntimeCommand).where(
+            RuntimeCommand.kind == "record",
+        )).one()
+        asset = db.get(AudioAssetRow, record.expected_raw_audio_id)
+        assert asset is not None
+        assert asset.is_simulation is False
+        assert asset.data_classification == "research"
+        # The microphone authorization must state the honest classification.
+        assert authorize_recording_command(
+            db,
+            session_id=SESSION_ID,
+            command_key=record.idempotency_key,
+            capability_token_hash=CAPABILITY_HASH,
+            bank=FIRST_ONLY_BANK,
+            protocol=PROTOCOL,
+            now=NOW,
+        ) is False
+
+
+@pytest.mark.parametrize(
+    ("source", "reason_code", "actor_type"),
+    [
+        ("patient_requested_pause", "patient_requested_pause", "device"),
+        ("subject_withdrawal", "subject_withdrawn", "researcher"),
+        (
+            "cloud_processing_consent_revoked",
+            "cloud_processing_revoked",
+            "system",
+        ),
+    ],
+)
+def test_real_session_external_safety_chain_fences_current_command(
+        service_engine, monkeypatch, source, reason_code, actor_type):
+    _set_channels(monkeypatch, "real_only")
+    _enable_cloud_policy(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_research_ready(db)
+        _start(db)
+        db.commit()
+        command = _current_tts(db)
+        kwargs = {}
+        if actor_type == "device":
+            kwargs.update({
+                "capability_token_hash": CAPABILITY_HASH,
+                "idempotency_token": "real-session-patient-pause-0001",
+            })
+        elif actor_type == "researcher":
+            kwargs["actor_id"] = ACTOR_ID
+
+        assert fence_autonomous_scope_for_external_stop(
+            db,
+            session_id=SESSION_ID,
+            reason_code=reason_code,
+            source=source,
+            actor_type=actor_type,
+            now=NOW + timedelta(seconds=1),
+            **kwargs,
+        )
+        db.commit()
+
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        assert state.status == "paused"
+        assert state.current_command_id is None
+        assert state.last_error_code == reason_code
+        latest = list(db.exec(select(AutopilotControlEvent).order_by(
+            AutopilotControlEvent.event_seq)))[-1]
+        assert latest.event_type == "pause"
+        assert latest.actor_type == actor_type
+        assert json.loads(latest.payload_json) == {
+            "reason_code": reason_code,
+            "source": source,
+        }
+        if source == "subject_withdrawal":
+            # Withdrawal closes the patient device through capability
+            # revocation in the governance transaction; the drain-target
+            # derivation intentionally never serves this source.
+            with pytest.raises(AutopilotServiceError) as refused:
+                get_drain_target(
+                    db,
+                    session_id=SESSION_ID,
+                    capability_token_hash=CAPABILITY_HASH,
+                )
+            assert refused.value.code == "autopilot_drain_target_invalid"
+            return
+        # The fenced command still drains through the one physical closure.
+        target = get_drain_target(
+            db,
+            session_id=SESSION_ID,
+            capability_token_hash=CAPABILITY_HASH,
+        )
+        assert target.command_key == command.idempotency_key
+        drained = acknowledge_device_drain(
+            db,
+            session_id=SESSION_ID,
+            command_key=command.idempotency_key,
+            capability_token_hash=CAPABILITY_HASH,
+            now=NOW + timedelta(seconds=2),
+        )
+        db.commit()
+        assert drained.replayed is False
+
+
+def test_real_session_researcher_takeover_reaches_manual_closure(
+        service_engine, monkeypatch):
+    _set_channels(monkeypatch, "real_only")
+    _enable_cloud_policy(monkeypatch)
+    with Session(service_engine) as db:
+        _seed_research_ready(db)
+        _start(db)
+        db.commit()
+        command = _current_tts(db)
+        assert pause_autonomous_scope_for_researcher(
+            db,
+            session_id=SESSION_ID,
+            actor_id=ACTOR_ID,
+            now=NOW + timedelta(seconds=1),
+        )
+        db.commit()
+        drained = acknowledge_device_drain(
+            db,
+            session_id=SESSION_ID,
+            command_key=command.idempotency_key,
+            capability_token_hash=CAPABILITY_HASH,
+            now=NOW + timedelta(seconds=2),
+        )
+        db.commit()
+        assert drained.replayed is False
+        receipt = takeover_autopilot_to_manual(
+            db,
+            session_id=SESSION_ID,
+            idempotency_key="takeover-real-session-0001",
+            expected_revision=3,
+            actor_id=ACTOR_ID,
+            now=NOW + timedelta(seconds=3),
+        )
+        db.commit()
+        assert receipt.mode == "manual"
+        state = db.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        assert (state.mode, state.status) == ("manual", "paused")
+
+
+def test_attempt_worker_submit_gate_opens_for_either_channel(monkeypatch):
+    ran = threading.Event()
+
+    def _worker(_session_id: str) -> None:
+        ran.set()
+
+    _set_channels(monkeypatch, "none")
+    assert autopilot_orchestration.submit(
+        "S-SUBMIT-CHANNEL-NONE", _worker) is False
+    _set_channels(monkeypatch, "real_only")
+    assert autopilot_orchestration.submit(
+        "S-SUBMIT-CHANNEL-REAL", _worker) is True
+    assert ran.wait(timeout=5)

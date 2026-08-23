@@ -44,8 +44,8 @@ const RELEASE_VISIBILITY_NOTICE: QualityNoticeViewModel = {
   tone: "info",
   title: "当前显示的是一份冻结发布",
   text:
-    "数字来自某一次切纪元时算好并存下的那一版，此后逐字节复读——"
-    + "库里新增的场次、新入组的受试者都不会让它变动。要看新数据必须重新切纪元。",
+    "数字来自某一次更新数据版本时算好并存下的那一版，此后原样复读——"
+    + "库里新增的场次、新入组的受试者都不会让它变动。要看新数据必须更新数据版本。",
 };
 
 const RELEASE_SUPPRESSION_NOTICE: QualityNoticeViewModel = {
@@ -60,12 +60,13 @@ function buildGroup(row: QualityReleaseRow): QualityDashboardGroupViewModel {
   const released = row.suppression.status === "released";
   return {
     key: "frozen-release-overall",
-    heading: "研究分区 overall（冻结发布）",
+    heading: "研究分区总览（冻结发布）",
     classification: "research",
     dimensions: [{
       key: "data_classification", label: "数据分区", value: "研究", known: true,
     }],
     visibilityNotice: RELEASE_VISIBILITY_NOTICE,
+    metricsWithheld: false,
     suppressionNotice: released ? RELEASE_SUPPRESSION_NOTICE : {
       tone: "warn",
       title: "本次没有可发布的数字",
@@ -98,8 +99,8 @@ function buildGroup(row: QualityReleaseRow): QualityDashboardGroupViewModel {
       rateMetric("prompt_escalation_rate", "提示升级率",
                  row.operational.prompt_escalation_rate,
                  "0..2 级提示尝试中升到 1 级或 2 级的占比。"
-                 + "分母有意不含「直接告知答案」——那一档床旁没有留存回执，"
-                 + "把它算进分母会让减法解出它"),
+                 + "分母有意不含「直接告知答案」——那一档床旁没有留存记录，"
+                 + "把它算进分母会让减法反推出它"),
     ],
     safetyMetrics: [],
     latencyMetrics: [

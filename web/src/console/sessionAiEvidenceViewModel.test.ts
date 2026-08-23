@@ -52,7 +52,7 @@ test("buildTtsServeEvidenceSection: a degraded row never claims a cache result, 
   ]);
   assert.equal(section.status, "ready");
   if (section.status !== "ready") return;
-  assert.equal(section.rows[0]!.cacheLabel, "缓存不适用(无服务端音频)");
+  assert.equal(section.rows[0]!.cacheLabel, "缓存不适用(服务器未返回音频)");
   assert.doesNotMatch(section.rows[0]!.cacheLabel, /未命中/);
 });
 
@@ -91,7 +91,7 @@ test("buildConfirmationRevisionTurnViewModel: finalRevision=0 WITH confirmed tex
   if (view.status !== "no_ledger") return;
   assert.doesNotMatch(view.notice, /从未确认/);
   assert.match(view.notice, /已存在确认文本/);
-  assert.match(view.notice, /修订账本未回填/);
+  assert.match(view.notice, /修订记录未补录/);
 });
 
 test("buildConfirmationRevisionTurnViewModel: finalRevision>0 lists every revision entry, content-blind", () => {

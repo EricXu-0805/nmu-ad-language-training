@@ -22,7 +22,7 @@ from . import autopilot_positions, content, runtime
 PROFILE_SCHEMA_VERSION = "autopilot-demo-profile.v1"
 WEEK2_SINGLE20_DEMO_VERSION = "week2-single20-demo-v1"
 WEEK2_SINGLE20_DEMO_DIGEST = (
-    "089c44fc5f20b541b374b24289693e066550acf6999e0b5dc382cd5f10ba71fc"
+    "655e60c654405526a91dce02e3c06403951f3762a018e65c02ecf29541dfbdec"
 )
 _PROFILE_PATH = content.CONTENT_DIR / "autopilot_demo_profiles_v1.json"
 _PROFILE_REGISTRY: dict[str, tuple[Path, str]] = {
@@ -350,6 +350,30 @@ def _source_unstructured_keys(bank: content.ItemBank) -> tuple[str, ...]:
     return tuple(keys)
 
 
+def _interaction_package_for_gap_accounting(
+    bank: content.ItemBank,
+    protocol: dict,
+    week_no: object,
+) -> dict | None:
+    """Load the week's validated interaction package for readiness accounting.
+
+    Accounting only: an unavailable/unbound package simply leaves the
+    double/multi positions as explicit ``interaction_package_unavailable`` gaps;
+    the autopilot admission fence re-validates independently before ownership.
+    """
+    if (not isinstance(week_no, int) or isinstance(week_no, bool)
+            or not 2 <= week_no <= 8):
+        return None
+    try:
+        package = content.load_autopilot_interaction_package(
+            week_no, protocol=protocol)
+    except content.FrozenContentUnavailable:
+        return None
+    if content.validate_autopilot_interaction_package(package, bank, protocol):
+        return None
+    return package
+
+
 def _canonical_resolution(
     *,
     bank: content.ItemBank,
@@ -370,10 +394,14 @@ def _canonical_resolution(
     except ValueError as exc:
         _fail("plan_profile_parent_mismatch", str(exc))
     positions = autopilot_positions.plan_positions(plan)
+    interaction_package = _interaction_package_for_gap_accounting(
+        bank, protocol, week_no)
     structured_gaps = tuple(
         gap
         for position in positions
-        if (gap := autopilot_positions.readiness_gap(bank, position)) is not None
+        if (gap := autopilot_positions.readiness_gap(
+            bank, position,
+            interaction_package=interaction_package)) is not None
     )
     source_gaps = _source_unstructured_keys(bank)
     if len(positions) + len(source_gaps) != source_position_count:
@@ -427,10 +455,14 @@ def _resolution_for_definition(
         canonical.session_plan.event_line,
         selected_items,
     )
+    profile_package = _interaction_package_for_gap_accounting(
+        bank, protocol, definition.week_no)
     structured_gaps = tuple(
         gap
         for position in positions
-        if (gap := autopilot_positions.readiness_gap(bank, position)) is not None
+        if (gap := autopilot_positions.readiness_gap(
+            bank, position,
+            interaction_package=profile_package)) is not None
     )
     if structured_gaps:
         _fail("plan_profile_invalid", "profile 选择了尚未冻结运行内容的位置")

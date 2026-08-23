@@ -242,6 +242,11 @@ def _logged_in_client(eng, username: str) -> TestClient:
     ("POST", "/future-unclassified-mutation", access_policy.AccessKind.ACCOUNT,
      access_policy.ADMIN_ROLES),
     ("GET", "/patient", access_policy.AccessKind.PUBLIC, None),
+    ("POST", "/device/attach", access_policy.AccessKind.DEVICE_ATTACH, None),
+    ("PATCH", "/patients/P", access_policy.AccessKind.ACCOUNT,
+     access_policy.TRAINING_OPERATION_ROLES),
+    ("PATCH", "/patients/P/cloud-processing", access_policy.AccessKind.ACCOUNT,
+     access_policy.TRAINING_OPERATION_ROLES),
 ])
 def test_central_route_policy(method, path, kind, roles):
     rule = access_policy.access_rule(method, path)

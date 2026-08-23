@@ -248,7 +248,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
     }
     setRecState("idle");
-    toast(`录音已保存${m.containsDirectIdentifier ? "(含直接标识,导出将红线)" : ""}:${m.rawAudioId.slice(0, 12)}… · ${m.durationSeconds.toFixed(1)}s`, "ok");
+    toast(`录音已保存（${m.durationSeconds.toFixed(1)} 秒）${m.containsDirectIdentifier ? "。这段录音含直接身份信息，导出时会被拦下" : ""}`, "ok");
   });
 
   if (scriptError) return <Alert tone="danger" title="第 1 周脚本校验失败">系统已安全暂停，不能使用未经校验的话术开场：{scriptError}</Alert>;

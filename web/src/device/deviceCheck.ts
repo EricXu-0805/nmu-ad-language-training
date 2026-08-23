@@ -155,6 +155,15 @@ export function mapMicrophoneError(error: unknown): string {
   }
 }
 
+/** 采样中途失败(权限被收回/设备被占用等)也要给中文说明,不能直出英文异常名。 */
+export function describeSampleFailure(error: unknown): string {
+  const name = (error as { name?: string } | null)?.name ?? "";
+  if (name === "NotAllowedError" || name === "NotFoundError" || name === "NotReadableError") {
+    return `采样失败：${mapMicrophoneError(error)}`;
+  }
+  return `采样失败（原始错误：${String((error as Error | null)?.message ?? error)}）`;
+}
+
 export function checkRecorderCodec(deps: DeviceCheckDependencies): CheckResult {
   const id = "codec";
   const title = "录音编码";

@@ -343,7 +343,8 @@ test("AI 初评各状态给一句人话", () => {
   assert.match(aiDraftStatusLine("not_applicable") ?? "", /此量表不提供 AI 初评/);
   assert.match(aiDraftStatusLine("unavailable_not_authorized") ?? "", /该受试者未授权云处理/);
   assert.match(aiDraftStatusLine("unavailable_no_data") ?? "", /暂无训练数据可供参考/);
-  assert.match(aiDraftStatusLine("failed") ?? "", /AI 初评暂时不可用，请人工评定/);
+  assert.match(aiDraftStatusLine("failed") ?? "", /AI 初评没有成功/);
+  assert.match(aiDraftStatusLine("failed") ?? "", /请直接人工评定/);
 });
 
 test("缺项预览:ordinal 数条目与每节要素", () => {
@@ -453,4 +454,10 @@ test("文案钉:试用横幅原句 + 两张屏禁工程名词上屏", () => {
     assert.equal(drawerSource.toLowerCase().includes(banned), false,
       `QuestionnaireDrawer 不得出现 ${banned}`);
   }
+});
+
+test("P2-5:预检已知服务器会拒绝锁定时,确认框的锁定钮禁用", () => {
+  const drawer = readFileSync(new URL("./QuestionnaireDrawer.tsx", import.meta.url), "utf8");
+  assert.match(drawer, /confirmDisabled=\{missing\.length > 0\}/);
+  assert.match(drawer, /暂不能锁定——请先补齐/);
 });

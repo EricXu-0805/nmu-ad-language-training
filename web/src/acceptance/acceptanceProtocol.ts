@@ -272,6 +272,14 @@ export function formatAcceptanceText(receipt: AcceptanceReceipt): string {
   return lines.join("\n");
 }
 
+/** 屏上显示用的 8 位短版本号；完整编号仍完整地写进回执与纯文本。 */
+export function shortBuildId(buildId: string): string {
+  if (/^\d+$/.test(buildId)) {
+    return BigInt(buildId).toString(16).padStart(8, "0").slice(0, 8);
+  }
+  return buildId.slice(0, 8);
+}
+
 export function receiptFilename(receipt: AcceptanceReceipt): string {
   const date = (receipt.header.date || "无日期").replace(/[^0-9A-Za-z-]/g, "");
   const device = (receipt.header.device || "无设备").replace(/[^0-9A-Za-z一-龥-]/g, "");

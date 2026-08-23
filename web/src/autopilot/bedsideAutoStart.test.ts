@@ -154,18 +154,34 @@ test("a lost start response locks the manual plane and is never auto-retried", (
   assert.equal(autopilotServerOwnsConsole(uncertain), true);
 });
 
-test("research sessions can never auto start", () => {
+test("a proven research session may auto start once when every gate is green", () => {
   const research: Session = {
     ...SIMULATION_SESSION,
     is_simulation: false,
     data_classification: "research",
   };
   const eligibility = p0aConsoleEligibility(research);
-  assert.equal(eligibility.allowed, false);
+  assert.equal(eligibility.allowed, true);
   assert.equal(renderCycles([
     { eventSessionId: SESSION_ID, gates: { eligibilityAllowed: eligibility.allowed } },
     { gates: { eligibilityAllowed: eligibility.allowed } },
-  ]), 0);
+  ]), 1);
+});
+
+test("classification-unverified sessions can never auto start", () => {
+  for (const spoiled of [
+    { ...SIMULATION_SESSION, data_classification: undefined },
+    { ...SIMULATION_SESSION, data_classification: "legacy_unknown" as const },
+    { ...SIMULATION_SESSION, is_simulation: false },
+    { ...SIMULATION_SESSION, data_classification: "research" as const },
+  ] satisfies Session[]) {
+    const eligibility = p0aConsoleEligibility(spoiled);
+    assert.deepEqual(eligibility, { allowed: false, reason: "classification_unverified" });
+    assert.equal(renderCycles([
+      { eventSessionId: SESSION_ID, gates: { eligibilityAllowed: eligibility.allowed } },
+      { gates: { eligibilityAllowed: eligibility.allowed } },
+    ]), 0);
+  }
 });
 
 test("re-opening the bedside overlay while the server owns control never re-posts", () => {

@@ -86,7 +86,7 @@ export function SessionAbortControl({ sessionId, expectedRevision, disabled = fa
                 ))}
               </select>
             </label>
-            <Alert tone="warn" title="本次访问位保留">
+            <Alert tone="warn" title="本次训练名额保留">
               中止后本次训练是否补做，由研究负责人决定。
             </Alert>
             {error && <Alert tone="danger" title="服务器尚未确认中止">{error}</Alert>}

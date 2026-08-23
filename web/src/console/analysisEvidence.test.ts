@@ -164,7 +164,7 @@ test("technical failure stays distinct from a wrong answer and requires safe-pau
   const messages = timeline.turns[0]?.attempts[0]?.issues.map((row) => row.message).join(" ") ?? "";
   assert.equal(timeline.summary.technicalFailures, 1);
   assert.match(messages, /不代表受试者回答错误/);
-  assert.match(messages, /technical_pause/);
+  assert.match(messages, /安全暂停/);
 });
 
 test("classification, source and ledger mismatches are surfaced rather than repaired", () => {

@@ -9,12 +9,13 @@ engine's audio, even on a machine where Piper is perfectly usable.
 """
 from __future__ import annotations
 
+import shutil
 import struct
 import wave
 
 import pytest
 
-from app import tts
+from app import content, tts
 
 
 def _wav_bytes(marker: int = 1) -> bytes:
@@ -187,3 +188,82 @@ def test_a_missing_key_degrades_instead_of_selecting_any_local_engine(
     assert (data, cached) == (None, False)
     assert version == resolved.version
     assert piper.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# cloud_text_allowed 的交互数据包接线（tts.py 自己的装载链，不打桩白名单）。
+# 上面的测试都把 cloud_text_allowed 换成桩；这一节反过来，专测真实装载链：
+# 逐周数据包并入白名单、装载失败按设计缩集合（fail-closed）、逐文件
+# (mtime_ns, size) 缓存键让数据包字节一动就失效重建。
+# ---------------------------------------------------------------------------
+
+# 只存在于交互数据包的 verbatim 纠正句：namefix 模板展开只会给出「它叫鸟」，
+# 题库字段是作用/关系讲解句——这些句子进白名单的唯一通道是数据包接线。
+# 鸟句在 wk7+wk8 两个包里都有；钥匙句只在 wk7（单周失效测试要用它判别）。
+PACKAGE_ONLY_LINE = "这个我们刚刚见过，它是一只鸟。"
+WK7_ONLY_LINE = "这个我们刚刚见过，它是钥匙。"
+
+
+def _wk7_fixture_lines() -> tuple[str, str]:
+    """(数据包问句, wk7 题库字段句)——后者不经数据包接线也应在白名单。"""
+    package = content.load_autopilot_interaction_package(7)
+    question = package["items"][0]["turns"][0]["question"]["text"]
+    bank = content.load_item_bank_for_week(7)
+    bank_line = bank.double_element[0]["left_function_cue"]
+    return question, bank_line
+
+
+def test_cloud_allowlist_admits_interaction_package_lines(monkeypatch):
+    monkeypatch.setattr(tts, "_allow_cache", None)
+    question, bank_line = _wk7_fixture_lines()
+    bank = content.load_item_bank_for_week(7)
+    protocol = content.load_autopilot_protocol(
+        content.CONTENT_DIR / "autopilot_protocol_v1.json")
+    # 判别力自证：这两句不经数据包接线进不了白名单（防断言空转）。
+    without_package = content.tts_allowlist(bank, autopilot_protocol=protocol)
+    assert PACKAGE_ONLY_LINE not in without_package
+    assert question not in without_package
+    # 真链条：cloud_text_allowed 自己装载协议+逐周数据包并入白名单。
+    assert tts.cloud_text_allowed(question) is True
+    assert tts.cloud_text_allowed(PACKAGE_ONLY_LINE) is True
+    # namefix 模板展开句照旧放行（协议模板×题库词，不依赖数据包）。
+    expansion = protocol["double"]["namefix_left"].replace(
+        "【物品名】", bank.double_element[0]["left_word"])
+    assert tts.cloud_text_allowed(expansion) is True
+    assert tts.cloud_text_allowed(bank_line) is True
+
+
+def test_cloud_allowlist_fails_closed_when_package_loading_breaks(monkeypatch):
+    question, bank_line = _wk7_fixture_lines()
+    monkeypatch.setattr(tts, "_allow_cache", None)
+
+    def broken(week_no, content_dir=None, protocol=None):
+        raise content.FrozenContentUnavailable("接线断开演习")
+
+    monkeypatch.setattr(content, "load_autopilot_interaction_package", broken)
+    # 数据包装载全灭 → 只来自数据包的句子出白名单（正集合缩小=fail-closed），
+    # 题库来源的句子不受牵连（单点坏档不放大成全项目云语音瘫痪）。
+    assert tts.cloud_text_allowed(question) is False
+    assert tts.cloud_text_allowed(PACKAGE_ONLY_LINE) is False
+    assert tts.cloud_text_allowed(bank_line) is True
+
+
+def test_package_byte_change_invalidates_cache_and_fails_closed(
+        monkeypatch, tmp_path):
+    content_copy = tmp_path / "content"
+    content_copy.mkdir()
+    for path in content.CONTENT_DIR.glob("*.json"):
+        shutil.copy(path, content_copy / path.name)
+    monkeypatch.setattr(content, "CONTENT_DIR", content_copy)
+    monkeypatch.setattr(tts, "_allow_cache", None)
+    assert tts.cloud_text_allowed(WK7_ONLY_LINE) is True
+    # 数据包字节一动：逐文件 (mtime_ns, size) 缓存键必须失效重建，重建时
+    # 字节 sha 与协议钉不符 → 该周整包退出白名单，而不是吃缓存继续放行。
+    wk7 = content_copy / "autopilot_interaction_week7_v1.json"
+    wk7.write_bytes(wk7.read_bytes() + b"\n")
+    assert tts.cloud_text_allowed(WK7_ONLY_LINE) is False
+    # 其他周与题库来源不受牵连：wk7+wk8 共句仍由 wk8 包放行。
+    assert tts.cloud_text_allowed(PACKAGE_ONLY_LINE) is True
+    bank2 = content.load_item_bank_for_week(2)
+    assert tts.cloud_text_allowed(
+        bank2.double_element[0]["left_function_cue"]) is True

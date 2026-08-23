@@ -249,3 +249,46 @@ test("pending audio already named by a server receipt is not retained as unuploa
 
   assert.equal(merged.audios["aud-pending"], undefined);
 });
+
+test("附带小修:无 turn 的服务端音频从采集回执取真实时长——自动带练录音不再显示 0.0 秒", () => {
+  const serverAudio = audio("aud-ap", "checksum_verified");
+  const merged = mergeServerJournal(persistedJournal(), remote({
+    audios: [serverAudio],
+    audio_receipts: [{
+      server_seq: 7,
+      raw_audio_id: "aud-ap",
+      session_id: "S-A",
+      turn_key: "ITEM#1",
+      received_at: "2026-08-22T00:00:00Z",
+      duration_seconds: 14.2,
+      byte_count: 999,
+      checksum: "def",
+      data_classification: "simulation",
+      is_simulation: true,
+      contains_direct_identifier: false,
+    }],
+  }));
+  assert.equal(merged.audios["aud-ap"].durationSeconds, 14.2);
+  // 有 turn 时仍以 turn 记录为准。
+  const withTurn = mergeServerJournal(persistedJournal(), remote({
+    turns: [turn({ raw_audio_id: "aud-ap", duration_seconds: 3.5 })],
+    audios: [serverAudio],
+    audio_receipts: [{
+      server_seq: 8,
+      raw_audio_id: "aud-ap",
+      session_id: "S-A",
+      turn_key: "ITEM#1",
+      received_at: "2026-08-22T00:00:00Z",
+      duration_seconds: 14.2,
+      byte_count: 999,
+      checksum: "def",
+      data_classification: "simulation",
+      is_simulation: true,
+      contains_direct_identifier: false,
+    }],
+  }));
+  assert.equal(withTurn.audios["aud-ap"].durationSeconds, 3.5);
+  // 什么都没有:保持 undefined(上层不许再显示成 0.0 秒)。
+  const bare = mergeServerJournal(persistedJournal(), remote({ audios: [serverAudio] }));
+  assert.equal(bare.audios["aud-ap"].durationSeconds, undefined);
+});

@@ -191,7 +191,7 @@ export function lookupCue(bundle: ItemBankBundle | null, itemId: string, taskTyp
 export function assertVersionsMatch(bundleVer: string, planVer: string, itemBankVer: string): void {
   if (bundleVer !== planVer || bundleVer !== itemBankVer) {
     throw new Error(
-      `题库版本不一致,拒开训练:随包=${bundleVer} / 计划=${planVer} / 后端=${itemBankVer}`,
+      `题库版本不一致，请刷新页面重试（随包=${bundleVer} 计划=${planVer} 服务器=${itemBankVer}）`,
     );
   }
 }

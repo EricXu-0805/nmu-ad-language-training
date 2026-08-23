@@ -1,3 +1,4 @@
+import { ApiError } from "../apiResponse.ts";
 import type { Session } from "../types";
 
 export const P0A_SCOPE_KEY = "p0a_sim_first_single_v1" as const;
@@ -34,6 +35,9 @@ export interface AutopilotStatusReceipt {
   serverOwned: boolean;
   takeoverReady: boolean;
   commandKind: "tts" | "record" | null;
+  /** 只读展示投影:自动带练当前/最后触及的计划位置。不参与任何控制判定。 */
+  positionItemId: string | null;
+  positionTurnSeq: number | null;
   lastErrorCode: string | null;
 }
 
@@ -42,7 +46,6 @@ export type P0aConsoleEligibility =
   | {
     allowed: false;
     reason:
-      | "research_session"
       | "classification_unverified"
       | "scope_unsupported"
       | "account_required"
@@ -67,6 +70,11 @@ export interface AutopilotConsoleState {
     | "rejected";
   receipt: AutopilotStatusReceipt | null;
   error: string | null;
+  /**
+   * 最近一次启动被拒的拒因,常驻到用户再次点启动或服务器真的持有为止——
+   * 权威 no-owner 轮询只把强横幅降级为持久提示,不许无痕抹掉(D1)。
+   */
+  lastStartRejection: string | null;
 }
 
 /**
@@ -148,7 +156,8 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
   if (!isRecord(value)
       || !hasExactKeys(value, [
         "scope_key", "mode", "status", "state_revision", "server_owned",
-        "takeover_ready", "current_command_kind", "last_error_code",
+        "takeover_ready", "current_command_kind", "position_item_id",
+        "position_turn_seq", "last_error_code",
       ])
       || (value.scope_key !== "disabled" && value.scope_key !== P0A_SCOPE_KEY)
       || (value.mode !== "disabled" && value.mode !== "autonomous" && value.mode !== "manual")
@@ -169,12 +178,25 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
           || !SAFE_ERROR_CODE.test(value.last_error_code)))) {
     throw new Error("自动驾驶状态响应不符合最小收据契约");
   }
+  // 位置字段成对出现:半个位置无法映射进冻结计划,按契约违规拒收。
+  const positionAbsent = value.position_item_id === null
+    && value.position_turn_seq === null;
+  const positionValid = typeof value.position_item_id === "string"
+    && value.position_item_id.length >= 1
+    && value.position_item_id.length <= 128
+    && typeof value.position_turn_seq === "number"
+    && Number.isSafeInteger(value.position_turn_seq)
+    && value.position_turn_seq >= 1;
+  if (!positionAbsent && !positionValid) {
+    throw new Error("自动驾驶状态位置投影不符合收据契约");
+  }
 
   const status = value.status as AutopilotServerStatus;
   const disabled = value.scope_key === "disabled";
   if (disabled) {
     if (value.mode !== "disabled" || status !== "idle" || value.state_revision !== 0
         || value.server_owned || value.takeover_ready || value.current_command_kind !== null
+        || value.position_item_id !== null || value.position_turn_seq !== null
         || value.last_error_code !== null) {
       throw new Error("自动驾驶禁用状态内部矛盾");
     }
@@ -219,6 +241,8 @@ export function parseAutopilotStatusReceipt(value: unknown): AutopilotStatusRece
     serverOwned: value.server_owned,
     takeoverReady: value.takeover_ready,
     commandKind: value.current_command_kind,
+    positionItemId: (value.position_item_id ?? null) as string | null,
+    positionTurnSeq: (value.position_turn_seq ?? null) as number | null,
     lastErrorCode: value.last_error_code,
   };
 }
@@ -234,6 +258,8 @@ export function sameAutopilotStatusReceipt(
     && left.serverOwned === right.serverOwned
     && left.takeoverReady === right.takeoverReady
     && left.commandKind === right.commandKind
+    && left.positionItemId === right.positionItemId
+    && left.positionTurnSeq === right.positionTurnSeq
     && left.lastErrorCode === right.lastErrorCode;
 }
 
@@ -241,6 +267,36 @@ export function receiptAllowsAutopilotTakeover(
   receipt: AutopilotStatusReceipt | null,
 ): boolean {
   return receipt?.serverOwned === true && receipt.takeoverReady === true;
+}
+
+/**
+ * 服务端 _require_gate 在写入任何控制事实之前就拒绝的确定性门禁码(D1)。
+ * 这些 409 与「可能已有 owner/幂等冲突」不同:可以安全按写前拒绝呈现拒因,
+ * 不必折成会被下一次权威轮询无痕抹掉的 uncertain。幂等/revision/CAS 冲突
+ * 一律不在此列,继续 fail-closed 等权威核实。
+ */
+const PREWRITE_START_REJECTION_CODES = new Set([
+  "autopilot_p0a_disabled",
+  "autopilot_real_sessions_disabled",
+  "autopilot_cloud_processing_required",
+  "autopilot_recording_not_allowed",
+  "autopilot_consent_denied",
+  "autopilot_subject_withdrawn",
+  "autopilot_scope_unsupported",
+  "autopilot_classification_invalid",
+  "autopilot_plan_not_fully_supported",
+  "autopilot_runtime_inactive",
+]);
+
+export function isPrewriteStartRejection(error: unknown): boolean {
+  if (!(error instanceof ApiError)
+      || error.status !== 409
+      || error.detailEnvelope !== "nested-detail"
+      || error.detailData === null
+      || typeof error.detailData !== "object"
+      || Array.isArray(error.detailData)) return false;
+  const code = (error.detailData as { code?: unknown }).code;
+  return typeof code === "string" && PREWRITE_START_REJECTION_CODES.has(code);
 }
 
 export const parseAutopilotStartReceipt = parseAutopilotStatusReceipt;
@@ -251,13 +307,18 @@ export function p0aConsoleEligibility(
   runtimeBlocked = false,
   hasNamedAccount = true,
 ): P0aConsoleEligibility {
-  if (session.data_classification === "research" || session.is_simulation === false) {
-    return { allowed: false, reason: "research_session" };
-  }
-  if (session.data_classification !== "simulation" || session.is_simulation !== true) {
+  // 只有两种可证明的分类组合可继续：严格模拟对与严格真实研究对。
+  // 任何其他组合（legacy_unknown、字段缺失、错配）都按不可证明拒绝——
+  // classification_unverified 的场次永远不会渲染启动入口，也永远不会自动开跑。
+  const provenSimulation = session.is_simulation === true
+    && session.data_classification === "simulation";
+  const provenResearch = session.is_simulation === false
+    && session.data_classification === "research";
+  if (!provenSimulation && !provenResearch) {
     return { allowed: false, reason: "classification_unverified" };
   }
-  if (session.week_no !== 2
+  if (!Number.isInteger(session.week_no)
+      || session.week_no < 2 || session.week_no > 8
       || session.phase_type !== "正式训练"
       || session.event_line !== "正式训练") {
     return { allowed: false, reason: "scope_unsupported" };
@@ -270,7 +331,7 @@ export function p0aConsoleEligibility(
 export function initialAutopilotConsoleState(sessionId: string): AutopilotConsoleState {
   // Until the account-only GET proves otherwise, an old tab must not become a
   // second driver during the first render after refresh.
-  return { sessionId, phase: "checking", receipt: null, error: null };
+  return { sessionId, phase: "checking", receipt: null, error: null, lastStartRejection: null };
 }
 
 export function autopilotConsoleReducer(
@@ -295,6 +356,8 @@ export function autopilotConsoleReducer(
       phase: action.receipt.serverOwned ? action.receipt.status : "idle",
       receipt: action.receipt,
       error: null,
+      // 服务器真的持有 = 拒因条件已消失;仍无 owner 时持久保留拒因。
+      lastStartRejection: action.receipt.serverOwned ? null : state.lastStartRejection,
     };
   }
   if (action.type === "status_uncertain") {
@@ -302,9 +365,15 @@ export function autopilotConsoleReducer(
   }
   if (action.type === "start_requested") {
     if (state.phase !== "idle" && state.phase !== "rejected") return state;
-    return { ...state, phase: "starting", error: null };
+    return { ...state, phase: "starting", error: null, lastStartRejection: null };
   }
-  return { ...state, phase: "rejected", receipt: null, error: action.error };
+  return {
+    ...state,
+    phase: "rejected",
+    receipt: null,
+    error: action.error,
+    lastStartRejection: action.error,
+  };
 }
 
 export function autopilotServerOwnsConsole(state: AutopilotConsoleState): boolean {

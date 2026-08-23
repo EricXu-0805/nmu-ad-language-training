@@ -259,3 +259,37 @@ test("blocked 告警档(设备侧故障)维持 role=alert", async (context) => {
   assert.match(markup, /role="alert"/);
   assert.match(markup, /请研究者处置/);
 });
+
+test("V2:线索级(prompt_level>0)题图收紧一档给长文本让位;首问不收紧", async (context) => {
+  const vite = await createServer({
+    root: process.cwd(),
+    appType: "custom",
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  context.after(() => vite.close());
+  const { PatientAutopilotStage } = await vite.ssrLoadModule(
+    "/src/patient/PatientAutopilotStage.tsx",
+  );
+
+  const cueView = recordingView();
+  cueView.current = { ...cueView.current, prompt_level: 2 };
+  cueView.runtime = { ...cueView.runtime, command: cueView.current };
+  const cueMarkup = renderToStaticMarkup(React.createElement(PatientAutopilotStage, {
+    autopilot: cueView,
+    sessionId: "S-ONE",
+    activated: true,
+    ttsOn: true,
+    externallyPaused: false,
+  }));
+  assert.match(cueMarkup, /data-compact="true"/);
+
+  const questionMarkup = renderToStaticMarkup(React.createElement(PatientAutopilotStage, {
+    autopilot: recordingView(),
+    sessionId: "S-ONE",
+    activated: true,
+    ttsOn: true,
+    externallyPaused: false,
+  }));
+  assert.match(questionMarkup, /data-compact="false"/);
+});

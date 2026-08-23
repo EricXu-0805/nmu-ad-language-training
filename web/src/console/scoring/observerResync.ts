@@ -6,6 +6,7 @@ import type { ServerSessionJournal } from "../../hooks/useSessionJournal.ts";
 import type { SessionPlan, SessionRuntimeState } from "../../types.ts";
 import {
   exactPlanCursor,
+  planCursorForReceiptPosition,
   type ExactPlanCursor,
   type ObserverOwnership,
   ownershipImpliesAutomationExposure,
@@ -14,6 +15,12 @@ import {
 export interface ResyncStatusSnapshot {
   serverOwned: boolean;
   stateRevision: number;
+  /**
+   * 权威回执的只读位置投影(api.autopilotStatus 直接给出)。接管收口后
+   * runtime cursor 仍停在自动带练开始前的位置——恢复真值优先用它(D4①)。
+   */
+  positionItemId?: string | null;
+  positionTurnSeq?: number | null;
 }
 
 export interface ResyncGuard {
@@ -99,7 +106,16 @@ export async function runManualResyncTransaction(
     if (!plan) {
       return { kind: "failed", error: new Error("冻结计划尚未载入，无法证明精确恢复位置") };
     }
-    const cursor = exactPlanCursor(runtime, sessionId, plan);
+    // 接管释放的权威回执带自动带练最后位置;服务端自动推进从不写 runtime
+    // cursor,所以回执位置优先。回执带了位置却映射不进冻结计划是深层不一致:
+    // fail-closed 可重试,绝不静默回退到必然更旧的 cursor。
+    const receiptPosition = statusAfter.positionItemId ?? null;
+    const receiptCursor = planCursorForReceiptPosition(
+      plan, statusAfter.positionItemId, statusAfter.positionTurnSeq);
+    if (receiptPosition !== null && !receiptCursor) {
+      return { kind: "failed", error: new Error("服务器回执位置不在冻结计划内，拒绝据此恢复") };
+    }
+    const cursor = receiptCursor ?? exactPlanCursor(runtime, sessionId, plan);
     if (!cursor) {
       return { kind: "failed", error: new Error("服务器游标缺失、非法或不在冻结计划内，无法证明精确恢复位置") };
     }

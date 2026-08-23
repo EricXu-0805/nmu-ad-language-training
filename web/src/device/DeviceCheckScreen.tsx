@@ -11,6 +11,7 @@ import {
   classifyNoiseFloor,
   classifySpeakerConfirmation,
   classifySpeechLevel,
+  describeSampleFailure,
   formatReport,
   runAutoChecks,
   summarize,
@@ -72,13 +73,13 @@ export function DeviceCheckScreen() {
         try {
           push(classifyNoiseFloor(await deps.sampleNoise(3)));
         } catch (error) {
-          push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: `采样失败：${String(error)}` });
+          push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: describeSampleFailure(error) });
         }
         setStage("speech");
         try {
           push(classifySpeechLevel(await deps.sampleNoise(4)));
         } catch (error) {
-          push({ id: "speech-level", title: "人声拾取", status: "fail", detail: `采样失败：${String(error)}` });
+          push({ id: "speech-level", title: "人声拾取", status: "fail", detail: describeSampleFailure(error) });
         }
       } else {
         push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: "麦克风不可用，未采样。" });

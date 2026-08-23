@@ -263,7 +263,7 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
               </p>
               {meta.release.bound && (
                 <p className="muted">
-                  冻结发布纪元 <code>第 {meta.release.epochSeq} 版</code> · 聚合载荷指纹{" "}
+                  数据版本 <code>第 {meta.release.epochSeq} 版</code> · 数据指纹{" "}
                   <code>{meta.release.aggregatePayloadSha256.slice(0, 12)}</code>
                 </p>
               )}
