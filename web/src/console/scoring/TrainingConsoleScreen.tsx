@@ -359,7 +359,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     if (autoPilotRef.current) {
       failAutopilotRef.current("upload", "8 秒未收到录音保存回报，可能是麦克风、音频保存或上传失败。");
     } else {
-      toast("8 秒未收到老人端录音回报——可能没录上(麦克风权限/网络)。请检查老人端后重新示意录音。", "danger");
+      toast("8 秒未收到老人端录音回报——可能是停止太快（老人端还没开始录），或麦克风权限/网络问题。请检查老人端后重新示意录音。", "danger");
     }
   });
   // 看门狗守的是"哪个环节的回报":录音中跳题/暂停时守的是旧环节,回报到达时若按
@@ -2213,7 +2213,7 @@ function CueButtons({ bundle, itemId, taskType, role, cueLevel, onSend, patientO
   const disabledNote = cueLevel >= maxLevel
     ? "已是最高提示级，不能再升"
     : nextEntry && nextText == null
-      ? `「${nextEntry.label}」暂缺题库文本(待内容组补齐)，暂不能发送`
+      ? `「${nextEntry.label}」的提示语暂未配置，本环节请口头提示`
       : lockedLabels.length > 0
         ? `提示只能逐级升：先发「${nextEntry?.label}」，${lockedLabels.join("")}才会解锁`
         : null;

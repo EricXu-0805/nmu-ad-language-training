@@ -1263,6 +1263,16 @@ def update_patient_profile(patient_id: str, body: PatientProfileUpdate,
             422,
             "撤回或否定知情同意不能在档案编辑里登记——研究撤回请使用“登记研究撤回”"
             "流程；如属登记笔误，请联系研究负责人走纸质记录更正流程")
+    # 反方向同样是治理动作:已登记的否定态(未同意/已撤回)不能经档案编辑洗成
+    # 「已同意」——重新取得同意必须走正式知情同意流程并留纸质记录。
+    if ("consent_status" in provided
+            and (p.consent_status or "").strip().casefold()
+            in _CONSENT_DENIED_STATUSES
+            and body.consent_status != p.consent_status):
+        raise HTTPException(
+            422,
+            f"该档案的知情同意状态已登记为「{p.consent_status}」，不能在档案编辑里改写；"
+            "如受试者重新同意入组，请按知情同意流程重新签署并联系研究负责人更正记录")
     # 知情同意方式:补录空值允许(纠正遗漏),改写非空值拒绝(那是治理动作)。
     # 与前端 patientEdit.consentTypeLockedReason 同则。
     if ("consent_type" in provided

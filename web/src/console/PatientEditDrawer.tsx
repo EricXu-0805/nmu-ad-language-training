@@ -131,7 +131,8 @@ export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }:
                   </div>
                 </div>
                 <div className="form-grid">
-                  <Field label="知情同意状态">
+                  <Field label="知情同意状态"
+                    hint="这里只能更正为「已同意」；受试者退出研究请走登记表的「登记研究撤回」">
                     <EnumSelect options={CONSENT_STATUSES} value={draft.consent_status ?? null}
                       onChange={(v) => set("consent_status", v)} placeholder="请选择" />
                   </Field>
@@ -173,7 +174,8 @@ export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }:
                     </p>
                   </div>
                 </div>
-                <Field label="新研究编号" hint="留空表示不改；只能用字母、数字、点、横线，例如 NMU-001"
+                <Field label="新研究编号"
+                  hint={canRename ? "留空表示不改；只能用字母、数字、点、横线，例如 NMU-001" : "已有训练数据，编号不能再改"}
                   error={idIssue ?? undefined}>
                   <TextInput value={newId} disabled={!canRename}
                     onChange={(e) => { setSaveError(null); setNewId(e.target.value); }}

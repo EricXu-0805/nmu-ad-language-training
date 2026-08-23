@@ -171,8 +171,9 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
           <strong className="mono">{r.patient_id}</strong>
           <DataBoundaryBadge classification={classification} entity="patient" />
           {r.pairing_code && (
-            <span className="muted" title="老人端一次输入这位老人的专属配对码，之后每次开场自动连接">
+            <span className="muted">
               配对码 <strong className="mono">{r.pairing_code}</strong>
+              <small> · 在受试者平板输入一次，之后每次训练自动连接</small>
             </span>
           )}
         </span>

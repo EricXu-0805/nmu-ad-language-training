@@ -126,6 +126,21 @@ def test_patch_cannot_fake_withdrawal_via_consent_status(profile_client):
         assert "撤回" in response.json()["detail"]
 
 
+def test_denied_consent_cannot_be_washed_back_to_granted(profile_client):
+    # 反方向:已登记「未同意/已撤回」的档案不能经编辑洗成「已同意」——重新同意
+    # 必须走正式知情同意流程(2026-08-24 复审发现的伦理门缺口)。
+    _seed_patient(profile_client)
+    with Session(profile_client.test_engine) as s:
+        patient = s.get(Patient, "P-EDIT")
+        patient.consent_status = "未同意"
+        s.add(patient)
+        s.commit()
+    response = profile_client.patch(
+        "/patients/P-EDIT", json={"consent_status": "已同意"})
+    assert response.status_code == 422
+    assert "重新签署" in response.json()["detail"]
+
+
 def test_withdrawn_profile_is_not_editable(profile_client):
     _seed_patient(profile_client)
     with Session(profile_client.test_engine) as s:

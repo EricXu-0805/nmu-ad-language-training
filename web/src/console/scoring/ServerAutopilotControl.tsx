@@ -244,7 +244,7 @@ export function ServerAutopilotControl({
     onOwnershipChange(true, "starting");
     try {
       if (!await prepareOwnership()) {
-        const error = "老人端安全收麦尚未得到服务器确认";
+        const error = "老人端麦克风还未确认关闭";
         dispatch({ type: "start_rejected", sessionId: session.session_id, error });
         onOwnershipChange(false, "rejected");
         return;
@@ -378,13 +378,13 @@ export function ServerAutopilotControl({
     && state.receipt.mode === "manual";
   const canTakeover = receiptAllowsAutopilotTakeover(state.receipt)
     && (paused || completed || serverFailed);
-  const title = manual ? "AI 自动干预已完成审计接管"
+  const title = manual ? "AI 自动带练已转为人工接管"
     : active ? "AI 正在控制当前环节"
     : processing ? "AI 正在处理当前回答"
       : contentGap ? "下一题内容不全，AI 已停下"
-      : paused ? "AI 自动干预已安全暂停"
+      : paused ? "AI 自动带练已安全暂停"
         : completed ? "当前可自动范围已完成"
-          : serverFailed ? "AI 自动干预已进入失败锁定"
+          : serverFailed ? "AI 自动带练已进入失败锁定"
             : checking ? "正在核对服务器控制权"
           : uncertain ? "服务器状态待核实 · 人工控制已锁定"
             : isSimulation ? "AI 自动带练（演练）" : "AI 自动带练";
@@ -404,12 +404,12 @@ export function ServerAutopilotControl({
               || autopilotServerOwnsConsole(state)}
             onClick={() => { void start(); }}
           >
-            {manual ? "已转为人工处置"
+            {manual ? "已转为人工操作"
               : state.phase === "starting" ? "正在核对启动条件…"
               : checking ? "正在恢复服务器状态…"
               : active ? "服务器正在控制当前位置"
                 : processing ? "服务器正在处理回答"
-                  : paused ? "等待研究者处置"
+                  : paused ? "等待研究者处理"
                     : completed ? "当前可自动范围已完成"
                       : serverFailed ? "服务器失败·人工入口已锁定"
                       : uncertain ? "等待权威状态核实"
@@ -419,17 +419,17 @@ export function ServerAutopilotControl({
                 : providerBlocked ? providerReadiness === null
                   ? "正在核对 AI 服务实测"
                   : "AI 服务实测未通过或已过期"
-                : scopeBlocked ? "当前安排不支持服务器自动干预"
+                : scopeBlocked ? "当前安排不支持 AI 自动带练"
                   : accountBlocked ? "需要具名研究账号"
                   : runtimeBlocked ? "场次未处于可启动状态"
                     : rejected ? "重新核对并启动"
-                      : isSimulation ? "启动模拟 AI 自动干预"
+                      : isSimulation ? "启动 AI 自动带练（演练）"
                         : "启动 AI 自动带练"}
           </Button>
           {canTakeover && (
             <Button type="button" variant="danger" disabled={takeoverBusy}
               onClick={() => setConfirmTakeover(true)}>
-              {takeoverBusy ? "正在核对收麦…" : "收麦后转为人工处置"}
+              {takeoverBusy ? "正在确认麦克风已关闭…" : "转为人工操作"}
             </Button>
           )}
           {canProbeProvider && !autopilotServerOwnsConsole(state) && (
@@ -449,15 +449,15 @@ export function ServerAutopilotControl({
         <>服务器正在处理刚才的回答，请稍候。</>
       ) : paused ? (
         contentGap ? (
-          <>下一题缺少自动训练内容，AI 已停下，不会跳题。请点「收麦后转为人工处置」继续人工操作。</>
+          <>下一题缺少自动训练内容，AI 已停下，不会跳题。请点「转为人工操作」继续。</>
         ) : (
-          <>AI 已暂停，题目停在当前位置；要继续人工操作，请点「收麦后转为人工处置」。</>
+          <>AI 已暂停，题目停在当前位置；要继续人工操作，请点「转为人工操作」。</>
         )
       ) : completed ? (
-        <>{isSimulation ? "本次模拟训练" : "本场训练"}的自动部分已完成；如需继续，请点「收麦后转为人工处置」。</>
+        <>{isSimulation ? "本次模拟训练" : "本场训练"}的自动部分已完成；如需继续，请点「转为人工操作」。</>
       ) : serverFailed ? (
         <>
-          AI 自动训练出错停止，页面保持锁定；请联系研究团队处置。
+          AI 自动训练出错停止，页面保持锁定；请联系研究团队处理。
           {state.receipt?.lastErrorCode && (
             <details style={{ marginTop: "var(--sp-2)" }}>
               <summary>技术详情</summary>
@@ -473,7 +473,7 @@ export function ServerAutopilotControl({
         operationalAutopilotReady === null ? (
           <>正在核对训练内容，请稍候。</>
         ) : (
-          <>训练内容还有 {unsupportedOperationalPositions.length} 处未配齐，AI 自动干预不可启动，请人工操作。</>
+          <>训练内容还有 {unsupportedOperationalPositions.length} 处未配齐，AI 自动带练不可启动，请人工操作。</>
         )
       ) : providerBlocked ? (
         <>
@@ -493,7 +493,7 @@ export function ServerAutopilotControl({
       )}
       {isRealResearch && (
         <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.85 }}>
-          带练话术为原型版，未经临床终审。
+          训练引导语为研究初版，尚未经临床定稿；请按研究方案核对后使用。
         </div>
       )}
       {providerReadiness && (
@@ -512,21 +512,21 @@ export function ServerAutopilotControl({
       )}
       {state.error && <div role="alert" style={{ marginTop: 6 }}>
         {uncertain ? "状态核实失败" : "启动未通过"}：{state.error}。
-        {uncertain ? " 人工入口继续锁定，避免与可能已启动的服务器流程并行。" : " 服务器在写入前拒绝了请求。"}
+        {uncertain ? " 人工入口继续锁定，避免与可能已启动的服务器流程并行。" : " 服务器在写入前拒绝了请求，未产生任何记录。"}
       </div>}
       {/* D1:拒因不许无痕消失——权威 no-owner 回执把强横幅降级为持久提示,
           直到再次点启动或服务器真的持有。 */}
       {!state.error && state.lastStartRejection && (
         <div role="alert" style={{ marginTop: 6 }}>
-          上次启动被拒：{state.lastStartRejection}。处理后可重新点「启动」。
+          上次启动被拒：{state.lastStartRejection}。处理后可重新点「启动 AI 自动带练」。
         </div>
       )}
     </Alert>
     <ConfirmDialog
       open={confirmTakeover}
-      title="确认结束服务器控制并转为人工处置？"
+      title="确认结束 AI 控制并转为人工操作？"
       body="服务器确认老人端麦克风已关闭后才会放行；接管会留下记录，技术故障不会算作老人答错。"
-      confirmLabel="确认转为人工处置"
+      confirmLabel="确认转为人工操作"
       onCancel={() => setConfirmTakeover(false)}
       onConfirm={() => { void takeover(); }}
     />

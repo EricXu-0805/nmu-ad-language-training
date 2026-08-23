@@ -75,7 +75,7 @@ export function PinPrompt() {
         onSubmit={(e) => { e.preventDefault(); void pair(); }}>
         <div className="dialog-header"><h3 id="pin-dialog-title">连接这台平板</h3></div>
         <Field label="请工作人员输入配对码"
-          hint="可输入这位老人的专属配对码（一次输入，以后开场自动连接），或本次训练的配对码">
+          hint="可输入专属配对码（一次输入，以后每次训练自动连接），或本次训练的配对码">
           <input inputMode="numeric" type="password" autoComplete="one-time-code"
             value={val} onChange={(e) => { setVal(e.target.value); setError(null); }}
             className="pin-input" aria-label="配对码" disabled={busy} />
