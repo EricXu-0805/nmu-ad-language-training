@@ -446,6 +446,10 @@ _BROKEN = asr._AsrCall(ok=False, text="")
     ("分段但只有空白", _asr_response(choices=[_asr_choice([{"text": "  "}])]), _EMPTY),
     ("显式空字符串段", _asr_response(choices=[_asr_choice([{"text": ""}])]), _EMPTY),
     ("空字符串转写", _asr_response(choices=[_asr_choice("")]), _EMPTY),
+    # 2026-08-23 生产直调实证(静音 wav 与纯音调各复现):真实 DashScope 对
+    # 无语音音频返回 200 + content=[]。判成技术失败会让老人一冷场就安全暂停,
+    # 冻结协议的 silence 阶梯永远走不到。
+    ("空转写段列表", _asr_response(choices=[_asr_choice([])]), _EMPTY),
     # 以下全部按技术失败 fail closed，绝不映射成"本轮无转写"。
     ("缺 status_code", _asr_response(status_code=_NO_STATUS,
                                      choices=[_asr_choice([{"text": "胡萝卜"}])]), _BROKEN),
@@ -455,7 +459,6 @@ _BROKEN = asr._AsrCall(ok=False, text="")
                                         choices=[_asr_choice([{"text": "x"}])]), _BROKEN),
     ("缺 output", _asr_response(), _BROKEN),
     ("空 choices", _asr_response(choices=[]), _BROKEN),
-    ("空转写段列表", _asr_response(choices=[_asr_choice([])]), _BROKEN),
     ("段里缺 text", _asr_response(choices=[_asr_choice([{"foo": "bar"}])]), _BROKEN),
     ("段 text 不是字符串", _asr_response(choices=[_asr_choice([{"text": 42}])]), _BROKEN),
     ("混入坏段", _asr_response(

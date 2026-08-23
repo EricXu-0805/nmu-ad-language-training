@@ -150,10 +150,12 @@ class DashScopeAsrEngine:
                 return _AsrCall(ok=False)
             content = choices[0].message.content
             if isinstance(content, list):
-                # 空段列表、缺 text、text 不是字符串、混进非 dict 的段——都是损坏
-                # 结构,不能当成"这次没有转写"。
+                # 空段列表 = 真实 DashScope 对无语音音频的正常应答(2026-08-23
+                # 生产直调实证:静音与纯音调都返回 200 + content=[]),按"本轮
+                # 无转写"处理;判成技术失败会把沉默映射成 asr_degraded 安全暂停。
                 if not content:
-                    return _AsrCall(ok=False)
+                    return _AsrCall(ok=True, text="")
+                # 缺 text、text 不是字符串、混进非 dict 的段——损坏结构,fail closed。
                 parts = []
                 for segment in content:
                     if not isinstance(segment, dict):
