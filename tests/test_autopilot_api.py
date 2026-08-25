@@ -1967,6 +1967,44 @@ def test_start_rejects_legacy_hot_mic_until_device_reports_stopped(
     assert accepted.json()["status"] == "waiting_tts"
 
 
+def test_start_not_blocked_by_stale_selfstart_alone(
+        api_clients: ApiClients, monkeypatch):
+    """selfStart 待命 ≠ 录音进行中:单独的 selfStart=true 不得拒启。
+
+    2026-08-26 生产实测(墙五):人工呈现游标残留 selfStart=true 且无任何机制
+    自我纠正时,自动带练启动被 autopilot_patient_microphone_active 永久拒——
+    第 4 周 3 场 6 击全灭。真正的热麦保护由 recording∈active 标记与设备权威
+    patientRec 承担,二者本测试不动;仅「按钮待命+录音 idle+设备不活跃」放行。
+    """
+    _enable_p0a(monkeypatch)
+    stale_cursor = {
+        "sessionId": SESSION_ID,
+        "screen": "present",
+        "itemIdx": 0,
+        "turnIdx": 0,
+        "responseRole": "命名",
+        "cueLevel": 0,
+        "recording": "idle",
+        "selfStart": True,
+    }
+    posted = api_clients.account.put(
+        "/live/state", json={"kind": "cursor", "payload": stale_cursor})
+    assert posted.status_code == 200, posted.text
+    inactive = api_clients.device.put(
+        "/live/state",
+        headers=api_clients.device_headers,
+        json={"kind": "patientRec", "payload": {
+            "active": False,
+            "turnKey": "itm-0001#1",
+            "sessionId": SESSION_ID,
+        }},
+    )
+    assert inactive.status_code == 200, inactive.text
+    accepted = _start(api_clients)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "waiting_tts"
+
+
 def test_patient_rec_failure_fences_autopilot_as_device_in_runtime_pause_txn(
         api_clients: ApiClients, monkeypatch):
     _enable_p0a(monkeypatch)

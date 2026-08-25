@@ -8625,9 +8625,16 @@ def _ensure_patient_capture_idle_for_autopilot(live: LiveState | None) -> None:
     """Never acquire server ownership while a legacy microphone may be hot.
 
     The server only evaluates already-received facts.  It deliberately does not
-    rewrite ``selfStart``/``recording`` to manufacture a stopped microphone; the
-    patient device must first report an inactive state (or have no prior capture
-    fact in a fresh session).
+    rewrite ``recording`` to manufacture a stopped microphone; the patient
+    device must first report an inactive state (or have no prior capture fact
+    in a fresh session).
+
+    ``selfStart`` alone does NOT block: it means the patient's self-start
+    button is armed, not that a capture is running.  2026-08-26 生产实测(墙五):
+    人工呈现游标的 selfStart=true 残留没有任何机制自我纠正,把它当热麦会让
+    启动永久死锁(第 4 周 3 场 6 击全灭)。真正的热麦保护 = recording 活动
+    标记 + 设备权威 patientRec;启动后交接窗内老人若恰好点下自助录音,由
+    「迟到音频不推进 + started-record interrupt 收口」既有机制兜住。
     """
     if live is None:
         return
@@ -8635,8 +8642,7 @@ def _ensure_patient_capture_idle_for_autopilot(live: LiveState | None) -> None:
     rapport = _json_load(live.rapport_json) or {}
     patient_rec = _json_load(live.patient_rec_json) or {}
     command_capture_active = any(
-        snapshot.get("selfStart") is True
-        or str(snapshot.get("recording") or "").strip().lower()
+        str(snapshot.get("recording") or "").strip().lower()
         in _ACTIVE_CAPTURE_MARKERS
         for snapshot in (cursor, rapport)
     )
