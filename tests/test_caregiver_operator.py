@@ -1271,3 +1271,30 @@ def test_after_a_caregiver_help_pause_a_named_supervisor_can_still_resume(
         state = session.get(SessionRuntimeState, session_id)
         assert state is not None
         assert state.status == "active"
+
+
+def test_session_plan_projection_resolves_weeks_3_to_8_by_session_week():
+    # 2026-08-26 扫雷坐实:不传 bank 的 resolve_for_session 回落第 2 周题库,
+    # 第 3~8 周场次在照护员摘要里静默解析失败(scope/进度整块空白)。修后按
+    # 场次周次取题库;第 2 周行为不变。
+    from app import content
+
+    def wk_session(week_no: int) -> TrainSession:
+        bank = content.load_item_bank_for_week(week_no)
+        return TrainSession(
+            session_id=f"unit-wk{week_no}", patient_id=f"unit-wk{week_no}",
+            week_no=week_no, phase_type="正式训练", event_line="正式训练",
+            item_bank_version_id=bank.version_id,
+            item_bank_definition_digest=content.item_bank_definition_digest(bank),
+            is_simulation=True, data_classification="simulation")
+
+    for week in (2, 3, 8):
+        scope, positions, demo_ready = (
+            caregiver_service._session_plan_projection(wk_session(week)))
+        assert scope == "canonical_full_source", week
+        assert positions == 78, week
+        assert demo_ready is False, week
+    # 旧缺陷机制仍然成立:拿第 3 周场次配第 2 周默认题库必然解析失败——
+    # 这条断言钉住「为什么必须按周传 bank」。
+    with pytest.raises(autopilot_plan_profiles.PlanProfileError):
+        autopilot_plan_profiles.resolve_for_session(wk_session(3))

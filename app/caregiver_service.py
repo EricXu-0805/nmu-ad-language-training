@@ -14,7 +14,7 @@ from typing import NoReturn
 
 from sqlmodel import Session as DBSession, select
 
-from . import autopilot_plan_profiles
+from . import autopilot_plan_profiles, content
 from .caregiver_contract import (
     CaregiverHelpRequestOut,
     CaregiverPlanOut,
@@ -89,7 +89,12 @@ def _session_plan_projection(
             session, require_runtime_enabled=False)
     except autopilot_plan_profiles.PlanProfileError:
         try:
-            resolved = autopilot_plan_profiles.resolve_for_session(session)
+            # 不传 bank 会回落到第 2 周题库,第 3~8 周场次在这里静默解析失败,
+            # 照护员工作台的进度/范围整块空白——按场次周次取(2..8 之外仍回落 2,
+            # 与 autopilot_service._session_week_bank 同则)。
+            week_no = session.week_no if 2 <= (session.week_no or 0) <= 8 else 2
+            resolved = autopilot_plan_profiles.resolve_for_session(
+                session, bank=content.load_item_bank_for_week(week_no))
         except (autopilot_plan_profiles.PlanProfileError, ValueError, OSError):
             return None, None, False
         return (

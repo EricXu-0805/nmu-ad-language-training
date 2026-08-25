@@ -5371,7 +5371,10 @@ def _session_plan_for_account_projection(
             ),
         }
 
-    if sess.week_no == 2 and event == "正式训练":
+    # 2..8 与 session_admission/_select_p0a_content 的放行区间一致——此前写死
+    # ==2,第 3~8 周场次掉进下面的兜底被硬写「未就绪」,启动按钮灰死而服务端
+    # 明明放行(2026-08-26 第四堵墙,与 item-bank 写死第 2 周同族)。
+    if 2 <= sess.week_no <= 8 and event == "正式训练":
         protocol = content.load_autopilot_protocol(
             content.CONTENT_DIR / "autopilot_protocol_v1.json")
         try:
@@ -12599,7 +12602,10 @@ def _run_legacy_repeat_recovery_worker(session_id: str) -> None:
                 resolved = (
                     autopilot_orchestration.verify_legacy_pre_repeat_recovery(
                         worker_db, session_id=session_id))
-                bank = content.load_item_bank_for_week(2)
+                # 写死第 2 周会让第 3~8 周的 legacy 修复在判类处 404 被吞,
+                # 该 capture 永远卡在 received——按场次周次取题库。
+                bank = autopilot_service._session_week_bank(  # noqa: SLF001
+                    worker_db, session_id)
                 blob = audio_store.find_blob(
                     resolved.target.attempt_input.raw_audio_id)
                 capture_claim = attempt_claim = None

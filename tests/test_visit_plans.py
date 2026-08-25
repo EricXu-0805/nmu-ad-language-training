@@ -2127,6 +2127,37 @@ def test_unsupported_protocol_may_be_drafted_but_cannot_be_approved(
         assert _linked_session_for_test(session, created["plan_id"]) is None
 
 
+def test_week3_real_plan_projection_reports_autopilot_ready(
+        visit_clients: VisitClients):
+    """第 3~8 周 paired-null 场次的投影必须如实上报自动带练就绪。
+
+    2026-08-26 实测第四堵墙:投影层写死 `week_no == 2`,第 3~8 周被兜底硬写
+    operational_autopilot_ready=False → 前端「启动 AI 自动带练」灰死并弹
+    「完整场次自动化尚未获内容放行/0 处未配齐」的自相矛盾黄条——而服务端
+    start 门(session_admission/_select_p0a_content)明明放行 2..8。
+    """
+    created = _create(
+        visit_clients.researcher, "P-VISIT-10", "create-wk3-proj-01",
+        week_no=3)
+    approved = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key="approve-wk3-proj-1", expected_revision=created["revision"])
+    assert approved.status_code == 200, approved.text
+    started = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key="start-wk3-proj-001", expected_revision=approved.json()["revision"])
+    assert started.status_code == 200, started.text
+    session_id = started.json()["session_id"]
+
+    projected = visit_clients.researcher.get(f"/sessions/{session_id}/plan")
+    assert projected.status_code == 200, projected.text
+    body = projected.json()
+    assert body["autopilot_profile_version_id"] is None
+    assert body["completion_scope"] == "canonical_full_source"
+    assert body["unsupported_position_count"] == 0
+    assert body["operational_autopilot_ready"] is True
+
+
 def test_week1_rapport_plan_approves_and_starts_a_rapport_session(
         visit_clients: VisitClients):
     """签字即通同款:关系建立有了独立完成合同后,准入闸门放行整条直线。"""
