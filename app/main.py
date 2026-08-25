@@ -3178,10 +3178,14 @@ def get_autopilot_protocol_bundle(request: Request):
 
 
 @app.get("/content/item-bank")
-def get_item_bank():
-    # 就绪探针保持第 2 周语义(P0a 自动化验收探针);逐周结构化状态由
-    # structured_training_weeks / training_week_content 字段另行发布。
-    bank = content.load_item_bank_for_week(2)
+def get_item_bank(week: int = 2):
+    # 默认(不带参数)保持第 2 周就绪探针语义(P0a 自动化验收探针);训练台按
+    # 场次周次带 ?week= 取数——2026-08-25 实测:此前写死第 2 周,第 3~8 周
+    # 场次在训练台必然「题库版本不一致」整屏 fail-closed。逐周结构化状态由
+    # structured_training_weeks / training_week_content 字段发布,不随请求周漂移。
+    if not 2 <= week <= 8:
+        raise HTTPException(422, "week 必须在 2..8")
+    bank = content.load_item_bank_for_week(week)
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     readiness = content.content_readiness(bank)
@@ -3195,10 +3199,10 @@ def get_item_bank():
     # Publish that same full-plan scan to the console so it can never announce
     # readiness from the smaller rubric subset while the server would refuse.
     positions = autopilot_positions.build_positions(
-        bank, week_no=2, event_line="正式训练")
+        bank, week_no=week, event_line="正式训练")
     try:
         interaction_package = content.load_autopilot_interaction_package(
-            2, protocol=protocol)
+            week, protocol=protocol)
         if content.validate_autopilot_interaction_package(
                 interaction_package, bank, protocol):
             interaction_package = None
@@ -3228,7 +3232,7 @@ def get_item_bank():
     readiness_session = TrainSession(
         session_id="content-readiness",
         patient_id="content-readiness",
-        week_no=2,
+        week_no=week,
         phase_type="正式训练",
         event_line="正式训练",
         item_bank_version_id=bank.version_id,
@@ -3283,8 +3287,8 @@ def get_item_bank():
     training_week_content: dict[str, dict[str, object]] = {}
     for wk in sorted(week_files):
         try:
-            week_bank = bank if wk == 2 else content.load_item_bank_for_week(wk)
-            week_readiness = (readiness if wk == 2
+            week_bank = bank if wk == week else content.load_item_bank_for_week(wk)
+            week_readiness = (readiness if wk == week
                               else content.content_readiness(week_bank))
         except ValueError:
             continue

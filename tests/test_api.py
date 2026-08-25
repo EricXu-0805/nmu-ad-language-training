@@ -478,6 +478,28 @@ def test_item_bank_endpoint(client):
     assert d["warnings"] == []
 
 
+def test_item_bank_endpoint_serves_requested_week(client):
+    # 2026-08-25 Eric 实测:第 3 周场次在训练台整屏 fail-closed「题库版本不一致:
+    # 计划=wk3-v1-20260819 后端=wk2-v1-20260707」——本端点曾写死第 2 周,
+    # 训练台按场次周次取数就永远对不上。周参数必须真的换周。
+    from app import content as content_module
+    for week in (3, 8):
+        expected = content_module.load_item_bank_for_week(week)
+        d = client.get(f"/content/item-bank?week={week}").json()
+        assert d["version_id"] == expected.version_id, week
+        assert d["supported_training_weeks"] == [week]
+        assert d["operational_position_count"] == 78
+        assert d["unsupported_operational_position_count"] == 0
+        assert d["operational_autopilot_ready"] is True
+        # 逐周汇总与默认周语义不随请求周漂移。
+        assert d["structured_training_weeks"] == [2, 3, 4, 5, 6, 7, 8]
+    # 默认(不带参数)保持第 2 周就绪探针语义,见 test_item_bank_endpoint。
+    assert client.get("/content/item-bank").json()["version_id"].startswith("wk2-")
+    # 越界周 fail-closed。
+    assert client.get("/content/item-bank?week=1").status_code == 422
+    assert client.get("/content/item-bank?week=9").status_code == 422
+
+
 def test_score_double_all_correct_is_100(client):
     items = [{"item_id": "d1", "left_name": 1, "left_function": 1,
               "right_name": 1, "right_function": 1, "relation": 1}]

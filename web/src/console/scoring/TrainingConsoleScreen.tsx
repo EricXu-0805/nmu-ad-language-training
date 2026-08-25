@@ -420,7 +420,10 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     setRecoveredLabel(null);
     Promise.all([
       api.sessionPlan(session.session_id, session.week_no, session.event_line),
-      api.itemBank(),
+      // 第 1 周(关系建立)没有独立题库,计划绑的就是第 2 周题库——只有 2..8
+      // 传周次,其余走默认第 2 周语义,与计划的 item_bank_version_id 对得上。
+      api.itemBank(session.week_no >= 2 && session.week_no <= 8
+        ? session.week_no : undefined),
     ])
       .then(([p, bank]) => {
         // bundle 可能还没到,尽力断言 plan==后端;bundle 到位后再断言一次

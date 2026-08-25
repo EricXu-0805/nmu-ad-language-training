@@ -913,7 +913,10 @@ export const api = {
       DEFAULT_REQUEST_TIMEOUT_MS, opts?.device ? { ...opts, deviceSessionId: sid } : opts),
 
   // 内容 / 计划
-  itemBank: () => req<ItemBankInfo>("GET", "/content/item-bank"),
+  // 不带周次 = 第 2 周就绪探针语义;训练台必须带场次周次,否则第 3~8 周
+  // 场次会撞「题库版本不一致」整屏 fail-closed(2026-08-25 实测)。
+  itemBank: (week?: number) => req<ItemBankInfo>(
+    "GET", week ? `/content/item-bank?week=${week}` : "/content/item-bank"),
   scaleProtocol: async () => parseScaleProtocolReadiness(await req<unknown>(
     "GET", "/content/scale-protocol", undefined,
     DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
