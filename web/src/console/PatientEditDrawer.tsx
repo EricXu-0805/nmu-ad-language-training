@@ -2,14 +2,21 @@ import { useEffect, useState } from "react";
 import { api, ApiError } from "../api";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { EnumSelect, Field, TextInput, TriStateField } from "../components/Field";
 import { StatusPill } from "../components/StatusPill";
 import { useToast } from "../components/ToastContext";
 import { useDialogFocusTrap } from "../components/useDialogFocusTrap";
 import { CONSENT_TYPES } from "../types";
-import type { Patient } from "../types";
+import type { CloudProcessingPolicy, Patient } from "../types";
+import {
+  cloudProcessingAllowDisabledReason,
+  cloudProcessingDisclosure,
+} from "./cloudProcessingPolicy";
 import {
   buildProfilePatch,
+  cloudAuthorizationLabel,
+  cloudConsentBaseChanged,
   consentTypeLockedReason,
   draftFromPatient,
   patchIsEmpty,
@@ -22,8 +29,9 @@ import {
 // 纸质记录更正——后端对否定态闭集同样 422,这里不提供入口。
 const CONSENT_STATUSES = ["已同意"] as const;
 
-// 档案编辑抽屉:手滑填错不用重新建档。只覆盖非治理字段;撤回、云处理授权、
-// 模拟/研究身份各有专属流程,这里一律不出现。
+// 档案编辑抽屉:手滑填错不用重新建档。普通字段走差量 PATCH;云处理授权是
+// 治理动作,在本抽屉里有独立区块+单独确认,走专用端点;研究撤回、模拟/研究
+// 身份仍各有专属流程,这里不出现。
 export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }: {
   patientId: string;
   sessionCount: number;
@@ -33,6 +41,10 @@ export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }:
   const toast = useToast();
   const [original, setOriginal] = useState<ProfileDraft | null>(null);
   const [draft, setDraft] = useState<ProfileDraft | null>(null);
+  const [patientAtOpen, setPatientAtOpen] = useState<Patient | null>(null);
+  const [cloudPolicy, setCloudPolicy] = useState<CloudProcessingPolicy | null>(null);
+  const [cloudPolicyError, setCloudPolicyError] = useState<string | null>(null);
+  const [cloudConfirm, setCloudConfirm] = useState<"grant" | "revoke" | null>(null);
   const [newId, setNewId] = useState("");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -49,9 +61,15 @@ export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }:
         const loaded = draftFromPatient(patient);
         setOriginal(loaded);
         setDraft(loaded);
+        setPatientAtOpen(patient);
       })
       .catch((error) => {
         if (active) setLoadError(error instanceof ApiError ? error.detail : String(error));
+      });
+    api.cloudProcessingPolicy()
+      .then((policy) => { if (active) setCloudPolicy(policy); })
+      .catch((error) => {
+        if (active) setCloudPolicyError(error instanceof ApiError ? error.detail : String(error));
       });
     return () => { active = false; };
   }, [patientId]);
@@ -82,6 +100,60 @@ export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }:
       setBusy(false);
     }
   };
+
+  // 云处理授权变更:确认时重取 policy 与档案——告知条款、撤回状态或授权快照
+  // 在抽屉打开后变过,这次就不写,提示重读。与建档口的独立确认流程同一口径。
+  const confirmCloudChange = async (requested: boolean) => {
+    if (!patientAtOpen || busy) return;
+    setBusy(true);
+    try {
+      let confirmedPolicy: CloudProcessingPolicy | null = null;
+      if (requested) {
+        const currentPolicy = await api.cloudProcessingPolicy();
+        if (!currentPolicy.configured || !currentPolicy.provider_id
+            || !currentPolicy.notice_version) {
+          throw new Error("服务器还没接入云端 AI 服务，现在无法授权");
+        }
+        if (currentPolicy.provider_id !== cloudPolicy?.provider_id
+            || currentPolicy.notice_version !== cloudPolicy?.notice_version) {
+          setCloudPolicy(currentPolicy);
+          setCloudConfirm(null);
+          toast("云处理方或告知版本已变化，未更新授权；请阅读最新告知后重新确认", "danger");
+          return;
+        }
+        confirmedPolicy = currentPolicy;
+      }
+      const current = await api.getPatient(patientId);
+      if (current.withdrawal_status || cloudConsentBaseChanged(patientAtOpen, current)) {
+        setPatientAtOpen(current);
+        setCloudConfirm(null);
+        toast(
+          current.withdrawal_status
+            ? `档案已变为撤回状态「${current.withdrawal_status}」，云处理授权不可更改`
+            : "档案在确认期间已变化，未更新授权；请按最新状态重新核对",
+          "danger",
+        );
+        return;
+      }
+      const updated = await api.setPatientCloudProcessing(
+        patientId, requested, current, confirmedPolicy);
+      if (updated.cloud_processing_allowed !== requested) {
+        throw new Error("服务器未返回已确认的云处理授权状态");
+      }
+      setCloudConfirm(null);
+      toast(requested ? "云处理授权已按独立确认更新" : "云处理授权已撤销", requested ? "ok" : "warn");
+      onSaved(updated);
+    } catch (error) {
+      toast(`云处理授权未更新：${saveErrorText(error)}`, "danger");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cloudAllowed = patientAtOpen?.cloud_processing_allowed === true;
+  const cloudGrantDisabledReason = patientAtOpen?.withdrawal_status
+    ? "该档案已登记研究撤回，云处理授权已封存"
+    : cloudProcessingAllowDisabledReason(cloudPolicy, cloudPolicyError);
 
   return (
     <div className="drawer-backdrop" onClick={cancelSafely}>
@@ -127,7 +199,7 @@ export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }:
                 <div className="form-section-header">
                   <div>
                     <h3>知情同意与录音授权</h3>
-                    <p className="muted">以伦理批件和现场签署文件为准。研究撤回和云端 AI 授权不在这里改，各有专门入口。</p>
+                    <p className="muted">以伦理批件和现场签署文件为准。研究撤回不在这里改，请走登记表的「登记研究撤回」。</p>
                   </div>
                 </div>
                 <div className="form-grid">
@@ -166,6 +238,40 @@ export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }:
               <section className="form-section">
                 <div className="form-section-header">
                   <div>
+                    <h3>第三方云处理授权</h3>
+                    <p className="muted">{cloudProcessingDisclosure(cloudPolicy)}</p>
+                  </div>
+                </div>
+                <div className="form-grid">
+                  <Field label="当前状态"
+                    hint="AI 自动带练和 AI 转写需要此授权；变更走单独确认，不随「保存修改」一起提交">
+                    <div className="col" style={{ gap: 8, alignItems: "flex-start" }}>
+                      <StatusPill tone={cloudAllowed ? "warn" : "muted"}>
+                        {patientAtOpen ? cloudAuthorizationLabel(patientAtOpen) : "正在读取…"}
+                      </StatusPill>
+                      {cloudAllowed ? (
+                        <Button onClick={() => setCloudConfirm("revoke")} disabled={busy || !patientAtOpen}>
+                          撤销云处理授权…
+                        </Button>
+                      ) : (
+                        <>
+                          <Button onClick={() => setCloudConfirm("grant")}
+                            disabled={busy || !patientAtOpen || cloudGrantDisabledReason !== null}>
+                            登记允许云处理…
+                          </Button>
+                          {cloudGrantDisabledReason && (
+                            <span className="muted">{cloudGrantDisabledReason}</span>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </Field>
+                </div>
+              </section>
+
+              <section className="form-section">
+                <div className="form-section-header">
+                  <div>
                     <h3>研究编号更正</h3>
                     <p className="muted">
                       {canRename
@@ -187,6 +293,22 @@ export function PatientEditDrawer({ patientId, sessionCount, onClose, onSaved }:
           </fieldset>
         )}
 
+        <ConfirmDialog
+          open={cloudConfirm === "grant"}
+          title="单独确认允许云处理"
+          body={`当前状态：${patientAtOpen ? cloudAuthorizationLabel(patientAtOpen) : "未知"}。确认后，回答录音和文字将按最新告知条款发给第三方。请确保已取得受试者（或代理人）对云处理的授权。`}
+          confirmLabel={busy ? "正在核对…" : "已取得授权，确认登记"}
+          onConfirm={() => { if (!busy) void confirmCloudChange(true); }}
+          onCancel={() => { if (!busy) setCloudConfirm(null); }}
+        />
+        <ConfirmDialog
+          open={cloudConfirm === "revoke"}
+          title="单独确认撤销云处理授权"
+          body="确认后服务器将撤销第三方云处理授权；后续云端 ASR 或判类会被阻止并安全暂停。"
+          confirmLabel={busy ? "正在核对…" : "确认撤销授权"}
+          onConfirm={() => { if (!busy) void confirmCloudChange(false); }}
+          onCancel={() => { if (!busy) setCloudConfirm(null); }}
+        />
         {saveError && <Alert tone="danger" title="没有保存成功">{saveError}</Alert>}
         <div className="drawer-actions">
           <Button onClick={cancelSafely} disabled={busy}>取消</Button>

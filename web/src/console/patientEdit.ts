@@ -77,6 +77,32 @@ export function renameIssue(
   return null;
 }
 
+// 云处理授权是治理动作,不走 buildProfilePatch——它有专用端点、单独确认与
+// 并发闸。这里只放纯逻辑:状态标签 + 「确认期间档案变了没」的判据。
+export function cloudAuthorizationLabel(patient: Patient): string {
+  if (patient.cloud_processing_allowed === true) return "允许";
+  if (patient.cloud_processing_revoked_at) return "不允许（已有拒绝/撤销记录）";
+  if (patient.cloud_processing_allowed === false) return "不允许";
+  return "暂未选择";
+}
+
+// 与后端 PATCH /patients/{id}/cloud-processing 的 expected 快照同一组字段:
+// 抽屉打开到点确认之间任何一项变了,这次都不能写,必须重读再确认。
+export function cloudConsentBaseChanged(
+  before: Patient,
+  current: Patient,
+): boolean {
+  return ([
+    "cloud_processing_allowed",
+    "cloud_processing_provider_id",
+    "cloud_processing_notice_version",
+    "cloud_processing_consented_at",
+    "cloud_processing_revoked_at",
+    "withdrawal_status",
+    "governance_revision",
+  ] as const).some((key) => (before[key] ?? null) !== (current[key] ?? null));
+}
+
 export function saveErrorText(error: unknown): string {
   if (error instanceof ApiError) {
     if (error.status === 409) return error.detail;
