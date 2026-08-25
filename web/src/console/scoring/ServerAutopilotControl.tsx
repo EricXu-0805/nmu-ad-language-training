@@ -55,7 +55,7 @@ export function ServerAutopilotControl({
   onOwnershipChange: (owned: boolean, phase: AutopilotConsoleState["phase"]) => void;
   /** 权威回执里的只读位置投影(观察面/接管恢复展示用),无位置时回报 null。 */
   onReceiptPosition?: (position: { itemId: string; turnSeq: number } | null) => void;
-  prepareOwnership: () => Promise<boolean>;
+  prepareOwnership: () => Promise<true | string>;
 }) {
   const [state, dispatch] = useReducer(
     autopilotConsoleReducer,
@@ -243,9 +243,10 @@ export function ServerAutopilotControl({
     // POST 的响应可能丢失；请求一发出就必须先收回旧人工控制，不能等绿色成功态。
     onOwnershipChange(true, "starting");
     try {
-      if (!await prepareOwnership()) {
-        const error = "老人端麦克风还未确认关闭";
-        dispatch({ type: "start_rejected", sessionId: session.session_id, error });
+      const prepared = await prepareOwnership();
+      if (prepared !== true) {
+        // 拒因由 prepareOwnership 逐分支给出真话;这里绝不折成统一的麦克风文案。
+        dispatch({ type: "start_rejected", sessionId: session.session_id, error: prepared });
         onOwnershipChange(false, "rejected");
         return;
       }

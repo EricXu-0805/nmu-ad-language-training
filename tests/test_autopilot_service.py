@@ -1132,6 +1132,11 @@ def test_fresh_start_rejects_preexisting_manual_attempt_evidence(
         with pytest.raises(AutopilotServiceError) as caught:
             _start(db)
         assert caught.value.code == "autopilot_existing_manual_evidence"
+        # 拒因直接上研究者屏,必须是人话并带下一步指引,不能出现「P0a/控制面」
+        # 这类工程词(Eric 2026-08-25 实测在这里看不懂卡死)。
+        assert "重新开一场" in caught.value.message
+        assert "启动 AI 自动带练" in caught.value.message
+        assert "P0a" not in caught.value.message
         db.rollback()
 
         assert db.get(SessionAutopilotState, SESSION_ID) is None

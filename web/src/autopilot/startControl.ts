@@ -286,6 +286,12 @@ const PREWRITE_START_REJECTION_CODES = new Set([
   "autopilot_classification_invalid",
   "autopilot_plan_not_fully_supported",
   "autopilot_runtime_inactive",
+  // 场次已有人工证据 → 该场永久走人工;拒因写在任何控制事实之前。
+  // 2026-08-25 实测:缺这条时前端把它折成 uncertain,观察台闪一下弹回、
+  // 一个字不显示,研究者完全不知道为什么启动不了。
+  "autopilot_existing_manual_evidence",
+  // 受试者端收麦回执未闭合的启动拒绝,同样在任何写入之前。
+  "autopilot_patient_microphone_active",
 ]);
 
 export function isPrewriteStartRejection(error: unknown): boolean {

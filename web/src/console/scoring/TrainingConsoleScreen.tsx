@@ -1240,11 +1240,27 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     } catch { /* 私隐模式等 */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverOwned]);
-  const prepareServerOwnership = async (): Promise<boolean> => {
-    if (!planTurn || interactionBlocked || patientMicOn) {
-      if (patientMicOn) toast("老人端麦克风仍在工作；请先完成保存，再启动服务器控制", "danger");
-      return false;
+  // 返回 true 或一句给研究者看的具体拒因。此前所有分支都折成同一句「老人端
+  // 麦克风还未确认关闭」——2026-08-25 Eric 撞了一晚上却看不出真原因(实际是
+  // 技术失败闩/暂停态挡的),拒因必须逐分支说真话,麦克风只在真是麦克风时提。
+  const prepareServerOwnership = async (): Promise<true | string> => {
+    if (patientMicOn) {
+      const reason = "老人端麦克风仍在工作；请先完成保存，再启动自动带练";
+      toast(reason, "danger");
+      return reason;
     }
+    if (apFailure) {
+      return "本场早前发生过技术失败，故障锁还没解除——请先在红色横幅里点"
+        + "「确认并人工接管」，处理后开新场再启动自动带练";
+    }
+    if (patientDeviceFailure) return "老人端设备故障还没解除，请先处理红色横幅里的设备提示";
+    if (terminal) return "场次已结束，不能再启动自动带练";
+    if (paused || pausePending) return "场次暂停中——请先点「继续本场」恢复，再启动自动带练";
+    if (wrapupPending) return "正在进入收尾流程，不能启动自动带练";
+    if (recoveryPending || Boolean(recoveryError)) {
+      return "页面还没与服务器完成状态同步——稍等几秒，或刷新页面后再启动";
+    }
+    if (!planTurn) return "训练内容还没加载完成——稍等几秒再启动";
     serverOwnershipApplied.current = true;
     // The one awaited cursor write below is the pre-start handoff fact. Avoid a
     // second fire-and-forget write from disarmAutopilot.
@@ -1260,7 +1276,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
       recSeq: recSeq.current,
       selfStart: false,
     });
-    if (!accepted) return false;
+    if (!accepted) return "与服务器的交接写入未被确认——请再点一次启动";
     await flushLiveWrites();
     return true;
   };

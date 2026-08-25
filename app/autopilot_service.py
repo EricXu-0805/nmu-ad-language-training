@@ -2031,7 +2031,8 @@ def start_p0a(
     if existing_attempt is not None or existing_interaction is not None:
         _fail(
             "autopilot_existing_manual_evidence",
-            "场次已有人工逐次或交互证据，禁止叠加 P0a 控制面",
+            "本场次已有人工操作登记的训练证据，AI 自动带练只能在全新场次里开启——"
+            "请结束或中止本场后重新开一场，进场后先点「启动 AI 自动带练」再做其他操作",
         )
 
     state = db.exec(select(SessionAutopilotState).where(

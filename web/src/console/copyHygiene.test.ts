@@ -31,7 +31,8 @@ test("免责小字改为诚实但不吓人的措辞,并给出动作", () => {
 
 test("启动拒因说人话,常驻拒因条引用真实按钮名", () => {
   assert.doesNotMatch(autopilotControl, /安全收麦尚未得到服务器确认/);
-  assert.match(autopilotControl, /老人端麦克风还未确认关闭/);
+  // 2026-08-25 升级:麦克风文案不再是 catch-all(见下一条「逐分支说真话」),
+  // 拒因原文由 prepareOwnership/服务器给出并透传。
   // 拒因条让人去点的按钮必须真实存在(按钮名是「启动 AI 自动带练」)。
   assert.match(autopilotControl, /处理后可重新点「启动 AI 自动带练」/);
   assert.doesNotMatch(autopilotControl, /重新点「启动」/);
@@ -62,4 +63,14 @@ test("编辑抽屉:同意状态单选项有解释;编号禁改时不再显示自
   assert.match(editDrawer, /只能更正为「已同意」/);
   assert.match(editDrawer, /hint=\{canRename\s*\?\s*"留空表示不改/);
   assert.match(editDrawer, /已有训练数据，编号不能再改/);
+});
+
+test("自动带练启动拒因逐分支说真话,不再一律折成「麦克风还未确认关闭」", () => {
+  // 旧 catch-all:任何 prepareOwnership 失败都硬写成同一句麦克风文案(Eric
+  // 2026-08-25 实测被误导一整晚)。麦克风文案只允许出现在 TrainingConsoleScreen
+  // 的 patientMicOn 分支里。
+  assert.doesNotMatch(autopilotControl, /老人端麦克风还未确认关闭/);
+  assert.match(trainingConsole, /老人端麦克风仍在工作/);
+  assert.match(trainingConsole, /故障锁还没解除/);
+  assert.match(trainingConsole, /场次暂停中——请先点「继续本场」恢复/);
 });

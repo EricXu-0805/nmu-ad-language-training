@@ -409,6 +409,10 @@ test("D1:部署门禁 409 是确定的写前拒绝——按拒因处理,不再�
     "autopilot_classification_invalid",
     "autopilot_plan_not_fully_supported",
     "autopilot_runtime_inactive",
+    // 2026-08-25 实测缺口:人工证据场的启动拒绝被折成 uncertain,观察台闪回
+    // 且零提示;收麦回执未闭合的拒绝同理。两者都在任何控制写入之前。
+    "autopilot_existing_manual_evidence",
+    "autopilot_patient_microphone_active",
   ]) {
     assert.equal(isPrewriteStartRejection(gate(code)), true, code);
   }
