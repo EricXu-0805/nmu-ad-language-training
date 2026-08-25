@@ -7,7 +7,22 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
-> **最新上线（2026-08-23 22:10–22:16 UTC）**：`edb363d` → **`e33bb89`**，**零迁移热更新**
+> **最新上线（2026-08-25 07:25–07:28 UTC）**：`60c2e7e` → **`920a20c`**，**零迁移热更新**
+> （库头 `b6d4f8a2c917` 未变）。自动带练启动拒因逐分支说真话:prepareServerOwnership
+> 返回具体拒因(技术失败闩/暂停中/状态未同步…)、删掉「老人端麦克风还未确认关闭」
+> catch-all、`autopilot_existing_manual_evidence` 与 `autopilot_patient_microphone_active`
+> 进写前拒绝清单(服务端拒因不再被吞成 uncertain)、后端人工证据拒启文案改人话。
+> 背景:Eric 通宵实测撞墙 + agent 三轮确定性复现(收据待 223)。同窗口
+> `demo-admin`/`demo-researcher` 两临时账号已停用(密码曾入转录)。旧 dist 隔离
+> `/opt/nmu/dist-stale-20260825-0725`。树核 `MATCH revision=920a20c files=89
+> identical=89`;preflight 8/8 退 0。
+>
+> **上一次（2026-08-25 06:10–06:12 UTC）**：`e33bb89` → **`60c2e7e`**，**纯前端零重启热更**：
+> 编辑档案抽屉内置云处理授权入口(独立区块+单独确认,复用治理端点 CAS),不再借道
+> 重复建档流程。旧 dist 隔离 `/opt/nmu/dist-stale-20260825-0610`。树核 `MATCH 89/89`;
+> GitHub CI 绿;真 Chrome 三轮验证(VERIFY-003 授权→撤销→再授权全循环)。
+>
+> **上一次（2026-08-23 22:10–22:16 UTC）**：`edb363d` → **`e33bb89`**，**零迁移热更新**
 > （库头 `b6d4f8a2c917` 未变，前后闸均退 0）。内容:演示前复审收口——同意状态反向
 > 改写伦理门（已登记「未同意/已撤回」不能经档案编辑洗成「已同意」）+ 7 处文案与
 > 交互修正 + **云 ASR 空转写段列表按「本轮无转写」处理**（生产直调三次实证:真实
@@ -48,7 +63,7 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `e33bb89`（2026-08-23 22:16 UTC 上线；此前 `edb363d` 08-23 上午、`92040ac`/`7d70cce` 08-21 热更、`3ccb86d` 08-20） | `scripts/verify_deployed_tree.py --manifest <清单> --revision e33bb89` 应输出 `MATCH … identical=89`（2026-08-23 22:15 UTC 实测通过） |
+| 应用代码版本 | `920a20c`（2026-08-25 07:28 UTC 上线；此前 `60c2e7e` 08-25 早、`e33bb89` 08-23 晚、`edb363d` 08-23 上午） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 920a20c` 应输出 `MATCH … identical=89`（2026-08-25 07:28 UTC 实测通过） |
 | 部署树后续同步 | 已与 `main` 一致 | `git diff 3ccb86d..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b6d4f8a2c917`（2026-08-20 18:58 由 `6f2a9c4d8e17` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `79aea62e1a1ed4c6e01e` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
@@ -235,6 +250,8 @@ PM_20260730_自动对话/218-上线命令_b1765c0.sh`），Claude 只读核验�
 
 | 日期 | 代码版本 | 结构版本 | 回滚存档 | 备注 |
 | --- | --- | --- | --- | --- |
+| 2026-08-25 07:28 UTC | `920a20c` | `b6d4f8a2c917`（未变） | `dist-stale-20260825-0725` + 上一基线 `60c2e7e` 重同步 | 零迁移热更新:自动带练启动拒因逐分支说真话(prepareServerOwnership 返回具体拒因、删麦克风 catch-all、existing_manual_evidence/patient_microphone_active 进写前拒绝清单、后端拒启文案改人话)。背景=Eric 通宵实测+agent 三轮复现两堵墙。同窗口停用 demo-admin/demo-researcher(密码曾入转录)。树核 `MATCH 89/89`;preflight 8/8 退 0。**受控技术环境更新，不构成任何外部批准。** |
+| 2026-08-25 06:12 UTC | `60c2e7e` | `b6d4f8a2c917`（未变） | `dist-stale-20260825-0610` + 上一基线 `e33bb89` 重同步 | 纯前端零重启热更:编辑档案抽屉内置云处理授权入口(独立区块+单独确认+CAS)。真 Chrome 三轮验证含授权全循环。树核 `MATCH 89/89`;CI 绿。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-23 22:16 UTC | `e33bb89` | `b6d4f8a2c917`（未变） | `dist-stale-20260823-2210` + 上一基线 `edb363d` 重同步 | 零迁移热更新:同意状态反向改写伦理门 + 7 处文案交互修 + 云 ASR 空转写段列表按沉默处理(生产直调实证,原先老人一冷场即误判 asr_degraded 安全暂停)。当日生产运维:遗留暂停场中止、`.env` 加 readiness 指纹密钥(备份 `.env.before-20260823-fpkey`)、真云五项演示动线复验全 PASS(收据 220/221)。树核 `MATCH 89/89`;preflight 8/8 退 0;两提交 CI 绿。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-23 11:22 UTC | `edb363d` | `b6d4f8a2c917`（未变） | `dist-stale-20260823-110420` + 上一基线 `92040ac` 重同步 | 零迁移热更新（151 文件）：交互协议数据包 autopilot-v2（58 缺口清零，qc=draft 待书面确认）、引擎全题位化、真实场次通道（新开关+云前置）、按受试者配对/档案编辑/登记表归档、两轮可用性审计修复（含研究者端录音回执致盲根因 `sourceWseq`）。`.env` +5 变量（备份 `.env.before-20260823-111955`）。对抗审查 5 发现全处置；真 Chrome 双窗 E2E（22 题位自动推进+安全链）通过；树核 `MATCH 89/89`；preflight 8/8。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-19 00:3x | `10c90e4` | `b3e7c5a9d214` → **`6f2a9c4d8e17`**（三级） | 锚点快照 `20260818-162027` + 旧代码 `167273f` + 旧校验器 `2d50ce0c…`（三者一体） | 求助四态、研究分区披露控制与冻结发布纪元、`/research/v1/*` 绑纪元、切纪元 CLI、240 场机械容量 harness、只读部署树校验器。预检 8/8 退出码 0；部署树逐文件核过 `MATCH 84/84`；数据一条没动。**受控技术环境更新，不构成任何外部批准。** |
