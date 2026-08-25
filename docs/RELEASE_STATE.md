@@ -7,7 +7,16 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
-> **最新上线（2026-08-25 07:25–07:28 UTC）**：`60c2e7e` → **`920a20c`**，**零迁移热更新**
+> **最新上线（2026-08-26 16:15–16:20 UTC）**：`920a20c` → **`679c0e0`**，**零迁移热更新**
+> （库头 `b6d4f8a2c917` 未变）。`/content/item-bank` 按周供数:端点此前写死第 2 周
+> (就绪探针历史遗留),训练台不带周次取数再与计划比版本 → **第 3~8 周场次在训练台
+> 必然「题库版本不一致」整屏 fail-closed**(Eric 08-25 实测第 3 周场撞死)。修=端点
+> `?week=`(2..8,越界 422,默认保持第 2 周探针语义)、训练台按 `session.week_no`
+> 取数(第 1 周关系建立绑第 2 周题库,不传周)。新增按周端点测试先红后绿。
+> 旧 dist 隔离 `/opt/nmu/dist-stale-20260826-1615`。树核 `MATCH revision=679c0e0
+> files=89 identical=89`;preflight 8/8 退 0。
+>
+> **上一次（2026-08-25 07:25–07:28 UTC）**：`60c2e7e` → **`920a20c`**，**零迁移热更新**
 > （库头 `b6d4f8a2c917` 未变）。自动带练启动拒因逐分支说真话:prepareServerOwnership
 > 返回具体拒因(技术失败闩/暂停中/状态未同步…)、删掉「老人端麦克风还未确认关闭」
 > catch-all、`autopilot_existing_manual_evidence` 与 `autopilot_patient_microphone_active`
@@ -63,7 +72,7 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `920a20c`（2026-08-25 07:28 UTC 上线；此前 `60c2e7e` 08-25 早、`e33bb89` 08-23 晚、`edb363d` 08-23 上午） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 920a20c` 应输出 `MATCH … identical=89`（2026-08-25 07:28 UTC 实测通过） |
+| 应用代码版本 | `679c0e0`（2026-08-26 16:20 UTC 上线；此前 `920a20c`/`60c2e7e` 08-25、`e33bb89`/`edb363d` 08-23） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 679c0e0` 应输出 `MATCH … identical=89`（2026-08-26 16:20 UTC 实测通过） |
 | 部署树后续同步 | 已与 `main` 一致 | `git diff 3ccb86d..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b6d4f8a2c917`（2026-08-20 18:58 由 `6f2a9c4d8e17` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `79aea62e1a1ed4c6e01e` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
@@ -250,6 +259,7 @@ PM_20260730_自动对话/218-上线命令_b1765c0.sh`），Claude 只读核验�
 
 | 日期 | 代码版本 | 结构版本 | 回滚存档 | 备注 |
 | --- | --- | --- | --- | --- |
+| 2026-08-26 16:20 UTC | `679c0e0` | `b6d4f8a2c917`（未变） | `dist-stale-20260826-1615` + 上一基线 `920a20c` 重同步 | 零迁移热更新:/content/item-bank 按周供数(端点 ?week= 2..8,训练台按场次周次取数)——第 3~8 周场次不再在训练台撞「题库版本不一致」fail-closed。树核 `MATCH 89/89`;preflight 8/8 退 0。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-25 07:28 UTC | `920a20c` | `b6d4f8a2c917`（未变） | `dist-stale-20260825-0725` + 上一基线 `60c2e7e` 重同步 | 零迁移热更新:自动带练启动拒因逐分支说真话(prepareServerOwnership 返回具体拒因、删麦克风 catch-all、existing_manual_evidence/patient_microphone_active 进写前拒绝清单、后端拒启文案改人话)。背景=Eric 通宵实测+agent 三轮复现两堵墙。同窗口停用 demo-admin/demo-researcher(密码曾入转录)。树核 `MATCH 89/89`;preflight 8/8 退 0。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-25 06:12 UTC | `60c2e7e` | `b6d4f8a2c917`（未变） | `dist-stale-20260825-0610` + 上一基线 `e33bb89` 重同步 | 纯前端零重启热更:编辑档案抽屉内置云处理授权入口(独立区块+单独确认+CAS)。真 Chrome 三轮验证含授权全循环。树核 `MATCH 89/89`;CI 绿。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-23 22:16 UTC | `e33bb89` | `b6d4f8a2c917`（未变） | `dist-stale-20260823-2210` + 上一基线 `edb363d` 重同步 | 零迁移热更新:同意状态反向改写伦理门 + 7 处文案交互修 + 云 ASR 空转写段列表按沉默处理(生产直调实证,原先老人一冷场即误判 asr_degraded 安全暂停)。当日生产运维:遗留暂停场中止、`.env` 加 readiness 指纹密钥(备份 `.env.before-20260823-fpkey`)、真云五项演示动线复验全 PASS(收据 220/221)。树核 `MATCH 89/89`;preflight 8/8 退 0;两提交 CI 绿。**受控技术环境更新，不构成任何外部批准。** |
