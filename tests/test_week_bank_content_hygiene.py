@@ -109,3 +109,81 @@ def test_double_rubric_keywords_are_substrings_of_their_cue(bank_file: str):
                         f"{bank_file}:{item['item_id']}:{role}: “{term}”")
     assert not offenders, (
         "rubric 关键词不是其 cue/tell 源句的子串：\n" + "\n".join(offenders))
+
+
+@pytest.mark.parametrize("week", [2, 3, 4, 5, 6, 7, 8])
+def test_every_position_of_every_week_is_engine_selectable(week: int):
+    """2~8 周全部 78 题位必须能被自动带练引擎选中——任何一周任何题位坏了当场红。
+
+    2026-08-26 生产实测(墙六):wk4 SE_花瓶 因登记勘误后 unknown/silence 借用
+    同一源句,被「cue1 三分支异源」规则拒 → 全周启动 409,而周就绪面报绿。
+    引擎已为「errata_fixed 登记过 cues.1.* 的题」开精确豁免;未登记的塌缩仍拒。
+    """
+    from app import autopilot_positions, autopilot_service, content, repeat_intent
+    from app.models import Session as TrainSession
+
+    bank = content.load_item_bank_for_week(week)
+    proto = content.load_autopilot_protocol(
+        content.CONTENT_DIR / "autopilot_protocol_v1.json")
+    pkg = content.load_autopilot_interaction_package(week, protocol=proto)
+    rp = repeat_intent.active_protocol()
+    sess = TrainSession(
+        session_id=f"hyg-wk{week}", patient_id=f"hyg-wk{week}", week_no=week,
+        phase_type="正式训练", event_line="正式训练",
+        item_bank_version_id=bank.version_id,
+        item_bank_definition_digest=content.item_bank_definition_digest(bank),
+        autopilot_protocol_version_id=str(proto.get("protocol_version_id")),
+        autopilot_protocol_definition_digest=(
+            content.autopilot_protocol_definition_digest(proto)),
+        repeat_protocol_version_id=rp.version_id,
+        repeat_protocol_definition_digest=rp.definition_digest,
+        is_simulation=True, data_classification="simulation")
+    positions = autopilot_positions.build_positions(
+        bank, week_no=week, event_line="正式训练")
+    assert len(positions) == 78, week
+    failures = []
+    for p in positions:
+        try:
+            autopilot_service._select_p0a_content(
+                sess, bank, proto, item_id=p.item_id, turn_seq=p.turn_seq,
+                interaction_package=pkg)
+        except autopilot_service.AutopilotServiceError as exc:
+            failures.append(f"wk{week} {p.item_id}#{p.turn_seq}: {exc.code} {exc.message}")
+    assert not failures, "\n".join(failures)
+
+
+def test_same_source_cue1_collapse_without_errata_still_fails_closed():
+    """豁免只认 errata_fixed 显式记录:抹掉登记,同一塌缩必须立刻被拒。"""
+    from dataclasses import replace
+
+    from app import autopilot_positions, autopilot_service, content, repeat_intent
+    from app.models import Session as TrainSession
+
+    bank = content.load_item_bank_for_week(4)
+    stripped = replace(bank, errata_fixed=[])
+    proto = content.load_autopilot_protocol(
+        content.CONTENT_DIR / "autopilot_protocol_v1.json")
+    pkg = content.load_autopilot_interaction_package(4, protocol=proto)
+    rp = repeat_intent.active_protocol()
+    sess = TrainSession(
+        session_id="hyg-neg", patient_id="hyg-neg", week_no=4,
+        phase_type="正式训练", event_line="正式训练",
+        item_bank_version_id=stripped.version_id,
+        item_bank_definition_digest=content.item_bank_definition_digest(stripped),
+        autopilot_protocol_version_id=str(proto.get("protocol_version_id")),
+        autopilot_protocol_definition_digest=(
+            content.autopilot_protocol_definition_digest(proto)),
+        repeat_protocol_version_id=rp.version_id,
+        repeat_protocol_definition_digest=rp.definition_digest,
+        is_simulation=True, data_classification="simulation")
+    position = autopilot_positions.find_position(
+        autopilot_positions.build_positions(
+            stripped, week_no=4, event_line="正式训练"),
+        item_id="SE_花瓶", turn_seq=1)
+    with pytest.raises(autopilot_service.AutopilotServiceError) as caught:
+        autopilot_service._select_p0a_content(
+            sess, stripped, proto,
+            item_id=position.item_id, turn_seq=position.turn_seq,
+            interaction_package=pkg)
+    assert caught.value.code == "autopilot_content_incomplete"
+    assert "三分支" in caught.value.message

@@ -413,6 +413,9 @@ test("D1:部署门禁 409 是确定的写前拒绝——按拒因处理,不再�
     // 且零提示;收麦回执未闭合的拒绝同理。两者都在任何控制写入之前。
     "autopilot_existing_manual_evidence",
     "autopilot_patient_microphone_active",
+    // 2026-08-26 同病两例:内容完整性(wk4 SE_花瓶)与设备未唯一配对。
+    "autopilot_content_incomplete",
+    "autopilot_device_not_paired",
   ]) {
     assert.equal(isPrewriteStartRejection(gate(code)), true, code);
   }

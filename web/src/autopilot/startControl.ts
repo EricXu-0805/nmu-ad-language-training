@@ -292,6 +292,10 @@ const PREWRITE_START_REJECTION_CODES = new Set([
   "autopilot_existing_manual_evidence",
   // 受试者端收麦回执未闭合的启动拒绝,同样在任何写入之前。
   "autopilot_patient_microphone_active",
+  // 2026-08-26 实测同病两例:内容完整性拒绝(wk4 SE_花瓶)与设备未唯一配对,
+  // 都是写前确定性 409,折成 uncertain 会让研究者对着可点的按钮反复空击。
+  "autopilot_content_incomplete",
+  "autopilot_device_not_paired",
 ]);
 
 export function isPrewriteStartRejection(error: unknown): boolean {

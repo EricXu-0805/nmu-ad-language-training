@@ -1107,7 +1107,20 @@ def _select_p0a_content(
             )
         source_paragraphs.append(source_index)
     if len(set(source_paragraphs)) != len(response_paths):
-        _fail("autopilot_content_incomplete", "P0a cue1 三分支不能指向同一源段落")
+        # 登记过勘误的题允许分支借用同一源句:wk4 SE_花瓶 的③槽源稿误贴他题
+        # 话术被废弃,②④两句按语体重分配后三分支只剩两句可用(errata_fixed
+        # 有案,待临床书面确认)。未登记的同段落塌缩仍然 fail-closed——豁免只认
+        # 题库 errata_fixed 里对本题 cues.1.* 字段的显式记录。
+        errata_covers = any(
+            entry.get("item") == position.item_id
+            and str(entry.get("field") or "").startswith("cues.1.")
+            for entry in bank.errata_fixed
+        )
+        if not errata_covers:
+            _fail(
+                "autopilot_content_incomplete",
+                "P0a cue1 三分支不能指向同一源段落",
+            )
     legacy_cue1 = _required_text(cue1_row.get("text"), "cue1.text")
     if legacy_cue1 != cue1_lines["unknown"]:
         _fail("autopilot_content_incomplete", "P0a cue1.text 与 unknown 源分支不一致")
