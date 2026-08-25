@@ -7,7 +7,16 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
-> **最新上线（2026-08-26 16:15–16:20 UTC）**：`920a20c` → **`679c0e0`**，**零迁移热更新**
+> **最新上线（2026-08-26 16:55–17:00 UTC）**：`679c0e0` → **`075e2c6`**，**零迁移热更新（纯后端）**。
+> 第四堵墙:计划投影层 `_session_plan_for_account_projection` 只对 `week_no==2` 算
+> `operational_autopilot_ready`,第 3~8 周被兜底硬写 False → 「启动 AI 自动带练」灰死
+> +自相矛盾黄条,而服务端启动门明明放行 2..8。修=闸放宽 2..8;连修同族两处:照护员
+> 摘要裸调回落第 2 周题库(3~8 周 scope/进度静默空白)、legacy 修复 worker 写死第 2 周
+> (3~8 周 capture 卡死 received)。三处均有测试(投影 week3 先红后绿/照护员 2/3/8 三周
+> +旧机制钉/legacy 既有套件回归)。树核 `MATCH revision=075e2c6 files=89 identical=89`;
+> preflight 8/8 退 0。**受控技术环境更新，不构成任何外部批准。**
+>
+> **上一次（2026-08-26 16:15–16:20 UTC）**：`920a20c` → **`679c0e0`**，**零迁移热更新**
 > （库头 `b6d4f8a2c917` 未变）。`/content/item-bank` 按周供数:端点此前写死第 2 周
 > (就绪探针历史遗留),训练台不带周次取数再与计划比版本 → **第 3~8 周场次在训练台
 > 必然「题库版本不一致」整屏 fail-closed**(Eric 08-25 实测第 3 周场撞死)。修=端点
@@ -72,7 +81,7 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `679c0e0`（2026-08-26 16:20 UTC 上线；此前 `920a20c`/`60c2e7e` 08-25、`e33bb89`/`edb363d` 08-23） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 679c0e0` 应输出 `MATCH … identical=89`（2026-08-26 16:20 UTC 实测通过） |
+| 应用代码版本 | `075e2c6`（2026-08-26 17:00 UTC 上线；此前 `679c0e0` 同日、`920a20c`/`60c2e7e` 08-25、`e33bb89`/`edb363d` 08-23） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 075e2c6` 应输出 `MATCH … identical=89`（2026-08-26 17:00 UTC 实测通过） |
 | 部署树后续同步 | 已与 `main` 一致 | `git diff 3ccb86d..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b6d4f8a2c917`（2026-08-20 18:58 由 `6f2a9c4d8e17` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `79aea62e1a1ed4c6e01e` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
@@ -152,7 +161,7 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**无。生产 = `679c0e0` = origin/main 的最新代码提交（2026-08-26 16:20 UTC，docs 提交除外）。**
+**无。生产 = `075e2c6` = origin/main 的最新代码提交（2026-08-26 17:00 UTC，docs 提交除外）。**
 （2026-08-21 00:5x–01:0x 两次零迁移热更新：`70f2fec` 量表定义包勘误 v2——Eric 拍板
 修正 NPI-Q 五处笔误+SFACS 四处空格，定义按请求装载免重启；`7d70cce` 前端 UX——
 toast 底部居中+warn 8s、安排屏未完成计划前置横幅+锚点滚动、槽位 409 人话翻译。
@@ -259,6 +268,7 @@ PM_20260730_自动对话/218-上线命令_b1765c0.sh`），Claude 只读核验�
 
 | 日期 | 代码版本 | 结构版本 | 回滚存档 | 备注 |
 | --- | --- | --- | --- | --- |
+| 2026-08-26 17:00 UTC | `075e2c6` | `b6d4f8a2c917`（未变） | 按上一基线 `679c0e0` 重同步(纯后端无 dist 变化) | 零迁移热更新:第四堵墙——计划投影周次闸 ==2 放宽 2..8(第 3~8 周启动按钮不再灰死)+照护员摘要/legacy worker 按周取库。树核 `MATCH 89/89`;preflight 8/8 退 0。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-26 16:20 UTC | `679c0e0` | `b6d4f8a2c917`（未变） | `dist-stale-20260826-1615` + 上一基线 `920a20c` 重同步 | 零迁移热更新:/content/item-bank 按周供数(端点 ?week= 2..8,训练台按场次周次取数)——第 3~8 周场次不再在训练台撞「题库版本不一致」fail-closed。树核 `MATCH 89/89`;preflight 8/8 退 0。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-25 07:28 UTC | `920a20c` | `b6d4f8a2c917`（未变） | `dist-stale-20260825-0725` + 上一基线 `60c2e7e` 重同步 | 零迁移热更新:自动带练启动拒因逐分支说真话(prepareServerOwnership 返回具体拒因、删麦克风 catch-all、existing_manual_evidence/patient_microphone_active 进写前拒绝清单、后端拒启文案改人话)。背景=Eric 通宵实测+agent 三轮复现两堵墙。同窗口停用 demo-admin/demo-researcher(密码曾入转录)。树核 `MATCH 89/89`;preflight 8/8 退 0。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-25 06:12 UTC | `60c2e7e` | `b6d4f8a2c917`（未变） | `dist-stale-20260825-0610` + 上一基线 `e33bb89` 重同步 | 纯前端零重启热更:编辑档案抽屉内置云处理授权入口(独立区块+单独确认+CAS)。真 Chrome 三轮验证含授权全循环。树核 `MATCH 89/89`;CI 绿。**受控技术环境更新，不构成任何外部批准。** |
