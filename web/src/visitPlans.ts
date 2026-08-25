@@ -229,7 +229,10 @@ function queueCompare(left: VisitPlanReceipt, right: VisitPlanReceipt): number {
     if (right.queue_order === null) return -1;
     return left.queue_order - right.queue_order;
   }
-  return left.plan_id.localeCompare(right.plan_id);
+  // 码点比较,与服务端 Python str 排序同一种序——localeCompare 的 ICU 字母序
+  // 会把大小写混排的 plan_id 判成与服务端相反的顺序,今日队列整屏误报乱序
+  // (2026-08-26 生产实拍)。
+  return left.plan_id < right.plan_id ? -1 : left.plan_id > right.plan_id ? 1 : 0;
 }
 
 export function parseVisitPlanToday(value: unknown): VisitPlanToday {

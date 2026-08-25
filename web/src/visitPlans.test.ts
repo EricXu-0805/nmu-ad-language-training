@@ -533,3 +533,22 @@ test("history request gate is latest-wins and invalidates work after unmount", (
   gate.invalidate();
   assert.equal(gate.isLatest(second), false);
 });
+
+test("today parser tiebreak follows server codepoint order, not locale collation", () => {
+  // 2026-08-26 生产实拍:同 date+time+order 的两计划,服务端按码点排
+  // (Python 大写<小写),前端 localeCompare 按 ICU 字母序判成「乱序」→
+  // 今日队列整屏红。平局键必须与服务端同一种比较:码点。
+  const upper = {
+    ...approved(`vp_${"B".repeat(24)}`),
+    scheduled_date: "2026-07-19", scheduled_time: "09:00:00", queue_order: 0,
+  };
+  const lower = {
+    ...approved(`vp_${"a".repeat(24)}`),
+    scheduled_date: "2026-07-19", scheduled_time: "09:00:00", queue_order: 0,
+  };
+  // 服务端顺序:码点 "B"(0x42) < "a"(0x61)。
+  const queue = { as_of_date: "2026-07-19", plans: [upper, lower], withheld_count: 0 };
+  assert.deepEqual(parseVisitPlanToday(queue), queue);
+  // 真乱序(码点逆序)仍必须拒。
+  assert.throws(() => parseVisitPlanToday({ ...queue, plans: [lower, upper] }));
+});
