@@ -18,8 +18,9 @@
 > content/questionnaires 五包在位,dist 15 文件完整,`OK database_at_head`,树核
 > `MATCH revision=ec2d1b5 files=89 identical=89`,红线 404 / 量表目录 401。
 > preflight 7/8:唯一 FAIL=备份新鲜度——08-26 19:38Z 夜备份被快照校验器以
-> `audio_governed_bytes_present` 拒绝(演示产生的受管音频未走导出/删除流程,既有契约,
-> 与本次改动无关,待处置)。后端重启,readiness 探针缓存已清,自动带练前需重按
+> `audio_governed_bytes_present` 拒绝:受试者 demo-001 已登记研究撤回,其 7 条录音行
+> withdrawn=1 而 7 个 .webm 仍在 data/audio(契约:已撤回者音频字节不得进快照)。既有
+> 契约,与本次改动无关;录音走删除流程后自愈,待 Eric 处置。后端重启,readiness 探针缓存已清,自动带练前需重按
 > 「检查 AI 服务」。**受控技术环境更新，不构成任何外部批准；两份新表待钱凯/丁老师终确认。**
 >
 > **上一次（2026-08-27 15:03 UTC）**：`7a80c9e` → **`ec682d3`**，**零迁移纯前端热更（零重启）**。
