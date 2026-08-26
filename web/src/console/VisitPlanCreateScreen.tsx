@@ -13,7 +13,7 @@ import type {
   VisitPlanReceipt,
 } from "../types";
 import { LatestVisitPlanHistoryRequest, PendingVisitPlanCommandKeys } from "../visitPlans";
-import { nextUnplannedWeek, plannedWeeksSummary } from "./visitPlanWeekDefaults";
+import { nextSittingNoForSlot, nextUnplannedWeek, occupiedSittingsForSlot, plannedWeeksSummary } from "./visitPlanWeekDefaults";
 import { DataBoundaryBadge } from "./DataBoundaryFilter";
 import { assessVisitPlanProtocol, type TrainingContentStatus } from "./protocolAdmission";
 import { humanizeEligibilityText } from "./researchEligibility";
@@ -215,6 +215,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   // 用户手动改过之后不再被推导覆盖。
   const [weekNo, setWeekNo] = useState(1);
   const weekTouched = useRef(false);
+  const sittingTouched = useRef(false);
   const [phase, setPhase] = useState<PhaseType>("关系建立");
   const [patientSimulation, setPatientSimulation] = useState<boolean | null>(null);
   const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
@@ -277,6 +278,19 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
       ? "正式训练"
       : (WEEK_ONE_PHASES as readonly string[]).includes(current) ? current : "关系建立");
   }, [plans]);
+
+  // 「同周第几次训练」跟着协议槽位(周次+环节)推导:换槽位即重推,同一槽位内
+  // 研究者手动改过序号就不再打扰。场次中止后重选该周会自动指到下一个可用序号,
+  // 免得默认 1 撞「同一协议槽位」409;第 1 周三个环节各自独立计数。
+  useEffect(() => {
+    sittingTouched.current = false;
+  }, [weekNo, phase]);
+  useEffect(() => {
+    if (plans === null || sittingTouched.current) return;
+    const slotPhase = normalizePhase(weekNo);
+    setSittingNo(nextSittingNoForSlot(plans, weekNo, slotPhase, eventLineFor(weekNo, slotPhase)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plans, weekNo, phase]);
 
   useEffect(() => {
     let active = true;
@@ -408,11 +422,24 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
     } catch (error) {
       releaseKnownFailure("create", command.fingerprint, command.key, error);
       const text = errorText(error);
-      toast(text.includes("同一协议槽位")
-        ? "这位受试者同一周次已有一份安排还没处理——在下方列表先「审核通过」或「取消安排」，不要重复创建"
+      const slotConflict = text.includes("同一协议槽位");
+      // 占住槽位的若是已开训安排:它既不能审核也不能取消(started 是终占位),
+      // 老建议「先审核或取消」是死胡同——真正的出路是换下一个「同周第几次训练」。
+      // 槽位按(周次+环节+序号)全键匹配,第 1 周不同环节的同序号安排不是冲突方。
+      const slotPhase = normalizePhase(weekNo);
+      const slotLine = eventLineFor(weekNo, slotPhase);
+      const blocking = slotConflict
+        ? plans?.find((plan) => plan.status !== "cancelled"
+          && plan.week_no === weekNo && plan.session_sitting_no === sittingNo
+          && plan.phase_type === slotPhase && plan.event_line === slotLine)
+        : undefined;
+      toast(slotConflict
+        ? (blocking?.status === "started"
+          ? `第 ${weekNo} 周第 ${sittingNo} 次已开训，不能重复创建——把「同周第几次训练」改为 ${nextSittingNoForSlot(plans, weekNo, slotPhase, slotLine)} 再保存，即可继续本周训练`
+          : "这位受试者同一周次已有一份安排还没处理——在下方列表先「审核通过」或「取消安排」，不要重复创建")
         : text, "danger");
       await reload();
-      if (text.includes("同一协议槽位")) {
+      if (slotConflict && blocking?.status !== "started") {
         document.getElementById("visit-plan-history")?.scrollIntoView(
           { behavior: "smooth", block: "start" });
       }
@@ -518,7 +545,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
         <Alert tone="info" title={`下方已有 ${openPlans.length} 份未完成的训练安排`}>
           <p style={{ margin: 0 }}>
             先在「既有训练安排」里处理它——草稿点「审核通过」，不用的点「取消安排」。
-            同一周次重复创建会被拒绝。
+            同一周同一「第几次」重复创建会被拒绝；场次中止后要再练同一周，把「同周第几次训练」加一即可。
           </p>
           <Button size="sm" onClick={() => {
             document.getElementById("visit-plan-history")?.scrollIntoView(
@@ -548,9 +575,19 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
               <TextInput type="number" min={0} max={100000} value={queueOrder} disabled={!canManage || busy}
                 onChange={(event) => setQueueOrder(Math.max(0, Math.min(100000, Number(event.target.value) || 0)))} />
             </Field>
-            <Field label="同周第几次训练" hint="通常为 1；研究计划要求续坐时再调整">
+            <Field label="同周第几次训练"
+              hint={(() => {
+                const slotPhase = normalizePhase(weekNo);
+                const occupied = occupiedSittingsForSlot(plans, weekNo, slotPhase, eventLineFor(weekNo, slotPhase));
+                return occupied.length > 0
+                  ? `该周该环节已占第 ${occupied.join("、")} 次（含已开训/已中止的场次），重复序号会被拒绝`
+                  : "通常为 1；研究计划要求续坐时再调整";
+              })()}>
               <TextInput type="number" min={1} max={1000} value={sittingNo} disabled={!canManage || busy}
-                onChange={(event) => setSittingNo(Math.max(1, Math.min(1000, Number(event.target.value) || 1)))} />
+                onChange={(event) => {
+                  sittingTouched.current = true;
+                  setSittingNo(Math.max(1, Math.min(1000, Number(event.target.value) || 1)));
+                }} />
             </Field>
             <Field label="训练周次（1–8 周）" required hint={plannedWeeksSummary(plans)}>
               <TextInput type="number" min={1} max={8} value={weekNo} required disabled={!canManage || busy}

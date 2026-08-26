@@ -1161,7 +1161,7 @@ def create_plan(
         _fail(
             409,
             "visit_plan_protocol_slot_conflict",
-            "该受试者的同一协议槽位已有未取消训练安排",
+            "该受试者的同一协议槽位已有未取消训练安排；同周再次训练请把「同周第几次训练」加一后重新创建",
         )
     plan = VisitPlan(
         plan_id=_new_id("vp"),

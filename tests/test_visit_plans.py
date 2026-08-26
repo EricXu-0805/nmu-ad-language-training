@@ -2960,6 +2960,68 @@ def test_abort_preserves_started_visit_slot_and_never_auto_reschedules(
     assert replacement.status_code == 409, replacement.text
 
 
+def test_same_week_next_sitting_reopens_training_after_abort(
+        visit_clients: VisitClients):
+    """中止后同周继续训练的既定出路:换下一个「同周第几次训练」全链放行。
+
+    排程页的引导文案指的就是这条路——create→approve→start 必须全 200,
+    否则前端指引是空话;同槽重建的 409 里也必须把这条路说出来。
+    """
+    created = _create(
+        visit_clients.researcher,
+        "P-VISIT-12",
+        "create-next-sitting-first-0001",
+    )
+    approved = _command(
+        visit_clients.researcher, created["plan_id"], "approve",
+        key="approve-next-sitting-first-0001",
+        expected_revision=created["revision"],
+    )
+    assert approved.status_code == 200, approved.text
+    started = _command(
+        visit_clients.researcher, created["plan_id"], "start",
+        key="start-next-sitting-first-0001",
+        expected_revision=approved.json()["revision"],
+    )
+    assert started.status_code == 200, started.text
+    aborted = visit_clients.researcher.post(
+        f"/sessions/{started.json()['session_id']}/abort",
+        json={
+            "reason_code": "clinical_safety",
+            "expected_revision": 0,
+            "idempotency_key": "abort-next-sitting-first-0001",
+        },
+    )
+    assert aborted.status_code == 200, aborted.text
+    assert aborted.json()["status"] == "aborted"
+
+    retry_same_slot = visit_clients.researcher.post(
+        "/visit-plans",
+        json=_plan_body("P-VISIT-12", "create-next-sitting-conflict-0001"),
+    )
+    assert retry_same_slot.status_code == 409, retry_same_slot.text
+    assert "同周第几次训练" in retry_same_slot.text
+
+    second = _create(
+        visit_clients.researcher,
+        "P-VISIT-12",
+        "create-next-sitting-second-0001",
+        session_sitting_no=2,
+    )
+    second_approved = _command(
+        visit_clients.researcher, second["plan_id"], "approve",
+        key="approve-next-sitting-second-0001",
+        expected_revision=second["revision"],
+    )
+    assert second_approved.status_code == 200, second_approved.text
+    second_started = _command(
+        visit_clients.researcher, second["plan_id"], "start",
+        key="start-next-sitting-second-0001",
+        expected_revision=second_approved.json()["revision"],
+    )
+    assert second_started.status_code == 200, second_started.text
+
+
 def test_concurrent_abort_cas_commits_one_reason_across_independent_sessions(
         visit_clients: VisitClients):
     created = _create(

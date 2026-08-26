@@ -17,6 +17,37 @@ export function nextUnplannedWeek(
   return MAX_TRAINING_WEEK;
 }
 
+// 同槽再训:后端协议槽位键 = (受试者, 序号, 周次, 阶段, 任务线)。序号推导必须
+// 按同一组键过滤——只按周计数会把第 1 周合法共存的三个环节(关系建立/基线测评/
+// 前测,同 sitting 不同 phase/event_line)误标成「第 2、3 次」且服务器照单全收。
+// 场次中止后 plan 停在 started、槽位不释放,同槽继续只能用下一个序号——后端本来
+// 就放行这条路,这里只负责把默认值指对,审核权威仍在服务器。
+export function occupiedSittingsForSlot(
+  plans: readonly VisitPlanReceipt[] | null | undefined,
+  weekNo: number,
+  phaseType: string,
+  eventLine: string,
+): number[] {
+  if (!plans) return [];
+  const occupied = plans
+    .filter((plan) => plan.status !== "cancelled"
+      && plan.week_no === weekNo
+      && plan.phase_type === phaseType
+      && plan.event_line === eventLine)
+    .map((plan) => plan.session_sitting_no);
+  return [...new Set(occupied)].sort((a, b) => a - b);
+}
+
+export function nextSittingNoForSlot(
+  plans: readonly VisitPlanReceipt[] | null | undefined,
+  weekNo: number,
+  phaseType: string,
+  eventLine: string,
+): number {
+  const occupied = occupiedSittingsForSlot(plans, weekNo, phaseType, eventLine);
+  return occupied.length === 0 ? 1 : Math.max(...occupied) + 1;
+}
+
 // 下拉旁的可见说明:这位受试者已完成/进行中的周次一目了然。
 export function plannedWeeksSummary(
   plans: readonly VisitPlanReceipt[] | null | undefined,
