@@ -179,6 +179,8 @@ export function usePatientAutopilot(input: {
   const serverContextRef = useRef<ServerContext | null>(null);
   const probeRetryAttempt = useRef(0);
   const probeRetryKey = useRef("");
+  // 无 server 上下文时(暂停期间整页刷新)收麦交接的去重键:同一命令只钉一次证据。
+  const standaloneDrainedKey = useRef<string | null>(null);
   serverContextRef.current = server;
   const [localCapturePhase, setLocalCapturePhase] =
     useState<LocalAutopilotCapturePhase | null>(null);
@@ -638,27 +640,35 @@ export function usePatientAutopilot(input: {
   // finished any durable capture staging and released its device lease, then let
   // the paired device append one command-bound drain proof. The account takeover
   // endpoint remains locked until this proof exists.
+  //
+  // 刻意不要求仍处于 server 模式,也不要求本机还有 server 上下文:暂停恰落在
+  // 「命令领取窗口」时,/next 的 runtime_inactive 会先把本机踢进平静档 blocked,
+  // 而收麦交接恰恰是那种时序下唯一能解锁「继续/转为人工」的动作(否则
+  // takeover_ready 永假,研究者只剩中止)。暂停期间整页刷新后上下文为空,新页面
+  // 没有任何在放媒体——交接只是把这个事实按 drain-target 指定的命令钉成服务端
+  // 证据。没有自动带练/非本发行设备时,服务端会如实拒绝,按处置表安静收场。
   useEffect(() => {
     const context = serverContextRef.current;
-    if (!input.sessionPaused || input.sessionTerminal || visibleMode !== "server" || !context
-        || !input.sessionId) return;
+    if (!input.sessionPaused || input.sessionTerminal || !input.sessionId) return;
     let cancelled = false;
     let retryTimer: number | null = null;
     let retryAttempt = 0;
     let requestAbort: AbortController | null = null;
+    const fence = context?.fence ?? new AutopilotExecutionFence();
 
     const report = async () => {
       let provenCommandKey: string | null = null;
-      const active = context.controller;
+      const active = context?.controller ?? null;
       let shutdown: Promise<void> | null = null;
-      if (active) {
+      if (context && active) {
         context.controller = null;
         if (controllerRef.current === active) controllerRef.current = null;
         shutdown = active.stopAndWait();
       }
+      stopSpeaking();
       try {
         await acknowledgeDrainAfterShutdown({
-          fence: context.fence,
+          fence,
           shutdown,
           acknowledge: async () => {
             if (cancelled) return;
@@ -668,7 +678,9 @@ export function usePatientAutopilot(input: {
               requestAbort.signal,
               browserAutopilotMediaDependencies,
             );
-            if (context.drainedCommandKey === target.command_key) return;
+            const alreadyProven = context
+              ? context.drainedCommandKey : standaloneDrainedKey.current;
+            if (alreadyProven === target.command_key) return;
             provenCommandKey = target.command_key;
             const receipt = await acknowledgeExactAutopilotDrain(
               input.sessionId as string,
@@ -680,8 +692,11 @@ export function usePatientAutopilot(input: {
           },
         });
         if (cancelled) return;
-        if (provenCommandKey) context.drainedCommandKey = provenCommandKey;
-        setServer((before) => before?.delivery === context.delivery
+        if (provenCommandKey) {
+          if (context) context.drainedCommandKey = provenCommandKey;
+          else standaloneDrainedKey.current = provenCommandKey;
+        }
+        setServer((before) => context && before?.delivery === context.delivery
           ? { ...before } : before);
       } catch (error) {
         if (cancelled) return;
@@ -689,7 +704,7 @@ export function usePatientAutopilot(input: {
         if (disposition === "released") {
           // A concurrent, already-audited takeover won; the next ownership probe
           // will unmount this server runner. Never revive or re-report old media.
-          await releaseServerToLegacy(context, probeKey);
+          if (context) await releaseServerToLegacy(context, probeKey);
           return;
         }
         if (disposition === "repair-credential") {

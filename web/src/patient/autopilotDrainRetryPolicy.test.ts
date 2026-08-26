@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { ApiError } from "../apiResponse.ts";
 import {
@@ -48,4 +49,14 @@ test("只有精确的 409 command_not_current 判为代际围栏可丢弃", () =
     canonical(500, "autopilot_command_not_current")), false);
   assert.equal(pendingAckPermanentlyFenced(new TypeError("network")), false);
   assert.equal(pendingAckPermanentlyFenced(new Error("parse")), false);
+});
+
+
+test("收麦交接不再被「仍在 server 模式」挡住:暂停即应答,无上下文(刷新)也应答", () => {
+  const source = readFileSync(new URL("./usePatientAutopilot.ts", import.meta.url), "utf8");
+  // 暂停落在命令领取窗口时,runtime_inactive 先把本机踢进平静档;守卫若要求
+  // server 模式/本机上下文,收麦交接永不发生,takeover_ready 永假,研究者只剩中止。
+  assert.match(source, /if \(!input\.sessionPaused \|\| input\.sessionTerminal \|\| !input\.sessionId\) return;/);
+  assert.doesNotMatch(source, /visibleMode !== "server" \|\| !context/);
+  assert.match(source, /standaloneDrainedKey/);
 });
