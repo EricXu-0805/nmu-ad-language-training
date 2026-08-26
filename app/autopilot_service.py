@@ -2042,9 +2042,11 @@ def start_p0a(
         InteractionEvent.session_id == session_id,
     )).first()
     if existing_attempt is not None or existing_interaction is not None:
+        # 证据表没有来源列,人工操作和 AI 带练自己写的行在这里无法区分——
+        # 文案不得声称证据来自「人工操作」(AI 暂停后重启也会走到这里)。
         _fail(
             "autopilot_existing_manual_evidence",
-            "本场次已有人工操作登记的训练证据，AI 自动带练只能在全新场次里开启——"
+            "本场次已登记训练证据（人工操作或 AI 带练产生的都算），AI 自动带练只能在全新场次里开启——"
             "请结束或中止本场后重新开一场，进场后先点「启动 AI 自动带练」再做其他操作",
         )
 
@@ -3771,6 +3773,238 @@ def takeover_autopilot_to_manual(
     db.flush()
     db.expire(state)
     return get_autopilot_status(db, session_id=session_id)
+
+
+def resume_p0a(
+    db: Session,
+    *,
+    session_id: str,
+    idempotency_key: str,
+    expected_revision: int,
+    actor_id: str,
+    bank: content.ItemBank | None = None,
+    protocol: dict | None = None,
+    now: datetime | None = None,
+) -> StartP0aResult:
+    """从安全暂停(或人工接管)恢复自动带练:重发当前未完成题位的全新命令。
+
+    与 start 的 fresh-scope 语义互补:start 只接受全新场次,resume 只接受已有
+    P0a 状态且 status=='paused' 的场次(mode 允许 autonomous——暂停后原地继续,
+    或 manual——人工接管后切回 AI)。control/runner generation 双双 +1,暂停前的
+    一切设备 ACK、租约与收麦目标全部按代际作废;新命令一律从提示等级 0 重新
+    出题,绝不复活半截录音。位置规则:取最后一条自动命令,若其 purpose 已宣告
+    本题终结则从冻结计划下一位继续,否则原题位重出;人工接管期间产生的人工
+    证据只影响 attempt_seq 续号(避开唯一约束),不改变位置选择。终态
+    (failed/scope_completed)不可复活;撤回/云授权撤销由 gate 原样拒绝。
+    """
+    idempotency_key = _validate_idempotency_key(idempotency_key, "idempotency_key")
+    if (not isinstance(expected_revision, int) or isinstance(expected_revision, bool)
+            or expected_revision < 0):
+        _fail("autopilot_input_invalid", "expected_revision 必须是非负整数")
+    actor_id = _required_text(actor_id, "actor_id")
+    if len(actor_id) > 128:
+        _fail("autopilot_input_invalid", "actor_id 过长")
+    observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
+    resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
+    resolved_protocol = protocol or _default_protocol()
+
+    locked_session = db.exec(select(TrainSession).where(
+        TrainSession.session_id == session_id,
+    ).with_for_update()).first()
+    if locked_session is None:
+        _fail("autopilot_session_unavailable", "场次不存在或不可用于 P0a")
+
+    expected_payload = autopilot_ledger.encode_control_event_payload(
+        "resume", {
+            "reason_code": "researcher_explicit_resume",
+            "source": "account_resume_endpoint",
+        })
+    state = db.exec(select(SessionAutopilotState).where(
+        SessionAutopilotState.session_id == session_id,
+    ).with_for_update()).first()
+    prior_event = db.exec(select(AutopilotControlEvent).where(
+        AutopilotControlEvent.idempotency_key == idempotency_key,
+    )).first()
+    if prior_event is not None:
+        if (prior_event.session_id != session_id
+                or prior_event.event_type != "resume"
+                or prior_event.scope_key != P0A_SCOPE_KEY
+                or prior_event.actor_type != "researcher"
+                or prior_event.actor_id != actor_id
+                or prior_event.payload_json != expected_payload):
+            _fail("autopilot_idempotency_conflict", "恢复幂等键已被其他事实使用")
+        if (state is None or state.scope_key != P0A_SCOPE_KEY
+                or state.revision < expected_revision + 1):
+            _fail("autopilot_state_invalid", "恢复事件缺少一致的自动驾驶状态")
+        if state.current_command_id is None:
+            return StartP0aResult(
+                status=state.status, state_revision=state.revision,
+                replayed=True, command=None)
+        replay_command = db.get(RuntimeCommand, state.current_command_id)
+        if (replay_command is None
+                or replay_command.session_id != session_id
+                or replay_command.scope_key != P0A_SCOPE_KEY):
+            _fail("autopilot_state_invalid", "恢复回放缺少一致的当前命令")
+        replay_gate = _require_gate(
+            db, session_id,
+            bank=resolved_bank, protocol=resolved_protocol, now=observed_at,
+            position_item_id=replay_command.item_id,
+            position_turn_seq=replay_command.turn_seq)
+        return StartP0aResult(
+            status=state.status,
+            state_revision=state.revision,
+            replayed=True,
+            command=_projection_for_state(
+                db, state, replay_gate.selected,
+                expected_capability=replay_gate.active_capability),
+        )
+
+    if state is None or state.scope_key != P0A_SCOPE_KEY:
+        _fail("autopilot_not_active", "当前场次没有可继续的 P0a 状态")
+    if state.status != "paused":
+        _fail(
+            "autopilot_resume_requires_pause",
+            "只有安全暂停中的自动带练可以继续;完成或失败锁定的场次请开新场",
+        )
+    if state.mode not in {"autonomous", "manual"}:
+        _fail("autopilot_state_invalid", "暂停状态的控制模式不可证明")
+    if state.revision != expected_revision:
+        _fail("autopilot_revision_conflict", "自动驾驶状态 revision 已变化")
+    if state.current_command_id is not None or state.lease_owner is not None:
+        _fail("autopilot_state_invalid", "暂停状态不应持有在途命令或租约")
+    if state.mode == "autonomous":
+        # 与显式接管同一安全闸:必须已有本代际的收麦/媒体终止证明,
+        # 否则可能存在无人认领的热麦克风。
+        _safe_takeover_proof(db, state=state)
+    else:
+        latest = _latest_control_event(db, session_id)
+        if latest is None or not _control_event_matches_state(latest, state):
+            _fail("autopilot_state_invalid", "人工接管状态缺少当前 generation 证据")
+
+    # 恢复位置 = 冻结计划里第一个没有 TurnEvent(环节结论)的题位。AI 与人工
+    # 的结论都以 TurnEvent 落账,天然统一两种模式的进度;题位若已有半截 attempt
+    # (提示阶梯中段被打断),账本合同把每个阶梯格子的 attempt_seq 钉成绝对表,
+    # 无法安全地从中段续弹——如实拒绝并指路,绝不静默跳题或伪造阶梯位。
+    resolved = _resolved_profile_plan(
+        locked_session, resolved_bank, resolved_protocol)
+    if not resolved.positions:
+        _fail("autopilot_content_incomplete", "自动驾驶冻结计划没有可执行位置")
+    concluded_pairs = set(db.exec(
+        select(ItemEvent.item_id, TurnEvent.turn_seq)
+        .where(ItemEvent.session_id == session_id)
+        .where(TurnEvent.item_event_id == ItemEvent.id)
+    ).all())
+    target = next(
+        (position for position in resolved.positions
+         if (position.item_id, position.turn_seq) not in concluded_pairs),
+        None)
+    if target is None:
+        _fail(
+            "autopilot_scope_completed",
+            "本场可自动范围已全部训毕,请直接进入场次收尾",
+        )
+    attempted = db.exec(select(AttemptEvent).where(
+        AttemptEvent.session_id == session_id,
+        AttemptEvent.item_id == target.item_id,
+        AttemptEvent.turn_seq == target.turn_seq,
+    )).first()
+    if attempted is not None:
+        _fail(
+            "autopilot_resume_position_unresumable",
+            "当前题位停在提示阶梯中段,AI 暂不支持从中段原地续弹——"
+            "请「转为人工操作」把这一题完成后再切回 AI,或结束本场后开新场",
+        )
+    target_item, target_turn = target.item_id, target.turn_seq
+
+    gate = _require_gate(
+        db, session_id,
+        bank=resolved_bank, protocol=resolved_protocol, now=observed_at,
+        position_item_id=target_item, position_turn_seq=target_turn,
+        require_entire_plan_supported=True)
+    attempt_seq = 1
+
+    control_generation = state.control_generation + 1
+    runner_generation = state.runner_generation + 1
+    command_seq = state.next_command_seq
+    tts_payload = TtsCommandPayload(
+        speech_key=f"p0a.question.{command_seq}",
+        speech_text=gate.selected.initial_prompt,
+        purpose="question",
+        item_id=target_item,
+        turn_seq=target_turn,
+        cue_level=0,
+    )
+    command = RuntimeCommand(
+        idempotency_key=_command_key(),
+        session_id=session_id,
+        command_seq=command_seq,
+        item_id=target_item,
+        turn_seq=target_turn,
+        turn_key=f"{target_item}#{target_turn}",
+        attempt_seq=attempt_seq,
+        prompt_level=0,
+        **_command_definition_fields(gate.selected),
+        **_command_repeat_binding_fields(gate.train_session),
+        scope_key=P0A_SCOPE_KEY,
+        control_generation=control_generation,
+        runner_generation=runner_generation,
+        issued_capability_token_hash=gate.active_capability.token_hash,
+        issued_device_id_hash=gate.active_capability.device_id_hash,
+        issued_at=observed_at,
+        kind="tts",
+        state="pending",
+        payload_json=tts_payload.model_dump_json(exclude_none=True),
+        created_at=observed_at,
+        updated_at=observed_at,
+    )
+    db.add(command)
+    db.flush()
+    if command.id is None:  # pragma: no cover - SQLAlchemy invariant
+        _fail("autopilot_state_invalid", "恢复命令未能持久化")
+
+    from_mode = state.mode
+    from_status = state.status
+    state.mode = "autonomous"
+    state.status = "waiting_tts"
+    state.control_generation = control_generation
+    state.runner_generation = runner_generation
+    state.revision = expected_revision + 1
+    state.current_command_id = command.id
+    state.next_command_seq = command_seq + 1
+    state.last_error_code = None
+    state.lease_owner = None
+    state.lease_acquired_at = None
+    state.lease_expires_at = None
+    state.updated_at = observed_at
+    db.add(state)
+    db.add(AutopilotControlEvent(
+        idempotency_key=idempotency_key,
+        session_id=session_id,
+        event_seq=_next_control_event_seq(db, session_id),
+        event_type="resume",
+        scope_key=P0A_SCOPE_KEY,
+        control_generation=control_generation,
+        runner_generation=runner_generation,
+        command_id=command.id,
+        actor_type="researcher",
+        actor_id=actor_id,
+        reason_code="researcher_explicit_resume",
+        from_mode=from_mode,
+        to_mode="autonomous",
+        from_status=from_status,
+        to_status="waiting_tts",
+        payload_json=expected_payload,
+        created_at=observed_at,
+    ))
+    db.flush()
+    return StartP0aResult(
+        status=state.status,
+        state_revision=state.revision,
+        replayed=False,
+        command=_project_command(
+            db, command, gate.selected,
+            expected_capability=gate.active_capability),
+    )
 
 
 # Mirrors the write-side contract in autopilot_ledger.fenced_autopilot_update:

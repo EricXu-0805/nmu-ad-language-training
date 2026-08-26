@@ -5816,3 +5816,188 @@ def test_worker_drives_full_double_item_and_autofinishes_scope(
         assert runtime_state.intervention_ended_by == "SERVER-AUTOPILOT"
         from app.models import SessionOutcomeSummary
         assert session.get(SessionOutcomeSummary, SESSION_ID) is not None
+
+
+def _resume(clients: ApiClients, *, key: str, expected_revision: int):
+    return clients.account.post(
+        f"/sessions/{SESSION_ID}/autopilot/resume",
+        json={"idempotency_key": key, "expected_revision": expected_revision},
+    )
+
+
+def test_resume_after_researcher_pause_reissues_position_with_new_generation(
+        api_clients: ApiClients, monkeypatch):
+    """暂停→收麦证明→恢复:原题位重出、代际+1、runtime 同事务复活。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    first = _device_next(api_clients)
+    assert first is not None and first["kind"] == "tts"
+
+    paused = api_clients.account.post(f"/sessions/{SESSION_ID}/pause")
+    assert paused.status_code == 200, paused.text
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{first['command_key']}/drain-ack",
+        headers=api_clients.device_headers,
+    )
+    assert drained.status_code == 200, drained.text
+
+    resumed = _resume(
+        api_clients, key="resume-after-pause-0001",
+        expected_revision=drained.json()["state_revision"])
+    assert resumed.status_code == 200, resumed.text
+    receipt = resumed.json()
+    assert (receipt["mode"], receipt["status"]) == ("autonomous", "waiting_tts")
+
+    with Session(api_clients.engine) as session:
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        assert state.mode == "autonomous" and state.status == "waiting_tts"
+        commands = list(session.exec(select(RuntimeCommand).order_by(
+            RuntimeCommand.command_seq)))
+        issued = commands[-1]
+        # 原题位重出:同题同环节、提示等级归零、首答序号(该题位无任何 attempt,
+        # 首格 (0,1) 合法且不会撞证据唯一约束)。
+        assert (issued.item_id, issued.turn_seq) == (
+            commands[0].item_id, commands[0].turn_seq)
+        assert issued.prompt_level == 0
+        assert issued.attempt_seq == 1
+        assert json.loads(issued.payload_json)["purpose"] == "question"
+        # 代际围栏:暂停前的一切设备事实全部作废。
+        assert issued.control_generation == first["control_generation"] + 1
+        assert issued.runner_generation == first["runner_generation"] + 1
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None and runtime_state.status == "active"
+        resume_events = list(session.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.event_type == "resume")))
+        assert len(resume_events) == 1
+        assert resume_events[0].to_mode == "autonomous"
+
+    # 幂等重放:同键再打一次,不发第二条命令、不再推进 revision。
+    replay = _resume(
+        api_clients, key="resume-after-pause-0001",
+        expected_revision=drained.json()["state_revision"])
+    assert replay.status_code == 200, replay.text
+    with Session(api_clients.engine) as session:
+        commands = list(session.exec(select(RuntimeCommand)))
+        assert len(commands) == 2
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.revision == receipt["state_revision"]
+
+
+def test_resume_without_drain_proof_is_rejected(
+        api_clients: ApiClients, monkeypatch):
+    """无收麦证明不得恢复——可能存在无人认领的热麦克风。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    assert _device_next(api_clients) is not None
+    paused = api_clients.account.post(f"/sessions/{SESSION_ID}/pause")
+    assert paused.status_code == 200, paused.text
+
+    with Session(api_clients.engine) as session:
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        revision = state.revision
+
+    rejected = _resume(
+        api_clients, key="resume-no-drain-0001", expected_revision=revision)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "autopilot_takeover_drain_required"
+    with Session(api_clients.engine) as session:
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "paused"
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        # 失败必须整体回滚:runtime 不得被单独复活成 active。
+        assert runtime_state is not None and runtime_state.status == "paused"
+
+
+def test_resume_after_manual_takeover_returns_to_autonomous_and_fences_stale_acks(
+        api_clients: ApiClients, monkeypatch):
+    """转人工后切回 AI:mode 翻回 autonomous,旧代际设备 ACK 必须被拒。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    command = _device_next(api_clients)
+    assert command is not None and command["kind"] == "tts"
+    taken = _pause_drain_takeover(
+        api_clients, command, takeover_key="takeover-then-resume-0001")
+
+    resumed = _resume(
+        api_clients, key="resume-from-manual-0001",
+        expected_revision=taken["state_revision"])
+    assert resumed.status_code == 200, resumed.text
+    receipt = resumed.json()
+    assert (receipt["mode"], receipt["status"]) == ("autonomous", "waiting_tts")
+
+    # 暂停前那条命令的收麦回执属于旧代际,重放必须被代际围栏挡下,
+    # 不得污染恢复后的新命令链。
+    stale = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{command['command_key']}/drain-ack",
+        headers=api_clients.device_headers,
+    )
+    assert stale.status_code == 409, stale.text
+
+
+def test_resume_is_blocked_for_withdrawn_subject(
+        api_clients: ApiClients, monkeypatch):
+    """撤回受试者的场次不可恢复自动带练,状态原样保持。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    command = _device_next(api_clients)
+    assert command is not None
+    taken = _pause_drain_takeover(
+        api_clients, command, takeover_key="takeover-withdrawn-0001")
+
+    with Session(api_clients.engine) as session:
+        patient = session.get(Patient, PATIENT_ID)
+        assert patient is not None
+        patient.withdrawal_status = "withdrawn"
+        session.add(patient)
+        session.commit()
+
+    rejected = _resume(
+        api_clients, key="resume-withdrawn-0001",
+        expected_revision=taken["state_revision"])
+    # 主张:撤回后恢复必须被拒(具体由撤回门/主体围栏先到者拒),状态不得改变。
+    assert rejected.status_code in (403, 409), rejected.text
+    with Session(api_clients.engine) as session:
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None
+        assert (state.mode, state.status) == ("manual", "paused")
+
+
+def test_resume_rejects_position_stopped_mid_cue_ladder(
+        api_clients: ApiClients, monkeypatch):
+    """提示阶梯中段被暂停的题位不可原地续弹:如实拒绝并保持暂停原样。"""
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+    monkeypatch.setattr(asr, "get_engine", lambda: _EmptyTranscriptAsr())
+    _run_p0a_attempt_worker(SESSION_ID)
+
+    cue = _device_next(api_clients)
+    assert cue is not None and cue["kind"] == "tts"
+    assert json.loads(
+        Session(api_clients.engine).exec(select(RuntimeCommand).where(
+            RuntimeCommand.command_seq == cue["command_seq"],
+        )).first().payload_json)["purpose"] == "cue"
+
+    paused = api_clients.account.post(f"/sessions/{SESSION_ID}/pause")
+    assert paused.status_code == 200, paused.text
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{cue['command_key']}/drain-ack",
+        headers=api_clients.device_headers,
+    )
+    assert drained.status_code == 200, drained.text
+
+    rejected = _resume(
+        api_clients, key="resume-mid-ladder-0001",
+        expected_revision=drained.json()["state_revision"])
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == (
+        "autopilot_resume_position_unresumable")
+    with Session(api_clients.engine) as session:
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "paused"
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None and runtime_state.status == "paused"

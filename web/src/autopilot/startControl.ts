@@ -269,6 +269,40 @@ export function receiptAllowsAutopilotTakeover(
   return receipt?.serverOwned === true && receipt.takeoverReady === true;
 }
 
+// 「继续/切回 AI 自动带练」的呈现资格。两种来态:①AI 安全暂停中(autonomous
+// +paused)——要求与显式接管同一份收麦证明(takeoverReady),没有证明就可能有
+// 无人认领的热麦;②人工接管态(manual+paused)——服务端 resume 会重跑启动侧
+// 全部门禁,这里只判定按钮该不该出现。终态(failed/scope_completed)不出现。
+export function receiptAllowsAutopilotResume(
+  receipt: AutopilotStatusReceipt | null,
+): boolean {
+  if (receipt?.scopeKey !== "p0a_sim_first_single_v1") return false;
+  if (receipt.status !== "paused") return false;
+  return receipt.mode === "manual"
+    || (receipt.serverOwned && receipt.takeoverReady);
+}
+
+export interface AutopilotResumeRequest {
+  idempotency_key: string;
+  expected_revision: number;
+}
+
+export function buildAutopilotResumeRequest(
+  sessionId: string,
+  stateRevision: number,
+): AutopilotResumeRequest {
+  if (!SAFE_SESSION_ID.test(sessionId)) {
+    throw new Error("当前场次标识不能安全用于恢复自动带练");
+  }
+  if (!Number.isSafeInteger(stateRevision) || stateRevision < 1) {
+    throw new Error("恢复自动带练缺少可验证的服务器状态版本");
+  }
+  return {
+    idempotency_key: `p0a.resume.${sessionId}.${stateRevision}`,
+    expected_revision: stateRevision,
+  };
+}
+
 /**
  * 服务端 _require_gate 在写入任何控制事实之前就拒绝的确定性门禁码(D1)。
  * 这些 409 与「可能已有 owner/幂等冲突」不同:可以安全按写前拒绝呈现拒因,

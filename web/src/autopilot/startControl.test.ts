@@ -13,6 +13,8 @@ import {
   isPrewriteStartRejection,
   parseAutopilotStatusReceipt,
   p0aConsoleEligibility,
+  buildAutopilotResumeRequest,
+  receiptAllowsAutopilotResume,
   receiptAllowsAutopilotTakeover,
 } from "./startControl.ts";
 
@@ -127,6 +129,40 @@ test("account takeover stays closed until the exact server drain proof is ready"
   assert.equal(receiptAllowsAutopilotTakeover({
     ...drained, serverOwned: false,
   }), false);
+});
+
+test("resume 呈现资格:暂停+收麦证明或人工接管态才出现,终态一律不出", () => {
+  assert.equal(receiptAllowsAutopilotResume(null), false);
+  const pausedNoProof = parseAutopilotStatusReceipt({
+    ...safeStatus(), status: "paused", current_command_kind: null,
+  });
+  // 无收麦证明的暂停不得出现「继续 AI」——可能有无人认领的热麦。
+  assert.equal(receiptAllowsAutopilotResume(pausedNoProof), false);
+  const drained = parseAutopilotStatusReceipt({
+    ...safeStatus(), status: "paused", current_command_kind: null,
+    takeover_ready: true,
+  });
+  assert.equal(receiptAllowsAutopilotResume(drained), true);
+  const manual = parseAutopilotStatusReceipt({
+    ...safeStatus(), mode: "manual", status: "paused",
+    current_command_kind: null, server_owned: false,
+  });
+  assert.equal(receiptAllowsAutopilotResume(manual), true);
+  assert.equal(receiptAllowsAutopilotResume({
+    ...drained, status: "failed",
+  }), false);
+  assert.equal(receiptAllowsAutopilotResume({
+    ...drained, status: "scope_completed",
+  }), false);
+});
+
+test("resume 请求构造:revision 围栏与幂等键形状", () => {
+  assert.deepEqual(buildAutopilotResumeRequest("S-a1b2c3d4", 7), {
+    idempotency_key: "p0a.resume.S-a1b2c3d4.7",
+    expected_revision: 7,
+  });
+  assert.throws(() => buildAutopilotResumeRequest("S-a1b2c3d4", 0), /状态版本/);
+  assert.throws(() => buildAutopilotResumeRequest("受试者\n答案", 3), /不能安全/);
 });
 
 test("status/start share an exact content-free receipt", () => {

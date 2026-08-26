@@ -38,6 +38,7 @@ import {
   type ResearchPage,
 } from "./console/research/researchDataContract";
 import {
+  buildAutopilotResumeRequest,
   buildAutopilotStartRequest,
   buildAutopilotTakeoverRequest,
   parseAutopilotStatusReceipt,
@@ -906,6 +907,15 @@ export const api = {
       "POST",
       `/sessions/${encodeURIComponent(sid)}/autopilot/takeover`,
       buildAutopilotTakeoverRequest(sid, stateRevision),
+    )),
+  resumeAutopilot: async (
+    sid: string,
+    stateRevision: number,
+  ): Promise<AutopilotStartReceipt> =>
+    parseAutopilotStatusReceipt(await req<unknown>(
+      "POST",
+      `/sessions/${encodeURIComponent(sid)}/autopilot/resume`,
+      buildAutopilotResumeRequest(sid, stateRevision),
     )),
   recordingAuthorization: (sid: string, opts?: { device?: boolean }) =>
     req<{ allowed: boolean; runtime_status: SessionRuntimeStatus; is_simulation: boolean }>(

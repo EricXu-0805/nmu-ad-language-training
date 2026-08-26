@@ -171,6 +171,9 @@ _ROUTE_RULES = (
            roles=CAREGIVER_SESSION_CONTROL_ROLES, label="启动限定自动驾驶范围"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/takeover", AccessKind.ACCOUNT,
            roles=CAREGIVER_SESSION_CONTROL_ROLES, label="显式接管自动驾驶"),
+    # 恢复=重新开启老人端出题与录音,只允许具名研究者/管理员;照护员不在内。
+    _route({"POST"}, r"/sessions/[^/]+/autopilot/resume", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="恢复自动驾驶"),
 
     # 照护员只进入独立工作台窄路径。通用训练、内容、评分、音频、
     # 收尾与导出路由下方原有角色集合继续拒绝，不把新角色混入

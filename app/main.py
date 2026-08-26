@@ -8600,6 +8600,18 @@ class AutopilotTakeoverIn(BaseModel):
     expected_revision: int = PydanticField(ge=0)
 
 
+class AutopilotResumeIn(BaseModel):
+    """Account CAS command; resume reason/source are derived server-side."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = PydanticField(
+        min_length=8, max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+    )
+    expected_revision: int = PydanticField(ge=0)
+
+
 def _autopilot_write_failure(
         s: DBSession, exc: autopilot_service.AutopilotServiceError) -> NoReturn:
     """领域错误永远先回滚，再暴露稳定机器码，不泄露库内细节。"""
@@ -8871,6 +8883,80 @@ def autopilot_takeover(
                 expected_revision=body.expected_revision,
                 actor_id=actor_id,
             )
+            s.commit()
+        except autopilot_service.AutopilotServiceError as exc:
+            _autopilot_write_failure(s, exc)
+        except IntegrityError as exc:
+            _autopilot_integrity_conflict(s, exc)
+    return result
+
+
+@app.post(
+    "/sessions/{session_id}/autopilot/resume",
+    response_model=autopilot_service.AutopilotStatusReceipt,
+)
+def autopilot_resume(
+        session_id: str, body: AutopilotResumeIn, request: Request,
+        s: DBSession = Depends(get_session)):
+    """从安全暂停(或人工接管)恢复自动带练。
+
+    与 pause 侧对称:控制面 resume 与 runtime 复活在同一事务一次 commit,
+    绝不制造「AI 在跑而场次仍暂停」的双面分裂。启动侧的全部门禁在此重跑:
+    provider 实测、麦克风空闲、录音授权、云处理授权与撤回门(gate 内)。
+    """
+    actor_id = _require_account_identity(
+        request, "恢复自动驾驶",
+        roles={"researcher", "admin"},
+        allow_local_m0=True)
+    patient_id = _preauthorize_session_subject_fence(
+        request, session_id, s, "恢复自动驾驶")
+    with (governance_lock.subject_fence(s, patient_id),
+          _LIVE_WRITE_LOCK,
+          device_capability.serialized_mutation()):
+        sess = s.exec(select(TrainSession).where(
+            TrainSession.session_id == session_id,
+        ).with_for_update()).first()
+        if sess is None:
+            raise HTTPException(404, "场次不存在")
+        _require_session_operator(
+            request, sess, s, "恢复自动驾驶", mutation=True)
+        _require_started_visit_plan_session(session_id, s, sess=sess)
+        live = _live_row_for_update(s)
+        runtime = _runtime_row_for_update(session_id, s)
+        try:
+            provider_readiness.require_start_ready(s)
+        except provider_readiness.ProviderReadinessConflict as exc:
+            s.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=provider_readiness.conflict_detail(exc)) from exc
+        _ensure_patient_capture_idle_for_autopilot(live)
+        _ensure_runtime_writable(session_id, s, "恢复")
+        if runtime.status == "paused":
+            # 只复活运行状态,不重放人工游标:老人端画面由自动命令链重绘,
+            # 重放旧游标反而可能把暂停前的 selfStart/armed 还魂。
+            live_is_current = bool(live and _live_session_id(live) == session_id)
+            if live_is_current and live:
+                _set_live_session_paused(live, False)
+                live.patient_rec_json = None
+                live.seq += 1
+                live.updated_at = datetime.now()
+                s.add(live)
+            runtime.status = "active"
+            runtime.resumed_at = datetime.now()
+            runtime.revision += 1
+            runtime.updated_at = runtime.resumed_at
+            s.add(runtime)
+        try:
+            autopilot_service.resume_p0a(
+                s,
+                session_id=session_id,
+                idempotency_key=body.idempotency_key,
+                expected_revision=body.expected_revision,
+                actor_id=actor_id,
+            )
+            result = autopilot_service.get_autopilot_status(
+                s, session_id=session_id)
             s.commit()
         except autopilot_service.AutopilotServiceError as exc:
             _autopilot_write_failure(s, exc)

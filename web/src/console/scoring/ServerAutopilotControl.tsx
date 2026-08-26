@@ -8,6 +8,7 @@ import {
   initialAutopilotConsoleState,
   isPrewriteStartRejection,
   p0aConsoleEligibility,
+  receiptAllowsAutopilotResume,
   receiptAllowsAutopilotTakeover,
   sameAutopilotStatusReceipt,
   type AutopilotConsoleState,
@@ -89,6 +90,8 @@ export function ServerAutopilotControl({
   const lastWakeToken = useRef<string | null>(null);
   const [confirmTakeover, setConfirmTakeover] = useState(false);
   const [takeoverBusy, setTakeoverBusy] = useState(false);
+  const [confirmResume, setConfirmResume] = useState(false);
+  const [resumeBusy, setResumeBusy] = useState(false);
   const [providerReadiness, setProviderReadiness] = useState<ProviderReadiness | null>(null);
   const [providerReadinessError, setProviderReadinessError] = useState<string | null>(null);
   const [canProbeProvider, setCanProbeProvider] = useState(false);
@@ -140,6 +143,8 @@ export function ServerAutopilotControl({
     lastWakeToken.current = null;
     setConfirmTakeover(false);
     setTakeoverBusy(false);
+    setConfirmResume(false);
+    setResumeBusy(false);
     if (!classificationProven) {
       onOwnershipChange(false, "idle");
       return undefined;
@@ -360,6 +365,39 @@ export function ServerAutopilotControl({
     }
   };
 
+  // 与 takeover 同一收口范式:写前重取权威状态,写后收权威回执;失败折 uncertain
+  // fail-closed。恢复成功后 serverOwned 仍为 true,不触发人工面重挂。
+  const resume = async () => {
+    if (!receiptAllowsAutopilotResume(state.receipt) || resumeBusy) return;
+    setConfirmResume(false);
+    setResumeBusy(true);
+    controlWriteInFlight.current = true;
+    operationEpoch.current.beginWrite();
+    onOwnershipChange(true, "uncertain");
+    try {
+      const latest = await api.autopilotStatus(session.session_id);
+      acceptReceipt(latest);
+      if (!receiptAllowsAutopilotResume(latest)) return;
+      const next = await api.resumeAutopilot(
+        session.session_id,
+        latest.stateRevision,
+      );
+      acceptReceipt(next);
+    } catch (error) {
+      const message = error instanceof ApiError ? error.detail
+        : error instanceof Error ? error.message : String(error);
+      dispatch({
+        type: "status_uncertain",
+        sessionId: session.session_id,
+        error: message,
+      });
+      onOwnershipChange(true, "uncertain");
+    } finally {
+      setResumeBusy(false);
+      controlWriteInFlight.current = false;
+    }
+  };
+
   const scopeBlocked = !eligibility.allowed && eligibility.reason === "scope_unsupported";
   const accountBlocked = !eligibility.allowed && eligibility.reason === "account_required";
   const runtimeBlocked = !eligibility.allowed && eligibility.reason === "runtime_blocked";
@@ -410,7 +448,7 @@ export function ServerAutopilotControl({
               : checking ? "正在恢复服务器状态…"
               : active ? "服务器正在控制当前位置"
                 : processing ? "服务器正在处理回答"
-                  : paused ? "等待研究者处理"
+                  : paused ? "AI 已安全暂停"
                     : completed ? "当前可自动范围已完成"
                       : serverFailed ? "服务器失败·人工入口已锁定"
                       : uncertain ? "等待权威状态核实"
@@ -427,8 +465,15 @@ export function ServerAutopilotControl({
                       : isSimulation ? "启动 AI 自动带练（演练）"
                         : "启动 AI 自动带练"}
           </Button>
+          {receiptAllowsAutopilotResume(state.receipt) && !contentGap && (
+            <Button type="button" variant="primary" disabled={resumeBusy || takeoverBusy}
+              onClick={() => setConfirmResume(true)}>
+              {resumeBusy ? "正在恢复 AI 自动带练…"
+                : manual ? "切回 AI 自动带练" : "继续 AI 自动带练"}
+            </Button>
+          )}
           {canTakeover && (
-            <Button type="button" variant="danger" disabled={takeoverBusy}
+            <Button type="button" variant="danger" disabled={takeoverBusy || resumeBusy}
               onClick={() => setConfirmTakeover(true)}>
               {takeoverBusy ? "正在确认麦克风已关闭…" : "转为人工操作"}
             </Button>
@@ -443,7 +488,7 @@ export function ServerAutopilotControl({
       }
     >
       {manual ? (
-        <>已转为人工操作，服务器已记录本次接管。如场次仍在暂停，请先确认老人状态再继续。</>
+        <>已转为人工操作，服务器已记录本次接管。要回到自动模式，点「切回 AI 自动带练」，AI 会从当前未完成的题目重新出题；题目若停在提示阶梯中段，请先人工完成这一题再切回。如场次仍在暂停，请先确认老人状态再继续。</>
       ) : active ? (
         <>AI 正在进行当前环节；本页人工操作暂时关闭。</>
       ) : processing ? (
@@ -452,7 +497,7 @@ export function ServerAutopilotControl({
         contentGap ? (
           <>下一题缺少自动训练内容，AI 已停下，不会跳题。请点「转为人工操作」继续。</>
         ) : (
-          <>AI 已暂停，题目停在当前位置；要继续人工操作，请点「转为人工操作」。</>
+          <>AI 已安全暂停，题目停在当前位置。点「继续 AI 自动带练」由 AI 从当前未完成的题目重新出题；或点「转为人工操作」由你人工继续本场。</>
         )
       ) : completed ? (
         <>{isSimulation ? "本次模拟训练" : "本场训练"}的自动部分已完成；如需继续，请点「转为人工操作」。</>
@@ -530,6 +575,14 @@ export function ServerAutopilotControl({
       confirmLabel="确认转为人工操作"
       onCancel={() => setConfirmTakeover(false)}
       onConfirm={() => { void takeover(); }}
+    />
+    <ConfirmDialog
+      open={confirmResume}
+      title={manual ? "确认切回 AI 自动带练？" : "确认继续 AI 自动带练？"}
+      body="AI 会从当前未完成的题目重新出题并开启老人端麦克风；请先确认老人已准备好继续。恢复会留下记录。"
+      confirmLabel={manual ? "确认切回 AI" : "确认继续 AI"}
+      onCancel={() => setConfirmResume(false)}
+      onConfirm={() => { void resume(); }}
     />
     </>
   );
