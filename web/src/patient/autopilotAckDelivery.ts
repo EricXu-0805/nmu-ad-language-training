@@ -15,6 +15,7 @@ import {
   type AutopilotAckPersistencePhase,
   type AutopilotTransport,
 } from "./autopilotController.ts";
+import { pendingAckPermanentlyFenced } from "./autopilotDrainRetryPolicy.ts";
 import { commandSupersedesTerminalLatch } from "./autopilotRuntime.ts";
 import {
   checkpointTerminalFailureLatch,
@@ -293,8 +294,31 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
     }
     const entry = this.pending;
     if (!entry) return null;
-    await this.deliver(entry);
+    try {
+      await this.deliver(entry);
+    } catch (error) {
+      if (pendingAckPermanentlyFenced(error)) {
+        // 恢复/接管轮换代际后,这条回执被服务器永久围栏:重放永远 409,不丢弃
+        // 就会在每次进场(含刷新)时闩死老人端。持久丢弃并推进本地序号,
+        // 调用方按「无待恢复回执」继续走 /next。
+        await this.discardFencedPending(entry);
+        return null;
+      }
+      throw error;
+    }
     return entry;
+  }
+
+  /**
+   * 服务器已按代际围栏该命令,回执不可能再被接受:持久移除并消费其事件序号。
+   * 序号只需严格递增不需连续,跳过被丢弃的序号对服务端安全;终态失败 latch 照常
+   * 落存——它只挡「同代际重发」,新代际命令经 commandSupersedesTerminalLatch 放行。
+   */
+  private async discardFencedPending(entry: AutopilotAckEnvelope): Promise<void> {
+    await this.store.complete(entry);
+    this.lastSeq = entry.ack.device_event_seq;
+    this.pending = null;
+    this.latch = nextAutopilotAckLatch(entry);
   }
 
   private async readOwnerSnapshot(): Promise<

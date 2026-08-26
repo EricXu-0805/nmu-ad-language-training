@@ -4,6 +4,7 @@ import { ApiError } from "../apiResponse.ts";
 import {
   classifyAutopilotDrainFailure,
   drainRetryDelayMs,
+  pendingAckPermanentlyFenced,
 } from "./autopilotDrainRetryPolicy.ts";
 
 function canonical(status: number, code: string): ApiError {
@@ -34,4 +35,17 @@ test("released, credential and permanent contract failures do not request-storm"
     409, "autopilot_drain_device_mismatch")), "blocked");
   assert.equal(classifyAutopilotDrainFailure(new ApiError(422, "contract")), "blocked");
   assert.equal(classifyAutopilotDrainFailure(new Error("invalid response")), "blocked");
+});
+
+test("只有精确的 409 command_not_current 判为代际围栏可丢弃", () => {
+  assert.equal(pendingAckPermanentlyFenced(
+    canonical(409, "autopilot_command_not_current")), true);
+  assert.equal(pendingAckPermanentlyFenced(
+    canonical(409, "autopilot_runtime_inactive")), false);
+  assert.equal(pendingAckPermanentlyFenced(
+    canonical(409, "autopilot_revision_conflict")), false);
+  assert.equal(pendingAckPermanentlyFenced(
+    canonical(500, "autopilot_command_not_current")), false);
+  assert.equal(pendingAckPermanentlyFenced(new TypeError("network")), false);
+  assert.equal(pendingAckPermanentlyFenced(new Error("parse")), false);
 });

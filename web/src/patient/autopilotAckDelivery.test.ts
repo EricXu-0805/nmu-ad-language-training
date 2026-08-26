@@ -1874,3 +1874,86 @@ test("脱离克隆守卫：函数值抛 TypeError；原型为 null 的对象是�
   assert.equal(Object.isFrozen(clone), true);
   assert.equal(Object.isFrozen(nullProto), false);
 });
+
+test("代际围栏的滞留回执被持久丢弃,重放 409 command_not_current 不再闩死老人端", async () => {
+  const { ApiError } = await import("../apiResponse.ts");
+  const fenced = new ApiError(409, "test", {
+    code: "autopilot_command_not_current",
+    message: "设备回执命令已不是当前自主命令",
+  }, "nested-detail");
+  const store = new MemoryAckStore();
+  const first = await DurableAutopilotAckDelivery.create({
+    capability,
+    store,
+    transport: {
+      next: async () => null,
+      ack: async () => {
+        store.events.push("http-lost");
+        throw new Error("response lost");
+      },
+    },
+  });
+  await assert.rejects(() => first.send(question(), 0, { ack_type: "tts_started" }));
+  assert.equal(store.pending?.ack.device_event_seq, 1);
+
+  const recovered = await DurableAutopilotAckDelivery.create({
+    capability,
+    store,
+    transport: {
+      next: async () => null,
+      ack: async () => {
+        store.events.push("http-fenced");
+        throw fenced;
+      },
+    },
+  });
+  // 按「无待恢复回执」继续:不抛错、不进 blocked、随后照常 /next。
+  assert.equal(await recovered.drainPending(), null);
+  assert.equal(store.pending, null);
+  assert.equal(recovered.unresolvedSettlement, null);
+  // 被围栏的序号已持久消费(服务器只要求严格递增,跳号安全)。
+  assert.equal(store.checkpoint?.lastDeviceEventSeq, 1);
+  assert.deepEqual(store.events, ["stage", "http-lost", "http-fenced", "complete"]);
+
+  // 整页刷新重入:死回执不复活,一条 HTTP 都不发。
+  const reloaded = await DurableAutopilotAckDelivery.create({
+    capability,
+    store,
+    transport: {
+      next: async () => null,
+      ack: async () => { throw new Error("刷新后不得重放已丢弃回执"); },
+    },
+  });
+  assert.equal(await reloaded.drainPending(), null);
+  assert.equal(reloaded.initialDeviceEventSeq, 1);
+});
+
+test("非围栏拒因(如暂停窗口的 runtime_inactive)照旧保留待重放", async () => {
+  const { ApiError } = await import("../apiResponse.ts");
+  const pausedWindow = new ApiError(409, "test", {
+    code: "autopilot_runtime_inactive",
+    message: "P0a 要求显式 active 的场次运行状态",
+  }, "nested-detail");
+  const store = new MemoryAckStore();
+  const first = await DurableAutopilotAckDelivery.create({
+    capability,
+    store,
+    transport: {
+      next: async () => null,
+      ack: async () => { throw new Error("response lost"); },
+    },
+  });
+  await assert.rejects(() => first.send(question(), 0, { ack_type: "tts_started" }));
+
+  const recovered = await DurableAutopilotAckDelivery.create({
+    capability,
+    store,
+    transport: {
+      next: async () => null,
+      ack: async () => { throw pausedWindow; },
+    },
+  });
+  await assert.rejects(() => recovered.drainPending(), (error: unknown) => error === pausedWindow);
+  // exact envelope 原样保留:恢复后重放才可能拿到围栏拒因并被安全丢弃。
+  assert.equal(store.pending?.ack.device_event_seq, 1);
+});
