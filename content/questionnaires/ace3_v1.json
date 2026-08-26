@@ -1,0 +1,508 @@
+{
+  "schema_version": "questionnaire-definition.v1",
+  "questionnaire_id": "ace3_v1",
+  "title": "ADDENBROOKE’S 认知功能检查 - 中文版(2012)",
+  "short_name": "ACE-III",
+  "respondent": "examiner_administered",
+  "status": "prototype",
+  "provenance": {
+    "provided_by": "钱凯（南医大）",
+    "provided_via": "微信文件（量表-五个测量.rar）",
+    "provided_on": "2026-08-26",
+    "source_file": "ACE-III 量表原版本.pdf",
+    "source_sha256": "e1a420fde55740aa9aba15ae2dd70ce3a0c27477ec491ae3753676893e56b067",
+    "final_confirmation": "待钱凯与丁老师终确认；确认前本表按原型使用，不作为正式研究结局"
+  },
+  "instruction": "由检查者当面施测。画图、书写、图画命名等纸笔任务照原表在纸上完成，这里只记录各项得分；两项语言流利性记录正确总数，平台按分档表换算得分（‘车’字一项的分档见勘误 1）。五个认知域小计与总分（/100）由平台自动加总。",
+  "response_kind": "examiner_scored",
+  "value_field": null,
+  "element_field": null,
+  "present_field": null,
+  "severity_field": null,
+  "frequency_field": null,
+  "sections": null,
+  "items": null,
+  "examiner_panel": {
+    "domains": [
+      {
+        "domain_key": "attention",
+        "title": "注意力",
+        "max_score": 18
+      },
+      {
+        "domain_key": "memory",
+        "title": "记忆力",
+        "max_score": 26
+      },
+      {
+        "domain_key": "fluency",
+        "title": "语言流利性",
+        "max_score": 14
+      },
+      {
+        "domain_key": "language",
+        "title": "语言",
+        "max_score": 26
+      },
+      {
+        "domain_key": "visuospatial",
+        "title": "视空间",
+        "max_score": 16
+      }
+    ],
+    "items": [
+      {
+        "item_key": "ace_01",
+        "no": 1,
+        "domain_key": "attention",
+        "name": "定向（时间）",
+        "text": "问：今天是——哪年、哪月、几号、星期几、什么季节",
+        "entry": {
+          "kind": "score",
+          "max": 5,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_02",
+        "no": 2,
+        "domain_key": "attention",
+        "name": "定向（地点）",
+        "text": "问：您住在——哪个国家、哪个省/市、哪个区/县、街道名称、楼层号码",
+        "entry": {
+          "kind": "score",
+          "max": 5,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_03",
+        "no": 3,
+        "domain_key": "attention",
+        "name": "三个词组登记",
+        "text": "告诉受检者：“我说三个词组，我说完了请你重复一遍：柠檬、钥匙和皮球”。受检者重复完后，告诉他/她：“记住这三个词，过一会我还会问你。”只对第一次检查评分（必要的话可以重复三次）",
+        "entry": {
+          "kind": "score",
+          "max": 3,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_04",
+        "no": 4,
+        "domain_key": "attention",
+        "name": "三个词组重复次数",
+        "text": "重复次数",
+        "entry": {
+          "kind": "count",
+          "max": 3,
+          "scored": false,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_05",
+        "no": 5,
+        "domain_key": "attention",
+        "name": "连续减 7",
+        "text": "问受检者：100 减去 7 是多少？得到的数字再减去 7 是多少？连续做五次。如果受检者中间算错的话，可以继续进行，将错就错，只要下一个答案正确就给分（如 93，84，77，70，63，得分为 4 分，虽然第二次（93-84）答案错误，但后 3 次按照 84 依次减 7 都是对的）。五次减法算完后停止计算（93，86，79，72，65）",
+        "entry": {
+          "kind": "score",
+          "max": 5,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_06",
+        "no": 6,
+        "domain_key": "memory",
+        "name": "三个词组回忆",
+        "text": "问受检者：我让你重复并记住的那三个词是什么？",
+        "entry": {
+          "kind": "score",
+          "max": 3,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_07",
+        "no": 7,
+        "domain_key": "fluency",
+        "name": "组词（‘车’字）",
+        "text": "组词：告诉受检者：我会给你一个字，你要用这个字组尽可能多的词。准备好了吗？你只有一分钟的时间。请用‘车’字组词（记录正确的总数，由平台按分档表换算为 0–7 分，分档见勘误 1）",
+        "entry": {
+          "kind": "count",
+          "max": 60,
+          "scored": true,
+          "bins": [
+            {
+              "min": 18,
+              "max": null,
+              "score": 7
+            },
+            {
+              "min": 14,
+              "max": 17,
+              "score": 6
+            },
+            {
+              "min": 11,
+              "max": 13,
+              "score": 5
+            },
+            {
+              "min": 8,
+              "max": 10,
+              "score": 4
+            },
+            {
+              "min": 6,
+              "max": 7,
+              "score": 3
+            },
+            {
+              "min": 4,
+              "max": 5,
+              "score": 2
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "score": 1
+            },
+            {
+              "min": 0,
+              "max": 1,
+              "score": 0
+            }
+          ],
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_08",
+        "no": 8,
+        "domain_key": "fluency",
+        "name": "动物",
+        "text": "告诉受检者：你能说出尽可能多的动物的名称吗？你只有一分钟的时间，现在开始（记录正确的总数，由平台按分档表换算为 0–7 分）",
+        "entry": {
+          "kind": "count",
+          "max": 60,
+          "scored": true,
+          "bins": [
+            {
+              "min": 22,
+              "max": null,
+              "score": 7
+            },
+            {
+              "min": 17,
+              "max": 21,
+              "score": 6
+            },
+            {
+              "min": 14,
+              "max": 16,
+              "score": 5
+            },
+            {
+              "min": 11,
+              "max": 13,
+              "score": 4
+            },
+            {
+              "min": 9,
+              "max": 10,
+              "score": 3
+            },
+            {
+              "min": 7,
+              "max": 8,
+              "score": 2
+            },
+            {
+              "min": 5,
+              "max": 6,
+              "score": 1
+            },
+            {
+              "min": 0,
+              "max": 4,
+              "score": 0
+            }
+          ],
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_09",
+        "no": 9,
+        "domain_key": "memory",
+        "name": "名字和地址学习",
+        "text": "告诉受检者：我会说一个名字和地址，我说完之后你要重复一遍，我们重复三次，所以你会记住的，我以后会再问你的（只对第三次检查评分）。王春明 / 北京市 / 海淀区 / 哈尔滨路 18 号",
+        "entry": {
+          "kind": "score",
+          "max": 7,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_10",
+        "no": 10,
+        "domain_key": "memory",
+        "name": "远期记忆",
+        "text": "现任国家主席的名字；第一任中华人民共和国主席的名字；中国历史上唯一的女皇帝的名字；现任的美国总统的名字",
+        "entry": {
+          "kind": "score",
+          "max": 4,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_11",
+        "no": 11,
+        "domain_key": "language",
+        "name": "执行指令",
+        "text": "在受检者前放一只铅笔和一张纸，然后，让受检者“请您拿起铅笔，然后拿起纸”。如果受检者不能正确完成这个指令，就计 0 分，不继续检查。如果受检者第一个问题回答正确，请继续让受检者完成以下三个动作：请把纸放在铅笔的上面；请拿起铅笔，但不要拿纸；请摸一下纸后，递给我铅笔",
+        "entry": {
+          "kind": "score",
+          "max": 3,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_12",
+        "no": 12,
+        "domain_key": "language",
+        "name": "书写",
+        "text": "要求受检者至少写出两个关于他/她的近期活动的句子。要求受检者写出完整的句子，不要用缩写。如果受检者围绕上述某个主题至少写出两个句子，就计 1 分。如果句子的语法和拼写都正确，再计 1 分。",
+        "entry": {
+          "kind": "score",
+          "max": 2,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_13",
+        "no": 13,
+        "domain_key": "language",
+        "name": "复述（四短句）",
+        "text": "让受检者重复：知足天地宽；心安菜根香；人到无求品自高；发光的未必都是金子。4 短句都正确的话给 2 分，2-3 个正确给 1 分，1 个或无给 0 分。",
+        "entry": {
+          "kind": "score",
+          "max": 2,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_14",
+        "no": 14,
+        "domain_key": "language",
+        "name": "复述（一）",
+        "text": "让受检者重复：春江水暖鸭先知",
+        "entry": {
+          "kind": "score",
+          "max": 1,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_15",
+        "no": 15,
+        "domain_key": "language",
+        "name": "复述（二）",
+        "text": "让受检者重复：业精于勤荒于嬉",
+        "entry": {
+          "kind": "score",
+          "max": 1,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_16",
+        "no": 16,
+        "domain_key": "language",
+        "name": "图画命名（12 幅）",
+        "text": "让受检者说出下列图画的名称：（12 幅图见原表第 3 页）",
+        "entry": {
+          "kind": "score",
+          "max": 12,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_17",
+        "no": 17,
+        "domain_key": "language",
+        "name": "理解（指图）",
+        "text": "用上面的图片，让受检者说出：指出哪个是国王戴的？指出哪个动物生活在中国四川卧龙？指出哪个动物生活在南极？指出哪个与泊船有关？",
+        "entry": {
+          "kind": "score",
+          "max": 4,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_18",
+        "no": 18,
+        "domain_key": "language",
+        "name": "朗读",
+        "text": "让受检者读出下列单词：[所有的都正确给 1 分] 玉、软、士、郊、海、移、盼、姓",
+        "entry": {
+          "kind": "score",
+          "max": 1,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_19",
+        "no": 19,
+        "domain_key": "visuospatial",
+        "name": "临摹（无穷大）",
+        "text": "相互重叠的数学符号 无穷大：让受检者按照下面的图形画出相同的图形",
+        "entry": {
+          "kind": "score",
+          "max": 1,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_20",
+        "no": 20,
+        "domain_key": "visuospatial",
+        "name": "临摹（立方体）",
+        "text": "金属丝制的立方体：让受检者画出相同的立方体图案",
+        "entry": {
+          "kind": "score",
+          "max": 2,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_21",
+        "no": 21,
+        "domain_key": "visuospatial",
+        "name": "画钟",
+        "text": "钟表：让受检者画出带有数字的钟表面，指针指向 5:10",
+        "entry": {
+          "kind": "score",
+          "max": 5,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_22",
+        "no": 22,
+        "domain_key": "visuospatial",
+        "name": "数黑点",
+        "text": "让受检者说出黑点的个数，但是不能用手指去数（四组，见原表第 5 页）",
+        "entry": {
+          "kind": "score",
+          "max": 4,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_23",
+        "no": 23,
+        "domain_key": "visuospatial",
+        "name": "认字母",
+        "text": "让受检者说出下面的字母（按照英文字母和汉语拼音发音均可）（四个，见原表第 6 页）",
+        "entry": {
+          "kind": "score",
+          "max": 4,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_24",
+        "no": 24,
+        "domain_key": "memory",
+        "name": "名字和地址回忆",
+        "text": "问受检者：“告诉我刚开始的时候我们重复过的名字和地址。”王春明 / 北京市 / 海淀区 / 哈尔滨路 18 号",
+        "entry": {
+          "kind": "score",
+          "max": 7,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "ace_25",
+        "no": 25,
+        "domain_key": "memory",
+        "name": "名字和地址再认",
+        "text": "如果都能回忆起来的话可以跳过下面这个测试，并计 5 分。如果受检者不能回忆起一个或更多词组，则进行下面的测试。让受检者选择：“下面我给你一些提示，名字（或者其他需要选择的项目）是“X”,“Y”还是“Z”？”如果受检者能找出正确答案可以得 1 分，并可以把这个分数加到回忆一栏的得分里。（选项表：王春力 / 王春明 / 张冬明；北京市 / 上海市 / 天津市；宣武区 / 朝阳区 / 海淀区；长沙路 / 哈尔滨路 / 广州路；81 号 / 18 号 / 19 号）",
+        "entry": {
+          "kind": "score",
+          "max": 5,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      }
+    ]
+  },
+  "scoring": {
+    "kind": "examiner_sum",
+    "scoring_rule_id": "ace3_cn2012.form_scoring.v1",
+    "max_score": 100,
+    "cutoff": null,
+    "stratified_cutoff": null,
+    "rule_verbatim": "得分：ACE-III总分 /100；注意力 /18；记忆力 /26；语言流利性 /14；语言 /26；视空间 /16"
+  },
+  "transcription_notes": [
+    "逐字来源：钱凯 2026-08-26 微信提供的 PDF（source_sha256 见上），版权行：© John R Hodges，translated by Gang Wang & Yue Huang，2013.03.03。",
+    "勘误 1（待钱凯裁决）：源表‘车’字组词分档表印为 ≥18→7、14-17→6、11-13→5、8-10→4、6-7→3、4-5→2、3-4→1、<3→0，总数为 4 时 4-5 与 3-4 两档同时命中（2 分或 1 分）。本包按英文原版 ACE-III 换算：≥18→7、14-17→6、11-13→5、8-10→4、6-7→3、4-5→2、2-3→1、0-1→0。与源表的差别只有两处：总数 4 记 2 分（源表两可）；总数 2 记 1 分（源表记 0 分）。其余各档一致。",
+    "动物分档表逐字：≥22→7、17-21→6、14-16→5、11-13→4、9-10→3、7-8→2、5-6→1、<5→0，无重叠。",
+    "源表无总指导语，instruction 为平台说明。各条目 text 为源表指令逐字；源表分行、分格的要点以 。、；、——、/ 连写；括号内以「记录」「选项表」「见原表」起头的文字是平台注，不是源表文字。",
+    "rule_verbatim 为源表第 6 页得分栏各行以；连写。",
+    "源表表头（受检者姓名、生日、病历号、检查日期、检查者姓名、文化程度、职业、右/左利手）不在本记录内：受试者身份由档案承载，其余按原表纸质留存。",
+    "「重复次数」为源表记录栏，不计分，源表未印范围，本包取 0–3；其余 24 项计分，五域之和 = 100。",
+    "未搬进电子记录的源表栏目：名字和地址三次学习的逐次记录（源表只对第三次评分，本包只记该分）；两项流利性的「总数」栏（本包只记「正确的」总数）；各题作答空格与画图区。第 25 题源表规定「都能回忆起来可以跳过并计 5 分」，本包不做跨题校验，由检查者照规则记分。",
+    "第 18 题朗读字表源表分两列排版（左列 玉软士郊，右列 海移盼姓），本包按左列后右列连写。",
+    "两项流利性的正确总数录入上限 60 为平台设定（源表无此数，≥18 / ≥22 已封顶，不影响得分）。"
+  ]
+}

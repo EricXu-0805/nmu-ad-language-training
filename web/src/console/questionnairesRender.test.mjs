@@ -60,6 +60,7 @@ function ordinalDefinition() {
       items: [fakeItem("i1", 1), fakeItem("i2", 2)],
     }],
     items: null,
+    examiner_panel: null,
     scoring: null,
     transcription_notes: [],
   };
@@ -83,6 +84,7 @@ function binaryDefinition() {
     frequency_field: null,
     sections: null,
     items: [fakeItem("b1", 1, { score_when: "是" }), fakeItem("b2", 2, { score_when: "否" })],
+    examiner_panel: null,
     scoring: {
       kind: "binary_sum",
       scoring_rule_id: "fake.rule.v1",
@@ -114,7 +116,63 @@ function tripletDefinition() {
     frequency_field: choice(["1", "2", "3", "4"], "假频率锚"),
     sections: null,
     items: [fakeItem("t1", 1, { name: "假名甲" }), fakeItem("t2", 2, { name: "假名乙" })],
+    examiner_panel: null,
     scoring: null,
+    transcription_notes: [],
+  };
+}
+
+function examinerDefinition() {
+  return {
+    schema_version: "questionnaire-definition.v1",
+    questionnaire_id: "fake_examiner_v1",
+    title: "假想认知检查",
+    short_name: "FAKE-D",
+    respondent: "examiner_administered",
+    status: "prototype",
+    provenance: provenance(),
+    instruction: "假指导语四句",
+    response_kind: "examiner_scored",
+    value_field: null,
+    element_field: null,
+    present_field: null,
+    severity_field: null,
+    frequency_field: null,
+    sections: null,
+    items: null,
+    examiner_panel: {
+      domains: [
+        { domain_key: "alpha", title: "假域甲", max_score: 4 },
+        { domain_key: "beta", title: "假域乙", max_score: 2 },
+      ],
+      items: [
+        { item_key: "e1", no: 1, domain_key: "alpha", name: "假名一", text: "假题干1",
+          entry: { kind: "score", max: 2, scored: true, bins: null, choice: null } },
+        { item_key: "e2", no: 2, domain_key: "alpha", name: "假名二", text: "假题干2",
+          entry: { kind: "count", max: 10, scored: true, choice: null, bins: [
+            { min: 5, max: null, score: 2 }, { min: 2, max: 4, score: 1 }, { min: 0, max: 1, score: 0 },
+          ] } },
+        { item_key: "e3", no: 3, domain_key: "alpha", name: "假名三", text: "假题干3",
+          entry: { kind: "count", max: 3, scored: false, bins: null, choice: null } },
+        { item_key: "e4", no: 4, domain_key: "beta", name: "假名四", text: "假题干4",
+          entry: { kind: "choice", max: null, scored: false, bins: null,
+            choice: choice(["组甲", "组乙"], "假组") } },
+        { item_key: "e5", no: 5, domain_key: "beta", name: "假名五", text: "假题干5",
+          entry: { kind: "count", max: 2, scored: true, bins: null, choice: null } },
+      ],
+    },
+    scoring: {
+      kind: "examiner_sum",
+      scoring_rule_id: "fake.examiner.v1",
+      max_score: 6,
+      cutoff: null,
+      stratified_cutoff: {
+        by_item: "e4",
+        groups: { "组甲": { operator: "<=", value: 3, label: "假达界甲" }, "组乙": null },
+        unjudged_label: "假未判定",
+      },
+      rule_verbatim: "示例计分",
+    },
     transcription_notes: [],
   };
 }
@@ -282,4 +340,35 @@ test("定义包漂移:只读并解释原因,不再给 AI 初评与锁定入口",
     countOccurrences(markup, "segmented-control__button"),
     countOccurrences(markup, 'segmented-control__button" aria-pressed="false" disabled')
     + countOccurrences(markup, 'segmented-control__button" aria-pressed="true" disabled'));
+});
+
+test("examiner_scored:记分框是档位按钮、计数框是数字输入、分档换算与各域小计在场", async () => {
+  const markup = await render(examinerDefinition(), recordFor(examinerDefinition(), {
+    values: [
+      slot("e1", "value", { final_value: "2", value_source: "human_direct" }),
+      slot("e2", "value", { final_value: "4", value_source: "human_direct" }),
+    ],
+  }));
+  // e1 记分框 0/1/2 三键 + e4 分组两键 = 5 个档位按钮;e2/e3/e5 三个数字输入。
+  assert.equal(countOccurrences(markup, "segmented-control__button"), 5);
+  assert.equal(countOccurrences(markup, 'inputMode="numeric"'), 3);
+  assert.equal(countOccurrences(markup, 'type="number"'), 0);
+  assert.ok(markup.includes("假域甲"));
+  assert.ok(markup.includes("假域乙"));
+  assert.ok(markup.includes("假题干5"));
+  assert.ok(markup.includes("假名二"));
+  // 总数 4 落在 2-4 档 → 1 分,换算结果对施测者可见。
+  assert.ok(markup.includes("换算得分 1 / 2"));
+  // 不计分的记录栏明说不计分。
+  assert.ok(markup.includes("不计分，仅记录"));
+  // 小计:假域甲 2+1=3/4,假域乙还差 1 项;总分 3 / 6。
+  assert.ok(markup.includes("3 / 4"));
+  assert.ok(markup.includes("还有 1 项未评"));
+  assert.ok(markup.includes("总分 3 / 6"));
+  // 不渲染其他三种题型的作答面。
+  assert.equal(markup.includes("严重度"), false);
+  assert.equal(markup.includes("本节沟通要素"), false);
+  for (const banned of ["attempt", "fail-closed", "幂等", "examiner", "bins"]) {
+    assert.equal(markup.includes(banned), false, `渲染结果不得含 ${banned}`);
+  }
 });

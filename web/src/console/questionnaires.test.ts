@@ -5,6 +5,8 @@ import test from "node:test";
 import {
   adoptableAiDraftEntries,
   aiDraftStatusLine,
+  examinerDomainTotals,
+  examinerEntryPoints,
   lockedScoreSummary,
   missingLockEntries,
   parseQuestionnaireCatalog,
@@ -68,6 +70,7 @@ function ordinalDefinition() {
     frequency_field: null,
     sections: [{ section_id: "s1", title: "假节甲", items: [fakeItem("i1", 1), fakeItem("i2", 2)] }],
     items: null,
+    examiner_panel: null,
     scoring: null,
     transcription_notes: ["假转录注一"],
   };
@@ -95,6 +98,7 @@ function binaryDefinition() {
       fakeItem("b2", 2, { score_when: "否" }),
       fakeItem("b3", 3, { score_when: "是" }),
     ],
+    examiner_panel: null,
     scoring: {
       kind: "binary_sum",
       scoring_rule_id: "fake.rule.v1",
@@ -126,7 +130,63 @@ function tripletDefinition() {
     frequency_field: choice(["1", "2", "3", "4"], "假频率锚"),
     sections: null,
     items: [fakeItem("t1", 1, { name: "假名甲" }), fakeItem("t2", 2, { name: "假名乙" })],
+    examiner_panel: null,
     scoring: null,
+    transcription_notes: [],
+  };
+}
+
+function examinerDefinition() {
+  return {
+    schema_version: "questionnaire-definition.v1",
+    questionnaire_id: "fake_examiner_v1",
+    title: "假想认知检查",
+    short_name: "FAKE-D",
+    respondent: "examiner_administered",
+    status: "prototype",
+    provenance: provenance(),
+    instruction: "假指导语四句",
+    response_kind: "examiner_scored",
+    value_field: null,
+    element_field: null,
+    present_field: null,
+    severity_field: null,
+    frequency_field: null,
+    sections: null,
+    items: null,
+    examiner_panel: {
+      domains: [
+        { domain_key: "alpha", title: "假域甲", max_score: 4 },
+        { domain_key: "beta", title: "假域乙", max_score: 2 },
+      ],
+      items: [
+        { item_key: "e1", no: 1, domain_key: "alpha", name: "假名一", text: "假题干1",
+          entry: { kind: "score", max: 2, scored: true, bins: null, choice: null } },
+        { item_key: "e2", no: 2, domain_key: "alpha", name: "假名二", text: "假题干2",
+          entry: { kind: "count", max: 10, scored: true, choice: null, bins: [
+            { min: 5, max: null, score: 2 }, { min: 2, max: 4, score: 1 }, { min: 0, max: 1, score: 0 },
+          ] } },
+        { item_key: "e3", no: 3, domain_key: "alpha", name: "假名三", text: "假题干3",
+          entry: { kind: "count", max: 3, scored: false, bins: null, choice: null } },
+        { item_key: "e4", no: 4, domain_key: "beta", name: "假名四", text: "假题干4",
+          entry: { kind: "choice", max: null, scored: false, bins: null,
+            choice: choice(["组甲", "组乙"], "假组") } },
+        { item_key: "e5", no: 5, domain_key: "beta", name: "假名五", text: "假题干5",
+          entry: { kind: "count", max: 2, scored: true, bins: null, choice: null } },
+      ],
+    },
+    scoring: {
+      kind: "examiner_sum",
+      scoring_rule_id: "fake.examiner.v1",
+      max_score: 6,
+      cutoff: null,
+      stratified_cutoff: {
+        by_item: "e4",
+        groups: { "组甲": { operator: "<=", value: 3, label: "假达界甲" }, "组乙": null },
+        unjudged_label: "假未判定",
+      },
+      rule_verbatim: "示例计分",
+    },
     transcription_notes: [],
   };
 }
@@ -460,4 +520,120 @@ test("P2-5:预检已知服务器会拒绝锁定时,确认框的锁定钮禁用",
   const drawer = readFileSync(new URL("./QuestionnaireDrawer.tsx", import.meta.url), "utf8");
   assert.match(drawer, /confirmDisabled=\{missing\.length > 0\}/);
   assert.match(drawer, /暂不能锁定——请先补齐/);
+});
+
+// ---------------- examiner_scored ----------------
+
+test("examiner_scored:定义解析通过,四种量表同目录", () => {
+  const entries = parseQuestionnaireCatalog(catalog([
+    ordinalDefinition(), binaryDefinition(), tripletDefinition(), examinerDefinition()]));
+  assert.deepEqual(
+    entries.map((entry) => entry.definition.response_kind),
+    ["ordinal_sections", "binary_scored", "symptom_triplet", "examiner_scored"]);
+  const examiner = entries[3].definition;
+  assert.equal(examiner.examiner_panel?.items.length, 5);
+  assert.equal(examiner.scoring?.kind, "examiner_sum");
+  assert.equal(examiner.examiner_panel?.items[1].entry.bins?.[0].max, null);
+});
+
+test("examiner_scored:旧夹具少了 examiner_panel 键整包拒收(exactKeys 对新键同样生效)", () => {
+  const stale = ordinalDefinition() as Record<string, unknown>;
+  delete stale.examiner_panel;
+  assert.throws(() => parseQuestionnaireCatalog(catalog([stale])), /字段不完整/);
+});
+
+test("examiner_scored:重叠分档/错放 examiner_panel/分组键不齐/score 不计分 全部拒收", () => {
+  const overlapping = examinerDefinition();
+  overlapping.examiner_panel.items[1].entry.bins = [
+    { min: 5, max: null, score: 2 }, { min: 3, max: 4, score: 1 }, { min: 0, max: 3, score: 0 },
+  ];
+  assert.throws(() => parseQuestionnaireCatalog(catalog([overlapping])), /连续且不重叠/);
+
+  const misplaced = { ...ordinalDefinition(), examiner_panel: examinerDefinition().examiner_panel };
+  assert.throws(() => parseQuestionnaireCatalog(catalog([misplaced])), /字段组合不合法/);
+
+  const groups = examinerDefinition();
+  delete (groups.scoring.stratified_cutoff.groups as Record<string, unknown>)["组乙"];
+  assert.throws(() => parseQuestionnaireCatalog(catalog([groups])), /组键与 allowed 一致/);
+
+  const unscored = examinerDefinition();
+  unscored.examiner_panel.items[0].entry.scored = false;
+  assert.throws(() => parseQuestionnaireCatalog(catalog([unscored])), /scored 必须为 true/);
+
+  const binaryScoring = { ...examinerDefinition(), scoring: binaryDefinition().scoring };
+  assert.throws(() => parseQuestionnaireCatalog(catalog([binaryScoring])), /字段组合不合法/);
+});
+
+test("examiner_scored:录入值换算——记分直取、计数查档、越界与非规范整数为 null、不计分恒 0", () => {
+  const definition = parsedDefinition(examinerDefinition());
+  const [score, binned, aux, group, direct] = definition.examiner_panel!.items.map((item) => item.entry);
+  assert.equal(examinerEntryPoints(score, "2"), 2);
+  assert.equal(examinerEntryPoints(score, "3"), null);
+  assert.equal(examinerEntryPoints(score, null), null);
+  assert.equal(examinerEntryPoints(binned, "0"), 0);
+  assert.equal(examinerEntryPoints(binned, "1"), 0);
+  assert.equal(examinerEntryPoints(binned, "2"), 1);
+  assert.equal(examinerEntryPoints(binned, "4"), 1);
+  assert.equal(examinerEntryPoints(binned, "5"), 2);
+  assert.equal(examinerEntryPoints(binned, "10"), 2);
+  assert.equal(examinerEntryPoints(binned, "11"), null);
+  assert.equal(examinerEntryPoints(binned, "05"), null);
+  assert.equal(examinerEntryPoints(binned, "1.5"), null);
+  assert.equal(examinerEntryPoints(aux, "3"), 0);
+  assert.equal(examinerEntryPoints(group, "组甲"), 0);
+  assert.equal(examinerEntryPoints(direct, "2"), 2);
+});
+
+test("examiner_scored:认知域小计只累加合法录入,缺项计数", () => {
+  const definition = parsedDefinition(examinerDefinition());
+  const values = new Map([["e1", "2"], ["e2", "4"], ["e3", "1"]]);
+  const totals = examinerDomainTotals(
+    definition.examiner_panel!, (key) => values.get(key) ?? null);
+  assert.deepEqual(totals.map((entry) => [entry.domain.title, entry.points, entry.missing]), [
+    ["假域甲", 3, 0], ["假域乙", 0, 1],
+  ]);
+});
+
+test("examiner_scored:缺项预览带认知域标题,不计分的记录栏同样必填", () => {
+  const definition = parsedDefinition(examinerDefinition());
+  const record = parsedRecord(recordFor(definition, {
+    values: [slot("e1", "value", { final_value: "1", value_source: "human_direct" })],
+  }));
+  assert.deepEqual(missingLockEntries(definition, record), [
+    "「假域甲」第2题未评", "「假域甲」第3题未评", "「假域乙」第4题未评", "「假域乙」第5题未评",
+  ]);
+});
+
+test("examiner_scored:锁定摘要 = 总分/满分 + 各域小计 + 界值三态", () => {
+  const definition = parsedDefinition(examinerDefinition());
+  const values = (group: string) => [
+    slot("e1", "value", { final_value: "2", value_source: "human_direct" }),
+    slot("e2", "value", { final_value: "3", value_source: "human_direct" }),
+    slot("e3", "value", { final_value: "0", value_source: "human_direct" }),
+    slot("e4", "value", { final_value: group, value_source: "human_direct" }),
+    slot("e5", "value", { final_value: "2", value_source: "human_direct" }),
+  ];
+  const locked = (overrides: Record<string, unknown>) => parsedRecord(recordFor(definition, {
+    status: "locked", locked_by: "tester", locked_at: "2026-08-27T01:00:00",
+    computed_total: 5, scoring_rule_id: "fake.examiner.v1", ...overrides,
+  }));
+  assert.equal(
+    lockedScoreSummary(locked({ cutoff_met: false, computed_flag: null, values: values("组甲") }), definition),
+    "总分 5 / 6 · 假域甲 3/4 · 假域乙 2/2 · 高于界值（界值 ≤ 3 分）");
+  assert.equal(
+    lockedScoreSummary(locked({ cutoff_met: true, computed_flag: "假达界甲", values: values("组甲") }), definition),
+    "总分 5 / 6 · 假域甲 3/4 · 假域乙 2/2 · 假达界甲");
+  assert.equal(
+    lockedScoreSummary(locked({ cutoff_met: null, computed_flag: "假未判定", values: values("组乙") }), definition),
+    "总分 5 / 6 · 假域甲 3/4 · 假域乙 2/2 · 假未判定");
+  // 定义包读不到时退回不带满分/小计的一行话;没有界值判定就不编造「未达界值」。
+  assert.equal(
+    lockedScoreSummary(locked({ cutoff_met: null, computed_flag: null, values: values("组乙") }), null),
+    "总分 5");
+  assert.equal(
+    lockedScoreSummary(locked({ cutoff_met: null, computed_flag: "假未判定", values: values("组乙") }), null),
+    "总分 5 · 假未判定");
+  assert.equal(
+    lockedScoreSummary(locked({ cutoff_met: false, computed_flag: null, values: values("组甲") }), null),
+    "总分 5 · 未达界值");
 });

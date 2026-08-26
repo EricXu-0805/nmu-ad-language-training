@@ -15,7 +15,9 @@ export const QUESTIONNAIRE_PHASE_LABELS = ["前测", "后测", "随访", "其他
 export type QuestionnairePhaseLabel = typeof QUESTIONNAIRE_PHASE_LABELS[number];
 
 export type QuestionnaireResponseKind =
-  | "ordinal_sections" | "binary_scored" | "symptom_triplet";
+  | "ordinal_sections" | "binary_scored" | "symptom_triplet" | "examiner_scored";
+export type QuestionnaireRespondent =
+  | "observer" | "patient_reported" | "examiner_administered";
 export type QuestionnaireAiDraftStatus =
   | "none" | "not_applicable" | "generated"
   | "unavailable_no_data" | "unavailable_not_authorized" | "failed";
@@ -49,7 +51,7 @@ export interface QuestionnaireSection {
   items: QuestionnaireItem[];
 }
 
-export interface QuestionnaireScoring {
+export interface QuestionnaireBinarySumScoring {
   kind: "binary_sum";
   scoring_rule_id: string;
   max_score: number;
@@ -57,6 +59,67 @@ export interface QuestionnaireScoring {
   cutoff_operator: ">=";
   cutoff_label: string;
   rule_verbatim: string;
+}
+
+export interface QuestionnaireCutoff {
+  operator: "<=" | ">=";
+  value: number;
+  label: string;
+}
+
+/** 界值按某个 choice 条目的选项分组;组值 null = 源表没给该组界值,锁定时不判定。 */
+export interface QuestionnaireStratifiedCutoff {
+  by_item: string;
+  groups: Record<string, QuestionnaireCutoff | null>;
+  unjudged_label: string;
+}
+
+export interface QuestionnaireExaminerSumScoring {
+  kind: "examiner_sum";
+  scoring_rule_id: string;
+  max_score: number | null;
+  cutoff: QuestionnaireCutoff | null;
+  stratified_cutoff: QuestionnaireStratifiedCutoff | null;
+  rule_verbatim: string;
+}
+
+export type QuestionnaireScoring =
+  | QuestionnaireBinarySumScoring | QuestionnaireExaminerSumScoring;
+
+/** 分档表一行:总数落在 [min, max] 记 score 分;max=null 表示「及以上」。 */
+export interface QuestionnaireScoreBin {
+  min: number;
+  max: number | null;
+  score: number;
+}
+
+/** 检查者录入方式:score=直接记分;count=记总数(可按 bins 换算);choice=闭集选项。 */
+export interface QuestionnaireExaminerEntry {
+  kind: "score" | "count" | "choice";
+  max: number | null;
+  scored: boolean;
+  bins: QuestionnaireScoreBin[] | null;
+  choice: QuestionnaireChoiceField | null;
+}
+
+export interface QuestionnaireExaminerItem {
+  item_key: string;
+  no: number;
+  domain_key: string;
+  name: string;
+  text: string;
+  entry: QuestionnaireExaminerEntry;
+}
+
+export interface QuestionnaireExaminerDomain {
+  domain_key: string;
+  title: string;
+  max_score: number | null;
+}
+
+export interface QuestionnaireExaminerPanel {
+  domains: QuestionnaireExaminerDomain[];
+  items: QuestionnaireExaminerItem[];
 }
 
 export interface QuestionnaireProvenance {
@@ -73,7 +136,7 @@ export interface QuestionnaireDefinition {
   questionnaire_id: string;
   title: string;
   short_name: string;
-  respondent: "observer" | "patient_reported";
+  respondent: QuestionnaireRespondent;
   status: "prototype";
   provenance: QuestionnaireProvenance;
   instruction: string;
@@ -85,6 +148,7 @@ export interface QuestionnaireDefinition {
   frequency_field: QuestionnaireChoiceField | null;
   sections: QuestionnaireSection[] | null;
   items: QuestionnaireItem[] | null;
+  examiner_panel: QuestionnaireExaminerPanel | null;
   scoring: QuestionnaireScoring | null;
   transcription_notes: string[];
 }
@@ -143,7 +207,7 @@ const DEFINITION_KEYS = [
   "schema_version", "questionnaire_id", "title", "short_name", "respondent",
   "status", "provenance", "instruction", "response_kind", "value_field",
   "element_field", "present_field", "severity_field", "frequency_field",
-  "sections", "items", "scoring", "transcription_notes",
+  "sections", "items", "examiner_panel", "scoring", "transcription_notes",
 ] as const;
 const PROVENANCE_KEYS = [
   "provided_by", "provided_via", "provided_on", "source_file",
@@ -154,10 +218,20 @@ const ELEMENT_FIELD_KEYS = ["allowed", "anchors", "elements"] as const;
 const ELEMENT_KEYS = ["element_key", "label"] as const;
 const ITEM_KEYS = ["item_key", "no", "text", "name", "score_when"] as const;
 const SECTION_KEYS = ["section_id", "title", "items"] as const;
-const SCORING_KEYS = [
+const BINARY_SCORING_KEYS = [
   "kind", "scoring_rule_id", "max_score", "cutoff_value",
   "cutoff_operator", "cutoff_label", "rule_verbatim",
 ] as const;
+const EXAMINER_SCORING_KEYS = [
+  "kind", "scoring_rule_id", "max_score", "cutoff", "stratified_cutoff", "rule_verbatim",
+] as const;
+const CUTOFF_KEYS = ["operator", "value", "label"] as const;
+const STRATIFIED_CUTOFF_KEYS = ["by_item", "groups", "unjudged_label"] as const;
+const EXAMINER_PANEL_KEYS = ["domains", "items"] as const;
+const EXAMINER_DOMAIN_KEYS = ["domain_key", "title", "max_score"] as const;
+const EXAMINER_ITEM_KEYS = ["item_key", "no", "domain_key", "name", "text", "entry"] as const;
+const EXAMINER_ENTRY_KEYS = ["kind", "max", "scored", "bins", "choice"] as const;
+const SCORE_BIN_KEYS = ["min", "max", "score"] as const;
 const RECORD_KEYS = [
   "schema_version", "record_id", "patient_id", "questionnaire_id",
   "definition_sha256", "phase_label", "status", "created_by", "created_at",
@@ -244,6 +318,19 @@ function integerValue(
   return value as number;
 }
 
+function nullableIntegerValue(
+  row: UnknownRecord, key: string, label: string, minimum: number,
+): number | null {
+  if (row[key] === null) return null;
+  return integerValue(row, key, label, minimum);
+}
+
+function booleanValue(row: UnknownRecord, key: string, label: string): boolean {
+  const value = row[key];
+  if (typeof value !== "boolean") throw new Error(`${label}.${key}必须是布尔值`);
+  return value;
+}
+
 function enumValue<T extends string>(
   row: UnknownRecord, key: string, values: readonly T[], label: string,
 ): T {
@@ -326,8 +413,57 @@ function parseItem(value: unknown, label: string): QuestionnaireItem {
   };
 }
 
+function parseCutoff(value: unknown, label: string): QuestionnaireCutoff {
+  const row = exactRecord(value, CUTOFF_KEYS, label);
+  return {
+    operator: enumValue(row, "operator", ["<=", ">="] as const, label),
+    value: integerValue(row, "value", label, 0),
+    label: stringValue(row, "label", label),
+  };
+}
+
+function parseStratifiedCutoff(
+  value: unknown, label: string,
+): QuestionnaireStratifiedCutoff {
+  const row = exactRecord(value, STRATIFIED_CUTOFF_KEYS, label);
+  const groupsRaw = row.groups;
+  if (groupsRaw === null || typeof groupsRaw !== "object" || Array.isArray(groupsRaw)) {
+    throw new Error(`${label}.groups 必须是对象`);
+  }
+  const groups: Record<string, QuestionnaireCutoff | null> = {};
+  const keys = Object.keys(groupsRaw as UnknownRecord);
+  if (keys.length < 1) throw new Error(`${label}.groups 不能为空`);
+  for (const key of keys) {
+    const rule = (groupsRaw as UnknownRecord)[key];
+    groups[key] = rule === null ? null : parseCutoff(rule, `${label}.groups.${key}`);
+  }
+  return {
+    by_item: stringValue(row, "by_item", label),
+    groups,
+    unjudged_label: stringValue(row, "unjudged_label", label),
+  };
+}
+
 function parseScoring(value: unknown, label: string): QuestionnaireScoring {
-  const row = exactRecord(value, SCORING_KEYS, label);
+  const kind = (value as UnknownRecord | null)?.kind;
+  if (kind === "examiner_sum") {
+    const row = exactRecord(value, EXAMINER_SCORING_KEYS, label);
+    const scoring: QuestionnaireExaminerSumScoring = {
+      kind: "examiner_sum",
+      scoring_rule_id: stringValue(row, "scoring_rule_id", label),
+      max_score: nullableIntegerValue(row, "max_score", label, 1),
+      cutoff: row.cutoff === null ? null : parseCutoff(row.cutoff, `${label}.cutoff`),
+      stratified_cutoff: row.stratified_cutoff === null
+        ? null
+        : parseStratifiedCutoff(row.stratified_cutoff, `${label}.stratified_cutoff`),
+      rule_verbatim: stringValue(row, "rule_verbatim", label),
+    };
+    if (scoring.cutoff !== null && scoring.stratified_cutoff !== null) {
+      throw new Error(`${label}:cutoff 与 stratified_cutoff 只能二选一`);
+    }
+    return scoring;
+  }
+  const row = exactRecord(value, BINARY_SCORING_KEYS, label);
   return {
     kind: literalValue(row, "kind", "binary_sum", label),
     scoring_rule_id: stringValue(row, "scoring_rule_id", label),
@@ -337,6 +473,87 @@ function parseScoring(value: unknown, label: string): QuestionnaireScoring {
     cutoff_label: stringValue(row, "cutoff_label", label),
     rule_verbatim: stringValue(row, "rule_verbatim", label),
   };
+}
+
+function parseScoreBins(value: unknown, label: string): QuestionnaireScoreBin[] {
+  if (!Array.isArray(value)) throw new Error(`${label}必须是数组`);
+  const bins = value.map((entry, index) => {
+    const row = exactRecord(entry, SCORE_BIN_KEYS, `${label}[${index}]`);
+    return {
+      min: integerValue(row, "min", `${label}[${index}]`, 0),
+      max: nullableIntegerValue(row, "max", `${label}[${index}]`, 0),
+      score: integerValue(row, "score", `${label}[${index}]`, 0),
+    };
+  });
+  // 与服务端同一条不变量:降序、最高档开放、连续不重叠、从 0 起——否则换算会静默错分。
+  const ordered = [...bins].sort((a, b) => b.min - a.min);
+  if (ordered.length < 2 || ordered[0].max !== null || ordered[ordered.length - 1].min !== 0) {
+    throw new Error(`${label}:分档表必须至少两档、最高档开放、从 0 起`);
+  }
+  for (let index = 1; index < ordered.length; index += 1) {
+    const upper = ordered[index - 1];
+    const lower = ordered[index];
+    if (lower.max === null || lower.max < lower.min || lower.max !== upper.min - 1) {
+      throw new Error(`${label}:分档表必须连续且不重叠`);
+    }
+  }
+  return bins;
+}
+
+function parseExaminerEntry(value: unknown, label: string): QuestionnaireExaminerEntry {
+  const row = exactRecord(value, EXAMINER_ENTRY_KEYS, label);
+  const entry: QuestionnaireExaminerEntry = {
+    kind: enumValue(row, "kind", ["score", "count", "choice"] as const, label),
+    max: nullableIntegerValue(row, "max", label, 1),
+    scored: booleanValue(row, "scored", label),
+    bins: row.bins === null ? null : parseScoreBins(row.bins, `${label}.bins`),
+    choice: row.choice === null ? null : parseChoiceField(row.choice, `${label}.choice`),
+  };
+  if (entry.kind === "score") {
+    if (entry.max === null || !entry.scored || entry.bins !== null || entry.choice !== null) {
+      throw new Error(`${label}:score 条目需要 max,scored 必须为 true,不接受 bins/choice`);
+    }
+  } else if (entry.kind === "count") {
+    if (entry.max === null || entry.choice !== null || (entry.bins !== null && !entry.scored)) {
+      throw new Error(`${label}:count 条目需要 max,不接受 choice;不计分的不接受 bins`);
+    }
+  } else if (entry.choice === null || entry.max !== null || entry.scored || entry.bins !== null) {
+    throw new Error(`${label}:choice 条目需要 choice,scored 必须为 false,不接受 max/bins`);
+  }
+  return entry;
+}
+
+function parseExaminerPanel(value: unknown, label: string): QuestionnaireExaminerPanel {
+  const row = exactRecord(value, EXAMINER_PANEL_KEYS, label);
+  const domains = arrayValue(row, "domains", label).map((entry, index) => {
+    const domainRow = exactRecord(entry, EXAMINER_DOMAIN_KEYS, `${label}.domains[${index}]`);
+    return {
+      domain_key: stringValue(domainRow, "domain_key", `${label}.domains[${index}]`),
+      title: stringValue(domainRow, "title", `${label}.domains[${index}]`),
+      max_score: nullableIntegerValue(domainRow, "max_score", `${label}.domains[${index}]`, 1),
+    };
+  });
+  const domainKeys = domains.map((domain) => domain.domain_key);
+  if (domainKeys.length < 1 || new Set(domainKeys).size !== domainKeys.length) {
+    throw new Error(`${label}.domains 的 domain_key 必须非空且唯一`);
+  }
+  const items = arrayValue(row, "items", label).map((entry, index) => {
+    const itemRow = exactRecord(entry, EXAMINER_ITEM_KEYS, `${label}.items[${index}]`);
+    const item: QuestionnaireExaminerItem = {
+      item_key: stringValue(itemRow, "item_key", `${label}.items[${index}]`),
+      no: integerValue(itemRow, "no", `${label}.items[${index}]`, 1),
+      domain_key: stringValue(itemRow, "domain_key", `${label}.items[${index}]`),
+      name: stringValue(itemRow, "name", `${label}.items[${index}]`),
+      text: stringValue(itemRow, "text", `${label}.items[${index}]`),
+      entry: parseExaminerEntry(itemRow.entry, `${label}.items[${index}].entry`),
+    };
+    if (!domainKeys.includes(item.domain_key)) {
+      throw new Error(`${label}.items[${index}] 的 domain_key 不在 domains 内`);
+    }
+    return item;
+  });
+  if (items.length < 1) throw new Error(`${label}.items 不能为空`);
+  return { domains, items };
 }
 
 export function questionnaireAllItems(
@@ -354,7 +571,8 @@ export function parseQuestionnaireDefinition(value: unknown): QuestionnaireDefin
   const provenanceRow = exactRecord(row.provenance, PROVENANCE_KEYS, `${label}.provenance`);
   const responseKind = enumValue(
     row, "response_kind",
-    ["ordinal_sections", "binary_scored", "symptom_triplet"] as const, label);
+    ["ordinal_sections", "binary_scored", "symptom_triplet", "examiner_scored"] as const,
+    label);
   const definition: QuestionnaireDefinition = {
     schema_version: literalValue(
       row, "schema_version", QUESTIONNAIRE_DEFINITION_SCHEMA, label),
@@ -362,7 +580,8 @@ export function parseQuestionnaireDefinition(value: unknown): QuestionnaireDefin
     title: stringValue(row, "title", label),
     short_name: stringValue(row, "short_name", label),
     respondent: enumValue(
-      row, "respondent", ["observer", "patient_reported"] as const, label),
+      row, "respondent",
+      ["observer", "patient_reported", "examiner_administered"] as const, label),
     status: literalValue(row, "status", "prototype", label),
     provenance: {
       provided_by: stringValue(provenanceRow, "provided_by", `${label}.provenance`),
@@ -405,6 +624,8 @@ export function parseQuestionnaireDefinition(value: unknown): QuestionnaireDefin
       ? null
       : arrayValue(row, "items", label).map((entry, index) =>
         parseItem(entry, `${label}.items[${index}]`)),
+    examiner_panel: row.examiner_panel === null
+      ? null : parseExaminerPanel(row.examiner_panel, `${label}.examiner_panel`),
     scoring: row.scoring === null ? null : parseScoring(row.scoring, `${label}.scoring`),
     transcription_notes: arrayValue(row, "transcription_notes", label)
       .map((entry, index) => {
@@ -419,21 +640,22 @@ export function parseQuestionnaireDefinition(value: unknown): QuestionnaireDefin
     if (!definition.value_field || !definition.element_field || !definition.sections
         || definition.items || definition.present_field
         || definition.severity_field || definition.frequency_field
-        || definition.scoring) {
+        || definition.examiner_panel || definition.scoring) {
       throw new Error(`${label}:ordinal_sections 的字段组合不合法`);
     }
   } else if (responseKind === "binary_scored") {
     if (!definition.value_field || !definition.items || !definition.scoring
+        || definition.scoring.kind !== "binary_sum"
         || definition.sections || definition.element_field
         || definition.present_field || definition.severity_field
-        || definition.frequency_field) {
+        || definition.frequency_field || definition.examiner_panel) {
       throw new Error(`${label}:binary_scored 的字段组合不合法`);
     }
-  } else {
+  } else if (responseKind === "symptom_triplet") {
     if (!definition.present_field || !definition.severity_field
         || !definition.frequency_field || !definition.items
         || definition.sections || definition.value_field
-        || definition.element_field || definition.scoring) {
+        || definition.element_field || definition.examiner_panel || definition.scoring) {
       throw new Error(`${label}:symptom_triplet 的字段组合不合法`);
     }
     const presentAllowed = [...definition.present_field.allowed].sort();
@@ -441,8 +663,29 @@ export function parseQuestionnaireDefinition(value: unknown): QuestionnaireDefin
         || presentAllowed[0] !== "无" || presentAllowed[1] !== "有") {
       throw new Error(`${label}:symptom_triplet 的 present_field 只允许 有/无`);
     }
+  } else {
+    if (!definition.examiner_panel || !definition.scoring
+        || definition.scoring.kind !== "examiner_sum"
+        || definition.value_field || definition.element_field
+        || definition.present_field || definition.severity_field
+        || definition.frequency_field || definition.sections || definition.items) {
+      throw new Error(`${label}:examiner_scored 的字段组合不合法`);
+    }
+    const stratified = definition.scoring.stratified_cutoff;
+    if (stratified !== null) {
+      const byItem = definition.examiner_panel.items
+        .find((item) => item.item_key === stratified.by_item);
+      const allowed = byItem?.entry.choice?.allowed;
+      if (!allowed || [...allowed].sort().join("\u0000")
+          !== Object.keys(stratified.groups).sort().join("\u0000")) {
+        throw new Error(`${label}:stratified_cutoff 必须指向 choice 条目且组键与 allowed 一致`);
+      }
+    }
   }
-  const itemKeys = questionnaireAllItems(definition).map((item) => item.item_key);
+  const itemKeys = [
+    ...questionnaireAllItems(definition).map((item) => item.item_key),
+    ...(definition.examiner_panel?.items ?? []).map((item) => item.item_key),
+  ];
   if (new Set(itemKeys).size !== itemKeys.length || itemKeys.length < 1) {
     throw new Error(`${label}:item_key 必须非空且全表唯一`);
   }
@@ -624,6 +867,13 @@ export function missingLockEntries(
         missing.push(`第${item.no}题未作答`);
       }
     }
+  } else if (definition.response_kind === "examiner_scored") {
+    const panel = definition.examiner_panel;
+    for (const item of panel?.items ?? []) {
+      if (value(item.item_key, "value") === null) {
+        missing.push(`「${examinerDomainOf(panel, item).title}」第${item.no}题未评`);
+      }
+    }
   } else {
     for (const item of definition.items ?? []) {
       const present = value(item.item_key, "present");
@@ -648,6 +898,80 @@ export function questionnaireStatusLabel(record: QuestionnaireRecord): string {
   return record.status === "locked" ? "已锁定" : "草稿";
 }
 
+// ---------------- examiner_scored 的纯换算(屏上小计与锁定摘要共用) ----------------
+
+const CANONICAL_INT = /^(0|[1-9][0-9]*)$/;
+
+/** 计分框/计数框的录入值 → 整数;非规范整数串或越界返回 null。 */
+export function examinerEntryNumber(
+  entry: QuestionnaireExaminerEntry, value: string | null,
+): number | null {
+  if (value === null || entry.max === null || !CANONICAL_INT.test(value)) return null;
+  const number = Number(value);
+  return number <= entry.max ? number : null;
+}
+
+export function examinerBinScore(bins: QuestionnaireScoreBin[], count: number): number {
+  for (const row of bins) {
+    if (count >= row.min && (row.max === null || count <= row.max)) return row.score;
+  }
+  throw new Error("分档表未覆盖该总数");
+}
+
+/** 条目对总分的贡献;不计分条目恒为 0,未录入/不合法返回 null。 */
+export function examinerEntryPoints(
+  entry: QuestionnaireExaminerEntry, value: string | null,
+): number | null {
+  if (!entry.scored) return 0;
+  const number = examinerEntryNumber(entry, value);
+  if (number === null) return null;
+  return entry.bins ? examinerBinScore(entry.bins, number) : number;
+}
+
+export function examinerEntryMaxPoints(entry: QuestionnaireExaminerEntry): number {
+  if (!entry.scored) return 0;
+  if (entry.bins) return Math.max(...entry.bins.map((row) => row.score));
+  return entry.max ?? 0;
+}
+
+export function examinerDomainOf(
+  panel: QuestionnaireExaminerPanel | null, item: QuestionnaireExaminerItem,
+): QuestionnaireExaminerDomain {
+  const domain = panel?.domains.find((entry) => entry.domain_key === item.domain_key);
+  return domain ?? { domain_key: item.domain_key, title: item.domain_key, max_score: null };
+}
+
+export interface QuestionnaireExaminerDomainTotal {
+  domain: QuestionnaireExaminerDomain;
+  points: number;
+  /** 该域里还没有合法录入值的计分条目数。 */
+  missing: number;
+}
+
+export function examinerDomainTotals(
+  panel: QuestionnaireExaminerPanel,
+  effective: (itemKey: string) => string | null,
+): QuestionnaireExaminerDomainTotal[] {
+  return panel.domains.map((domain) => {
+    let points = 0;
+    let missing = 0;
+    for (const item of panel.items) {
+      if (item.domain_key !== domain.domain_key || !item.entry.scored) continue;
+      const contribution = examinerEntryPoints(item.entry, effective(item.item_key));
+      if (contribution === null) missing += 1;
+      else points += contribution;
+    }
+    return { domain, points, missing };
+  });
+}
+
+/** 界值未命中的一句话:≥ 型说「未达」,≤ 型说「高于」——方向说反了临床会读成相反结论。 */
+function cutoffMissText(cutoff: QuestionnaireCutoff): string {
+  return cutoff.operator === "<="
+    ? `高于界值（界值 ≤ ${cutoff.value} 分）`
+    : `未达界值（界值 ≥ ${cutoff.value} 分）`;
+}
+
 /** 锁定后的总分一行话;源表没定义计分(总分为空)时返回 null,绝不发明汇总分。 */
 export function lockedScoreSummary(
   record: QuestionnaireRecord,
@@ -658,7 +982,38 @@ export function lockedScoreSummary(
   const total = Number.isInteger(record.computed_total)
     ? String(record.computed_total)
     : record.computed_total.toFixed(1);
+  if (scoring?.kind === "examiner_sum") {
+    const finals = finalValuesBySlot(record);
+    const effective = (itemKey: string) =>
+      finals.get(questionnaireSlotKey(itemKey, "value")) ?? null;
+    const parts = [`总分 ${total}${scoring.max_score !== null ? ` / ${scoring.max_score}` : ""}`];
+    const panel = definition?.examiner_panel ?? null;
+    if (panel && panel.domains.length > 1) {
+      for (const entry of examinerDomainTotals(panel, effective)) {
+        parts.push(`${entry.domain.title} ${entry.points}${
+          entry.domain.max_score !== null ? `/${entry.domain.max_score}` : ""}`);
+      }
+    }
+    if (record.cutoff_met === true) {
+      parts.push(record.computed_flag ?? "达到界值");
+    } else if (record.cutoff_met === false) {
+      const rule = scoring.cutoff
+        ?? (scoring.stratified_cutoff
+          ? scoring.stratified_cutoff.groups[effective(scoring.stratified_cutoff.by_item) ?? ""]
+            ?? null
+          : null);
+      parts.push(rule ? cutoffMissText(rule) : "未达界值");
+    } else if (record.computed_flag !== null) {
+      parts.push(record.computed_flag);
+    }
+    return parts.join(" · ");
+  }
   const denominator = scoring ? ` / ${scoring.max_score}` : "";
+  if (record.cutoff_met === null) {
+    // 没有界值判定的记录(例如定义包读不到的 ACE-III):只报总分,不编造「未达界值」。
+    return `总分 ${total}${denominator}${
+      record.computed_flag !== null ? ` · ${record.computed_flag}` : ""}`;
+  }
   const flag = record.cutoff_met
     ? record.computed_flag ?? "达到界值"
     : scoring

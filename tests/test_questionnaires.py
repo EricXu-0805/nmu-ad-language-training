@@ -78,10 +78,10 @@ def _repin_index(qdir: Path) -> None:
 
 def test_real_content_packages_load_with_expected_item_counts():
     registry = load_questionnaire_registry()
-    assert set(registry) == {"sfacs_v1", "gds15_v1", "npiq_v1"}
+    assert set(registry) == {"sfacs_v1", "gds15_v1", "npiq_v1", "ace3_v1", "aft_v1"}
     assert {qid: len(loaded.definition.all_items())
             for qid, loaded in registry.items()} == {
-        "sfacs_v1": 21, "gds15_v1": 15, "npiq_v1": 12,
+        "sfacs_v1": 21, "gds15_v1": 15, "npiq_v1": 12, "ace3_v1": 25, "aft_v1": 4,
     }
     for loaded in registry.values():
         assert loaded.definition.status == "prototype"
@@ -92,7 +92,7 @@ def test_untampered_copy_is_a_loadable_control(tmp_path):
     # 对照组：拷贝本身可装载。后面的拒绝测试红，才归因于各自的破坏。
     base, _ = _questionnaire_content_copy(tmp_path)
     assert set(load_questionnaire_registry(base)) == {
-        "sfacs_v1", "gds15_v1", "npiq_v1"}
+        "sfacs_v1", "gds15_v1", "npiq_v1", "ace3_v1", "aft_v1"}
 
 
 def test_tampered_package_bytes_are_rejected_by_the_index_byte_pin(tmp_path):
@@ -399,7 +399,7 @@ def test_data_steward_can_read_but_cannot_write(api_env):
     assert catalog.status_code == 200, catalog.text
     assert [row["definition"]["questionnaire_id"]
             for row in catalog.json()["questionnaires"]] == [
-        "gds15_v1", "npiq_v1", "sfacs_v1"]
+        "ace3_v1", "aft_v1", "gds15_v1", "npiq_v1", "sfacs_v1"]
 
     listing = steward.get("/patients/P-Q1/questionnaire-records")
     assert listing.status_code == 200, listing.text
@@ -545,7 +545,8 @@ def test_unknown_questionnaire_is_a_409_naming_the_registered_catalog(api_env):
     assert create.status_code == 409, create.text
     detail = create.json()["detail"]
     assert detail["code"] == "questionnaire_unknown"
-    assert detail["registered"] == ["gds15_v1", "npiq_v1", "sfacs_v1"]
+    assert detail["registered"] == [
+        "ace3_v1", "aft_v1", "gds15_v1", "npiq_v1", "sfacs_v1"]
 
 
 def test_value_source_tracks_ai_accept_override_and_human_direct(api_env,

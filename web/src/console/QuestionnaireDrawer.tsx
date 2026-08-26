@@ -7,6 +7,11 @@ import { useDialogFocusTrap } from "../components/useDialogFocusTrap";
 import {
   adoptableAiDraftEntries,
   aiDraftStatusLine,
+  examinerDomainOf,
+  examinerDomainTotals,
+  examinerEntryMaxPoints,
+  examinerEntryNumber,
+  examinerEntryPoints,
   finalValuesBySlot,
   lockedScoreSummary,
   missingLockEntries,
@@ -16,6 +21,9 @@ import {
   QUESTIONNAIRE_TRIAL_NOTICE,
   type QuestionnaireChoiceField,
   type QuestionnaireDefinition,
+  type QuestionnaireExaminerDomain,
+  type QuestionnaireExaminerEntry,
+  type QuestionnaireExaminerItem,
   type QuestionnaireFailure,
   type QuestionnaireItem,
   type QuestionnaireRecord,
@@ -217,6 +225,144 @@ function SymptomTripletBody({ definition, disabled, effective, hints, onWrite }:
   );
 }
 
+function examinerScoreField(max: number): QuestionnaireChoiceField {
+  const allowed = Array.from({ length: max + 1 }, (_, index) => String(index));
+  return {
+    allowed,
+    anchors: Object.fromEntries(allowed.map((value) => [value, `${value} 分`])),
+  };
+}
+
+function examinerCountHint(entry: QuestionnaireExaminerEntry, number: number | null): string {
+  if (!entry.scored) return "不计分，仅记录";
+  const maxPoints = examinerEntryMaxPoints(entry);
+  if (entry.bins) {
+    return number === null
+      ? `记正确总数（0–${entry.max}），按原表分档表换算为 0–${maxPoints} 分`
+      : `换算得分 ${examinerEntryPoints(entry, String(number))} / ${maxPoints}`;
+  }
+  return number === null ? `记总数（0–${entry.max}），总数即得分` : `计 ${number} 分`;
+}
+
+function ExaminerCountInput({ item, value, disabled, onWrite }: {
+  item: QuestionnaireExaminerItem;
+  value: string | null;
+  disabled: boolean;
+  onWrite: (entries: QuestionnaireValueWrite[]) => void;
+}) {
+  const entry = item.entry;
+  const max = entry.max ?? 0;
+  const number = examinerEntryNumber(entry, value);
+  return (
+    <div className="row wrap" style={{ alignItems: "center" }}>
+      {/* 用 text+inputMode 而不是 type=number:后者把 "5e"/"-" 这类半截输入直接吐成空串,
+          硬键盘误触一下就会把已存的总数清掉;滚轮也会改值。文本框里原始按键全可见,由正则把关。 */}
+      <input type="text" className="form-control" inputMode="numeric" pattern="[0-9]*"
+        style={{ width: "7em" }}
+        disabled={disabled} value={value ?? ""}
+        aria-label={`第${item.no}题 ${item.name}`}
+        onChange={(event) => {
+          const raw = event.target.value.trim();
+          if (raw === "") {
+            onWrite([{ item_key: item.item_key, field_key: "value", value: null }]);
+            return;
+          }
+          // 只接受 0–max 的整数;越界或非数字的按键不落地,屏上停在上一个合法值。
+          if (!/^[0-9]+$/.test(raw)) return;
+          const parsed = Number(raw);
+          if (parsed > max) return;
+          onWrite([{ item_key: item.item_key, field_key: "value", value: String(parsed) }]);
+        }} />
+      <span className="muted">{examinerCountHint(entry, number)}</span>
+    </div>
+  );
+}
+
+function ExaminerItemRow({ item, value, disabled, onWrite }: {
+  item: QuestionnaireExaminerItem;
+  value: string | null;
+  disabled: boolean;
+  onWrite: (entries: QuestionnaireValueWrite[]) => void;
+}) {
+  const entry = item.entry;
+  const write = (next: string) =>
+    onWrite([{ item_key: item.item_key, field_key: "value", value: next }]);
+  return (
+    <div className="col" style={ITEM_ROW_STYLE}>
+      <span>
+        <strong>{`第${item.no}题 · ${item.name}`}</strong>
+        {` ${item.text}`}
+      </span>
+      {entry.kind === "score" && entry.max !== null && (
+        <ChoiceButtons field={examinerScoreField(entry.max)} disabled={disabled}
+          selected={value} onSelect={write} />
+      )}
+      {entry.kind === "count" && (
+        <ExaminerCountInput item={item} value={value} disabled={disabled} onWrite={onWrite} />
+      )}
+      {entry.kind === "choice" && entry.choice && (
+        <ChoiceButtons field={entry.choice} disabled={disabled} fullAnchors
+          selected={value} onSelect={write} />
+      )}
+    </div>
+  );
+}
+
+// 检查者当场判分(ACE-III / 动物流畅性):屏上顺序照原表走,相邻同域条目合成一卡;
+// 各域小计与总分随录入现算,只是预览——锁定时以服务器按同一分档表核算的为准。
+function ExaminerScoredBody({ definition, disabled, effective, onWrite }: {
+  definition: QuestionnaireDefinition;
+  disabled: boolean;
+  effective: (itemKey: string, fieldKey: string) => string | null;
+  hints: ReadonlyMap<string, AiDraftHint>;
+  onWrite: (entries: QuestionnaireValueWrite[]) => void;
+}) {
+  const panel = definition.examiner_panel;
+  const scoring = definition.scoring;
+  if (!panel || !scoring || scoring.kind !== "examiner_sum") return null;
+  const value = (itemKey: string) => effective(itemKey, "value");
+  const groups: { domain: QuestionnaireExaminerDomain; items: QuestionnaireExaminerItem[] }[] = [];
+  for (const item of panel.items) {
+    const last = groups[groups.length - 1];
+    if (last && last.domain.domain_key === item.domain_key) last.items.push(item);
+    else groups.push({ domain: examinerDomainOf(panel, item), items: [item] });
+  }
+  const totals = examinerDomainTotals(panel, value);
+  const sum = totals.reduce((acc, entry) => acc + entry.points, 0);
+  const missing = totals.reduce((acc, entry) => acc + entry.missing, 0);
+  return (
+    <>
+      {groups.map((group, index) => (
+        <div className="card col" key={`${group.domain.domain_key}:${index}`}>
+          <h4>{group.domain.title}</h4>
+          {group.items.map((item) => (
+            <ExaminerItemRow key={item.item_key} item={item} value={value(item.item_key)}
+              disabled={disabled} onWrite={onWrite} />
+          ))}
+        </div>
+      ))}
+      <div className="card col">
+        <h4>得分小计（随录入自动加总）</h4>
+        {totals.map((entry) => (
+          <div className="row wrap" key={entry.domain.domain_key}
+            style={{ justifyContent: "space-between" }}>
+            <span>{entry.domain.title}</span>
+            <span className="mono">
+              {`${entry.points}${
+                entry.domain.max_score !== null ? ` / ${entry.domain.max_score}` : ""}`}
+              {entry.missing > 0 ? `（还有 ${entry.missing} 项未评）` : ""}
+            </span>
+          </div>
+        ))}
+        <strong>
+          {`总分 ${sum}${scoring.max_score !== null ? ` / ${scoring.max_score}` : ""}`}
+          {missing > 0 ? `（${missing} 项计分条目未评）` : ""}
+        </strong>
+      </div>
+    </>
+  );
+}
+
 export function QuestionnaireDrawer({
   initialRecord, definition, definitionDrifted, client, onClose, onRecordUpdated,
 }: {
@@ -392,7 +538,7 @@ export function QuestionnaireDrawer({
           </Alert>
         )}
 
-        {editable && (
+        {editable && definition.response_kind !== "examiner_scored" && (
           <div className="card col">
             <div className="row wrap" style={{ justifyContent: "space-between" }}>
               <h3>AI 初评</h3>
@@ -428,9 +574,10 @@ export function QuestionnaireDrawer({
           </Alert>
         )}
 
-        <OrdinalSectionsBody {...bodyProps} />
-        <BinaryScoredBody {...bodyProps} />
-        <SymptomTripletBody {...bodyProps} />
+        {definition.response_kind === "ordinal_sections" && <OrdinalSectionsBody {...bodyProps} />}
+        {definition.response_kind === "binary_scored" && <BinaryScoredBody {...bodyProps} />}
+        {definition.response_kind === "symptom_triplet" && <SymptomTripletBody {...bodyProps} />}
+        {definition.response_kind === "examiner_scored" && <ExaminerScoredBody {...bodyProps} />}
 
         {lockFailure && (
           <Alert tone="danger" title="锁定被拒绝">

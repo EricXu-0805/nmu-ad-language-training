@@ -16,6 +16,16 @@
       "questionnaire_id": "npiq_v1",
       "file": "npiq_v1.json",
       "content_sha256": "b04277aa5b2dc4601c2159eaa46eb544501b6c5cf61619482ced5769bb8c7ef3"
+    },
+    {
+      "questionnaire_id": "ace3_v1",
+      "file": "ace3_v1.json",
+      "content_sha256": "e5970d79624119b986631edf772b1fd1bfe356f1ba2e17ee52e0414c6fda26b5"
+    },
+    {
+      "questionnaire_id": "aft_v1",
+      "file": "aft_v1.json",
+      "content_sha256": "3da391db1229f480bd496fa426377e7e5bcae8cb4833c20e37ea604b5ef0849b"
     }
   ]
 }

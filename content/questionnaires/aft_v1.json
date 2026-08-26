@@ -1,0 +1,140 @@
+{
+  "schema_version": "questionnaire-definition.v1",
+  "questionnaire_id": "aft_v1",
+  "title": "动物流畅性测验（Animal Fluency Test，AFT）",
+  "short_name": "AFT",
+  "respondent": "examiner_administered",
+  "status": "prototype",
+  "provenance": {
+    "provided_by": "钱凯（南医大）",
+    "provided_via": "微信文件（量表-五个测量.rar）",
+    "provided_on": "2026-08-26",
+    "source_file": "动物流畅性测验.png",
+    "source_sha256": "08b75798c09bdb961d32291fc0d983b6e403b0c684b8f8c4869e70db2d715d7d",
+    "final_confirmation": "待钱凯与丁老师终确认；确认前本表按原型使用，不作为正式研究结局"
+  },
+  "instruction": "该测试用于评估痴呆患者的语言流畅性和语义记忆。该测试是语义流畅性测试常用的一种神经心理学测试，要求受试者就动物这一范畴在 1min 内列举尽可能多的例子，评分通常基于受试者能够正确说出的动物名称的总数。重复或不相关的词语不计入总分。得分越高，说明语言流畅性和语义记忆越好。评分界值：动物流畅性得分≤12（初中组）、≤13（高中组）、≤14（大学组）。",
+  "response_kind": "examiner_scored",
+  "value_field": null,
+  "element_field": null,
+  "present_field": null,
+  "severity_field": null,
+  "frequency_field": null,
+  "sections": null,
+  "items": null,
+  "examiner_panel": {
+    "domains": [
+      {
+        "domain_key": "fluency",
+        "title": "动物流畅性",
+        "max_score": null
+      }
+    ],
+    "items": [
+      {
+        "item_key": "aft_01",
+        "no": 1,
+        "domain_key": "fluency",
+        "name": "文化程度分组",
+        "text": "受试者文化程度分组（决定评分界值）",
+        "entry": {
+          "kind": "choice",
+          "max": null,
+          "scored": false,
+          "bins": null,
+          "choice": {
+            "allowed": [
+              "初中组",
+              "高中组",
+              "大学组",
+              "初中以下或不详"
+            ],
+            "anchors": {
+              "初中组": "界值 ≤12",
+              "高中组": "界值 ≤13",
+              "大学组": "界值 ≤14",
+              "初中以下或不详": "源表无界值，只记分不判定"
+            }
+          }
+        }
+      },
+      {
+        "item_key": "aft_02",
+        "no": 2,
+        "domain_key": "fluency",
+        "name": "正确动物名称总数",
+        "text": "1 分钟内正确说出的动物名称总数（重复或不相关的词语不计入总分）",
+        "entry": {
+          "kind": "count",
+          "max": 60,
+          "scored": true,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "aft_03",
+        "no": 3,
+        "domain_key": "fluency",
+        "name": "重复词语数",
+        "text": "重复的词语数（不计入总分，仅记录）",
+        "entry": {
+          "kind": "count",
+          "max": 60,
+          "scored": false,
+          "bins": null,
+          "choice": null
+        }
+      },
+      {
+        "item_key": "aft_04",
+        "no": 4,
+        "domain_key": "fluency",
+        "name": "不相关词语数",
+        "text": "不相关的词语数（不计入总分，仅记录）",
+        "entry": {
+          "kind": "count",
+          "max": 60,
+          "scored": false,
+          "bins": null,
+          "choice": null
+        }
+      }
+    ]
+  },
+  "scoring": {
+    "kind": "examiner_sum",
+    "scoring_rule_id": "aft.source_cutoffs.v1",
+    "max_score": null,
+    "cutoff": null,
+    "stratified_cutoff": {
+      "by_item": "aft_01",
+      "groups": {
+        "初中组": {
+          "operator": "<=",
+          "value": 12,
+          "label": "得分≤界值（初中组界值 12）"
+        },
+        "高中组": {
+          "operator": "<=",
+          "value": 13,
+          "label": "得分≤界值（高中组界值 13）"
+        },
+        "大学组": {
+          "operator": "<=",
+          "value": 14,
+          "label": "得分≤界值（大学组界值 14）"
+        },
+        "初中以下或不详": null
+      },
+      "unjudged_label": "该文化程度分组源表无界值，未判定"
+    },
+    "rule_verbatim": "评分通常基于受试者能够正确说出的动物名称的总数。重复或不相关的词语不计入总分。得分越高，说明语言流畅性和语义记忆越好。评分界值：动物流畅性得分≤12（初中组）、≤13（高中组）、≤14（大学组）。"
+  },
+  "transcription_notes": [
+    "逐字来源：钱凯 2026-08-26 微信提供的图片（source_sha256 见上），指导语与计分说明逐字。",
+    "源表只给初中/高中/大学三组界值；「初中以下或不详」为平台增设的分组，锁定时只记总分、不判界值（待钱凯裁决该组用哪个界值）。",
+    "重复词语数与不相关词语数为平台增设的记录栏，不计分，供核对总数口径。",
+    "三个计数栏的录入上限 60 为平台设定（源表无上限；总数即得分，超过 60 记不进去），待钱凯裁决。"
+  ]
+}
