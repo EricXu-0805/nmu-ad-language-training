@@ -8,7 +8,7 @@ import {
   type PatientPresentationExpectation,
 } from "./presentationContent";
 
-const RETRY_MS = 1_500;
+const RETRY_MS = 1_000;
 
 // 弱网/游标竞态下保持安静重试。任何旧转位响应即使后到，也只会被
 // exact expectation 拒绝，不会把上一题/上一级提示闪回老人屏幕。

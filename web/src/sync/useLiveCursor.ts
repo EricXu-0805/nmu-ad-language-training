@@ -23,7 +23,7 @@ import {
   type SyncMsg,
 } from "./messages";
 
-const LIVE_POLL_MS = 1500;
+const LIVE_POLL_MS = 800;
 const RECONNECT_GRACE_MS = 4500;
 const LIVE_FETCH_TIMEOUT_MS = 4000;
 

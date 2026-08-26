@@ -529,9 +529,9 @@ export function usePatientAutopilot(input: {
         }
         return;
       }
-      if (!cancelled) timer = window.setTimeout(poll, 1_500);
+      if (!cancelled) timer = window.setTimeout(poll, 1_000);
     };
-    timer = window.setTimeout(poll, 1_500);
+    timer = window.setTimeout(poll, 1_000);
     return () => {
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);

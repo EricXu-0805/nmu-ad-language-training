@@ -32,7 +32,7 @@ import {
 } from "./messages";
 import { nextWseq, observeWseq } from "./wseq";
 
-const LIVE_POLL_MS = 2000;
+const LIVE_POLL_MS = 1000;
 type LiveWriteKind = LiveWriteRetryKind;
 
 let globalWriteQueue: Promise<void> = Promise.resolve();
@@ -317,7 +317,7 @@ export function usePatientRec(sessionId: string): PatientRecMsg | null {
   useEffect(() => { setRec(null); }, [sessionId]);
   useEffect(() => {
     // 工作台登录页、准备区和今日队列没有当前场次；此时既没有可绑定的
-    // patientRec 真值，也不应每两秒读取全局 live 状态。
+    // patientRec 真值，也不应按 LIVE_POLL_MS 周期读取全局 live 状态。
     if (!sessionId) return;
     let cancelled = false;
     let inFlight = false;

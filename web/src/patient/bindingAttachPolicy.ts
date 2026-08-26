@@ -1,7 +1,7 @@
 // 自动跟场轮询的纯决策层:对 /device/attach 的每种结果给出唯一处置。
 // 老人端永不报错、永不闪红;这里只区分"接上了/安静重试/放弃绑定"。
 
-export const ATTACH_POLL_MS = 4000;
+export const ATTACH_POLL_MS = 2000;
 
 export type AttachDisposition =
   | "attached"          // 200:能力已到手,停止轮询交回既有 live 流程

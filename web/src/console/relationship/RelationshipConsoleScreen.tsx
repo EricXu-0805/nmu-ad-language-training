@@ -302,18 +302,21 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     if (recState !== "idle") armWatchdog(lastArmedKey.current);
     setRecState("idle");
     try {
-      const next = await runtimeControl.pause();
-      if (next) toast("关系建立已暂停，患者端麦克风保持关闭", "ok");
+      const result = await runtimeControl.pause();
+      if (result?.ok) toast("关系建立已暂停，患者端麦克风保持关闭", "ok");
+      else if (result) toast(result.message, "danger");
     } finally {
       setPausePending(false);
     }
   }
 
   async function resumeRapport() {
-    const next = await runtimeControl.resume();
-    if (next) {
+    const result = await runtimeControl.resume();
+    if (result?.ok) {
       releaseSafetyPause();
       toast("已恢复到暂停前的对话位置", "ok");
+    } else if (result) {
+      toast(result.message, "danger");
     }
   }
 

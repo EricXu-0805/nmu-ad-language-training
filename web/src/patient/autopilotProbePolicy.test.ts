@@ -91,7 +91,7 @@ test("transient probe failures use finite exponential backoff", () => {
 test("patient hook has no inactive standby loop and fences every passive terminal poll", () => {
   const source = readFileSync(new URL("./usePatientAutopilot.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /standby probe/);
-  assert.doesNotMatch(source, /window\.setTimeout\(check,\s*1_500\)/);
+  assert.doesNotMatch(source, /window\.setTimeout\(check,\s*[\d_]+\)/);
   assert.match(source, /if \(!sessionId \|\| input\.sessionTerminal\)/);
   assert.match(source, /mediaAllowed \|\| !probeAllowed/);
   assert.match(source, /input\.sessionPaused \|\| input\.sessionTerminal/);

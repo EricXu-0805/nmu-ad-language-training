@@ -1768,12 +1768,18 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     }
     setRecState("idle");
     try {
-      const confirmed = technicalFailure
-        ? await commitAtomicTechnicalPause(evidence)
-        : Boolean(await runtimeControl.pause());
-      if (confirmed) toast("本场训练已暂停，患者端麦克风保持关闭", "ok");
-      else if (technicalFailure) {
-        toast("服务端原子暂停尚未确认；本机仍保持安全锁定，请检查连接后重试同步。", "danger");
+      if (technicalFailure) {
+        const confirmed = await commitAtomicTechnicalPause(evidence);
+        if (confirmed) toast("本场训练已暂停，患者端麦克风保持关闭", "ok");
+        else toast("服务端原子暂停尚未确认；本机仍保持安全锁定，请检查连接后重试同步。", "danger");
+      } else {
+        const result = await runtimeControl.pause();
+        if (result?.ok) toast("本场训练已暂停，患者端麦克风保持关闭", "ok");
+        else if (result) {
+          // 服务器 pause 才是跨设备的权威停止;本机写通道已被安全闩锁住,
+          // 没有别的补救通道——失败必须立刻让操作员知道并重试。
+          toast(`暂停尚未生效（${result.message}）。请立即重试暂停；确认成功前老人端录音入口可能仍开着。`, "danger");
+        }
       }
     } finally {
       setPausePending(false);
@@ -1782,10 +1788,12 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
   }
 
   async function resumeTraining() {
-    const next = await runtimeControl.resume();
-    if (next) {
+    const result = await runtimeControl.resume();
+    if (result?.ok) {
       releaseSafetyPause();
       toast("已恢复到暂停前的位置", "ok");
+    } else if (result) {
+      toast(result.message, "danger");
     }
   }
 
@@ -1860,7 +1868,11 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
         </div>
 
         <SessionControlBar paused={paused} loading={recoveryPending} busy={runtimeControl.busy || pausePending || wrapupPending}
-          resumeBlocked={observerMode || Boolean(apFailure)} recoveredLabel={recoveredLabel}
+          resumeBlocked={observerMode || Boolean(apFailure)}
+          resumeBlockedHint={observerMode
+            ? "已暂停；AI 仍托管本场。要继续，请在「AI 自动带练」卡片点「继续 AI 自动带练」或「转为人工操作」。"
+            : apFailure ? "已暂停；技术失败已锁定本场，请按红色提示处理，或结束本场后重新开一场。" : null}
+          recoveredLabel={recoveredLabel}
           terminalStatus={runtimeControl.terminalStatus} onExit={onExit}
           error={recoveryError} onRetry={retryRecovery}
           onPause={() => void pauseTraining()} onResume={() => void resumeTraining()} />

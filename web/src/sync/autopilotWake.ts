@@ -1,7 +1,7 @@
 // 服务器取得控制权后的同窗一次性唤醒。
 //
 // 时序问题:患者端配对后先探测 /autopilot/next,权威 autopilot_not_active 会被
-// stop-legacy 闩住(防 1.5 秒 409 请求风暴)——闩住语义为"停止轮询,直到发生明确的
+// stop-legacy 闩住(防按轮询节奏刷 409 请求风暴)——闩住语义为"停止轮询,直到发生明确的
 // serverOwned 唤醒或 capability/session epoch 改变"。console 随后启动服务器 AI
 // 时,患者 hook 的 sessionId/capabilityKey/probeKey/probeEpoch 都不变,老人端会
 // 停在 legacy 收不到第一条服务器命令。此模块补上那一次明确唤醒。
@@ -58,7 +58,7 @@ export function nextServerOwnershipWake(
 /**
  * 跨设备路径。同窗 CustomEvent 只在 console 与患者端同一个浏览器里成立;真实验收
  * 是两台设备/两个独立浏览器,console 那条 window 事件根本到不了患者端。患者端已有的
- * 每 1.5 秒 /live/state 轮询于是成为唯一有界的服务端权威通道。
+ * /live/state 周期轮询(LIVE_POLL_MS)于是成为唯一有界的服务端权威通道。
  *
  * 这里只做严格解析与"同一响应内自洽"两件事:唤醒必须指向这次快照里那个 session,
  * 否则就是旧场次/串场的投影,一律拒绝。重复同 token 不在这里去重——首个 live 响应

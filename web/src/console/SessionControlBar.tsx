@@ -3,11 +3,15 @@ import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
 import type { SessionRuntimeStatus } from "../types";
 
-export function SessionControlBar({ paused, loading = false, busy, resumeBlocked = false, recoveredLabel, error, terminalStatus, onPause, onResume, onRetry, onExit }: {
+export function SessionControlBar({ paused, loading = false, busy, resumeBlocked = false, resumeBlockedHint, recoveredLabel, error, terminalStatus, onPause, onResume, onRetry, onExit }: {
   paused: boolean;
   loading?: boolean;
   busy?: boolean;
   resumeBlocked?: boolean;
+  // resumeBlocked 时给用户的真话指引:说清此刻谁挡着、去哪里继续。不给则退回
+  // 通用文案。本栏不写「等待服务器确认」这类暗示等着就会有结果的话——这里没有
+  // 任何在途核实(观察台的同名文案有真实的权威轮询在途,不在此列)。
+  resumeBlockedHint?: string | null;
   recoveredLabel?: string | null;
   error?: string | null;
   terminalStatus?: SessionRuntimeStatus | null;
@@ -34,10 +38,10 @@ export function SessionControlBar({ paused, loading = false, busy, resumeBlocked
       <section className={`session-control-bar${paused ? " is-paused" : ""}`} aria-label="场次运行状态">
         <div className="session-control-bar__copy">
           <StatusPill tone={loading ? "muted" : retryMode ? "danger" : paused ? "warn" : "ok"}>{loading ? "正在恢复场次" : retryMode ? "恢复失败" : paused ? "场次已暂停" : "场次进行中"}</StatusPill>
-          <span>{loading ? "正在核对服务器中的位置与已保存记录。" : retryMode ? "恢复完成前，推进、线索、录音和收尾入口保持关闭。" : paused && resumeBlocked ? "已暂停；等服务器确认后才能继续。" : paused ? "患者端已停止推进，麦克风保持关闭。" : "当前位置会自动保存，可在刷新或换设备后继续。"}</span>
+          <span>{loading ? "正在核对服务器中的位置与已保存记录。" : retryMode ? "恢复完成前，推进、线索、录音和收尾入口保持关闭。" : paused && resumeBlocked ? (resumeBlockedHint ?? "已暂停；当前不能在这里继续，请按页面上的提示处理。") : paused ? "患者端已停止推进，麦克风保持关闭。" : "当前位置会自动保存，可在刷新或换设备后继续。"}</span>
         </div>
         <Button variant={retryMode || paused ? "primary" : "secondary"} disabled={loading || busy || (retryMode && !onRetry) || (paused && resumeBlocked)} onClick={retryMode ? onRetry : paused ? onResume : onPause}>
-          {loading || busy ? "正在处理…" : retryMode ? "重新同步场次" : paused && resumeBlocked ? "等待服务器确认" : paused ? "继续本场训练" : "暂停本场训练"}
+          {loading || busy ? "正在处理…" : retryMode ? "重新同步场次" : paused && resumeBlocked ? "暂不能在此继续" : paused ? "继续本场训练" : "暂停本场训练"}
         </Button>
       </section>
       {recoveredLabel && !paused && !loading && !error && (
