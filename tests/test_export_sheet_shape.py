@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import ast
 import csv
 from pathlib import Path
 
@@ -51,9 +52,28 @@ def test_score_sheet_carries_the_prompt_level_distribution_as_columns():
     assert "summary" not in row, "结局指标不许再压成一个字符串列"
 
 
-def test_every_sheet_has_a_declared_field_contract():
-    missing = set(export.SHEET_FIELDS) ^ set(export.EXPECTED_SHEET_NAMES)
-    assert not missing, f"表名与字段契约对不上：{sorted(missing)}"
+def test_every_sheet_built_by_the_bundle_has_a_declared_field_contract():
+    """原来这条写的是 `set(SHEET_FIELDS) ^ set(EXPECTED_SHEET_NAMES)`，而
+    `EXPECTED_SHEET_NAMES = frozenset(SHEET_FIELDS)` —— 一条恒真的断言。
+    真正要比的是「构造出来的那些表」和「声明过的那些表」。
+    """
+    tree = ast.parse((Path(export.__file__)).read_text(encoding="utf-8"))
+    built: list[set[str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "sheets" for t in node.targets):
+            continue
+        keys = [k for k in node.value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+        if len(keys) == len(node.value.keys):
+            built.append({k.value for k in keys})
+    assert len(built) == 1, (
+        f"在 app/export.py 里找到 {len(built)} 处 `sheets = {{...}}` 字面量，预期 1 处；"
+        "构造方式变了就得同步改这条断言，别让它悄悄什么都不比")
+    assert built[0] == set(export.SHEET_FIELDS), (
+        f"构造了却没声明：{sorted(built[0] - set(export.SHEET_FIELDS))}；"
+        f"声明了却不构造：{sorted(set(export.SHEET_FIELDS) - built[0])}")
 
 
 def test_empty_sheets_still_get_their_header_row(tmp_path: Path):

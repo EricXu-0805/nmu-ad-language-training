@@ -1514,6 +1514,8 @@ def export_session_bundle(
                                 if effective_export_batch_id else None),
                             "controlled_audio_exported": will_export})
 
+    # 表名闭集：漏声明一张表 → _write_csvs 会拒收；声明了却从来不产 → 分析者
+    # 拿到的包永远少一张而没人报错。两个方向都在这里当场炸。
     sheets = {"session": session_sheet, "turns": turn_sheet, "attempts": attempt_sheet,
               "interactions": interaction_sheet, "item_scores": score_sheet,
               "scales": scale_sheet,
@@ -1522,6 +1524,11 @@ def export_session_bundle(
               "questionnaire_item_values": questionnaire_item_value_sheet,
               "abnormal": abn_sheet, "audio_manifest": audio_sheet,
               "repeat_audio_manifest": repeat_audio_sheet}
+    if set(sheets) != set(SHEET_FIELDS):
+        raise ValueError(
+            "导出表名与 SHEET_FIELDS 不一致："
+            f"多出 {sorted(set(sheets) - set(SHEET_FIELDS))}，"
+            f"缺 {sorted(set(SHEET_FIELDS) - set(sheets))}")
     for row in repeat_audio_sheet:
         if set(row) != set(REPEAT_AUDIO_MANIFEST_FIELDS):
             raise ValueError("重复请求音频清单字段不等于批准的四项白名单，拒绝导出")
@@ -2131,9 +2138,6 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "repeat_audio_manifest": REPEAT_AUDIO_MANIFEST_FIELDS,
 }
-EXPECTED_SHEET_NAMES = frozenset(SHEET_FIELDS)
-
-
 def _write_csvs(
         sheets: dict, batch_id: str, write_dir: Optional[Path],
         data_classification: str, *, staging_owner_hash: str,

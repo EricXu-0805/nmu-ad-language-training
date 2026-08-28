@@ -36,6 +36,24 @@ def _directives(path: Path) -> dict[str, list[str]]:
     return found
 
 
+# 下面三条都按 `_units()` 参数化：这个清单空掉时它们不会红，而是**一条不剩地
+# 消失**，pytest 照样全绿。所以先钉住清单本身。
+_EXPECTED_UNITS = frozenset({
+    "nmu.service", "nmu-caddy.service", "nmu-backup.service",
+    "nmu-backup-health.service", "nmu-capacity.service",
+    "nmu-restore-drill.service", "nmu-os-security.service",
+    "nmu-health.service",
+})
+
+
+def test_the_parametrized_unit_list_is_not_empty():
+    names = {path.name for path in _units()}
+    assert names, f"{UNITS} 下一个 .service 都没扫到——下面三条此刻全在空转"
+    assert _EXPECTED_UNITS <= names, (
+        "这些单元从 deploy/systemd 里消失了：{}".format(
+            ", ".join(sorted(_EXPECTED_UNITS - names))))
+
+
 @pytest.mark.parametrize("unit", _units(), ids=lambda p: p.name)
 def test_every_unit_routes_its_failure_to_the_alert_service(unit):
     assert "nmu-alert@%N.service" in _directives(unit).get("OnFailure", []), (
@@ -91,8 +109,11 @@ def test_web_workers_are_never_multiplied():
     真正在护着自动带练写路径的是进程内的 `_LIVE_WRITE_LOCK`。多开一个 worker
     会把这个前提整个掀掉。Dockerfile 里写过这句话，而运维要编辑的是 systemd 单元。
     """
+    dockerfile = UNITS.parents[1] / "Dockerfile"
+    assert dockerfile.exists(), (
+        f"{dockerfile} 不在——这条断言原本要扫它，路径写错时会静默跳过")
     offenders = []
-    for path in list(UNITS.glob("*.service")) + [UNITS.parents[1] / "Dockerfile"]:
+    for path in list(UNITS.glob("*.service")) + [dockerfile]:
         if not path.exists():
             continue
         for raw in path.read_text(encoding="utf-8").splitlines():

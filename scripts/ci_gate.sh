@@ -195,6 +195,10 @@ fi
 
 echo ""
 echo "═════ 汇总 ═════"
+# 本机门 ≠ GitHub CI 全绿。image job（容器构建 + trivy 扫描）本机没有 docker
+# 守护进程时跑不了，2026-08-25 起它红了三天而本机六关一直全绿——「门禁全过」
+# 因此被写成了「CI 全绿」。名单由 tests/test_ci_job_coverage.py 钉住。
+echo "  （本机不覆盖：image —— 容器构建+trivy 扫描，只在 GitHub CI 上跑）"
 failed=0
 for i in "${!names[@]}"; do
   if [ "${codes[$i]}" -eq 0 ]; then
