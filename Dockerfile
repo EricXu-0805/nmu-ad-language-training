@@ -20,7 +20,10 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
 # 入口、显式迁移与快照脚本使用 bash 的 pipefail、[[ ]]、进程替换等语义。
 # 包版本与 Alpine 3.24 底座一起锁定；升级底座时必须同步重新扫描与回归。
-RUN apk add --no-cache bash=5.3.9-r1
+# libcrypto3/libssl3 显式钉在底座之上：底座那层是 2026-06-16 构建的，带 3.5.7-r0，
+# 而 CVE-2026-14456 的修复 3.5.8-r0 是 2026-08-25 才进 Alpine 3.24 的。等底座重建
+# 追上之后这两项会变成同版本的空操作，但仍然留着——底座换 digest 时它是硬下限。
+RUN apk add --no-cache bash=5.3.9-r1 libcrypto3=3.5.8-r0 libssl3=3.5.8-r0
 
 # 云端为主：默认只装核心运行依赖(不含 pytest/piper)。要本地神经兜底音色可另装 piper。
 COPY requirements-deploy.txt requirements-deploy.lock.txt ./

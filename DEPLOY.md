@@ -470,7 +470,7 @@ docker compose ps
 | 层 | 钉法 | 文件 |
 |---|---|---|
 | 容器底座 | `FROM …@sha256:` 双镜像 digest；tag 只作可读注释 | `Dockerfile` |
-| 底座系统包 | `apk add bash=5.3.9-r1` 精确版本 | `Dockerfile` |
+| 底座系统包 | `apk add bash=5.3.9-r1 libcrypto3=3.5.8-r0 libssl3=3.5.8-r0` 精确版本（openssl 两项是底座 digest 尚未追上 CVE-2026-14456 修复时的显式下限） | `Dockerfile` |
 | 运行期 Python | 全量传递锁 + 每个分发包 sha256，安装走 `--require-hashes` | `requirements-deploy.lock.txt` |
 | 前端 | `package-lock.json` v3，含每个包的 integrity；构建走 `npm ci` | `web/package-lock.json` |
 | 物料清单 | CycloneDX 1.6，确定性输出，入库 | `sbom.cdx.json` |
