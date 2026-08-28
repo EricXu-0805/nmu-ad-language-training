@@ -103,10 +103,18 @@ log_before=\$(wc -l < '$ROOT/offsite/pull.log' 2>/dev/null || echo 0)
 rc=0
 ./scripts/vps-backup-pull.sh || rc=\$?
 this_run=\$(sed -n "\$((log_before + 1)),\\\$p" '$ROOT/offsite/pull.log' 2>/dev/null || true)
-first_fail=\$(printf '%s\\n' "\$this_run" | grep -m1 ' FAIL ' || true)
+fail_lines=\$(printf '%s\\n' "\$this_run" | grep ' FAIL ' || true)
 fail_count=\$(printf '%s\\n' "\$this_run" | grep -c ' FAIL ' || true)
+# 只端「第一条 FAIL」不行:盘上常驻若干份等人工处置的 legacy 快照,每轮都各写一行
+# snapshot_unresolved_evidence,永远占着第一条,真正的新故障被挤到后面看不见——
+# 和它取代的 tail -5 是同一个病。按 code 分组,每种各给一条样例,新 code 必然出现。
+by_code=\$(printf '%s\\n' "\$fail_lines" | awk '/ FAIL /{c="code=?"; for (i=1;i<=NF;i++) if (\$i ~ /^code=/) c=\$i; n[c]++} END {for (k in n) printf "  %s x%d\\n", k, n[k]}' | sort || true)
+examples=\$(printf '%s\\n' "\$fail_lines" | awk '/ FAIL /{c="code=?"; for (i=1;i<=NF;i++) if (\$i ~ /^code=/) c=\$i; if (!seen[c]++) print "  " \$0}' | head -6 || true)
 summary=\$(printf '%s\\n' "\$this_run" | grep -E ' (ok|partial) snapshots=' | tail -1 || true)
-detail="本轮 FAIL \${fail_count} 条。第一条:\${first_fail:-(无)}
+detail="本轮 FAIL \${fail_count} 条,按 code 分:
+\${by_code:-  (无)}
+每种一条样例:
+\${examples:-  (无)}
 收尾:\${summary:-(本轮没写收尾行)}"
 if [ "\$rc" -ne 0 ]; then
   if [ -f '$ROOT/ops-webhook.env' ]; then

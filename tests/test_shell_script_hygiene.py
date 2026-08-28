@@ -56,14 +56,22 @@ def test_the_generated_offsite_runner_also_parses():
     start = text.index('cat > "$ROOT/run-pull.sh"')
     body = text[text.index("\n", start) + 1:]
     body = body[:body.index("\nEOF\n") + 1]
-    # heredoc 未加引号，转义的 \$ 在生成时会还原成 $。
-    generated = body.replace("\\$", "$")
+    # heredoc 未加引号：反斜杠只在 \$ \` \\ 之前有意义，其余原样保留。
+    # 只还原 \$ 是不够的——那样 `printf '%s\\n'` 会被当成两个字符留在这里，
+    # 与真正写到盘上的 `printf '%s\\\\n'` 不是同一份文本。
+    generated = re.sub(r"\\([$`\\])", r"\1", body)
     result = subprocess.run(["bash", "-n"], input=generated,
                             capture_output=True, text=True)
     assert result.returncode == 0, (
         f"安装器生成出来的 run-pull.sh 语法不合法：{result.stderr.strip()}")
     for match in BARE_VAR_BEFORE_WIDE.finditer(generated):
         pytest.fail(f"生成出来的 run-pull.sh 里有裸变量接全角字符：{match.group(0)!r}")
+    # 告警正文不能靠「第一条 FAIL」——盘上常驻若干份等人工处置的 legacy 快照，
+    # 每轮都各写一行同样的 code，永远占着第一条，真故障被挤到看不见的地方。
+    assert "grep -m1 ' FAIL '" not in generated, (
+        "run-pull.sh 又退回「只端第一条 FAIL」了；稳态失败会永远占住那个位置")
+    assert "by_code=" in generated and "examples=" in generated, (
+        "告警正文要按 FAIL 的 code 分组并各给一条样例，新出现的 code 才不会被淹掉")
 
 
 def test_the_verifier_fingerprint_records_the_installed_copy_not_the_repo_file():
