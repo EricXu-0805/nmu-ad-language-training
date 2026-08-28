@@ -107,6 +107,9 @@ _TURNS = Dataset(
         Column("response_role", "clear", "string", "作答角色"),
         Column("source_attempt_seq", "clear", "integer", "关联的原始尝试序号"),
         Column("prompt_level", "clear", "integer", "提示层级 0–3"),
+        Column("duration_seconds", "clear", "float",
+               "本环节收音时长（秒）。相对量，不是绝对时间；**不是命名反应时**——"
+               "反应时需要临床先定「潜伏期从哪一刻起算」，平台今天不产它"),
         Column("asr_confidence", "clear", "float", "语音识别置信度"),
         Column("ai_answer_type", "clear", "string", "AI 判类"),
         Column("ai_score", "clear", "float", "AI 初评（永不覆盖人工锁定分）"),
@@ -128,7 +131,67 @@ _TURNS = Dataset(
     ),
 )
 
-DATASETS: tuple[Dataset, ...] = (_SUBJECTS, _SESSIONS, _TURNS)
+_QUESTIONNAIRE_RECORDS = Dataset(
+    key="questionnaire_records",
+    title="量表记录（试用道）",
+    grain="一行一份已锁定的量表记录",
+    columns=(
+        Column("record_code", "pseudonym", "string",
+               "量表记录假名，与去标识导出包的 record_code 完全一致，"
+               "可直接与 questionnaire_item_values join",
+               source="HMAC(record_id)"),
+        Column("subject_code", "pseudonym", "string", "受试者假名"),
+        Column("questionnaire_id", "clear", "string",
+               "量表标识（sfacs_v1 / gds15_v1 / npiq_v1 / ace3_v1 / aft_v1）"),
+        Column("phase_label", "clear", "string", "期别：前测 / 后测 / 随访 / 其他"),
+        Column("phase_ordinal", "clear", "integer",
+               "同一位受试者、同一份量表、同一期别内的序号。改错的做法是新建一条，"
+               "**分析前必须先按 superseded_by_ordinal 过滤掉被作废的那些**"),
+        Column("superseded_by_ordinal", "clear", "integer",
+               "作废本条的那条记录的序号；为空表示本条仍然作数"),
+        Column("definition_sha256", "clear", "string", "创建时定义包的字节指纹"),
+        Column("scoring_rule_id", "clear", "string", "计分规则标识"),
+        Column("computed_total", "clear", "float", "锁定时按源表计分说明算出的总分"),
+        Column("cutoff_met", "clear", "boolean", "是否达界值；无界值规则时为空"),
+        Column("computed_flag", "clear", "string", "分层界值下的判定标签"),
+        Column("ai_draft_status", "clear", "string",
+               "AI 初评状态。初评永不覆盖人工终值，只作建议"),
+        Column("ai_draft_engine", "clear", "string", "出初评的引擎标识"),
+        Column("withdrawn", "clear", "boolean",
+               "该受试者是否已登记研究撤回。撤回者的行是墓碑：假名与自然键保留，"
+               "其余全为空。**统计时必须先按本列过滤**"),
+        Column("status", "forbidden", "-",
+               "只有 locked 的记录进研究面，draft 不是证据，所以这一列没有意义"),
+        Column("note", "forbidden", "-", "施测备注（自由文本）：永不出现"),
+        Column("locked_by", "forbidden", "-", "锁定人账号：永不出现"),
+        Column("locked_at", "forbidden", "-", "绝对时间：永不出现"),
+    ),
+)
+
+_QUESTIONNAIRE_ITEM_VALUES = Dataset(
+    key="questionnaire_item_values",
+    title="量表逐条目作答（试用道）",
+    grain="一行一个 (量表记录, 条目, 字段)",
+    columns=(
+        Column("record_code", "pseudonym", "string", "所属量表记录假名"),
+        Column("subject_code", "pseudonym", "string", "受试者假名"),
+        Column("item_key", "clear", "string", "条目键（自然键，替代数据库主键）"),
+        Column("field_key", "clear", "string",
+               "字段键：value / present / severity / frequency / element:*"),
+        Column("final_value", "clear", "string", "人工终值——研究真值就是这一列"),
+        Column("value_source", "clear", "string",
+               "终值来源：human_direct / ai_accepted / ai_overridden"),
+        Column("ai_draft_value", "clear", "string", "AI 建议值（永不覆盖终值）"),
+        Column("withdrawn", "clear", "boolean", "所属受试者是否已登记研究撤回"),
+        Column("ai_draft_rationale", "forbidden", "-", "AI 理由（自由文本）：永不出现"),
+        Column("updated_at", "forbidden", "-", "绝对时间：永不出现"),
+    ),
+)
+
+DATASETS: tuple[Dataset, ...] = (
+    _SUBJECTS, _SESSIONS, _TURNS,
+    _QUESTIONNAIRE_RECORDS, _QUESTIONNAIRE_ITEM_VALUES,
+)
 _BY_KEY = {dataset.key: dataset for dataset in DATASETS}
 
 

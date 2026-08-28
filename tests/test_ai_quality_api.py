@@ -69,7 +69,7 @@ def quality_env(monkeypatch) -> QualityEnv:
     )
     monkeypatch.setattr(db, "engine", engine)
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "135790")
+    monkeypatch.setenv("CONSOLE_PIN", "13579024")
     monkeypatch.delenv(
         ai_quality_service.RESEARCH_MIN_SUBJECTS_ENV, raising=False)
     SQLModel.metadata.create_all(engine)
@@ -180,7 +180,7 @@ def test_query_and_named_account_boundary_and_empty_simulation_v2(quality_env):
     assert denied.status_code in {401, 403}
     pin_only = anonymous.get(
         "/quality/ai-metrics?data_classification=simulation",
-        headers={"X-Console-Pin": "135790"},
+        headers={"X-Console-Pin": "13579024"},
     )
     assert pin_only.status_code in {401, 403}
 

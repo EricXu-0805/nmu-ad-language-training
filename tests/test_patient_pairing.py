@@ -88,13 +88,13 @@ def _login(client_engine, username: str, role: str) -> TestClient:
 # ---------------- 派生配对码(纯函数层) ----------------
 
 def test_derived_pin_is_stable_six_digit_and_never_equals_console_pin(monkeypatch):
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     first = patient_pairing.derive_patient_pin("P-ONE")
     assert first == patient_pairing.derive_patient_pin("P-ONE")
     assert len(first) == 6 and first.isdigit()
     assert first != patient_pairing.derive_patient_pin("P-TWO")
     for pid in ("P-ONE", "P-TWO", "NMU-001", "A.b_c-9"):
-        assert patient_pairing.derive_patient_pin(pid) != "246810"
+        assert patient_pairing.derive_patient_pin(pid) != "24681024"
 
 
 def test_pairing_fail_closed_without_console_pin(monkeypatch):
@@ -107,7 +107,7 @@ def test_pairing_fail_closed_without_console_pin(monkeypatch):
 
 
 def test_binding_token_round_trip_and_tamper_rejection(monkeypatch):
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     token = patient_pairing.issue_binding_token("P-ONE", "device-patient-000001")
     claims = patient_pairing.verify_binding_token(token)
     assert claims is not None
@@ -116,7 +116,7 @@ def test_binding_token_round_trip_and_tamper_rejection(monkeypatch):
     # 任意一个字符被改动即验签失败;换密钥(轮换 CONSOLE_PIN)同样全部作废。
     tampered = token[:-1] + ("A" if token[-1] != "A" else "B")
     assert patient_pairing.verify_binding_token(tampered) is None
-    monkeypatch.setenv("CONSOLE_PIN", "135791")
+    monkeypatch.setenv("CONSOLE_PIN", "13579124")
     assert patient_pairing.verify_binding_token(token) is None
 
 
@@ -137,9 +137,9 @@ def test_attach_and_patch_routes_are_explicitly_classified():
 
 def test_global_pin_pair_response_shape_unchanged(pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     response = pairing_client.post(
-        "/device/pair", headers={"X-Console-Pin": "246810"},
+        "/device/pair", headers={"X-Console-Pin": "24681024"},
         json={"deviceId": "legacy-device-0000001"})
     assert response.status_code == 200, response.text
     assert set(response.json()) == {"capability", "sessionId", "expiresAt"}
@@ -148,7 +148,7 @@ def test_global_pin_pair_response_shape_unchanged(pairing_client, monkeypatch):
 def test_patient_pin_pairs_binding_and_capability_for_own_live_session(
         pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     code = patient_pairing.derive_patient_pin("P-ONE")
     response = pairing_client.post(
         "/device/pair", headers={"X-Console-Pin": code},
@@ -170,7 +170,7 @@ def test_patient_pin_pairs_binding_and_capability_for_own_live_session(
 def test_other_patient_pin_gets_binding_only_and_attach_leaks_nothing(
         pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     code = patient_pairing.derive_patient_pin("P-TWO")
     paired = pairing_client.post(
         "/device/pair", headers={"X-Console-Pin": code},
@@ -190,7 +190,7 @@ def test_other_patient_pin_gets_binding_only_and_attach_leaks_nothing(
     # 切 live 是操作端动作;测试里临时回到开放回环身份完成,再恢复 PIN。
     monkeypatch.delenv("CONSOLE_PIN")
     _switch_live(pairing_client, "S-TWO")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     attached = pairing_client.post("/device/attach", json={
         "deviceId": "patient-two-device-01", "binding": binding})
     assert attached.status_code == 200, attached.text
@@ -205,7 +205,7 @@ def test_other_patient_pin_gets_binding_only_and_attach_leaks_nothing(
 
 def test_attach_rotates_same_session_capability(pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     code = patient_pairing.derive_patient_pin("P-ONE")
     paired = pairing_client.post(
         "/device/pair", headers={"X-Console-Pin": code},
@@ -232,7 +232,7 @@ def test_attach_never_steals_another_devices_live_capability(
     2026-08-22 坐实的拉锯战:每 4 秒互踢+每次轮换强制暂停训练)。轮换权只留给
     当面输码的人工配对;失联设备等能力过期或人工重配。"""
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     code = patient_pairing.derive_patient_pin("P-ONE")
     old_tablet = pairing_client.post(
         "/device/pair", headers={"X-Console-Pin": code},
@@ -262,7 +262,7 @@ def test_attach_never_steals_another_devices_live_capability(
 def test_forged_binding_is_rejected_and_locks_like_pin_bruteforce(
         pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     code = patient_pairing.derive_patient_pin("P-ONE")
     paired = pairing_client.post(
         "/device/pair", headers={"X-Console-Pin": code},
@@ -287,7 +287,7 @@ def test_forged_binding_is_rejected_and_locks_like_pin_bruteforce(
     assert locked.status_code == 429
     assert locked.json()["code"] == "auth_locked"
     pair_locked = pairing_client.post(
-        "/device/pair", headers={"X-Console-Pin": "246810"},
+        "/device/pair", headers={"X-Console-Pin": "24681024"},
         json={"deviceId": "patient-one-device-01"})
     assert pair_locked.status_code == 429
 
@@ -295,7 +295,7 @@ def test_forged_binding_is_rejected_and_locks_like_pin_bruteforce(
 def test_withdrawn_patient_binding_and_pin_stop_working(
         pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     code = patient_pairing.derive_patient_pin("P-ONE")
     paired = pairing_client.post(
         "/device/pair", headers={"X-Console-Pin": code},
@@ -319,7 +319,7 @@ def test_withdrawn_patient_binding_and_pin_stop_working(
 
 def test_attach_unavailable_without_console_pin(pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     code = patient_pairing.derive_patient_pin("P-ONE")
     binding = pairing_client.post(
         "/device/pair", headers={"X-Console-Pin": code},
@@ -335,7 +335,7 @@ def test_attach_unavailable_without_console_pin(pairing_client, monkeypatch):
 
 def test_pairing_code_visible_only_to_training_roles(pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     eng = pairing_client.test_engine
     researcher = _login(eng, "pair-researcher", "researcher")
     steward = _login(eng, "pair-steward", "data_steward")

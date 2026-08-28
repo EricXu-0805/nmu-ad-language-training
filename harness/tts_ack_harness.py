@@ -24,7 +24,7 @@
     export AUDIO_DIR="$NMU_HARNESS_ROOT/audio"
     export NMU_HARNESS_TTS_CACHE_DIR="$NMU_HARNESS_ROOT/tts-cache"
     export ALLOW_SIMULATION_DATA=1 ENABLE_AUTOPILOT_P0A_SIMULATION=1 REQUIRE_AUTH=1
-    export CONSOLE_PIN=...            # 6–32 位数字，临时 PIN，用完即弃，不写进任何文件
+    export CONSOLE_PIN=...            # 8–32 位数字，临时 PIN，用完即弃，不写进任何文件
     export NMU_HARNESS_PASSWORD=...   # 临时管理员口令，同上
 
     # 1) 先把临时库迁到 head（绝不碰 platform/data/app.db）
@@ -107,7 +107,7 @@ DEFAULT_ACTOR = "syn-t5-admin"
 TTS_MODES = ("synthetic", "production")
 CANONICAL_BANK_PATH = PLATFORM_ROOT / "content" / "item_bank_v1.json"
 DEMO_PROFILE_VERSION = "week2-single20-demo-v1"
-_PIN_RE = re.compile(r"[0-9]{6,32}")
+_PIN_RE = re.compile(r"[0-9]{8,32}")
 
 
 class HarnessConfigError(RuntimeError):
@@ -266,7 +266,7 @@ def resolve_config(env: Mapping[str, str] | None = None) -> HarnessConfig:
     # 否则非法 PIN 要等到 lifespan 才炸，那时默认库路径已经被引擎解析过。
     pin = env.get("CONSOLE_PIN") or ""
     if not _PIN_RE.fullmatch(pin):
-        raise HarnessConfigError("CONSOLE_PIN 必须是 6–32 位 ASCII 数字")
+        raise HarnessConfigError("CONSOLE_PIN 必须是 8–32 位 ASCII 数字")
 
     password = env.get(PASSWORD_ENV) or ""
     if len(password) < 8:

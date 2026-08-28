@@ -101,6 +101,9 @@ export interface PatientAutopilotView {
   reason: string | null;
   /** 仅 mode==="blocked" 时有意义:平静档(status)还是告警档(alert)。 */
   blockedCalm: boolean;
+  /** 仅 mode==="blocked" 时有意义:是「连不上服务器、重试预算用尽」而非设备侧判死。
+   *  这一档网络一恢复就该自愈,所以它单独放行一次重探。 */
+  blockedRetryExhausted: boolean;
   assetReadiness: PatientAssetReadinessEvent | null;
   /** Browser-only: bytes captured, still saving. Never a server phase. */
   localCapturePhase: LocalAutopilotCapturePhase | null;
@@ -166,6 +169,8 @@ export function usePatientAutopilot(input: {
   // blocked 屏的紧急度:true=平静档(runtime 被服务器收走),false=告警档。
   // 每个 setMode("blocked") 位点都必须显式定它,不许继承上一次的值。
   const [blockedCalm, setBlockedCalm] = useState(false);
+  // 「连不上服务器、重试预算用尽」与「设备侧判死」是两回事:前者网络一恢复就该自愈。
+  const [blockedRetryExhausted, setBlockedRetryExhausted] = useState(false);
   const [assetReadiness, setAssetReadiness] = useState<PatientAssetReadinessEvent | null>(null);
   const assetGateRef = useRef<PatientAssetMediaGate | null>(null);
   if (assetGateRef.current === null) assetGateRef.current = new PatientAssetMediaGate();
@@ -395,9 +400,10 @@ export function usePatientAutopilot(input: {
           stopSpeaking();
           setMode("blocked");
           setReason(failurePlan.retryExhausted
-            ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
+            ? "暂时连不上服务器。请研究者刷新本页；网络恢复后会自动继续。"
             : blockedReason(error));
           setBlockedCalm(!failurePlan.retryExhausted && blockedIsCalm(error));
+          setBlockedRetryExhausted(failurePlan.retryExhausted);
           setResolvedProbeKey(probeKey);
         }
       } finally {
@@ -428,10 +434,15 @@ export function usePatientAutopilot(input: {
   // 探测在途时唤醒被持有不丢弃,server 已在场时标记完成、绝不重建 runner。
   useEffect(() => {
     const probeResolved = probeKey !== "" && probeKey === resolvedProbeKey;
-    if (wakeCoordinatorRef.current?.consume({ mode: visibleMode, probeResolved })) {
+    if (wakeCoordinatorRef.current?.consume({
+      mode: visibleMode, probeResolved, blockedRecoverable: blockedRetryExhausted,
+    })) {
       setProbeEpoch((value) => value + 1);
     }
-  }, [wakeNonce, visibleMode, probeKey, resolvedProbeKey]);
+    // blockedRetryExhausted 必须进依赖：断网 37.5 秒后落进这一档时，模式与探测键
+    // 都已经不再变化——不重跑这个 effect，控制台后来发的唤醒就一个都消费不掉，
+    // 而那正是这一档唯一的自愈路。
+  }, [wakeNonce, visibleMode, probeKey, resolvedProbeKey, blockedRetryExhausted]);
 
   // D5①:owner load 落到 paused/scope_completed(或 blocked 平静档)后本次挂载
   // 再无轮询——接管+研究者 resume 之后患者端会永远停在「我们先休息一下」。
@@ -448,10 +459,11 @@ export function usePatientAutopilot(input: {
       mode: visibleMode,
       runtimePhase: serverContextRef.current?.runtime.phase ?? null,
       blockedCalm,
+      blockedRetryExhausted,
     })) {
       setProbeEpoch((value) => value + 1);
     }
-  }, [input.serverPaused, visibleMode, blockedCalm]);
+  }, [input.serverPaused, visibleMode, blockedCalm, blockedRetryExhausted]);
 
   // 每个 owner generation 恰好装一次页面事件监听，owner 一换就按序摘掉。
   // 摘监听本身不是失败：普通的 session/gate/所有权变化走各自的 shutdown。
@@ -524,9 +536,10 @@ export function usePatientAutopilot(input: {
             stopSpeaking();
             setMode("blocked");
             setReason(failurePlan.retryExhausted
-              ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
+              ? "暂时连不上服务器。请研究者刷新本页；网络恢复后会自动继续。"
               : blockedReason(error));
             setBlockedCalm(!failurePlan.retryExhausted && blockedIsCalm(error));
+            setBlockedRetryExhausted(failurePlan.retryExhausted);
           }
         }
         return;
@@ -613,9 +626,10 @@ export function usePatientAutopilot(input: {
         stopSpeaking();
         setMode("blocked");
         setReason(failurePlan.retryExhausted
-          ? "服务器状态连续无法确认，已停止自动重试，请研究者检查连接后重新配对"
+          ? "暂时连不上服务器。请研究者刷新本页；网络恢复后会自动继续。"
           : blockedReason(error));
         setBlockedCalm(!failurePlan.retryExhausted && blockedIsCalm(error));
+        setBlockedRetryExhausted(failurePlan.retryExhausted);
       }
     });
     return () => {
@@ -743,6 +757,7 @@ export function usePatientAutopilot(input: {
       ? "自动流程需要显式开启语音后才能继续"
       : reason,
     blockedCalm,
+    blockedRetryExhausted,
     assetReadiness,
     localCapturePhase,
     reportAssetReadiness,

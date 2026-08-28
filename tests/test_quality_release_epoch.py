@@ -15,6 +15,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import ai_quality_service, export_security, quality_release, research_read
+from app import research_dataset
 from app.ai_quality_metrics import (
     AttemptQualityEvidence,
     QualityDimensions,
@@ -114,9 +115,12 @@ def _snapshot_for_sessions(session_ids: list[str]):
         })
         subject_rows.append(subject_row)
         session_rows.append(session_row)
-    return quality_release._snapshot_from_rows({
-        "subjects": subject_rows, "sessions": session_rows, "turns": [],
-    })
+    # 注册表里有几张表就得给几张——少一张 _snapshot_from_rows 会拒（这是对的：
+    # 纪元少冻一张表，读回放时那张表就永远是空的，而没人会发现）。
+    rows = {"subjects": subject_rows, "sessions": session_rows, "turns": []}
+    for key in research_dataset.dataset_keys():
+        rows.setdefault(key, [])
+    return quality_release._snapshot_from_rows(rows)
 
 
 def _publish(db: Session, *, key: str = "cut-0001") -> QualityReleaseEpoch:
@@ -516,9 +520,9 @@ def test_research_snapshot_reuses_the_closed_row_projection_and_binds_all_pages(
             }
         return read
 
-    monkeypatch.setattr(research_read, "list_subjects", reader("subjects"))
-    monkeypatch.setattr(research_read, "list_sessions", reader("sessions"))
-    monkeypatch.setattr(research_read, "list_turns", reader("turns"))
+    # 按注册表全打替身：漏掉哪个，那个就会拿着 object() 去真查库。
+    for _key, _fn_name in research_read.READERS.items():
+        monkeypatch.setattr(research_read, _fn_name, reader(_key))
     first = quality_release.build_research_snapshot(
         object(), session_ids=["S-1", "S-2"],
         config=SimpleNamespace(key_id="test"))

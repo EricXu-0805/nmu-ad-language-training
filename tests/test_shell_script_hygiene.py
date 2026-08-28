@@ -122,3 +122,54 @@ def test_every_frontend_test_file_is_actually_in_the_run_list():
     assert on_disk - listed == set(), (
         "这些前端测试文件存在但不在 npm test/pretest 清单里，等于没写：\n"
         + "\n".join(sorted(on_disk - listed)))
+
+
+# ---------------------------------------------------------------------------
+# 只有测试在调用的导出函数
+# ---------------------------------------------------------------------------
+# 2026-08-27 扫出 7 个：最典型的是 formalAssessment.ts 里那三个闸，
+# 测试断言「正式测评进行中前端会拦住切换受试者」，而没有任何屏幕调用它们——
+# 测试给的是假的安全感。这不等于都该删：有的是漏接线，有的是真死代码，
+# 逐个拍板，别一刀切。白名单里每一条都要写清为什么留着。
+
+# 已判定过的例外。删空这个字典之前请先看每条的理由。
+_TEST_ONLY_EXPORT_ALLOWLIST = {
+    # 2026-08-27 立案，本轮不处置——判断要动屏上交互或要确认真死，都不该顺手做。
+    # 三个正式测评闸：测试断言「正式测评进行中前端会拦住切换受试者/收尾」，
+    # 而没有任何屏调用它们。看名字都该接在 SessionCreateScreen 与收尾屏上，
+    # 属于**漏接线**而不是死代码；接线要动那两屏的交互，单独一轮做。
+    # ⚠️ 在接上之前，别把这三条测试当成「切换受试者有人拦」的证据。
+    "assessmentEventAllowsSwitch": "漏接线，待接 SessionCreateScreen",
+    "assessmentEventAllowsCloseout": "漏接线，待接收尾屏",
+    "assessmentWorkflowAllowsPatientSwitch": "漏接线，待接 SessionCreateScreen",
+    "operationalReadinessPolicy": "漏接线，待接今日队列屏",
+    "sessionCreationPolicy": "漏接线，待接 SessionCreateScreen",
+    # 这两个更像真死代码，删之前要确认没有别的入口在用（含动态取名）。
+    "nextFeedbackSequence": "疑似真死代码，待确认后删",
+    "clearPatientPauseOutboxIfMatches": "疑似真死代码，待确认后删",
+}
+
+
+def test_no_new_frontend_export_is_called_only_by_its_own_test():
+    import re as _re
+    src_root = WEB / "src"
+    sources = [p for p in src_root.rglob("*.ts") if ".test." not in p.name]
+    sources += [p for p in src_root.rglob("*.tsx") if ".test." not in p.name]
+    tests = [p for p in src_root.rglob("*.test.ts")]
+    tests += [p for p in src_root.rglob("*.test.tsx")]
+    prod_text = "\n".join(p.read_text(encoding="utf-8") for p in sources)
+    test_text = "\n".join(p.read_text(encoding="utf-8") for p in tests)
+
+    offenders = []
+    for path in sources:
+        for name in _re.findall(r"^export function ([A-Za-z0-9_]+)",
+                                path.read_text(encoding="utf-8"), _re.M):
+            if name in _TEST_ONLY_EXPORT_ALLOWLIST:
+                continue
+            uses = len(_re.findall(rf"\b{_re.escape(name)}\b", prod_text))
+            if uses <= 1 and _re.search(rf"\b{_re.escape(name)}\b", test_text):
+                offenders.append(f"{path.relative_to(WEB)}::{name}")
+    assert not offenders, (
+        "这些导出函数只有测试在调用，生产代码一处也没接——测试给的是假的安全感：\n"
+        + "\n".join(sorted(offenders))
+        + "\n要么接上，要么删掉；确实要暂留就加进 _TEST_ONLY_EXPORT_ALLOWLIST 并写明理由。")

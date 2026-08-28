@@ -113,14 +113,22 @@ export class PatientProbeWakeCoordinator {
    * has already resolved to legacy; an in-flight probe holds the wake instead
    * of dropping it, closing the start-vs-initial-probe race.
    */
-  consume(input: { mode: PatientWakeMode; probeResolved: boolean }): boolean {
+  consume(input: {
+    mode: PatientWakeMode;
+    probeResolved: boolean;
+    /** blocked 里可自愈的那一档(重试预算用尽=瞬时断网,不是设备侧判死)。
+     *  唤醒本身就是「服务器活着且持有本场」的权威证据,所以这一档也放行一次重探。
+     *  原来它被排除在外:网络恢复后控制台一直发唤醒,一次都消费不掉。 */
+    blockedRecoverable?: boolean;
+  }): boolean {
     if (this.#pending === null) return false;
     if (input.mode === "server") {
       this.#handled.add(this.#pending);
       this.#pending = null;
       return false;
     }
-    if (input.mode !== "legacy" || !input.probeResolved) return false;
+    const recoverableBlocked = input.mode === "blocked" && input.blockedRecoverable === true;
+    if (!recoverableBlocked && (input.mode !== "legacy" || !input.probeResolved)) return false;
     this.#handled.add(this.#pending);
     this.#pending = null;
     return true;

@@ -838,7 +838,7 @@ def test_demo_profile_real_http_start_reaches_the_first_tts(
     VisitPlan command ledger instead of constructing a Session by hand.
     """
     monkeypatch.setenv("ENABLE_AUTOPILOT_P0A_SIMULATION", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.delenv("NMU_TEST_ALLOW_DIRECT_SESSION_CREATE", raising=False)
     created = _create(
         visit_clients.researcher,
@@ -917,7 +917,7 @@ def test_demo_profile_real_http_start_reaches_the_first_tts(
     try:
         paired = device.post(
             "/device/pair",
-            headers={"X-Console-Pin": "246810"},
+            headers={"X-Console-Pin": "24681024"},
             json={"deviceId": "demo20-http-device-0001"},
         )
         assert paired.status_code == 200, paired.text

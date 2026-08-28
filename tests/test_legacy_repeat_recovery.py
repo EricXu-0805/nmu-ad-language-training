@@ -132,7 +132,7 @@ def legacy_env(monkeypatch, tmp_path) -> LegacyEnv:
     # every device request would fail as device_capability_required, which
     # would make the route-level acceptance below meaningless.
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
 
     db_path = tmp_path / "legacy-pre-repeat.sqlite"
     config = _config(db_path)
@@ -1945,7 +1945,7 @@ def test_a_valid_preflight_demoted_to_recovery_only_still_closes_the_scope(
 
 
 def _pair(client: TestClient, device_id: str = "legacy-repaired-device-0001"):
-    return client.post("/device/pair", headers={"X-Console-Pin": "246810"},
+    return client.post("/device/pair", headers={"X-Console-Pin": "24681024"},
                        json={"deviceId": device_id})
 
 

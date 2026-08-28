@@ -1,0 +1,16 @@
+[Unit]
+Description=NMU public endpoint health probe (the only check that runs from outside)
+OnFailure=nmu-alert@%N.service
+After=network-online.target
+
+[Service]
+Type=oneshot
+# 本机的每一样东西都可能在服务已经不服务时继续报绿：备份脚本直接 sqlite3 打开磁盘上
+# 的 app.db，服务死没死它照写 ok；health.state 只看备份链。站点到底还在不在，只有
+# 从外面打一次才知道——这一条同时覆盖「进程活着但返 500」「Caddy 死了」「证书过期」
+# 「磁盘满转只读」。--max-time 挡住卡死的连接；-f 让 4xx/5xx 变成非零退出。
+ExecStart=/usr/bin/curl -fsS --max-time 10 -o /dev/null https://89-208-253-119.sslip.io/health
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

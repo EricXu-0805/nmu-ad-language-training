@@ -177,6 +177,12 @@ function examinerDefinition() {
   };
 }
 
+function firstAllowed(definition, kind) {
+  if (kind === "symptom_triplet") return definition.present_field.allowed[0];
+  if (kind === "examiner_scored") return "0";
+  return definition.value_field.allowed[0];
+}
+
 function slot(itemKey, fieldKey, overrides = {}) {
   return {
     item_key: itemKey,
@@ -371,4 +377,36 @@ test("examiner_scored:记分框是档位按钮、计数框是数字输入、分�
   for (const banned of ["attempt", "fail-closed", "幂等", "examiner", "bins"]) {
     assert.equal(markup.includes(banned), false, `渲染结果不得含 ${banned}`);
   }
+});
+
+// 点错一格必须退得回「未评」。原来 ChoiceButtons 只有 onSelect,再点已选项也只是
+// 重写同值;唯一能写 null 的是计数框的清空分支。施测者点错一格就只能带着错值锁定,
+// 而「未评」是锁定门禁的判据——门禁于是形同虚设。
+test("四种题型:已填的条目都给得出「退回未评」,未填的不给", async () => {
+  const cases = [
+    ["ordinal_sections", ordinalDefinition, "i1", "value"],
+    ["binary_scored", binaryDefinition, "b1", "value"],
+    ["symptom_triplet", tripletDefinition, "t1", "present"],
+    ["examiner_scored", examinerDefinition, "e1", "value"],
+  ];
+  for (const [kind, make, itemKey, fieldKey] of cases) {
+    const definition = make();
+    const filled = await render(definition, recordFor(definition, {
+      values: [slot(itemKey, fieldKey, { final_value: firstAllowed(definition, kind) })],
+    }));
+    assert.ok(filled.includes("退回未评"),
+      `${kind}: 条目已填,却没有退回未评的入口`);
+    const empty = await render(definition, recordFor(definition, { values: [] }));
+    assert.equal(empty.includes("退回未评"), false,
+      `${kind}: 一条都没填,不该出现退回未评`);
+  }
+});
+
+test("锁定之后不给退回未评——锁了就不能改", async () => {
+  const definition = binaryDefinition();
+  const markup = await render(definition, recordFor(definition, {
+    status: "locked",
+    values: [slot("b1", "value", { final_value: firstAllowed(definition, "binary_scored") })],
+  }));
+  assert.equal(markup.includes("退回未评"), false);
 });

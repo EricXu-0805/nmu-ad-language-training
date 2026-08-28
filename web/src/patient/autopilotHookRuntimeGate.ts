@@ -46,6 +46,12 @@ export function canStartAutopilotRunner(restored: AutopilotRuntimeState): boolea
  * 发现服务器仍持有(回到同一终态,无环),要么拿到 autopilot_not_active 走
  * 既有 stop-legacy 收口回到 live 游标平面。
  * 活跃 runner 自有轮询;blocked 告警档是设备侧判死,留给研究者处置,不自动醒。
+ *
+ * 例外一档:`blockedRetryExhausted`。它是累计 37.5 秒连不上服务器落进来的,
+ * 也就是最纯粹的瞬时断网,而不是设备侧判死。原来这一档被两条自愈路同时排除,
+ * 网络恢复后老人端就永远停在那里;屏上那句话还让人去「重新配对」,而重新配对
+ * 会把「可能恢复」变成「一定不能恢复」。重探只是一次读:探得通回到 live 游标
+ * 平面,探不通仍旧 fail-closed 停在原地,不放宽任何门禁。
  */
 export function shouldReprobeAfterServerResume(input: {
   previousServerPaused: boolean;
@@ -53,10 +59,12 @@ export function shouldReprobeAfterServerResume(input: {
   mode: PatientAutopilotMode;
   runtimePhase: AutopilotRuntimePhase | null;
   blockedCalm: boolean;
+  blockedRetryExhausted: boolean;
 }): boolean {
   if (!input.previousServerPaused || input.serverPaused) return false;
   if (input.mode === "server") {
     return input.runtimePhase !== null && isAutopilotRuntimeTerminal(input.runtimePhase);
   }
-  return input.mode === "blocked" && input.blockedCalm;
+  return input.mode === "blocked"
+    && (input.blockedCalm === true || input.blockedRetryExhausted === true);
 }

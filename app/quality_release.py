@@ -706,11 +706,8 @@ def build_research_snapshot(
             "研究行快照的场次集合为空或重复")
     binding = _LiveSnapshotBinding(session_ids=frozen_ids)
     rows_by_dataset: dict[str, list[dict[str, Any]]] = {}
-    readers = {
-        "subjects": research_read.list_subjects,
-        "sessions": research_read.list_sessions,
-        "turns": research_read.list_turns,
-    }
+    # 按名字动态解析：测试给某个 reader 打替身时必须真的换得掉。
+    readers = {k: research_read.reader_for(k) for k in research_dataset.dataset_keys()}
     for dataset_key in research_dataset.dataset_keys():
         cursor: str | None = None
         seen_cursors: set[str] = set()

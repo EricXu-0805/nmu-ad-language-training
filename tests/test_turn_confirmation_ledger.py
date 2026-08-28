@@ -27,7 +27,7 @@ def confirmation_env(monkeypatch):
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     monkeypatch.setattr(db, "engine", engine)
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "135790")
+    monkeypatch.setenv("CONSOLE_PIN", "13579024")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
         for username, display_id, role in (

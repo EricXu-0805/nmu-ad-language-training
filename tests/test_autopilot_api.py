@@ -244,7 +244,7 @@ def api_clients(monkeypatch, tmp_path) -> ApiClients:
         session.commit()
 
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     account = TestClient(app)
     login = account.post("/auth/login", json={
         "username": "p0a-researcher", "password": "password1",
@@ -258,7 +258,7 @@ def api_clients(monkeypatch, tmp_path) -> ApiClients:
     device = TestClient(app)
     paired = device.post(
         "/device/pair",
-        headers={"X-Console-Pin": "246810"},
+        headers={"X-Console-Pin": "24681024"},
         json={"deviceId": "p0a-http-device-000001"},
     )
     assert paired.status_code == 200, paired.text
@@ -4762,7 +4762,7 @@ def test_device_rotation_during_active_processing_fences_both_claims_and_pauses(
         try:
             paired = new_device.post(
                 "/device/pair",
-                headers={"X-Console-Pin": "246810"},
+                headers={"X-Console-Pin": "24681024"},
                 json={"deviceId": "p0a-http-device-rotated-000002"},
             )
             assert paired.status_code == 200, paired.text
@@ -4824,7 +4824,7 @@ def test_device_rotation_fencing_failure_rolls_back_capability_atomically(
     try:
         response = new_device.post(
             "/device/pair",
-            headers={"X-Console-Pin": "246810"},
+            headers={"X-Console-Pin": "24681024"},
             json={"deviceId": "p0a-http-device-fault-000003"},
         )
         assert response.status_code == 409, response.text
@@ -4882,7 +4882,7 @@ def test_device_pair_capability_collision_rolls_back_entire_request_atomically(
     try:
         response = new_device.post(
             "/device/pair",
-            headers={"X-Console-Pin": "246810"},
+            headers={"X-Console-Pin": "24681024"},
             json={"deviceId": "p0a-http-device-integrity-000004"},
         )
         assert response.status_code == 503, response.text
@@ -5194,7 +5194,7 @@ def test_takeover_requires_exact_drain_and_drain_requires_issued_current_device(
     try:
         paired = replacement.post(
             "/device/pair",
-            headers={"X-Console-Pin": "246810"},
+            headers={"X-Console-Pin": "24681024"},
             json={"deviceId": "p0a-http-replacement-0001"},
         )
         assert paired.status_code == 200, paired.text

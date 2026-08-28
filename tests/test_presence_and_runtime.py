@@ -876,14 +876,14 @@ def test_atomic_technical_pause_concurrent_snapshot_commits_once(client):
 
 def test_patient_heartbeat_is_minimal_pin_protected_and_does_not_advance_command_seq(
         client, monkeypatch):
-    pin = {"X-Console-Pin": "246810"}
+    pin = {"X-Console-Pin": "24681024"}
     # 研究者在开启独立老人端认证前已建好档案/场次并下发握手。
     _patient(client, "P-HB")
     _training_session(client, "S-HB", "P-HB")
     handshake = _handshake(client, "S-HB", wseq=100)
     assert handshake.status_code == 200
     issued_wseq = handshake.json()["wseq"]
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     assert client.get("/sessions/S-HB/runtime").status_code == 401
     assert client.get("/sessions/S-HB/runtime", headers=pin).status_code == 401
     assert client.post("/sessions/S-HB/pause").status_code == 401

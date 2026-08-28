@@ -23,7 +23,7 @@ import pytest
 
 from harness import tts_ack_harness as harness
 
-PIN = "135790"
+PIN = "13579024"
 PASSWORD = "harness-password-1"
 PLACEHOLDER_PROVIDER_KEY = "harness-placeholder-not-a-real-key"
 PLACEHOLDER_FINGERPRINT = "harness-placeholder-fingerprint-material"
@@ -536,7 +536,7 @@ _CREDENTIAL_ROTATION_SCRIPT = """
     h.assert_production_fingerprint_contract()
     results["idempotent_ok"] = True
 
-    os.environ["CONSOLE_PIN"] = "999888"
+    os.environ["CONSOLE_PIN"] = "99988824"
     try:
         h.assert_production_fingerprint_contract()
         results["pin_rotation"] = None

@@ -322,7 +322,7 @@ def readiness_api(monkeypatch, tmp_path):
     monkeypatch.setattr(
         provider_readiness, "capture_configuration", lambda **_kwargs: config)
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "135790")
+    monkeypatch.setenv("CONSOLE_PIN", "13579024")
 
     clients = {}
     for username in ("probe-admin", "probe-researcher", "probe-steward"):

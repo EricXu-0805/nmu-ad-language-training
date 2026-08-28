@@ -414,7 +414,6 @@ export interface TurnEvent {
   start_time?: string | null;
   end_time?: string | null;
   duration_seconds?: number | null;
-  naming_latency_ms?: number | null;
   prompt_level?: number | null;
   cue_type?: string | null;
   ai_answer_type?: string | null; // 仅辅助

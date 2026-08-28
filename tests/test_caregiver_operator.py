@@ -243,7 +243,7 @@ def caregiver_clients(monkeypatch) -> CaregiverClients:
         session.commit()
 
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ALLOW_SIMULATION_DATA", "1")
     monkeypatch.setenv("ENABLE_AUTOPILOT_P0A_SIMULATION", "1")
     owner = _login("caregiver-owner")

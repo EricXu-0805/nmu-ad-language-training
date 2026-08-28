@@ -1327,7 +1327,9 @@ def test_m0_end_to_end_single_item(client):
     # 去标识导出：不带直接标识
     _mark_completed(client, "SM0")
     _login_admin(client)
-    ex = client.post("/sessions/SM0/export", json=_export_body("sm0")).json()
+    _r = client.post("/sessions/SM0/export", json=_export_body("sm0"))
+    assert _r.status_code == 200, _r.text
+    ex = _r.json()
     assert ex["deidentified"] is True and ex["sheet_counts"]["turns"] == 1
 
 

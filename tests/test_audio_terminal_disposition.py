@@ -88,7 +88,7 @@ def _seed_sessions(client: TestClient) -> None:
 def _pair(client: TestClient, *, device_id: str = "terminal-device-000001") -> dict[str, str]:
     response = client.post(
         "/device/pair",
-        headers={"X-Console-Pin": "246810"},
+        headers={"X-Console-Pin": "24681024"},
         json={"deviceId": device_id},
     )
     assert response.status_code == 200, response.text
@@ -359,7 +359,7 @@ def test_deleted_without_governance_gate_never_authorizes_local_discard(
 def test_recovery_capability_can_get_exact_410_but_account_or_bad_token_cannot(
         disposition_client, monkeypatch):
     _seed_sessions(disposition_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair(disposition_client)
     _content, uploaded = _upload(
         disposition_client, "recovery-terminal", headers=capability,
@@ -419,7 +419,7 @@ def test_capability_cannot_enumerate_foreign_session_raw_audio_ids(
         disposition_client, "foreign-secret-id",
         session_id="S-TWO", turn_key="SE_锚#1")
     _switch_live(disposition_client, "S-ONE")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     s1_capability = _pair(
         disposition_client, device_id="enumeration-device-0002")
 
@@ -469,7 +469,7 @@ def test_delete_commit_failure_never_unlinks(
         row.status = AudioStatus.deletable
         session.add(row)
         session.commit()
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     # This test isolates DB-before-unlink ordering. Export authority is covered
     # independently by the legacy-ledger deletion-gate API regression.
@@ -521,7 +521,7 @@ def test_delete_source_is_closed_enum_and_cannot_pollute_audit(
         row.status = AudioStatus.deletable
         session.add(row)
         session.commit()
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     admin = _admin_client(disposition_client.test_engine, username="source-admin")
     try:
@@ -562,7 +562,7 @@ def test_unlink_failure_keeps_deleted_and_retry_finishes_cleanup(
         row.status = AudioStatus.deletable
         session.add(row)
         session.commit()
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     monkeypatch.setattr(
         main_module, "_require_authoritative_export_copy", lambda *_args: None)
@@ -605,7 +605,7 @@ def test_directory_fsync_failure_is_reported_and_absent_bytes_retry_is_idempoten
         row.status = AudioStatus.deletable
         session.add(row)
         session.commit()
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     monkeypatch.setattr(
         main_module, "_require_authoritative_export_copy", lambda *_args: None)

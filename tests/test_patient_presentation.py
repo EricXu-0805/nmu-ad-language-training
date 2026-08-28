@@ -76,7 +76,7 @@ def _post_live_session(client: TestClient, session_id: str, *, week_no: int) -> 
 
 
 def _pair(client: TestClient, device_id: str) -> dict[str, str]:
-    response = client.post("/device/pair", headers={"X-Console-Pin": "246810"}, json={
+    response = client.post("/device/pair", headers={"X-Console-Pin": "24681024"}, json={
         "deviceId": device_id,
     })
     assert response.status_code == 200, response.text
@@ -162,7 +162,7 @@ def test_task_device_gets_only_current_text_and_redacted_plan(
     assert open_patient_plan.status_code == 200, open_patient_plan.text
     assert open_patient_plan.headers["cache-control"] == "private, no-store"
 
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair(client, "presentation-device-000001")
 
     anonymous = client.get("/sessions/S-PRESENT/patient-presentation")
@@ -311,7 +311,7 @@ def test_rapport_device_gets_only_the_current_question(
     })
     assert written.status_code == 200, written.text
 
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair(client, "rapport-presentation-device-01")
     response = client.get(
         "/sessions/S-RAPPORT-PRESENT/patient-presentation",
@@ -404,7 +404,7 @@ def test_opaque_turn_ref_becomes_canonical_only_inside_server_ledgers(
     })
     assert written.status_code == 200, written.text
 
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair(client, "opaque-turn-device-0001")
     opaque_turn_key = "itm-0001#1"
 

@@ -85,6 +85,28 @@ function ChoiceButtons({ field, selected, disabled, fullAnchors = false, onSelec
   );
 }
 
+/** 点错一格要退得回「未评」。
+
+档位按钮本身不做「再点一次取消」——在临床表单上那种手势太容易误触，一次误触
+就把已经评好的一格清掉。这里给一个只在「本题已填且未锁定」时才出现的独立按钮，
+按下把该条目的**全部字段**写回 null（NPI-Q 那种一题三格的，三格一起清）。
+「未评」是锁定门禁的判据；退不回未评，门禁就形同虚设。 */
+function ClearItemButton({ shown, fields, onWrite }: {
+  shown: boolean;
+  fields: readonly QuestionnaireValueWrite[];
+  onWrite: (entries: QuestionnaireValueWrite[]) => void;
+}) {
+  if (!shown) return null;
+  return (
+    <div>
+      <button type="button" className="button button--quiet button--sm"
+        onClick={() => onWrite(fields.map((f) => ({ ...f, value: null })))}>
+        退回未评
+      </button>
+    </div>
+  );
+}
+
 function ItemHeading({ item }: { item: QuestionnaireItem }) {
   return (
     <span>
@@ -124,6 +146,9 @@ function OrdinalSectionsBody({ definition, disabled, effective, hints, onWrite }
                 onSelect={(value) => onWrite([
                   { item_key: item.item_key, field_key: "value", value },
                 ])} />
+              <ClearItemButton onWrite={onWrite}
+                shown={!disabled && effective(item.item_key, "value") !== null}
+                fields={[{ item_key: item.item_key, field_key: "value", value: null }]} />
             </div>
           ))}
           <h5>本节沟通要素</h5>
@@ -139,6 +164,15 @@ function OrdinalSectionsBody({ definition, disabled, effective, hints, onWrite }
                   field_key: `element:${element.element_key}`,
                   value,
                 }])} />
+              <ClearItemButton onWrite={onWrite}
+                shown={!disabled && effective(
+                  `section:${section.section_id}`,
+                  `element:${element.element_key}`) !== null}
+                fields={[{
+                  item_key: `section:${section.section_id}`,
+                  field_key: `element:${element.element_key}`,
+                  value: null,
+                }]} />
             </div>
           ))}
         </div>
@@ -167,6 +201,9 @@ function BinaryScoredBody({ definition, disabled, effective, hints, onWrite }: {
             onSelect={(value) => onWrite([
               { item_key: item.item_key, field_key: "value", value },
             ])} />
+          <ClearItemButton onWrite={onWrite}
+            shown={!disabled && effective(item.item_key, "value") !== null}
+            fields={[{ item_key: item.item_key, field_key: "value", value: null }]} />
         </div>
       ))}
     </div>
@@ -218,6 +255,12 @@ function SymptomTripletBody({ definition, disabled, effective, hints, onWrite }:
                   ])} />
               </>
             )}
+            <ClearItemButton onWrite={onWrite} shown={!disabled && present !== null}
+              fields={[
+                { item_key: item.item_key, field_key: "present", value: null },
+                { item_key: item.item_key, field_key: "severity", value: null },
+                { item_key: item.item_key, field_key: "frequency", value: null },
+              ]} />
           </div>
         );
       })}
@@ -304,6 +347,10 @@ function ExaminerItemRow({ item, value, disabled, onWrite }: {
         <ChoiceButtons field={entry.choice} disabled={disabled} fullAnchors
           selected={value} onSelect={write} />
       )}
+      {/* 计数框清空输入就是未评,不需要额外按钮;分档与闭集选项那两种要。 */}
+      <ClearItemButton onWrite={onWrite}
+        shown={!disabled && entry.kind !== "count" && value !== null}
+        fields={[{ item_key: item.item_key, field_key: "value", value: null }]} />
     </div>
   );
 }

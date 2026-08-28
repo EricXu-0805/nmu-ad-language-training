@@ -1305,6 +1305,10 @@ def export_session_bundle(
                 "source_attempt_seq": source_attempt_seq,
                 "asr_text": asr, "confirmed_response_text": conf,
                 "asr_confidence": t.asr_confidence, "prompt_level": t.prompt_level,
+                # 本环节收音时长（秒）。它是相对量，不是绝对时间，也**不是反应时**——
+                # 反应时要等钱凯定「潜伏期从哪一刻起算」。原来只有 attempts.csv 带它，
+                # 而那张表自己盖的章是 truth_scope=operational_only。
+                "duration_seconds": t.duration_seconds,
                 "ai_answer_type": t.ai_answer_type, "ai_score": t.ai_score,
                 "ai_needs_review": t.ai_needs_review,
                 "ai_judge_mode": t.ai_judge_mode,
@@ -1316,8 +1320,7 @@ def export_session_bundle(
 
     # --- 重建评分汇总 ---
     scores = _reconstruct_scores(items, turns_by_item)
-    score_sheet = [{**session_cols(), "task_type": tt,
-                    "summary": _flat(scores[key])}
+    score_sheet = [_score_row(session_cols(), tt, scores[key])
                    for tt, key in (("单要素", "single"), ("双要素", "double"), ("多要素", "multi"))
                    if scores[key]]
 
@@ -1345,9 +1348,8 @@ def export_session_bundle(
     # created_by / locked_by 与全部绝对时间列一律不产；两表用同一域的
     # HMAC 假名 record_code 连接，裸 record_id 不出。
     def questionnaire_record_code(record_id: str) -> str:
-        return export_security._tokenize_identifier(
-            record_id, domain="questionnaire-record", prefix="QREC",
-            config=deidentification_config)
+        return export_security.pseudonymize_questionnaire_record(
+            record_id, deidentification_config)
 
     questionnaire_records = list(db.exec(
         select(QuestionnaireRecord)
@@ -2017,6 +2019,121 @@ def _assert_no_direct_identifiers(sheets: dict) -> None:
     export_security.assert_deidentified_sheets(sheets)
 
 
+# 场次级结局：七个指标各占一列，提示层级分布展成 prompt_level_0..3。
+# 原来它们被 `_flat` 压成一个 `summary` 字符串列，进 SPSS/R 要自己写正则拆，
+# 拆错静默出错；而分布那一项压根没落盘。
+# 三种题型的指标集不同，取并集；缺的那几列在该题型的行里是空值。
+SCORE_METRIC_FIELDS = (
+    # 单要素
+    "n", "naming_accuracy", "spontaneous_naming_accuracy", "prompt_rate",
+    "total_prompt_load", "avg_time_per_item", "total_task_time",
+    # 双要素
+    "weekly_de_score_percentile", "spontaneous_relation_identification_rate",
+    # 多要素
+    "weekly_me_score_percentile",
+)
+SCORE_PROMPT_LEVELS = (0, 1, 2, 3)
+# 逐题明细是列表，压不进一个格子。它们不属于场次级汇总表，但也**不许静默丢掉**——
+# 各自单独出一列 JSON，分析者要拆得开、要查得到。
+SCORE_PER_ITEM_FIELDS = ("per_item", "per_item_de_total")
+
+
+def _score_row(session_cols: dict, task_type: str, metrics: dict) -> dict:
+    distribution = metrics.get("prompt_level_distribution") or {}
+    row = {**session_cols, "task_type": task_type}
+    for field in SCORE_METRIC_FIELDS:
+        row[field] = metrics.get(field)
+    for level in SCORE_PROMPT_LEVELS:
+        row[f"prompt_level_{level}"] = distribution.get(level)
+    for field in SCORE_PER_ITEM_FIELDS:
+        value = metrics.get(field)
+        row[f"{field}_json"] = (None if value is None
+                                else json.dumps(value, ensure_ascii=False,
+                                                sort_keys=True))
+    unknown = (set(metrics) - set(SCORE_METRIC_FIELDS)
+               - set(SCORE_PER_ITEM_FIELDS) - {"prompt_level_distribution"})
+    if unknown:
+        raise ValueError(
+            f"结局指标多出未登记的键 {sorted(unknown)}：先加进 SCORE_METRIC_FIELDS 再导出")
+    return row
+
+# 每张表的列契约。表头从**契约**来，不从数据推。
+#
+# 原来是 `cols = sorted({k for r in rows for k in r}) if rows else []`：没有异常事件的
+# 场次，abnormal.csv 就是个 0 列文件。批处理里 rbind 240 个场次包时，要么当场炸、
+# 要么被 dplyr::bind_rows 静默跳过——而「异常事件为零」恰是最常见的情况，被跳过的
+# 是绝大多数场次。列序也跟着数据变，两个包的同名表可能列序不同。
+#
+# 加新列：先加到这里（放在末尾，别插在中间——列序是对外契约），再改构造代码。
+_SUBJECT_COLS = ("subject_code",)
+_SESSION_COLS = _SUBJECT_COLS + ("session_code",)
+
+SHEET_FIELDS: dict[str, tuple[str, ...]] = {
+    "session": _SESSION_COLS + (
+        "week_no", "phase_type", "event_line", "session_sitting_no",
+        "data_classification", "is_simulation", "is_simulation_subject",
+        "dementia_severity", "mandarin_eligible", "item_bank_version_id",
+        "autopilot_profile_version_id", "completion_scope",
+        "pseudonym_key_id", "pseudonym_version",
+    ),
+    "turns": _SESSION_COLS + (
+        "item_id", "task_type", "turn_seq", "response_role",
+        "source_attempt_seq", "asr_text", "confirmed_response_text",
+        "asr_confidence", "prompt_level", "ai_answer_type", "ai_score",
+        "ai_needs_review", "ai_judge_mode", "reviewed_score", "score_locked",
+        "element_value", "ai_human_diff", "judge_portrait_used",
+        "duration_seconds",
+    ),
+    "attempts": _SESSION_COLS + (
+        "item_id", "turn_seq", "response_role", "attempt_seq", "audio_code",
+        "prompt_level", "cue_type", "duration_seconds", "asr_text",
+        "asr_confidence", "asr_engine_version", "operational_answer_type",
+        "operational_score", "operational_needs_review", "judge_mode",
+        "judge_engine_version", "judge_reason", "matched_on",
+        "contains_target", "error_code", "is_simulation", "truth_scope",
+        # 这两列只在带重复请求/画像证据的场次里出现，第一版按实测列集推契约时
+        # 没走到那条路径。列契约必须覆盖**所有**分支，不是抽样到的那些。
+        "judge_portrait_used", "processing_status",
+    ),
+    "interactions": _SESSION_COLS + (
+        "event_seq", "item_id", "turn_seq", "attempt_seq", "audio_code",
+        "event_type", "payload_json", "is_simulation", "truth_scope",
+    ),
+    "item_scores": (_SESSION_COLS + ("task_type",) + SCORE_METRIC_FIELDS
+                    + tuple(f"prompt_level_{level}" for level in SCORE_PROMPT_LEVELS)
+                    + tuple(f"{field}_json" for field in SCORE_PER_ITEM_FIELDS)),
+    # 正式结局量表：定义包由 PI 冻结之前这张表固定为空。这里只声明两列身份列——
+    # 结局列随冻结契约一起进来。今天它是「只有表头、零行」，那是设计。
+    "scales": _SESSION_COLS,
+    "legacy_unverified_scales": _SUBJECT_COLS + (
+        "phase_type", "legacy_reported_label", "legacy_reported_subscale",
+        "legacy_reported_score", "source_schema", "verification_status",
+        "formal_outcome_eligible",
+    ),
+    "questionnaire_records": _SUBJECT_COLS + (
+        "record_code", "questionnaire_id", "phase_label", "status",
+        "definition_sha256", "scoring_rule_id", "computed_total",
+        "cutoff_met", "computed_flag", "ai_draft_status", "ai_draft_engine",
+    ),
+    "questionnaire_item_values": (
+        "record_code", "item_key", "field_key", "final_value",
+        "value_source", "ai_draft_value",
+    ),
+    "abnormal": _SESSION_COLS + (
+        "phase_type", "abnormal_type", "intervention_type", "note",
+        "affects_scoring_validity",
+    ),
+    "audio_manifest": _SESSION_COLS + (
+        "audio_code", "turn_key", "audio_format", "status",
+        "data_classification", "is_simulation", "contains_direct_identifier",
+        "is_reliability_sample", "controlled_audio_exported",
+        "export_batch_code",
+    ),
+    "repeat_audio_manifest": REPEAT_AUDIO_MANIFEST_FIELDS,
+}
+EXPECTED_SHEET_NAMES = frozenset(SHEET_FIELDS)
+
+
 def _write_csvs(
         sheets: dict, batch_id: str, write_dir: Optional[Path],
         data_classification: str, *, staging_owner_hash: str,
@@ -2038,14 +2155,24 @@ def _write_csvs(
         if not _SAFE_BATCH_ID.fullmatch(name):
             raise ValueError("导出表名含非法路径字符")
         p = base / f"{name}.csv"
+        declared = SHEET_FIELDS.get(name)
+        if declared is None:
+            raise ValueError(f"导出表 {name} 没有登记列契约，拒绝导出")
+        cols = list(declared)
         if name == "repeat_audio_manifest":
             # The approved governance contract fixes both the field set and
             # their order; it must not inherit the generic sorted ordering.
-            cols = list(REPEAT_AUDIO_MANIFEST_FIELDS)
             if any(set(r) != set(cols) for r in rows):
                 raise ValueError("重复请求音频清单字段不等于批准的四项白名单，拒绝导出")
         else:
-            cols = sorted({k for r in rows for k in r}) if rows else []
+            for row in rows:
+                extra = sorted(set(row) - set(cols))
+                if extra:
+                    raise ValueError(
+                        f"导出表 {name} 出现未登记的列 {extra}："
+                        "先把它加进 SHEET_FIELDS 末尾，再导出")
+        # 行里缺的列补 None：表头由契约固定，空表也照写表头。
+        rows = [{col: row.get(col) for col in cols} for row in rows]
         export_security.atomic_write_csv(p, cols, rows)
         files.append(str(p))
     return files, staging_receipt
@@ -2056,7 +2183,19 @@ def _v(x):
 
 
 def _flat(d: Optional[dict]) -> Optional[str]:
+    """把一层平字典压成 "k=v; k=v"。
+
+    原来这里写的是 `keep = {k: v for ... if not isinstance(v, (list, dict))}`——
+    嵌套值被静默丢掉，`prompt_level_distribution` 就是这么从导出里消失的：
+    不报错、不留痕，只有把判分引擎在 R 里重写一遍才看得出少了什么。
+    现在遇到嵌套直接拒绝：要出就展开成列，别偷偷不出。
+    """
     if not d:
         return None
-    keep = {k: v for k, v in d.items() if not isinstance(v, (list, dict))}
-    return "; ".join(f"{k}={v}" for k, v in keep.items())
+    nested = sorted(k for k, v in d.items() if isinstance(v, (list, dict)))
+    if nested:
+        raise ValueError(
+            f"结局指标含嵌套值 {nested}，不得压成字符串静默丢弃；请展开成列")
+    return "; ".join(f"{k}={v}" for k, v in d.items())
+
+

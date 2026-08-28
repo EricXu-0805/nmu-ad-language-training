@@ -8064,11 +8064,7 @@ def get_research_dataset(
         # 只会让演练也需要治理动作。
         binding = (quality_release.bind_research_read(s, config=config)
                    if data_classification == "research" else None)
-        reader = {
-            "subjects": research_read.list_subjects,
-            "sessions": research_read.list_sessions,
-            "turns": research_read.list_turns,
-        }[dataset_key]
+        reader = research_read.reader_for(dataset_key)
         payload = reader(s, config=config,
                          data_classification=data_classification,
                          cursor=cursor, limit=size, binding=binding)

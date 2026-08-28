@@ -112,6 +112,14 @@ def pseudonymize_batch(
         batch_id, domain="export-batch", prefix="BATCH", config=config)
 
 
+def pseudonymize_questionnaire_record(
+        record_id: str, config: Optional[DeidentificationConfig] = None) -> str:
+    """量表记录假名。导出包与 /research/v1 必须走同一个函数——两边各写一份
+    就会有一天分岔，而 PI 手里的 CSV 和用接口拉的数就再也 join 不上了。"""
+    return _tokenize_identifier(
+        record_id, domain="questionnaire-record", prefix="QREC", config=config)
+
+
 def redact_free_text(value: Optional[str]) -> Optional[str]:
     """Default-deny PHI policy: any persisted free text is removed from exports."""
     return None if value is None else REDACTED_TEXT

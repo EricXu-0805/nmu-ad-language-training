@@ -18,7 +18,7 @@ from app.models import ResearchUser
 from scripts import manage_users
 
 
-HEAD = "b6d4f8a2c917"
+HEAD = "c8e5a1f3b209"
 PREVIOUS_HEAD = "d8f2a6c9e104"
 
 
@@ -72,7 +72,7 @@ def test_startup_preflight_rejects_duplicate_identity_in_legacy_schema(
         ))
         _insert_user(connection, "legacy-a", "LEGACY-DUPLICATE")
         _insert_user(connection, "legacy-b", "LEGACY-DUPLICATE")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     with Session(engine) as session:
         with pytest.raises(RuntimeError, match="display_id.*重复"):
             auth.assert_deploy_credentials(session)

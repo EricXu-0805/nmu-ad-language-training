@@ -65,7 +65,6 @@ def build_evidence(s: DBSession, patient_id: str) -> dict | None:
     by_group: dict[tuple[str, str], list[float]] = {}
     weeks: set[int] = set()
     prompt_levels: dict[str, int] = {}
-    latencies: list[int] = []
     for turn, task_type, week_no in rows:
         weeks.add(int(week_no))
         role = turn.response_role or "未标注"
@@ -75,8 +74,6 @@ def build_evidence(s: DBSession, patient_id: str) -> dict | None:
             by_group.setdefault(key, []).append(float(turn.element_value))
         level = "未记录" if turn.prompt_level is None else str(int(turn.prompt_level))
         prompt_levels[level] = prompt_levels.get(level, 0) + 1
-        if turn.naming_latency_ms is not None:
-            latencies.append(int(turn.naming_latency_ms))
     groups = [
         {
             "task_type": task_type,
@@ -92,8 +89,6 @@ def build_evidence(s: DBSession, patient_id: str) -> dict | None:
         "weeks_covered": sorted(weeks),
         "score_groups": groups,
         "prompt_level_counts": dict(sorted(prompt_levels.items())),
-        "mean_naming_latency_ms": (
-            round(sum(latencies) / len(latencies)) if latencies else None),
     }
 
 

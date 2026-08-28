@@ -31,7 +31,7 @@ def account_client(monkeypatch):
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     monkeypatch.setattr(app_db, "engine", engine)
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     SQLModel.metadata.create_all(engine)
 
     with Session(engine) as session:

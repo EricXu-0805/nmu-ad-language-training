@@ -18,7 +18,7 @@ def real_db(monkeypatch):
     monkeypatch.setattr(db, "engine", eng)
     SQLModel.metadata.create_all(eng)
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     with Session(eng) as s:
         s.add_all([
             ResearchUser(username="u", display_id="丁老师",

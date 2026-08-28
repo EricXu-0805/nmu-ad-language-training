@@ -103,6 +103,15 @@ def _b64url_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(padded.encode("ascii"))
 
 
+# 绑定令牌的最大寿命。整个干预就 8 周，跨周期还在用的令牌一定是该重新配对的那种。
+# 没有这条，令牌就是终身的：平板换人、送修、被家属带走，旧令牌照样拿得到设备能力
+# （读本场全部临床呈现内容、以「老人端设备」身份 POST /audio、打断训练），
+# 而唯一的作废手段是轮换 CONSOLE_PIN——那会同时作废所有受试者的配对码。
+BINDING_TOKEN_MAX_AGE_DAYS = 70          # 8 周 + 14 天缓冲
+# 未来时间戳不给宽限：时钟回拨或伪造都不该换来更长的寿命。留 1 天容忍设备时钟漂移。
+_BINDING_TOKEN_FUTURE_SKEW_SECONDS = 86400
+
+
 def _sign(payload: bytes) -> bytes:
     return hmac.new(_key(), _BIND_DOMAIN + b"\x00" + payload, hashlib.sha256).digest()
 
@@ -152,6 +161,11 @@ def verify_binding_token(token: str) -> BindingClaims | None:
             or not isinstance(device_id, str)
             or not _DEVICE_ID_PATTERN.fullmatch(device_id)
             or not isinstance(issued_at, int) or issued_at < 0):
+        return None
+    age = datetime.now(timezone.utc).timestamp() - issued_at
+    if age > BINDING_TOKEN_MAX_AGE_DAYS * 86400:
+        return None
+    if age < -_BINDING_TOKEN_FUTURE_SKEW_SECONDS:
         return None
     return BindingClaims(
         patient_id=patient_id, device_id=device_id, issued_at=issued_at)

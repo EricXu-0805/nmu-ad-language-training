@@ -42,6 +42,8 @@ from .models import (
     ItemEvent,
     Patient,
     QualityReleaseEpochRowSnapshot,
+    QuestionnaireItemValue,
+    QuestionnaireRecord,
     Session,
     SessionRuntimeState,
     TurnEvent,
@@ -513,6 +515,163 @@ def list_turns(db: DBSession, *, config, data_classification: str,
     return _envelope("turns", rows, next_cursor, has_more, config, binding)
 
 
+def _questionnaire_patient_ids(db: DBSession, binding: Any) -> set[str] | None:
+    """冻结纪元下，量表面覆盖哪些受试者。
+
+    纪元是一个**场次**集合，而量表记录挂在受试者上、不挂场次。取「这批场次
+    对应的受试者」是唯一不引入新治理概念的口径。None = 不绑定（仿真分区）。
+    """
+    if binding is None:
+        return None
+    rows = db.exec(select(Session.patient_id).where(
+        Session.session_id.in_(binding.session_ids))).all()
+    return {row if isinstance(row, str) else row[0] for row in rows}
+
+
+def list_questionnaire_records(db: DBSession, *, config, data_classification: str,
+                               cursor: str | None, limit: int,
+                               binding: Any = None) -> dict[str, Any]:
+    """按 record_id 的 keyset 翻页。**只发已锁定的记录**——draft 还不是证据。"""
+    if _has_frozen_snapshot(binding):
+        return _list_frozen_snapshot(
+            db, dataset_key="questionnaire_records", config=config,
+            data_classification=data_classification, cursor=cursor,
+            limit=limit, binding=binding)
+    after = decode_cursor(cursor, config, "questionnaire_records") if cursor else None
+    patient_ids = _questionnaire_patient_ids(db, binding)
+    statement = (
+        select(QuestionnaireRecord)
+        .where(QuestionnaireRecord.status == "locked")
+        .order_by(QuestionnaireRecord.record_id)
+    )
+    if patient_ids is not None:
+        if not patient_ids:
+            return _envelope("questionnaire_records", [], None, False, config, binding)
+        statement = statement.where(
+            QuestionnaireRecord.patient_id.in_(patient_ids))
+    if after is not None:
+        statement = statement.where(QuestionnaireRecord.record_id > after[0])
+    picked = list(db.exec(statement.limit(limit + 1)))
+    page, has_more = _page(picked, limit)
+
+    withdrawn = _withdrawn_patient_ids(db)
+    rows: list[dict[str, Any]] = []
+    last_key: list[Any] | None = None
+    for record in page:
+        record_code = export_security.pseudonymize_questionnaire_record(
+            record.record_id, config)
+        subject_code = export_security.pseudonymize_subject(
+            record.patient_id, config)
+        if record.patient_id in withdrawn:
+            rows.append(_tombstone("questionnaire_records", {
+                "record_code": record_code,
+                "subject_code": subject_code,
+                "questionnaire_id": record.questionnaire_id,
+                "phase_label": record.phase_label,
+                "phase_ordinal": record.phase_ordinal,
+                "withdrawn": True,
+            }))
+        else:
+            rows.append({
+                "record_code": record_code,
+                "subject_code": subject_code,
+                "questionnaire_id": record.questionnaire_id,
+                "phase_label": record.phase_label,
+                "phase_ordinal": record.phase_ordinal,
+                "superseded_by_ordinal": record.superseded_by_ordinal,
+                "definition_sha256": record.definition_sha256,
+                "scoring_rule_id": record.scoring_rule_id,
+                "computed_total": record.computed_total,
+                "cutoff_met": record.cutoff_met,
+                "computed_flag": record.computed_flag,
+                "ai_draft_status": record.ai_draft_status,
+                "ai_draft_engine": record.ai_draft_engine,
+                "withdrawn": False,
+            })
+        last_key = [record.record_id]
+
+    next_cursor = (encode_cursor(last_key, config, "questionnaire_records")
+                   if has_more and last_key is not None else None)
+    return _envelope("questionnaire_records", rows, next_cursor, has_more,
+                     config, binding)
+
+
+def list_questionnaire_item_values(db: DBSession, *, config,
+                                   data_classification: str,
+                                   cursor: str | None, limit: int,
+                                   binding: Any = None) -> dict[str, Any]:
+    """按 (record_id, item_key, field_key) 的 keyset 翻页；同样只跟已锁定的记录走。"""
+    if _has_frozen_snapshot(binding):
+        return _list_frozen_snapshot(
+            db, dataset_key="questionnaire_item_values", config=config,
+            data_classification=data_classification, cursor=cursor,
+            limit=limit, binding=binding)
+    after = (decode_cursor(cursor, config, "questionnaire_item_values")
+             if cursor else None)
+    patient_ids = _questionnaire_patient_ids(db, binding)
+    statement = (
+        select(QuestionnaireItemValue, QuestionnaireRecord)
+        .join(QuestionnaireRecord,
+              QuestionnaireItemValue.record_id == QuestionnaireRecord.record_id)
+        .where(QuestionnaireRecord.status == "locked")
+        .order_by(QuestionnaireItemValue.record_id,
+                  QuestionnaireItemValue.item_key,
+                  QuestionnaireItemValue.field_key)
+    )
+    if patient_ids is not None:
+        if not patient_ids:
+            return _envelope("questionnaire_item_values", [], None, False,
+                             config, binding)
+        statement = statement.where(
+            QuestionnaireRecord.patient_id.in_(patient_ids))
+    if after is not None:
+        record_after, item_after, field_after = after
+        statement = statement.where(or_(
+            QuestionnaireItemValue.record_id > record_after,
+            and_(QuestionnaireItemValue.record_id == record_after,
+                 QuestionnaireItemValue.item_key > item_after),
+            and_(QuestionnaireItemValue.record_id == record_after,
+                 QuestionnaireItemValue.item_key == item_after,
+                 QuestionnaireItemValue.field_key > field_after),
+        ))
+    picked = list(db.exec(statement.limit(limit + 1)))
+    page, has_more = _page(picked, limit)
+
+    withdrawn = _withdrawn_patient_ids(db)
+    rows: list[dict[str, Any]] = []
+    last_key: list[Any] | None = None
+    for value, record in page:
+        record_code = export_security.pseudonymize_questionnaire_record(
+            value.record_id, config)
+        subject_code = export_security.pseudonymize_subject(
+            record.patient_id, config)
+        if record.patient_id in withdrawn:
+            rows.append(_tombstone("questionnaire_item_values", {
+                "record_code": record_code,
+                "subject_code": subject_code,
+                "item_key": value.item_key,
+                "field_key": value.field_key,
+                "withdrawn": True,
+            }))
+        else:
+            rows.append({
+                "record_code": record_code,
+                "subject_code": subject_code,
+                "item_key": value.item_key,
+                "field_key": value.field_key,
+                "final_value": value.final_value,
+                "value_source": value.value_source,
+                "ai_draft_value": value.ai_draft_value,
+                "withdrawn": False,
+            })
+        last_key = [value.record_id, value.item_key, value.field_key]
+
+    next_cursor = (encode_cursor(last_key, config, "questionnaire_item_values")
+                   if has_more and last_key is not None else None)
+    return _envelope("questionnaire_item_values", rows, next_cursor, has_more,
+                     config, binding)
+
+
 def _turn_row(session_code: str, subject_code: str,
               item: ItemEvent, turn: TurnEvent,
               source_attempt_seq: int | None) -> dict[str, Any]:
@@ -526,6 +685,7 @@ def _turn_row(session_code: str, subject_code: str,
         "turn_seq": turn.turn_seq,
         "response_role": getattr(turn.response_role, "value", turn.response_role),
         "source_attempt_seq": source_attempt_seq,
+        "duration_seconds": turn.duration_seconds,
         "prompt_level": turn.prompt_level,
         "asr_confidence": turn.asr_confidence,
         "ai_answer_type": getattr(turn.ai_answer_type, "value", turn.ai_answer_type),
@@ -710,6 +870,28 @@ def _list_frozen_snapshot(
         dataset_key, rows, next_cursor, has_more, config, binding)
 
 
+#: dataset_key → 取数函数**的名字**。**唯一的一份**。
+#: 2026-08-27 之前这张表在三个地方各写了一遍（HTTP 取数、冻结纪元、测试夹具），
+#: 加两个数据集就得改三处，漏一处的表现是 KeyError 或纪元少冻两张表。
+#: 存名字不存函数对象：函数对象在导入那一刻就被抓死，测试 monkeypatch 模块属性
+#: 换不掉它，于是打了替身却仍然走真实 DB。
+READERS: dict[str, str] = {
+    "subjects": "list_subjects",
+    "sessions": "list_sessions",
+    "turns": "list_turns",
+    "questionnaire_records": "list_questionnaire_records",
+    "questionnaire_item_values": "list_questionnaire_item_values",
+}
+
+
+def reader_for(dataset_key: str):
+    name = READERS.get(dataset_key)
+    if name is None:
+        raise KeyError(f"数据集 {dataset_key} 没有登记取数函数")
+    import sys
+    return getattr(sys.modules[__name__], name)
+
+
 def _envelope(dataset_key: str, rows: Iterable[dict[str, Any]],
               next_cursor: str | None, has_more: bool,
               config, binding: Any = None) -> dict[str, Any]:
@@ -799,3 +981,10 @@ def dictionary_csv() -> bytes:
     header = ["dataset", "column", "disclosure", "dtype", "unit",
               "description", "source", "published"]
     return render_csv(header, [[row.get(name) for name in header] for row in rows])
+
+
+assert set(READERS) == set(research_dataset.dataset_keys()), (
+    "登记的数据集与取数函数对不上："
+    + str(set(READERS) ^ set(research_dataset.dataset_keys())))
+for _name in READERS.values():
+    assert _name in globals(), f"READERS 指向了不存在的函数 {_name}"

@@ -35,7 +35,8 @@ _PBKDF2_ITERATIONS = 600_000
 _SESSION_TTL_HOURS = 12
 _PASSWORD_MAX_BYTES = 1024
 _CSRF_CONTEXT = b"nmu-csrf-v1\0account-write"
-_PAIRING_PIN_PATTERN = re.compile(r"^[0-9]{6,32}$")
+# 8 位起：6 位纯数字空间只有 1e6，配上全局限速器的稳态吞吐就是可枚举的。
+_PAIRING_PIN_PATTERN = re.compile(r"^[0-9]{8,32}$")
 
 
 # ---------------- 口令散列（stdlib pbkdf2，无第三方依赖）----------------
@@ -168,7 +169,11 @@ def pin_configured() -> bool:
     if raw is None:
         return False
     if not _PAIRING_PIN_PATTERN.fullmatch(raw):
-        raise RuntimeError("CONSOLE_PIN 必须是 6–32 位 ASCII 数字；空值、空白、过短或非数字均拒绝启动")
+        raise RuntimeError(
+            "CONSOLE_PIN 必须是 8–32 位 ASCII 数字；空值、空白、过短或非数字均拒绝启动。"
+            "2026-08-27 由 6 位提到 8 位：6 位空间只有 1e6，配上全局限速器的稳态吞吐"
+            "就是可枚举的。**升级这版代码之前必须先把 .env 里的 PIN 换成 8 位以上**，"
+            "否则服务起不来——现有配对码也会随之作废，要重新发。")
     return True
 
 
@@ -254,6 +259,12 @@ _LOCKED_UNTIL: OrderedDict[str, float] = OrderedDict()
 _TRACKED_KEYS: OrderedDict[str, None] = OrderedDict()
 _GLOBAL_FAILURES: dict[str, list[float]] = {}
 _GLOBAL_LOCKED_UNTIL: dict[str, float] = {}
+# 连续命中的档位与最近一次锁定的到期时刻。
+# 原来命中上限就 `pop` 掉计数器、锁固定 30 秒，于是稳态吞吐 ≈ 上限次/30 秒
+# ≈ 7560 次/小时,与用多少个 IP 无关(这是全局桶)。现在越锁越久。
+# 合法场景不受影响:护理员当面输错三五次,永远碰不到第二档。
+_GLOBAL_LOCK_STREAK: dict[str, int] = {}
+_GLOBAL_LOCK_LAST_END: dict[str, float] = {}
 _NEXT_SWEEP_AT = 0.0
 _PASSWORD_VERIFY_IN_FLIGHT = 0
 
@@ -261,6 +272,8 @@ _TRACKED_KEYS_DEFAULT = 4096
 _TRACKED_KEYS_HARD_MAX = 16_384
 _PER_KEY_FAILURE_HARD_MAX = 256
 _GLOBAL_FAILURE_HARD_MAX = 4096
+# 连续命中的时长阶梯，乘在 _global_lock_seconds() 上：30s → 2min → 10min → 1h。
+_GLOBAL_LOCK_LADDER = (1, 4, 20, 120)
 _PASSWORD_VERIFY_CONCURRENCY_DEFAULT = 2
 _PASSWORD_VERIFY_CONCURRENCY_HARD_MAX = 32
 
@@ -310,6 +323,12 @@ def _global_limit_window() -> float:
 def _global_limit_max() -> int:
     return _positive_int(
         "AUTH_GLOBAL_FAIL_MAX", 64, hard_max=_GLOBAL_FAILURE_HARD_MAX)
+
+
+def _global_escalation_memory_seconds() -> float:
+    """上一次锁定结束后多久之内再打满，算「连续」。"""
+    return _positive_float("AUTH_GLOBAL_ESCALATION_MEMORY_SECONDS",
+                           _global_lock_seconds() * 20)
 
 
 def _global_lock_seconds() -> float:
@@ -394,6 +413,10 @@ def _sweep(now: float) -> None:
             _GLOBAL_FAILURES[scope] = current
         else:
             _GLOBAL_FAILURES.pop(scope, None)
+    for scope, end in list(_GLOBAL_LOCK_LAST_END.items()):
+        if now - end > _global_escalation_memory_seconds():
+            _GLOBAL_LOCK_LAST_END.pop(scope, None)
+            _GLOBAL_LOCK_STREAK.pop(scope, None)
     for scope, until in list(_GLOBAL_LOCKED_UNTIL.items()):
         if now >= until:
             _GLOBAL_LOCKED_UNTIL.pop(scope, None)
@@ -455,7 +478,18 @@ def record_failure(key: str, *, now: float | None = None) -> None:
         ]
         global_hits.append(current)
         if len(global_hits) >= _global_limit_max():
-            _GLOBAL_LOCKED_UNTIL[scope] = current + _global_lock_seconds()
+            base = _global_lock_seconds()
+            last_end = _GLOBAL_LOCK_LAST_END.get(scope)
+            streak = _GLOBAL_LOCK_STREAK.get(scope, 0)
+            if last_end is None or current - last_end > _global_escalation_memory_seconds():
+                streak = 0          # 安静够久:回到第一档
+            streak = min(streak + 1, len(_GLOBAL_LOCK_LADDER))
+            duration = base * _GLOBAL_LOCK_LADDER[streak - 1]
+            _GLOBAL_LOCK_STREAK[scope] = streak
+            _GLOBAL_LOCKED_UNTIL[scope] = current + duration
+            _GLOBAL_LOCK_LAST_END[scope] = current + duration
+            # 计数器清零是有意的：锁定期间的失败不该再累加。连续性由上面的
+            # streak 记着，所以清零不再等于「从头再来」。
             _GLOBAL_FAILURES.pop(scope, None)
         else:
             _GLOBAL_FAILURES[scope] = global_hits
@@ -488,6 +522,8 @@ def reset_for_tests() -> None:
         _TRACKED_KEYS.clear()
         _GLOBAL_FAILURES.clear()
         _GLOBAL_LOCKED_UNTIL.clear()
+        _GLOBAL_LOCK_STREAK.clear()
+        _GLOBAL_LOCK_LAST_END.clear()
         _NEXT_SWEEP_AT = 0.0
         _PASSWORD_VERIFY_IN_FLIGHT = 0
     _USERS_PRESENT = False

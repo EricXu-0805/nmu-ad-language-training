@@ -97,18 +97,27 @@ set -a
 . '$ROOT/config.env'
 set +a
 cd '$ROOT/runtime'
+# 只报**本轮**写的行。2026-08-26 链断那次,tail -5 端出来的全是 8-22 起每晚一模一样的
+# 稳态 held 项,真因(audit_anchor_check_failed)排在第 1 行、被挤出了消息。
+log_before=\$(wc -l < '$ROOT/offsite/pull.log' 2>/dev/null || echo 0)
 rc=0
 ./scripts/vps-backup-pull.sh || rc=\$?
+this_run=\$(sed -n "\$((log_before + 1)),\\\$p" '$ROOT/offsite/pull.log' 2>/dev/null || true)
+first_fail=\$(printf '%s\\n' "\$this_run" | grep -m1 ' FAIL ' || true)
+fail_count=\$(printf '%s\\n' "\$this_run" | grep -c ' FAIL ' || true)
+summary=\$(printf '%s\\n' "\$this_run" | grep -E ' (ok|partial) snapshots=' | tail -1 || true)
+detail="本轮 FAIL \${fail_count} 条。第一条:\${first_fail:-(无)}
+收尾:\${summary:-(本轮没写收尾行)}"
 if [ "\$rc" -ne 0 ]; then
   if [ -f '$ROOT/ops-webhook.env' ]; then
     if [ "\$rc" -eq 3 ]; then
       msg="异地备份卷超软配额(拉取本身成功)。看 $ROOT/offsite/pull.log 尾行,提配额或降保留。"
     elif [ "\$rc" -eq 4 ]; then
-      msg="异地备份部分完成:有快照进了 legacy/conflicts 等人工处置,其余已归档。pull.log 尾部:
-\$(tail -5 '$ROOT/offsite/pull.log' 2>/dev/null || echo '(pull.log 不可读)')"
+      msg="异地备份部分完成:有快照进了 legacy/conflicts 等人工处置,其余已归档。
+\$detail"
     else
-      msg="异地备份拉取失败 rc=\${rc}。pull.log 尾部:
-\$(tail -5 '$ROOT/offsite/pull.log' 2>/dev/null || echo '(pull.log 不可读)')"
+      msg="异地备份拉取失败 rc=\${rc}。
+\$detail"
     fi
     '$ROOT/venv/bin/python' ./scripts/notify_ops.py \\
       --env-file '$ROOT/ops-webhook.env' --message "\$msg" || true

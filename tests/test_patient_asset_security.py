@@ -110,10 +110,10 @@ def _activate_session(
 
 
 def _pair(client: TestClient, monkeypatch, *, device_id: str) -> dict[str, str]:
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     response = client.post(
         "/device/pair",
-        headers={"X-Console-Pin": "246810"},
+        headers={"X-Console-Pin": "24681024"},
         json={"deviceId": device_id},
     )
     assert response.status_code == 200, response.text
@@ -205,7 +205,7 @@ def test_asset_auth_is_capability_only_and_exact_session_bound(
 
     raw_pin = client.get(
         "/sessions/S-ASSET-A/patient-asset/current",
-        headers={"X-Console-Pin": "246810"},
+        headers={"X-Console-Pin": "24681024"},
     )
     assert raw_pin.status_code == 401
     assert raw_pin.json()["code"] == "device_pair_required"

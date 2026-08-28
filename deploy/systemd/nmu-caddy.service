@@ -2,6 +2,14 @@
 Description=Caddy TLS front for NMU platform (443 only, nginx:80 untouched)
 OnFailure=nmu-alert@%N.service
 After=network-online.target
+# Restart=always 配 RestartSec=3 时，systemd 默认的 10 秒 5 次永远够不到——
+# 3 秒一重启在窗口里最多落 4 次，单元于是永不进 failed，上面那行 OnFailure 是死的。
+# 放宽到 120 秒窗口：连续起不来 5 次就落 failed 并告警。
+# 代价说清楚：落 failed 之后不再自动拉起。但 3 秒一循环的服务本来就已经不在服务了，
+# 让人知道比让它安静地循环重要。
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
 [Service]
 User=nmu
 AmbientCapabilities=CAP_NET_BIND_SERVICE

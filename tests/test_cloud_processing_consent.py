@@ -548,14 +548,14 @@ def test_patch_requires_named_account_rejects_forged_version_and_audits_metadata
 
         anonymous = TestClient(app)
         pin = TestClient(app)
-        monkeypatch.setenv("CONSOLE_PIN", "246810")
+        monkeypatch.setenv("CONSOLE_PIN", "24681024")
         try:
             assert anonymous.patch(
                 "/patients/P-PATCH/cloud-processing", json={"allowed": True}).status_code == 401
             denied_pin = pin.patch(
                 "/patients/P-PATCH/cloud-processing", json={
                     "allowed": True, "provider_id": "forged",
-                }, headers={"X-Console-Pin": "246810"})
+                }, headers={"X-Console-Pin": "24681024"})
             assert denied_pin.status_code == 401
         finally:
             anonymous.close()

@@ -235,7 +235,7 @@ test("console ownership receipts are actually wired to the patient probe epoch",
     new URL("../patient/usePatientAutopilot.ts", import.meta.url), "utf8");
   assert.match(hookSource, /addEventListener\(PATIENT_AUTOPILOT_WAKE_EVENT/);
   assert.match(hookSource, /wakeCoordinatorRef\.current\?\.receive\(detail, sessionId\)/);
-  assert.match(hookSource, /wakeCoordinatorRef\.current\?\.consume\(\{ mode: visibleMode, probeResolved \}\)/);
+  assert.match(hookSource, /wakeCoordinatorRef\.current\?\.consume\(\{[\s\S]{0,160}mode: visibleMode, probeResolved,[\s\S]{0,160}blockedRecoverable: blockedRetryExhausted,/);
   assert.match(hookSource, /setProbeEpoch\(\(value\) => value \+ 1\)/);
   // 场次切换必须清空协调器(旧场 token 不得跨场存活)。
   assert.match(hookSource, /wakeCoordinatorRef\.current\?\.reset\(\)/);
@@ -335,4 +335,19 @@ test("live poll emitter is wired before the unchanged-seq early return, and prob
     new URL("../patient/PatientShell.tsx", import.meta.url), "utf8");
   assert.match(shellSource, /autopilot\.mode === "legacy"/);
   assert.match(shellSource, /autopilot\.mode !== "legacy"/);
+});
+
+test("blocked 里可自愈的那一档也消费唤醒——断网恢复后控制台的唤醒不再全部落空", () => {
+  const coordinator = new PatientProbeWakeCoordinator();
+  assert.equal(coordinator.receive(
+    { sessionId: SESSION_ID, stateRevision: 1 }, SESSION_ID), true);
+  // 设备侧判死的告警档:唤醒仍然留着不消费,等研究者处置。
+  assert.equal(coordinator.consume(
+    { mode: "blocked", probeResolved: true, blockedRecoverable: false }), false);
+  // 重试预算用尽 = 瞬时断网:恰好放行一次。
+  assert.equal(coordinator.consume(
+    { mode: "blocked", probeResolved: true, blockedRecoverable: true }), true);
+  // 同一个 token 只放行一次。
+  assert.equal(coordinator.consume(
+    { mode: "blocked", probeResolved: true, blockedRecoverable: true }), false);
 });

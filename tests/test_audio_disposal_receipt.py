@@ -89,10 +89,10 @@ def _seed_sessions(client: TestClient) -> None:
 
 def _pair(client: TestClient, monkeypatch, *,
           device_id: str = "disposal-device-000001") -> dict[str, str]:
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     response = client.post(
         "/device/pair",
-        headers={"X-Console-Pin": "246810"},
+        headers={"X-Console-Pin": "24681024"},
         json={"deviceId": device_id},
     )
     assert response.status_code == 200, response.text

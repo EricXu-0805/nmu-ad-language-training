@@ -1632,7 +1632,11 @@ def test_real_runtime_repeat_ledger_exports_as_metadata_only(
     assert len(score_files) == 1
     with score_files[0].open(encoding="utf-8-sig", newline="") as handle:
         score_rows = list(csv.reader(handle))
-    assert score_rows[0] == ["session_code", "subject_code", "summary", "task_type"]
+    # 表头从列契约来（2026-08-27 起），不再是按数据推出来的排序列。
+    # 结局指标各占一列，`summary` 那个 "k=v; k=v" 字符串列没有了。
+    assert score_rows[0] == list(export.SHEET_FIELDS["item_scores"])
+    assert "summary" not in score_rows[0]
+    assert "prompt_level_0" in score_rows[0]
     assert len(score_rows) == 2
     assert dict(zip(score_rows[0], score_rows[1]))["task_type"] == "单要素"
 

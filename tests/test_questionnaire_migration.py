@@ -13,7 +13,11 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
 
+# 这个文件专测量表那条迁移，靶子就是它本身，不是全仓最新头。
+# 直接 upgrade 到 "head" 会把后面的迁移也带上，于是「被拒绝的降级」
+# 变得不原子：后一条先降完了，才轮到这一条拒绝。
 HEAD = "b6d4f8a2c917"
+REPO_HEAD = "c8e5a1f3b209"
 PARENT = "6f2a9c4d8e17"
 
 
@@ -76,10 +80,11 @@ def test_upgrade_creates_both_tables_with_exact_constraints_and_roundtrips(
         tmp_path):
     db_path = tmp_path / "questionnaire-clean.sqlite"
     config = _config(db_path)
-    assert ScriptDirectory.from_config(config).get_heads() == [HEAD]
+    assert ScriptDirectory.from_config(config).get_heads() == [REPO_HEAD]
 
-    command.upgrade(config, "head")
-    command.check(config)
+    command.upgrade(config, HEAD)
+    # 这里不 check：库此刻停在中间那一版，而模型在最新头，两者本来就不一致。
+    # 「模型与库没有漂移」那条断言挪到本用例末尾、走到最新头之后再做。
     engine = create_engine(f"sqlite:///{db_path}")
     inspector = inspect(engine)
     tables = inspector.get_table_names()
@@ -124,11 +129,17 @@ def test_upgrade_creates_both_tables_with_exact_constraints_and_roundtrips(
     assert "questionnairerecord" not in tables
     assert "questionnaireitemvalue" not in tables
 
-    command.upgrade(config, "head")
-    command.check(config)
+    command.upgrade(config, HEAD)
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version")).scalar_one() == HEAD
+    # 「模型与库没有漂移」这条只有在全仓最新头上才成立——这个文件停在中间那一版，
+    # 所以最后再往前走到最新头再查一次，两件事都不放过。
+    command.upgrade(config, REPO_HEAD)
+    command.check(config)
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT version_num FROM alembic_version")).scalar_one() == REPO_HEAD
 
 
 @pytest.mark.parametrize("evidence_kind", ["record", "value"])
@@ -136,7 +147,7 @@ def test_downgrade_refuses_while_any_questionnaire_evidence_exists(
         tmp_path, evidence_kind):
     db_path = tmp_path / f"questionnaire-evidence-{evidence_kind}.sqlite"
     config = _config(db_path)
-    command.upgrade(config, "head")
+    command.upgrade(config, HEAD)
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.begin() as connection:
         _insert_record(connection)
@@ -162,7 +173,7 @@ def test_downgrade_refuses_while_any_questionnaire_evidence_exists(
 def test_database_rejects_rows_violating_the_named_constraints(tmp_path):
     db_path = tmp_path / "questionnaire-constraints.sqlite"
     config = _config(db_path)
-    command.upgrade(config, "head")
+    command.upgrade(config, HEAD)
     engine = create_engine(f"sqlite:///{db_path}")
 
     with pytest.raises(IntegrityError):

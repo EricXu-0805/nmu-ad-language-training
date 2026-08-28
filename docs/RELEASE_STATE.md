@@ -7,6 +7,20 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+> **待上线（2026-08-27 本机完成，未部署）**：审查处置批次，**含迁移
+> `b6d4f8a2c917` → `c8e5a1f3b209`**，上线脚本在收据 228。
+> ⚠️ **三个会让服务起不来的耦合，顺序不能换**：
+> ① **CONSOLE_PIN 必须先换成 8 位以上**（新代码里不合格的 PIN 直接拒绝启动；
+> 换 PIN 会让**所有现有配对码作废**，要重新发）；② 停服后迁移，起服前闸门验头；
+> ③ 备份校验器恢复指纹随头前进到 `973f314a…`，异地拉取机要重装校验器。
+> 内容：异地锚点基线重置（`--reset-baseline` + 世代边界）、告警三个死角
+> （`Restart=always` 够不到 burst 永不进 failed / os-security `|| true` 吞退出码 /
+> 无公网健康探针）、回滚与 RELEASE_STATE 改真话、四份对外文档补第四条出网路径、
+> 量表可退回未评、老人端断网自愈与「设备卡死」不再显示成暂停、导出表列契约
+> （空表也写表头、结局指标展成列、逐题明细出 JSON 列）、Patient 加四个研究协变量、
+> 量表进 `/research/v1` 两个新数据集、量表期别序号与唯一约束、删死列
+> `naming_latency_ms`、全局限速改成连续锁定阶梯、老人端绑定令牌 70 天寿命。
+>
 > **最新上线（2026-08-26 20:54 UTC）**：`ec682d3` → **`ec2d1b5`**，**零迁移热更新（后端+前端,重启）**。
 > 量表电子记录接入 ACE-III(6 页,25 项/五域/总分 100)与动物流畅性测验:新增
 > examiner_scored 题型(计分框/计数框→分档查表/闭集选项)+examiner_sum 计分(域小计
@@ -149,23 +163,32 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `08ad898`（2026-08-26 22:07 UTC 上线；同日此前 `083fa35`/`075e2c6`/`679c0e0`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 08ad898` 应输出 `MATCH … identical=89`（2026-08-26 22:07 UTC 实测通过） |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff 3ccb86d..main -- app web alembic` 应为空 |
+| 应用代码版本 | `ec2d1b5`（2026-08-26 20:54 UTC 上线；此前依次 `08ad898` → `263d0bd` → `7a80c9e` → `ec682d3`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision ec2d1b5` 应输出 `MATCH … identical=89`（2026-08-26 20:54 UTC 实测通过） |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff ec2d1b5..main -- app web alembic` 应为空 |
 | 数据库结构版本 | `b6d4f8a2c917`（2026-08-20 18:58 由 `6f2a9c4d8e17` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `79aea62e1a1ed4c6e01e` | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
-| 回滚存档 | `/opt/nmu/app-before-deploy-20260820-185806.tar.gz`（退到 `b1765c0`）；更早按 `ls -t` 逐级回退。⚠️ `…170248-语法错疑含data勿用.tar.gz` 是失败残留已改名标记，勿用 | `ls -t /opt/nmu/app-before-deploy-*.tar.gz \| head -1` |
+| 回滚存档 | ⚠️ **最新一份仍是 `app-before-deploy-20260820-185806.tar.gz`（对应 `b1765c0`）——它比当前库头旧一个迁移，直接换上去起不来服务。** 8-20 之后的 8 次上线都是「按上一基线重同步」，一份 tar 都没产生。**同结构回滚 = 从仓库按上一基线 sha 重同步，不是解 tar。** 用 tar 之前必须先核：解开后在那棵树上跑 `python -I scripts/check_database_head.py`，退 0 才准换上。⚠️ `…170248-语法错疑含data勿用.tar.gz` 是失败残留已改名标记，勿用 | 解开到临时目录后 `cd <解开处> && /opt/nmu/venv/bin/python -I scripts/check_database_head.py` |
 | 回滚锚点快照 | **跨结构**退回 `b1765c0`/`6f2a9c4d8e17` 用停写锚点 `20260820-105812`（旧头，现按 §8.1 在 `legacy-unvalidated/`），必须连**旧代码树 + 旧校验器（7d434d79…）**一起放回；同结构回退直接用最新 `daily/` 快照 |
 | 起服前闸门 | 已装（`ExecStartPre` 验库头，以 `User=nmu` 身份跑） | `systemctl cat nmu.service \| grep ExecStartPre`；journal 里 `OK database_at_head` 应在 `Started` 之前 |
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
-| 库里数据 | 1 个受试者、1 个场次、0 条云语音使用记录 | 这台机器**从未被真实使用过** |
+| 库里数据（2026-08-27 只读实查） | 3 个演示受试者档案（`demo-001` 已登记撤回、`demo-002`、`Q`）、6 个场次（`data_classification` 全是 `research`）、77 条审计、0 条量表记录 | `sqlite3 …/app.db "select count(*) from patient"` 等。**没有真实入组受试者，但这台机器已经被用过**：云 TTS / ASR / LLM 都有实际使用记录，演示场次也留了录音。原来这一行写「从未被真实使用过」——那句话曾被当成「数据可以随便重建」的依据，删掉 |
 
-最后一次只读核对：**2026-08-17 13:40（上海时间）**，方法见文首。实测到的：
-服务 `nmu` active；库头 `b3e7c5a9d214`；1 受试者 / 1 场次（这台机器仍然从未被
-真实使用过）；校验器指纹 `2d50ce0cad5f7813a5c3`（与本条表格一致）；
-连续三夜备份都是 `ok`（最新 `20260816-193921`）；`health.state` HEALTHY；
-`capacity.state` HEALTHY（用量 51.1%，剩 8.5 GB，按 1.79 MB/日估还有十年以上）；
-自动恢复演练 **2026-08-16 通过**（在 `b3e7c5a9d214` 上，`/health` 200）；
-可用内存 568 MB。
+最后一次只读核对：**2026-08-27 19:55 UTC**，方法见文首。实测到的：
+服务 `nmu` active（02:49:43 UTC 起）；库头 `b6d4f8a2c917`；3 个演示受试者 / 6 个场次；
+`preflight_check.py --require-all --os` **8 项全 PASS、退出码 0**（迁移头一致、备份新鲜度、
+53 个包逐个对上锁、安全补丁积压 0、`/health` 200、安全头齐、红线全 404、受保护路由全 401/403）；
+另有 5 个**非安全**更新待装（不计失败）；`daily/` 14 份，当夜 19:35 UTC 快照
+`20260827-193521` ok；`capacity.state` HEALTHY（58.3%，剩 7.1 GB）；可用内存 565 MB；
+`last-deploy.state` = `ec2d1b5`，与树核一致。
+
+**异地副本链（2026-08-27 修复）**：8-26 那次按收据 224 清库重建让审计链从头开始，
+锚点账里 8-07 记的 `count=12 tip` 与新链不再相等，于是**每一份后续快照**都以
+`audit_anchor_check_failed / prefix_rewritten` 失败，异地副本停在 `20260825-193551`。
+处置：`audit_anchor_check.py` 新增 `--reset-baseline <理由> --boundary <快照名>`，
+往同一本追加账里写一条 `baseline-reset` 行（旧锚点一行未删，只是不再参与比对），
+边界之前的快照只做链内校验、不做跨快照比对也不记账。重拉后
+`ok snapshots=45 pulled=1`，最新异地副本 `20260827-193521`，`conflicts/` 清零。
+详见 `~/Library/nmu-backup/offsite/AUDIT-ANCHOR-RESET-20260826.md`。
 
 ## last-deploy.state 已过期（2026-08-17 发现，未修）
 
@@ -229,7 +252,7 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**无。生产 = `08ad898` = origin/main 的最新代码提交（2026-08-26 22:07 UTC，docs 提交除外）。**
+**无。生产 = `ec2d1b5` = origin/main 的最新代码提交（2026-08-26 20:54 UTC，docs 提交除外）。**
 （2026-08-21 00:5x–01:0x 两次零迁移热更新：`70f2fec` 量表定义包勘误 v2——Eric 拍板
 修正 NPI-Q 五处笔误+SFACS 四处空格，定义按请求装载免重启；`7d70cce` 前端 UX——
 toast 底部居中+warn 8s、安排屏未完成计划前置横幅+锚点滚动、槽位 409 人话翻译。

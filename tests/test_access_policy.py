@@ -73,7 +73,7 @@ def _seed_session(client: TestClient, *, patient_id: str = "P-POLICY",
     assert cursor.status_code == 200, cursor.text
 
 
-def _pair_device(client: TestClient, *, pin: str = "246810",
+def _pair_device(client: TestClient, *, pin: str = "24681024",
                  device_id: str = "policy-device-00000001") -> dict[str, str]:
     response = client.post("/device/pair", headers={"X-Console-Pin": pin}, json={
         "deviceId": device_id,
@@ -316,9 +316,9 @@ def test_every_mutation_route_has_an_explicit_access_policy():
 
 def test_pin_is_limited_to_patient_device_workflow(policy_client, monkeypatch):
     _seed_session(policy_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setattr("app.main.tts.speak", lambda _text: (None, "null-test", False))
-    pin = {"X-Console-Pin": "246810"}
+    pin = {"X-Console-Pin": "24681024"}
 
     # 认证开启后，即使是老人端最小读口也不再允许匿名访问。
     assert policy_client.get("/live/state").status_code == 401
@@ -417,7 +417,7 @@ def test_pin_is_limited_to_patient_device_workflow(policy_client, monkeypatch):
 def test_generic_tts_account_must_own_current_live_session(
         policy_client, monkeypatch):
     _seed_session(policy_client, trainer_id="ACTOR-tts-owner")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair_device(
         policy_client, device_id="tts-owner-device-0001")
     synthesized: list[str] = []
@@ -468,7 +468,7 @@ def test_generic_tts_account_must_own_current_live_session(
 def test_non_pair_routes_never_compare_pin_or_consume_pair_limiter(
         policy_client, monkeypatch):
     _seed_session(policy_client, patient_id="P-ORACLE", session_id="S-ORACLE")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     auth.record_success("pair:testclient")
     cases = (
         ("GET", "/live/state", {}),
@@ -483,7 +483,7 @@ def test_non_pair_routes_never_compare_pin_or_consume_pair_limiter(
         baseline = policy_client.request(method, path, **kwargs)
         correct_kwargs = dict(kwargs)
         correct_headers = dict(correct_kwargs.pop("headers", {}))
-        correct_headers["X-Console-Pin"] = "246810"
+        correct_headers["X-Console-Pin"] = "24681024"
         wrong_kwargs = dict(kwargs)
         wrong_headers = dict(wrong_kwargs.pop("headers", {}))
         wrong_headers["X-Console-Pin"] = "000000"
@@ -515,8 +515,8 @@ def test_pin_device_is_scoped_to_current_live_session(policy_client, monkeypatch
         "phase_type": "正式训练", "event_line": "正式训练",
         "item_bank_version_id": "wk2-v1-20260707", "is_simulation": True,
     }).status_code == 200
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
-    pin = {"X-Console-Pin": "246810"}
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    pin = {"X-Console-Pin": "24681024"}
     capability = _pair_device(
         policy_client, device_id="current-device-0000001")
 
@@ -678,7 +678,7 @@ def test_named_account_and_role_allowlist_matrix(policy_client):
 def test_expired_cookie_plus_valid_pin_still_requests_account_login(policy_client, monkeypatch):
     _seed_session(policy_client)
     _add_user(policy_client.test_engine, "expired", "researcher")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     response = policy_client.post("/auth/login", json={
         "username": "expired", "password": "password1",
     })
@@ -691,7 +691,7 @@ def test_expired_cookie_plus_valid_pin_still_requests_account_login(policy_clien
         session.commit()
 
     denied = policy_client.get(
-        "/patients", headers={"X-Console-Pin": "246810"})
+        "/patients", headers={"X-Console-Pin": "24681024"})
     assert denied.status_code == 401
     assert denied.json()["code"] == "account_required"
 
@@ -849,7 +849,7 @@ def test_protected_accounts_can_only_recover_existing_exact_audio_facts(
         policy_client, monkeypatch):
     """Owner/admin supervision cannot manufacture a raw id or first voice blob."""
     _seed_session(policy_client, trainer_id="ACTOR-audio-owner")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair_device(
         policy_client, device_id="account-audio-boundary-0001")
     eng = policy_client.test_engine
@@ -963,7 +963,7 @@ def test_single_operator_blocks_second_researcher_and_admin_supervision_is_audit
         "trainer_id": "ACTOR-b",
     }).status_code == 200
 
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     _pair_device(policy_client, device_id="operator-a-device-0001")
 
     eng = policy_client.test_engine

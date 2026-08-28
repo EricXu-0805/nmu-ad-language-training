@@ -6,7 +6,9 @@ from app import export_security, research_dataset as rd
 
 def test_registry_is_self_consistent():
     assert rd.registry_self_check() == []
-    assert rd.dataset_keys() == ("subjects", "sessions", "turns")
+    assert rd.dataset_keys() == (
+        "subjects", "sessions", "turns",
+        "questionnaire_records", "questionnaire_item_values")
 
 
 def test_every_forbidden_column_is_documented_but_never_published():

@@ -6,6 +6,7 @@ import { PATIENT_ACTIVATION_EVENT } from "../sync/messages";
 import { useLiveCursor } from "../sync/useLiveCursor";
 import { usePatientHeartbeat } from "../sync/usePatientHeartbeat";
 import type { PatientPresenceScreen } from "../types";
+import { autopilotPresenceScreen } from "./patientPresenceScreen.ts";
 import { isSessionTerminalStatus } from "../sessionLifecycle";
 import { Centered } from "./Centered";
 import {
@@ -401,12 +402,11 @@ export function PatientShell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.sessionId, session?.weekNo, session?.eventLine, session?.mode, terminal, autopilot.mode]);
 
-  const autopilotScreen: PatientPresenceScreen = autopilot.runtime?.phase === "recording"
-    || autopilot.runtime?.phase === "record_ready" ? "record"
-    : autopilot.runtime?.phase === "tts_playing" || autopilot.runtime?.phase === "tts_ready"
-      ? "present"
-      : autopilot.runtime?.phase === "paused" || autopilot.mode === "blocked"
-        ? "paused" : "waiting";
+  const autopilotScreen: PatientPresenceScreen = autopilotPresenceScreen({
+    runtimePhase: autopilot.runtime?.phase,
+    mode: autopilot.mode,
+    blockedCalm: autopilot.blockedCalm,
+  });
   const currentScreen: PatientPresenceScreen = !session
     ? "waiting"
     : terminal

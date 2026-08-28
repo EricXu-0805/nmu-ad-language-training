@@ -84,7 +84,7 @@ def _switch_live(client: TestClient, session_id: str) -> None:
 
 
 def _pair(client: TestClient, device_id: str) -> tuple[dict[str, str], dict]:
-    response = client.post("/device/pair", headers={"X-Console-Pin": "246810"}, json={
+    response = client.post("/device/pair", headers={"X-Console-Pin": "24681024"}, json={
         "deviceId": device_id,
     })
     assert response.status_code == 200, response.text
@@ -135,7 +135,7 @@ def _register_and_upload(client: TestClient, capability: dict[str, str], raw_id:
 def test_pair_hashes_token_and_switch_back_never_reactivates_old_capability(
         capability_client, monkeypatch):
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     first_headers, first = _pair(capability_client, "device-capability-000001")
 
     with Session(capability_client.test_engine) as session:
@@ -187,7 +187,7 @@ def test_pair_hashes_token_and_switch_back_never_reactivates_old_capability(
 def test_stalled_staging_does_not_block_delete_or_resurrect_voice(
         capability_client, monkeypatch):
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     # Concurrency-only test: immutable export authority has dedicated API tests.
     monkeypatch.setattr(
@@ -254,7 +254,7 @@ def test_stalled_staging_does_not_block_delete_or_resurrect_voice(
 def test_terminal_audio_receipt_returns_disposition_but_blob_upload_stays_rejected(
         capability_client, monkeypatch):
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability, _ = _pair(capability_client, "device-terminal-000001")
     _registration, content, uploaded = _register_and_upload(
         capability_client, capability, "terminal-audio")
@@ -295,7 +295,7 @@ def test_terminal_audio_receipt_returns_disposition_but_blob_upload_stays_reject
 def test_explicit_bad_or_recovery_capability_never_falls_back_to_account(
         capability_client, monkeypatch):
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     active, _ = _pair(capability_client, "device-deputy-0000001")
     assert capability_client.post("/audio", headers=active, json={
         "raw_audio_id": "deputy-unuploaded",
@@ -346,7 +346,7 @@ def test_explicit_bad_or_recovery_capability_never_falls_back_to_account(
 def test_successful_upload_then_admin_delete_ends_deleted_with_no_physical_blob(
         capability_client, monkeypatch):
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     monkeypatch.setattr(
         main_module, "_require_authoritative_export_copy", lambda *_args: None)
@@ -371,7 +371,7 @@ def test_successful_upload_then_admin_delete_ends_deleted_with_no_physical_blob(
 def test_audio_saved_receipt_and_delete_are_raw_id_linearized(
         capability_client, monkeypatch):
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     monkeypatch.setattr(
         main_module, "_require_authoritative_export_copy", lambda *_args: None)
@@ -479,7 +479,7 @@ def test_create_audio_and_audio_saved_obey_global_lock_order_under_barrier(
     deterministically instead of leaving two test workers deadlocked.
     """
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability, _ = _pair(capability_client, "device-lock-order-0001")
     _registration, _content, uploaded = _register_and_upload(
         capability_client, capability, "lock-order-receipt")
@@ -610,7 +610,7 @@ def test_create_audio_and_audio_saved_obey_global_lock_order_under_barrier(
 def test_baseexception_after_publish_removes_uncommitted_voice_bytes(
         capability_client, monkeypatch):
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability, _ = _pair(capability_client, "device-cancel-0000001")
     created = capability_client.post("/audio", headers=capability, json={
         "raw_audio_id": "cancel-after-publish",
@@ -653,7 +653,7 @@ def test_baseexception_after_publish_removes_uncommitted_voice_bytes(
 def test_audio_rollback_cleanup_exception_logs_only_stable_code(
         capability_client, monkeypatch, capsys):
     _seed_two_sessions(capability_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability, _ = _pair(capability_client, "device-log-privacy-0001")
     raw_id = "raw-audio-sentinel-0001"
     created = capability_client.post("/audio", headers=capability, json={

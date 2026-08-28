@@ -94,7 +94,7 @@ def _seed_two_sessions_at_first_turn(client: TestClient) -> None:
 def _pair(client: TestClient, device_id: str) -> dict[str, str]:
     response = client.post(
         "/device/pair",
-        headers={"X-Console-Pin": "246810"},
+        headers={"X-Console-Pin": "24681024"},
         json={"deviceId": device_id},
     )
     assert response.status_code == 200, response.text
@@ -194,7 +194,7 @@ def _database_snapshot(engine) -> dict:
 def test_patient_rec_failure_schema_is_strict_and_atomic(
         failure_client, monkeypatch, payload_patch):
     _seed_two_sessions_at_first_turn(failure_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair(failure_client, "device-mic-schema-00001")
     payload = {
         "active": False,
@@ -215,7 +215,7 @@ def test_patient_rec_failure_schema_is_strict_and_atomic(
 def test_first_failure_pauses_once_and_replays_are_pure_acks(
         failure_client, monkeypatch):
     _seed_two_sessions_at_first_turn(failure_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair(failure_client, "device-mic-failure-0001")
     before = _database_snapshot(failure_client.test_engine)
 
@@ -341,7 +341,7 @@ def test_first_failure_pauses_once_and_replays_are_pure_acks(
 def test_failure_rejects_stale_turn_cross_session_and_terminal_runtime(
         failure_client, monkeypatch):
     _seed_two_sessions_at_first_turn(failure_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     capability = _pair(failure_client, "device-mic-reject-00001")
     before = _database_snapshot(failure_client.test_engine)
 
@@ -372,7 +372,7 @@ def test_failure_rejects_stale_turn_cross_session_and_terminal_runtime(
 def test_failure_rejects_recovery_only_and_revoked_device_generations(
         failure_client, monkeypatch):
     _seed_two_sessions_at_first_turn(failure_client)
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     old = _pair(failure_client, "device-mic-generation-01")
 
     replacement = _pair(failure_client, "device-mic-generation-02")

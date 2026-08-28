@@ -113,6 +113,16 @@ REPLAY_REQUIRES_REPEAT_BINDING_CHECK = (
 class Patient(SQLModel, table=True):
     __table_args__ = (
         CheckConstraint(
+            "sex IS NULL OR sex IN ('男','女','其他','未记录')",
+            name="ck_patient_sex"),
+        CheckConstraint(
+            "birth_year IS NULL OR (birth_year >= 1900 AND birth_year <= 2100)",
+            name="ck_patient_birth_year"),
+        CheckConstraint(
+            "education_years IS NULL OR "
+            "(education_years >= 0 AND education_years <= 30)",
+            name="ck_patient_education_years"),
+        CheckConstraint(
             "governance_revision >= 0",
             name="ck_patient_governance_revision_nonnegative"),
     )
@@ -147,6 +157,13 @@ class Patient(SQLModel, table=True):
     withdrawal_status: Optional[str] = None
     ethics_approval_no: Optional[str] = None
     registration_no: Optional[str] = None
+    # 研究协变量（Eric 2026-08-27 拍板）。没有它们，「训练前后量表变化、年龄与
+    # 受教育年限做协变量」这张表结构上做不出来——不是拉不到数，是拉到的数不能用，
+    # 而且要等统计那天才发现。出生年而非出生日期：绝对日期不进任何导出面。
+    birth_year: Optional[int] = None
+    sex: Optional[str] = None                 # '男' / '女' / '其他' / '未记录'
+    education_years: Optional[int] = None
+    study_arm: Optional[str] = None           # 分组标签，现在可空
 
 
 class PatientWithdrawalEvent(SQLModel, table=True):
@@ -454,7 +471,9 @@ class TurnEvent(SQLModel, table=True):
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     duration_seconds: Optional[float] = None
-    naming_latency_ms: Optional[int] = None
+    # naming_latency_ms 于 2026-08-27 删除：建表以来零写入点，恒为 None，
+    # 却在被喂给量表 AI 初评当证据。真要做反应时，先定「潜伏期从哪一刻起算」，
+    # 再连同写入路径与迁移一起加回来。历史库里那一列由迁移保留、不再读。
     # 提示/线索
     prompt_level: Optional[int] = None
     cue_type: Optional[str] = None
@@ -1264,7 +1283,10 @@ class QualityReleaseEpochRowSnapshot(SQLModel, table=True):
             "epoch_id", "dataset_key", "row_ordinal",
             name="uq_quality_release_epoch_row_snapshot_ordinal"),
         CheckConstraint(
-            "dataset_key IN ('subjects','sessions','turns')",
+            # 闭集随注册表一起前进。2026-08-27 加入两张量表表：加数据集必须同时
+            # 改这里和一个迁移，否则冻结纪元写不进去——这道闸就是干这个用的。
+            "dataset_key IN ('subjects','sessions','turns',"
+            "'questionnaire_records','questionnaire_item_values')",
             name="ck_quality_release_epoch_row_snapshot_dataset_closed"),
         CheckConstraint(
             "row_ordinal >= 1",
@@ -3044,6 +3066,15 @@ class QuestionnaireRecord(SQLModel, table=True):
         CheckConstraint(
             "phase_label IN ('前测','后测','随访','其他')",
             name="ck_questionnaire_record_phase_label"),
+        CheckConstraint(
+            "phase_ordinal >= 1", name="ck_questionnaire_record_phase_ordinal"),
+        CheckConstraint(
+            "superseded_by_ordinal IS NULL OR "
+            "superseded_by_ordinal > phase_ordinal",
+            name="ck_questionnaire_record_supersede_forward"),
+        UniqueConstraint(
+            "patient_id", "questionnaire_id", "phase_label", "phase_ordinal",
+            name="uq_questionnaire_record_phase_slot"),
     )
     record_id: str = Field(primary_key=True)
     patient_id: str = Field(foreign_key="patient.patient_id", index=True)
@@ -3063,6 +3094,13 @@ class QuestionnaireRecord(SQLModel, table=True):
     computed_flag: Optional[str] = None
     scoring_rule_id: Optional[str] = None
     note: Optional[str] = None                    # 施测备注（自由文本，永不进导出）
+    # 同一位受试者、同一份量表、同一期别可以有多条记录——手册规定的改错方式正是
+    # 「新建一条正确的，在备注里说明」。而备注永不进导出，record_id 是随机串、
+    # 导出还按它排序，于是导出里出现两行同为「前测」、总分一个 32 一个 41，
+    # 分析脚本取 first 或 max 都可能取到作废那条，从数据本身永远发现不了。
+    # phase_ordinal 是同组内单调递增的序号；superseded_by_ordinal 指向作废它的那条。
+    phase_ordinal: int = 1
+    superseded_by_ordinal: Optional[int] = None
 
 
 @sa_event.listens_for(QuestionnaireRecord, "before_update")

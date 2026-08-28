@@ -183,7 +183,7 @@ def test_prompt_is_portrait_free_by_construction():
 
 # ---------------- 老人端设备 PIN 门 ----------------
 def test_pin_gate_blocks_writes_allows_reads(client, monkeypatch):
-    pin = {"X-Console-Pin": "246810"}
+    pin = {"X-Console-Pin": "24681024"}
     # 先在本地开放模式建立测试场次，然后开启 PIN 模拟独立老人端。
     assert client.post("/patients", json={"patient_id": "PP", "consent_status": "已同意",
                                            "consent_type": "本人同意",
@@ -205,7 +205,7 @@ def test_pin_gate_blocks_writes_allows_reads(client, monkeypatch):
     }})
     assert cursor.status_code == 200, cursor.text
 
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     assert client.get("/health").status_code == 200
     assert client.get("/live/state").status_code == 401
     direct_pin = client.get("/live/state", headers=pin)

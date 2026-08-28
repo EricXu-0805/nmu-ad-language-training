@@ -45,7 +45,7 @@ def withdrawal_clients(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(app_db, "engine", engine)
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "246810")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
     monkeypatch.setenv("ENABLE_AUDIO_DELETE", "1")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
@@ -850,7 +850,7 @@ def test_withdrawal_migration_fresh_check_and_parent_roundtrip(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version")).scalar_one() == (
-                "b6d4f8a2c917")
+                "c8e5a1f3b209")
 
     command.downgrade(config, "f2b7d4e9a106")
     inspector = inspect(engine)

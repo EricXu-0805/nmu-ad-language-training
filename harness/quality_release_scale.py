@@ -964,11 +964,16 @@ def _run_in_root(root: Path, profile: ScaleProfile) -> dict[str, Any]:
                     epoch_id = epoch.epoch_id
                     session.commit()
 
+                # 这套 harness 只造训练侧的数据，不造量表记录——所以量表那两张表
+                # 期望是 0 行。写成「注册表里其余的都期望 0」，加数据集时不用再改这里，
+                # 而一旦某天 harness 真开始造量表数据，它会立刻红出来。
                 expected_snapshot = {
+                    key: 0 for key in research_dataset.dataset_keys()}
+                expected_snapshot.update({
                     "subjects": profile.subject_count,
                     "sessions": profile.session_count,
                     "turns": profile.expected_turn_rows,
-                }
+                })
                 snapshot_counts = {
                     key: manifest["datasets"][key]["row_count"]
                     for key in research_dataset.dataset_keys()

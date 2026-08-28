@@ -1,0 +1,12 @@
+[Unit]
+Description=Probe the public /health every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+# 定时器错过的那次要补跑：机器睡过去再醒来时，最该知道的就是站点还在不在。
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

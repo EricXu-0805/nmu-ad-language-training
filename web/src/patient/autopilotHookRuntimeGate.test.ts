@@ -156,6 +156,7 @@ test("D5①:session.paused 真→假的权威下降沿,在 server-终态或 bloc
     mode: "server" as const,
     runtimePhase: "paused" as const,
     blockedCalm: false,
+    blockedRetryExhausted: false,
   };
   assert.equal(shouldReprobeAfterServerResume(base), true);
   assert.equal(shouldReprobeAfterServerResume({
@@ -190,4 +191,34 @@ test("D5① 源码接线守卫:usePatientAutopilot 用 serverPaused 下降沿消
   const shellPath = join(dirname(fileURLToPath(import.meta.url)), "PatientShell.tsx");
   const shell = readFileSync(shellPath, "utf8");
   assert.match(shell, /serverPaused: session\?\.paused === true/);
+});
+
+// 「重试预算耗尽」是唯一没有自愈路径的 blocked,而它恰恰是最纯粹的瞬时断网:
+// 退避 1.5+3+6+12+15 = 37.5 秒累计连不上服务器就会落进来。网络 10 秒后恢复、
+// 服务端一切正常,控制台继续发唤醒,一次都消费不掉——老人端就这么停在那里。
+// 重探只是一次读:探得通就回到 live 游标平面,探不通仍然 fail-closed 停在原地。
+test("D5②:重试预算耗尽的 blocked 也放行一次重探——这是断网恢复唯一的自愈路", () => {
+  const base = {
+    previousServerPaused: true, serverPaused: false,
+    mode: "blocked" as const, runtimePhase: null,
+  };
+  assert.equal(shouldReprobeAfterServerResume(
+    { ...base, blockedCalm: false, blockedRetryExhausted: true }), true);
+  // 平静档照旧放行。
+  assert.equal(shouldReprobeAfterServerResume(
+    { ...base, blockedCalm: true, blockedRetryExhausted: false }), true);
+  // 既不平静也没耗尽 = 设备侧判死的告警档,仍然留给研究者处置,不自动醒。
+  assert.equal(shouldReprobeAfterServerResume(
+    { ...base, blockedCalm: false, blockedRetryExhausted: false }), false);
+  // 下降沿这个前提不变:没有「暂停真→假」就不重探。
+  assert.equal(shouldReprobeAfterServerResume(
+    { ...base, previousServerPaused: false, blockedCalm: false,
+      blockedRetryExhausted: true }), false);
+});
+
+test("D5② 源码接线守卫:usePatientAutopilot 真的把 blockedRetryExhausted 喂进那个闸", () => {
+  const source = readFileSync(
+    new URL("./usePatientAutopilot.ts", import.meta.url), "utf8");
+  assert.match(source, /blockedRetryExhausted/);
+  assert.match(source, /shouldReprobeAfterServerResume\(\{[\s\S]{0,400}blockedRetryExhausted/);
 });

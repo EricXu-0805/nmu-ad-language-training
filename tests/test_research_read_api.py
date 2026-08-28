@@ -37,6 +37,8 @@ from app.models import (
     Session as TrainSession,
     SessionRuntimeState,
     TurnEvent,
+    QuestionnaireItemValue,
+    QuestionnaireRecord,
 )
 
 
@@ -69,12 +71,10 @@ def _snapshot_rows(session: Session, session_ids: tuple[str, ...]):
     binding = _LiveSnapshotBinding(session_ids)
     datasets: dict[str, dict] = {}
     frozen_rows: list[tuple[str, int, str, str]] = []
-    readers = {
-        "subjects": research_read.list_subjects,
-        "sessions": research_read.list_sessions,
-        "turns": research_read.list_turns,
-    }
-    for dataset_key, reader in readers.items():
+    # 用生产那张权威表，别在测试里再抄一份：抄的那份不会跟着新数据集走，
+    # 于是纪元少冻两张表，而报出来的样子是别的数据集 503。
+    for dataset_key in research_read.READERS:
+        reader = research_read.reader_for(dataset_key)
         cursor = None
         rows: list[dict] = []
         while True:
@@ -193,7 +193,7 @@ def research_env(monkeypatch):
                            poolclass=StaticPool)
     monkeypatch.setattr(db, "engine", engine)
     monkeypatch.setenv("REQUIRE_AUTH", "1")
-    monkeypatch.setenv("CONSOLE_PIN", "135790")
+    monkeypatch.setenv("CONSOLE_PIN", "13579024")
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
         for username, display_id, role in (
@@ -239,6 +239,22 @@ def research_env(monkeypatch):
             asr_text=SECRET_TEXT, confirmed_response_text=SECRET_TEXT,
             asr_confidence=0.9, prompt_level=0, ai_score=1.0,
             reviewed_score=1.0, score_locked=True, judge_portrait_used=False))
+        session.commit()
+        # 两位受试者各一份已锁定的量表记录：撤回者那份必须变成墓碑，
+        # 而没有真行的话「每个数据集都有 withdrawn 布尔列」那条断言会空转。
+        for patient_id, record_id in (("P-REAL-1", "qr_real_1"),
+                                      ("P-GONE-1", "qr_gone_1")):
+            session.add(QuestionnaireRecord(
+                record_id=record_id, patient_id=patient_id,
+                questionnaire_id="gds15_v1", definition_sha256="d" * 64,
+                phase_label="前测", status="locked", created_by="RESEARCHER",
+                locked_by="RESEARCHER", locked_at=datetime(2026, 8, 1),
+                computed_total=4.0, cutoff_met=False,
+                scoring_rule_id="gds15-sum", note=SECRET_TEXT))
+            session.add(QuestionnaireItemValue(
+                record_id=record_id, item_key="q1", field_key="value",
+                final_value="1", value_source="human_direct",
+                ai_draft_rationale=SECRET_TEXT))
         session.commit()
 
     # 研究分区的行面绑在冻结纪元上：不切纪元就一行也读不到。默认 fixture 把这
