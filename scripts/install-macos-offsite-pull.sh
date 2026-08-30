@@ -205,11 +205,15 @@ if [ "$(job_state)" = "running" ]; then
   exit 1
 fi
 
-status=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
+# 变量名不能叫 status：zsh 里 $status 是 $? 的只读别名，赋值当场
+# "read-only variable: status" 退 1。shebang 虽然写的是 bash，但人是照着 runbook
+# 敲 `zsh 这个脚本` 的——2026-08-29 的迁移窗口里就这么报了一次假失败：安装其实
+# 全做完了，只有最后这段「报告 launchd 退出码」没跑到，而退出码 1 让人以为没装上。
+last_exit=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
   | awk -F'= ' '/last exit code/{print $2; exit}')
-echo "launchd 上次退出码: ${status:-未知}"
+echo "launchd 上次退出码: ${last_exit:-未知}"
 tail -3 "$ROOT/offsite/pull.log" 2>/dev/null || echo "(还没有 pull.log)"
-case "${status:-1}" in
+case "${last_exit:-1}" in
   0) echo "异地拉取这条路已经跑通，每天 12:30 自动执行。" ;;
   # 退出码 4 = 拉取本身成功，但有快照进了 legacy/conflicts 等人工处置。
   # 迁移头一前进，升级前拍的所有快照都会一次性变成这个状态——那是设计。

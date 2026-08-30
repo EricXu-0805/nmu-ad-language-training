@@ -49,6 +49,30 @@ def test_script_itself_parses(script: Path):
     assert result.returncode == 0, f"{script.name} 语法不合法：{result.stderr.strip()}"
 
 
+# zsh 里这些名字是只读或有特殊语义的：赋值要么当场报 "read-only variable"，
+# 要么把 shell 自己的状态改掉。这些脚本的 shebang 是 bash，但 runbook 里写的是
+# `zsh <脚本>`，人就真的这么敲——2026-08-29 的迁移窗口里 `status=` 让安装器在
+# 最后一步退 1，看起来像没装上，其实只有「报告 launchd 退出码」那段没跑到。
+_ZSH_HOSTILE_NAMES = ("status", "argv", "pipestatus", "options", "functions",
+                      "path", "cdpath", "fignore", "histchars")
+_ASSIGNS = re.compile(
+    r"(?m)^\s*(?:local\s+|export\s+|readonly\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=")
+
+
+@pytest.mark.parametrize("script", SHELL_SCRIPTS, ids=lambda p: p.name)
+def test_no_script_assigns_to_a_name_zsh_treats_as_special(script: Path):
+    offenders = []
+    for lineno, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1):
+        if line.strip().startswith("#"):
+            continue
+        match = _ASSIGNS.match(line)
+        if match and match.group("name") in _ZSH_HOSTILE_NAMES:
+            offenders.append(f"{script.name}:{lineno}: {match.group('name')}=")
+    assert not offenders, (
+        "这些名字在 zsh 里是只读或特殊变量，`zsh <脚本>` 会当场炸或改坏 shell 状态；"
+        "换个名字（last_exit / args / rc_list …）：\n" + "\n".join(offenders))
+
+
 def test_the_generated_offsite_runner_also_parses():
     """安装器用 heredoc 拼出 run-pull.sh，模板改坏了到真跑才发现。"""
     installer = SCRIPTS / "install-macos-offsite-pull.sh"

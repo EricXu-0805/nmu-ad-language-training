@@ -140,7 +140,10 @@ fi
 HARNESS_ROOT=""
 SERVER_PID=""
 cleanup() {
-  status=$?
+  # 不叫 status：zsh 里 $status 是 $? 的只读别名，赋值当场报 read-only。
+  # 这一行在 EXIT trap 的第一句，`zsh <脚本>` 时**每次退出（含 Ctrl+C）都会炸在
+  # 这里**，临时库与 uvicorn 进程可能留一半没清。
+  cleanup_rc=$?
   trap - EXIT
   # 清理期间忽略第二次 Ctrl+C/TERM/HUP，避免留下半清理的临时数据库。
   trap '' INT TERM HUP
@@ -176,7 +179,7 @@ cleanup() {
         ;;
     esac
   fi
-  exit "$status"
+  exit "$cleanup_rc"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
