@@ -1889,7 +1889,11 @@ def test_locked_questionnaire_record_exports_two_joined_deidentified_sheets(
     assert set(record_row) == {
         "subject_code", "record_code", "questionnaire_id", "definition_sha256",
         "phase_label", "status", "ai_draft_status", "ai_draft_engine",
-        "computed_total", "cutoff_met", "computed_flag", "scoring_rule_id"}
+        "computed_total", "cutoff_met", "computed_flag", "scoring_rule_id",
+        # 同期别重测的两列：作废那行同样带总分，不发这两列分析者就只能猜。
+        "phase_ordinal", "superseded_by_ordinal"}
+    assert record_row["phase_ordinal"] == 1
+    assert record_row["superseded_by_ordinal"] is None
     assert record_row["subject_code"] == pseudonymize("P77")
     assert re.fullmatch(
         r"QREC-v1-test-2026-[0-9a-f]{20}", record_row["record_code"])

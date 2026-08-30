@@ -137,3 +137,15 @@ def test_the_dead_latency_column_is_gone_everywhere():
     assert not offenders, (
         "naming_latency_ms 没有任何写入点，是死列；还留在：" + ", ".join(offenders)
         + "。真要做反应时，先和钱凯定「潜伏期从哪一刻起算」，再连同写入路径一起加。")
+
+
+def test_the_questionnaire_sheet_says_which_row_is_the_one_that_counts():
+    """同一期别可能有两行，而作废那行同样带总分。
+
+    只发 `computed_total` 不发序号与取代指针，拿导出包的人就只能靠 `record_code`
+    （随机串）或创建时间猜——那正是加唯一约束要消除的那种猜。
+    """
+    cols = export.SHEET_FIELDS["questionnaire_records"]
+    assert "phase_ordinal" in cols and "superseded_by_ordinal" in cols, (
+        "量表记录表必须同时带序号与取代指针，否则分析者分不清哪条作数")
+    assert cols.index("phase_ordinal") < cols.index("superseded_by_ordinal")

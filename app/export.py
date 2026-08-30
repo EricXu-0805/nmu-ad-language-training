@@ -1361,6 +1361,10 @@ def export_session_bundle(
         "questionnaire_id": record.questionnaire_id,
         "definition_sha256": record.definition_sha256,
         "phase_label": record.phase_label,
+        # 同期别重测的两列。不发出去，拿导出包的人就分不清同为「前测」的两行
+        # 哪条作数——而作废那条同样带总分，正是最容易被取错的一行。
+        "phase_ordinal": record.phase_ordinal,
+        "superseded_by_ordinal": record.superseded_by_ordinal,
         "status": record.status,
         "ai_draft_status": record.ai_draft_status,
         "ai_draft_engine": record.ai_draft_engine,
@@ -2121,6 +2125,7 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         "record_code", "questionnaire_id", "phase_label", "status",
         "definition_sha256", "scoring_rule_id", "computed_total",
         "cutoff_met", "computed_flag", "ai_draft_status", "ai_draft_engine",
+        "phase_ordinal", "superseded_by_ordinal",
     ),
     "questionnaire_item_values": (
         "record_code", "item_key", "field_key", "final_value",
