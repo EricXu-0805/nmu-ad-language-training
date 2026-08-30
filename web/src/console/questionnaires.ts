@@ -3,6 +3,24 @@
 // 测试一律用微型假定义。多一键或少一键的响应整包拒收,绝不静默放行。
 
 export const QUESTIONNAIRE_CATALOG_SCHEMA = "questionnaire-catalog.v1";
+/** 同期别重测的一句话说明。只有一次施测时返回 null——别在界面上写「第 1 次」。
+ *
+ * 没有这句话，控制台上两条同为「前测」的记录长得一模一样，研究者只能靠创建时间猜
+ * 哪条作数；而作废那条同样带总分，正是导出里最容易被统计脚本取错的那一行。
+ */
+export function questionnaireRetakeNote(record: {
+  phase_ordinal: number;
+  superseded_by_ordinal: number | null;
+}): string | null {
+  if (record.superseded_by_ordinal !== null) {
+    return `第 ${record.phase_ordinal} 次施测 · 已被第 ${record.superseded_by_ordinal} 次取代，不作数`;
+  }
+  if (record.phase_ordinal > 1) {
+    return `第 ${record.phase_ordinal} 次施测 · 当前作数的一条`;
+  }
+  return null;
+}
+
 export const QUESTIONNAIRE_RECORD_SCHEMA = "questionnaire-record.v1";
 export const QUESTIONNAIRE_RECORD_LIST_SCHEMA = "questionnaire-record-list.v1";
 export const QUESTIONNAIRE_DEFINITION_SCHEMA = "questionnaire-definition.v1";
@@ -174,6 +192,10 @@ export interface QuestionnaireRecord {
   questionnaire_id: string;
   definition_sha256: string;
   phase_label: QuestionnairePhaseLabel;
+  /** 同一期别第几次施测（1 起）。同槽位再建一条 = 序号 +1。 */
+  phase_ordinal: number;
+  /** 被第几次取代；null = 这条就是当前作数的那条。 */
+  superseded_by_ordinal: number | null;
   status: "draft" | "locked";
   created_by: string;
   created_at: string;
@@ -237,7 +259,7 @@ const RECORD_KEYS = [
   "definition_sha256", "phase_label", "status", "created_by", "created_at",
   "locked_by", "locked_at", "ai_draft_status", "ai_draft_engine", "ai_draft_at",
   "computed_total", "cutoff_met", "computed_flag", "scoring_rule_id",
-  "note", "values",
+  "note", "values", "phase_ordinal", "superseded_by_ordinal",
 ] as const;
 const VALUE_SLOT_KEYS = [
   "item_key", "field_key", "ai_draft_value", "ai_draft_rationale",
@@ -739,6 +761,9 @@ export function parseQuestionnaireRecord(
     questionnaire_id: stringValue(row, "questionnaire_id", label),
     definition_sha256: sha256Value(row, "definition_sha256", label),
     phase_label: enumValue(row, "phase_label", QUESTIONNAIRE_PHASE_LABELS, label),
+    phase_ordinal: integerValue(row, "phase_ordinal", label, 1),
+    superseded_by_ordinal: nullableIntegerValue(
+      row, "superseded_by_ordinal", label, 1),
     status: enumValue(row, "status", ["draft", "locked"] as const, label),
     created_by: stringValue(row, "created_by", label),
     created_at: stringValue(row, "created_at", label),
@@ -763,6 +788,10 @@ export function parseQuestionnaireRecord(
   }
   if (record.status === "locked" && (record.locked_by === null || record.locked_at === null)) {
     throw new Error(`${label}:锁定态必须带锁定人与锁定时间`);
+  }
+  if (record.superseded_by_ordinal !== null
+      && record.superseded_by_ordinal <= record.phase_ordinal) {
+    throw new Error(`${label}:取代它的那次序号必须比自己大`);
   }
   const slots = record.values.map((slot) => questionnaireSlotKey(slot.item_key, slot.field_key));
   if (new Set(slots).size !== slots.length) {

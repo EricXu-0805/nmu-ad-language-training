@@ -681,3 +681,62 @@ def test_patient_registration_rejects_non_ascii_research_code(api_env):
     accepted = client.post("/patients", json={
         "patient_id": "TEST-OK-01", "name": "x"})
     assert accepted.status_code == 200, accepted.text
+
+
+# ---------------- G. 同期别重测：唯一约束 + 取代记账 ----------------
+# 2026-08-30 上线后自查发现的回归。加 `uq_questionnaire_record_phase_slot`
+# 的初衷是对的（导出里两行同为「前测」、总分一个 32 一个 41，分析脚本取 first
+# 或 max 都可能取到作废那条），但 `phase_ordinal` 恒为 1 且接口改不了，于是
+# **手册明写的改错方式「新建一条正确的，在备注里说明」被堵死**，第二次建记录
+# 直接撞 IntegrityError 变成没人处理的 500。
+# 约束保留，重做的路补上：同槽位再建一条 = 序号 +1，并把上一条标成被它取代。
+
+
+def _record_row(engine, record_id: str) -> QuestionnaireRecord:
+    with Session(engine) as session:
+        row = session.get(QuestionnaireRecord, record_id)
+        assert row is not None
+        session.expunge(row)
+        return row
+
+
+def test_a_second_record_in_the_same_phase_slot_supersedes_the_locked_first(api_env):
+    client = _client("research-a")
+    first = _lock_gds_record(client, "否")
+    second = _create_record(client, "P-Q1", "gds15_v1")
+
+    assert second["phase_ordinal"] == 2, "同槽位第二条应当是第 2 次"
+    assert second["superseded_by_ordinal"] is None, "最新一条不该被标成已取代"
+    assert _record_row(api_env, first["record_id"]).superseded_by_ordinal == 2, (
+        "上一条必须留下「被第 2 次取代」的记账，否则分析者只能靠猜")
+
+
+def test_the_third_attempt_supersedes_only_the_one_that_was_live(api_env):
+    client = _client("research-a")
+    first = _lock_gds_record(client, "否")
+    second = _create_record(client, "P-Q1", "gds15_v1")
+    third = _create_record(client, "P-Q1", "gds15_v1")
+
+    assert third["phase_ordinal"] == 3
+    assert _record_row(api_env, second["record_id"]).superseded_by_ordinal == 3
+    assert _record_row(api_env, first["record_id"]).superseded_by_ordinal == 2, (
+        "第一条的取代指针不该被后来的重测改写——它指的是「谁接替了我」")
+
+
+def test_a_different_phase_label_starts_its_own_numbering(api_env):
+    client = _client("research-a")
+    _lock_gds_record(client, "否")
+    other = _create_record(client, "P-Q1", "gds15_v1", phase="后测")
+    assert other["phase_ordinal"] == 1, "换期别就是另一个槽位，重新从 1 开始"
+
+
+def test_locking_still_freezes_the_content_itself(api_env):
+    """取代记账是锁定后唯一允许写的字段；作答内容仍然一个字都不能改。"""
+    client = _client("research-a")
+    locked = _lock_gds_record(client, "否")
+    with Session(api_env) as session:
+        row = session.get(QuestionnaireRecord, locked["record_id"])
+        row.note = "锁定之后偷改备注"
+        with pytest.raises(RuntimeError, match="锁定后不可变"):
+            session.commit()
+        session.rollback()

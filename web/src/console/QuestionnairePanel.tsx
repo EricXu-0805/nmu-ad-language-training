@@ -8,15 +8,16 @@ import {
   type QuestionnaireRecordClient,
 } from "./QuestionnaireDrawer";
 import {
-  lockedScoreSummary,
-  questionnaireFailureText,
-  questionnaireStatusLabel,
   QUESTIONNAIRE_PHASE_LABELS,
   QUESTIONNAIRE_TRIAL_NOTICE,
+  lockedScoreSummary,
+  questionnaireRetakeNote,
+  questionnaireFailureText,
+  questionnaireStatusLabel,
   type QuestionnaireCatalogEntry,
   type QuestionnairePhaseLabel,
   type QuestionnaireRecord,
-} from "./questionnaires";
+} from "./questionnaires.ts";
 
 const client: QuestionnaireRecordClient = {
   putValues: (record, values) => api.putQuestionnaireValues(record, values),
@@ -134,6 +135,11 @@ export function QuestionnairePanel({ patientId }: { patientId: string }) {
                   : record.questionnaire_id}
               </strong>
               {` · ${record.phase_label}`}
+              {questionnaireRetakeNote(record) ? (
+                <small className="muted" style={{ display: "block" }}>
+                  {questionnaireRetakeNote(record)}
+                </small>
+              ) : null}
             </span>
             <span className="row wrap">
               <StatusPill tone={record.status === "locked" ? "ok" : "warn"}>

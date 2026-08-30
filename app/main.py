@@ -13872,6 +13872,10 @@ def _questionnaire_record_out(record: QuestionnaireRecord,
         "questionnaire_id": record.questionnaire_id,
         "definition_sha256": record.definition_sha256,
         "phase_label": record.phase_label,
+        # 同期别第几次施测，以及被第几次取代（None = 这条就是当前作数的那条）。
+        # 不发出去的话，控制台上两条同为「前测」的记录长得一模一样。
+        "phase_ordinal": record.phase_ordinal,
+        "superseded_by_ordinal": record.superseded_by_ordinal,
         "status": record.status,
         "created_by": record.created_by,
         "created_at": record.created_at,
@@ -13943,21 +13947,38 @@ def create_questionnaire_record(patient_id: str, body: QuestionnaireRecordCreate
             "message": f"量表 {body.questionnaire_id} 未注册",
             "registered": sorted(registry),
         })
+    # 同一位受试者 + 同一份量表 + 同一期别 = 一个槽位。手册规定的改错方式是
+    # 「新建一条正确的，在备注里说明」，所以同槽位再建一条是**正常动作**，不是错误；
+    # 唯一约束要挡的是「两条并列、谁也不知道哪条作数」。于是这里给新记录发下一个
+    # 序号，并把上一条标成被它取代——两条都留着，链条自己说得清。
+    previous = s.exec(
+        select(QuestionnaireRecord)
+        .where(QuestionnaireRecord.patient_id == patient_id,
+               QuestionnaireRecord.questionnaire_id == body.questionnaire_id,
+               QuestionnaireRecord.phase_label == body.phase_label)
+        .order_by(QuestionnaireRecord.phase_ordinal.desc())
+    ).first()
+    ordinal = 1 if previous is None else previous.phase_ordinal + 1
     record = QuestionnaireRecord(
         record_id=f"qr_{secrets.token_hex(12)}",
         patient_id=patient_id,
         questionnaire_id=body.questionnaire_id,
         definition_sha256=loaded.content_sha256,
         phase_label=body.phase_label,
+        phase_ordinal=ordinal,
         created_by=operator,
         note=body.note,
     )
     s.add(record)
+    if previous is not None and previous.superseded_by_ordinal is None:
+        previous.superseded_by_ordinal = ordinal
+        s.add(previous)
     s.commit()
     s.refresh(record)
-    _audit(s, request, "questionnaire_record",
-           f"建立量表记录 {body.questionnaire_id}/{body.phase_label}",
-           patient_id=patient_id)
+    detail = f"建立量表记录 {body.questionnaire_id}/{body.phase_label}"
+    if ordinal > 1:
+        detail += f"（第 {ordinal} 次，取代第 {ordinal - 1} 次）"
+    _audit(s, request, "questionnaire_record", detail, patient_id=patient_id)
     return _questionnaire_record_out(record, [])
 
 

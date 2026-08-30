@@ -3103,13 +3103,34 @@ class QuestionnaireRecord(SQLModel, table=True):
     superseded_by_ordinal: Optional[int] = None
 
 
+# 锁定后唯一允许写的字段。它记的不是这份记录的内容，而是「谁接替了我」——
+# 按定义只可能发生在锁定之后（手册规定的改错方式就是新建一条正确的）。
+# 不放它进来，唯一约束就把重测这条路彻底堵死：第二次建记录撞 IntegrityError
+# 变成没人处理的 500，而这正是 2026-08-30 上线后自查抓到的回归。
+_QUESTIONNAIRE_POST_LOCK_WRITABLE = frozenset({"superseded_by_ordinal"})
+
+
 @sa_event.listens_for(QuestionnaireRecord, "before_update")
 def _reject_locked_questionnaire_record_update(_mapper, _connection, target) -> None:
     from sqlalchemy import inspect as _sa_inspect
-    history = _sa_inspect(target).attrs.status.history
+    state = _sa_inspect(target)
+    history = state.attrs.status.history
     previous_status = history.deleted[0] if history.deleted else target.status
-    if previous_status == "locked":
-        raise RuntimeError("QuestionnaireRecord 锁定后不可变；改错走新记录")
+    if previous_status != "locked":
+        return
+    changed = {
+        attr.key for attr in state.attrs
+        if attr.history.has_changes()
+    }
+    forbidden = changed - _QUESTIONNAIRE_POST_LOCK_WRITABLE
+    if forbidden:
+        raise RuntimeError(
+            "QuestionnaireRecord 锁定后不可变；改错走新记录"
+            f"（本次想改：{sorted(forbidden)}）")
+    previous_pointer = state.attrs.superseded_by_ordinal.history.deleted
+    if previous_pointer and previous_pointer[0] is not None:
+        raise RuntimeError(
+            "取代指针只写一次：它指的是「谁接替了我」，改写会让链条断掉")
 
 
 @sa_event.listens_for(QuestionnaireRecord, "before_delete")

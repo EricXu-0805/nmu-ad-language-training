@@ -5,6 +5,7 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { StatusPill } from "../components/StatusPill";
 import { useDialogFocusTrap } from "../components/useDialogFocusTrap";
 import {
+  QUESTIONNAIRE_TRIAL_NOTICE,
   adoptableAiDraftEntries,
   aiDraftStatusLine,
   examinerDomainOf,
@@ -16,9 +17,9 @@ import {
   lockedScoreSummary,
   missingLockEntries,
   performQuestionnaireMutation,
+  questionnaireRetakeNote,
   questionnaireSlotKey,
   questionnaireStatusLabel,
-  QUESTIONNAIRE_TRIAL_NOTICE,
   type QuestionnaireChoiceField,
   type QuestionnaireDefinition,
   type QuestionnaireExaminerDomain,
@@ -28,7 +29,7 @@ import {
   type QuestionnaireItem,
   type QuestionnaireRecord,
   type QuestionnaireValueWrite,
-} from "./questionnaires";
+} from "./questionnaires.ts";
 
 // 本抽屉刻意不 import api:题面/锚点/档位全部由 client 与定义包(经认证接口)喂进来,
 // 源码里没有任何题词,SSR 测试可直接装载。
@@ -554,6 +555,9 @@ export function QuestionnaireDrawer({
           <div>
             <div className="page-kicker">
               受试者 {record.patient_id} · {record.phase_label}
+              {questionnaireRetakeNote(record)
+                ? ` · ${questionnaireRetakeNote(record)}`
+                : ""}
             </div>
             <h2 id="questionnaire-drawer-title">
               {definition.title}

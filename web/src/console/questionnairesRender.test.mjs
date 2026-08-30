@@ -203,6 +203,8 @@ function recordFor(definition, overrides = {}) {
     questionnaire_id: definition.questionnaire_id,
     definition_sha256: SHA,
     phase_label: "前测",
+    phase_ordinal: 1,
+    superseded_by_ordinal: null,
     status: "draft",
     created_by: "tester",
     created_at: "2026-08-20T01:02:03",

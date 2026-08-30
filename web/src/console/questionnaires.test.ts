@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  QUESTIONNAIRE_TRIAL_NOTICE,
   adoptableAiDraftEntries,
   aiDraftStatusLine,
   examinerDomainTotals,
@@ -13,9 +14,9 @@ import {
   parseQuestionnaireRecord,
   parseQuestionnaireRecordList,
   performQuestionnaireMutation,
+  questionnaireRetakeNote,
   questionnaireFailureText,
   questionnaireSlotKey,
-  QUESTIONNAIRE_TRIAL_NOTICE,
   type QuestionnaireDefinition,
   type QuestionnaireItemValueSlot,
   type QuestionnaireRecord,
@@ -225,6 +226,8 @@ function recordFor(
     questionnaire_id: definition.questionnaire_id,
     definition_sha256: SHA,
     phase_label: "前测",
+    phase_ordinal: 1,
+    superseded_by_ordinal: null,
     status: "draft",
     created_by: "tester",
     created_at: "2026-08-20T01:02:03",
@@ -636,4 +639,24 @@ test("examiner_scored:锁定摘要 = 总分/满分 + 各域小计 + 界值三态
   assert.equal(
     lockedScoreSummary(locked({ cutoff_met: false, computed_flag: null, values: values("组甲") }), null),
     "总分 5 · 未达界值");
+});
+
+test("同期别重测:序号与取代关系要说成人话,只有一次时不写「第 1 次」", () => {
+  assert.equal(
+    questionnaireRetakeNote({ phase_ordinal: 1, superseded_by_ordinal: null }),
+    null, "只施测过一次就别在界面上写「第 1 次」");
+  assert.equal(
+    questionnaireRetakeNote({ phase_ordinal: 2, superseded_by_ordinal: null }),
+    "第 2 次施测 · 当前作数的一条");
+  assert.equal(
+    questionnaireRetakeNote({ phase_ordinal: 1, superseded_by_ordinal: 2 }),
+    "第 1 次施测 · 已被第 2 次取代，不作数");
+});
+
+test("解析器拒收自相矛盾的取代指针", () => {
+  assert.throws(
+    () => parseQuestionnaireRecord(recordFor(binaryDefinition(), {
+      phase_ordinal: 3, superseded_by_ordinal: 2,
+    })),
+    /取代它的那次序号必须比自己大/);
 });
