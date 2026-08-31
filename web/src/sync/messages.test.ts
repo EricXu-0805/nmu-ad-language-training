@@ -152,3 +152,20 @@ test("rapport beat rides the wire as a closed set and survives the round trip", 
     beat: "reply", recording: "idle", containsDirectIdentifier: true,
   });
 });
+
+test("回应句编号是闭集小写短串，且只在回应拍上出现", () => {
+  const chosen = { ...rapport, beat: "reply" as const, replyId: "a1" };
+  assert.deepEqual(parseSyncMsg(chosen), chosen);
+  // 解析器把它丢了,老人端就退回脚本里那句固定回应——七个分组按钮全部失效。
+  assert.equal(parseSyncMsg({ ...chosen, replyId: "A1" }), null);
+  assert.equal(parseSyncMsg({ ...chosen, replyId: "" }), null);
+  assert.equal(parseSyncMsg({ ...chosen, replyId: "a".repeat(17) }), null);
+  assert.equal(parseSyncMsg({ ...chosen, replyId: 1 }), null);
+  assert.deepEqual(parseSyncPayload("rapportStep", {
+    sessionId: "S-1", sectionKey: "自我介绍", questionIdx: 3,
+    beat: "reply", replyId: "b2", recording: "idle", containsDirectIdentifier: false,
+  }), {
+    type: "rapportStep", sessionId: "S-1", sectionKey: "自我介绍", questionIdx: 3,
+    beat: "reply", replyId: "b2", recording: "idle", containsDirectIdentifier: false,
+  });
+});

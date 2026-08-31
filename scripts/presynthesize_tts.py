@@ -24,12 +24,15 @@ from app import content, tts  # noqa: E402
 def collect_lines() -> list[str]:
     script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
     proto = content.load_autopilot_protocol(content.CONTENT_DIR / "autopilot_protocol_v1.json")
+    replies = content.load_week1_reply_bank(
+        content.CONTENT_DIR / "week1_reply_bank_v1.json")
     lines: set[str] = set()
     # 预合成缓存覆盖索引里的全部训练周,新周登记后重跑本脚本即可获得同等缓冲。
     for week in sorted(content.load_item_bank_index()):
         bank = content.load_item_bank_for_week(week)
         package = content.load_autopilot_interaction_package(week, protocol=proto)
-        lines |= content.tts_allowlist(bank, script, proto, package)
+        lines |= content.tts_allowlist(bank, script, proto, package,
+                                       week1_reply_bank=replies)
     return sorted(lines)
 
 

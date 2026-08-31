@@ -65,6 +65,40 @@ function assertWeek1Shape(s: Week1Script): Week1Script {
   return s;
 }
 
+// 第1周开放式回应库：机器人在老人答完后说的那句，全部事先定稿。
+// 分组由研究者点选——他刚听完老人说什么，判断比任何自动分类都准。
+export interface Week1Reply {
+  id: string;
+  text: string;
+  when: string;
+  invites_more: boolean;
+  group: string;
+}
+export interface Week1ReplyGroup { key: string; hint: string }
+export interface Week1ReplyBank {
+  bank_version_id: string;
+  qc_status: string;
+  signed_by: string | null;
+  applies_to: { section_key: string; question_idx: number }[];
+  fallback: string;
+  groups: Week1ReplyGroup[];
+  replies: Week1Reply[];
+}
+
+// 同一个理由:文件与代码字段错位过一次(见上)。分组键对不上就整包拒用,
+// 免得屏上出一排点了没有句子的按钮。
+function assertReplyBankShape(b: Week1ReplyBank): Week1ReplyBank {
+  if (!Array.isArray(b.replies) || b.replies.length === 0) throw new Error("回应库无 replies");
+  if (!Array.isArray(b.groups) || b.groups.length === 0) throw new Error("回应库无 groups");
+  const keys = new Set(b.groups.map((g) => g.key));
+  for (const r of b.replies) {
+    if (!r.id || !r.text || !r.group) throw new Error(`回应句缺 id/text/group:${JSON.stringify(r).slice(0, 80)}`);
+    if (!keys.has(r.group)) throw new Error(`回应句 ${r.id} 引用了未登记的分组 ${r.group}`);
+  }
+  if (!Array.isArray(b.applies_to)) throw new Error("回应库无 applies_to");
+  return b;
+}
+
 // 自动驾驶协议(通用固定话术,逐字来自源文档;【物品名】槽位由题库目标词回填)
 export interface AutopilotProtocol {
   protocol_version_id: string;
@@ -82,6 +116,7 @@ export type FbKey =
 const bankCacheByWeek = new Map<number, ItemBankBundle>();
 let scriptCache: Week1Script | null = null;
 let protocolCache: AutopilotProtocol | null = null;
+let replyBankCache: Week1ReplyBank | null = null;
 
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url, {
@@ -123,6 +158,18 @@ export function useWeek1Script(): { script: Week1Script | null; error: string | 
       .catch((e) => setError(String(e)));
   }, []);
   return { script, error };
+}
+
+export function useWeek1ReplyBank(): { bank: Week1ReplyBank | null; error: string | null } {
+  const [bank, setBank] = useState<Week1ReplyBank | null>(replyBankCache);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (replyBankCache) return;
+    fetchJson<Week1ReplyBank>("/content/week1-reply-bank")
+      .then((b) => { const ok = assertReplyBankShape(b); replyBankCache = ok; setBank(ok); })
+      .catch((e) => setError(String(e)));
+  }, []);
+  return { bank, error };
 }
 
 export function useAutopilotProtocol(): { protocol: AutopilotProtocol | null; error: string | null } {

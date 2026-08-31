@@ -4,7 +4,7 @@ import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { StatusPill } from "../../components/StatusPill";
 import { useToast } from "../../components/ToastContext";
-import { useWeek1Script } from "../../content/bundle";
+import { useWeek1ReplyBank, useWeek1Script } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
 import { useSessionRuntime } from "../../hooks/useSessionRuntime";
 import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
@@ -54,6 +54,10 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   // 一问两拍:ask=机器人问句,reply=老人答完后机器人说的那句。恢复一律回到 ask,
   // 老人重新听见的是问题本身,不是一句悬空的回应。
   const [beat, setBeat] = useState<RapportBeat>("ask");
+  const [spokenReply, setSpokenReply] = useState<string | null>(null);
+  const { bank: replyBank } = useWeek1ReplyBank();
+  // 同一组连点两次不该说同一句;按组各记一个游标,轮着来。
+  const replyCursor = useRef<Record<string, number>>({});
   const patientRec = usePatientRec(session.session_id);
   const patientDeviceFailure = isPatientRecFailure(patientRec)
     && patientRec.sessionId === session.session_id ? patientRec : null;
@@ -65,6 +69,8 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const isSelfIntro = section?.key === "自我介绍";
   const questions = section?.questions ?? [];
   const replyLine = section?.speaker === "机器人" ? (questions[qIdx]?.success ?? null) : null;
+  const openReplyHere = Boolean(replyBank?.applies_to.some(
+    (row) => row.section_key === section?.key && row.question_idx === qIdx));
   const recSeq = useRef(0);
   // ★必须在所有 early-return 之前:hook 写在条件 return 后面,脚本从"加载中"变"已加载"
   // 那一帧 hook 数量改变,React 抛错卸载整棵树——整页按钮全部失灵。
@@ -270,6 +276,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setSectionIdx(sIdx);
     setQIdx(q);
     setBeat("ask");
+    setSpokenReply(null);
     setRapportFlags(nextFlags);
     postRapport({ sectionKey: s?.key ?? "", questionIdx: q, beat: "ask", recording: "idle", recSeq: recSeq.current, ...nextFlags });
   };
@@ -284,6 +291,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     lastArmedKey.current = `关系建立·${section?.key ?? ""}`;
     setRecState("armed");
     setBeat("ask");
+    setSpokenReply(null);
     postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "ask", recording: "armed", recSeq: recSeq.current, ...rapportFlags });
   };
   // 老人答完 → 机器人把冻结脚本里写好的那句回应读出来。只在关麦时可用,发出去的
@@ -291,7 +299,22 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const sayReply = () => {
     if (interactionBlocked || !replyLine || recState !== "idle") return;
     setBeat("reply");
+    setSpokenReply(replyLine);
     postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "reply", recording: "idle", recSeq: recSeq.current, ...rapportFlags });
+  };
+  // 研究者点的是「刚才是哪种情况」,系统在那一组里轮一句。他刚听完老人说什么,
+  // 这个判断比任何自动分类都准——第1周不判分、没有 attempt,录音本来就不转写,
+  // 系统这一侧没有老人说了什么的文本。
+  const sayGroupReply = (group: string) => {
+    if (interactionBlocked || recState !== "idle" || !replyBank) return;
+    const pool = replyBank.replies.filter((r) => r.group === group);
+    if (!pool.length) return;
+    const n = (replyCursor.current[group] ?? -1) + 1;
+    replyCursor.current[group] = n;
+    const chosen = pool[n % pool.length];
+    setBeat("reply");
+    setSpokenReply(chosen.text);
+    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "reply", replyId: chosen.id, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
   };
   const stopRecording = () => {
     setRecState("idle");
@@ -409,17 +432,35 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
             <div className="toolbar rapport-question-actions">
               <div className="row">
                 <Button disabled={interactionBlocked || qIdx === 0} onClick={() => go(sectionIdx, qIdx - 1)}>上一问</Button>
-                <Button variant="primary" disabled={interactionBlocked || !replyLine || recState !== "idle"}
-                  title={replyLine
-                    ? (recState === "idle" ? undefined : "先停止录音，再让机器人回应")
-                    : "冻结脚本没有为这一问写回应句，要先由内容组补上"}
-                  onClick={sayReply}>
-                  {beat === "reply" ? "再说一次回应" : "让机器人回应"}
-                </Button>
+                {!openReplyHere && (
+                  <Button variant="primary" disabled={interactionBlocked || !replyLine || recState !== "idle"}
+                    title={replyLine
+                      ? (recState === "idle" ? undefined : "先停止录音，再让机器人回应")
+                      : "冻结脚本没有为这一问写回应句，要先由内容组补上"}
+                    onClick={sayReply}>
+                    {beat === "reply" ? "再说一次回应" : "让机器人回应"}
+                  </Button>
+                )}
                 <Button disabled={interactionBlocked || qIdx >= questions.length - 1} onClick={() => go(sectionIdx, qIdx + 1)}>下一问</Button>
               </div>
               <span className="muted">第 {qIdx + 1} / {questions.length} 问</span>
             </div>
+            {openReplyHere && replyBank && (
+              <div className="rapport-reply-picker">
+                <p className="muted">受试者答完了，刚才是哪种情况？点一下，机器人就照这个说一句。</p>
+                <div className="row wrap">
+                  {replyBank.groups.map((g) => (
+                    <Button key={g.key} variant={g.key === "接着聊" ? "primary" : undefined}
+                      disabled={interactionBlocked || recState !== "idle"}
+                      title={recState === "idle" ? g.hint : "先停止录音，再让机器人回应"}
+                      onClick={() => sayGroupReply(g.key)}>{g.key}</Button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {spokenReply && (
+              <p className="muted" role="status" aria-live="polite">机器人刚说了：{spokenReply}</p>
+            )}
           </>
         )}
         {isSelfIntro && <Alert tone="warn" title="本段录音可能包含直接身份信息">如启动录音，整段会被标记为含直接标识，并在导出时进入受控处理。</Alert>}

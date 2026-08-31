@@ -1251,6 +1251,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 .rapport-question-list li span { font-size: var(--text-sm); }
 .rapport-question-actions { justify-content: space-between; }
 .rapport-section-actions { margin-top: var(--sp-4); }
+.rapport-reply-picker { margin-top: var(--sp-4); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--c-border); border-radius: var(--radius-sm); background: var(--c-surface-subtle); display: flex; flex-direction: column; gap: var(--sp-3); }
+.rapport-reply-picker > p { margin: 0; }
 
 /* ---------- 双端在线状态与可恢复场次 ---------- */
 .session-presence {

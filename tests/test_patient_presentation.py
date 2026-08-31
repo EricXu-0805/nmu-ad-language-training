@@ -588,3 +588,73 @@ def test_every_scripted_reply_line_can_be_spoken_by_the_cloud_voice():
     assert all("【" not in line for line in spoken), spoken
     assert spoken[0] == "好的，认识您真开心。"
     assert spoken[2] == "好的，谢谢您告诉我。"
+
+
+def _reply_bank():
+    return content.load_week1_reply_bank(
+        content.CONTENT_DIR / "week1_reply_bank_v1.json")
+
+
+def test_open_reply_bank_never_applies_to_the_name_and_age_questions():
+    """姓名/年龄那两问的回答是直接身份信息——不进选句这条路。"""
+    bank = _reply_bank()
+    for idx in (0, 1, 2):
+        assert not patient_presentation.rapport_reply_allowed_here(
+            bank, "自我介绍", idx)
+    assert patient_presentation.rapport_reply_allowed_here(bank, "自我介绍", 3)
+    assert patient_presentation.rapport_reply_allowed_here(bank, "介绍机构环境", 0)
+    excluded = {(row["section_key"], row["question_idx"]) for row in bank["excluded"]}
+    assert ("自我介绍", 0) in excluded and ("自我介绍", 1) in excluded
+
+
+def test_every_open_reply_can_be_spoken_by_the_cloud_voice():
+    """回应库不进白名单，老人听见的会是平板系统语音——同一场对话两把嗓子。"""
+    bank = _reply_bank()
+    allowed = content.tts_allowlist(
+        content.load_item_bank_for_week(2),
+        content.load_week1_script(content.CONTENT_DIR / "week1_script.json"),
+        week1_reply_bank=bank,
+    )
+    missing = [row["text"] for row in bank["replies"] if row["text"] not in allowed]
+    assert missing == [], missing
+    assert bank["fallback"] in allowed
+
+
+def test_a_reply_id_from_another_question_is_refused(
+        presentation_client, monkeypatch):
+    """回应句编号必须绑当前一问：姓名那一问不许借开放回应库说话。"""
+    client = presentation_client
+    _create_patient(client, "P-RAPPORT-BANK")
+    _create_session(
+        client, session_id="S-RAPPORT-BANK",
+        patient_id="P-RAPPORT-BANK", week_no=1)
+    _post_live_session(client, "S-RAPPORT-BANK", week_no=1)
+
+    def write(section_key, question_idx, reply_id, beat="reply"):
+        return client.put("/live/state", json={
+            "kind": "rapportStep",
+            "payload": {
+                "sessionId": "S-RAPPORT-BANK", "sectionKey": section_key,
+                "questionIdx": question_idx, "beat": beat, "replyId": reply_id,
+                "recording": "idle",
+                "containsDirectIdentifier": section_key == "自我介绍",
+            },
+        })
+
+    refused = write("自我介绍", 0, "a1")
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"] == "当前一问不接受这条回应句"
+    assert write("自我介绍", 3, "zzz").status_code == 422
+    assert write("自我介绍", 3, "a1", beat="ask").status_code == 422
+
+    accepted = write("自我介绍", 3, "a1")
+    assert accepted.status_code == 200, accepted.text
+
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    capability = _pair(client, "rapport-bank-device-01")
+    projected = client.get(
+        "/sessions/S-RAPPORT-BANK/patient-presentation", headers=capability).json()
+    assert projected["beat"] == "reply"
+    assert projected["text"] == "这个挺好的，您再多讲一点吧。"
+    # 编号是内部键，不该跟着投影下去让配对设备去枚举整个回应库。
+    assert "replyId" not in projected and "a1" not in json.dumps(projected)

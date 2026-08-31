@@ -620,7 +620,8 @@ def cloud_text_allowed(text: str) -> bool:
             week_files = content.load_item_bank_index()
             paths = [content.CONTENT_DIR / content.ITEM_BANK_INDEX_FILE,
                      content.CONTENT_DIR / "week1_script.json",
-                     content.CONTENT_DIR / "autopilot_protocol_v1.json"]
+                     content.CONTENT_DIR / "autopilot_protocol_v1.json",
+                     content.CONTENT_DIR / "week1_reply_bank_v1.json"]
             paths += [content.CONTENT_DIR / week_files[week]
                       for week in sorted(week_files)]
             proto = json.loads(paths[2].read_text(encoding="utf-8"))
@@ -637,6 +638,11 @@ def cloud_text_allowed(text: str) -> bool:
             )
             if _allow_cache is None or _allow_cache[0] != key:
                 wk = json.loads(paths[1].read_text(encoding="utf-8"))
+                # 回应库坏了只让第1周回应句落回本地引擎,不牵连其余各周的云语音。
+                try:
+                    replies = content.load_week1_reply_bank(paths[3])
+                except Exception:
+                    replies = None
                 allowed: frozenset[str] = frozenset()
                 # 白名单=全部已结构化训练周的并集:同一云引擎服务所有周。
                 # 单周坏档只让该周文本落回本地引擎(正集合缩小=fail-closed),
@@ -651,7 +657,8 @@ def cloud_text_allowed(text: str) -> bool:
                             week, protocol=proto)
                     except ValueError:
                         package = None
-                    allowed |= content.tts_allowlist(bank, wk, proto, package)
+                    allowed |= content.tts_allowlist(bank, wk, proto, package,
+                                                     week1_reply_bank=replies)
                 _allow_cache = (key, allowed)
             return text.strip() in _allow_cache[1]
     except Exception:

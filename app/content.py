@@ -875,6 +875,72 @@ def load_item_bank_for_week(
     return bank
 
 
+class _Week1ReplyEntrySchema(_FrozenContentSchema):
+    id: str = Field(min_length=1, max_length=16, pattern=r"^[a-z][a-z0-9]*$")
+    text: str = Field(min_length=1, max_length=60)
+    when: str = Field(min_length=1)
+    invites_more: bool
+    group: str = Field(min_length=1)
+
+    @field_validator("text")
+    @classmethod
+    def _no_slot_may_carry_what_the_elder_said(cls, value: str) -> str:
+        if "【" in value or "】" in value:
+            raise ValueError("回应句不得带槽位：实例化后含老人自述内容，进不了云 TTS 白名单")
+        return value
+
+
+class _Week1ReplyGroupSchema(_FrozenContentSchema):
+    key: str = Field(min_length=1)
+    hint: str = Field(min_length=1)
+
+
+class _Week1ReplyPositionSchema(_FrozenContentSchema):
+    section_key: str = Field(min_length=1)
+    question_idx: int = Field(ge=0)
+
+
+class _Week1ReplyExclusionSchema(_Week1ReplyPositionSchema):
+    why: str = Field(min_length=1)
+
+
+class _Week1ReplyBankSchema(_FrozenContentSchema):
+    bank_version_id: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    qc_status: str = Field(min_length=1)
+    signed_by: str | None
+    note: str = Field(min_length=1)
+    applies_to: list[_Week1ReplyPositionSchema] = Field(min_length=1)
+    excluded: list[_Week1ReplyExclusionSchema]
+    fallback: str = Field(min_length=1)
+    groups: list[_Week1ReplyGroupSchema] = Field(min_length=1)
+    replies: list[_Week1ReplyEntrySchema] = Field(min_length=1)
+
+    @field_validator("replies")
+    @classmethod
+    def _ids_are_unique(cls, value):
+        ids = [row.id for row in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError("回应句 id 重复")
+        return value
+
+
+def load_week1_reply_bank(path: str | Path) -> dict:
+    """第1周开放式回应库。每一句都由人事先定稿，运行时只能从这个闭集里选。"""
+    try:
+        data = _load_strict_json_object(path, label="第一周回应库")
+        _validate_frozen_schema(data, _Week1ReplyBankSchema, label="第一周回应库")
+    except FrozenContentUnavailable:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise FrozenContentUnavailable(str(exc)) from exc
+    known = {row["key"] for row in data["groups"]}
+    unknown = {row["group"] for row in data["replies"]} - known
+    if unknown:
+        raise FrozenContentUnavailable(f"回应句引用了未登记的分组：{sorted(unknown)}")
+    return data
+
+
 def load_week1_script(path: str | Path) -> dict:
     try:
         data = _load_strict_json_object(path, label="第一周脚本")
@@ -1551,7 +1617,8 @@ def _expand_slots(line: str, zodiac: list[str]):
 
 def tts_allowlist(bank: ItemBank, week1_script: dict | None = None,
                   autopilot_protocol: dict | None = None,
-                  interaction_package: dict | None = None) -> frozenset[str]:
+                  interaction_package: dict | None = None,
+                  week1_reply_bank: dict | None = None) -> frozenset[str]:
     """云 TTS 允许合成的全部文本（闭集）。
 
     红线：发往云端的文本只能来自题库/脚本/固定 UI 话术，永不携带患者字段。
@@ -1596,6 +1663,14 @@ def tts_allowlist(bank: ItemBank, week1_script: dict | None = None,
                         lines.update(_expand_slots(t, zodiac))
         for slot in (week1_script.get("slots") or {}).values():
             t = (slot or {}).get("fallback_line")
+            if t:
+                lines.add(t)
+    if week1_reply_bank:
+        t = week1_reply_bank.get("fallback")
+        if t:
+            lines.add(t)
+        for row in week1_reply_bank.get("replies") or []:
+            t = (row or {}).get("text")
             if t:
                 lines.add(t)
     if autopilot_protocol:

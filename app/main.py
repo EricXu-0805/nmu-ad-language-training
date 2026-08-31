@@ -3160,6 +3160,22 @@ def get_week1_script_bundle(request: Request):
 
 
 @app.api_route(
+    "/content/week1-reply-bank", methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
+def get_week1_reply_bank_bundle(request: Request):
+    _require_staff_content_bundle_access(request)
+    try:
+        bank = content.load_week1_reply_bank(
+            content.CONTENT_DIR / "week1_reply_bank_v1.json")
+    except HTTPException:
+        raise
+    except (content.FrozenContentUnavailable, OSError, TypeError, ValueError):
+        _content_bundle_unavailable()
+    return _content_bundle_response(request, bank)
+
+
+@app.api_route(
     "/content/autopilot-protocol", methods=["GET", "HEAD"],
     include_in_schema=False,
 )
@@ -4759,6 +4775,8 @@ class LiveRapportPayload(BaseModel):
                                     pattern=r"^[^\r\n\x00]+$")
     questionIdx: int = PydanticField(ge=0)
     beat: Literal["ask", "reply"] = "ask"
+    replyId: str | None = PydanticField(default=None, min_length=1, max_length=16,
+                                        pattern=r"^[a-z][a-z0-9]*$")
     recording: Literal["idle", "armed", "recording", "stopped"] = "idle"
     recSeq: int | None = PydanticField(default=None, ge=0)
     rawAudioId: str | None = PydanticField(default=None, max_length=160)
@@ -5099,9 +5117,9 @@ _PUBLIC_LIVE_FIELDS = {
     "cursor": {"sessionId", "screen", "itemIdx", "turnIdx", "responseRole",
                "cueLevel", "recording", "recSeq", "selfStart",
                "fbKey", "fbSeq", "wseq"},
-    "rapportStep": {"sessionId", "sectionKey", "questionIdx", "beat", "recording",
-                    "recSeq", "assentGate", "containsDirectIdentifier", "paused",
-                    "wseq"},
+    "rapportStep": {"sessionId", "sectionKey", "questionIdx", "beat", "replyId",
+                    "recording", "recSeq", "assentGate", "containsDirectIdentifier",
+                    "paused", "wseq"},
 }
 
 
@@ -5628,6 +5646,14 @@ def _validate_cursor(sess: TrainSession, payload: dict, s: DBSession) -> None:
             raise HTTPException(409, "当前位置已锁分，禁止重新下发录音状态")
 
 
+def _week1_reply_bank() -> dict:
+    try:
+        return content.load_week1_reply_bank(
+            content.CONTENT_DIR / "week1_reply_bank_v1.json")
+    except content.FrozenContentUnavailable as exc:
+        raise HTTPException(503, f"第1周回应库不可用：{exc}") from exc
+
+
 def _validate_rapport(sess: TrainSession, payload: dict, s: DBSession) -> None:
     if sess.week_no != 1:
         raise HTTPException(409, "rapportStep 仅属于第1周关系建立场次")
@@ -5647,9 +5673,18 @@ def _validate_rapport(sess: TrainSession, payload: dict, s: DBSession) -> None:
     beat = payload.get("beat", "ask")
     if beat not in {"ask", "reply"}:
         raise HTTPException(422, "未知关系建立话拍")
-    if beat == "reply" and patient_presentation.rapport_reply_line(
-            script, section_key, question_idx) is None:
-        raise HTTPException(422, "冻结关系建立脚本没有为当前一问写回应句")
+    reply_id = payload.get("replyId")
+    if reply_id is not None and beat != "reply":
+        raise HTTPException(422, "问句拍不接受回应句编号")
+    if beat == "reply":
+        if reply_id is not None:
+            bank = _week1_reply_bank()
+            if patient_presentation.rapport_bank_reply_line(
+                    bank, reply_id, section_key, question_idx) is None:
+                raise HTTPException(422, "当前一问不接受这条回应句")
+        elif patient_presentation.rapport_reply_line(
+                script, section_key, question_idx) is None:
+            raise HTTPException(422, "冻结关系建立脚本没有为当前一问写回应句")
     recording = payload.get("recording", "idle")
     if recording not in _RECORDING_STATES:
         raise HTTPException(422, "未知 recording 状态")
@@ -9523,14 +9558,17 @@ def patient_presentation_get(
                     or isinstance(question_idx, bool) or question_idx < 0):
                 raise HTTPException(409, "当前关系建立游标损坏，拒绝呈现")
             beat = rapport.get("beat", "ask")
-            if beat not in {"ask", "reply"}:
+            reply_id = rapport.get("replyId")
+            if beat not in {"ask", "reply"} or not isinstance(
+                    reply_id, (str, type(None))):
                 raise HTTPException(409, "当前关系建立游标损坏，拒绝呈现")
             script = content.load_week1_script(
                 content.CONTENT_DIR / "week1_script.json")
             try:
                 speaker, text = patient_presentation.resolve_rapport_text(
                     script, section_key=section_key, question_idx=question_idx,
-                    beat=beat)
+                    beat=beat, reply_id=reply_id,
+                    reply_bank=_week1_reply_bank() if reply_id else None)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
             return PatientRapportPresentationOut(

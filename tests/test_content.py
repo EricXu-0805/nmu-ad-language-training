@@ -7,7 +7,7 @@ from app import content
 from app.content import (
     CONTENT_DIR, autopilot_protocol_definition_digest,
     item_bank_definition_digest, load_autopilot_protocol,
-    load_item_bank, load_week1_script,
+    load_item_bank, load_week1_reply_bank, load_week1_script,
     content_readiness, operational_rubric_for, unsupported_operational_rubrics,
     validate_autopilot_protocol, validate_item_bank, validate_week1_script, ItemBank,
 )
@@ -372,14 +372,19 @@ def test_missing_version_id_rejected(tmp_path):
 _FROZEN_JSON_LOADERS = (
     (load_item_bank, "item_bank_version_id"),
     (load_week1_script, "script_version_id"),
+    (load_week1_reply_bank, "bank_version_id"),
     (load_autopilot_protocol, "protocol_version_id"),
 )
+_FROZEN_JSON_LOADER_IDS = (
+    "item-bank", "week1-script", "week1-reply-bank", "autopilot-protocol",
+)
+assert len(_FROZEN_JSON_LOADER_IDS) == len(_FROZEN_JSON_LOADERS)
 
 
 @pytest.mark.parametrize(
     ("loader", "version_key"),
     _FROZEN_JSON_LOADERS,
-    ids=("item-bank", "week1-script", "autopilot-protocol"),
+    ids=_FROZEN_JSON_LOADER_IDS,
 )
 @pytest.mark.parametrize("duplicate_scope", ("root", "nested"))
 def test_frozen_json_loaders_reject_duplicate_keys_at_any_depth(
@@ -398,7 +403,7 @@ def test_frozen_json_loaders_reject_duplicate_keys_at_any_depth(
 @pytest.mark.parametrize(
     ("loader", "version_key"),
     _FROZEN_JSON_LOADERS,
-    ids=("item-bank", "week1-script", "autopilot-protocol"),
+    ids=_FROZEN_JSON_LOADER_IDS,
 )
 @pytest.mark.parametrize(
     "non_finite_token",
@@ -419,7 +424,7 @@ def test_frozen_json_loaders_reject_non_finite_numbers(
 @pytest.mark.parametrize(
     ("loader", "_version_key"),
     _FROZEN_JSON_LOADERS,
-    ids=("item-bank", "week1-script", "autopilot-protocol"),
+    ids=_FROZEN_JSON_LOADER_IDS,
 )
 @pytest.mark.parametrize("root", ("[]", "null", '"string"', "42", "true"))
 def test_frozen_json_loaders_require_object_root(
@@ -434,7 +439,7 @@ def test_frozen_json_loaders_require_object_root(
 @pytest.mark.parametrize(
     ("loader", "version_key"),
     _FROZEN_JSON_LOADERS,
-    ids=("item-bank", "week1-script", "autopilot-protocol"),
+    ids=_FROZEN_JSON_LOADER_IDS,
 )
 def test_frozen_json_loaders_normalize_excessive_nesting_to_value_error(
         tmp_path, loader, version_key):

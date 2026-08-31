@@ -74,7 +74,8 @@ _ROUTE_RULES = (
     # 不再复制进 SPA 静态目录；患者 capability 永远不能读取答案整包。
     _route(
         {"GET", "HEAD"},
-        r"/content/(?:item-bank-bundle|week1-script|autopilot-protocol)",
+        r"/content/(?:item-bank-bundle|week1-script|week1-reply-bank"
+        r"|autopilot-protocol)",
         AccessKind.ACCOUNT,
         label="读取工作人员端冻结内容包",
     ),
@@ -356,11 +357,13 @@ _MAX_PATH_DECODE_LAYERS = 8
 STAFF_CONTENT_BUNDLE_PATHS = frozenset({
     "/content/item-bank-bundle",
     "/content/week1-script",
+    "/content/week1-reply-bank",
     "/content/autopilot-protocol",
 })
 _LEGACY_ANSWER_BUNDLE_PATHS = frozenset({
     "/content/item_bank_v1.json",
     "/content/week1_script.json",
+    "/content/week1_reply_bank_v1.json",
     "/content/autopilot_protocol_v1.json",
 })
 

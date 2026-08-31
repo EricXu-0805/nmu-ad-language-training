@@ -167,6 +167,27 @@ def resolve_task_texts(
     return cue_text, feedback_text
 
 
+def rapport_reply_allowed_here(bank: dict, section_key: str, question_idx: int) -> bool:
+    """这一问是否开放选句。姓名/年龄那两问永远不在里面——回答是直接身份信息。"""
+    for row in bank.get("applies_to") or []:
+        if (isinstance(row, dict) and row.get("section_key") == section_key
+                and row.get("question_idx") == question_idx):
+            return True
+    return False
+
+
+def rapport_bank_reply_line(bank: dict, reply_id: str,
+                            section_key: str, question_idx: int) -> str | None:
+    """回应库里那一句；这一问不开放选句、或者 id 不在闭集里，一律 None。"""
+    if not rapport_reply_allowed_here(bank, section_key, question_idx):
+        return None
+    for row in bank.get("replies") or []:
+        if isinstance(row, dict) and row.get("id") == reply_id:
+            text = row.get("text")
+            return text if isinstance(text, str) and text.strip() else None
+    return None
+
+
 def rapport_reply_line(script: dict, section_key: str, question_idx: int) -> str | None:
     """当前一问在冻结脚本里写好的回应句；脚本没写就是 None（不代拟）。"""
     sections = script.get("sections")
@@ -221,6 +242,8 @@ def resolve_rapport_text(
     section_key: str,
     question_idx: int,
     beat: str = "ask",
+    reply_id: str | None = None,
+    reply_bank: dict | None = None,
 ) -> tuple[str, str | None]:
     """投影第1周当前一拍；不返回其他节、其他问或画像槽位。
 
@@ -242,6 +265,14 @@ def resolve_rapport_text(
     if beat == "reply":
         if speaker != "机器人":
             raise ValueError("研究者节没有机器人回应句")
+        if reply_id is not None:
+            if reply_bank is None:
+                raise ValueError("回应库未就绪，拒绝按 id 投影回应句")
+            reply = rapport_bank_reply_line(
+                reply_bank, reply_id, section_key, question_idx)
+            if reply is None:
+                raise ValueError("当前一问不接受这条回应句")
+            return speaker, reply
         reply = rapport_reply_line(script, section_key, question_idx)
         if reply is None:
             raise ValueError("冻结关系建立脚本没有为当前一问写回应句")

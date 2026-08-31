@@ -1,0 +1,279 @@
+{
+  "bank_version_id": "wk1-reply-v1-20260830",
+  "source": "Claude 按第1周关系建立场景起草 2026-08-30；未经临床签署",
+  "qc_status": "draft",
+  "signed_by": null,
+  "note": "机器人在老人答完后说的开放式回应。每一句都不得含老人自述内容——带槽位的句子进不了云 TTS 白名单，也不该把老人说的话原样播回去。选哪一组由研究者点：他刚听完，判断比任何自动分类都准；第1周不判分、没有 attempt，录音本来就不转写，所以系统这一侧没有老人说了什么的文本。",
+  "applies_to": [
+    {
+      "section_key": "自我介绍",
+      "question_idx": 3
+    },
+    {
+      "section_key": "自我介绍",
+      "question_idx": 4
+    },
+    {
+      "section_key": "介绍机构环境",
+      "question_idx": 0
+    },
+    {
+      "section_key": "介绍机构环境",
+      "question_idx": 1
+    },
+    {
+      "section_key": "介绍机构环境",
+      "question_idx": 2
+    },
+    {
+      "section_key": "介绍机构环境",
+      "question_idx": 3
+    }
+  ],
+  "excluded": [
+    {
+      "section_key": "自我介绍",
+      "question_idx": 0,
+      "why": "问姓名——回答是直接身份信息，不送云端做选句"
+    },
+    {
+      "section_key": "自我介绍",
+      "question_idx": 1,
+      "why": "问年龄——同上"
+    },
+    {
+      "section_key": "自我介绍",
+      "question_idx": 2,
+      "why": "问属相——脚本已有闭集回应句，无需选句"
+    }
+  ],
+  "fallback": "好的，谢谢您告诉我。",
+  "replies": [
+    {
+      "id": "a1",
+      "text": "这个挺好的，您再多讲一点吧。",
+      "when": "老人说了一件具体的事，可以顺着聊",
+      "invites_more": true,
+      "group": "接着聊"
+    },
+    {
+      "id": "a2",
+      "text": "听起来挺有意思，您平时常做吗？",
+      "when": "老人说了一件具体的事，可以顺着聊",
+      "invites_more": true,
+      "group": "接着聊"
+    },
+    {
+      "id": "a3",
+      "text": "真好，那您一定挺熟悉的。",
+      "when": "老人说了一件具体的事，只想肯定不追问",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "a4",
+      "text": "嗯，我听着呢，您接着说。",
+      "when": "老人正说到一半，像是还想说",
+      "invites_more": true,
+      "group": "接着聊"
+    },
+    {
+      "id": "b1",
+      "text": "好的。那您能再多说两句吗？",
+      "when": "老人只说了两三个字",
+      "invites_more": true,
+      "group": "请他多说"
+    },
+    {
+      "id": "b2",
+      "text": "嗯，我在听。还有别的吗？",
+      "when": "老人只说了两三个字",
+      "invites_more": true,
+      "group": "请他多说"
+    },
+    {
+      "id": "b3",
+      "text": "好。您愿意的话，再讲讲。",
+      "when": "老人说得短，语气不太想说",
+      "invites_more": true,
+      "group": "请他多说"
+    },
+    {
+      "id": "c1",
+      "text": "您说得真好，谢谢您。",
+      "when": "老人说了很多，情绪不错",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "c2",
+      "text": "谢谢您跟我讲这些，我很爱听。",
+      "when": "老人说了很多，情绪不错",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "c3",
+      "text": "听您说话真舒服。",
+      "when": "老人说了很多，情绪不错",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "d1",
+      "text": "没关系，想不起来也不要紧。",
+      "when": "老人说不知道、忘了、想不起来",
+      "invites_more": false,
+      "group": "想不起来"
+    },
+    {
+      "id": "d2",
+      "text": "不着急，我们慢慢来。",
+      "when": "老人说不知道、忘了、想不起来",
+      "invites_more": false,
+      "group": "想不起来"
+    },
+    {
+      "id": "d3",
+      "text": "那咱们说点别的，也一样的。",
+      "when": "老人想不起来，且不想在这一问上停留",
+      "invites_more": false,
+      "group": "想不起来"
+    },
+    {
+      "id": "e1",
+      "text": "嗯，我听着呢。",
+      "when": "老人说的和问题不搭，或者听不出在说什么",
+      "invites_more": false,
+      "group": "拿不准"
+    },
+    {
+      "id": "e2",
+      "text": "好的，谢谢您跟我说。",
+      "when": "老人说的和问题不搭",
+      "invites_more": false,
+      "group": "拿不准"
+    },
+    {
+      "id": "f1",
+      "text": "嗯，我在这儿陪着您。",
+      "when": "老人语气低落，或说了不开心的事",
+      "invites_more": false,
+      "group": "陪一下"
+    },
+    {
+      "id": "f2",
+      "text": "慢慢说，不着急。",
+      "when": "老人语气着急或说不顺",
+      "invites_more": false,
+      "group": "陪一下"
+    },
+    {
+      "id": "f3",
+      "text": "谢谢您愿意跟我说这些。",
+      "when": "老人说了比较私人或沉重的事",
+      "invites_more": false,
+      "group": "陪一下"
+    },
+    {
+      "id": "g1",
+      "text": "有人作伴真好。",
+      "when": "老人说到身边的人",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "g2",
+      "text": "听起来您跟他们挺熟的。",
+      "when": "老人说到身边的人",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "g3",
+      "text": "身边有熟人，心里踏实。",
+      "when": "老人说到身边的人",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "h1",
+      "text": "那地方您常去吗？",
+      "when": "老人说到一个地方",
+      "invites_more": true,
+      "group": "接着聊"
+    },
+    {
+      "id": "h2",
+      "text": "听起来是个待着舒服的地方。",
+      "when": "老人说到一个地方",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "i1",
+      "text": "这个您常用吗？",
+      "when": "老人说到一样东西",
+      "invites_more": true,
+      "group": "接着聊"
+    },
+    {
+      "id": "i2",
+      "text": "这东西看着就顺手。",
+      "when": "老人说到一样东西",
+      "invites_more": false,
+      "group": "肯定一下"
+    },
+    {
+      "id": "j1",
+      "text": "没听太清楚，您再说一次好吗？",
+      "when": "录到的声音听不清",
+      "invites_more": true,
+      "group": "没听清"
+    },
+    {
+      "id": "j2",
+      "text": "没关系，那我们聊点别的吧。",
+      "when": "老人没说话",
+      "invites_more": false,
+      "group": "没听清"
+    },
+    {
+      "id": "k1",
+      "text": "好的，谢谢您告诉我。",
+      "when": "拿不准的时候用这一句",
+      "invites_more": false,
+      "group": "拿不准"
+    }
+  ],
+  "groups": [
+    {
+      "key": "接着聊",
+      "hint": "老人说了具体的事，想让他顺着往下讲"
+    },
+    {
+      "key": "请他多说",
+      "hint": "老人只说了两三个字"
+    },
+    {
+      "key": "肯定一下",
+      "hint": "说完了，暖一句就够，不再追问"
+    },
+    {
+      "key": "想不起来",
+      "hint": "老人说不知道、忘了"
+    },
+    {
+      "key": "陪一下",
+      "hint": "老人语气低落或说得着急"
+    },
+    {
+      "key": "没听清",
+      "hint": "没录清楚，或者老人没开口"
+    },
+    {
+      "key": "拿不准",
+      "hint": "不确定该归哪一类"
+    }
+  ]
+}
