@@ -321,11 +321,12 @@ def test_rapport_device_gets_only_the_current_question(
     projected = response.json()
     assert set(projected) == {
         "schema_version", "mode", "session_id", "script_version_id",
-        "section_key", "question_idx", "speaker", "text", "wseq",
+        "section_key", "question_idx", "beat", "speaker", "text", "wseq",
     }
     assert projected["mode"] == "rapport"
     assert projected["section_key"] == "自我介绍"
     assert projected["question_idx"] == 2
+    assert projected["beat"] == "ask"
     assert projected["speaker"] == "机器人"
     assert projected["text"] == "您属什么呀？比如属鼠、属牛、属虎。"
     serialized = response.text
@@ -504,3 +505,86 @@ def test_opaque_turn_ref_becomes_canonical_only_inside_server_ledgers(
         "raw_audio_id": "legacy-registered-audio", "registered": True,
     }
     assert canonical_item_id not in legacy_ack.text
+
+
+def _write_rapport(client, session_id, *, section_key, question_idx, beat):
+    return client.put("/live/state", json={
+        "kind": "rapportStep",
+        "payload": {
+            "sessionId": session_id,
+            "sectionKey": section_key,
+            "questionIdx": question_idx,
+            "beat": beat,
+            "recording": "idle",
+            "containsDirectIdentifier": section_key == "自我介绍",
+        },
+    })
+
+
+def test_elder_hears_the_scripted_reply_after_answering(
+        presentation_client, monkeypatch):
+    """老人答完必须听见机器人的回应；今天这句只由研究者当面代说，屏上一片安静。"""
+    client = presentation_client
+    _create_patient(client, "P-RAPPORT-REPLY")
+    _create_session(
+        client, session_id="S-RAPPORT-REPLY",
+        patient_id="P-RAPPORT-REPLY", week_no=1)
+    _post_live_session(client, "S-RAPPORT-REPLY", week_no=1)
+    written = _write_rapport(
+        client, "S-RAPPORT-REPLY",
+        section_key="自我介绍", question_idx=0, beat="reply")
+    assert written.status_code == 200, written.text
+
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    capability = _pair(client, "rapport-reply-device-01")
+    projected = client.get(
+        "/sessions/S-RAPPORT-REPLY/patient-presentation",
+        headers=capability,
+    ).json()
+    assert projected["beat"] == "reply"
+    assert projected["speaker"] == "机器人"
+    assert projected["text"] == "好的，认识您真开心。"
+    # 问句不能顺带泄给同一拍：老人这一刻只该听见回应。
+    assert "请问您叫什么名字" not in json.dumps(projected, ensure_ascii=False)
+
+
+def test_a_reply_the_frozen_script_never_wrote_is_refused_not_invented(
+        presentation_client):
+    """介绍机构环境那四问脚本没写回应句——工程不得代拟一句读给老人听。"""
+    client = presentation_client
+    _create_patient(client, "P-RAPPORT-NOREPLY")
+    _create_session(
+        client, session_id="S-RAPPORT-NOREPLY",
+        patient_id="P-RAPPORT-NOREPLY", week_no=1)
+    _post_live_session(client, "S-RAPPORT-NOREPLY", week_no=1)
+    refused = _write_rapport(
+        client, "S-RAPPORT-NOREPLY",
+        section_key="介绍机构环境", question_idx=0, beat="reply")
+    assert refused.status_code == 422, refused.text
+    assert "回应句" in refused.json()["detail"]
+
+    accepted = _write_rapport(
+        client, "S-RAPPORT-NOREPLY",
+        section_key="介绍机构环境", question_idx=0, beat="ask")
+    assert accepted.status_code == 200, accepted.text
+
+
+def test_every_scripted_reply_line_can_be_spoken_by_the_cloud_voice():
+    """回应句必须在云 TTS 白名单里，否则老人听见的是另一把嗓子（本地降级引擎）。"""
+    script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
+    # 第1周没有题库（关系建立不判分）；白名单在生产里是各周并集，取任一结构化周即可。
+    bank = content.load_item_bank_for_week(2)
+    allowed = content.tts_allowlist(bank, script)
+    spoken = [
+        patient_presentation.rapport_reply_line(script, section["key"], idx)
+        for section in script["sections"]
+        if section.get("speaker") == "机器人"
+        for idx, question in enumerate(section.get("questions") or [])
+        if question.get("success")
+    ]
+    assert spoken, "冻结脚本一句回应都没写"
+    assert [line for line in spoken if line not in allowed] == []
+    # 带槽位的三句改说脚本自己写的备用句；占位符绝不能被念出来。
+    assert all("【" not in line for line in spoken), spoken
+    assert spoken[0] == "好的，认识您真开心。"
+    assert spoken[2] == "好的，谢谢您告诉我。"

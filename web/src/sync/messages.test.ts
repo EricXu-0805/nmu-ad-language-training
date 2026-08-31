@@ -133,3 +133,22 @@ test("P0-4 回归:服务端诊断键 sourceWseq 会让 session 槽整槽被拒�
   assert.equal(parsed?.sessionId, stored.sessionId);
   assert.equal(parsed?.paused, true);
 });
+
+test("rapport beat rides the wire as a closed set and survives the round trip", () => {
+  // 老人答完那句回应走的就是这一格；解析器把它丢了，操作端广播了回应而老人端
+  // 收到的仍是问句，屏上一片安静——正是钱凯 2026-08-30 报的现象。
+  const reply = { ...rapport, beat: "reply" as const };
+  assert.deepEqual(parseSyncMsg(reply), reply);
+  assert.deepEqual(parseSyncMsg({ ...rapport, beat: "ask" as const }), { ...rapport, beat: "ask" });
+  assert.equal(parseSyncMsg({ ...rapport, beat: "自由发挥" }), null);
+  assert.equal(parseSyncMsg({ ...rapport, beat: 1 }), null);
+  // 不带 beat 的旧投影仍然是合法的问句拍。
+  assert.deepEqual(parseSyncMsg(rapport), rapport);
+  assert.deepEqual(parseSyncPayload("rapportStep", {
+    sessionId: "S-1", sectionKey: "自我介绍", questionIdx: 0,
+    beat: "reply", recording: "idle", containsDirectIdentifier: true,
+  }), {
+    type: "rapportStep", sessionId: "S-1", sectionKey: "自我介绍", questionIdx: 0,
+    beat: "reply", recording: "idle", containsDirectIdentifier: true,
+  });
+});

@@ -37,6 +37,7 @@ export function RapportStage({
           sessionId,
           sectionKey: rapportStep.sectionKey,
           questionIdx: rapportStep.questionIdx,
+          beat: rapportStep.beat ?? "ask",
           wseq: rapportStep.wseq,
         }
       : null;
@@ -45,6 +46,7 @@ export function RapportStage({
   const contentReady = rapportPresentation !== null;
   const isRobot = rapportPresentation?.speaker === "机器人";
   const qIdx = rapportStep?.questionIdx ?? 0;
+  const beat = rapportStep?.beat ?? "ask";
   const text = isRobot
     ? rapportPresentation?.text ?? ""
     : "我们一起聊聊天，好吗？";
@@ -63,7 +65,7 @@ export function RapportStage({
     if (connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey) {
       speak(text, {
         contextKey: ttsContextKey,
-        tag: `rapport:${rapportPresentation?.section_key ?? ""}:${qIdx}`,
+        tag: `rapport:${rapportPresentation?.section_key ?? ""}:${qIdx}:${beat}`,
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

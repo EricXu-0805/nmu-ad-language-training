@@ -4758,6 +4758,7 @@ class LiveRapportPayload(BaseModel):
     sectionKey: str = PydanticField(min_length=1, max_length=100,
                                     pattern=r"^[^\r\n\x00]+$")
     questionIdx: int = PydanticField(ge=0)
+    beat: Literal["ask", "reply"] = "ask"
     recording: Literal["idle", "armed", "recording", "stopped"] = "idle"
     recSeq: int | None = PydanticField(default=None, ge=0)
     rawAudioId: str | None = PydanticField(default=None, max_length=160)
@@ -5098,8 +5099,9 @@ _PUBLIC_LIVE_FIELDS = {
     "cursor": {"sessionId", "screen", "itemIdx", "turnIdx", "responseRole",
                "cueLevel", "recording", "recSeq", "selfStart",
                "fbKey", "fbSeq", "wseq"},
-    "rapportStep": {"sessionId", "sectionKey", "questionIdx", "recording", "recSeq",
-                    "assentGate", "containsDirectIdentifier", "paused", "wseq"},
+    "rapportStep": {"sessionId", "sectionKey", "questionIdx", "beat", "recording",
+                    "recSeq", "assentGate", "containsDirectIdentifier", "paused",
+                    "wseq"},
 }
 
 
@@ -5642,6 +5644,12 @@ def _validate_rapport(sess: TrainSession, payload: dict, s: DBSession) -> None:
     questions = section.get("questions") or []
     if (questions and question_idx >= len(questions)) or (not questions and question_idx != 0):
         raise HTTPException(422, "questionIdx 超出冻结关系建立脚本")
+    beat = payload.get("beat", "ask")
+    if beat not in {"ask", "reply"}:
+        raise HTTPException(422, "未知关系建立话拍")
+    if beat == "reply" and patient_presentation.rapport_reply_line(
+            script, section_key, question_idx) is None:
+        raise HTTPException(422, "冻结关系建立脚本没有为当前一问写回应句")
     recording = payload.get("recording", "idle")
     if recording not in _RECORDING_STATES:
         raise HTTPException(422, "未知 recording 状态")
@@ -9474,6 +9482,7 @@ class PatientRapportPresentationOut(BaseModel):
     script_version_id: str
     section_key: str
     question_idx: int
+    beat: Literal["ask", "reply"]
     speaker: Literal["机器人", "研究者"]
     text: str | None
     wseq: int | None
@@ -9513,11 +9522,15 @@ def patient_presentation_get(
                     or not isinstance(question_idx, int)
                     or isinstance(question_idx, bool) or question_idx < 0):
                 raise HTTPException(409, "当前关系建立游标损坏，拒绝呈现")
+            beat = rapport.get("beat", "ask")
+            if beat not in {"ask", "reply"}:
+                raise HTTPException(409, "当前关系建立游标损坏，拒绝呈现")
             script = content.load_week1_script(
                 content.CONTENT_DIR / "week1_script.json")
             try:
                 speaker, text = patient_presentation.resolve_rapport_text(
-                    script, section_key=section_key, question_idx=question_idx)
+                    script, section_key=section_key, question_idx=question_idx,
+                    beat=beat)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
             return PatientRapportPresentationOut(
@@ -9525,6 +9538,7 @@ def patient_presentation_get(
                 script_version_id=str(script["script_version_id"]),
                 section_key=section_key,
                 question_idx=question_idx,
+                beat=beat,
                 speaker=speaker,
                 text=text,
                 wseq=_wseq_from(rapport),

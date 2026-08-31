@@ -84,6 +84,7 @@ test("rapport projection contains and matches only the current section/question"
     script_version_id: "script-v1",
     section_key: "自我介绍",
     question_idx: 2,
+    beat: "ask",
     speaker: "机器人",
     text: "您属什么呀？",
     wseq: 55,
@@ -94,6 +95,7 @@ test("rapport projection contains and matches only the current section/question"
     sessionId: "S-RAPPORT",
     sectionKey: "自我介绍",
     questionIdx: 2,
+    beat: "ask",
     wseq: 55,
   }), true);
   assert.equal(presentationMatches(parsed, {
@@ -101,8 +103,22 @@ test("rapport projection contains and matches only the current section/question"
     sessionId: "S-RAPPORT",
     sectionKey: "介绍机构环境",
     questionIdx: 0,
+    beat: "ask",
     wseq: 55,
   }), false);
+  // 同一问的两拍共用 section+idx。不比对话拍的话，老人端会把还没换的问句
+  // 当成"回应已经到了"，屏上照旧是问题、一句回应也不会读出来。
+  assert.equal(presentationMatches(parsed, {
+    mode: "rapport",
+    sessionId: "S-RAPPORT",
+    sectionKey: "自我介绍",
+    questionIdx: 2,
+    beat: "reply",
+    wseq: 55,
+  }), false);
+  const reply = parsePatientPresentation({ ...rapport, beat: "reply", text: "好的，谢谢您告诉我。" });
+  assert.equal(reply.mode === "rapport" && reply.beat, "reply");
+  assert.throws(() => parsePatientPresentation({ ...rapport, beat: "闲聊" }));
   assert.throws(() => parsePatientPresentation({
     ...rapport,
     sections: [{ key: "道别", line: "不应同时下发的后续话术" }],

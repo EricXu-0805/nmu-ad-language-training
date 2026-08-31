@@ -1,5 +1,6 @@
 // 老人端当前呈现的网络信任边界。严格拒绝多字段响应，防止后端日后
 // 误把整份题库/答案塞进这个过渡接口而前端无感接受。
+import type { RapportBeat } from "../sync/messages";
 
 export const PATIENT_FEEDBACK_KEYS = [
   "self", "cued1_unknown", "cued1_close", "cued1_silence",
@@ -33,6 +34,7 @@ export interface PatientRapportPresentation {
   script_version_id: string;
   section_key: string;
   question_idx: number;
+  beat: RapportBeat;
   speaker: "机器人" | "研究者";
   text: string | null;
   wseq: number | null;
@@ -61,6 +63,7 @@ export interface RapportPresentationExpectation {
   sessionId: string;
   sectionKey: string;
   questionIdx: number;
+  beat: RapportBeat;
   wseq?: number;
 }
 
@@ -78,7 +81,7 @@ const TASK_KEYS = [
 ] as const;
 const RAPPORT_KEYS = [
   "schema_version", "mode", "session_id", "script_version_id",
-  "section_key", "question_idx", "speaker", "text", "wseq",
+  "section_key", "question_idx", "beat", "speaker", "text", "wseq",
 ] as const;
 
 function exactRecord(value: unknown, keys: readonly string[]): UnknownRecord | null {
@@ -145,6 +148,7 @@ function parseRapport(value: unknown): PatientRapportPresentation | null {
       || !boundedText(row.script_version_id, 128)
       || !boundedText(row.section_key, 100)
       || !nonNegativeInteger(row.question_idx)
+      || !["ask", "reply"].includes(row.beat as string)
       || !["机器人", "研究者"].includes(row.speaker as string)
       || !nullableText(row.text)
       || !nullableNonNegativeInteger(row.wseq)) return null;
@@ -169,7 +173,8 @@ export function presentationMatches(
   if (expected.wseq !== undefined && presentation.wseq !== expected.wseq) return false;
   if (presentation.mode === "rapport" && expected.mode === "rapport") {
     return presentation.section_key === expected.sectionKey
-      && presentation.question_idx === expected.questionIdx;
+      && presentation.question_idx === expected.questionIdx
+      && presentation.beat === expected.beat;
   }
   if (presentation.mode !== "task" || expected.mode !== "task") return false;
   return presentation.item_bank_version_id === expected.itemBankVersionId

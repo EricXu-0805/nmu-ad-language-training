@@ -167,13 +167,66 @@ def resolve_task_texts(
     return cue_text, feedback_text
 
 
+def rapport_reply_line(script: dict, section_key: str, question_idx: int) -> str | None:
+    """当前一问在冻结脚本里写好的回应句；脚本没写就是 None（不代拟）。"""
+    sections = script.get("sections")
+    if not isinstance(sections, list):
+        return None
+    section = next((row for row in sections
+                    if isinstance(row, dict) and row.get("key") == section_key), None)
+    if section is None or section.get("speaker") != "机器人":
+        return None
+    questions = section.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    if question_idx < 0 or question_idx >= len(questions):
+        return None
+    question = questions[question_idx]
+    if not isinstance(question, dict):
+        return None
+    reply = question.get("success")
+    if not isinstance(reply, str) or not reply.strip():
+        return None
+    return _reply_without_unfilled_slots(script, reply)
+
+
+_SLOT_IN_LINE = re.compile(r"【([^】]+)】")
+
+
+def _reply_without_unfilled_slots(script: dict, reply: str) -> str | None:
+    """回应句里的槽位要填老人刚说的话；还没有可填的值时改说脚本写的备用句。
+
+    冻结脚本给每个槽位都写了 fallback_line，正是为这一刻准备的。带槽位的模板
+    本身不在云 TTS 白名单里（实例化后含老人自述内容=患者数据），照原样下发会把
+    「【老人所说的兴趣】」这七个字念给老人听。
+    """
+    slot_names = _SLOT_IN_LINE.findall(reply)
+    if not slot_names:
+        return reply
+    slots = script.get("slots")
+    if not isinstance(slots, dict):
+        return None
+    fallbacks = {
+        (slots.get(name) or {}).get("fallback_line") for name in slot_names
+    }
+    if len(fallbacks) != 1:
+        return None
+    fallback = fallbacks.pop()
+    return fallback if isinstance(fallback, str) and fallback.strip() else None
+
+
 def resolve_rapport_text(
     script: dict,
     *,
     section_key: str,
     question_idx: int,
+    beat: str = "ask",
 ) -> tuple[str, str | None]:
-    """投影第1周当前一问；不返回其他节、其他问或画像槽位。"""
+    """投影第1周当前一拍；不返回其他节、其他问或画像槽位。
+
+    beat="ask" 是问句，beat="reply" 是老人答完后机器人说的那句。回应句只能来自
+    冻结脚本的 success 字段——脚本没写就拒绝，绝不由代码代拟一句给老人听。
+    """
     sections = script.get("sections")
     if not isinstance(sections, list):
         raise ValueError("关系建立脚本缺少 sections")
@@ -184,6 +237,15 @@ def resolve_rapport_text(
     speaker = _required_text(section.get("speaker"), "话术说话人")
     if speaker not in {"机器人", "研究者"}:
         raise ValueError("当前关系建立话术的说话人未被允许")
+    if beat not in {"ask", "reply"}:
+        raise ValueError("当前关系建立话拍未被允许")
+    if beat == "reply":
+        if speaker != "机器人":
+            raise ValueError("研究者节没有机器人回应句")
+        reply = rapport_reply_line(script, section_key, question_idx)
+        if reply is None:
+            raise ValueError("冻结关系建立脚本没有为当前一问写回应句")
+        return speaker, reply
     questions = section.get("questions")
     if isinstance(questions, list) and questions:
         if question_idx < 0 or question_idx >= len(questions):

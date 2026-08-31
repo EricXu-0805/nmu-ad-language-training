@@ -3,6 +3,8 @@
 import type { SessionRuntimeStatus } from "../types";
 
 export type RecState = "idle" | "armed" | "recording" | "stopped";
+// 第1周一问分两拍:ask=机器人问句,reply=老人答完后机器人说的那句(只能来自冻结脚本)。
+export type RapportBeat = "ask" | "reply";
 export type CueLevel = 0 | 1 | 2 | 3;
 export type PatientScreen = "idle" | "present" | "record" | "thanks" | "paused" | "done";
 export type FeedbackKey =
@@ -49,7 +51,7 @@ export type SyncMsg =
   // "点这里,开始回答"自助开录按钮。缺省/false 一律不显示(fail-closed:合规闸门不被老人端绕过)。
   // fbKey/fbItemId/fbSeq:自动驾驶反馈——不载文本,只指向题库/协议固定话术,老人端本地查表回填(fbSeq 变化才重读)。
   | { type: "cursor"; sessionId: string; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; selfStart?: boolean; fbKey?: FeedbackKey; fbItemId?: string; fbSeq?: number; wseq?: number }
-  | { type: "rapportStep"; sessionId: string; sectionKey: string; questionIdx: number; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; paused?: boolean; wseq?: number }
+  | { type: "rapportStep"; sessionId: string; sectionKey: string; questionIdx: number; beat?: RapportBeat; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; paused?: boolean; wseq?: number }
   // sessionId:操作端凭它丢弃跨场次的迟到/残留回报(live state 里 audioSaved 存到下次握手才清)。
   | { type: "audioSaved"; rawAudioId: string; durationSeconds: number; byteCount: number; checksum: string; turnKey: string; sessionId: string; containsDirectIdentifier: boolean }
   // 老人端麦克风真值上报(自助开录时操作端唯一的感知渠道;也用于示意录音的开麦确认)。
@@ -75,6 +77,7 @@ const SESSION_STATUSES = [
 ] as const satisfies readonly SessionRuntimeStatus[];
 const SCREENS = ["idle", "present", "record", "thanks", "paused", "done"] as const;
 const REC_STATES = ["idle", "armed", "recording", "stopped"] as const;
+const RAPPORT_BEATS = ["ask", "reply"] as const;
 const FEEDBACK_KEYS = [
   "self", "cued1_unknown", "cued1_close", "cued1_silence",
   "cued2", "namefix_l", "namefix_r",
@@ -224,7 +227,7 @@ function parseRapport(value: unknown, withType: boolean): RapportMsg | null {
   const row = record(value);
   if (!row || !exactKeys(row,
     ["sessionId", "sectionKey", "questionIdx", "recording"],
-    ["recSeq", "rawAudioId", "assentGate", "containsDirectIdentifier", "paused", "wseq"], withType)
+    ["beat", "recSeq", "rawAudioId", "assentGate", "containsDirectIdentifier", "paused", "wseq"], withType)
     || (withType && row.type !== "rapportStep")
     || !boundedText(row.sessionId, 128)
     || !boundedText(row.sectionKey, 100)
@@ -234,6 +237,10 @@ function parseRapport(value: unknown, withType: boolean): RapportMsg | null {
     type: "rapportStep", sessionId: row.sessionId, sectionKey: row.sectionKey,
     questionIdx: row.questionIdx, recording: row.recording,
   };
+  if (Object.hasOwn(row, "beat")) {
+    if (!oneOf(row.beat, RAPPORT_BEATS)) return null;
+    result.beat = row.beat;
+  }
   for (const key of ["recSeq", "wseq"] as const) {
     if (!addOptionalInteger(result, row, key)) return null;
   }

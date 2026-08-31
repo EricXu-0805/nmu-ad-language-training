@@ -8,7 +8,7 @@ import { useWeek1Script } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
 import { useSessionRuntime } from "../../hooks/useSessionRuntime";
 import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
-import { isPatientRecFailure, type RecState } from "../../sync/messages";
+import { isPatientRecFailure, type RapportBeat, type RecState } from "../../sync/messages";
 import type { Session } from "../../types";
 import { SessionControlBar } from "../SessionControlBar";
 import { SessionAbortControl } from "../SessionAbortControl";
@@ -51,6 +51,9 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const recoveredOnce = useRef(false);
   const handshakeSent = useRef(false);
   const [recState, setRecState] = useState<RecState>("idle");
+  // 一问两拍:ask=机器人问句,reply=老人答完后机器人说的那句。恢复一律回到 ask,
+  // 老人重新听见的是问题本身,不是一句悬空的回应。
+  const [beat, setBeat] = useState<RapportBeat>("ask");
   const patientRec = usePatientRec(session.session_id);
   const patientDeviceFailure = isPatientRecFailure(patientRec)
     && patientRec.sessionId === session.session_id ? patientRec : null;
@@ -61,6 +64,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const section = script?.sections[sectionIdx];
   const isSelfIntro = section?.key === "自我介绍";
   const questions = section?.questions ?? [];
+  const replyLine = section?.speaker === "机器人" ? (questions[qIdx]?.success ?? null) : null;
   const recSeq = useRef(0);
   // ★必须在所有 early-return 之前:hook 写在条件 return 后面,脚本从"加载中"变"已加载"
   // 那一帧 hook 数量改变,React 抛错卸载整棵树——整页按钮全部失灵。
@@ -116,6 +120,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setRecoveredLabel(null);
     setSectionIdx(0);
     setQIdx(0);
+    setBeat("ask");
     setRapportFlags(defaultRapportFlags("认识机器人"));
   }, [resetSession, session.session_id]);
 
@@ -149,6 +154,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     const safeQuestion = Math.min(Math.max(0, saved?.questionIdx ?? 0), maxQuestion);
     setSectionIdx(safeSection);
     setQIdx(safeQuestion);
+    setBeat("ask");
     const restoredFlags = defaultRapportFlags(script.sections[safeSection]?.key ?? "");
     setRapportFlags({
       assentGate: saved?.assentGate ?? restoredFlags.assentGate,
@@ -263,8 +269,9 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setRecState("idle");
     setSectionIdx(sIdx);
     setQIdx(q);
+    setBeat("ask");
     setRapportFlags(nextFlags);
-    postRapport({ sectionKey: s?.key ?? "", questionIdx: q, recording: "idle", recSeq: recSeq.current, ...nextFlags });
+    postRapport({ sectionKey: s?.key ?? "", questionIdx: q, beat: "ask", recording: "idle", recSeq: recSeq.current, ...nextFlags });
   };
 
   const armRecording = () => {
@@ -276,12 +283,20 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
     lastArmedKey.current = `关系建立·${section?.key ?? ""}`;
     setRecState("armed");
-    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "armed", recSeq: recSeq.current, ...rapportFlags });
+    setBeat("ask");
+    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "ask", recording: "armed", recSeq: recSeq.current, ...rapportFlags });
+  };
+  // 老人答完 → 机器人把冻结脚本里写好的那句回应读出来。只在关麦时可用,发出去的
+  // recording 与当前状态一致,所以这一步不碰录音链,只换屏上那句话和朗读内容。
+  const sayReply = () => {
+    if (interactionBlocked || !replyLine || recState !== "idle") return;
+    setBeat("reply");
+    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "reply", recording: "idle", recSeq: recSeq.current, ...rapportFlags });
   };
   const stopRecording = () => {
     setRecState("idle");
     armWatchdog(lastArmedKey.current ?? `关系建立·${section?.key ?? ""}`);
-    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
+    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
   };
 
   async function recordProxyNaming() {
@@ -385,12 +400,24 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
               {questions.map((q, i) => (
                 <li key={i} className={i === qIdx ? "is-active" : ""}>
                   <strong>{q.ask}</strong>
-                  {q.success && <span>回答后说：{q.success}</span>}
+                  {q.success
+                    ? <span>受试者答完后机器人说：{q.success}</span>
+                    : <span className="muted">这一问脚本里没有写机器人的回应句</span>}
                 </li>
               ))}
             </ol>
             <div className="toolbar rapport-question-actions">
-              <div className="row"><Button disabled={interactionBlocked || qIdx === 0} onClick={() => go(sectionIdx, qIdx - 1)}>上一问</Button><Button disabled={interactionBlocked || qIdx >= questions.length - 1} onClick={() => go(sectionIdx, qIdx + 1)}>下一问</Button></div>
+              <div className="row">
+                <Button disabled={interactionBlocked || qIdx === 0} onClick={() => go(sectionIdx, qIdx - 1)}>上一问</Button>
+                <Button variant="primary" disabled={interactionBlocked || !replyLine || recState !== "idle"}
+                  title={replyLine
+                    ? (recState === "idle" ? undefined : "先停止录音，再让机器人回应")
+                    : "冻结脚本没有为这一问写回应句，要先由内容组补上"}
+                  onClick={sayReply}>
+                  {beat === "reply" ? "再说一次回应" : "让机器人回应"}
+                </Button>
+                <Button disabled={interactionBlocked || qIdx >= questions.length - 1} onClick={() => go(sectionIdx, qIdx + 1)}>下一问</Button>
+              </div>
               <span className="muted">第 {qIdx + 1} / {questions.length} 问</span>
             </div>
           </>
