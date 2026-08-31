@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { decodeJsonApiResponse } from "../apiResponse.ts";
 import {
+  AUTOPILOT_FAILURE_STAGES,
   buildAutopilotAck,
   parseAutopilotAck,
   parseNextCommandProjection,
@@ -198,6 +199,57 @@ test("failure ACKs use a closed machine-code vocabulary", () => {
   );
   assert.deepEqual(parseAutopilotAck(failure), failure);
   assert.throws(() => parseAutopilotAck({ ...failure, error_code: "unknown_failure" }));
+});
+
+test("failure_stage 闭集成员逐条钉死（与服务端 _ACK_FAILURE_STAGES 手抄同步）", () => {
+  assert.deepEqual([...AUTOPILOT_FAILURE_STAGES], [
+    "credential_rotated",
+    "authority_changed",
+    "blob_invalid",
+    "media_decode_error",
+    "play_rejected",
+    "media_timeout",
+    "fetch_failed",
+    "executor_start_failed",
+  ]);
+});
+
+test("失败 ACK 可带闭集 failure_stage 且构造/解析往返稳定", () => {
+  const staged = buildAutopilotAck(
+    questionCommand(), 1, "evt-tts-failed-0002",
+    {
+      ack_type: "tts_failed",
+      error_code: "audio_playback_failed",
+      failure_stage: "play_rejected",
+    },
+  );
+  assert.deepEqual(parseAutopilotAck(staged), staged);
+  const recordStaged = buildAutopilotAck(
+    recordCommand(), 2, "evt-rec-failed-0003",
+    {
+      ack_type: "record_failed",
+      error_code: "recording_start_failed",
+      failure_stage: "executor_start_failed",
+    },
+  );
+  assert.deepEqual(parseAutopilotAck(recordStaged), recordStaged);
+});
+
+test("failure_stage 非法值被拒、缺省合法、非失败 ACK 不得携带", () => {
+  const failure = buildAutopilotAck(
+    questionCommand(), 0, "evt-tts-failed-0004",
+    { ack_type: "tts_failed", error_code: "audio_playback_failed" },
+  );
+  // 存量旧失败 ACK 没有 failure_stage 键：必须继续解析通过。
+  assert.deepEqual(parseAutopilotAck(failure), failure);
+  assert.throws(() => parseAutopilotAck({ ...failure, failure_stage: "half_open" }));
+  assert.throws(() => parseAutopilotAck({ ...failure, failure_stage: null }));
+  assert.throws(() => parseAutopilotAck({ ...failure, failure_stage: undefined }));
+  const ended = buildAutopilotAck(
+    questionCommand(), 0, "evt-tts-ended-0009",
+    { ack_type: "tts_ended", media_ended: true },
+  );
+  assert.throws(() => parseAutopilotAck({ ...ended, failure_stage: "media_timeout" }));
 });
 
 test("JSON response can hydrate a pending current command after refresh", () => {

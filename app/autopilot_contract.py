@@ -34,6 +34,17 @@ _ACK_ERROR_CODES = frozenset({
     "device_runtime_failed",
 })
 
+_ACK_FAILURE_STAGES = frozenset({
+    "credential_rotated",
+    "authority_changed",
+    "blob_invalid",
+    "media_decode_error",
+    "play_rejected",
+    "media_timeout",
+    "fetch_failed",
+    "executor_start_failed",
+})
+
 
 class TtsCommandPayload(BaseModel):
     """由服务端从冻结计划/协议生成；设备不能回填自由话术。"""
@@ -158,6 +169,12 @@ class AutopilotAckIn(BaseModel):
         default=None, min_length=1, max_length=96,
         pattern=r"^[a-z][a-z0-9_]{0,95}$",
     )
+    # 可选的设备端失败阶段：把同一个 error_code 背后的六七个失败分支分开，
+    # 便于生产定位。闭集校验在 validator 里，缺省恒合法。
+    failure_stage: str | None = Field(
+        default=None, min_length=1, max_length=64,
+        pattern=r"^[a-z][a-z0-9_]{0,63}$",
+    )
 
     @model_validator(mode="after")
     def _shape_matches_ack(self) -> "AutopilotAckIn":
@@ -181,6 +198,11 @@ class AutopilotAckIn(BaseModel):
             raise ValueError("失败回执必须且只能携带 error_code")
         if self.error_code is not None and self.error_code not in _ACK_ERROR_CODES:
             raise ValueError("失败回执 error_code 不在封闭机器码集中")
+        if self.failure_stage is not None:
+            if not failed:
+                raise ValueError("只有失败回执可以携带 failure_stage")
+            if self.failure_stage not in _ACK_FAILURE_STAGES:
+                raise ValueError("failure_stage 不在封闭阶段集中")
 
         tts_fields = (self.media_ended, self.media_duration_ms)
         record_start_fields = (self.mime_type, self.sample_rate_hz, self.channels)
@@ -228,7 +250,11 @@ class AutopilotAckIn(BaseModel):
             return payload
         if self.ack_type in {"tts_failed", "record_failed"}:
             assert self.error_code is not None
-            return {"error_code": self.error_code}
+            failure_payload: dict[str, bool | int | str] = {
+                "error_code": self.error_code}
+            if self.failure_stage is not None:
+                failure_payload["failure_stage"] = self.failure_stage
+            return failure_payload
         if self.ack_type == "record_started":
             assert self.mime_type is not None
             payload = {"mime_type": self.mime_type}

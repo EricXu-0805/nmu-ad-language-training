@@ -2,6 +2,7 @@ import type {
   AutopilotSpeechExecutor,
   AutopilotSpeechPlayback,
 } from "./autopilotController.ts";
+import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
 
 type TtsCommand = Extract<NextCommandProjection, { kind: "tts" }>;
@@ -91,11 +92,19 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
 
   private async run(): Promise<void> {
     try {
-      if (!this.ports.enabled()) throw new Error("自动驾驶语音门禁未显式开启");
+      if (!this.ports.enabled()) {
+        throw new AutopilotMediaError(
+          "audio_playback_failed", "自动驾驶语音门禁未显式开启",
+          { failureStage: "executor_start_failed" });
+      }
       this.ports.stopSpeaking();
       const blob = await this.ports.fetchTts(
         this.sessionId, this.command, this.abortController.signal);
-      if (blob === null) throw new Error("TTS 服务当前未产生音频");
+      if (blob === null) {
+        throw new AutopilotMediaError(
+          "audio_playback_failed", "TTS 服务当前未产生音频",
+          { failureStage: "fetch_failed" });
+      }
       if (this.terminal) return;
       this.objectUrl = this.ports.createObjectUrl(blob);
       this.audio.src = this.objectUrl;
@@ -114,8 +123,17 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
         this.endedDeferred.resolve({ media_duration_ms: elapsed });
         this.closedDeferred.resolve(undefined);
       };
-      this.audio.onerror = () => this.fail(new Error("TTS 音频解码或播放失败"));
-      await this.audio.play();
+      this.audio.onerror = () => this.fail(new AutopilotMediaError(
+        "audio_playback_failed", "TTS 音频解码或播放失败",
+        { failureStage: "media_decode_error" }));
+      try {
+        await this.audio.play();
+      } catch (error) {
+        // NotAllowedError / NotSupportedError 等 play() 拒绝在这里统一定阶段。
+        throw new AutopilotMediaError(
+          "audio_playback_failed", "浏览器拒绝开始播放合成语音",
+          { cause: error, failureStage: "play_rejected" });
+      }
     } catch (error) {
       this.fail(error);
     }
@@ -135,7 +153,11 @@ export class BrowserAutopilotSpeechExecutor implements AutopilotSpeechExecutor {
   }
 
   start(command: TtsCommand): AutopilotSpeechPlayback {
-    if (command.state !== "pending") throw new Error("仅 pending TTS 命令可播放");
+    if (command.state !== "pending") {
+      throw new AutopilotMediaError(
+        "audio_playback_failed", "仅 pending TTS 命令可播放",
+        { failureStage: "executor_start_failed" });
+    }
     return new BrowserAutopilotSpeechPlayback(this.sessionId, command, this.ports);
   }
 }

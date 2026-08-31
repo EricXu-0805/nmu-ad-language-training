@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { MicButton } from "../components/MicButton";
 import type { RapportMsg } from "../sync/messages";
 import { Centered } from "./Centered";
@@ -52,6 +52,14 @@ export function RapportStage({
     : "我们一起聊聊天，好吗？";
 
   const isPaused = sessionPaused || sessionTerminal || rapportStep?.paused === true;
+  // 录音链的挂起判据只认「题位已确认」,不认 wseq 级新鲜度:每次 arm 都会重签
+  // wseq → 呈现期望必刷新 → contentReady 必闪断;若把这次闪断当挂起,
+  // useVoxRecorder 的封存闩会用**这一条 arm 自己的 recSeq** 把它永久封死,
+  // 麦克风永远打不开(真机走查抓出的存量缺陷)。换题/换拍仍会先确认再开麦。
+  const positionKey = `${rapportStep?.sectionKey ?? ""}#${qIdx}#${beat}`;
+  const confirmedPositionRef = useRef<string | null>(null);
+  if (contentReady) confirmedPositionRef.current = positionKey;
+  const positionConfirmed = confirmedPositionRef.current === positionKey;
   // 小语开口:机器人节话术变了就读;研究者节/脚本未就绪/校验失败一律不读。
   useLayoutEffect(() => {
     if (!(connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey)) {
@@ -61,15 +69,20 @@ export function RapportStage({
       stopSpeaking();
     }
   }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey]);
+  const utteranceId = rapportStep?.utteranceId;
   useEffect(() => {
     if (connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey) {
       speak(text, {
         contextKey: ttsContextKey,
         tag: `rapport:${rapportPresentation?.section_key ?? ""}:${qIdx}:${beat}`,
+        // 回应拍带发声记录编号时按行取音——LLM 现编句只有这一条发声通道。
+        fetchPath: beat === "reply" && utteranceId
+          ? `/sessions/${encodeURIComponent(sessionId)}/rapport/utterances/${utteranceId}/tts`
+          : undefined,
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey]);
+  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, utteranceId]);
 
   const recording = rapportStep?.recording ?? "idle";
   const {
@@ -83,8 +96,8 @@ export function RapportStage({
     turnKey: `关系建立·${rapportStep?.sectionKey ?? ""}`,
     containsDirectIdentifier: rapportStep?.containsDirectIdentifier ?? false,
     connectionReady,
-    suspended: sessionPaused || sessionTerminal || !contentReady,
-    stopRequested: isPaused || sessionTerminal || !contentReady,
+    suspended: sessionPaused || sessionTerminal || !positionConfirmed,
+    stopRequested: isPaused || sessionTerminal || !positionConfirmed,
   });
   useLayoutEffect(() => {
     registerImmediateDiscard?.(discardForPatientPause);

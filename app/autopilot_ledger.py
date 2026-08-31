@@ -562,10 +562,10 @@ def fenced_command_transition(
 ACK_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "tts_started": frozenset({"media_duration_ms"}),
     "tts_ended": frozenset({"media_ended", "media_duration_ms"}),
-    "tts_failed": frozenset({"error_code"}),
+    "tts_failed": frozenset({"error_code", "failure_stage"}),
     "record_started": frozenset({"mime_type", "sample_rate_hz", "channels"}),
     "record_stopped": frozenset({"stop_reason"}),
-    "record_failed": frozenset({"error_code"}),
+    "record_failed": frozenset({"error_code", "failure_stage"}),
 }
 
 RECORD_STOP_REASONS = frozenset({

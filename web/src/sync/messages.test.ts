@@ -153,6 +153,22 @@ test("rapport beat rides the wire as a closed set and survives the round trip", 
   });
 });
 
+test("发声记录编号是正整数，解析器丢了它老人端就听不到 AI 现编句", () => {
+  const auto = { ...rapport, beat: "reply" as const, utteranceId: 7 };
+  assert.deepEqual(parseSyncMsg(auto), auto);
+  assert.equal(parseSyncMsg({ ...auto, utteranceId: 0 }), null);
+  assert.equal(parseSyncMsg({ ...auto, utteranceId: -3 }), null);
+  assert.equal(parseSyncMsg({ ...auto, utteranceId: 1.5 }), null);
+  assert.equal(parseSyncMsg({ ...auto, utteranceId: "7" }), null);
+  assert.deepEqual(parseSyncPayload("rapportStep", {
+    sessionId: "S-1", sectionKey: "介绍机构环境", questionIdx: 1,
+    beat: "reply", utteranceId: 42, recording: "idle", containsDirectIdentifier: false,
+  }), {
+    type: "rapportStep", sessionId: "S-1", sectionKey: "介绍机构环境", questionIdx: 1,
+    beat: "reply", utteranceId: 42, recording: "idle", containsDirectIdentifier: false,
+  });
+});
+
 test("回应句编号是闭集小写短串，且只在回应拍上出现", () => {
   const chosen = { ...rapport, beat: "reply" as const, replyId: "a1" };
   assert.deepEqual(parseSyncMsg(chosen), chosen);

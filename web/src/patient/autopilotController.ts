@@ -5,6 +5,7 @@ import {
   buildAutopilotAck,
   type AutopilotAck,
   type AutopilotErrorCode,
+  type AutopilotFailureStage,
   type AutopilotMimeType,
   type AutopilotStopReason,
   type NextCommandProjection,
@@ -16,7 +17,10 @@ import {
   restoreAutopilotRuntime,
   type AutopilotRuntimeState,
 } from "./autopilotRuntime.ts";
-import { autopilotMediaErrorCode } from "./autopilotMediaError.ts";
+import {
+  autopilotMediaErrorCode,
+  autopilotMediaFailureStage,
+} from "./autopilotMediaError.ts";
 
 type TtsCommand = Extract<NextCommandProjection, { kind: "tts" }>;
 type RecordCommand = Extract<NextCommandProjection, { kind: "record" }>;
@@ -775,11 +779,15 @@ export class PatientAutopilotController {
   private async mediaFailure(
     kind: "tts" | "record",
     errorCode: AutopilotErrorCode,
+    failureStage?: AutopilotFailureStage,
   ): Promise<void> {
     const command = this.currentCommand(kind);
+    // failure_stage 在这里一次定死进 facts；重试/恢复重放的是同一份持久事实，
+    // 不存在第二次判定。undefined 时键根本不出现（含义≠值为 undefined 的键）。
     await this.sendAck(command, {
       ack_type: kind === "tts" ? "tts_failed" : "record_failed",
       error_code: errorCode,
+      ...(failureStage === undefined ? {} : { failure_stage: failureStage }),
     });
   }
 
@@ -787,8 +795,9 @@ export class PatientAutopilotController {
     const initial = this.currentCommand("tts");
     let playback: AutopilotSpeechPlayback;
     try { playback = this.speech.start(initial); }
-    catch {
-      await this.mediaFailure("tts", "audio_playback_failed");
+    catch (error) {
+      await this.mediaFailure(
+        "tts", "audio_playback_failed", autopilotMediaFailureStage(error));
       return;
     }
     this.activeMedia = playback;
@@ -803,8 +812,13 @@ export class PatientAutopilotController {
         }
         playback.cancel();
         await playback.closed;
-        await this.mediaFailure("tts", observedStart.error instanceof MediaDeadlineError
-          ? "device_command_timeout" : "audio_playback_failed");
+        await this.mediaFailure(
+          "tts",
+          observedStart.error instanceof MediaDeadlineError
+            ? "device_command_timeout" : "audio_playback_failed",
+          observedStart.error instanceof MediaDeadlineError
+            ? "media_timeout" : autopilotMediaFailureStage(observedStart.error),
+        );
         return;
       }
       await this.sendAck(initial, { ack_type: "tts_started", ...observedStart.value });
@@ -819,8 +833,13 @@ export class PatientAutopilotController {
       if (!observedEnd.ok) {
         playback.cancel();
         await playback.closed;
-        await this.mediaFailure("tts", observedEnd.error instanceof MediaDeadlineError
-          ? "device_command_timeout" : "audio_playback_failed");
+        await this.mediaFailure(
+          "tts",
+          observedEnd.error instanceof MediaDeadlineError
+            ? "device_command_timeout" : "audio_playback_failed",
+          observedEnd.error instanceof MediaDeadlineError
+            ? "media_timeout" : autopilotMediaFailureStage(observedEnd.error),
+        );
         return;
       }
       await playback.closed;
@@ -843,7 +862,11 @@ export class PatientAutopilotController {
     let capture: AutopilotRecordingCapture;
     try { capture = this.recording.start(initial); }
     catch (error) {
-      await this.mediaFailure("record", autopilotMediaErrorCode(error, "recording_start_failed"));
+      await this.mediaFailure(
+        "record",
+        autopilotMediaErrorCode(error, "recording_start_failed"),
+        autopilotMediaFailureStage(error),
+      );
       return;
     }
     this.activeMedia = capture;
@@ -872,8 +895,11 @@ export class PatientAutopilotController {
         }
         capture.cancel();
         await capture.closed;
-        await this.mediaFailure("record",
-          autopilotMediaErrorCode(observedStart.error, "recording_start_failed"));
+        await this.mediaFailure(
+          "record",
+          autopilotMediaErrorCode(observedStart.error, "recording_start_failed"),
+          autopilotMediaFailureStage(observedStart.error),
+        );
         return;
       }
       this.activeRecording = capture;

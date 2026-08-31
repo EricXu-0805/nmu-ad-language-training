@@ -32,6 +32,20 @@ export const AUTOPILOT_ERROR_CODES = [
 ] as const;
 export type AutopilotErrorCode = typeof AUTOPILOT_ERROR_CODES[number];
 
+// 设备失败回执的可选精确阶段：同一个 error_code 背后的不同失败分支借此分开。
+// 闭集与服务端 _ACK_FAILURE_STAGES 手抄同步，两端测试各钉一次成员清单。
+export const AUTOPILOT_FAILURE_STAGES = [
+  "credential_rotated",
+  "authority_changed",
+  "blob_invalid",
+  "media_decode_error",
+  "play_rejected",
+  "media_timeout",
+  "fetch_failed",
+  "executor_start_failed",
+] as const;
+export type AutopilotFailureStage = typeof AUTOPILOT_FAILURE_STAGES[number];
+
 export const AUTOPILOT_RESPONSE_PATHS = ["unknown", "close", "silence"] as const;
 export type AutopilotResponsePath = typeof AUTOPILOT_RESPONSE_PATHS[number];
 
@@ -94,6 +108,7 @@ export type AutopilotAck =
   | (AckBase & {
     ack_type: "tts_failed";
     error_code: AutopilotErrorCode;
+    failure_stage?: AutopilotFailureStage;
   })
   | (AckBase & {
     ack_type: "record_started";
@@ -113,6 +128,7 @@ export type AutopilotAck =
   | (AckBase & {
     ack_type: "record_failed";
     error_code: AutopilotErrorCode;
+    failure_stage?: AutopilotFailureStage;
   });
 
 export type AutopilotAckFacts =
@@ -313,7 +329,12 @@ export function parseAutopilotAck(value: unknown): AutopilotAck {
       break;
     case "tts_failed":
     case "record_failed":
-      if (exact(["error_code"]) && oneOf(row.error_code, AUTOPILOT_ERROR_CODES)) {
+      // failure_stage 必须 optional：IndexedDB 存量旧失败 ACK 没有这个键，
+      // required 会让刷新恢复把历史 checkpoint 判非法。
+      if (exact(["error_code"], ["failure_stage"])
+          && oneOf(row.error_code, AUTOPILOT_ERROR_CODES)
+          && (!Object.hasOwn(row, "failure_stage")
+            || oneOf(row.failure_stage, AUTOPILOT_FAILURE_STAGES))) {
         return row as unknown as AutopilotAck;
       }
       break;

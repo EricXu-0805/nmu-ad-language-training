@@ -26,6 +26,9 @@ EXPECTED_EGRESS = {
     "app/questionnaire_ai_draft.py": {"README.md": "量表初评",
                                       "DEPLOY.md": "量表初评",
                                       "Gate0分类会材料包.md": "大模型初评"},
+    "app/rapport_reply.py": {"README.md": "回应生成",
+                             "DEPLOY.md": "回应生成",
+                             "Gate0分类会材料包.md": "回应生成"},
 }
 
 

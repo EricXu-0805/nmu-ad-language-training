@@ -822,6 +822,14 @@ export const api = {
     "GET", `/sessions/${encodeURIComponent(sid)}/journal`, undefined,
     DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true, signal },
   ),
+  rapportReplyCreate: (sid: string, body: {
+    sectionKey: string; questionIdx: number; mode: "auto" | "bank" | "script";
+    replyId?: string; rawAudioId?: string;
+  }) => req<{
+    utteranceId: number; text: string;
+    source: "script" | "bank" | "llm" | "fallback";
+    replyId: string | null; degradedReason: string | null; idempotent: boolean;
+  }>("POST", `/sessions/${encodeURIComponent(sid)}/rapport/replies`, body),
   audioReceipts: (sid: string, afterSeq = 0, limit = 500) => {
     const q = new URLSearchParams({ after_seq: String(afterSeq), limit: String(limit) });
     return req<{

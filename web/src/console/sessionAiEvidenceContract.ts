@@ -52,12 +52,13 @@ function validServerTimestamp(value: unknown): value is string {
   return day <= (days[month - 1] ?? 0);
 }
 
-export type TtsServeSource = "autopilot_command" | "live_speak";
+export type TtsServeSource = "autopilot_command" | "live_speak" | "rapport_utterance";
 export type TtsServeResult = "served" | "degraded";
 
 export interface TtsServeEvidenceRecord {
   id: number;
   commandId: number | null;
+  utteranceId: number | null;
   source: TtsServeSource;
   engineVersion: string;
   cacheHit: boolean;
@@ -69,8 +70,9 @@ export interface TtsServeEvidenceRecord {
 }
 
 const TTS_SERVE_KEYS = new Set([
-  "id", "session_id", "command_id", "source", "engine_version", "cache_hit",
-  "result", "byte_count", "text_sha256", "is_simulation", "created_at",
+  "id", "session_id", "command_id", "utterance_id", "source", "engine_version",
+  "cache_hit", "result", "byte_count", "text_sha256", "is_simulation",
+  "created_at",
 ]);
 
 function parseTtsServeEvidenceEntry(
@@ -85,9 +87,14 @@ function parseTtsServeEvidenceEntry(
   if (row.session_id !== expectedSessionId) throw new Error(`${path} 属于其他场次，已拒绝显示`);
   if (!positiveInteger(row.id)) throw new Error(`${path}.id 非法`);
   if (row.command_id !== null && !positiveInteger(row.command_id)) throw new Error(`${path}.command_id 非法`);
-  if (row.source !== "autopilot_command" && row.source !== "live_speak") throw new Error(`${path}.source 非法`);
+  if (row.utterance_id !== null && !positiveInteger(row.utterance_id)) throw new Error(`${path}.utterance_id 非法`);
+  if (row.source !== "autopilot_command" && row.source !== "live_speak"
+    && row.source !== "rapport_utterance") throw new Error(`${path}.source 非法`);
   if ((row.source === "autopilot_command") !== (row.command_id !== null)) {
     throw new Error(`${path} 的 source 与 command_id 绑定关系不一致`);
+  }
+  if ((row.source === "rapport_utterance") !== (row.utterance_id !== null)) {
+    throw new Error(`${path} 的 source 与 utterance_id 绑定关系不一致`);
   }
   if (!boundedNonEmptyString(row.engine_version)) throw new Error(`${path}.engine_version 非法`);
   if (typeof row.cache_hit !== "boolean") throw new Error(`${path}.cache_hit 非法`);
@@ -111,6 +118,7 @@ function parseTtsServeEvidenceEntry(
   return {
     id: row.id as number,
     commandId: row.command_id as number | null,
+    utteranceId: row.utterance_id as number | null,
     source: row.source,
     engineVersion: row.engine_version,
     cacheHit: row.cache_hit,

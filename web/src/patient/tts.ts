@@ -49,7 +49,7 @@ function audit(ev: string, tag: string, text: string): void {
 }
 
 // ---------------- 播放状态机 ----------------
-type Line = TtsReplayLine;
+type Line = TtsReplayLine & { fetchPath?: string };
 let neural: "unknown" | "on" | "off" = "unknown"; // 后端引擎可用性;只有"引擎未接"(X-Tts-Engine=null-0)的 204 才一次锁定整场回退
 let activeEngineTag: string | null = null; // 只记录实际返回可播放字节的服务器签发音源
 let neuralFails = 0;           // 连续网络/后端失败计数:偶发抖动单句回退,连败才整场降级
@@ -83,17 +83,25 @@ async function playItem(item: Line, g: number): Promise<void> {
     let url: string | null = null;
     try {
       const credential = selectDeviceCredential();
-      const res = await fetch("/tts/speak", {
-        method: "POST",
-        credentials: "omit",
-        cache: "no-store",
-        headers: {
-          "Content-Type": "application/json",
-          ...credential.headers,
-          ...csrfHeader("POST"),
-        },
-        body: JSON.stringify({ text: item.text }),
-      });
+      // fetchPath=按行取音(第1周回应句):文本只在服务端持久行里,请求不携带正文。
+      const res = item.fetchPath
+        ? await fetch(item.fetchPath, {
+          method: "POST",
+          credentials: "omit",
+          cache: "no-store",
+          headers: { ...credential.headers, ...csrfHeader("POST") },
+        })
+        : await fetch("/tts/speak", {
+          method: "POST",
+          credentials: "omit",
+          cache: "no-store",
+          headers: {
+            "Content-Type": "application/json",
+            ...credential.headers,
+            ...csrfHeader("POST"),
+          },
+          body: JSON.stringify({ text: item.text }),
+        });
       if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
       // 已被打断/撤销上下文:新句自会驱动,旧续体退场
       const engineTag = res.headers.get("X-Tts-Engine") ?? "";
@@ -267,12 +275,14 @@ export function speak(text: string, opts: {
   contextKey: TtsPlaybackContextKey;
   tag?: string;
   enqueue?: boolean;
+  /** 按行取音端点(第1周回应句)。text 仅作屏显/回退朗读,不进任何合成请求。 */
+  fetchPath?: string;
 }): void {
   if (typeof window === "undefined" || !text) return;
   const tag = opts?.tag ?? "";
   const contextKey = opts.contextKey;
   if (!contextKey || contextState.activeContextKey !== contextKey) return;
-  const line = { text, tag, contextKey };
+  const line: Line = { text, tag, contextKey, fetchPath: opts?.fetchPath };
   contextState = rememberTtsLine(contextState, line);
   if (!enabled) return;
   // 轮询、StrictMode 或同状态重挂载都不应把同一句重复塞进播放队列。
@@ -299,7 +309,12 @@ export function speak(text: string, opts: {
 export function speakSample(contextKey: TtsPlaybackContextKey | null): void {
   const line = replayLineForContext(contextState, contextKey);
   if (!line) return;
-  speak(line.text, { contextKey: line.contextKey, tag: line.tag });
+  // 回放必须原样带上取音通道:LLM 现编句丢了 fetchPath 会被当自由文本
+  // POST 进 /tts/speak——白名单拒它,老人听到的就换成另一副本地嗓子。
+  speak(line.text, {
+    contextKey: line.contextKey, tag: line.tag,
+    fetchPath: (line as { fetchPath?: string }).fetchPath,
+  });
 }
 
 /**

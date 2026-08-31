@@ -692,17 +692,24 @@ def _chain() -> list[TtsProvider]:
     return chain
 
 
-def _synthesize_with(chain: list[TtsProvider], text: str) -> tuple[bytes | None, str, bool]:
+def _synthesize_with(chain: list[TtsProvider], text: str, *,
+                     cloud_text_authorized: bool = False,
+                     ) -> tuple[bytes | None, str, bool]:
     """跑一条给定的引擎链:白名单、缓存读写、WAV 校验全部共用一份实现。
 
     链由调用方决定,这里不追加任何降级层——通用链带本地 piper,自动驾驶链只有
-    Qwen。返回值语义与 speak 一致。"""
+    Qwen。返回值语义与 speak 一致。
+
+    cloud_text_authorized 是**仅 speak_rapport_utterance 可传**的白名单旁路:
+    文本已被服务端按 rapportutteranceevent 行加载,授权依据是"行已持久化+按行
+    服务",不是客户端说了算。除那一个入口外任何调用都必须走默认 False。"""
     last_version = NullTtsEngine.version
     for eng in chain:
         if isinstance(eng, NullTtsEngine):
             continue
         last_version = eng.version
-        if getattr(eng, "cloud", False) and not cloud_text_allowed(text):
+        if (getattr(eng, "cloud", False) and not cloud_text_authorized
+                and not cloud_text_allowed(text)):
             continue                                        # 红线:白名单外的文本不出网
         key = hashlib.sha256(f"{eng.version}\n{eng.cache_params}\n{text}".encode()).hexdigest()
         cached = CACHE_DIR / f"{key}.wav"
@@ -741,6 +748,29 @@ def speak(text: str) -> tuple[bytes | None, str, bool]:
     except Exception:
         return None, NullTtsEngine.version, False
     return _synthesize_with(chain, text)
+
+
+def speak_rapport_utterance(text: str, *,
+                            allow_cloud: bool = True,
+                            ) -> tuple[bytes | None, str, bool]:
+    """第1周回应句(服务端持久 utterance 行)合成:唯一允许绕过静态白名单的入口。
+
+    text 只能来自 rapportutteranceevent 行——调用方(utterance TTS 端点)按 id
+    加载并逐字使用,客户端递不进任何文本。LLM 现编句不在冻结白名单里,这里以
+    "行已持久化+按行服务"为出网授权依据;链路带 piper 降级,云端失败老人听到
+    的是本地嗓子而不是沉默。"""
+    try:
+        if allow_cloud:
+            chain = _chain()
+        else:
+            # 受试者云授权已撤销:一个字节不出网,只许本地 piper 发声。
+            piper = _fallback_piper_engine()
+            chain = [piper] if piper.available() else []
+    except Exception:
+        return None, NullTtsEngine.version, False
+    if not chain:
+        return None, NullTtsEngine.version, False
+    return _synthesize_with(chain, text, cloud_text_authorized=allow_cloud)
 
 
 def get_autopilot_engine() -> TtsProvider:

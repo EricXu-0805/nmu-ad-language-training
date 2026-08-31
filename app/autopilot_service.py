@@ -2737,16 +2737,29 @@ def _device_failure_proves_media_terminal(
             or ack.device_id_hash != command.issued_device_id_hash
             or ack.command_revision + 1 != command.revision):
         return False
-    expected_ack_payload = autopilot_ledger.encode_ack_payload(
-        expected_ack_type, {"error_code": event.reason_code})
+    # ACK payload 允许可选 failure_stage：以持久化的 ack.payload_json 为基准，
+    # 用 canonical 白名单编码复核（天然拒未知键），不再按单键重建期望值。
+    # 控制事件 payload 一行不放宽：ai_quality 钉死 {"error_code","source"}。
+    try:
+        ack_payload = json.loads(ack.payload_json)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(ack_payload, dict):
+        return False
+    try:
+        canonical_ack_payload = autopilot_ledger.encode_ack_payload(
+            expected_ack_type, ack_payload)
+    except (TypeError, ValueError):
+        return False
     expected_event_payload = autopilot_ledger.encode_control_event_payload(
         "failure", {
             "error_code": event.reason_code,
             "source": "device_ack",
         })
     return (
-        ack.payload_json == expected_ack_payload
-        and command.result_json == expected_ack_payload
+        ack.payload_json == canonical_ack_payload
+        and ack_payload.get("error_code") == event.reason_code
+        and command.result_json == ack.payload_json
         and event.payload_json == expected_event_payload
     )
 

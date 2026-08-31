@@ -42,7 +42,8 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                caregiver_contract, caregiver_service,
                cloud_processing, content, db, export_security, governance_lock,
                device_capability, evidence_ledger, export, http_security, judging,
-               ai_quality_service, llm_judge, rule_judge, runtime, scoring,
+               ai_quality_service, llm_judge, rapport_reply, rule_judge,
+               runtime, scoring,
                session_completion,
                resource_limits, patient_asset, patient_pairing,
                patient_presentation,
@@ -67,6 +68,7 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      Patient, PatientDeviceCapability, PatientPauseReceipt,
                      PatientWithdrawalEvent,
                      QuestionnaireItemValue, QuestionnaireRecord,
+                     RapportUtteranceEvent,
                      RuntimeCommand, ScaleResult,
                      SessionAutopilotState,
                      SessionCloseoutReport, SessionOutcomeSummary,
@@ -4777,6 +4779,7 @@ class LiveRapportPayload(BaseModel):
     beat: Literal["ask", "reply"] = "ask"
     replyId: str | None = PydanticField(default=None, min_length=1, max_length=16,
                                         pattern=r"^[a-z][a-z0-9]*$")
+    utteranceId: int | None = PydanticField(default=None, ge=1)
     recording: Literal["idle", "armed", "recording", "stopped"] = "idle"
     recSeq: int | None = PydanticField(default=None, ge=0)
     rawAudioId: str | None = PydanticField(default=None, max_length=160)
@@ -5118,8 +5121,8 @@ _PUBLIC_LIVE_FIELDS = {
                "cueLevel", "recording", "recSeq", "selfStart",
                "fbKey", "fbSeq", "wseq"},
     "rapportStep": {"sessionId", "sectionKey", "questionIdx", "beat", "replyId",
-                    "recording", "recSeq", "assentGate", "containsDirectIdentifier",
-                    "paused", "wseq"},
+                    "utteranceId", "recording", "recSeq", "assentGate",
+                    "containsDirectIdentifier", "paused", "wseq"},
 }
 
 
@@ -5674,10 +5677,23 @@ def _validate_rapport(sess: TrainSession, payload: dict, s: DBSession) -> None:
     if beat not in {"ask", "reply"}:
         raise HTTPException(422, "未知关系建立话拍")
     reply_id = payload.get("replyId")
+    utterance_id = payload.get("utteranceId")
     if reply_id is not None and beat != "reply":
         raise HTTPException(422, "问句拍不接受回应句编号")
+    if utterance_id is not None and beat != "reply":
+        raise HTTPException(422, "问句拍不接受发声记录编号")
     if beat == "reply":
-        if reply_id is not None:
+        if utterance_id is not None:
+            if reply_id is not None:
+                raise HTTPException(422, "utteranceId 与 replyId 只能带其一")
+            # 只追加账本:行存在即永远存在,恢复重放这条校验恒幂等。
+            utterance = s.get(RapportUtteranceEvent, utterance_id)
+            if (utterance is None
+                    or utterance.session_id != sess.session_id
+                    or utterance.section_key != section_key
+                    or utterance.question_idx != question_idx):
+                raise HTTPException(422, "发声记录不属于当前一问")
+        elif reply_id is not None:
             bank = _week1_reply_bank()
             if patient_presentation.rapport_bank_reply_line(
                     bank, reply_id, section_key, question_idx) is None:
@@ -5691,6 +5707,282 @@ def _validate_rapport(sess: TrainSession, payload: dict, s: DBSession) -> None:
     if recording in {"armed", "recording"}:
         _ensure_recording_allowed_for_session(
             sess.session_id, s, is_simulation=sess.is_simulation)
+
+
+class RapportReplyCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sectionKey: str = PydanticField(min_length=1, max_length=100,
+                                    pattern=r"^[^\r\n\x00]+$")
+    questionIdx: int = PydanticField(ge=0)
+    mode: Literal["auto", "bank", "script"]
+    replyId: str | None = PydanticField(default=None, min_length=1, max_length=16,
+                                        pattern=r"^[a-z][a-z0-9]*$")
+    rawAudioId: str | None = PydanticField(
+        default=None, min_length=1, max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
+
+
+class RapportReplyCreateOut(BaseModel):
+    utteranceId: int
+    text: str
+    source: Literal["script", "bank", "llm", "fallback"]
+    replyId: str | None
+    degradedReason: str | None
+    idempotent: bool = False
+
+
+def _rapport_bank_or_frozen_fallback(
+        bank: dict, reply_id: str, section_key: str, question_idx: int,
+        reason: str) -> tuple[str, str | None, str, str]:
+    """降级句仍只出自冻结句库;句 id 不在库里就用库自带的 fallback,不代拟。"""
+    text = patient_presentation.rapport_bank_reply_line(
+        bank, reply_id, section_key, question_idx)
+    if text is not None:
+        return "bank", reply_id, text, reason
+    return "fallback", None, str(bank["fallback"]), reason
+
+
+def _rapport_validate_script_position(
+        script: dict, section_key: str, question_idx: int) -> dict:
+    section = next((row for row in script.get("sections", [])
+                    if row.get("key") == section_key), None)
+    if section is None:
+        raise HTTPException(422, "sectionKey 不在冻结关系建立脚本中")
+    questions = section.get("questions") or []
+    if ((questions and question_idx >= len(questions))
+            or (not questions and question_idx != 0)):
+        raise HTTPException(422, "questionIdx 超出冻结关系建立脚本")
+    return questions[question_idx] if questions else {}
+
+
+def _rapport_auto_allowed_for_section(
+        bank: dict, script: dict, section_key: str) -> bool:
+    """自动回应按节判定:节内每一问都开放选句才算开放(录音只绑到节)。"""
+    section = next((row for row in script.get("sections", [])
+                    if row.get("key") == section_key), None)
+    if not isinstance(section, dict):
+        return False
+    questions = section.get("questions") or []
+    if not questions:
+        return False
+    return all(
+        patient_presentation.rapport_reply_allowed_here(bank, section_key, idx)
+        for idx in range(len(questions)))
+
+
+@app.post("/sessions/{session_id}/rapport/replies",
+          response_model=RapportReplyCreateOut)
+def rapport_reply_create(
+        session_id: str, body: RapportReplyCreateIn, request: Request,
+        s: DBSession = Depends(get_session)):
+    """生成第1周回应拍的持久发声行——机器人说出口的每句话先在这里落账。
+
+    auto 模式跑「老人录音→云 ASR→LLM 现编一句」管线,受与第2-8周同一套
+    逐受试者云授权门禁;任何一层不可用都落回冻结句库(j1 没听清/j2 没说话/
+    k1 兜底),老人永远有回应。生成文本发声走按行合成端点,客户端递不进文本。
+    """
+    sess = s.get(TrainSession, session_id)
+    if not sess:
+        raise HTTPException(404, "场次不存在")
+    _require_session_operator(request, sess, s, "生成第1周回应句", mutation=True)
+    if sess.week_no != 1:
+        raise HTTPException(409, "回应句发声记录仅属于第1周关系建立场次")
+    if _session_runtime_status(session_id, s) in _DATA_STEWARD_VISIBLE_SESSION_STATUSES:
+        raise HTTPException(409, "场次已结束，发声账本不再追加")
+    if body.mode != "auto" and body.rawAudioId is not None:
+        raise HTTPException(422, "rawAudioId 仅用于 auto 模式")
+    script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
+    question = _rapport_validate_script_position(
+        script, body.sectionKey, body.questionIdx)
+    bank = _week1_reply_bank()
+
+    source: str
+    reply_id: str | None = None
+    degraded: str | None = None
+    asr_text_saved: str | None = None
+    asr_engine_version: str | None = None
+    reply_engine_version: str | None = None
+
+    if body.mode == "script":
+        text = patient_presentation.rapport_reply_line(
+            script, body.sectionKey, body.questionIdx)
+        if text is None:
+            raise HTTPException(422, "冻结关系建立脚本没有为当前一问写回应句")
+        source = "script"
+    elif body.mode == "bank":
+        if body.replyId is None:
+            raise HTTPException(422, "bank 模式必须带 replyId")
+        text = patient_presentation.rapport_bank_reply_line(
+            bank, body.replyId, body.sectionKey, body.questionIdx)
+        if text is None:
+            raise HTTPException(422, "当前一问不接受这条回应句")
+        source, reply_id = "bank", body.replyId
+    else:
+        if body.rawAudioId is None:
+            raise HTTPException(422, "auto 模式必须带 rawAudioId")
+        if not patient_presentation.rapport_reply_allowed_here(
+                bank, body.sectionKey, body.questionIdx):
+            # 姓名/年龄两问:回答是直接身份信息,自动管线对它们不启动 ASR。
+            raise HTTPException(409, "当前一问不开放自动回应")
+        if not _rapport_auto_allowed_for_section(bank, script, body.sectionKey):
+            # 录音资产只绑到节(关系建立·<节>),问位是客户端声称的——节内只要有
+            # 身份问询问位,迟到/重放的那段录音就可能顶着开放问位的名义进云 ASR。
+            # 所以整节都不开放自动回应(手点句库不受影响,它不碰录音)。
+            raise HTTPException(
+                409, "本节含身份问询问位，录音只绑到节，不开放自动回应")
+        existing = s.exec(select(RapportUtteranceEvent).where(
+            RapportUtteranceEvent.session_id == session_id,
+            RapportUtteranceEvent.raw_audio_id == body.rawAudioId,
+            RapportUtteranceEvent.origin == "auto",
+        )).first()
+        if existing is not None and existing.id is not None:
+            return RapportReplyCreateOut(
+                utteranceId=existing.id, text=existing.text,
+                source=existing.source, replyId=existing.reply_id,
+                degradedReason=existing.degraded_reason, idempotent=True)
+        asset = s.get(AudioAssetRow, body.rawAudioId)
+        if not asset or asset.session_id != session_id:
+            raise HTTPException(404, "音频资产不存在")
+        if asset.turn_key != f"关系建立·{body.sectionKey}":
+            raise HTTPException(409, "录音不属于当前关系建立节")
+        _ensure_audio_read_allowed(asset, s, sess=sess)
+        receipt = s.exec(select(AudioCaptureReceipt).where(
+            AudioCaptureReceipt.raw_audio_id == body.rawAudioId)).first()
+        if receipt is None:
+            raise HTTPException(409, "录音尚未落入采集账本，不能自动回应")
+        blob = audio_store.find_blob(body.rawAudioId)
+        if not blob:
+            raise HTTPException(409, "音频字节不存在，不能自动回应")
+        ask_line = question.get("ask")
+        if not isinstance(ask_line, str) or not ask_line.strip():
+            raise HTTPException(409, "当前一问没有可供生成器引用的问句")
+        audio_bytes = blob.read_bytes()
+        patient_id = sess.patient_id
+        # 铁律:provider I/O 期间不得持有任何数据库事务/行锁。
+        s.rollback()
+
+        source, reply_id, text, degraded = "fallback", None, str(bank["fallback"]), None
+        asr_result = None
+        asr_engine = asr.get_engine()
+        asr_boundary = cloud_processing.provider_boundary(asr_engine)
+        try:
+            if asr_boundary is cloud_processing.DataBoundary.CLOUD:
+                with _serialized_cloud_provider_call(
+                        session_id=session_id, patient_id=patient_id,
+                        provider=asr_engine, bind=s.get_bind()):
+                    asr_result = asr_engine.transcribe(audio_bytes, [])
+            elif asr_boundary is cloud_processing.DataBoundary.LOCAL:
+                asr_result = asr_engine.transcribe(audio_bytes, [])
+        except _CloudEgressNotAuthorized:
+            source, reply_id, text, degraded = _rapport_bank_or_frozen_fallback(
+                bank, "k1", body.sectionKey, body.questionIdx,
+                "cloud_not_authorized")
+            asr_result = None
+        except Exception:
+            asr_result = None
+        if degraded != "cloud_not_authorized":
+            if (asr_result is None or asr_result.asr_text is None
+                    or len(asr_result.asr_text) > 2000):
+                source, reply_id, text, degraded = (
+                    _rapport_bank_or_frozen_fallback(
+                        bank, "j1", body.sectionKey, body.questionIdx,
+                        "asr_failed"))
+            elif not asr_result.asr_text.strip():
+                asr_engine_version = asr_result.engine_version
+                source, reply_id, text, degraded = (
+                    _rapport_bank_or_frozen_fallback(
+                        bank, "j2", body.sectionKey, body.questionIdx,
+                        "asr_empty"))
+            else:
+                asr_engine_version = asr_result.engine_version
+                asr_text = asr_result.asr_text.strip()
+                engine = rapport_reply.get_engine()
+                generated: str | None = None
+                boundary = cloud_processing.provider_boundary(engine)
+                try:
+                    if boundary is cloud_processing.DataBoundary.CLOUD:
+                        with _serialized_cloud_provider_call(
+                                session_id=session_id, patient_id=patient_id,
+                                provider=engine, bind=s.get_bind()):
+                            generated = engine.generate(ask_line, asr_text)
+                    elif boundary is cloud_processing.DataBoundary.LOCAL:
+                        generated = engine.generate(ask_line, asr_text)
+                except _CloudEgressNotAuthorized:
+                    source, reply_id, text, degraded = (
+                        _rapport_bank_or_frozen_fallback(
+                            bank, "k1", body.sectionKey, body.questionIdx,
+                            "cloud_not_authorized"))
+                    generated = None
+                except Exception:
+                    generated = None
+                if degraded is None:
+                    if generated is None:
+                        source, reply_id, text, degraded = (
+                            _rapport_bank_or_frozen_fallback(
+                                bank, "k1", body.sectionKey, body.questionIdx,
+                                "llm_unavailable"))
+                    else:
+                        source, text = "llm", generated
+                        reply_engine_version = engine.version
+                        asr_text_saved = asr_text
+
+    # provider I/O 之后重新开事务落账;撤回/隔离在窗口内生效则拒绝——
+    # 账本只追加,落错一行永远删不掉(与第2-8周 commit 围栏同口径)。
+    s.expire_all()
+    sess = s.get(TrainSession, session_id)
+    if sess is None or sess.week_no != 1:
+        raise HTTPException(409, "场次状态已变化，发声记录未落账")
+    if _session_read_restriction_reason(sess, s) is not None:
+        raise HTTPException(409, "受试者已撤回或内容受限，发声记录未落账")
+    if body.rawAudioId is not None:
+        asset_now = s.get(AudioAssetRow, body.rawAudioId)
+        if (asset_now is None or asset_now.withdrawn
+                or (asset_now.withdrawal_status or "").strip()):
+            raise HTTPException(409, "录音已进入撤回/隔离流程，发声记录未落账")
+    if body.mode == "auto" and body.rawAudioId is not None:
+        # provider 窗口内另一次 auto 可能已先落账:丢弃本次结果,回放已入账那句。
+        raced = s.exec(select(RapportUtteranceEvent).where(
+            RapportUtteranceEvent.session_id == session_id,
+            RapportUtteranceEvent.raw_audio_id == body.rawAudioId,
+            RapportUtteranceEvent.origin == "auto",
+        )).first()
+        if raced is not None and raced.id is not None:
+            return RapportReplyCreateOut(
+                utteranceId=raced.id, text=raced.text, source=raced.source,
+                replyId=raced.reply_id, degradedReason=raced.degraded_reason,
+                idempotent=True)
+    last_seq = s.exec(
+        select(func.max(RapportUtteranceEvent.event_seq)).where(
+            RapportUtteranceEvent.session_id == session_id)).one()
+    row = RapportUtteranceEvent(
+        session_id=session_id,
+        event_seq=int(last_seq or 0) + 1,
+        section_key=body.sectionKey,
+        question_idx=body.questionIdx,
+        source=source,
+        origin="auto" if body.mode == "auto" else "manual",
+        reply_id=reply_id,
+        text=text,
+        asr_text=asr_text_saved,
+        asr_engine_version=asr_engine_version,
+        reply_engine_version=reply_engine_version,
+        degraded_reason=degraded,
+        raw_audio_id=body.rawAudioId,
+        text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        is_simulation=bool(sess.is_simulation),
+    )
+    s.add(row)
+    try:
+        s.commit()
+    except IntegrityError:
+        s.rollback()
+        raise HTTPException(409, "发声账本并发写入冲突，请重试")
+    s.refresh(row)
+    assert row.id is not None
+    return RapportReplyCreateOut(
+        utteranceId=row.id, text=text, source=source, replyId=reply_id,
+        degradedReason=degraded)
 
 
 def _pause_projection(payload: dict, wseq: int) -> dict:
@@ -8294,6 +8586,7 @@ def _revalidate_tts_after_provider(
         manual_text: bool,
         command_key: str | None = None,
         capability_token_hash: str | None = None,
+        utterance_id: int | None = None,
         expected_text: str | None = None,
         serve_facts: _TtsServeFacts | None = None,
 ) -> None:
@@ -8322,6 +8615,7 @@ def _revalidate_tts_after_provider(
                     manual_text=manual_text,
                 )
             command_id: int | None = None
+            utterance_row_id: int | None = None
             if command_key is not None:
                 if (session_id is None
                         or capability_token_hash is None
@@ -8345,6 +8639,21 @@ def _revalidate_tts_after_provider(
                 if command_row is None or command_row.id is None:
                     _raise_tts_authorization_changed()
                 command_id = command_row.id
+            if utterance_id is not None:
+                if session_id is None or expected_text is None:
+                    _raise_tts_authorization_changed()
+                # 合成期间行不可变(只追加账本),要重验的是"live 仍指着这一行"。
+                utterance = s.get(RapportUtteranceEvent, utterance_id)
+                current = (_json_load(live.rapport_json)
+                           if live is not None else None)
+                if (utterance is None
+                        or utterance.session_id != session_id
+                        or utterance.text != expected_text
+                        or not isinstance(current, dict)
+                        or current.get("utteranceId") != utterance_id
+                        or current.get("beat") != "reply"):
+                    _raise_tts_authorization_changed()
+                utterance_row_id = utterance_id
             if serve_facts is None:
                 s.rollback()
                 return
@@ -8354,7 +8663,10 @@ def _revalidate_tts_after_provider(
                 session_id=session_id,
                 command_id=command_id,
                 source=("autopilot_command" if command_key is not None
+                        else "rapport_utterance"
+                        if utterance_row_id is not None
                         else "live_speak"),
+                utterance_id=utterance_row_id,
                 engine_version=serve_facts.engine_version,
                 cache_hit=serve_facts.cache_hit,
                 result=serve_facts.result,
@@ -8501,6 +8813,87 @@ def autopilot_command_tts(
         manual_text=False,
         command_key=command_key,
         capability_token_hash=token_hash,
+        expected_text=text,
+        serve_facts=serve_facts,
+    )
+    return response
+
+
+class RapportUtteranceTtsIn(BaseModel):
+    """Closed request contract: reply text is never accepted from a device."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@app.post("/sessions/{session_id}/rapport/utterances/{utterance_id}/tts")
+def rapport_utterance_tts(
+        session_id: str, utterance_id: int, request: Request,
+        body: RapportUtteranceTtsIn = RapportUtteranceTtsIn(),
+        s: DBSession = Depends(get_session)):
+    """按服务端持久发声行合成第1周回应句。
+
+    这是 LLM 现编句唯一的发声通道:文本按 id 从只追加账本加载,设备只报编号。
+    绕过静态白名单的授权依据是"行已持久化+live 正指着这一行"——llm 行只会
+    在受试者已过逐人云授权时被创建,这里不再重复那道门。
+    """
+    del body
+    _require_device_capability_token_hash(request, "合成关系建立回应话术")
+    _require_capability_bound_session(request, session_id, "合成关系建立回应话术")
+    with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
+        s.rollback()
+        s.expire_all()
+        live = _live_row_for_update(s)
+        _require_capability_bound_session(
+            request, session_id, "合成关系建立回应话术")
+        _require_capability_current_live(
+            request, s, "合成关系建立回应话术", live_row=live)
+        _require_capability_active_for_write(request, s, session_id)
+        _require_tts_session_authorization(
+            request, s, session_id=session_id, live=live, manual_text=False)
+        sess = s.get(TrainSession, session_id)
+        if sess is None or sess.week_no != 1:
+            raise HTTPException(409, "回应句发声只属于第1周关系建立场次")
+        utterance = s.get(RapportUtteranceEvent, utterance_id)
+        current = _json_load(live.rapport_json) if live is not None else None
+        if (utterance is None or utterance.session_id != session_id
+                or not isinstance(current, dict)
+                or current.get("utteranceId") != utterance_id
+                or current.get("beat") != "reply"):
+            # discard 封套:老人端按它静默丢弃,不把指针漂移计入引擎连败。
+            _raise_tts_authorization_changed()
+        text = utterance.text
+        utterance_source = utterance.source
+        patient_id = sess.patient_id
+        authorization_snapshot = _tts_authorization_snapshot(live, s)
+        # Release the read transaction before provider/cache I/O.
+        s.rollback()
+    if utterance_source == "llm":
+        # llm 行是患者派生文本(prompt 要求轻复述老人的词)。云授权可中途撤销,
+        # 出网决定必须在合成时刻、于 subject 围栏内重读——撤销端点持同一把锁,
+        # 它返回 200 之后这里不可能再放行新的云合成;撤销后落回本地 piper 嗓子。
+        with cloud_processing.serialized_subject_egress(patient_id):
+            s.rollback()
+            patient_row = s.get(Patient, patient_id)
+            policy_provider = type("_PolicyCloudProvider", (), {
+                "data_boundary": "cloud",
+                "provider_id": cloud_processing.current_policy().provider_id,
+            })()
+            allow_cloud = (patient_row is not None
+                           and not cloud_processing.authorization_issues(
+                               patient_row, policy_provider))
+            s.rollback()
+            response, serve_facts = _synthesize_tts_text(
+                text, lambda t: tts.speak_rapport_utterance(
+                    t, allow_cloud=allow_cloud))
+    else:
+        # bank/script/fallback 行本就在冻结白名单里,不是患者数据。
+        response, serve_facts = _synthesize_tts_text(
+            text, tts.speak_rapport_utterance)
+    _revalidate_tts_after_provider(
+        request, s,
+        expected_snapshot=authorization_snapshot,
+        manual_text=False,
+        utterance_id=utterance_id,
         expected_text=text,
         serve_facts=serve_facts,
     )
@@ -9559,18 +9952,32 @@ def patient_presentation_get(
                 raise HTTPException(409, "当前关系建立游标损坏，拒绝呈现")
             beat = rapport.get("beat", "ask")
             reply_id = rapport.get("replyId")
-            if beat not in {"ask", "reply"} or not isinstance(
-                    reply_id, (str, type(None))):
+            utterance_ref = rapport.get("utteranceId")
+            if (beat not in {"ask", "reply"}
+                    or not isinstance(reply_id, (str, type(None)))
+                    or isinstance(utterance_ref, bool)
+                    or not isinstance(utterance_ref, (int, type(None)))):
                 raise HTTPException(409, "当前关系建立游标损坏，拒绝呈现")
             script = content.load_week1_script(
                 content.CONTENT_DIR / "week1_script.json")
-            try:
-                speaker, text = patient_presentation.resolve_rapport_text(
-                    script, section_key=section_key, question_idx=question_idx,
-                    beat=beat, reply_id=reply_id,
-                    reply_bank=_week1_reply_bank() if reply_id else None)
-            except ValueError as exc:
-                raise HTTPException(409, str(exc)) from exc
+            if utterance_ref is not None and beat == "reply":
+                # 回应文本以持久发声行为准:屏显与朗读同源,含 LLM 现编句。
+                utterance = s.get(RapportUtteranceEvent, utterance_ref)
+                if (utterance is None
+                        or utterance.session_id != session_id
+                        or utterance.section_key != section_key
+                        or utterance.question_idx != question_idx):
+                    raise HTTPException(409, "当前回应发声记录与场次不一致")
+                speaker, text = "机器人", utterance.text
+            else:
+                try:
+                    speaker, text = patient_presentation.resolve_rapport_text(
+                        script, section_key=section_key,
+                        question_idx=question_idx,
+                        beat=beat, reply_id=reply_id,
+                        reply_bank=_week1_reply_bank() if reply_id else None)
+                except ValueError as exc:
+                    raise HTTPException(409, str(exc)) from exc
             return PatientRapportPresentationOut(
                 session_id=session_id,
                 script_version_id=str(script["script_version_id"]),

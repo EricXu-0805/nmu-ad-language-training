@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { DeviceCredentialSelection } from "../api.ts";
 import { ApiError } from "../apiResponse.ts";
+import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import {
   acknowledgeExactAutopilotDrain,
   authorizeExactAutopilotRecording,
@@ -247,10 +248,17 @@ test("exact media errors preserve canonical API details and run auth-loss handli
   await assert.rejects(
     () => fetchExactAutopilotTts(
       "S/ONE", pendingTts("cmd-stale-0001"), new AbortController().signal, deps),
-    (error: unknown) => error instanceof ApiError
-      && error.status === 409
-      && error.detailEnvelope === "nested-detail"
-      && (error.detailData as { code?: string }).code === "autopilot_command_not_current",
+    (error: unknown) => {
+      // TTS 侧现在带 failure_stage 包装;原 ApiError 语义原封进 cause,不丢细节。
+      if (!(error instanceof AutopilotMediaError)) return false;
+      if (error.errorCode !== "audio_playback_failed"
+        || error.failureStage !== "fetch_failed") return false;
+      const cause = error.cause;
+      return cause instanceof ApiError
+        && cause.status === 409
+        && cause.detailEnvelope === "nested-detail"
+        && (cause.detailData as { code?: string }).code === "autopilot_command_not_current";
+    },
   );
   assert.deepEqual(authFailures, [409]);
 });
@@ -324,7 +332,10 @@ test("missing exact active capability fails before any network request", async (
   await assert.rejects(
     () => fetchExactAutopilotTts(
       "S/ONE", pendingTts("cmd-tts-0001"), new AbortController().signal, deps),
-    (error: unknown) => error instanceof ApiError && error.status === 401,
+    (error: unknown) => error instanceof AutopilotMediaError
+      && error.errorCode === "audio_playback_failed"
+      && error.failureStage === "credential_rotated"
+      && error.cause instanceof ApiError && error.cause.status === 401,
   );
   assert.equal(requests, 0);
 });

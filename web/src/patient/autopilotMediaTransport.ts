@@ -1,5 +1,6 @@
 import type { DeviceCredentialSelection } from "../api.ts";
 import { ApiError, decodeJsonApiResponse } from "../apiResponse.ts";
+import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import type { RecordingAuthorization } from "./recordingAuthorization.ts";
 import {
   parseNextCommandProjection,
@@ -98,6 +99,21 @@ function exactActiveCredential(
   return credential;
 }
 
+// TTS 专用包装：录音/收麦路径继续拿原始 ApiError，语义不变；
+// 只有 TTS 失败回执需要携带 credential_rotated 阶段。
+function exactTtsActiveCredential(
+  sessionId: string,
+  deps: AutopilotMediaTransportDependencies,
+): DeviceCredentialSelection {
+  try {
+    return exactActiveCredential(sessionId, deps);
+  } catch (error) {
+    throw new AutopilotMediaError(
+      "audio_playback_failed", "当前场次没有可用的独立老人端设备凭据",
+      { cause: error, failureStage: "credential_rotated" });
+  }
+}
+
 function commandPath(sessionId: string, commandKey: string, action: string): string {
   return `/sessions/${encodeURIComponent(sessionId)}/autopilot/commands/`
     + `${encodeURIComponent(commandKey)}/${action}`;
@@ -145,9 +161,11 @@ async function revalidateExactTtsAuthority(
   if (signal.aborted) {
     throw signal.reason ?? new DOMException("语音播放已取消", "AbortError");
   }
-  const before = exactActiveCredential(authority.sessionId, deps);
+  const before = exactTtsActiveCredential(authority.sessionId, deps);
   if (before.record?.capability !== authority.capability) {
-    throw new Error("TTS 播放前设备凭据已变化，拒绝播放旧话术");
+    throw new AutopilotMediaError(
+      "audio_playback_failed", "TTS 播放前设备凭据已变化，拒绝播放旧话术",
+      { failureStage: "credential_rotated" });
   }
   const currentValue = await deps.nextCommand(authority.sessionId);
   if (signal.aborted) {
@@ -155,15 +173,19 @@ async function revalidateExactTtsAuthority(
   }
   // Check again after /next: browser storage can rotate while that request is
   // in flight.  A replacement capability must synthesize its own bytes.
-  const after = exactActiveCredential(authority.sessionId, deps);
+  const after = exactTtsActiveCredential(authority.sessionId, deps);
   if (after.record?.capability !== authority.capability) {
-    throw new Error("TTS 播放前设备凭据已变化，拒绝播放旧话术");
+    throw new AutopilotMediaError(
+      "audio_playback_failed", "TTS 播放前设备凭据已变化，拒绝播放旧话术",
+      { failureStage: "credential_rotated" });
   }
   const current = currentValue === null ? null : parseNextCommandProjection(currentValue);
   if (current?.kind !== "tts" || current.state !== "pending"
       || current.command_key !== authority.commandKey
       || ttsCommandIdentity(current) !== authority.commandIdentity) {
-    throw new Error("TTS 播放前服务器运行时或命令世代已变化，拒绝播放旧话术");
+    throw new AutopilotMediaError(
+      "audio_playback_failed", "TTS 播放前服务器运行时或命令世代已变化，拒绝播放旧话术",
+      { failureStage: "authority_changed" });
   }
 }
 
@@ -181,30 +203,43 @@ export async function fetchExactAutopilotTts(
 ): Promise<Blob | null> {
   const parsed = parseNextCommandProjection(expectedCommand);
   if (parsed.kind !== "tts" || parsed.state !== "pending") {
-    throw new Error("仅 pending TTS 命令可请求精确语音");
+    throw new AutopilotMediaError(
+      "audio_playback_failed", "仅 pending TTS 命令可请求精确语音",
+      { failureStage: "executor_start_failed" });
   }
-  const credential = exactActiveCredential(sessionId, deps);
+  const credential = exactTtsActiveCredential(sessionId, deps);
   const authority: ExactTtsAuthority = {
     sessionId,
     commandKey: parsed.command_key,
     commandIdentity: ttsCommandIdentity(parsed),
     capability: credential.record!.capability,
   };
-  const response = await exactCommandPost(
-    sessionId,
-    parsed.command_key,
-    "tts",
-    signal,
-    deps,
-    credential,
-  );
+  let response: Response;
+  try {
+    response = await exactCommandPost(
+      sessionId,
+      parsed.command_key,
+      "tts",
+      signal,
+      deps,
+      credential,
+    );
+  } catch (error) {
+    // 取消不是网络失败；ApiError 语义保留在 cause 里，不在这里吞掉。
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw new AutopilotMediaError(
+      "audio_playback_failed", "TTS 合成请求失败",
+      { cause: error, failureStage: "fetch_failed" });
+  }
   if (response.status === 204) return null;
 
   // Synthesis runs outside the server command lock and may take seconds.
   await revalidateExactTtsAuthority(authority, signal, deps);
   const blob = await response.blob();
   if (blob.size <= 0 || !blob.type.startsWith("audio/")) {
-    throw new Error("TTS 服务返回的音频无效");
+    throw new AutopilotMediaError(
+      "audio_playback_failed", "TTS 服务返回的音频无效",
+      { failureStage: "blob_invalid" });
   }
   // Blob materialization can itself be asynchronous.  Re-prove exact authority
   // at the last await boundary before URL creation/play; stale bytes are dropped

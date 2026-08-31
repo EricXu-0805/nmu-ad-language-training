@@ -106,6 +106,10 @@ _ROUTE_RULES = (
     _route({"POST"}, r"/sessions/[^/]+/autopilot/commands/[^/]+/tts",
            AccessKind.DEVICE, roles=TRAINING_OPERATION_ROLES,
            label="合成当前自动驾驶话术"),
+    # 回应句发声只认"服务端持久 utterance 行";空 body,客户端递不进文本。
+    _route({"POST"}, r"/sessions/[^/]+/rapport/utterances/[^/]+/tts",
+           AccessKind.DEVICE, roles=TRAINING_OPERATION_ROLES,
+           label="合成关系建立回应话术"),
     _route(
         {"POST"},
         r"/sessions/[^/]+/autopilot/commands/[^/]+/recording-authorization",
@@ -168,6 +172,8 @@ _ROUTE_RULES = (
            label="读取去标识研究数据"),
     _route({"POST"}, r"/ai/provider-readiness/probe", AccessKind.ACCOUNT,
            roles=ADMIN_ROLES, label="执行 AI 服务合成检查"),
+    _route({"POST"}, r"/sessions/[^/]+/rapport/replies", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="生成第1周回应句发声记录"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/start", AccessKind.ACCOUNT,
            roles=CAREGIVER_SESSION_CONTROL_ROLES, label="启动限定自动驾驶范围"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/takeover", AccessKind.ACCOUNT,

@@ -955,6 +955,58 @@ def _reject_interaction_presentation_receipt_mutation(*_args) -> None:
     raise RuntimeError("InteractionPresentationReceipt 是只追加幂等回执")
 
 
+class RapportUtteranceEvent(SQLModel, table=True):
+    """第1周关系建立:机器人在回应拍定稿待说的那句话——只追加发声账本。
+
+    行落库在开口**之前**;是否真读给老人听,以 ttsserveevidence
+    (source='rapport_utterance', utterance_id=本行 id) 为准——两表合看才是
+    「说了什么+是否说出」的完整还原。
+
+    补的缺口:回应句从「照脚本可还原」变成「可选/可生成」之后,不落库就无法
+    还原机器人对老人说过什么。``text`` 恒为最终说出口的成句(槽位已回落);
+    ``asr_text`` 仅 llm 来源持有,是喂给生成器的老人转写——属患者数据,
+    不进任何研究导出/研究只读接口。
+    """
+    __table_args__ = (
+        UniqueConstraint("session_id", "event_seq",
+                         name="uq_rapport_utterance_session_event_seq"),
+        CheckConstraint("event_seq >= 1",
+                        name="ck_rapport_utterance_event_seq_positive"),
+        CheckConstraint("source IN ('script','bank','llm','fallback')",
+                        name="ck_rapport_utterance_source"),
+        CheckConstraint("origin IN ('auto','manual')",
+                        name="ck_rapport_utterance_origin"),
+        CheckConstraint("length(trim(text)) >= 1",
+                        name="ck_rapport_utterance_text_nonempty"),
+        CheckConstraint("question_idx >= 0",
+                        name="ck_rapport_utterance_question_idx"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: str = Field(foreign_key="session.session_id", index=True)
+    event_seq: int
+    section_key: str
+    question_idx: int
+    source: str = Field(index=True)     # script/bank/llm/fallback
+    origin: str = "manual"              # auto=系统自动回应 manual=研究者手点
+    reply_id: Optional[str] = None      # bank 来源:28句库句 id
+    text: str                           # 最终说出口的成句
+    asr_text: Optional[str] = None      # llm 来源:喂给生成器的老人转写(患者数据)
+    asr_engine_version: Optional[str] = None
+    reply_engine_version: Optional[str] = None
+    degraded_reason: Optional[str] = None  # asr_failed/asr_empty/llm_unavailable/llm_rejected/cloud_not_authorized
+    raw_audio_id: Optional[str] = None  # 回应针对的那段老人录音
+    text_sha256: str                    # 与 TtsServeEvidence.text_sha256 同口径
+    created_at: datetime = Field(default_factory=datetime.now)
+    is_simulation: bool = False
+
+
+@sa_event.listens_for(RapportUtteranceEvent, "before_update")
+@sa_event.listens_for(RapportUtteranceEvent, "before_delete")
+def _reject_rapport_utterance_mutation(*_args) -> None:
+    raise RuntimeError("RapportUtteranceEvent 是只追加发声证据，禁止更新或删除")
+
+
 class TechnicalPauseReceipt(SQLModel, table=True):
     """Durable receipt for one atomic researcher-triggered technical pause.
 
@@ -2181,8 +2233,9 @@ class TtsServeEvidence(SQLModel, table=True):
     不记行：行存在 ⇔ 字节确实返回给了请求方。
     """
     __table_args__ = (
-        CheckConstraint("source IN ('autopilot_command','live_speak')",
-                        name="ck_tts_serve_source"),
+        CheckConstraint(
+            "source IN ('autopilot_command','live_speak','rapport_utterance')",
+            name="ck_tts_serve_source"),
         CheckConstraint("result IN ('served','degraded')",
                         name="ck_tts_serve_result"),
         CheckConstraint(
@@ -2193,8 +2246,12 @@ class TtsServeEvidence(SQLModel, table=True):
             "(result = 'degraded' AND byte_count IS NULL)",
             name="ck_tts_serve_bytes_match_result"),
         CheckConstraint(
-            "(source = 'autopilot_command' AND command_id IS NOT NULL) OR "
-            "(source = 'live_speak' AND command_id IS NULL)",
+            "(source = 'autopilot_command' AND command_id IS NOT NULL "
+            "AND utterance_id IS NULL) OR "
+            "(source = 'live_speak' AND command_id IS NULL "
+            "AND utterance_id IS NULL) OR "
+            "(source = 'rapport_utterance' AND command_id IS NULL "
+            "AND utterance_id IS NOT NULL)",
             name="ck_tts_serve_command_binding"),
         Index("ix_tts_serve_session_created", "session_id", "created_at"),
     )
@@ -2204,6 +2261,9 @@ class TtsServeEvidence(SQLModel, table=True):
         default=None, foreign_key="session.session_id", index=True)
     command_id: Optional[int] = Field(
         default=None, foreign_key="runtimecommand.id", index=True)
+    # rapport_utterance 来源指向 rapportutteranceevent.id；应用层校验归属，
+    # 不设 FK——batch 重建表时给既有行补无名内联 FK 会破坏 DDL 与模型的逐字对齐。
+    utterance_id: Optional[int] = Field(default=None, index=True)
     source: str
     engine_version: str
     cache_hit: bool = False

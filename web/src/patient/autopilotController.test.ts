@@ -742,7 +742,102 @@ test("a real playback failure is ACKed and remains distinguishable from a transp
   assert.equal(state.pause_reason, "tts_failed");
   assert.equal(acks.length, 1);
   assert.equal(acks[0]?.ack_type, "tts_failed");
+  // 无 stage 的裸 Error 失败绝不注入 failure_stage 键（存量语义保持）。
+  assert.equal(Object.hasOwn(acks[0] ?? {}, "failure_stage"), false);
   assert.equal(cancels, 1);
+});
+
+test("带 stage 的播放拒绝照实回执 failure_stage=play_rejected", async () => {
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-ONE",
+    transport: {
+      next: async () => questionCommand(),
+      ack: async (_sessionId, _commandKey, ack) => { acks.push(ack); return {}; },
+    },
+    speech: {
+      start: () => ({
+        started: Promise.reject(new AutopilotMediaError(
+          "audio_playback_failed", "浏览器拒绝开始播放合成语音",
+          { failureStage: "play_rejected" })),
+        ended: Promise.resolve({}),
+        closed: Promise.resolve(),
+        cancel: () => {},
+      }),
+    },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+  });
+  const state = await controller.pollOnce();
+  assert.equal(state.pause_reason, "tts_failed");
+  const failed = acks[0];
+  assert.equal(failed?.ack_type, "tts_failed");
+  if (failed?.ack_type === "tts_failed") {
+    assert.equal(failed.error_code, "audio_playback_failed");
+    assert.equal(failed.failure_stage, "play_rejected");
+  }
+});
+
+test("speech.start 同步抛带 stage 错误时回执 failure_stage=fetch_failed", async () => {
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-ONE",
+    transport: {
+      next: async () => questionCommand(),
+      ack: async (_sessionId, _commandKey, ack) => { acks.push(ack); return {}; },
+    },
+    speech: {
+      start: () => {
+        throw new AutopilotMediaError(
+          "audio_playback_failed", "TTS 合成请求失败",
+          { failureStage: "fetch_failed" });
+      },
+    },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+  });
+  const state = await controller.pollOnce();
+  assert.equal(state.pause_reason, "tts_failed");
+  const failed = acks[0];
+  assert.equal(failed?.ack_type, "tts_failed");
+  if (failed?.ack_type === "tts_failed") {
+    assert.equal(failed.error_code, "audio_playback_failed");
+    assert.equal(failed.failure_stage, "fetch_failed");
+  }
+});
+
+test("TTS 启动超时回执 device_command_timeout + failure_stage=media_timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const acks: AutopilotAck[] = [];
+  const controller = new PatientAutopilotController({
+    sessionId: "S-ONE",
+    transport: {
+      next: async () => questionCommand(),
+      ack: async (_sessionId, _commandKey, ack) => { acks.push(ack); return {}; },
+    },
+    speech: {
+      start: () => ({
+        started: new Promise(() => {}),
+        ended: new Promise(() => {}),
+        closed: Promise.resolve(),
+        cancel: () => {},
+      }),
+    },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+  });
+  const polled = controller.pollOnce();
+  // 先让 pollOnce 走到 observeMedia 挂上 15s 定时器，再推进假时钟。
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  t.mock.timers.tick(15_000);
+  const state = await polled;
+  assert.equal(state.pause_reason, "tts_failed");
+  const failed = acks[0];
+  assert.equal(failed?.ack_type, "tts_failed");
+  if (failed?.ack_type === "tts_failed") {
+    assert.equal(failed.error_code, "device_command_timeout");
+    assert.equal(failed.failure_stage, "media_timeout");
+  }
 });
 
 test("stopAndWait never treats a cancelled pending microphone as physically closed", async () => {

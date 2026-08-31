@@ -55,6 +55,10 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   // 老人重新听见的是问题本身,不是一句悬空的回应。
   const [beat, setBeat] = useState<RapportBeat>("ask");
   const [spokenReply, setSpokenReply] = useState<string | null>(null);
+  const [replyMeta, setReplyMeta] = useState<string | null>(null);
+  // 默认开:老人说完,系统自动生成一句回应(AI 听完现编;不可用时落回句库)。
+  const [autoReply, setAutoReply] = useState(true);
+  const [replyPending, setReplyPending] = useState(false);
   const { bank: replyBank } = useWeek1ReplyBank();
   // 同一组连点两次不该说同一句;按组各记一个游标,轮着来。
   const replyCursor = useRef<Record<string, number>>({});
@@ -71,7 +75,20 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const replyLine = section?.speaker === "机器人" ? (questions[qIdx]?.success ?? null) : null;
   const openReplyHere = Boolean(replyBank?.applies_to.some(
     (row) => row.section_key === section?.key && row.question_idx === qIdx));
+  // 自动回应按节判定:录音只绑到节,节内含身份问询问位(自我介绍)整节退回手点。
+  const autoOpenHere = Boolean(openReplyHere && questions.length > 0
+    && questions.every((_q, i) => replyBank?.applies_to.some(
+      (row) => row.section_key === section?.key && row.question_idx === i)));
   const recSeq = useRef(0);
+  // 自动回应回来时研究者可能已换问:回应只写回它出发时的那一问。
+  const posRef = useRef("");
+  posRef.current = `${section?.key ?? ""}#${qIdx}`;
+  const recStateRef = useRef("idle");
+  recStateRef.current = recState;
+  // 三条回应入口共用的在途闩:state 异步,同帧竞态只有 ref 挡得住。
+  const replyBusyRef = useRef(false);
+  // 只有「这一问示意过录音」的收据才允许自动回应——同节迟到收据不冒名顶替。
+  const lastArmedPosRef = useRef<string | null>(null);
   // ★必须在所有 early-return 之前:hook 写在条件 return 后面,脚本从"加载中"变"已加载"
   // 那一帧 hook 数量改变,React 抛错卸载整棵树——整页按钮全部失灵。
   const [proxyBusy, setProxyBusy] = useState(false);
@@ -236,6 +253,32 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   useEffect(() => () => withdrawRef.current(), []);
   useEffect(() => { if (recoveryError) withdrawRef.current(); }, [recoveryError]);
 
+  const replySourceLabel = (source: string, reason: string | null): string => {
+    const base = source === "llm" ? "AI 现编"
+      : source === "bank" ? "冻结句库"
+        : source === "script" ? "冻结脚本" : "句库兜底";
+    const why = reason === "asr_failed" ? "，没听清录音"
+      : reason === "asr_empty" ? "，老人没说话"
+        : reason === "llm_unavailable" ? "，AI 暂不可用"
+          : reason === "cloud_not_authorized" ? "，受试者未授权云处理" : "";
+    return `${base}${why}`;
+  };
+  const applyReply = async (
+    u: { utteranceId: number; text: string; source: string; degradedReason: string | null },
+    sk: string, qi: number,
+  ) => {
+    if (recStateRef.current !== "idle") return; // 已重新示意录音:不许回应句顶掉 armed
+    setBeat("reply");
+    setSpokenReply(u.text);
+    setReplyMeta(replySourceLabel(u.source, u.degradedReason));
+    const accepted = await postRapport({ sectionKey: sk, questionIdx: qi, beat: "reply", utteranceId: u.utteranceId, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
+    if (!accepted) {
+      // 落库被拒=机器人没开口;「刚说了」的断言必须收回,不许屏上说谎。
+      setSpokenReply(null);
+      setReplyMeta(null);
+      toast("回应句没有送到老人端——检查场次状态后可点分组重试", "warn");
+    }
+  };
   // 老人端录音落库回报 → 记入作业日志(收尾屏音频闸门据此列出)
   useAudioSaved((m) => {
     if (m.sessionId !== session.session_id) return; // 跨场次残留/迟到回报一律丢弃
@@ -261,6 +304,23 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     }
     setRecState("idle");
     toast(`录音已保存（${m.durationSeconds.toFixed(1)} 秒）${m.containsDirectIdentifier ? "。这段录音含直接身份信息，导出时会被拦下" : ""}`, "ok");
+    // 互动态:录音一落账,机器人自己接话。失败不打断流程,研究者还能手点分组。
+    if (autoReply && autoOpenHere && !interactionBlocked && replyBank
+      && !replyBusyRef.current && lastArmedPosRef.current === posRef.current) {
+      const sk = section?.key ?? "";
+      const qi = qIdx;
+      const posAt = posRef.current;
+      replyBusyRef.current = true;
+      setReplyPending(true);
+      api.rapportReplyCreate(session.session_id, {
+        sectionKey: sk, questionIdx: qi, mode: "auto", rawAudioId: m.rawAudioId,
+      }).then((u) => {
+        if (posRef.current !== posAt) return;
+        void applyReply(u, sk, qi);
+      }).catch(() => {
+        toast("自动回应没有生成——可以点下面的分组，让机器人照句库说一句", "warn");
+      }).finally(() => { replyBusyRef.current = false; setReplyPending(false); });
+    }
   });
 
   if (scriptError) return <Alert tone="danger" title="第 1 周脚本校验失败">系统已安全暂停，不能使用未经校验的话术开场：{scriptError}</Alert>;
@@ -277,6 +337,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setQIdx(q);
     setBeat("ask");
     setSpokenReply(null);
+    setReplyMeta(null);
     setRapportFlags(nextFlags);
     postRapport({ sectionKey: s?.key ?? "", questionIdx: q, beat: "ask", recording: "idle", recSeq: recSeq.current, ...nextFlags });
   };
@@ -287,34 +348,52 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       toast(recStatus === "denied" ? "服务器当前未授权本场录音" : "录音授权尚未确认，系统保持关麦", "warn");
       return;
     }
+    if (replyPending || replyBusyRef.current) return; // 回应在途不开麦:防 idle 写顶掉 armed
+    lastArmedPosRef.current = posRef.current;
     recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
     lastArmedKey.current = `关系建立·${section?.key ?? ""}`;
     setRecState("armed");
     setBeat("ask");
     setSpokenReply(null);
+    setReplyMeta(null);
     postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "ask", recording: "armed", recSeq: recSeq.current, ...rapportFlags });
   };
   // 老人答完 → 机器人把冻结脚本里写好的那句回应读出来。只在关麦时可用,发出去的
   // recording 与当前状态一致,所以这一步不碰录音链,只换屏上那句话和朗读内容。
   const sayReply = () => {
-    if (interactionBlocked || !replyLine || recState !== "idle") return;
-    setBeat("reply");
-    setSpokenReply(replyLine);
-    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "reply", recording: "idle", recSeq: recSeq.current, ...rapportFlags });
+    if (interactionBlocked || !replyLine || recState !== "idle" || replyPending
+      || replyBusyRef.current) return;
+    const sk = section?.key ?? "";
+    const qi = qIdx;
+    const posAt = posRef.current;
+    replyBusyRef.current = true;
+    setReplyPending(true);
+    api.rapportReplyCreate(session.session_id, { sectionKey: sk, questionIdx: qi, mode: "script" })
+      .then((u) => { if (posRef.current === posAt) void applyReply(u, sk, qi); })
+      .catch(() => toast("回应句没有生成，请再试一次", "danger"))
+      .finally(() => { replyBusyRef.current = false; setReplyPending(false); });
   };
   // 研究者点的是「刚才是哪种情况」,系统在那一组里轮一句。他刚听完老人说什么,
   // 这个判断比任何自动分类都准——第1周不判分、没有 attempt,录音本来就不转写,
   // 系统这一侧没有老人说了什么的文本。
   const sayGroupReply = (group: string) => {
-    if (interactionBlocked || recState !== "idle" || !replyBank) return;
+    if (interactionBlocked || recState !== "idle" || !replyBank || replyPending
+      || replyBusyRef.current) return;
     const pool = replyBank.replies.filter((r) => r.group === group);
     if (!pool.length) return;
     const n = (replyCursor.current[group] ?? -1) + 1;
     replyCursor.current[group] = n;
     const chosen = pool[n % pool.length];
-    setBeat("reply");
-    setSpokenReply(chosen.text);
-    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "reply", replyId: chosen.id, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
+    const sk = section?.key ?? "";
+    const qi = qIdx;
+    const posAt = posRef.current;
+    replyBusyRef.current = true;
+    setReplyPending(true);
+    api.rapportReplyCreate(session.session_id, {
+      sectionKey: sk, questionIdx: qi, mode: "bank", replyId: chosen.id,
+    }).then((u) => { if (posRef.current === posAt) void applyReply(u, sk, qi); })
+      .catch(() => toast("回应句没有生成，请再试一次", "danger"))
+      .finally(() => { replyBusyRef.current = false; setReplyPending(false); });
   };
   const stopRecording = () => {
     setRecState("idle");
@@ -431,9 +510,9 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
             </ol>
             <div className="toolbar rapport-question-actions">
               <div className="row">
-                <Button disabled={interactionBlocked || qIdx === 0} onClick={() => go(sectionIdx, qIdx - 1)}>上一问</Button>
+                <Button disabled={interactionBlocked || replyPending || qIdx === 0} onClick={() => go(sectionIdx, qIdx - 1)}>上一问</Button>
                 {!openReplyHere && (
-                  <Button variant="primary" disabled={interactionBlocked || !replyLine || recState !== "idle"}
+                  <Button variant="primary" disabled={interactionBlocked || !replyLine || recState !== "idle" || replyPending}
                     title={replyLine
                       ? (recState === "idle" ? undefined : "先停止录音，再让机器人回应")
                       : "冻结脚本没有为这一问写回应句，要先由内容组补上"}
@@ -441,25 +520,37 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
                     {beat === "reply" ? "再说一次回应" : "让机器人回应"}
                   </Button>
                 )}
-                <Button disabled={interactionBlocked || qIdx >= questions.length - 1} onClick={() => go(sectionIdx, qIdx + 1)}>下一问</Button>
+                <Button disabled={interactionBlocked || replyPending || qIdx >= questions.length - 1} onClick={() => go(sectionIdx, qIdx + 1)}>下一问</Button>
               </div>
               <span className="muted">第 {qIdx + 1} / {questions.length} 问</span>
             </div>
             {openReplyHere && replyBank && (
               <div className="rapport-reply-picker">
-                <p className="muted">受试者答完了，刚才是哪种情况？点一下，机器人就照这个说一句。</p>
+                {autoOpenHere && (
+                  <label className="row">
+                    <input type="checkbox" checked={autoReply}
+                      onChange={(e) => setAutoReply(e.target.checked)} />
+                    <span>老人说完自动回应（AI 听完现编一句；听不清或 AI 不可用时自动改用句库）</span>
+                  </label>
+                )}
+                <p className="muted">{autoOpenHere
+                  ? "也可以手点：刚才是哪种情况？点一下，机器人就照句库说一句。"
+                  : "本节含身份问询问位，不开自动回应——刚才是哪种情况？点一下，机器人就照句库说一句。"}</p>
                 <div className="row wrap">
                   {replyBank.groups.map((g) => (
                     <Button key={g.key} variant={g.key === "接着聊" ? "primary" : undefined}
-                      disabled={interactionBlocked || recState !== "idle"}
+                      disabled={interactionBlocked || recState !== "idle" || replyPending}
                       title={recState === "idle" ? g.hint : "先停止录音，再让机器人回应"}
                       onClick={() => sayGroupReply(g.key)}>{g.key}</Button>
                   ))}
                 </div>
+                {replyPending && <p className="muted" role="status">小语正在想怎么回应…</p>}
               </div>
             )}
             {spokenReply && (
-              <p className="muted" role="status" aria-live="polite">机器人刚说了：{spokenReply}</p>
+              <p className="muted" role="status" aria-live="polite">
+                机器人刚说了：{spokenReply}{replyMeta ? `（${replyMeta}）` : ""}
+              </p>
             )}
           </>
         )}

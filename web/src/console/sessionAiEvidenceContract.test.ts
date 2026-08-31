@@ -13,6 +13,7 @@ function ttsRow(overrides: Record<string, unknown> = {}): Record<string, unknown
     id: 1,
     session_id: SID,
     command_id: 7,
+    utterance_id: null,
     source: "autopilot_command",
     engine_version: "qwen-tts-v1",
     cache_hit: false,
@@ -60,6 +61,15 @@ test("parseTtsServeEvidenceList: rejects a row from a foreign session", () => {
 
 test("parseTtsServeEvidenceList: rejects unknown source/result enum values", () => {
   assert.throws(() => parseTtsServeEvidenceList([ttsRow({ source: "phone_call" })], SID, false));
+  assert.doesNotThrow(() => parseTtsServeEvidenceList([
+    ttsRow({ id: 3, source: "rapport_utterance", command_id: null, utterance_id: 7 }),
+  ], SID, false));
+  assert.throws(() => parseTtsServeEvidenceList([
+    ttsRow({ id: 4, source: "rapport_utterance", command_id: null, utterance_id: null }),
+  ], SID, false));
+  assert.throws(() => parseTtsServeEvidenceList([
+    ttsRow({ id: 5, source: "live_speak", command_id: null, utterance_id: 7 }),
+  ], SID, false));
   assert.throws(() => parseTtsServeEvidenceList([ttsRow({ result: "cancelled" })], SID, false));
 });
 

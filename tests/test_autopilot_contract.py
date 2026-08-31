@@ -5,6 +5,7 @@ from app.autopilot_contract import (
     AutopilotAckIn,
     RecordCommandPayload,
     TtsCommandPayload,
+    _ACK_FAILURE_STAGES,
     effect_after_tts_ended,
     transition_for_ack,
 )
@@ -127,6 +128,77 @@ def test_failed_ack_requires_bounded_machine_error_code():
             command_revision=0,
             device_event_seq=3,
             error_code="invented_free_form_reason",
+        )
+
+
+def test_failure_stage_membership_is_pinned():
+    # 双端手抄闭集：这里逐个成员钉死，前端 autopilotProtocol.test.ts 钉另一份。
+    assert _ACK_FAILURE_STAGES == frozenset({
+        "credential_rotated",
+        "authority_changed",
+        "blob_invalid",
+        "media_decode_error",
+        "play_rejected",
+        "media_timeout",
+        "fetch_failed",
+        "executor_start_failed",
+    })
+
+
+def test_failed_ack_may_carry_a_closed_failure_stage():
+    staged = AutopilotAckIn(
+        idempotency_key="ack-tts-failed-4",
+        ack_type="tts_failed",
+        control_generation=1,
+        runner_generation=1,
+        command_revision=0,
+        device_event_seq=4,
+        error_code="audio_playback_failed",
+        failure_stage="media_timeout",
+    )
+    assert staged.failure_stage == "media_timeout"
+    assert staged.event_payload() == {
+        "error_code": "audio_playback_failed",
+        "failure_stage": "media_timeout",
+    }
+    bare = AutopilotAckIn(
+        idempotency_key="ack-rec-failed-5",
+        ack_type="record_failed",
+        control_generation=1,
+        runner_generation=1,
+        command_revision=0,
+        device_event_seq=5,
+        error_code="recording_start_failed",
+    )
+    assert bare.failure_stage is None
+    assert bare.event_payload() == {"error_code": "recording_start_failed"}
+
+
+def test_failure_stage_outside_closed_set_is_rejected():
+    with pytest.raises(ValidationError):
+        AutopilotAckIn(
+            idempotency_key="ack-tts-failed-6",
+            ack_type="tts_failed",
+            control_generation=1,
+            runner_generation=1,
+            command_revision=0,
+            device_event_seq=6,
+            error_code="audio_playback_failed",
+            failure_stage="invented_stage",
+        )
+
+
+def test_non_failure_ack_cannot_carry_failure_stage():
+    with pytest.raises(ValidationError):
+        AutopilotAckIn(
+            idempotency_key="ack-tts-ended-9",
+            ack_type="tts_ended",
+            control_generation=1,
+            runner_generation=1,
+            command_revision=0,
+            device_event_seq=7,
+            media_ended=True,
+            failure_stage="media_timeout",
         )
 
 

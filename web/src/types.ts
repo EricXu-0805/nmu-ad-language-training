@@ -296,6 +296,7 @@ export interface SessionRuntimeRapportStep {
   sessionId?: string;
   sectionKey: string;
   questionIdx: number;
+  utteranceId?: number;
   recording?: string;
   recSeq?: number;
   paused?: boolean;

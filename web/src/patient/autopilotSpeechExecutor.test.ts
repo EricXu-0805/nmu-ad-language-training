@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
 import {
   BrowserAutopilotSpeechExecutor,
@@ -188,9 +189,12 @@ test("audio error rejects media facts, closes, pauses, and revokes the URL once"
 test("play rejection closes, pauses, and revokes the created URL", async () => {
   const run = harness({ playResult: Promise.reject(new Error("autoplay rejected")) });
   const playback = run.start();
+  const playRejected = (error: unknown) => error instanceof AutopilotMediaError
+    && error.failureStage === "play_rejected"
+    && String((error.cause as Error | undefined)?.message).includes("autoplay rejected");
   await Promise.all([
-    assert.rejects(playback.started, /autoplay rejected/),
-    assert.rejects(playback.ended, /autoplay rejected/),
+    assert.rejects(playback.started, playRejected),
+    assert.rejects(playback.ended, playRejected),
     playback.closed,
   ]);
 

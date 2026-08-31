@@ -5284,6 +5284,50 @@ def test_device_failure_is_terminal_drain_proof_without_duplicate_event(
             "start", "failure", "takeover"]
 
 
+def test_device_failure_with_failure_stage_is_terminal_drain_proof(
+        api_clients: ApiClients, monkeypatch):
+    """专防：只扩 ACK_PAYLOAD_KEYS 白名单而不改三重等值时，带 stage 的失败
+    ACK 落库后 drain 证明必失败、收麦链闩死。整条链必须与无 stage 版等价。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    command = _device_next(api_clients)
+    assert command is not None
+    failed = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{command['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(
+            command,
+            ack_type="tts_failed",
+            ack_key="ack-terminal-stage-failure-0001",
+            device_event_seq=1,
+            error_code="audio_playback_failed",
+            failure_stage="media_timeout",
+        ),
+    )
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["status"] == "paused"
+    assert api_clients.account.post(
+        f"/sessions/{SESSION_ID}/pause").status_code == 200
+
+    failure_target = api_clients.device.get(
+        f"/sessions/{SESSION_ID}/autopilot/drain-target",
+        headers=api_clients.device_headers,
+    )
+    assert failure_target.status_code == 200, failure_target.text
+    assert failure_target.json() == {
+        "command_key": command["command_key"],
+        "state_revision": 2,
+    }
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{command['command_key']}/drain-ack",
+        headers=api_clients.device_headers,
+    )
+    assert drained.status_code == 200, drained.text
+    assert drained.json() == {"replayed": True, "state_revision": 2}
+
+
 def test_drain_target_rejects_stale_generation_without_content_projection(
         api_clients: ApiClients, monkeypatch):
     _enable_p0a(monkeypatch)
