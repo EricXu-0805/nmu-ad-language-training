@@ -22,6 +22,7 @@ from app.models import (
     ResearchUser,
     Session as TrainSession,
     TurnEvent,
+    RapportUtteranceEvent,
 )
 
 
@@ -185,6 +186,13 @@ def test_withdrawn_session_reads_return_only_content_free_tombstones(account_cli
             data_classification="simulation",
             is_simulation=True,
         ))
+        session.add(RapportUtteranceEvent(
+            session_id="S-WITHDRAWN-READ",
+            event_seq=1, section_key="介绍机构环境", question_idx=0,
+            source="llm", origin="auto", text="好的，谢谢您告诉我。",
+            asr_text="老人第1周的敏感自由发言转写",
+            text_sha256="b" * 64, is_simulation=True,
+        ))
         session.commit()
 
     # Even before withdrawal, public research projections never expose worker
@@ -243,10 +251,12 @@ def test_withdrawn_session_reads_return_only_content_free_tombstones(account_cli
         "attempts": 1,
         "interactions": 1,
         "audio_receipts": 1,
+        "rapport_utterances": 1,
     }
     for collection in (
         "items", "turns", "audios", "abnormal", "attempts",
-        "interactions", "audio_receipts",
+        "interactions", "audio_receipts", "tts_serves",
+        "rapport_utterances", "confirmation_revisions",
     ):
         assert journal[collection] == []
 

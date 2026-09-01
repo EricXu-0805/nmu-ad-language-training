@@ -12,6 +12,10 @@ export const DUPLICATE_INTAKE_FIELD_LABELS: Partial<Record<keyof Patient, string
   recording_allowed: "录音授权",
   secondary_use_allowed: "去标识数据二次使用授权",
   cloud_processing_allowed: "第三方云处理授权",
+  birth_year: "出生年份",
+  sex: "性别",
+  education_years: "受教育年限",
+  study_arm: "研究分组标签",
 };
 
 const DUPLICATE_SNAPSHOT_FIELDS: (keyof Patient)[] = [

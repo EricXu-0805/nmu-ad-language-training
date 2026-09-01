@@ -131,3 +131,8 @@ test("AnalysisScreen: the AI-usage drift note is present so short-lived cross-sn
   assert.match(screenSource, /本场实际调用 AI 服务的次数汇总/);
   assert.match(screenSource, /此处计数可能与上方略有延迟差异/);
 });
+
+test("AnalysisScreen: 旧后端 journal 无 rapport_utterances 键时按无记录隐藏,不渲染契约红警", () => {
+  const block = sliceBetween(screenSource, "const rapportSection", "}, [data, withdrawn]);");
+  assert.match(block, /rapportUtterancesRaw === undefined\) return \{ status: "empty" \}/);
+});

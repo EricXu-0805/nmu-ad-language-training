@@ -19,7 +19,8 @@ from typing import Callable, Literal, NamedTuple, NoReturn
 from urllib.parse import unquote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field as PydanticField, model_validator
+from pydantic import (BaseModel, ConfigDict, Field as PydanticField,
+                      field_validator, model_validator)
 from sqlalchemy import func, or_, select as sa_select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session as DBSession, SQLModel, select
@@ -1036,6 +1037,11 @@ def _session_content_counts(session_id: str, s: DBSession) -> dict[str, int]:
             InteractionEvent.session_id == session_id)).one() or 0),
         "audio_receipts": int(s.exec(select(func.count(AudioCaptureReceipt.server_seq)).where(
             AudioCaptureReceipt.session_id == session_id)).one() or 0),
+        # 第1周发声账本与前七张不同级:llm 行的 asr_text 是患者转写。第1周场次
+        # items/turns/attempts 恒为 0,漏了它,撤回对账就看不见被封存的内容行。
+        "rapport_utterances": int(s.exec(select(func.count(
+            RapportUtteranceEvent.id)).where(
+                RapportUtteranceEvent.session_id == session_id)).one() or 0),
     }
 
 
@@ -1106,6 +1112,9 @@ def create_patient(p: Patient, s: DBSession = Depends(get_session)):
     if (p.withdrawal_status or "").strip() or p.governance_revision != 0:
         raise HTTPException(
             422, "研究撤回状态与治理版本由服务器账本管理，建档请求不得自报")
+    covariate_issue = _covariate_issue(p)
+    if covariate_issue is not None:
+        raise HTTPException(422, covariate_issue)
     s.add(p)
     s.commit()
     s.refresh(p)
@@ -1226,6 +1235,49 @@ class PatientProfileUpdate(BaseModel):
     secondary_use_allowed: bool | None = None
     ethics_approval_no: str | None = None
     registration_no: str | None = None
+    # 研究协变量(与迁移 c8e5a1f3b209 的库 CHECK 同界;越界在这里 422 报中文
+    # 人话,不能落到 IntegrityError 变 500,也不能让编辑抽屉只看到英文 JSON)。
+    birth_year: int | None = None
+    sex: str | None = None
+    education_years: int | None = None
+    study_arm: str | None = None
+
+    @field_validator("birth_year", "sex", "education_years", "study_arm")
+    @classmethod
+    def _covariate_in_bounds(cls, value, info):
+        issue = _covariate_value_issue(info.field_name, value)
+        if issue is not None:
+            raise ValueError(issue)
+        return value
+
+
+_PATIENT_SEX_VALUES = frozenset({"男", "女", "其他", "未记录"})
+
+
+def _covariate_value_issue(field: str, value) -> str | None:
+    """四个研究协变量的统一边界——POST 建档与 PATCH 编辑同一批文案。"""
+    if value is None:
+        return None
+    if field == "sex" and value not in _PATIENT_SEX_VALUES:
+        return "性别只能填:男 / 女 / 其他 / 未记录"
+    if field == "birth_year" and not (
+            isinstance(value, int) and 1900 <= value <= 2100):
+        return "出生年份必须在 1900–2100 之间(只填年份,不填出生日期)"
+    if field == "education_years" and not (
+            isinstance(value, int) and 0 <= value <= 30):
+        return "受教育年限必须在 0–30 年之间"
+    if field == "study_arm" and len(str(value)) > 64:
+        return "分组标签最长 64 字符"
+    return None
+
+
+def _covariate_issue(p: Patient) -> str | None:
+    """建档口的协变量边界(PATCH 走 PatientProfileUpdate 的同界校验)。"""
+    for field in ("sex", "birth_year", "education_years", "study_arm"):
+        issue = _covariate_value_issue(field, getattr(p, field))
+        if issue is not None:
+            return issue
+    return None
 
 
 def _patient_referencing_tables(s: DBSession, patient_id: str) -> list[str]:
@@ -14695,7 +14747,8 @@ def session_journal(session_id: str, request: Request, response: Response,
             },
             "items": [], "turns": [], "audios": [], "abnormal": [],
             "attempts": [], "interactions": [], "audio_receipts": [],
-            "tts_serves": [], "confirmation_revisions": [],
+            "tts_serves": [], "rapport_utterances": [],
+            "confirmation_revisions": [],
             "tombstone": tombstone,
         }
     items = list(s.exec(select(ItemEvent)
@@ -14726,6 +14779,13 @@ def session_journal(session_id: str, request: Request, response: Response,
     tts_serves = list(s.exec(select(TtsServeEvidence).where(
         TtsServeEvidence.session_id == session_id,
     ).order_by(TtsServeEvidence.id)))
+    # 第1周发声账本:说了什么(本表)+是否说出(tts_serves 里 source=
+    # 'rapport_utterance' 指向行)合看才完整。llm 行含 asr_text(患者转写)——
+    # 本端点已按场次读权限收口,与 attempts 携带 asr_text 同一暴露面;
+    # 研究导出/研究只读接口仍不携带,口径见 models.RapportUtteranceEvent。
+    rapport_utterances = list(s.exec(select(RapportUtteranceEvent).where(
+        RapportUtteranceEvent.session_id == session_id,
+    ).order_by(RapportUtteranceEvent.event_seq)))
     # 修订账本的内容自由投影：who/when/revision，不带哈希与文本。
     turn_ids = [t.id for t in turns if t.id is not None]
     confirmation_revisions = []
@@ -14746,6 +14806,7 @@ def session_journal(session_id: str, request: Request, response: Response,
             "interactions": interactions,
             "audio_receipts": audio_receipts,
             "tts_serves": tts_serves,
+            "rapport_utterances": rapport_utterances,
             "confirmation_revisions": confirmation_revisions}
 
 

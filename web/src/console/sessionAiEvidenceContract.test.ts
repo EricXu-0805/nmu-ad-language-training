@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   parseConfirmationRevisionsByTurn,
+  parseRapportUtteranceList,
   parseTtsServeEvidenceList,
 } from "./sessionAiEvidenceContract.ts";
 
@@ -276,4 +277,86 @@ test("parseConfirmationRevisionsByTurn: rejects malformed rows (missing/extra fi
 
 test("parseConfirmationRevisionsByTurn: rejects non-array payload", () => {
   assert.throws(() => parseConfirmationRevisionsByTurn({}, TURNS));
+});
+
+function utteranceRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 1,
+    session_id: SID,
+    event_seq: 1,
+    section_key: "介绍机构环境",
+    question_idx: 0,
+    source: "llm",
+    origin: "auto",
+    reply_id: null,
+    text: "好的，谢谢您告诉我。",
+    asr_text: "我年轻时在学校教书",
+    asr_engine_version: "qwen3-asr-flash/1",
+    reply_engine_version: "qwen-plus/1",
+    degraded_reason: null,
+    raw_audio_id: "aud-1",
+    text_sha256: HASH,
+    created_at: "2026-08-31T10:00:00",
+    is_simulation: false,
+    ...overrides,
+  };
+}
+
+const BANK_ROW = {
+  id: 2, event_seq: 2, source: "bank", origin: "manual", reply_id: "a1",
+  asr_text: null, asr_engine_version: null, reply_engine_version: null,
+  raw_audio_id: null,
+};
+
+test("parseRapportUtteranceList: llm 行与句库行都能通过", () => {
+  const rows = parseRapportUtteranceList([utteranceRow(), utteranceRow(BANK_ROW)], SID, false);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.source, "llm");
+  assert.equal(rows[0]!.asrText, "我年轻时在学校教书");
+  assert.equal(rows[1]!.replyId, "a1");
+});
+
+test("parseRapportUtteranceList: 空数组与非数组", () => {
+  assert.deepEqual(parseRapportUtteranceList([], SID, false), []);
+  assert.throws(() => parseRapportUtteranceList({}, SID, false));
+  assert.throws(() => parseRapportUtteranceList(undefined, SID, false));
+});
+
+test("parseRapportUtteranceList: 缺键/多键整行拒收", () => {
+  const { text_sha256, ...missing } = utteranceRow();
+  void text_sha256;
+  assert.throws(() => parseRapportUtteranceList([missing], SID, false));
+  assert.throws(() => parseRapportUtteranceList([{ ...utteranceRow(), extra: 1 }], SID, false));
+});
+
+test("parseRapportUtteranceList: 场次与模拟标志围栏", () => {
+  assert.throws(() => parseRapportUtteranceList([utteranceRow({ session_id: "S2" })], SID, false));
+  assert.throws(() => parseRapportUtteranceList([utteranceRow({ is_simulation: true })], SID, false));
+});
+
+test("parseRapportUtteranceList: source 与 reply_id 绑定关系", () => {
+  assert.throws(() => parseRapportUtteranceList([utteranceRow({ ...BANK_ROW, reply_id: null })], SID, false));
+  assert.throws(() => parseRapportUtteranceList([utteranceRow({ reply_id: "a1" })], SID, false));
+});
+
+test("parseRapportUtteranceList: 降级原因闭集", () => {
+  const ok = parseRapportUtteranceList(
+    [utteranceRow({ source: "fallback", degraded_reason: "cloud_not_authorized", asr_text: null })], SID, false);
+  assert.equal(ok[0]!.degradedReason, "cloud_not_authorized");
+  assert.throws(() => parseRapportUtteranceList([utteranceRow({ degraded_reason: "mystery" })], SID, false));
+});
+
+test("parseRapportUtteranceList: 行 id 去重与 event_seq 严格递增", () => {
+  assert.throws(() => parseRapportUtteranceList(
+    [utteranceRow(), utteranceRow({ event_seq: 2 })], SID, false));
+  assert.throws(() => parseRapportUtteranceList(
+    [utteranceRow({ event_seq: 2 }), utteranceRow({ ...BANK_ROW, event_seq: 2 })], SID, false));
+  assert.throws(() => parseRapportUtteranceList(
+    [utteranceRow({ event_seq: 3 }), utteranceRow({ ...BANK_ROW, event_seq: 2 })], SID, false));
+});
+
+test("parseRapportUtteranceList: raw_audio_id 上界与服务端 160 一致", () => {
+  const ok = parseRapportUtteranceList([utteranceRow({ raw_audio_id: "a".repeat(160) })], SID, false);
+  assert.equal(ok[0]!.rawAudioId!.length, 160);
+  assert.throws(() => parseRapportUtteranceList([utteranceRow({ raw_audio_id: "a".repeat(161) })], SID, false));
 });

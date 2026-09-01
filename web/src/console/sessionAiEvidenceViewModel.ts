@@ -1,4 +1,8 @@
-import type { ConfirmationRevisionTurnRecord, TtsServeEvidenceRecord } from "./sessionAiEvidenceContract";
+import type {
+  ConfirmationRevisionTurnRecord,
+  RapportUtteranceRecord,
+  TtsServeEvidenceRecord,
+} from "./sessionAiEvidenceContract";
 import type { SessionAiUsageContract } from "./sessionAiUsageContract";
 
 const EMPTY_NOTICE = "当前汇总未记录实际使用证据";
@@ -184,3 +188,98 @@ export function buildAiUsageSection(contract: SessionAiUsageContract): AiUsageSe
 }
 
 export { EMPTY_NOTICE as sessionAiEvidenceEmptyNotice };
+
+// ---- 第1周对话回放(发声账本 × TTS 服务证据合看) ----
+
+export interface RapportReplayRowViewModel {
+  key: string;
+  time: string;
+  positionLabel: string;
+  originLabel: string;
+  sourceLabel: string;
+  sourceTone: "ok" | "warn" | "muted";
+  text: string;
+  asrText: string | null;
+  degradedLabel: string | null;
+  spokenLabel: string;
+  spokenTone: "ok" | "warn" | "muted";
+}
+
+export interface RapportReplaySummaryViewModel {
+  total: number;
+  auto: number;
+  llm: number;
+  degraded: number;
+  unspoken: number;
+}
+
+export type RapportReplaySectionViewModel =
+  | { status: "withdrawn" }
+  | { status: "contract-error"; message: string }
+  | { status: "empty" }
+  | {
+    status: "ready";
+    summary: RapportReplaySummaryViewModel;
+    rows: RapportReplayRowViewModel[];
+  };
+
+const RAPPORT_SOURCE_LABELS: Record<RapportUtteranceRecord["source"], string> = {
+  script: "脚本句",
+  bank: "回应库句",
+  llm: "AI 现编",
+  fallback: "兜底句",
+};
+
+const RAPPORT_DEGRADED_LABELS: Record<string, string> = {
+  asr_failed: "录音没听清，已退回固定句",
+  asr_empty: "老人没说话，已退回固定句",
+  llm_unavailable: "AI 没给出可用回应（服务不可用或生成越界被拒），已退回固定句",
+  llm_rejected: "AI 生成越界被拒，已退回固定句",
+  cloud_not_authorized: "该受试者未授权云处理，全程本机",
+};
+
+export function buildRapportReplaySection(
+  records: RapportUtteranceRecord[],
+  ttsServes: TtsServeEvidenceRecord[],
+): RapportReplaySectionViewModel {
+  if (records.length === 0) return { status: "empty" };
+  const servesByUtterance = new Map<number, TtsServeEvidenceRecord[]>();
+  for (const serve of ttsServes) {
+    if (serve.source !== "rapport_utterance" || serve.utteranceId == null) continue;
+    const list = servesByUtterance.get(serve.utteranceId) ?? [];
+    list.push(serve);
+    servesByUtterance.set(serve.utteranceId, list);
+  }
+  const summary: RapportReplaySummaryViewModel = {
+    total: records.length, auto: 0, llm: 0, degraded: 0, unspoken: 0,
+  };
+  const rows = records.map((record) => {
+    const serves = servesByUtterance.get(record.id) ?? [];
+    const anyServed = serves.some((serve) => serve.result === "served");
+    const anyDegraded = serves.some((serve) => serve.result === "degraded");
+    // 账本行只是定稿;有 served 证据才算"服务器真返回过这句的语音"。
+    const spokenLabel = anyServed ? "已返回语音"
+      : anyDegraded ? "已改用本机语音(服务器未返回音频)"
+      : "只有定稿，没有语音返回记录";
+    if (!anyServed && !anyDegraded) summary.unspoken += 1;
+    if (record.origin === "auto") summary.auto += 1;
+    if (record.source === "llm") summary.llm += 1;
+    if (record.degradedReason !== null) summary.degraded += 1;
+    return {
+      key: `rapport-${record.id}`,
+      time: formatTime(record.createdAt),
+      positionLabel: `${record.sectionKey} · 第 ${record.questionIdx + 1} 问`,
+      originLabel: record.origin === "auto" ? "老人说完自动回应" : "研究者点选",
+      sourceLabel: RAPPORT_SOURCE_LABELS[record.source],
+      sourceTone: record.source === "llm" ? "warn" as const
+        : record.source === "fallback" ? "muted" as const : "ok" as const,
+      text: record.text,
+      asrText: record.asrText,
+      degradedLabel: record.degradedReason === null ? null
+        : RAPPORT_DEGRADED_LABELS[record.degradedReason] ?? record.degradedReason,
+      spokenLabel,
+      spokenTone: anyServed ? "ok" as const : anyDegraded ? "warn" as const : "muted" as const,
+    };
+  });
+  return { status: "ready", summary, rows };
+}

@@ -250,3 +250,129 @@ export function parseConfirmationRevisionsByTurn(
   }
   return result;
 }
+
+// ---- 第1周发声账本(定稿待说;是否真说出以 tts_serves 里 source='rapport_utterance'
+// 指向本行的服务证据为准,两表合看才是完整还原) ----
+
+export type RapportUtteranceSource = "script" | "bank" | "llm" | "fallback";
+export type RapportUtteranceOrigin = "auto" | "manual";
+
+const RAPPORT_DEGRADED_REASONS = new Set([
+  "asr_failed", "asr_empty", "llm_unavailable", "llm_rejected", "cloud_not_authorized",
+]);
+
+export interface RapportUtteranceRecord {
+  id: number;
+  eventSeq: number;
+  sectionKey: string;
+  questionIdx: number;
+  source: RapportUtteranceSource;
+  origin: RapportUtteranceOrigin;
+  replyId: string | null;
+  text: string;
+  asrText: string | null;
+  asrEngineVersion: string | null;
+  replyEngineVersion: string | null;
+  degradedReason: string | null;
+  rawAudioId: string | null;
+  textSha256: string;
+  createdAt: string;
+  isSimulation: boolean;
+}
+
+const RAPPORT_UTTERANCE_KEYS = new Set([
+  "id", "session_id", "event_seq", "section_key", "question_idx", "source",
+  "origin", "reply_id", "text", "asr_text", "asr_engine_version",
+  "reply_engine_version", "degraded_reason", "raw_audio_id", "text_sha256",
+  "created_at", "is_simulation",
+]);
+
+function nullableBoundedString(value: unknown, max: number): value is string | null {
+  return value === null || boundedNonEmptyString(value, max);
+}
+
+function parseRapportUtteranceEntry(
+  value: unknown,
+  index: number,
+  expectedSessionId: string,
+  expectedIsSimulation: boolean,
+): RapportUtteranceRecord {
+  const path = `rapport_utterances[${index}]`;
+  const row = asRecord(value, path);
+  requireExactKeys(row, RAPPORT_UTTERANCE_KEYS, path);
+  if (row.session_id !== expectedSessionId) throw new Error(`${path} 属于其他场次，已拒绝显示`);
+  if (!positiveInteger(row.id)) throw new Error(`${path}.id 非法`);
+  if (!positiveInteger(row.event_seq)) throw new Error(`${path}.event_seq 非法`);
+  if (!boundedNonEmptyString(row.section_key, 64)) throw new Error(`${path}.section_key 非法`);
+  if (!nonNegativeInteger(row.question_idx)) throw new Error(`${path}.question_idx 非法`);
+  if (row.source !== "script" && row.source !== "bank" && row.source !== "llm"
+    && row.source !== "fallback") throw new Error(`${path}.source 非法`);
+  if (row.origin !== "auto" && row.origin !== "manual") throw new Error(`${path}.origin 非法`);
+  if ((row.source === "bank") !== (row.reply_id !== null)) {
+    throw new Error(`${path} 的 source 与 reply_id 绑定关系不一致`);
+  }
+  if (!nullableBoundedString(row.reply_id, 64)) throw new Error(`${path}.reply_id 非法`);
+  // 机器人说出口的成句:守卫层限 60 字,这里给足余量但仍有界。
+  if (!boundedNonEmptyString(row.text, 500)) throw new Error(`${path}.text 非法`);
+  // 老人转写是自由语音文本,只做类型与长度界,不做修剪/字符集断言。
+  if (row.asr_text !== null && (typeof row.asr_text !== "string"
+    || row.asr_text.length < 1 || row.asr_text.length > 4000)) {
+    throw new Error(`${path}.asr_text 非法`);
+  }
+  if (!nullableBoundedString(row.asr_engine_version, 100)) throw new Error(`${path}.asr_engine_version 非法`);
+  if (!nullableBoundedString(row.reply_engine_version, 100)) throw new Error(`${path}.reply_engine_version 非法`);
+  if (row.degraded_reason !== null && (typeof row.degraded_reason !== "string"
+    || !RAPPORT_DEGRADED_REASONS.has(row.degraded_reason))) {
+    throw new Error(`${path}.degraded_reason 非法`);
+  }
+  // 上界与服务端 AudioIn/audio_store.SAFE_ID 的 160 一致;收窄会把合法落库行
+  // 永久打死整个回放区块(账本只追加,修不回来)。
+  if (!nullableBoundedString(row.raw_audio_id, 160)) throw new Error(`${path}.raw_audio_id 非法`);
+  if (typeof row.text_sha256 !== "string" || !HEX64.test(row.text_sha256)) {
+    throw new Error(`${path}.text_sha256 必须是 64 位小写 hex`);
+  }
+  if (!validServerTimestamp(row.created_at)) throw new Error(`${path}.created_at 非法`);
+  if (typeof row.is_simulation !== "boolean") throw new Error(`${path}.is_simulation 非法`);
+  if (row.is_simulation !== expectedIsSimulation) {
+    throw new Error(`${path}.is_simulation 与本场次不一致，已拒绝显示`);
+  }
+  return {
+    id: row.id as number,
+    eventSeq: row.event_seq as number,
+    sectionKey: row.section_key as string,
+    questionIdx: row.question_idx as number,
+    source: row.source,
+    origin: row.origin,
+    replyId: row.reply_id as string | null,
+    text: row.text as string,
+    asrText: row.asr_text as string | null,
+    asrEngineVersion: row.asr_engine_version as string | null,
+    replyEngineVersion: row.reply_engine_version as string | null,
+    degradedReason: row.degraded_reason as string | null,
+    rawAudioId: row.raw_audio_id as string | null,
+    textSha256: row.text_sha256,
+    createdAt: row.created_at,
+    isSimulation: row.is_simulation,
+  };
+}
+
+export function parseRapportUtteranceList(
+  value: unknown,
+  expectedSessionId: string,
+  expectedIsSimulation: boolean,
+): RapportUtteranceRecord[] {
+  if (!Array.isArray(value)) throw new Error("rapport_utterances 必须是数组");
+  const records = value.map((entry, index) => (
+    parseRapportUtteranceEntry(entry, index, expectedSessionId, expectedIsSimulation)
+  ));
+  const seenIds = new Set<number>();
+  let lastSeq = 0;
+  for (const record of records) {
+    if (seenIds.has(record.id)) throw new Error(`rapport_utterances 存在重复的行 id #${record.id}，已拒绝显示`);
+    seenIds.add(record.id);
+    // 账本序:event_seq 必须严格递增(后端按它排序,重复或乱序都是结构损坏)。
+    if (record.eventSeq <= lastSeq) throw new Error("rapport_utterances 的 event_seq 不是严格递增，已拒绝显示");
+    lastSeq = record.eventSeq;
+  }
+  return records;
+}

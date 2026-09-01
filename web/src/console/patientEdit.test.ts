@@ -129,3 +129,10 @@ test("编辑抽屉里云处理授权是独立区块:单独确认、不进差量�
   // 撤回档案的授权已封存,授权按钮同样禁用。
   assert.match(drawer, /已登记研究撤回，云处理授权已封存/);
 });
+
+test("研究协变量在可编辑面里,差量补丁只带改动的键", () => {
+  const original = draftFromPatient(PATIENT);
+  const edited = { ...original, birth_year: 1948, education_years: 9 };
+  const patch = buildProfilePatch(original, edited, null, "P1");
+  assert.deepEqual(patch, { birth_year: 1948, education_years: 9 });
+});

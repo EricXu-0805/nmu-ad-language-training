@@ -37,6 +37,15 @@ function readableApiDetail(value: unknown, fallback: string): string {
     const text = plainResponseText(value);
     if (text) return text;
   }
+  // FastAPI/pydantic 的 422 detail 是对象数组;摘第一条 msg 给人看,
+  // 去掉 "Value error, " 包装——否则界面只剩「请求失败（HTTP 422）」或英文 JSON。
+  if (Array.isArray(value) && value.length > 0) {
+    const first = value[0] as { msg?: unknown } | null;
+    const msg = first !== null && typeof first === "object" ? first.msg : null;
+    if (typeof msg === "string" && msg.trim()) {
+      return msg.trim().replace(/^Value error,\s*/, "");
+    }
+  }
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
     const message = (value as { message?: unknown }).message;
     if (typeof message === "string" && message.trim()) return message.trim();

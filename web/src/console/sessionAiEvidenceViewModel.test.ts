@@ -157,3 +157,57 @@ test("buildAiUsageSection: an empty judge_engine_version still labels by judge_m
   }));
   assert.equal(model.judgeRows[0]!.label, "规则确定式");
 });
+
+import { buildRapportReplaySection } from "./sessionAiEvidenceViewModel.ts";
+
+function replayUtterance(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 1, eventSeq: 1, sectionKey: "介绍机构环境", questionIdx: 0,
+    source: "llm", origin: "auto", replyId: null, text: "好的，谢谢您告诉我。",
+    asrText: "我以前在学校教书", asrEngineVersion: "qwen3-asr-flash/1",
+    replyEngineVersion: "qwen-plus/1", degradedReason: null, rawAudioId: "aud-1",
+    textSha256: "a".repeat(64), createdAt: "2026-08-31T10:00:00", isSimulation: false,
+    ...overrides,
+  } as never;
+}
+
+function replayServe(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 10, commandId: null, utteranceId: 1, source: "rapport_utterance",
+    engineVersion: "qwen-tts/1", cacheHit: false, result: "served",
+    byteCount: 2048, textSha256: "a".repeat(64), isSimulation: false,
+    createdAt: "2026-08-31T10:00:01",
+    ...overrides,
+  } as never;
+}
+
+test("buildRapportReplaySection: 无账本行为 empty", () => {
+  assert.deepEqual(buildRapportReplaySection([], []), { status: "empty" });
+});
+
+test("buildRapportReplaySection: 定稿与语音返回合看,三种说出状态各归其位", () => {
+  const section = buildRapportReplaySection([
+    replayUtterance(),
+    replayUtterance({ id: 2, eventSeq: 2, source: "bank", origin: "manual",
+      replyId: "a1", asrText: null, degradedReason: "llm_unavailable" }),
+    replayUtterance({ id: 3, eventSeq: 3, source: "script", origin: "manual", asrText: null }),
+  ], [
+    replayServe(),
+    replayServe({ id: 11, utteranceId: 2, result: "degraded", byteCount: null }),
+    // 指向他句的 live_speak 证据不得串行。
+    replayServe({ id: 12, utteranceId: null, source: "live_speak" }),
+  ]);
+  assert.equal(section.status, "ready");
+  if (section.status !== "ready") return;
+  assert.equal(section.summary.total, 3);
+  assert.equal(section.summary.auto, 1);
+  assert.equal(section.summary.llm, 1);
+  assert.equal(section.summary.degraded, 1);
+  assert.equal(section.summary.unspoken, 1);
+  assert.equal(section.rows[0]!.spokenLabel, "已返回语音");
+  assert.equal(section.rows[1]!.spokenLabel, "已改用本机语音(服务器未返回音频)");
+  assert.equal(section.rows[2]!.spokenLabel, "只有定稿，没有语音返回记录");
+  assert.equal(section.rows[1]!.degradedLabel, "AI 没给出可用回应（服务不可用或生成越界被拒），已退回固定句");
+  assert.equal(section.rows[0]!.positionLabel, "介绍机构环境 · 第 1 问");
+  assert.equal(section.rows[0]!.originLabel, "老人说完自动回应");
+});

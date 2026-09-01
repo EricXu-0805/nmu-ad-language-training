@@ -22,6 +22,16 @@ import {
 import type { DuplicateIntakeAssessment } from "./patientIntakeDuplicate";
 
 const CONSENT_STATUSES = ["已同意", "未同意", "已撤回"] as const;
+const SEX_OPTIONS = ["男", "女", "其他", "未记录"] as const;
+
+function intFieldValue(raw: string): number | null {
+  // 只留数字位:误触一个符号/字母不清空已输内容(iPad 输入法极易误触),
+  // 也顺带堵掉 "0x" 十六进制歧义;越界仍由服务端边界报中文人话。
+  const digits = raw.replace(/[^0-9]/g, "");
+  if (!digits) return null;
+  const parsed = Number(digits);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
 
 interface DuplicateReview {
   submitted: Patient;
@@ -361,6 +371,25 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
               <TextInput value={p.dementia_severity ?? ""} onChange={(e) => set("dementia_severity", e.target.value || null)} placeholder="例如：轻度 / 中度" />
             </Field>
             <TriStateField label="是否符合普通话训练要求" value={p.mandarin_eligible} onChange={(v) => set("mandarin_eligible", v)} />
+            <Field label="出生年份" hint="统计分析用的协变量；只填年份（如 1948），不填出生日期">
+              <TextInput inputMode="numeric" value={p.birth_year == null ? "" : String(p.birth_year)}
+                onChange={(e) => set("birth_year", intFieldValue(e.target.value))}
+                placeholder="例如 1948" autoComplete="off" />
+            </Field>
+            <Field label="性别">
+              <EnumSelect options={SEX_OPTIONS} value={p.sex ?? null}
+                onChange={(v) => set("sex", v)} placeholder="请选择（可留空）" />
+            </Field>
+            <Field label="受教育年限" hint="按完成的正规教育年数填写，0–30 年">
+              <TextInput inputMode="numeric" value={p.education_years == null ? "" : String(p.education_years)}
+                onChange={(e) => set("education_years", intFieldValue(e.target.value))}
+                placeholder="例如 9" autoComplete="off" />
+            </Field>
+            <Field label="研究分组标签" hint="按研究方案填写，例如：训练组 / 对照组；未分组可留空">
+              <TextInput value={p.study_arm ?? ""}
+                onChange={(e) => set("study_arm", e.target.value || null)}
+                placeholder="例如：训练组" autoComplete="off" />
+            </Field>
           </div>
         </section>
 

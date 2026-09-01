@@ -223,3 +223,43 @@ def test_patch_requires_training_operation_role_when_protected(
     finally:
         researcher.close()
         steward.close()
+
+
+def test_covariates_editable_and_bounded(profile_client):
+    """四个研究协变量(Eric 2026-08-27 拍板)从此可经档案编辑落库;越界 422 不落 500。"""
+    _seed_patient(profile_client)
+    ok = profile_client.patch("/patients/P-EDIT", json={
+        "birth_year": 1948, "sex": "女", "education_years": 9,
+        "study_arm": "训练组"})
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert (body["birth_year"], body["sex"],
+            body["education_years"], body["study_arm"]) == (1948, "女", 9, "训练组")
+    for bad, keyword in (({"birth_year": 1899}, "出生年份"),
+                         ({"birth_year": 2101}, "出生年份"),
+                         ({"education_years": -1}, "受教育年限"),
+                         ({"education_years": 31}, "受教育年限"),
+                         ({"sex": "男性"}, "性别"),
+                         ({"study_arm": "x" * 65}, "分组标签")):
+        response = profile_client.patch("/patients/P-EDIT", json=bad)
+        assert response.status_code == 422, (bad, response.text)
+        # 编辑抽屉靠这句中文人话;英文 pydantic 原文对临床研究者等于没报错。
+        assert keyword in response.text, (bad, response.text)
+    # 越界请求不得污染已存值。
+    fetched = profile_client.get("/patients/P-EDIT").json()
+    assert fetched["birth_year"] == 1948
+
+
+def test_create_patient_covariates_bounded(profile_client):
+    for bad in ({"sex": "M"}, {"birth_year": 1800}, {"education_years": 99}):
+        response = profile_client.post("/patients", json={
+            "patient_id": "P-COV-BAD", "is_simulation_subject": True, **bad})
+        assert response.status_code == 422, (bad, response.text)
+    ok = profile_client.post("/patients", json={
+        "patient_id": "P-COV", "is_simulation_subject": True,
+        "birth_year": 1950, "sex": "男", "education_years": 12,
+        "study_arm": "对照组"})
+    assert ok.status_code == 200, ok.text
+    fetched = profile_client.get("/patients/P-COV").json()
+    assert fetched["birth_year"] == 1950
+    assert fetched["sex"] == "男"

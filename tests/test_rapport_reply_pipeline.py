@@ -339,6 +339,33 @@ def test_reply_step_only_accepts_a_matching_utterance(pipeline_client):
                              utterance_id=99_999).status_code == 422
 
 
+def test_journal_exposes_the_utterance_ledger(pipeline_client):
+    """回放屏的数据面:journal 携带发声账本行,键集合与前端 exact 契约同一半。"""
+    client = pipeline_client
+    _seed_scene(client)
+    scripted = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 0, "mode": "script"})
+    assert scripted.status_code == 200, scripted.text
+    banked = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 3, "mode": "bank",
+        "replyId": "a1"})
+    assert banked.status_code == 200, banked.text
+    journal = client.get("/sessions/S-PIPE/journal")
+    assert journal.status_code == 200, journal.text
+    rows = journal.json()["rapport_utterances"]
+    assert [r["source"] for r in rows] == ["script", "bank"]
+    assert [r["event_seq"] for r in rows] == [1, 2]
+    assert rows[0]["text"] == "好的，认识您真开心。"
+    assert rows[1]["reply_id"] == "a1"
+    # 后端多键/少键都必须先在这里红,再去同步前端 exact 解析器。
+    assert set(rows[0]) == {
+        "id", "session_id", "event_seq", "section_key", "question_idx",
+        "source", "origin", "reply_id", "text", "asr_text",
+        "asr_engine_version", "reply_engine_version", "degraded_reason",
+        "raw_audio_id", "text_sha256", "created_at", "is_simulation",
+    }
+
+
 def test_presentation_serves_the_persisted_text_without_leaking_ids(
         pipeline_client, monkeypatch):
     client = pipeline_client

@@ -817,6 +817,7 @@ export const api = {
     // 未经运行时校验的原始负载；调用方必须用 sessionAiEvidenceContract 的严格 parser
     // 校验后才能展示，缺字段/畸形不得静默当空数组。
     tts_serves: unknown;
+    rapport_utterances: unknown;
     confirmation_revisions: unknown;
   }>(
     "GET", `/sessions/${encodeURIComponent(sid)}/journal`, undefined,

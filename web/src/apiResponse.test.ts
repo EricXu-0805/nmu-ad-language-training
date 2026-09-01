@@ -84,3 +84,27 @@ test("non-JSON proxy throttling preserves bounded Retry-After", () => {
       && error.retryAfterSeconds === 9,
   );
 });
+
+test("decodeJsonApiResponse: pydantic 数组 detail 摘第一条 msg 并去掉 Value error 前缀", () => {
+  try {
+    decodeJsonApiResponse({
+      status: 422, ok: false,
+      text: JSON.stringify({ detail: [{ type: "value_error", loc: ["body", "sex"],
+        msg: "Value error, 性别只能填:男 / 女 / 其他 / 未记录" }] }),
+    });
+    assert.fail("应当抛 ApiError");
+  } catch (error) {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.detail, "性别只能填:男 / 女 / 其他 / 未记录");
+  }
+});
+
+test("decodeJsonApiResponse: 数组 detail 无可读 msg 时不崩,仍给出非空文案", () => {
+  try {
+    decodeJsonApiResponse({ status: 422, ok: false, text: JSON.stringify({ detail: [42] }) });
+    assert.fail("应当抛 ApiError");
+  } catch (error) {
+    assert.ok(error instanceof ApiError);
+    assert.ok(typeof error.detail === "string" && error.detail.length > 0);
+  }
+});

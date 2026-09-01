@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import unicodedata
 from typing import Optional, Protocol
 
 
@@ -31,9 +31,6 @@ _FORBIDDEN_SUBSTRINGS = (
     "多大年纪", "几岁了", "多少岁", "哪年出生", "出生年",
     "身份证", "住在哪", "家住哪", "住址", "地址", "电话",
 )
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
-
-
 def validate_reply_text(raw: object) -> Optional[str]:
     """生成文本的守卫:通过返回清洗后的一句话,任何越界返回 None(回落句库)。"""
     if not isinstance(raw, str):
@@ -41,7 +38,9 @@ def validate_reply_text(raw: object) -> Optional[str]:
     text = raw.strip()
     if not text or len(text) > MAX_REPLY_CHARS:
         return None
-    if _CONTROL_CHARS.search(text) or "\n" in text:
+    # Cc 含全部 ASCII 控制符;Cf 含零宽空格/ZWJ 等格式字符——TTS 念不出、
+    # 回放屏契约会整场拒收(fail-closed 且账本只追加,落一行永远修不好)。
+    if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in text):
         return None
     if any(sub in text for sub in _FORBIDDEN_SUBSTRINGS):
         return None

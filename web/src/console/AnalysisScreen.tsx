@@ -15,16 +15,19 @@ import {
 import { DataBoundaryBadge, DataBoundaryFilter } from "./DataBoundaryFilter";
 import {
   parseConfirmationRevisionsByTurn,
+  parseRapportUtteranceList,
   parseTtsServeEvidenceList,
 } from "./sessionAiEvidenceContract";
 import {
   buildAiUsageSection,
   buildConfirmationRevisionSection,
+  buildRapportReplaySection,
   buildTtsServeEvidenceSection,
   sessionAiEvidenceEmptyNotice,
   type AiUsageViewModel,
   type ConfirmationRevisionSectionViewModel,
   type ConfirmationRevisionTurnViewModel,
+  type RapportReplaySectionViewModel,
   type TtsServeEvidenceSectionViewModel,
 } from "./sessionAiEvidenceViewModel";
 import { AIQualityDashboard } from "./quality/AIQualityDashboard";
@@ -462,6 +465,7 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
     interactions: InteractionEvent[];
     session: Session;
     ttsServesRaw: unknown;
+    rapportUtterancesRaw: unknown;
     confirmationRevisionsRaw: unknown;
   } | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -500,6 +504,7 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
           interactions: Array.isArray(j.interactions) ? j.interactions : [],
           session: j.session,
           ttsServesRaw: j.tts_serves,
+          rapportUtterancesRaw: j.rapport_utterances,
           confirmationRevisionsRaw: j.confirmation_revisions,
         });
       })
@@ -570,6 +575,23 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
     try {
       const records = parseTtsServeEvidenceList(data.ttsServesRaw, data.session.session_id, data.session.is_simulation);
       return buildTtsServeEvidenceSection(records);
+    } catch (error) {
+      return { status: "contract-error", message: error instanceof Error ? error.message : String(error) };
+    }
+  }, [data, withdrawn]);
+
+  const rapportSection: RapportReplaySectionViewModel | null = useMemo(() => {
+    if (!data) return null;
+    if (withdrawn) return { status: "withdrawn" };
+    // 旧后端(部署窗口/回滚期)的 journal 没有 rapport_utterances 键:按"无记录"
+    // 处理并整块隐藏,不能把它当契约损坏在所有场次顶出红警。
+    if (data.rapportUtterancesRaw === undefined) return { status: "empty" };
+    try {
+      const utterances = parseRapportUtteranceList(
+        data.rapportUtterancesRaw, data.session.session_id, data.session.is_simulation);
+      const serves = parseTtsServeEvidenceList(
+        data.ttsServesRaw, data.session.session_id, data.session.is_simulation);
+      return buildRapportReplaySection(utterances, serves);
     } catch (error) {
       return { status: "contract-error", message: error instanceof Error ? error.message : String(error) };
     }
@@ -657,6 +679,8 @@ function SessionAnalysis({ patientId, sessionId, onBack }: {
             </section>
           )}
 
+          {rapportSection && (rapportSection.status !== "empty" || data?.session.week_no === 1)
+            && <RapportReplaySectionView section={rapportSection} />}
           {ttsSection && <TtsServeEvidenceSectionView section={ttsSection} />}
           {confirmationSection?.status === "contract-error" && (
             <Alert tone="danger" title="修订历史无法核实">
@@ -751,6 +775,59 @@ export function TtsServeEvidenceSectionView({ section }: { section: TtsServeEvid
                   <EvidenceValue label="引擎" value={row.engineVersion} mono />
                   <EvidenceValue label="缓存" value={row.cacheLabel} />
                   <EvidenceValue label="字节" value={row.byteLabel} mono />
+                </div>
+              </article>
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+// 第1周对话回放:发声账本(定稿待说) × 语音返回记录(是否说出)合看。
+export function RapportReplaySectionView({ section }: { section: RapportReplaySectionViewModel }) {
+  if (section.status === "withdrawn") return null;
+  return (
+    <section className="form-section" aria-label="第1周对话回放">
+      <div className="form-section-header"><div>
+        <h3>第 1 周对话回放（机器人说过的每句话）</h3>
+        <p className="muted">按发生顺序列出机器人在回应拍说的话：谁触发的、句子从哪来、服务器是否真返回了语音。</p>
+      </div></div>
+      {section.status === "contract-error" && (
+        <Alert tone="danger" title="对话回放记录异常">
+          数据未通过完整性检查,已停止显示。
+          <details className="muted"><summary>技术详情</summary>{section.message}</details>
+        </Alert>
+      )}
+      {section.status === "empty" && (
+        <Alert tone="info" title="本场没有机器人回应记录">
+          本场次没有记录到机器人回应（2026-08-31 上线发声记录之前的场次没有这项数据）。
+        </Alert>
+      )}
+      {section.status === "ready" && (
+        <>
+          <div className="evidence-stat-grid">
+            <EvidenceStat label="回应总数" value={section.summary.total} />
+            <EvidenceStat label="自动回应" value={section.summary.auto} />
+            <EvidenceStat label="AI 现编" value={section.summary.llm} tone={section.summary.llm ? "warn" : "muted"} />
+            <EvidenceStat label="退回固定句" value={section.summary.degraded} tone={section.summary.degraded ? "warn" : "muted"} />
+            <EvidenceStat label="无语音返回记录" value={section.summary.unspoken} tone={section.summary.unspoken ? "warn" : "muted"} />
+          </div>
+          <div className="evidence-attempt-section">
+            {section.rows.map((row) => (
+              <article className="evidence-attempt" key={row.key}>
+                <div className="analysis-turn-head">
+                  <strong className="mono">{row.time}</strong>
+                  <StatusPill tone={row.sourceTone} size="sm">{row.sourceLabel}</StatusPill>
+                  <StatusPill tone={row.spokenTone} size="sm">{row.spokenLabel}</StatusPill>
+                </div>
+                <p>「{row.text}」</p>
+                <div className="evidence-detail-grid evidence-detail-grid--attempt">
+                  <EvidenceValue label="位置" value={row.positionLabel} />
+                  <EvidenceValue label="触发" value={row.originLabel} />
+                  {row.degradedLabel && <EvidenceValue label="降级" value={row.degradedLabel} />}
+                  {row.asrText && <EvidenceValue label="老人当时说的（转写）" value={row.asrText} />}
                 </div>
               </article>
             ))}

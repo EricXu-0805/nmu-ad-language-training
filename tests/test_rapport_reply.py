@@ -131,3 +131,10 @@ def test_registered_stub_engine_is_used(monkeypatch):
         assert rapport_reply.get_engine().generate("问", "答") == "stub回应:答"
     finally:
         rapport_reply._ENGINES.pop("stub-test", None)
+
+
+def test_validate_rejects_format_characters():
+    """零宽字符(Cf)能穿过旧的 ASCII 控制符正则,却会让回放屏契约整场拒收。"""
+    assert rapport_reply.validate_reply_text("好的\u200b，谢谢您。") is None
+    assert rapport_reply.validate_reply_text("好的\u200d，谢谢您。") is None
+    assert rapport_reply.validate_reply_text("好的，谢谢您。") == "好的，谢谢您。"

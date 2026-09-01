@@ -15,6 +15,10 @@ export const EDITABLE_PROFILE_FIELDS = [
   "assent_obtained",
   "recording_allowed",
   "secondary_use_allowed",
+  "birth_year",
+  "sex",
+  "education_years",
+  "study_arm",
 ] as const;
 
 export type EditableProfileField = (typeof EDITABLE_PROFILE_FIELDS)[number];

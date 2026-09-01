@@ -113,6 +113,10 @@ export interface Patient {
   governance_revision: number;
   ethics_approval_no?: string | null;
   registration_no?: string | null;
+  birth_year?: number | null;
+  sex?: string | null;
+  education_years?: number | null;
+  study_arm?: string | null;
 }
 
 export interface CloudProcessingPolicy {
@@ -166,6 +170,10 @@ export interface PatientProfilePatch {
   secondary_use_allowed?: boolean | null;
   ethics_approval_no?: string | null;
   registration_no?: string | null;
+  birth_year?: number | null;
+  sex?: string | null;
+  education_years?: number | null;
+  study_arm?: string | null;
 }
 
 export type WithdrawalReasonCode =
