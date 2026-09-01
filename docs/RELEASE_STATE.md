@@ -7,6 +7,14 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+> **2026-08-31 23:3x UTC 已上线 `eb6dcd1`（含迁移 `c8e5a1f3b209` → `d0c22a6dae2a`：只追加
+> 发声账本 `rapportutteranceevent` + `ttsserveevidence` 扩来源/utterance_id）。**
+> 部署树 `MATCH revision=eb6dcd1 files=90 identical=90`；预检 7/8（唯一 FAIL = bzip2 系
+> 4 个安全补丁，走收据 237）。新头快照 `20260831-233817` ok 且已验证归档异地 `daily/`；
+> 异地校验器已重装（`c27cd173…`）；旧头快照按 §8.1 进 `legacy-unvalidated/` 等人处置。
+> 云 TTS 语速终态 = **1.0**（Eric 拍板；`.env` 已改、备份 `.env.before-rate-flip-20260831-234554`，
+> 重启生效 + 1.0 预合成核验 + bzip2 补丁 = 收据 237 交 Eric 执行）。执行记录见收据 236 §七。
+>
 > **2026-08-31 02:2x UTC 已上线 `a986f54`（零迁移；库头仍 `c8e5a1f3b209`）。**
 > 部署树 `MATCH revision=a986f54 files=89 identical=89`；预检 8/8 退出码 0。
 > 同一窗口把云 TTS 语速从 0.9 改成 1.0（生产 `.env` 的 `TTS_CLOUD_RATE`，就地改、
@@ -24,13 +32,13 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `a986f54`（2026-08-31 02:2x UTC 上线；此前依次 `74532be` → `0755e09` → `ec2d1b5` → `08ad898`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision a986f54` 应输出 `MATCH … identical=89`（2026-08-31 02:3x UTC 实测通过） |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff a986f54..main -- app web alembic` 应为空 |
-| 云 TTS 语速 | `TTS_CLOUD_RATE=0.9`（2026-08-31 19:0x UTC 调回，Eric 执行重启；1.0 那套缓存仍在盘上，两套可即切。0.9 缓存缺 28 句回应库——窗口脚本里补跑 presynthesize） | `grep ^TTS_CLOUD_RATE= /opt/nmu/app/.env`；缓存键带语速，改完必须重跑 `scripts/presynthesize_tts.py`，否则每句新话术都要现场云调用 |
-| 数据库结构版本 | `c8e5a1f3b209`（2026-08-30 03:3x 由 `b6d4f8a2c917` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
-| 备份校验器指纹（前 20 位） | `118233d447c14cd9f1ce`（2026-08-30 随头前进；异地已重装并核对一致） | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
-| 回滚存档 | ⚠️ **最新一份仍是 `app-before-deploy-20260820-185806.tar.gz`（对应 `b1765c0`，库头 `6f2a9c4d8e17`）——它比当前库头落后两次迁移（`6f2a9c4d8e17` → `b6d4f8a2c917` → `c8e5a1f3b209`），直接换上去起不来服务。** 8-20 之后的 9 次上线都是「按上一基线重同步」，一份 tar 都没产生。**同结构回滚 = 从仓库按上一基线 sha 重同步，不是解 tar。** 用 tar 之前必须先核：解开后在那棵树上跑 `python -I scripts/check_database_head.py`，退 0 才准换上。⚠️ `…170248-语法错疑含data勿用.tar.gz` 是失败残留已改名标记，勿用 | 解开到临时目录后 `cd <解开处> && /opt/nmu/venv/bin/python -I scripts/check_database_head.py` |
-| 回滚锚点快照 | **退回 `ec2d1b5`/`b6d4f8a2c917`** 用 2026-08-30 上线前的停写锚点 **`20260829-231747`**（旧头、旧校验器 `79aea62e…` 产出，已验证归档在 `offsite/daily/`），必须连**旧代码树 + 旧校验器**一起放回；同结构回退直接用最新 `daily/` 快照 |
+| 应用代码版本 | `eb6dcd1`（2026-08-31 23:3x UTC 上线；此前依次 `a986f54` → `74532be` → `0755e09` → `ec2d1b5`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision eb6dcd1` 应输出 `MATCH … identical=90`（2026-08-31 23:4x UTC 实测通过） |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff eb6dcd1..main -- app web alembic` 应为空 |
+| 云 TTS 语速 | `TTS_CLOUD_RATE=1.0`（2026-08-31 23:4x UTC Eric 拍板终态；`.env` 已改，重启生效走收据 237；0.9/1.0 两套缓存都留盘、可即切） | `grep ^TTS_CLOUD_RATE= /opt/nmu/app/.env`；缓存键带语速，改完必须重跑 `scripts/presynthesize_tts.py`，否则每句新话术都要现场云调用 |
+| 数据库结构版本 | `d0c22a6dae2a`（2026-08-31 23:38 由 `c8e5a1f3b209` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
+| 备份校验器指纹（前 20 位） | `c27cd1731aed7bf35c1b`（2026-08-31 随头前进；异地已重装并核对一致） | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
+| 回滚存档 | 最新一份 = `app-before-deploy-20260831-183746.tar.gz`（对应 `a986f54`，库头 `c8e5a1f3b209`——比当前库头落后一次迁移，直接换上去起不来服务）。**同结构回滚 = 从仓库按上一基线 sha 重同步，不是解 tar。** 用 tar 之前必须先核：解开后在那棵树上跑 `python -I scripts/check_database_head.py`，退 0 才准换上。⚠️ `…170248-语法错疑含data勿用.tar.gz` 是失败残留已改名标记，勿用 | 解开到临时目录后 `cd <解开处> && /opt/nmu/venv/bin/python -I scripts/check_database_head.py` |
+| 回滚锚点快照 | **退回 `a986f54`/`c8e5a1f3b209`** 用 2026-08-31 上线前的停写锚点 **`20260831-233749`**（旧头、旧校验器 `118233d4…` 产出，VPS 侧在档；异地侧新校验器不背书旧头，按 §8.1 处置时配旧校验器用），必须连**旧代码树 + 旧校验器**一起放回；同结构回退直接用最新 `daily/` 快照 |
 | 起服前闸门 | 已装（`ExecStartPre` 验库头，以 `User=nmu` 身份跑） | `systemctl cat nmu.service \| grep ExecStartPre`；journal 里 `OK database_at_head` 应在 `Started` 之前 |
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
 | 库里数据（2026-08-27 只读实查） | 3 个演示受试者档案（`demo-001` 已登记撤回、`demo-002`、`Q`）、6 个场次（`data_classification` 全是 `research`）、77 条审计、0 条量表记录 | `sqlite3 …/app.db "select count(*) from patient"` 等。**没有真实入组受试者，但这台机器已经被用过**：云 TTS / ASR / LLM 都有实际使用记录，演示场次也留了录音。原来这一行写「从未被真实使用过」——那句话曾被当成「数据可以随便重建」的依据，删掉 |
@@ -114,7 +122,11 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**第1周互动态 + 机器人发声账本 + 设备失败回执 failure_stage（2026-08-31 完成，待窗口上线，见收据 236）。**
+（无。）
+
+## 2026-08-31 晚上线记录（`eb6dcd1`：第1周互动态 + 发声账本 + failure_stage，含迁移 `c8e5a1f3b209` → `d0c22a6dae2a`）
+
+**2026-08-31 完成，当晚窗口 `20260831-183746` 上线（Eric 执行 17 步窗口脚本，全过；收据 236 §七）。**
 含迁移 `c8e5a1f3b209` → `d0c22a6dae2a`（新表 `rapportutteranceevent` 只追加发声账本；
 `ttsserveevidence` 扩 source 闭集 + utterance_id）。要点：
 - 老人答完（录音落账）→ 云 ASR → qwen-plus 现编一句 → 服务端持久行 → 苏瑶嗓子读出。
@@ -129,7 +141,7 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 - 上线走窗口脚本（收据 236）：停服 → 旧校验器停写锚点快照 → rsync（不带
   --delete、排除 .env/data、迁移文件补 644）→ alembic upgrade → 起服 →
   preflight --require-all → 新头快照 → Mac 侧重装异地校验器 → 重跑 presynthesize
-  （语速已回 0.9，回应库 28 句在 0.9 缓存缺失）。
+  （0.9 补跑 1289 句、1 句失败；语速随后拍板终态 1.0，该失败就地失效）。
 - 新环境变量（可选）：`RAPPORT_REPLY`（auto/qwen/off，默认 auto）、
   `RAPPORT_REPLY_MODEL`（默认 qwen-plus）。不配置也能跑：一律落回句库。
 - 四面对抗复核（22 条发现）已全部处置：自动回应收紧为**节级**（自我介绍节
@@ -248,6 +260,7 @@ PM_20260730_自动对话/218-上线命令_b1765c0.sh`），Claude 只读核验�
 | 日期 | 代码版本 | 结构版本 | 回滚存档 | 备注 |
 | --- | --- | --- | --- | --- |
 | 2026-08-26 22:07 UTC | `08ad898` | `b6d4f8a2c917`（未变） | `dist-stale-20260826-2205` + 上一基线 `083fa35` 重同步 | 零迁移热更新:第六堵墙——wk4 花瓶勘误借句获引擎 errata 精确豁免(未登记塌缩仍拒)+七周 78 题位全扫描进门禁+前端两拒因码上屏。**受控技术环境更新，不构成任何外部批准。** |
+| 2026-08-31 23:3x UTC | `eb6dcd1` | `d0c22a6dae2a`（由 `c8e5a1f3b209` 前进） | 锚点 `20260831-233749`（旧校验器）+ tar `app-before-deploy-20260831-183746.tar.gz` | 第1周互动态:老人答完→云 ASR→qwen-plus 现编一句→按持久行端点发声(白名单一条窄缝,客户端递不进文本)+四级降级梯全落冻结句库+机器人每句落只追加发声账本+ACK failure_stage(8值闭集)。窗口 17 步全过;preflight 7/8(bzip2×4→收据 237);树核 MATCH 90/90;新头快照 20260831-233817 已验证异地归档;语速终态 1.0。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-31 02:2x UTC | `a986f54` | `c8e5a1f3b209`（未变） | `dist-stale-20260830-212455` + 上一基线 `74532be` 重同步 | 零迁移热更新:第 1 周一问两拍(老人答完机器人自己开口,此前那句只印在研究者屏上让人代说)+ 开放式回应库 28 句 7 组(研究者点场景、组内轮换;姓名/年龄两问服务端拒绝走这条路)+ 云 TTS 语速 0.9→1.0(1290 句重跑预合成 0 失败)。真 Chrome 走查 21/21;树核 `MATCH 89/89`;preflight 8/8 退 0;CI 五 job 绿。⚠️ 机器人说了哪一句尚未落进任何持久记录,第 1 周会话不再可完整还原——待钱凯拍板(收据 235 §4)。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-30 03:5x UTC | `74532be` | `c8e5a1f3b209`（未变） | 上一基线 `0755e09` 重同步 | 零迁移热更新:同期别重测回归修复(phase_ordinal 递增 + 取代指针;此前唯一约束加了但序号恒为 1,手册明写的「锁完发现错了就新建一条」直接撞 500)+ 导出包量表两列。树核 `MATCH 89/89`;preflight 8/8 退 0;CI 五 job 绿。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-26 21:25 UTC | `083fa35` | `b6d4f8a2c917`（未变） | 按上一基线 `075e2c6` 重同步(纯后端) | 零迁移热更新:第五堵墙——selfStart 待命不再当热麦拒启(wk4 死锁整族消除);热麦真保护(recording 标记+设备权威)原样。树核 `MATCH 89/89`;preflight 8/8 退 0。**受控技术环境更新，不构成任何外部批准。** |
