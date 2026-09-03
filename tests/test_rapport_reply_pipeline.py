@@ -135,9 +135,13 @@ class _StubReply:
 
     def __init__(self, reply):
         self._reply = reply
+        self.calls: list[dict] = []
 
-    def generate(self, ask, asr_text):
-        return self._reply
+    def generate(self, ask, asr_text, history=(), round_no=1, max_rounds_value=1):
+        self.calls.append({"ask": ask, "asr": asr_text, "history": tuple(history),
+                           "round": round_no, "max": max_rounds_value})
+        reply = self._reply
+        return reply(round_no) if callable(reply) else reply
 
 
 def _use_reply_stub(monkeypatch, reply):
@@ -269,6 +273,198 @@ def test_ai_usage_summary_counts_rapport_degradation(pipeline_client, monkeypatc
     rapport = client.get("/sessions/S-PIPE/ai-usage").json()["rapport"]
     assert rapport["degraded"] == [{"reason": "asr_empty", "count": 1}]
     assert rapport["reply_engines"] == []
+
+
+def test_multi_round_counts_history_and_stops_at_limit(pipeline_client, monkeypatch):
+    """同一问位:第1轮追问、第2轮(末轮)收束且历史进 prompt、第3轮 409 换问。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "2")
+    asr_stub = _StubAsr("我年轻时在纺织厂")
+    monkeypatch.setattr(asr, "get_engine", lambda: asr_stub)
+    engine = _use_reply_stub(
+        monkeypatch, lambda r: "纺织厂啊，那时候忙不忙？" if r == 1 else "听您讲这些真好。")
+    for n, raw in ((1, "aud-r1"), (2, "aud-r2")):
+        _seed_audio(client, session_id="S-PIPE", raw_id=raw, section="介绍机构环境")
+        created = _create_reply(client, "S-PIPE", {
+            "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+            "rawAudioId": raw})
+        assert created.status_code == 200, created.text
+        body = created.json()
+        assert (body["round"], body["maxRounds"], body["final"]) == (n, 2, n == 2)
+        # 非末轮的现编句邀请老人接着说;末轮那句只收束,前端据此不再开麦。
+        assert body["invitesMore"] is (n == 1)
+    assert engine.calls[0]["round"] == 1 and engine.calls[0]["history"] == ()
+    assert engine.calls[1]["round"] == 2
+    assert engine.calls[1]["history"] == (("我年轻时在纺织厂", "纺织厂啊，那时候忙不忙？"),)
+
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-r3", section="介绍机构环境")
+    third = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-r3"})
+    # 聊满不是 409:老人仍然要有回应(端点的「老人永远有回应」契约),
+    # 但一个字节都不再进云,且这句是收束句、不再邀请老人接着说。
+    assert third.status_code == 200, third.text
+    exhausted = third.json()
+    assert exhausted["degradedReason"] == "round_limit"
+    assert exhausted["invitesMore"] is False
+    assert "？" not in exhausted["text"]
+    assert asr_stub.calls == 2 and len(engine.calls) == 2
+    # 收束行不计入轮次:再来一次仍然是收束,不会把轮次顶到 4、5……
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-r4", section="介绍机构环境")
+    again = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-r4"})
+    assert again.status_code == 200, again.text
+    assert again.json()["degradedReason"] == "round_limit"
+    # 轮次不越界:聊满后的收束行不是「第 3 轮」,屏上不能出现「第 3 / 2 轮」。
+    assert again.json()["round"] == 2 and again.json()["maxRounds"] == 2
+    assert asr_stub.calls == 2
+    # 换一问,轮次从 1 重数。
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-q1", section="介绍机构环境")
+    fresh = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 1, "mode": "auto",
+        "rawAudioId": "aud-q1"})
+    assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["round"] == 1
+
+
+def test_final_round_question_from_llm_falls_back_to_closing_line(
+        pipeline_client, monkeypatch):
+    """末轮 LLM 仍抛问题 → 守卫拒 → 回落 k1 收束句(不带问号),老人不会对着空气说话。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "1")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-f1", section="介绍机构环境")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我常去花园"))
+    # 直接返回带问号的句子:管线里 QwenReplyEngine 会经 validate(final=True) 拒掉;
+    # stub 绕过引擎自带守卫,所以这里模拟"引擎已拒绝"= 返回 None。
+    _use_reply_stub(monkeypatch, None)
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-f1"})
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["final"] is True
+    assert body["degradedReason"] == "llm_unavailable"
+    assert "？" not in body["text"] and "?" not in body["text"]
+
+
+def test_final_round_unclear_audio_uses_non_question_fallback(pipeline_client, monkeypatch):
+    """末轮 ASR 失败:不能用带问号的 j1 让老人对着空气回答,改 j2。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "1")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-unclear", section="介绍机构环境")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr(None))
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-unclear"})
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["degradedReason"] == "asr_failed" and body["final"] is True
+    assert body["replyId"] == "j2" and "？" not in body["text"]
+
+
+def test_closing_bank_lines_never_invite_more(pipeline_client, monkeypatch):
+    """降级回落句(j2/k1)说完不再开麦:句库自己标了 invites_more=false。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "3")   # 留出非末轮空间,单独验这一条
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-empty", section="介绍机构环境")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr(""))   # 老人没说话 → j2
+    _use_reply_stub(monkeypatch, "不该被用到")
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-empty"})
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["degradedReason"] == "asr_empty" and body["final"] is False
+    assert body["replyId"] == "j2"
+    assert body["invitesMore"] is False    # 收束句:非末轮也不许续麦
+
+
+def test_repeat_unclear_asks_once_then_closes(pipeline_client, monkeypatch):
+    """同一问位只请老人重说一次:第二次听不清改收束句,不反复要求重复。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "3")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr(None))   # 恒 ASR 失败
+    _use_reply_stub(monkeypatch, "不该被用到")
+    first = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": _seed_audio(client, session_id="S-PIPE", raw_id="aud-u1",
+                                  section="介绍机构环境") or "aud-u1"})
+    assert first.json()["replyId"] == "j1"          # 第一次:请老人再说一次
+    assert first.json()["invitesMore"] is True
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-u2", section="介绍机构环境")
+    second = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-u2"})
+    assert second.json()["replyId"] == "j2"         # 第二次:收束,不再要求重复
+    assert second.json()["invitesMore"] is False
+
+
+def test_endpoint_revalidates_generated_text_on_final_round(
+        pipeline_client, monkeypatch):
+    """末轮守卫必须由端点兜底:它长在 Qwen 引擎的解析里,换个引擎就绕过去了。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "1")   # 第一轮即末轮
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-rev", section="介绍机构环境")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我常去花园"))
+    # stub 绕过引擎自带守卫,直接交回一句还在追问的话。
+    _use_reply_stub(monkeypatch, "花园好呀，您常去吗？")
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-rev"})
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["source"] != "llm"                     # 被端点拒了
+    assert body["degradedReason"] == "llm_unavailable"
+    assert "？" not in body["text"] and body["invitesMore"] is False
+
+
+def test_generated_closing_line_does_not_invite_more(pipeline_client, monkeypatch):
+    """非末轮的现编句若其实是收束句,不能续麦——对着一句道谢开麦,老人不知道说什么。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "3")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-close", section="介绍机构环境")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我常去花园"))
+    _use_reply_stub(monkeypatch, "听着真好，谢谢您。")
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-close"})
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["source"] == "llm" and body["final"] is False
+    assert body["invitesMore"] is False
+
+
+def test_round_limit_is_not_counted_as_a_degradation(pipeline_client, monkeypatch):
+    """聊满是正常收束,不能混进 AI 使用汇总的降级计数,轮次也不能越界显示。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "1")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我常去花园"))
+    _use_reply_stub(monkeypatch, "听着真好，谢谢您。")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-l1", section="介绍机构环境")
+    first = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-l1"})
+    assert first.status_code == 200
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-l2", section="介绍机构环境")
+    over = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-l2"})
+    assert over.status_code == 200
+    body = over.json()
+    assert body["degradedReason"] == "round_limit"
+    # 屏上不能出现「第 2 / 1 轮」。
+    assert body["round"] <= body["maxRounds"]
+    rapport = client.get("/sessions/S-PIPE/ai-usage").json()["rapport"]
+    assert all(r["reason"] != "round_limit" for r in rapport["degraded"])
 
 
 def test_identity_questions_never_start_the_auto_pipeline(

@@ -60,12 +60,34 @@ let busy = false;   // 取队即置位:fetch/play 在途都算忙,同帧第二�
 let gen = 0;        // 世代:打断/停止即 +1,旧世代的一切异步续体自弃
 let curUrl: string | null = null; // 正在播的 blobURL:打断路径也要回收,不靠 onended
 
+// 「这一句的播放已经收口」——播完、失败或被打断。第1周多轮对话据此决定什么时候
+// 才放行麦克风:开麦时机不能开环估时(云合成冷启没有上界),抢话时机器人自己的
+// 声音会被录进老人的答句、被云 ASR 当成老人说的话写进研究账本。
+export type SpeechOutcome = "played" | "failed" | "interrupted";
+const settleListeners = new Set<(tag: string, outcome: SpeechOutcome) => void>();
+
+export function onSpeechSettled(
+  listener: (tag: string, outcome: SpeechOutcome) => void,
+): () => void {
+  settleListeners.add(listener);
+  return () => { settleListeners.delete(listener); };
+}
+
+function notifySettled(tag: string, outcome: SpeechOutcome): void {
+  for (const listener of [...settleListeners]) {
+    try { listener(tag, outcome); } catch { /* 订阅方自己的错不影响播放链 */ }
+  }
+}
+
 function interrupt(): void {
+  const wasBusy = busy;
+  const interruptedTag = pending?.tag ?? "";
   gen += 1;
   busy = false;
   if (audioEl && !audioEl.paused) audioEl.pause();
   if (curUrl) { URL.revokeObjectURL(curUrl); curUrl = null; }
   if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
+  if (wasBusy) notifySettled(interruptedTag, "interrupted");
 }
 
 function driveQueue(): void {
@@ -146,6 +168,7 @@ async function playItem(item: Line, g: number): Promise<void> {
           audit("end", item.tag, item.text);
           if (pending?.text === item.text && pending.contextKey === item.contextKey) pending = null;
           busy = false;
+          notifySettled(item.tag, "played");
           driveQueue();
         };
         audioEl.onerror = () => {
@@ -164,7 +187,7 @@ async function playItem(item: Line, g: number): Promise<void> {
         audit(`start@${engineTag || "neural"}`, item.tag, item.text);
         return;                                     // 播放中,后续由 onended 续驱
       }
-      else if (++neuralFails >= NEURAL_FAIL_LATCH) {
+      else if (++neuralFails >= NEURAL_FAIL_LATCH) {   // 连败:整场降级,本句落回退
         neural = "off";
         activeEngineTag = null;
       }
@@ -237,12 +260,19 @@ export function currentVoiceName(): string | null {
 
 function utterItem(item: Line, g: number): void {
   if (item.contextKey !== contextState.activeContextKey) { busy = false; return; }
-  if (typeof window === "undefined" || !("speechSynthesis" in window)) { busy = false; return; }
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+    busy = false;
+    notifySettled(item.tag, "failed");   // 这台设备根本不会出声,等它没有意义
+    return;
+  }
   const voice = pickLocalZhVoice();
   if (!voice) {
-    // 语音表未就绪/本机无中文语音:退回队首等 voiceschanged/触屏补读,绝不落到联网语音
+    // 语音表未就绪/本机无中文语音:退回队首等 voiceschanged/触屏补读,绝不落到联网语音。
+    // 但要立刻收口:等待方(第1周多轮的开麦闸)不能为一句可能永远不会响的话
+    // 一直挂着麦克风——屏上的字已经在了,流程该往下走。
     queue.unshift(item);
     busy = false;
+    notifySettled(item.tag, "failed");
     return;
   }
   const u = new SpeechSynthesisUtterance(item.text);
@@ -256,6 +286,7 @@ function utterItem(item: Line, g: number): void {
     audit("end", item.tag, item.text);
     if (pending?.text === item.text && pending.contextKey === item.contextKey) pending = null;
     busy = false;
+    notifySettled(item.tag, "played");
     driveQueue();
   };
   u.onerror = (e) => {
@@ -263,6 +294,7 @@ function utterItem(item: Line, g: number): void {
     if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
     if (e.error === "not-allowed") { queue.unshift(item); busy = false; return; } // 触屏后补读
     busy = false;
+    notifySettled(item.tag, "failed");
     driveQueue();                                   // 其他错误:跳过这句,队列不停摆
   };
   window.speechSynthesis.speak(u);

@@ -31,12 +31,50 @@ _FORBIDDEN_SUBSTRINGS = (
     "多大年纪", "几岁了", "多少岁", "哪年出生", "出生年",
     "身份证", "住在哪", "家住哪", "住址", "地址", "电话",
 )
-def validate_reply_text(raw: object) -> Optional[str]:
-    """生成文本的守卫:通过返回清洗后的一句话,任何越界返回 None(回落句库)。"""
+MAX_ROUNDS_DEFAULT = 2
+MAX_ROUNDS_CEILING = 5
+
+
+def max_rounds() -> int:
+    """每问最多聊几轮(RAPPORT_MAX_ROUNDS,默认 2,夹在 1..5)。"""
+    raw = (os.environ.get("RAPPORT_MAX_ROUNDS") or "").strip()
+    try:
+        value = int(raw) if raw else MAX_ROUNDS_DEFAULT
+    except ValueError:
+        value = MAX_ROUNDS_DEFAULT
+    return min(MAX_ROUNDS_CEILING, max(1, value))
+
+
+# 末轮之后不再开麦:任何把话头递回老人的句子都不许出现——问号只是最显眼的一种,
+# 「再讲讲…吧」「说说您的家人」「您常去那儿吗。」把问号换成句号一样是追问。
+_INVITING_TAILS = ("吗", "呢", "吧", "么")
+_INVITING_PHRASES = (
+    "讲讲", "说说", "聊聊", "谈谈", "再多讲", "再多说", "跟我讲", "跟我说",
+    "告诉我", "您接着", "你接着", "接着说", "再说说", "多说两句", "多讲两句",
+)
+
+
+def invites_reply(text: str) -> bool:
+    if "？" in text or "?" in text:
+        return True
+    body = text.rstrip("。！!…、,，.\u3000 ")
+    if body.endswith(_INVITING_TAILS):
+        return True
+    return any(phrase in text for phrase in _INVITING_PHRASES)
+
+
+def validate_reply_text(raw: object, *, final: bool = False) -> Optional[str]:
+    """生成文本的守卫:通过返回清洗后的一句话,任何越界返回 None(回落句库)。
+
+    final=True(本问最后一轮):只许收束,不许再向老人抛问题——那一轮之后不再开麦,
+    留一个悬着的问号等于让老人对着空气说话。
+    """
     if not isinstance(raw, str):
         return None
     text = raw.strip()
     if not text or len(text) > MAX_REPLY_CHARS:
+        return None
+    if final and invites_reply(text):
         return None
     # Cc 含全部 ASCII 控制符;Cf 含零宽空格/ZWJ 等格式字符——TTS 念不出、
     # 回放屏契约会整场拒收(fail-closed 且账本只追加,落一行永远修不好)。
@@ -47,20 +85,36 @@ def validate_reply_text(raw: object) -> Optional[str]:
     return text
 
 
-def build_reply_prompt(ask: str, asr_text: str) -> str:
-    return (
+History = tuple[tuple[Optional[str], str], ...]   # ((老人说, 机器人说), ...) 按轮次
+
+
+def build_reply_prompt(ask: str, asr_text: str, history: History = (),
+                       round_no: int = 1, max_rounds_value: int = 1) -> str:
+    final = round_no >= max_rounds_value
+    lines = [
         "你是陪伴长者聊天的语音机器人“小语”,声音温和、语速慢。"
-        "刚才你问了长者一个问题,长者回答了。请生成你接下来说的**一句**口语化回应,"
-        '输出 JSON {"reply": "..."}。\n'
-        f"你的问题:{ask}\n"
-        f"长者的回答(语音识别转写,可能有错字):{asr_text}\n"
-        "要求:\n"
-        "1. 只说一句,12~30个汉字,像面对面聊天那样自然,不书面。\n"
-        "2. 先接住长者说的内容(可以轻轻复述其中一个词),再给一句肯定或一个轻的开放式追问。\n"
-        "3. 绝不询问姓名、年龄、住址、身份证等身份信息;绝不给医疗建议;绝不纠正或否定长者。\n"
-        "4. 转写明显不通顺时按大意回应,不逐字复述;完全看不懂就说一句温和的承接话。\n"
-        "5. 不用感叹号连用,不用“哇”“太棒了”这类夸张词。"
-    )
+        "你问了长者一个问题,你们围绕这个问题聊了几句。请生成你接下来说的**一句**口语化回应,"
+        '输出 JSON {"reply": "..."}。',
+        f"你的问题:{ask}",
+    ]
+    if history:
+        lines.append("前几轮对话(按先后):")
+        for i, (elder, robot) in enumerate(history, 1):
+            lines.append(f"  第{i}轮 长者:{elder if elder else '(没听清)'}")
+            lines.append(f"  第{i}轮 你:{robot}")
+    lines.append(f"长者最新的回答(语音识别转写,可能有错字):{asr_text}")
+    lines.append(f"这是本问的第{round_no}轮,最多{max_rounds_value}轮。")
+    lines.append("要求:")
+    lines.append("1. 只说一句,12~30个汉字,像面对面聊天那样自然,不书面;不要重复你前几轮说过的话。")
+    if final:
+        lines.append("2. 这是最后一轮:先接住长者刚说的内容,再给一句温暖的肯定或收束。"
+                     "**不要再提任何问题,句尾不能是问号**——这句之后不再开麦。")
+    else:
+        lines.append("2. 先接住长者说的内容(可以轻轻复述其中一个词),再给一个轻的开放式追问,让长者能接着说。")
+    lines.append("3. 绝不询问姓名、年龄、住址、身份证等身份信息;绝不给医疗建议;绝不纠正或否定长者。")
+    lines.append("4. 转写明显不通顺时按大意回应,不逐字复述;完全看不懂就说一句温和的承接话。")
+    lines.append("5. 不用感叹号连用,不用“哇”“太棒了”这类夸张词。")
+    return "\n".join(lines)
 
 
 class RapportReplyProvider(Protocol):
@@ -68,7 +122,8 @@ class RapportReplyProvider(Protocol):
     data_boundary: str
     provider_id: str | None
 
-    def generate(self, ask: str, asr_text: str) -> Optional[str]: ...
+    def generate(self, ask: str, asr_text: str, history: History = (),
+                 round_no: int = 1, max_rounds_value: int = 1) -> Optional[str]: ...
 
 
 class OffReplyEngine:
@@ -77,7 +132,8 @@ class OffReplyEngine:
     data_boundary = "local"
     provider_id = None
 
-    def generate(self, ask: str, asr_text: str) -> Optional[str]:
+    def generate(self, ask: str, asr_text: str, history: History = (),
+                 round_no: int = 1, max_rounds_value: int = 1) -> Optional[str]:
         return None
 
 
@@ -102,14 +158,16 @@ class QwenReplyEngine:
     def available(self) -> bool:
         return bool(os.environ.get("DASHSCOPE_API_KEY"))
 
-    def generate(self, ask: str, asr_text: str) -> Optional[str]:
+    def generate(self, ask: str, asr_text: str, history: History = (),
+                 round_no: int = 1, max_rounds_value: int = 1) -> Optional[str]:
         if not self.available():
             return None
         try:
-            raw = self._call(build_reply_prompt(ask, asr_text))
+            raw = self._call(build_reply_prompt(
+                ask, asr_text, history, round_no, max_rounds_value))
         except Exception:
             return None
-        return self._parse(raw)
+        return self._parse(raw, final=round_no >= max_rounds_value)
 
     def _call(self, prompt: str) -> str | None:
         from dashscope import Generation
@@ -125,7 +183,7 @@ class QwenReplyEngine:
             return None
         return choices[0].message.content
 
-    def _parse(self, raw) -> Optional[str]:
+    def _parse(self, raw, *, final: bool = False) -> Optional[str]:
         if not raw or not isinstance(raw, str):
             return None
         text = raw.strip()
@@ -137,7 +195,7 @@ class QwenReplyEngine:
             return None
         if not isinstance(data, dict) or set(data) != _REPLY_KEYS:
             return None
-        return validate_reply_text(data["reply"])
+        return validate_reply_text(data["reply"], final=final)
 
 
 _ENGINES: dict[str, RapportReplyProvider] = {"off": OffReplyEngine()}

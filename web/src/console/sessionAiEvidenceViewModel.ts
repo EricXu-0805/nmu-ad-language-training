@@ -261,6 +261,7 @@ const RAPPORT_DEGRADED_LABELS: Record<string, string> = {
   llm_unavailable: "AI 没给出可用回应（服务不可用或生成越界被拒），已退回固定句",
   llm_rejected: "AI 生成越界被拒，已退回固定句",
   cloud_not_authorized: "该受试者未授权云处理，全程本机",
+  round_limit: "本问已聊满设定轮数，说收束句换下一问",
 };
 
 export function buildRapportReplaySection(

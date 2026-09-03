@@ -103,7 +103,8 @@ const RAPPORT_KEYS = new Set(["asr_engines", "reply_engines", "degraded"]);
 const RAPPORT_ENGINE_ROW_KEYS = new Set(["engine_version", "utterances"]);
 const RAPPORT_DEGRADED_ROW_KEYS = new Set(["reason", "count"]);
 const RAPPORT_DEGRADED_REASONS = new Set([
-  "asr_failed", "asr_empty", "llm_unavailable", "llm_rejected", "cloud_not_authorized",
+  "asr_failed", "asr_empty", "llm_unavailable", "llm_rejected",
+  "cloud_not_authorized", "round_limit",
 ]);
 
 function parseRapportEngineList(

@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from contextlib import ExitStack, asynccontextmanager, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
 import hashlib
 import ipaddress
 import re
@@ -5782,6 +5782,72 @@ class RapportReplyCreateOut(BaseModel):
     replyId: str | None
     degradedReason: str | None
     idempotent: bool = False
+    # 多轮:本问已是第几轮(含本句)、上限、是否最后一轮(末轮后不再开麦)。
+    round: int = 1
+    maxRounds: int = 1
+    final: bool = True
+    # 这句是否把话头递回老人。收束句(k1/j2/脚本句)说完不再开麦——否则老人
+    # 会听到「那我们聊点别的吧」之后麦克风又开了这种互相矛盾的指令。
+    invitesMore: bool = False
+
+
+_RAPPORT_ROUND_LIMIT = "round_limit"
+# 「数轮次 → 调云 → 落账」不是原子的:两条不同 rawAudioId 的自动回应并发进来,
+# 各自都只数到 N-1,可能把同一问位落成 N+1 行。落账段串行化即可;provider I/O
+# 在锁外,不会把云调用串成队列。
+# 与 _LIVE_WRITE_LOCK 同一前提:本服务按 DEPLOY.md §单 worker 部署(限速器等也
+# 依赖进程内状态),所以进程内锁足够;真要上多 worker,这里和限速器一起要换成
+# 数据库级串行化。
+_RAPPORT_LEDGER_LOCK = threading.Lock()
+
+
+def _rapport_auto_rounds_before(
+        s: DBSession, session_id: str, section_key: str, question_idx: int,
+        *, before_seq: int | None = None) -> list[RapportUtteranceEvent]:
+    """本问位已有的自动回应行(按账本序);多轮的轮次与历史都从这里推,不另存列。"""
+    statement = select(RapportUtteranceEvent).where(
+        RapportUtteranceEvent.session_id == session_id,
+        RapportUtteranceEvent.section_key == section_key,
+        RapportUtteranceEvent.question_idx == question_idx,
+        RapportUtteranceEvent.origin == "auto",
+        # 「已聊满」的收束行本身不是一轮对话,不计入轮次——否则同一问位反复
+        # 请求会让轮次无限增长。**必须显式收 NULL**:SQL 里 NULL != 'x' 是 NULL
+        # 不是真,只写 != 会把所有正常行(degraded_reason 为空)一并滤掉。
+        or_(RapportUtteranceEvent.degraded_reason.is_(None),
+            RapportUtteranceEvent.degraded_reason != _RAPPORT_ROUND_LIMIT),
+    )
+    if before_seq is not None:
+        statement = statement.where(RapportUtteranceEvent.event_seq < before_seq)
+    return list(s.exec(statement.order_by(RapportUtteranceEvent.event_seq)))
+
+
+def _rapport_invites_more(bank: dict, source: str, reply_id: str | None,
+                          degraded: str | None, text: str) -> bool:
+    """这句说完要不要再开麦让老人接着说。
+
+    llm 现编 → **按这句自己的内容判**(prompt 只是要求,不是约束):模型完全可能
+    交回一句纯道谢。对着一句已经收束的话开麦,老人不知道该说什么——正是钱凯
+    最初报的那个现象的镜像。用与末轮守卫同一个谓词,两侧口径一致。
+    句库行 → 用冻结库自带的 invites_more(j1 请老人重说=True;k1/j2 收束=False)。
+    脚本句/兜底句 → False。
+    """
+    if degraded == _RAPPORT_ROUND_LIMIT:
+        return False
+    if source == "llm":
+        return rapport_reply.invites_reply(text)
+    if source == "bank":
+        return patient_presentation.rapport_bank_invites_more(bank, reply_id)
+    return False
+
+
+def _rapport_round_fields(prior_count: int, *, invites_more: bool = False) -> dict:
+    limit = rapport_reply.max_rounds()
+    # 聊满后的收束行不是"第 N+1 轮":屏上不能出现「第 3 / 2 轮」。
+    round_no = min(prior_count + 1, limit)
+    final = prior_count + 1 >= limit
+    return {"round": round_no, "maxRounds": limit, "final": final,
+            # 末轮永不续麦;非末轮还要这句自己愿意把话头递回去。
+            "invitesMore": bool(invites_more) and not final}
 
 
 def _rapport_bank_or_frozen_fallback(
@@ -5889,10 +5955,33 @@ def rapport_reply_create(
             RapportUtteranceEvent.origin == "auto",
         )).first()
         if existing is not None and existing.id is not None:
+            prior_n = len(_rapport_auto_rounds_before(
+                s, session_id, body.sectionKey, body.questionIdx,
+                before_seq=existing.event_seq))
             return RapportReplyCreateOut(
                 utteranceId=existing.id, text=existing.text,
                 source=existing.source, replyId=existing.reply_id,
-                degradedReason=existing.degraded_reason, idempotent=True)
+                degradedReason=existing.degraded_reason, idempotent=True,
+                **_rapport_round_fields(prior_n, invites_more=(
+                    _rapport_invites_more(bank, existing.source,
+                                          existing.reply_id,
+                                          existing.degraded_reason,
+                                          existing.text))))
+        prior_rounds = _rapport_auto_rounds_before(
+            s, session_id, body.sectionKey, body.questionIdx)
+        round_limit = rapport_reply.max_rounds()
+        history: rapport_reply.History = tuple(
+            (row.asr_text, row.text) for row in prior_rounds)
+        round_no = len(prior_rounds) + 1
+        # 本问已聊满:老人仍然要有回应(端点的「老人永远有回应」契约),但一个字节
+        # 都不再进云——直接落冻结收束句,前端据此收束并换下一问。
+        round_exhausted = len(prior_rounds) >= round_limit
+        # 末轮之后不再开麦:降级句也不能留问号——j1「您再说一次好吗？」换 j2。
+        # 同一问位也只许请老人重说一次:再听不清就收束,不让人被反复要求重复。
+        already_unclear = any(
+            row.degraded_reason == "asr_failed" for row in prior_rounds)
+        unclear_id = ("j2" if (round_no >= round_limit or already_unclear)
+                      else "j1")
         asset = s.get(AudioAssetRow, body.rawAudioId)
         if not asset or asset.session_id != session_id:
             raise HTTPException(404, "音频资产不存在")
@@ -5916,8 +6005,11 @@ def rapport_reply_create(
 
         source, reply_id, text, degraded = "fallback", None, str(bank["fallback"]), None
         asr_result = None
-        asr_engine = asr.get_engine()
-        asr_boundary = cloud_processing.provider_boundary(asr_engine)
+        # 聊满即不再取 ASR 引擎:老人这段录音一个字节都不进云。说什么由落账段
+        # 的权威判定统一给(收束句),这里只负责把出网这条路断掉。
+        asr_engine = None if round_exhausted else asr.get_engine()
+        asr_boundary = (None if asr_engine is None
+                        else cloud_processing.provider_boundary(asr_engine))
         try:
             if asr_boundary is cloud_processing.DataBoundary.CLOUD:
                 with _serialized_cloud_provider_call(
@@ -5933,12 +6025,12 @@ def rapport_reply_create(
             asr_result = None
         except Exception:
             asr_result = None
-        if degraded != "cloud_not_authorized":
+        if degraded is None:
             if (asr_result is None or asr_result.asr_text is None
                     or len(asr_result.asr_text) > 2000):
                 source, reply_id, text, degraded = (
                     _rapport_bank_or_frozen_fallback(
-                        bank, "j1", body.sectionKey, body.questionIdx,
+                        bank, unclear_id, body.sectionKey, body.questionIdx,
                         "asr_failed"))
             elif not asr_result.asr_text.strip():
                 asr_engine_version = asr_result.engine_version
@@ -5957,9 +6049,11 @@ def rapport_reply_create(
                         with _serialized_cloud_provider_call(
                                 session_id=session_id, patient_id=patient_id,
                                 provider=engine, bind=s.get_bind()):
-                            generated = engine.generate(ask_line, asr_text)
+                            generated = engine.generate(
+                                ask_line, asr_text, history, round_no, round_limit)
                     elif boundary is cloud_processing.DataBoundary.LOCAL:
-                        generated = engine.generate(ask_line, asr_text)
+                        generated = engine.generate(
+                            ask_line, asr_text, history, round_no, round_limit)
                 except _CloudEgressNotAuthorized:
                     source, reply_id, text, degraded = (
                         _rapport_bank_or_frozen_fallback(
@@ -5968,6 +6062,10 @@ def rapport_reply_create(
                     generated = None
                 except Exception:
                     generated = None
+                # 末轮守卫必须由端点兜底复核:它长在 QwenReplyEngine._parse 里,
+                # 换个注册引擎(stub/将来的本地模型)就绕过去了。
+                generated = rapport_reply.validate_reply_text(
+                    generated, final=round_no >= round_limit)
                 if degraded is None:
                     if generated is None:
                         source, reply_id, text, degraded = (
@@ -6000,41 +6098,63 @@ def rapport_reply_create(
             RapportUtteranceEvent.origin == "auto",
         )).first()
         if raced is not None and raced.id is not None:
+            prior_n = len(_rapport_auto_rounds_before(
+                s, session_id, body.sectionKey, body.questionIdx,
+                before_seq=raced.event_seq))
             return RapportReplyCreateOut(
                 utteranceId=raced.id, text=raced.text, source=raced.source,
                 replyId=raced.reply_id, degradedReason=raced.degraded_reason,
-                idempotent=True)
-    last_seq = s.exec(
-        select(func.max(RapportUtteranceEvent.event_seq)).where(
-            RapportUtteranceEvent.session_id == session_id)).one()
-    row = RapportUtteranceEvent(
-        session_id=session_id,
-        event_seq=int(last_seq or 0) + 1,
-        section_key=body.sectionKey,
-        question_idx=body.questionIdx,
-        source=source,
-        origin="auto" if body.mode == "auto" else "manual",
-        reply_id=reply_id,
-        text=text,
-        asr_text=asr_text_saved,
-        asr_engine_version=asr_engine_version,
-        reply_engine_version=reply_engine_version,
-        degraded_reason=degraded,
-        raw_audio_id=body.rawAudioId,
-        text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        is_simulation=bool(sess.is_simulation),
-    )
-    s.add(row)
-    try:
-        s.commit()
-    except IntegrityError:
-        s.rollback()
-        raise HTTPException(409, "发声账本并发写入冲突，请重试")
-    s.refresh(row)
+                idempotent=True, **_rapport_round_fields(prior_n, invites_more=(
+                    _rapport_invites_more(bank, raced.source, raced.reply_id,
+                                          raced.degraded_reason, raced.text))))
+    # 落账段串行化:provider 窗口里并发的另一次 auto 可能已把轮次推进,
+    # 「重数 → 落账」必须在同一把锁里,否则同一问位会落成超轮次的行。
+    ledger_lock = _RAPPORT_LEDGER_LOCK if body.mode == "auto" else nullcontext()
+    with ledger_lock:
+        s.expire_all()
+        prior_now = len(_rapport_auto_rounds_before(
+            s, session_id, body.sectionKey, body.questionIdx))
+        if body.mode == "auto" and prior_now >= rapport_reply.max_rounds():
+            # 轮次在 provider 窗口内被别的请求占满:本次结果作废,改落收束句,
+            # 老人仍然有回应(不再调云,字节不出网)。
+            source, reply_id, text, degraded = _rapport_bank_or_frozen_fallback(
+                bank, "k1", body.sectionKey, body.questionIdx,
+                _RAPPORT_ROUND_LIMIT)
+            asr_text_saved = None
+            reply_engine_version = None
+        last_seq = s.exec(
+            select(func.max(RapportUtteranceEvent.event_seq)).where(
+                RapportUtteranceEvent.session_id == session_id)).one()
+        row = RapportUtteranceEvent(
+            session_id=session_id,
+            event_seq=int(last_seq or 0) + 1,
+            section_key=body.sectionKey,
+            question_idx=body.questionIdx,
+            source=source,
+            origin="auto" if body.mode == "auto" else "manual",
+            reply_id=reply_id,
+            text=text,
+            asr_text=asr_text_saved,
+            asr_engine_version=asr_engine_version,
+            reply_engine_version=reply_engine_version,
+            degraded_reason=degraded,
+            raw_audio_id=body.rawAudioId,
+            text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            is_simulation=bool(sess.is_simulation),
+        )
+        s.add(row)
+        try:
+            s.commit()
+        except IntegrityError:
+            s.rollback()
+            raise HTTPException(409, "发声账本并发写入冲突，请重试")
+        s.refresh(row)
     assert row.id is not None
     return RapportReplyCreateOut(
         utteranceId=row.id, text=text, source=source, replyId=reply_id,
-        degradedReason=degraded)
+        degradedReason=degraded,
+        **_rapport_round_fields(prior_now, invites_more=_rapport_invites_more(
+            bank, source, reply_id, degraded, text)))
 
 
 def _pause_projection(payload: dict, wseq: int) -> dict:
@@ -14905,7 +15025,9 @@ def session_ai_usage(session_id: str, request: Request, response: Response,
         if utt.reply_engine_version:
             rapport_reply[utt.reply_engine_version] = (
                 rapport_reply.get(utt.reply_engine_version, 0) + 1)
-        if utt.degraded_reason:
+        # round_limit 是「本问聊满,正常收束」,不是降级——混进降级计数会把
+        # 一次正常的换问算成 AI 失败,污染质量核查。
+        if utt.degraded_reason and utt.degraded_reason != _RAPPORT_ROUND_LIMIT:
             rapport_degraded[utt.degraded_reason] = (
                 rapport_degraded.get(utt.degraded_reason, 0) + 1)
     return {

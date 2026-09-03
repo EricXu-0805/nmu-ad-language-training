@@ -360,3 +360,11 @@ test("parseRapportUtteranceList: raw_audio_id 上界与服务端 160 一致", ()
   assert.equal(ok[0]!.rawAudioId!.length, 160);
   assert.throws(() => parseRapportUtteranceList([utteranceRow({ raw_audio_id: "a".repeat(161) })], SID, false));
 });
+
+test("parseRapportUtteranceList: round_limit 是合法降级原因(聊满收束)", () => {
+  const rows = parseRapportUtteranceList([utteranceRow({
+    source: "fallback", reply_id: null, asr_text: null, asr_engine_version: null,
+    reply_engine_version: null, degraded_reason: "round_limit",
+  })], SID, false);
+  assert.equal(rows[0]!.degradedReason, "round_limit");
+});

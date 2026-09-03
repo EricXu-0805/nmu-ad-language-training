@@ -59,5 +59,18 @@ test("切受试者、切运行平面和安全暂停都会在 paint 前撤销旧�
   assert.match(shell, /plane:legacy\|item:\$\{cursor\.itemIdx\}\|turn:\$\{cursor\.turnIdx\}/);
   assert.match(shell, /\["paused", "complete", "loading", "waiting", "thanks"\]\.includes\(currentScreen\)/);
   assert.match(rapport, /useLayoutEffect\(\(\) => \{/);
-  assert.match(rapport, /if \(!\(connectionReady[\s\S]*?ttsContextKey\)\) \{[\s\S]*?stopSpeaking\(\);/);
+  // 断线/暂停/这一拍本就不该出声时,必须在 paint 前收声。
+  const silence = rapport.match(/const mustSilence = [\s\S]*?;\n/);
+  assert.ok(silence, "RapportStage 缺少 paint 前的收声判据");
+  assert.match(silence[0], /!connectionReady/);
+  assert.match(silence[0], /isPaused/);
+  assert.match(silence[0], /ttsContextKey/);
+  assert.match(rapport, /if \(mustSilence \|\|[\s\S]*?\) \{\s*stopSpeaking\(\);/);
+  // 但**只有内容真的换了**才打断:开麦会重签 wseq,把它算进判据会掐断正在播
+  // 的那句并从头重念一遍,而这一遍常发生在麦克风已开之后(机器人自己的声音
+  // 会被录进老人的答句)。所以判据是 contentIdentity,且它不含 wseq。
+  const identity = rapport.match(/const contentIdentity =[\s\S]*?;\n/);
+  assert.ok(identity, "RapportStage 缺少内容身份");
+  assert.doesNotMatch(identity[0], /wseq/);
+  assert.match(rapport, /spokenIdentityRef\.current === contentIdentity\) return;/);
 });

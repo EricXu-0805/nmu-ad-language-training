@@ -188,6 +188,20 @@ def rapport_bank_reply_line(bank: dict, reply_id: str,
     return None
 
 
+def rapport_bank_invites_more(bank: dict, reply_id: str | None) -> bool:
+    """这句是不是把话头递回老人(冻结句库自带的 invites_more)。
+
+    多轮对话据此决定说完要不要再开麦:收束句(「那我们聊点别的吧」)之后开麦,
+    老人会收到互相矛盾的指令。
+    """
+    if reply_id is None:
+        return False
+    for row in bank.get("replies") or []:
+        if isinstance(row, dict) and row.get("id") == reply_id:
+            return bool(row.get("invites_more"))
+    return False
+
+
 def rapport_reply_line(script: dict, section_key: str, question_idx: int) -> str | None:
     """当前一问在冻结脚本里写好的回应句；脚本没写就是 None（不代拟）。"""
     sections = script.get("sections")

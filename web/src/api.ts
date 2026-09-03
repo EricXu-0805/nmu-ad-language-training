@@ -830,6 +830,7 @@ export const api = {
     utteranceId: number; text: string;
     source: "script" | "bank" | "llm" | "fallback";
     replyId: string | null; degradedReason: string | null; idempotent: boolean;
+    round: number; maxRounds: number; final: boolean; invitesMore: boolean;
   }>("POST", `/sessions/${encodeURIComponent(sid)}/rapport/replies`, body),
   audioReceipts: (sid: string, afterSeq = 0, limit = 500) => {
     const q = new URLSearchParams({ after_seq: String(afterSeq), limit: String(limit) });

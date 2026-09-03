@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MicButton } from "../components/MicButton";
 import type { RapportMsg } from "../sync/messages";
 import { Centered } from "./Centered";
@@ -6,6 +6,13 @@ import { audioRecorderBlockCopy } from "./audioRecorderBlock";
 import type { RapportPresentationExpectation } from "./presentationContent";
 import { speak, stopSpeaking } from "./tts";
 import { usePatientPresentation } from "./usePatientPresentation";
+import { onSpeechSettled, ttsEnabled } from "./tts";
+
+// 播放收口信号的兜底上限。迟开麦研究者能手点补救,永不开麦不能。
+// 云合成冷启的上界够用即可;等太久老人会以为没人理他,而迟开麦研究者能手点补救。
+const SPEECH_SETTLE_TIMEOUT_MS = 12000;
+
+type SpeechGate = { identity: string; settled: boolean } | null;
 import { useVoxRecorder } from "./useVoxRecorder";
 import type { TtsPlaybackContextKey } from "./ttsContext";
 
@@ -52,51 +59,94 @@ export function RapportStage({
     : "我们一起聊聊天，好吗？";
 
   const isPaused = sessionPaused || sessionTerminal || rapportStep?.paused === true;
-  // 录音链的挂起判据只认「题位已确认」,不认 wseq 级新鲜度:每次 arm 都会重签
-  // wseq → 呈现期望必刷新 → contentReady 必闪断;若把这次闪断当挂起,
-  // useVoxRecorder 的封存闩会用**这一条 arm 自己的 recSeq** 把它永久封死,
-  // 麦克风永远打不开(真机走查抓出的存量缺陷)。换题/换拍仍会先确认再开麦。
-  const positionKey = `${rapportStep?.sectionKey ?? ""}#${qIdx}#${beat}`;
+  // 「这一刻该显示/念哪一句」由位置+话拍+发声行唯一决定,**不含 wseq**。
+  // wseq 每次写(含开麦)都被服务端重签,但它不改变内容。把它算进判据会同时
+  // 造成两种伤害:①朗读被掐断并从头重念一遍,而这一遍常发生在麦克风已开之后,
+  // 机器人自己的声音被录进老人的答句;②录音链把这次闪断当挂起,封存闩用这条
+  // arm 自己的 recSeq 把它永久封死,麦克风再也打不开(六十轮存量缺陷)。
+  // 换问/换拍/换发声行时身份真的变了,仍会先确认呈现再开麦(fail-closed 保留)。
+  const utteranceId = rapportStep?.utteranceId;
+  const contentIdentity =
+    `${rapportStep?.sectionKey ?? ""}#${qIdx}#${beat}#${utteranceId ?? ""}`;
   const confirmedPositionRef = useRef<string | null>(null);
-  if (contentReady) confirmedPositionRef.current = positionKey;
-  const positionConfirmed = confirmedPositionRef.current === positionKey;
+  if (contentReady) confirmedPositionRef.current = contentIdentity;
+  const positionConfirmed = confirmedPositionRef.current === contentIdentity;
+  // 已经念过的那一句(按内容身份)。开麦重签 wseq 不改变它,所以不会重念。
+  const spokenIdentityRef = useRef<string | null>(null);
+  // ★开麦闭环:小语这句还没播完就不放行麦克风。
+  // 控制台那边的"等它说完"只能开环估时,而云合成冷启没有上界——抢话时机器人
+  // 自己的声音会被录进老人的答句,再被云 ASR 当成老人说的话写进研究账本、
+  // 喂进下一轮 prompt。播放收口(播完/失败/被打断)才是唯一可靠的信号。
+  const speakingTagRef = useRef<string | null>(null);
+  const [speechGate, setSpeechGate] = useState<SpeechGate>(null);
+  useEffect(() => onSpeechSettled((tag) => {
+    if (tag && tag === speakingTagRef.current) {
+      setSpeechGate((gate: SpeechGate) => (gate && !gate.settled ? { ...gate, settled: true } : gate));
+    }
+  }), []);
+  // 收口信号万一没来(引擎异常/订阅错过),不能把麦克风永久锁死:超时即放行。
+  // 迟开麦是可恢复的(研究者能手点),永不开麦不是。
+  useEffect(() => {
+    if (!speechGate || speechGate.settled) return;
+    const timer = window.setTimeout(() => {
+      setSpeechGate((gate: SpeechGate) => (gate && !gate.settled ? { ...gate, settled: true } : gate));
+    }, SPEECH_SETTLE_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [speechGate]);
   // 小语开口:机器人节话术变了就读;研究者节/脚本未就绪/校验失败一律不读。
   useLayoutEffect(() => {
-    if (!(connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey)) {
-      // A robot line may still be fetching when the next step belongs to the
-      // researcher.  Invalidate it before paint so it cannot speak over the
-      // human-led step.
+    // 断线/暂停/这一拍本就不该出声时必须立刻收声;此外只有「内容真的换了」
+    // 才打断——仅 wseq 重签造成的呈现闪断不算换内容。
+    const mustSilence = !connectionReady || isPaused
+      || (contentReady && (!isRobot || !text || !ttsContextKey));
+    if (mustSilence || contentIdentity !== spokenIdentityRef.current) {
       stopSpeaking();
     }
-  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey]);
-  const utteranceId = rapportStep?.utteranceId;
+    if (!connectionReady || isPaused) spokenIdentityRef.current = null;
+  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, contentIdentity]);
   useEffect(() => {
-    if (connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey) {
-      speak(text, {
-        contextKey: ttsContextKey,
-        tag: `rapport:${rapportPresentation?.section_key ?? ""}:${qIdx}:${beat}`,
-        // 回应拍带发声记录编号时按行取音——LLM 现编句只有这一条发声通道。
-        fetchPath: beat === "reply" && utteranceId
-          ? `/sessions/${encodeURIComponent(sessionId)}/rapport/utterances/${utteranceId}/tts`
-          : undefined,
-      });
-    }
+    if (!(connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey)) return;
+    if (spokenIdentityRef.current === contentIdentity) return;   // 同一句不重念
+    spokenIdentityRef.current = contentIdentity;
+    const speechTag = `rapport:${rapportPresentation?.section_key ?? ""}:${qIdx}:${beat}`;
+    speakingTagRef.current = speechTag;
+    // 语音关着时没有播放可等,直接算收口。
+    setSpeechGate({ identity: contentIdentity, settled: !ttsEnabled() });
+    speak(text, {
+      contextKey: ttsContextKey,
+      tag: speechTag,
+      // 回应拍带发声记录编号时按行取音——LLM 现编句只有这一条发声通道。
+      fetchPath: beat === "reply" && utteranceId
+        ? `/sessions/${encodeURIComponent(sessionId)}/rapport/utterances/${utteranceId}/tts`
+        : undefined,
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, utteranceId]);
+  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, contentIdentity]);
 
+  // 小语正在念这一句:麦克风等它说完再开。
+  // ★不能走 suspended:那是「永久挂起」语义,armed 到达时为真会让 useVoxRecorder
+  // 的封存闩用**这条 arm 自己的 recSeq** 把它永久封死(六十轮那个坑的同一机制)。
+  // 等播完是「临时等待」——对录音链先把 armed 压成 idle,播完再放行,recSeq 不变,
+  // recording 的 idle→armed 边沿会正常触发开麦。
+  const speechInFlight = speechGate !== null
+    && speechGate.identity === contentIdentity && !speechGate.settled;
   const recording = rapportStep?.recording ?? "idle";
+  const gatedRecording = speechInFlight && recording === "armed" ? "idle" : recording;
   const {
     stopAndSave, discardForPatientPause, retrySave, saving, canRetry, recActive, micError, saveError,
     starting, remoteCommandBlocked, blockReason,
   } = useVoxRecorder({
     sessionId,
-    recording: rapportStep?.recording,
+    recording: gatedRecording,
     recSeq: rapportStep?.recSeq,
     commandSeq: rapportStep?.wseq,
     turnKey: `关系建立·${rapportStep?.sectionKey ?? ""}`,
     containsDirectIdentifier: rapportStep?.containsDirectIdentifier ?? false,
     connectionReady,
-    suspended: sessionPaused || sessionTerminal || !positionConfirmed,
+    // error 是「呈现真的取不回来」(每秒重试仍失败),不是 wseq 重签造成的闪断:
+    // 此时组件走 fail-closed 早返回,屏上只有「请稍等一下」、老人连停止按钮都
+    // 没有——不挡住就是一支看不见的热麦。闪断(error 为空、只是在途)不受影响。
+    suspended: sessionPaused || sessionTerminal || !positionConfirmed || Boolean(error),
     stopRequested: isPaused || sessionTerminal || !positionConfirmed,
   });
   useLayoutEffect(() => {

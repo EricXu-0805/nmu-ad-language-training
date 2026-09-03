@@ -122,7 +122,7 @@ def test_registered_stub_engine_is_used(monkeypatch):
         data_boundary = "local"
         provider_id = None
 
-        def generate(self, ask, asr_text):
+        def generate(self, ask, asr_text, history=(), round_no=1, max_rounds_value=1):
             return f"stub回应:{asr_text}"
 
     rapport_reply.register_engine("stub-test", Stub())
@@ -138,3 +138,61 @@ def test_validate_rejects_format_characters():
     assert rapport_reply.validate_reply_text("好的\u200b，谢谢您。") is None
     assert rapport_reply.validate_reply_text("好的\u200d，谢谢您。") is None
     assert rapport_reply.validate_reply_text("好的，谢谢您。") == "好的，谢谢您。"
+
+
+# ---------------- 多轮:轮次上限、历史进 prompt、末轮只收束 ----------------
+
+def test_max_rounds_env_parsing(monkeypatch):
+    monkeypatch.delenv("RAPPORT_MAX_ROUNDS", raising=False)
+    assert rapport_reply.max_rounds() == 2
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "3")
+    assert rapport_reply.max_rounds() == 3
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "0")
+    assert rapport_reply.max_rounds() == 1
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "99")
+    assert rapport_reply.max_rounds() == 5
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "abc")
+    assert rapport_reply.max_rounds() == 2
+
+
+def test_prompt_carries_history_and_round_position():
+    prompt = rapport_reply.build_reply_prompt(
+        "您平时喜欢做些什么呢？", "还有种花",
+        history=(("我喜欢听戏", "听戏好呀，您常听哪出？"),), round_no=2, max_rounds_value=2)
+    assert "我喜欢听戏" in prompt and "听戏好呀" in prompt   # 上一轮两边都在
+    assert "还有种花" in prompt                               # 最新回答
+    assert "第2轮" in prompt and "最多2轮" in prompt
+    assert "最后一轮" in prompt and "不要再提任何问题" in prompt
+
+
+def test_prompt_non_final_round_invites_more():
+    prompt = rapport_reply.build_reply_prompt("问", "答", round_no=1, max_rounds_value=2)
+    assert "最后一轮" not in prompt
+    assert "追问" in prompt
+
+
+def test_final_round_rejects_a_question():
+    # 末轮之后不再开麦:留个问号等于让老人对着空气说话。
+    assert rapport_reply.validate_reply_text("那您常去吗？", final=True) is None
+    assert rapport_reply.validate_reply_text("那您常去吗?", final=True) is None
+    assert rapport_reply.validate_reply_text("听着真好，谢谢您。", final=True) == "听着真好，谢谢您。"
+    # 非末轮照常允许追问。
+    assert rapport_reply.validate_reply_text("那您常去吗？") == "那您常去吗？"
+
+
+def test_invites_reply_predicate_covers_more_than_question_marks():
+    """末轮之后不再开麦:把话头递回老人的任何说法都算"还在追问"。"""
+    assert rapport_reply.invites_reply("那您常去吗？") is True
+    assert rapport_reply.invites_reply("那您常去吗。") is True       # 问号换句号照样是追问
+    assert rapport_reply.invites_reply("再跟我讲讲您年轻时候的事吧。") is True
+    assert rapport_reply.invites_reply("说说您的家人。") is True
+    # 收束/感叹不是追问——误判成追问会让末轮句被大面积退回罐头句。
+    assert rapport_reply.invites_reply("听着真好，谢谢您。") is False
+    assert rapport_reply.invites_reply("有人作伴真好。") is False
+    assert rapport_reply.invites_reply("身边有熟人，心里踏实。") is False
+
+
+def test_inviting_tails_carry_no_stray_alphabet():
+    """这张表被逐项核过:里面只能是中文语气词(曾混进过一个西里尔字母串)。"""
+    for tail in rapport_reply._INVITING_TAILS:
+        assert all("\u4e00" <= ch <= "\u9fff" for ch in tail), tail

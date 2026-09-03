@@ -258,7 +258,8 @@ export type RapportUtteranceSource = "script" | "bank" | "llm" | "fallback";
 export type RapportUtteranceOrigin = "auto" | "manual";
 
 const RAPPORT_DEGRADED_REASONS = new Set([
-  "asr_failed", "asr_empty", "llm_unavailable", "llm_rejected", "cloud_not_authorized",
+  "asr_failed", "asr_empty", "llm_unavailable", "llm_rejected",
+  "cloud_not_authorized", "round_limit",
 ]);
 
 export interface RapportUtteranceRecord {
