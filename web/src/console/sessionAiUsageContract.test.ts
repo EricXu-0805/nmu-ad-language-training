@@ -10,6 +10,7 @@ function payload(overrides: Record<string, unknown> = {}): Record<string, unknow
     tts: { engines: [{ engine_version: "qwen-tts-v1", served: 3, cache_hits: 1, degraded: 1 }] },
     asr: { engines: [{ engine_version: "asr-v1", attempts: 5 }], degraded_attempts: 1 },
     judge: { modes: [{ judge_mode: "规则确定式", judge_engine_version: "rule-1", attempts: 5 }] },
+    rapport: { asr_engines: [], reply_engines: [], degraded: [] },
     ...overrides,
   };
 }
@@ -154,4 +155,36 @@ test("parseSessionAiUsage: rejects non-object/non-array shapes at every level", 
   assert.throws(() => parseSessionAiUsage(payload({ tts: { engines: "not-an-array" } }), SID));
   assert.throws(() => parseSessionAiUsage(payload({ asr: { engines: [], degraded_attempts: "1" } }), SID));
   assert.throws(() => parseSessionAiUsage(payload({ judge: { modes: "not-an-array" } }), SID));
+});
+
+test("parseSessionAiUsage: rapport 段解析(第1周互动态 ASR/现编/降级)", () => {
+  const result = parseSessionAiUsage(payload({
+    rapport: {
+      asr_engines: [{ engine_version: "qwen3-asr", utterances: 4 }],
+      reply_engines: [{ engine_version: "qwen-plus", utterances: 3 }],
+      degraded: [{ reason: "asr_empty", count: 1 }],
+    },
+  }), SID);
+  assert.equal(result.rapport.asrEngines[0]!.utterances, 4);
+  assert.equal(result.rapport.replyEngines[0]!.engineVersion, "qwen-plus");
+  assert.equal(result.rapport.degraded[0]!.reason, "asr_empty");
+});
+
+test("parseSessionAiUsage: 缺 rapport 段整体拒收(exactKeys)", () => {
+  const p = payload();
+  delete (p as Record<string, unknown>).rapport;
+  assert.throws(() => parseSessionAiUsage(p, SID));
+});
+
+test("parseSessionAiUsage: rapport.degraded 非法 reason 拒收", () => {
+  assert.throws(() => parseSessionAiUsage(payload({
+    rapport: { asr_engines: [], reply_engines: [],
+               degraded: [{ reason: "mystery", count: 1 }] },
+  }), SID));
+});
+
+test("parseSessionAiUsage: rapport 引擎行缺键拒收", () => {
+  assert.throws(() => parseSessionAiUsage(payload({
+    rapport: { asr_engines: [{ engine_version: "x" }], reply_engines: [], degraded: [] },
+  }), SID));
 });

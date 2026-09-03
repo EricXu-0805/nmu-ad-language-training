@@ -5644,6 +5644,10 @@ def test_ai_usage_endpoint_reports_actual_usage_not_probe(
     assert body["asr"]["engines"] == []
     assert body["asr"]["degraded_attempts"] == 0
     assert body["judge"]["modes"] == []
+    # 第2-8周场次无第1周互动态,rapport 三组恒空但键必须在(前端 exactKeys)。
+    assert body["rapport"] == {
+        "asr_engines": [], "reply_engines": [], "degraded": [],
+    }
 
 
 def test_account_status_stays_readable_after_the_api_record_stop_chain(

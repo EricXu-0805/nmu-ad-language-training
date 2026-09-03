@@ -125,6 +125,7 @@ function usageContract(overrides: Partial<SessionAiUsageContract> = {}): Session
     tts: { engines: [] },
     asr: { engines: [], degradedAttempts: 0 },
     judge: { modes: [] },
+    rapport: { asrEngines: [], replyEngines: [], degraded: [] },
     ...overrides,
   };
 }
@@ -210,4 +211,19 @@ test("buildRapportReplaySection: 定稿与语音返回合看,三种说出状态�
   assert.equal(section.rows[1]!.degradedLabel, "AI 没给出可用回应（服务不可用或生成越界被拒），已退回固定句");
   assert.equal(section.rows[0]!.positionLabel, "介绍机构环境 · 第 1 问");
   assert.equal(section.rows[0]!.originLabel, "老人说完自动回应");
+});
+
+test("buildAiUsageSection: 第1周 rapport 使 hasAnyRecords=true 且转写/现编/降级各成行", () => {
+  const model = buildAiUsageSection(usageContract({
+    rapport: {
+      asrEngines: [{ engineVersion: "qwen3-asr", utterances: 4 }],
+      replyEngines: [{ engineVersion: "qwen-plus", utterances: 3 }],
+      degraded: [{ reason: "llm_unavailable", count: 1 }],
+    },
+  }));
+  assert.equal(model.hasAnyRecords, true);
+  assert.equal(model.rapportRows.length, 3);
+  assert.match(model.rapportRows[0]!.label, /转写/);
+  assert.match(model.rapportRows[1]!.label, /现编回应/);
+  assert.match(model.rapportRows[2]!.label, /退回固定句/);
 });

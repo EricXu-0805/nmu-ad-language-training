@@ -230,6 +230,47 @@ def test_auto_mode_speaks_a_generated_line_and_is_idempotent(
     assert row.text_sha256 == hashlib.sha256(row.text.encode()).hexdigest()
 
 
+def test_ai_usage_summary_counts_the_rapport_pipeline(pipeline_client, monkeypatch):
+    """第1周 ASR/现编落在 RapportUtteranceEvent;/ai-usage 的 rapport 段必须数到它,
+    否则第1周场次会误显示"ASR/判类 无记录"(与钱凯质量核查口径直接相关)。"""
+    client = pipeline_client
+    _seed_scene(client)
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-usage-1",
+                section="介绍机构环境")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我年轻时在工厂做工"))
+    _use_reply_stub(monkeypatch, "做工辛苦，那时候您在哪个厂呀？")
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-usage-1"})
+    assert created.status_code == 200, created.text
+
+    usage = client.get("/sessions/S-PIPE/ai-usage")
+    assert usage.status_code == 200, usage.text
+    rapport = usage.json()["rapport"]
+    assert rapport["asr_engines"] == [{"engine_version": "stub-asr/1", "utterances": 1}]
+    assert rapport["reply_engines"] == [{"engine_version": "stub-reply/1", "utterances": 1}]
+    assert rapport["degraded"] == []
+
+
+def test_ai_usage_summary_counts_rapport_degradation(pipeline_client, monkeypatch):
+    """降级(老人没说话)也要进 rapport.degraded,现编引擎不计。"""
+    client = pipeline_client
+    _seed_scene(client)
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-usage-2",
+                section="介绍机构环境")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr(""))  # 空转写=没说话
+    _use_reply_stub(monkeypatch, "不该被用到")
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-usage-2"})
+    assert created.status_code == 200, created.text
+    assert created.json()["degradedReason"] == "asr_empty"
+
+    rapport = client.get("/sessions/S-PIPE/ai-usage").json()["rapport"]
+    assert rapport["degraded"] == [{"reason": "asr_empty", "count": 1}]
+    assert rapport["reply_engines"] == []
+
+
 def test_identity_questions_never_start_the_auto_pipeline(
         pipeline_client, monkeypatch):
     """姓名/年龄两问:一个字节都不许进 ASR——拒绝发生在任何云调用之前。"""

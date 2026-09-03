@@ -129,7 +129,7 @@ test("AI usage section distinguishes loading/forbidden/withdrawn/network-error/c
   const emptyReady = renderToStaticMarkup(React.createElement(AiUsageSectionView, {
     state: {
       status: "ready",
-      model: { hasAnyRecords: false, ttsRows: [], asrRows: [], judgeRows: [] },
+      model: { hasAnyRecords: false, ttsRows: [], asrRows: [], judgeRows: [], rapportRows: [] },
     },
   }));
   assert.match(emptyReady, /当前汇总未记录实际使用证据/);
@@ -143,6 +143,7 @@ test("AI usage section distinguishes loading/forbidden/withdrawn/network-error/c
         ttsRows: [{ key: "tts-qwen-tts-v1", label: "qwen-tts-v1", detail: "实际返回 3 次(缓存命中 1) · 改用本机语音 1 次" }],
         asrRows: [{ key: "asr-asr-v1", label: "asr-v1", detail: "尝试 5 次" }],
         judgeRows: [{ key: "judge-规则确定式-rule-1", label: "规则确定式 · rule-1", detail: "5 次" }],
+        rapportRows: [{ key: "rapport-reply-qwen-plus", label: "现编回应 · qwen-plus", detail: "3 次" }],
       },
     },
   }));

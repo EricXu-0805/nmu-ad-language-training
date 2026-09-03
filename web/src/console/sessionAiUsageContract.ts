@@ -68,20 +68,60 @@ export interface SessionAiUsageJudgeModeRow {
   attempts: number;
 }
 
+export interface SessionAiUsageEngineUtterRow {
+  engineVersion: string;
+  utterances: number;
+}
+
+export interface SessionAiUsageRapportDegradedRow {
+  reason: string;
+  count: number;
+}
+
+export interface SessionAiUsageRapport {
+  asrEngines: SessionAiUsageEngineUtterRow[];
+  replyEngines: SessionAiUsageEngineUtterRow[];
+  degraded: SessionAiUsageRapportDegradedRow[];
+}
+
 export interface SessionAiUsageContract {
   sessionId: string;
   tts: { engines: SessionAiUsageTtsEngineRow[] };
   asr: { engines: SessionAiUsageAsrEngineRow[]; degradedAttempts: number };
   judge: { modes: SessionAiUsageJudgeModeRow[] };
+  rapport: SessionAiUsageRapport;
 }
 
-const TOP_KEYS = new Set(["session_id", "tts", "asr", "judge"]);
+const TOP_KEYS = new Set(["session_id", "tts", "asr", "judge", "rapport"]);
 const TTS_KEYS = new Set(["engines"]);
 const TTS_ROW_KEYS = new Set(["engine_version", "served", "cache_hits", "degraded"]);
 const ASR_KEYS = new Set(["engines", "degraded_attempts"]);
 const ASR_ROW_KEYS = new Set(["engine_version", "attempts"]);
 const JUDGE_KEYS = new Set(["modes"]);
 const JUDGE_ROW_KEYS = new Set(["judge_mode", "judge_engine_version", "attempts"]);
+const RAPPORT_KEYS = new Set(["asr_engines", "reply_engines", "degraded"]);
+const RAPPORT_ENGINE_ROW_KEYS = new Set(["engine_version", "utterances"]);
+const RAPPORT_DEGRADED_ROW_KEYS = new Set(["reason", "count"]);
+const RAPPORT_DEGRADED_REASONS = new Set([
+  "asr_failed", "asr_empty", "llm_unavailable", "llm_rejected", "cloud_not_authorized",
+]);
+
+function parseRapportEngineList(
+  value: unknown, path: string,
+): SessionAiUsageEngineUtterRow[] {
+  if (!Array.isArray(value)) throw new Error(`${path} 必须是数组`);
+  const seen = new Set<string>();
+  return value.map((entry, index): SessionAiUsageEngineUtterRow => {
+    const rowPath = `${path}[${index}]`;
+    const entryRow = asRecord(entry, rowPath);
+    requireExactKeys(entryRow, RAPPORT_ENGINE_ROW_KEYS, rowPath);
+    const engineVersion = boundedNonEmptyString(entryRow, "engine_version", rowPath);
+    if (seen.has(engineVersion)) throw new Error(`${rowPath} 引擎重复出现`);
+    seen.add(engineVersion);
+    const utterances = nonNegativeInteger(entryRow, "utterances", rowPath);
+    return { engineVersion, utterances };
+  });
+}
 
 export function parseSessionAiUsage(value: unknown, expectedSessionId: string): SessionAiUsageContract {
   const row = asRecord(value, "AI 使用汇总");
@@ -139,10 +179,36 @@ export function parseSessionAiUsage(value: unknown, expectedSessionId: string): 
     return { judgeMode, judgeEngineVersion, attempts };
   });
 
+  const rapportRow = asRecord(row.rapport, "AI 使用汇总.rapport");
+  requireExactKeys(rapportRow, RAPPORT_KEYS, "AI 使用汇总.rapport");
+  const rapportAsr = parseRapportEngineList(
+    rapportRow.asr_engines, "AI 使用汇总.rapport.asr_engines");
+  const rapportReply = parseRapportEngineList(
+    rapportRow.reply_engines, "AI 使用汇总.rapport.reply_engines");
+  if (!Array.isArray(rapportRow.degraded)) throw new Error("AI 使用汇总.rapport.degraded 必须是数组");
+  const seenReasons = new Set<string>();
+  const rapportDegraded = rapportRow.degraded.map(
+    (entry, index): SessionAiUsageRapportDegradedRow => {
+      const path = `AI 使用汇总.rapport.degraded[${index}]`;
+      const entryRow = asRecord(entry, path);
+      requireExactKeys(entryRow, RAPPORT_DEGRADED_ROW_KEYS, path);
+      const reason = boundedNonEmptyString(entryRow, "reason", path);
+      if (!RAPPORT_DEGRADED_REASONS.has(reason)) throw new Error(`${path}.reason 非法`);
+      if (seenReasons.has(reason)) throw new Error(`${path}.reason 重复出现`);
+      seenReasons.add(reason);
+      const count = nonNegativeInteger(entryRow, "count", path);
+      return { reason, count };
+    });
+
   return {
     sessionId: row.session_id as string,
     tts: { engines: ttsEngines },
     asr: { engines: asrEngines, degradedAttempts },
     judge: { modes: judgeModes },
+    rapport: {
+      asrEngines: rapportAsr,
+      replyEngines: rapportReply,
+      degraded: rapportDegraded,
+    },
   };
 }

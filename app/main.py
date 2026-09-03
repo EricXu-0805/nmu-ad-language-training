@@ -14892,6 +14892,22 @@ def session_ai_usage(session_id: str, request: Request, response: Response,
         if attempt.judge_mode:
             key = (attempt.judge_mode, attempt.judge_engine_version or "")
             judge_modes[key] = judge_modes.get(key, 0) + 1
+    # 第1周互动态的 AI 调用落在 RapportUtteranceEvent(不是 AttemptEvent):
+    # 不聚进来,第1周场次的汇总会误显示"ASR/判类 无记录",而云 ASR+LLM 实际用了。
+    rapport_asr: dict[str, int] = {}
+    rapport_reply: dict[str, int] = {}
+    rapport_degraded: dict[str, int] = {}
+    for utt in s.exec(select(RapportUtteranceEvent).where(
+            RapportUtteranceEvent.session_id == session_id)):
+        if utt.asr_engine_version:
+            rapport_asr[utt.asr_engine_version] = (
+                rapport_asr.get(utt.asr_engine_version, 0) + 1)
+        if utt.reply_engine_version:
+            rapport_reply[utt.reply_engine_version] = (
+                rapport_reply.get(utt.reply_engine_version, 0) + 1)
+        if utt.degraded_reason:
+            rapport_degraded[utt.degraded_reason] = (
+                rapport_degraded.get(utt.degraded_reason, 0) + 1)
     return {
         "session_id": session_id,
         "tts": {
@@ -14912,6 +14928,22 @@ def session_ai_usage(session_id: str, request: Request, response: Response,
                 {"judge_mode": mode, "judge_engine_version": engine,
                  "attempts": count}
                 for (mode, engine), count in sorted(judge_modes.items())
+            ],
+        },
+        # 第1周关系建立互动态:老人转写(ASR)、机器人现编(LLM reply)、四级降级。
+        # TTS 已并入上面的 tts.engines(source=rapport_utterance)。
+        "rapport": {
+            "asr_engines": [
+                {"engine_version": v, "utterances": c}
+                for v, c in sorted(rapport_asr.items())
+            ],
+            "reply_engines": [
+                {"engine_version": v, "utterances": c}
+                for v, c in sorted(rapport_reply.items())
+            ],
+            "degraded": [
+                {"reason": r, "count": c}
+                for r, c in sorted(rapport_degraded.items())
             ],
         },
     }

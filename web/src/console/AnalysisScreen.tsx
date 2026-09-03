@@ -924,6 +924,16 @@ export function AiUsageSectionView({ state }: { state: AiUsageViewModel }) {
               </div>
             ))}
           </div>
+          <div className="evidence-attempt-section">
+            <div className="evidence-section-title"><strong>第 1 周互动态（转写 / 现编 / 降级）</strong></div>
+            {state.model.rapportRows.length === 0 && <p className="muted">无记录。</p>}
+            {state.model.rapportRows.map((row) => (
+              <div className="evidence-value" key={row.key}>
+                <span className="mono">{row.label}</span>
+                <strong>{row.detail}</strong>
+              </div>
+            ))}
+          </div>
         </>
       )}
     </section>

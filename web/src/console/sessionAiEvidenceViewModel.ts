@@ -147,6 +147,7 @@ export interface AiUsageSectionViewModel {
   ttsRows: AiUsageRowViewModel[];
   asrRows: AiUsageRowViewModel[];
   judgeRows: AiUsageRowViewModel[];
+  rapportRows: AiUsageRowViewModel[];
 }
 
 export type AiUsageViewModel =
@@ -180,11 +181,35 @@ export function buildAiUsageSection(contract: SessionAiUsageContract): AiUsageSe
     label: mode.judgeEngineVersion ? `${mode.judgeMode} · ${mode.judgeEngineVersion}` : mode.judgeMode,
     detail: `${mode.attempts} 次`,
   }));
+  // 第1周互动态:老人转写(ASR)+机器人现编(LLM)+四级降级,单独一组。
+  const rapportRows: AiUsageRowViewModel[] = [];
+  for (const engine of contract.rapport.asrEngines) {
+    rapportRows.push({
+      key: `rapport-asr-${engine.engineVersion}`,
+      label: `转写 · ${engine.engineVersion}`,
+      detail: `${engine.utterances} 次`,
+    });
+  }
+  for (const engine of contract.rapport.replyEngines) {
+    rapportRows.push({
+      key: `rapport-reply-${engine.engineVersion}`,
+      label: `现编回应 · ${engine.engineVersion}`,
+      detail: `${engine.utterances} 次`,
+    });
+  }
+  for (const row of contract.rapport.degraded) {
+    rapportRows.push({
+      key: `rapport-degraded-${row.reason}`,
+      label: `退回固定句 · ${RAPPORT_DEGRADED_LABELS[row.reason] ?? row.reason}`,
+      detail: `${row.count} 次`,
+    });
+  }
   const hasAnyRecords = contract.tts.engines.length > 0
     || contract.asr.engines.length > 0
     || contract.asr.degradedAttempts > 0
-    || contract.judge.modes.length > 0;
-  return { hasAnyRecords, ttsRows, asrRows, judgeRows };
+    || contract.judge.modes.length > 0
+    || rapportRows.length > 0;
+  return { hasAnyRecords, ttsRows, asrRows, judgeRows, rapportRows };
 }
 
 export { EMPTY_NOTICE as sessionAiEvidenceEmptyNotice };
