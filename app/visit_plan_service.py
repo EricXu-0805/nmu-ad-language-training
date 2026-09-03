@@ -22,6 +22,7 @@ from . import (
 )
 from .models import (
     AssessmentEvent,
+    LiveState,
     Patient,
     Session as TrainSession,
     SessionCloseoutReport,
@@ -1441,11 +1442,16 @@ def assert_patient_ready_for_new_work(
     sessions = list(db.exec(select(TrainSession).where(
         TrainSession.patient_id == patient_id,
     )))
+    live_row = db.get(LiveState, 1)
     for train_session in sessions:
         runtime = db.get(SessionRuntimeState, train_session.session_id)
-        if runtime is None or runtime.status in {"active", "paused"}:
-            _fail(409, "visit_plan_patient_session_open", "该受试者仍有活跃或暂停场次")
-        if (runtime.status == "intervention_completed"
+        status = runtime.status if runtime is not None else "active"
+        if status in {"active", "paused"}:
+            # 只拦仍持床旁槽且未遗弃的场;遗弃/被接管的交给握手层,别超前拦死。
+            if session_admission.bedside_session_blocks_new_work(
+                    train_session.session_id, runtime, live_row):
+                _fail(409, "visit_plan_patient_session_open", "该受试者仍有活跃或暂停场次")
+        if (status == "intervention_completed"
                 and db.get(
                     SessionCloseoutReport,
                     train_session.session_id,
@@ -1486,15 +1492,23 @@ def assert_actor_ready_for_new_work(
     sessions = list(db.exec(select(TrainSession).where(
         TrainSession.trainer_id == actor_id,
     )))
+    live_row = db.get(LiveState, 1)
     for train_session in sessions:
         runtime = db.get(SessionRuntimeState, train_session.session_id)
-        if runtime is None or runtime.status in {"active", "paused"}:
-            _fail(
-                409,
-                "visit_plan_actor_session_open",
-                "当前账号仍有活跃或暂停场次；必须先安全收口，才能切换受试者",
-            )
-        if (runtime.status == "intervention_completed"
+        status = runtime.status if runtime is not None else "active"
+        if status in {"active", "paused"}:
+            # 只拦仍持床旁槽且未遗弃的场:研究者关页签走人留下的弃场(共享账号
+            # 下尤其致命)会在这里被放行,由握手层安全暂停后让位(复核 P2)。
+            if session_admission.bedside_session_blocks_new_work(
+                    train_session.session_id, runtime, live_row):
+                _fail(
+                    409,
+                    "visit_plan_actor_session_open",
+                    f"当前账号仍有活跃或暂停场次（{train_session.patient_id} · "
+                    f"第 {train_session.week_no} 周）；到训练台「打开恢复入口」"
+                    "把它收尾或中止后，才能切换受试者",
+                )
+        if (status == "intervention_completed"
                 and db.get(SessionCloseoutReport, train_session.session_id) is None):
             _fail(
                 409,

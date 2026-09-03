@@ -1,11 +1,13 @@
 """Shared, provider-free admission rules for plans and session creation."""
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timedelta
 
 from . import content
 from .enums import ConsentType, EventLine, PhaseType
-from .models import Patient
+from .models import LiveState, Patient
 
 
 _CONSENT_GRANTED = frozenset({
@@ -143,3 +145,87 @@ def content_admission_issues(
     if phase == "正式训练" and week_no not in bank.supported_training_weeks:
         issues.append(f"第{week_no}周材料尚未结构化并校对")
     return issues
+
+
+# ── 床旁 live 槽的"遗弃"判据(2026-09-03 生产实证的雷) ────────────────────
+# 研究者训练中直接关页签走人 → 占着床旁槽的活跃/暂停场把下一场挡死。
+# "遗弃"只看操作端(控制台)侧的 live 写时间 row.updated_at:它由每次
+# 握手/推游标/推 rapport/老人端录音回报刷新。**绝不把老人端被动心跳
+# (patient_last_seen_at)算进来**——两设备部署里平板固定床旁、每几秒心跳一次,
+# 研究者关的是笔记本控制台;把心跳算进来会让平板一直开着的弃场永不判遗弃,
+# 修复在最常见部署下失效(复核 P1)。
+
+
+def bedside_stale_after() -> timedelta | None:
+    """床旁槽遗弃阈值;None = 关闭(永不自动让位)。
+
+    NMU_BEDSIDE_STALE_MINUTES:正整数=分钟阈值;0/负数=关闭;非数字=落回 15。
+    """
+    raw = (os.environ.get("NMU_BEDSIDE_STALE_MINUTES") or "15").strip()
+    try:
+        minutes = int(raw)
+    except ValueError:
+        minutes = 15
+    if minutes <= 0:
+        return None
+    return timedelta(minutes=minutes)
+
+
+def live_holder_session_id(live_row: LiveState | None) -> str | None:
+    """当前持有床旁槽的场次 id(live 广播槽指向谁)。"""
+    if live_row is None or not live_row.session_json:
+        return None
+    try:
+        payload = json.loads(live_row.session_json)
+    except (ValueError, TypeError):
+        return None
+    sid = payload.get("sessionId") if isinstance(payload, dict) else None
+    return sid or None
+
+
+def live_slot_stale(live_row: LiveState | None, now: datetime | None = None) -> bool:
+    """床旁槽是否已被遗弃:控制台侧 live 写停了超过阈值。
+
+    从未写过(updated_at 为空)的槽不谈守护,视为已遗弃。阈值关闭时永不遗弃。
+    """
+    threshold = bedside_stale_after()
+    if threshold is None:
+        return False
+    if live_row is None or live_row.updated_at is None:
+        return True
+    return (now or datetime.now()) - live_row.updated_at > threshold
+
+
+def runtime_stale(runtime, now: datetime | None = None) -> bool:
+    """场次自己的活动时钟是否已放置超时。
+
+    SessionRuntimeState.updated_at 由 START(建行)、推游标/rapport、暂停/恢复
+    刷新——是干净的"研究者在这场上还有没有动作"信号,**不受老人端心跳影响**。
+    """
+    threshold = bedside_stale_after()
+    if threshold is None:
+        return False
+    updated_at = getattr(runtime, "updated_at", None) if runtime is not None else None
+    if updated_at is None:
+        return False
+    return (now or datetime.now()) - updated_at > threshold
+
+
+def bedside_session_blocks_new_work(
+    session_id: str,
+    runtime,
+    live_row: LiveState | None,
+    now: datetime | None = None,
+) -> bool:
+    """活跃/暂停场是否应拦住新工作。
+
+    只拦"仍被照看"的场;遗弃/被接管的放行——握手层会接管,超前拦死正是那颗雷。
+    - 有 runtime 活动时钟(START 路径必有):按它是否放置超时判,刚开的场必新鲜=拦。
+    - 无 runtime 时钟(裸握手等):回退到"是否仍持新鲜床旁槽"。
+    遗弃只看控制台侧信号,绝不含老人端被动心跳。
+    """
+    if runtime is not None and getattr(runtime, "updated_at", None) is not None:
+        return not runtime_stale(runtime, now)
+    if live_holder_session_id(live_row) != session_id:
+        return False
+    return not live_slot_stale(live_row, now)

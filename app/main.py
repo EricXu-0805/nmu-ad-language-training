@@ -6248,10 +6248,43 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                 if previous_session_id and previous_session_id != session_id:
                     previous = s.get(TrainSession, previous_session_id)
                     if previous is not None:
-                        _require_session_operator(
-                            request, previous, s, "切换当前床旁场次",
-                            mutation=True,
-                            allow_withdrawn_safety_exit=True)
+                        prev_state = s.get(
+                            SessionRuntimeState, previous_session_id)
+                        prev_status = (prev_state.status
+                                       if prev_state is not None else "active")
+                        if prev_status in _TERMINAL_RUNTIME_STATUSES:
+                            # 已收尾/中止的终态场不再守床旁槽:换人接管是常态,
+                            # 不能要求新操作者对一个已结束的场持有操作权
+                            # (2026-09-03 生产实证:收完尾别的账号仍开不了新场)。
+                            _audit(s, request, "bedside_slot_terminal_takeover",
+                                   f"from={previous_session_id};"
+                                   f"status={prev_status};to={session_id}",
+                                   session_id=session_id)
+                        elif session_admission.live_slot_stale(row):
+                            # 放置超时(关页签走人)的活跃/暂停/待收尾场:安全暂停后
+                            # 让位。原场原样可从恢复入口继续或收尾,只交出床旁槽。
+                            # 遗弃只按控制台侧 updated_at 判,不含老人端被动心跳。
+                            if prev_status == "active":
+                                try:
+                                    autopilot_service.fence_autonomous_scope_for_device_rotation(
+                                        s, session_id=previous_session_id)
+                                except autopilot_service.AutopilotServiceError as exc:
+                                    _autopilot_write_failure(s, exc)
+                                except IntegrityError as exc:
+                                    _autopilot_integrity_conflict(s, exc)
+                                _pause_runtime_in_transaction(
+                                    previous_session_id, s)
+                            _audit(s, request, "bedside_slot_stale_takeover",
+                                   f"from={previous_session_id};"
+                                   f"status={prev_status};to={session_id}",
+                                   session_id=session_id)
+                        else:
+                            # 仍新鲜(active/paused/intervention_completed 且槽在动):
+                            # 维持保护,切槽要上一场操作权。
+                            _require_session_operator(
+                                request, previous, s, "切换当前床旁场次",
+                                mutation=True,
+                                allow_withdrawn_safety_exit=True)
             else:
                 sess = s.get(TrainSession, session_id)
                 if not sess:
@@ -6638,6 +6671,10 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
             return exact_ack
         assert applied is not None
         row, command_wseq, capture_receipt, receipt_idempotent = applied
+        # 每次 live 写都续鲜床旁槽:updated_at 是「槽是否被遗弃」的判据,
+        # 场次握手也必须刷新,否则新占的槽会立刻被误判为放置超时而失守。
+        row.updated_at = datetime.now()
+        s.add(row)
         try:
             s.commit()
         except IntegrityError:
