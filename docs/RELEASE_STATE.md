@@ -7,6 +7,14 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+> **2026-09-03 22:0x UTC 已上线 `f76cd21`（零迁移；库头仍 `d0c22a6dae2a`）。**
+> 三件事一次上线：床旁槽自动让位（关页签走人的弃场不再把下一场挡死）、AI 使用汇总
+> 补第 1 周互动态、**第 1 周每问多轮对话**（默认 2 轮，开麦闭环）。
+> 部署树 `MATCH revision=f76cd21 files=90 identical=90`；十一步全过；服务健康、红线 404。
+> ⚠️ preflight 7/8：**24 个 OS 安全补丁待装**（与本次上线无关，走收据 246 脚本）。
+> 依赖锁/迁移图/备份校验器零变化 → 没停定时器、没碰 venv、异地校验器免重装。
+> 执行记录见收据 242 / 244。
+>
 > **2026-09-01 07:0x UTC 已上线 `feec0d7`(零迁移;库头仍 `d0c22a6dae2a`)。**
 > 第1周对话回放屏(journal 携发声账本行+分析后台新区块)+ 四个研究协变量录入。
 > 部署树 `MATCH revision=feec0d7 files=90 identical=90`;preflight 8/8 退出码 0;
@@ -39,12 +47,12 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `feec0d7`（2026-09-01 07:0x UTC 上线；此前依次 `eb6dcd1` → `a986f54` → `74532be` → `0755e09`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision feec0d7` 应输出 `MATCH … identical=90`（2026-09-01 07:1x UTC 实测通过） |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff feec0d7..main -- app web alembic` 应为空 |
+| 应用代码版本 | `f76cd21`（2026-09-03 22:0x UTC 上线；此前依次 `feec0d7` → `eb6dcd1` → `a986f54` → `74532be`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision f76cd21` 应输出 `MATCH … identical=90`（2026-09-03 22:1x UTC 实测通过） |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff f76cd21..main -- app web alembic` 应为空 |
 | 云 TTS 语速 | `TTS_CLOUD_RATE=1.0`（2026-08-31 Eric 拍板终态；收据 237 重启已生效，1.0 缓存 1290/1290 全命中；0.9/1.0 两套缓存都留盘、可即切） | `grep ^TTS_CLOUD_RATE= /opt/nmu/app/.env`；缓存键带语速，改完必须重跑 `scripts/presynthesize_tts.py`，否则每句新话术都要现场云调用 |
 | 数据库结构版本 | `d0c22a6dae2a`（2026-08-31 23:38 由 `c8e5a1f3b209` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `c27cd1731aed7bf35c1b`（2026-08-31 随头前进；异地已重装并核对一致） | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
-| 回滚存档 | 最新一份 = `app-before-deploy-20260831-183746.tar.gz`（对应 `a986f54`，库头 `c8e5a1f3b209`——比当前库头落后一次迁移，直接换上去起不来服务）。**同结构回滚 = 从仓库按上一基线 sha 重同步，不是解 tar。** 用 tar 之前必须先核：解开后在那棵树上跑 `python -I scripts/check_database_head.py`，退 0 才准换上。⚠️ `…170248-语法错疑含data勿用.tar.gz` 是失败残留已改名标记，勿用 | 解开到临时目录后 `cd <解开处> && /opt/nmu/venv/bin/python -I scripts/check_database_head.py` |
+| 回滚存档 | ⚠️ 9-01 与 9-03 两次零迁移上线都没产生新 tar（同结构回滚 = 从仓库按上一基线 sha 重同步，不是解 tar）。最新一份 = `app-before-deploy-20260831-183746.tar.gz`（对应 `a986f54`，库头 `c8e5a1f3b209`——比当前库头落后一次迁移，直接换上去起不来服务）。**同结构回滚 = 从仓库按上一基线 sha 重同步，不是解 tar。** 用 tar 之前必须先核：解开后在那棵树上跑 `python -I scripts/check_database_head.py`，退 0 才准换上。⚠️ `…170248-语法错疑含data勿用.tar.gz` 是失败残留已改名标记，勿用 | 解开到临时目录后 `cd <解开处> && /opt/nmu/venv/bin/python -I scripts/check_database_head.py` |
 | 回滚锚点快照 | **退回 `a986f54`/`c8e5a1f3b209`** 用 2026-08-31 上线前的停写锚点 **`20260831-233749`**（旧头、旧校验器 `118233d4…` 产出，VPS 侧在档；异地侧新校验器不背书旧头，按 §8.1 处置时配旧校验器用），必须连**旧代码树 + 旧校验器**一起放回；同结构回退直接用最新 `daily/` 快照 |
 | 起服前闸门 | 已装（`ExecStartPre` 验库头，以 `User=nmu` 身份跑） | `systemctl cat nmu.service \| grep ExecStartPre`；journal 里 `OK database_at_head` 应在 `Started` 之前 |
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
@@ -128,6 +136,12 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 会被移进 `legacy-unvalidated/` 等人处置。它们不是坏备份，但绝不能改名当成当前合格快照。
 
 ## 待上线增量
+
+（无。）
+
+## 2026-09-03 上线记录（`f76cd21`：床旁槽让位 + AI 汇总补第1周 + 每问多轮对话，零迁移）
+
+**2026-09-03 22:0x UTC 窗口 `20260903-170336` 上线（Eric 执行收据 245 脚本，十一步全过；树核 MATCH 90/90；preflight 7/8，唯一 FAIL = 24 个 OS 安全补丁，走收据 246）。**
 
 **床旁槽自动让位 + AI 使用汇总补第 1 周互动态（2026-09-03 完成，零迁移，收据 242）。**
 - `75890a6` 床旁槽自动让位：研究者训练中直接关页签留下的活跃/暂停场不再把下一场
@@ -310,6 +324,7 @@ PM_20260730_自动对话/218-上线命令_b1765c0.sh`），Claude 只读核验�
 | 日期 | 代码版本 | 结构版本 | 回滚存档 | 备注 |
 | --- | --- | --- | --- | --- |
 | 2026-08-26 22:07 UTC | `08ad898` | `b6d4f8a2c917`（未变） | `dist-stale-20260826-2205` + 上一基线 `083fa35` 重同步 | 零迁移热更新:第六堵墙——wk4 花瓶勘误借句获引擎 errata 精确豁免(未登记塌缩仍拒)+七周 78 题位全扫描进门禁+前端两拒因码上屏。**受控技术环境更新，不构成任何外部批准。** |
+| 2026-09-03 22:0x UTC | `f76cd21` | `d0c22a6dae2a`（未变） | 零迁移:dist 隔离 `dist-stale-20260903-170336` + 按上一基线 `feec0d7` 可重同步 | 三件事:①床旁槽自动让位(终态立即让位/遗弃≥15分钟安全暂停后让位/新鲜维持保护,两道准入闸同口径,遗弃只按控制台侧活动判不含老人端心跳);②AI 使用汇总补 rapport 段(第1周不再误显示 ASR/判类无记录);③**第1周每问多轮对话**(默认2轮,历史入prompt,末轮只收束且端点兜底复核,聊满仍落冻结收束句不调云,**开麦闭环=老人端这句没播完不放行麦克风**)。三轮对抗复核53条全处置;真Chrome走查21/21连跑三次+wk1 30/30;突变红验13条;六关全绿;CI全job绿。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-09-01 07:0x UTC | `feec0d7` | `d0c22a6dae2a`（未变） | 零迁移:dist 隔离 `dist-stale-20260901-020748` + 按上一基线可重同步 | 第1周对话回放屏(journal 携发声账本行+撤回墓碑补键与治理计数+分析后台新区块「第1周对话回放」)+四研究协变量录入(建档/编辑抽屉,中文422与库CHECK同界)。四路对抗复核14条处置:raw_audio_id 界对齐160、LLM守卫拒Unicode格式字符、旧后端窗口不假红警、422全链人话、数字框误触不清空;上交=四协变量研究侧出口列与披露等级待PI。真Chrome走查15/15;preflight 8/8;树核 MATCH 90/90。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-31 23:3x UTC | `eb6dcd1` | `d0c22a6dae2a`（由 `c8e5a1f3b209` 前进） | 锚点 `20260831-233749`（旧校验器）+ tar `app-before-deploy-20260831-183746.tar.gz` | 第1周互动态:老人答完→云 ASR→qwen-plus 现编一句→按持久行端点发声(白名单一条窄缝,客户端递不进文本)+四级降级梯全落冻结句库+机器人每句落只追加发声账本+ACK failure_stage(8值闭集)。窗口 17 步全过;preflight 先 7/8、收据 237 装完 bzip2 后复绿 8/8;树核 MATCH 90/90;新头快照 20260831-233817 已验证异地归档;语速终态 1.0。**受控技术环境更新，不构成任何外部批准。** |
 | 2026-08-31 02:2x UTC | `a986f54` | `c8e5a1f3b209`（未变） | `dist-stale-20260830-212455` + 上一基线 `74532be` 重同步 | 零迁移热更新:第 1 周一问两拍(老人答完机器人自己开口,此前那句只印在研究者屏上让人代说)+ 开放式回应库 28 句 7 组(研究者点场景、组内轮换;姓名/年龄两问服务端拒绝走这条路)+ 云 TTS 语速 0.9→1.0(1290 句重跑预合成 0 失败)。真 Chrome 走查 21/21;树核 `MATCH 89/89`;preflight 8/8 退 0;CI 五 job 绿。⚠️ 机器人说了哪一句尚未落进任何持久记录,第 1 周会话不再可完整还原——待钱凯拍板(收据 235 §4)。**受控技术环境更新，不构成任何外部批准。** |
