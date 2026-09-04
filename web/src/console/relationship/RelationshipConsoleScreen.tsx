@@ -4,11 +4,11 @@ import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { StatusPill } from "../../components/StatusPill";
 import { useToast } from "../../components/ToastContext";
-import { useWeek1ReplyBank, useWeek1Script } from "../../content/bundle";
+import { useWeek1ReplyBank, useWeek1Script, type Week1Section } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
 import { useSessionRuntime } from "../../hooks/useSessionRuntime";
 import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
-import { isPatientRecFailure, type RapportBeat, type RecState } from "../../sync/messages";
+import { isPatientRecFailure, rapportTurnKey, type RapportBeat, type RecState } from "../../sync/messages";
 import {
   afterReplyAction, autoAdvanceTarget, nextQuestionArmDelayMs, roundLabel,
   shouldAutoArmOnEntry, speechDelayMs,
@@ -17,10 +17,22 @@ import type { Session } from "../../types";
 import { SessionControlBar } from "../SessionControlBar";
 import { SessionAbortControl } from "../SessionAbortControl";
 
-function defaultRapportFlags(sectionKey: string): { assentGate: boolean; containsDirectIdentifier: boolean } {
+// 自我介绍节里回答本身就是直接身份信息的问位(脚本槽位名 preferred_appellation/age):
+// 这两问的录音整段标记含直接标识、永不进云。属相/兴趣/活动不在其列
+// (2026-09-04 Eric 拍板放行进云;与服务端 RAPPORT_IDENTITY_SLOT_FIELDS 同一口径)。
+const IDENTITY_SLOT_FIELDS = new Set(["preferred_appellation", "age"]);
+
+function isIdentityQuestion(section: Week1Section | undefined, qIdx: number): boolean {
+  const field = section?.questions?.[qIdx]?.slot_field;
+  return section?.key === "自我介绍" && field !== undefined && IDENTITY_SLOT_FIELDS.has(field);
+}
+
+function defaultRapportFlags(sectionKey: string, qIdx: number, section?: Week1Section): {
+  assentGate: boolean; containsDirectIdentifier: boolean;
+} {
   return {
     assentGate: sectionKey === "认识机器人",
-    containsDirectIdentifier: sectionKey === "自我介绍",
+    containsDirectIdentifier: isIdentityQuestion(section, qIdx),
   };
 }
 
@@ -51,7 +63,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const [journalLoading, setJournalLoading] = useState(true);
   const [journalRetry, setJournalRetry] = useState(0);
   const [recoveryApplied, setRecoveryApplied] = useState(false);
-  const [rapportFlags, setRapportFlags] = useState(() => defaultRapportFlags("认识机器人"));
+  const [rapportFlags, setRapportFlags] = useState(() => defaultRapportFlags("认识机器人", 0));
   const recoveredOnce = useRef(false);
   const handshakeSent = useRef(false);
   const [recState, setRecState] = useState<RecState>("idle");
@@ -104,16 +116,14 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const recordingEligible = recStatus === "allowed";
   const [recRetry, setRecRetry] = useState(0);
   const section = script?.sections[sectionIdx];
-  const isSelfIntro = section?.key === "自我介绍";
   const questions = section?.questions ?? [];
   const replyLine = section?.speaker === "机器人" ? (questions[qIdx]?.success ?? null) : null;
   const openReplyHere = Boolean(replyBank?.applies_to.some(
     (row) => row.section_key === section?.key && row.question_idx === qIdx));
-  // AI 现编按节判定:录音只绑到节,节内含身份问询问位(自我介绍)整节不进云——
-  // 那一节老人答完由机器人照冻结脚本回应(不转写、不出网),流程照样自动往下走。
-  const autoOpenHere = Boolean(openReplyHere && questions.length > 0
-    && questions.every((_q, i) => replyBank?.applies_to.some(
-      (row) => row.section_key === section?.key && row.question_idx === i)));
+  // AI 现编按**问**判定(2026-09-04 起录音绑到问):姓名/年龄两问的回答是直接身份信息,
+  // 由机器人照冻结脚本回应(不转写、不出网);属相/兴趣/活动与机构环境四问进云现编。
+  const autoOpenHere = openReplyHere;
+  const identityHere = isIdentityQuestion(section, qIdx);
   // 自动带练在每个机器人节都开得了:AI 现编(autoOpenHere)或脚本回应二选一。
   const autoModeHere = section?.speaker === "机器人" && questions.length > 0;
   const recSeq = useRef(0);
@@ -190,7 +200,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setSectionIdx(0);
     setQIdx(0);
     setBeat("ask");
-    setRapportFlags(defaultRapportFlags("认识机器人"));
+    setRapportFlags(defaultRapportFlags("认识机器人", 0));
   }, [resetSession, session.session_id]);
 
   useEffect(() => {
@@ -224,7 +234,8 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setSectionIdx(safeSection);
     setQIdx(safeQuestion);
     setBeat("ask");
-    const restoredFlags = defaultRapportFlags(script.sections[safeSection]?.key ?? "");
+    const restoredFlags = defaultRapportFlags(
+      script.sections[safeSection]?.key ?? "", safeQuestion, script.sections[safeSection]);
     setRapportFlags({
       assentGate: saved?.assentGate ?? restoredFlags.assentGate,
       containsDirectIdentifier: saved?.containsDirectIdentifier ?? restoredFlags.containsDirectIdentifier,
@@ -409,7 +420,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   // 老人端录音落库回报 → 记入作业日志(收尾屏音频闸门据此列出)
   useAudioSaved((m) => {
     if (m.sessionId !== session.session_id) return; // 跨场次残留/迟到回报一律丢弃
-    const expectedTurnKey = `关系建立·${section?.key ?? ""}`;
+    const expectedTurnKey = rapportTurnKey(section?.key ?? "", qIdx);
     const isReplay = Boolean(journal.audios[m.rawAudioId]);
     upsertAudio(m.rawAudioId, {
       turnKey: m.turnKey,
@@ -468,7 +479,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     if (interactionBlocked) return;
     cancelAfterReply();
     const s = script.sections[sIdx];
-    const nextFlags = defaultRapportFlags(s?.key ?? "");
+    const nextFlags = defaultRapportFlags(s?.key ?? "", q, s);
     if (recState !== "idle") armWatchdog(lastArmedKey.current);
     setRecState("idle");
     setSectionIdx(sIdx);
@@ -507,7 +518,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     cancelAfterReply();
     lastArmedPosRef.current = posRef.current;
     recSeq.current += 1; // 每次 arm 新序号:老人自停后 armed→armed 重发才能重触发老人端
-    lastArmedKey.current = `关系建立·${section?.key ?? ""}`;
+    lastArmedKey.current = rapportTurnKey(section?.key ?? "", qIdx);
     setRecState("armed");
     setBeat("ask");
     replyBeatRef.current = { beat: "ask", utteranceId: null };
@@ -535,7 +546,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     cancelAfterReply();
     lastArmedPosRef.current = `${sk}#${qi}`;
     recSeq.current += 1;
-    lastArmedKey.current = `关系建立·${sk}`;
+    lastArmedKey.current = rapportTurnKey(sk, qi);
     setRecState("armed");
     // 与 applyReply 同口径:写被拒 = 麦克风没开。有一条完全静默的拒绝路径
     // (409「已暂停」不弹 toast),不看返回值就会出现"控制台显示在录、老人端
@@ -597,7 +608,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const stopRecording = () => {
     cancelAfterReply();
     setRecState("idle");
-    armWatchdog(lastArmedKey.current ?? `关系建立·${section?.key ?? ""}`);
+    armWatchdog(lastArmedKey.current ?? rapportTurnKey(section?.key ?? "", qIdx));
     postRapport({
       sectionKey: section?.key ?? "", questionIdx: qIdx,
       ...currentBeatFields(),
@@ -646,7 +657,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     cancelAfterReply();
     if (wrapupPending || interactionBlocked || !section) return;
     setWrapupPending(true);
-    if (recState !== "idle") armWatchdog(lastArmedKey.current ?? `关系建立·${section.key}`);
+    if (recState !== "idle") armWatchdog(lastArmedKey.current ?? rapportTurnKey(section.key, qIdx));
     const accepted = await postRapport({
       sectionKey: section.key,
       questionIdx: qIdx,
@@ -737,7 +748,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
                   onChange={(e) => { setAutoReply(e.target.checked); if (!e.target.checked) cancelAfterReply(); }} />
                 <span>{autoOpenHere
                   ? "自动带练：问完自动开麦，老人说完 AI 听完现编接着聊，每问最多聊几轮后自动问下一问；听不清或 AI 不可用时改用句库"
-                  : "自动带练：问完自动开麦，老人说完机器人照脚本回应后自动问下一问（本节含姓名、年龄等身份信息，回答不进云、不转写）"}</span>
+                  : "自动带练：问完自动开麦，老人说完机器人照脚本回应后自动问下一问（这一问是姓名、年龄等身份信息，回答不进云、不转写）"}</span>
               </label>
             )}
             {autoModeHere && !autoReply && (
@@ -745,9 +756,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
             )}
             {openReplyHere && replyBank && (
               <div className="rapport-reply-picker">
-                <p className="muted">{autoOpenHere
-                  ? "也可以手点：刚才是哪种情况？点一下，机器人就照句库说一句。"
-                  : "这一问也可以手点句库：刚才是哪种情况？点一下，机器人就照句库说一句。"}</p>
+                <p className="muted">也可以手点：刚才是哪种情况？点一下，机器人就照句库说一句。</p>
                 <div className="row wrap">
                   {replyBank.groups.map((g) => (
                     <Button key={g.key} variant={g.key === "接着聊" ? "primary" : undefined}
@@ -767,7 +776,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
             )}
           </>
         )}
-        {isSelfIntro && <Alert tone="warn" title="本段录音可能包含直接身份信息">如启动录音，整段会被标记为含直接标识，并在导出时进入受控处理。</Alert>}
+        {identityHere && <Alert tone="warn" title="这一问的录音包含直接身份信息">姓名、年龄这两问的录音整段标记为含直接标识，不进云、不转写，导出时进入受控处理。</Alert>}
 
         {patientDeviceFailure && (
           <Alert tone="danger" title="设备失败，场次已安全暂停">
@@ -790,7 +799,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
           {recoveryPending && <StatusPill tone="muted">正在恢复已保存记录</StatusPill>}
           {recoveryError && <StatusPill tone="danger">等待重新同步场次</StatusPill>}
           {!interactionBlocked && recordingEligible && (recState === "idle"
-            ? <Button variant="primary" onClick={armRecording}>开始受试者端录音{isSelfIntro ? "（含标识）" : ""}</Button>
+            ? <Button variant="primary" onClick={armRecording}>开始受试者端录音{identityHere ? "（含标识）" : ""}</Button>
             : <Button variant="danger" onClick={stopRecording}>停止受试者端录音</Button>)}
           {recState !== "idle" && <StatusPill tone="danger">正在等待受试者端保存</StatusPill>}
           <Button onClick={recordProxyNaming} disabled={interactionBlocked || proxyBusy}>{proxyBusy ? "正在记录…" : "记录研究者代说物品名"}</Button>

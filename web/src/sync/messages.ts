@@ -124,6 +124,12 @@ function nonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+/** 第1周录音键「关系建立·<节>#<问>」:设备开麦那一刻锁存问位,服务端按问放行进云
+ * (2026-09-04 起;姓名/年龄两问的录音永不进云)。旧版按节的键只读兼容。 */
+export function rapportTurnKey(sectionKey: string, questionIdx: number): string {
+  return `关系建立·${sectionKey}#${questionIdx}`;
+}
+
 function turnKey(value: unknown): value is string {
   if (!boundedText(value, 200)) return false;
   if (value.startsWith("关系建立·")) return value.length > "关系建立·".length;

@@ -5609,8 +5609,9 @@ def _validate_audio_turn_key(session_id: str | None, turn_key: str | None,
         raise HTTPException(404, "音频关联场次不存在")
     if sess.week_no == 1:
         script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
-        allowed = {f"关系建立·{section.get('key')}" for section in script.get("sections", [])
-                   if section.get("key")}
+        # 节级键(旧版/无问节)与问级键「关系建立·<节>#<问>」都认:问级键是设备开麦那一刻
+        # 锁存的问位,自动回应按它放行进云(2026-09-04)。
+        allowed = patient_presentation.rapport_allowed_turn_keys(script)
     else:
         plan = _session_plan_for_runtime(sess)
         allowed = {f"{item.item_id}#{turn.turn_seq}"
@@ -5624,11 +5625,7 @@ def _patient_rec_turn_identity(
     """Resolve a validated failure turn key without consulting the mutable cursor."""
     if sess.week_no == 1:
         script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
-        allowed = {
-            f"关系建立·{section.get('key')}"
-            for section in script.get("sections", []) if section.get("key")
-        }
-        if turn_key not in allowed:
+        if turn_key not in patient_presentation.rapport_allowed_turn_keys(script):
             raise HTTPException(422, "turnKey 不属于该场次冻结关系建立脚本")
         # Week 1 has no task turn_seq.  Retain the frozen section identity in
         # item_id so a failure id cannot be replayed against another section.
@@ -5656,7 +5653,11 @@ def _current_patient_rec_turn(
         section_key = (rapport or {}).get("sectionKey")
         if not isinstance(section_key, str) or not section_key:
             raise HTTPException(409, "当前场次尚无可绑定的关系建立录音位置")
-        turn_key = f"关系建立·{section_key}"
+        question_idx = (rapport or {}).get("questionIdx")
+        turn_key = patient_presentation.rapport_turn_key(
+            section_key,
+            question_idx if isinstance(question_idx, int)
+            and not isinstance(question_idx, bool) else 0)
         return turn_key, turn_key, None
 
     cursor = _json_load(state.cursor_json) or _json_load(live.cursor_json)
@@ -5893,21 +5894,6 @@ def _rapport_validate_script_position(
     return questions[question_idx] if questions else {}
 
 
-def _rapport_auto_allowed_for_section(
-        bank: dict, script: dict, section_key: str) -> bool:
-    """自动回应按节判定:节内每一问都开放选句才算开放(录音只绑到节)。"""
-    section = next((row for row in script.get("sections", [])
-                    if row.get("key") == section_key), None)
-    if not isinstance(section, dict):
-        return False
-    questions = section.get("questions") or []
-    if not questions:
-        return False
-    return all(
-        patient_presentation.rapport_reply_allowed_here(bank, section_key, idx)
-        for idx in range(len(questions)))
-
-
 @app.post("/sessions/{session_id}/rapport/replies",
           response_model=RapportReplyCreateOut)
 def rapport_reply_create(
@@ -5962,12 +5948,6 @@ def rapport_reply_create(
                 bank, body.sectionKey, body.questionIdx):
             # 姓名/年龄两问:回答是直接身份信息,自动管线对它们不启动 ASR。
             raise HTTPException(409, "当前一问不开放自动回应")
-        if not _rapport_auto_allowed_for_section(bank, script, body.sectionKey):
-            # 录音资产只绑到节(关系建立·<节>),问位是客户端声称的——节内只要有
-            # 身份问询问位,迟到/重放的那段录音就可能顶着开放问位的名义进云 ASR。
-            # 所以整节都不开放自动回应(手点句库不受影响,它不碰录音)。
-            raise HTTPException(
-                409, "本节含身份问询问位，录音只绑到节，不开放自动回应")
         existing = s.exec(select(RapportUtteranceEvent).where(
             RapportUtteranceEvent.session_id == session_id,
             RapportUtteranceEvent.raw_audio_id == body.rawAudioId,
@@ -6004,8 +5984,12 @@ def rapport_reply_create(
         asset = s.get(AudioAssetRow, body.rawAudioId)
         if not asset or asset.session_id != session_id:
             raise HTTPException(404, "音频资产不存在")
-        if asset.turn_key != f"关系建立·{body.sectionKey}":
-            raise HTTPException(409, "录音不属于当前关系建立节")
+        # 录音必须绑到**这一问**(设备开麦那一刻锁存的问级键):自我介绍节里姓名/年龄
+        # 的录音永远进不了云,不靠客户端在回应请求里声称的问位。旧版按节绑定的录音
+        # 分不清是哪一问,不开放自动回应(2026-09-04 起属相/兴趣/活动放行进云)。
+        if asset.turn_key != patient_presentation.rapport_turn_key(
+                body.sectionKey, body.questionIdx):
+            raise HTTPException(409, "录音不属于当前一问，不开放自动回应")
         _ensure_audio_read_allowed(asset, s, sess=sess)
         receipt = s.exec(select(AudioCaptureReceipt).where(
             AudioCaptureReceipt.raw_audio_id == body.rawAudioId)).first()

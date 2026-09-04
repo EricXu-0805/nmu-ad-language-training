@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MicButton } from "../components/MicButton";
-import type { RapportMsg } from "../sync/messages";
+import { rapportTurnKey, type RapportMsg } from "../sync/messages";
 import { Centered } from "./Centered";
 import { audioRecorderBlockCopy } from "./audioRecorderBlock";
 import type { RapportPresentationExpectation } from "./presentationContent";
@@ -144,7 +144,7 @@ export function RapportStage({
     recording: gatedRecording,
     recSeq: rapportStep?.recSeq,
     commandSeq: rapportStep?.wseq,
-    turnKey: `关系建立·${rapportStep?.sectionKey ?? ""}`,
+    turnKey: rapportTurnKey(rapportStep?.sectionKey ?? "", rapportStep?.questionIdx ?? 0),
     containsDirectIdentifier: rapportStep?.containsDirectIdentifier ?? false,
     connectionReady,
     // error 是「呈现真的取不回来」(每秒重试仍失败),不是 wseq 重签造成的闪断:

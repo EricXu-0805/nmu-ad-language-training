@@ -167,6 +167,73 @@ def resolve_task_texts(
     return cue_text, feedback_text
 
 
+RAPPORT_TURN_PREFIX = "关系建立·"
+# 自我介绍节里回答本身就是直接身份信息的问位(脚本槽位名):这两问的录音整段标记含
+# 直接标识、永不进云。属相/兴趣/活动不在其列(2026-09-04 Eric 拍板放行进云)。
+RAPPORT_IDENTITY_SLOT_FIELDS = frozenset({"preferred_appellation", "age"})
+
+
+def rapport_turn_key(section_key: str, question_idx: int | None = None) -> str:
+    """第1周录音的 turn_key。带问位=「关系建立·<节>#<问>」(2026-09-04 起设备开麦那一刻
+    锁存问位,服务端据此按问放行自动回应);不带问位是旧版按节绑定的键,只读兼容。"""
+    if question_idx is None:
+        return f"{RAPPORT_TURN_PREFIX}{section_key}"
+    return f"{RAPPORT_TURN_PREFIX}{section_key}#{question_idx}"
+
+
+def parse_rapport_turn_key(turn_key: str | None) -> tuple[str, int | None] | None:
+    """「关系建立·<节>[#<问>]」→ (节, 问|None);不是第1周键返回 None。"""
+    if not isinstance(turn_key, str) or not turn_key.startswith(RAPPORT_TURN_PREFIX):
+        return None
+    body = turn_key[len(RAPPORT_TURN_PREFIX):]
+    if not body:
+        return None
+    section, sep, idx = body.partition("#")
+    if not sep:
+        return section, None
+    if not section or not idx.isdigit():
+        return None
+    return section, int(idx)
+
+
+def rapport_allowed_turn_keys(script: dict) -> frozenset[str]:
+    """冻结脚本允许的全部第1周录音键:每节的节级键(旧版/无问节)+ 每一问的问级键。"""
+    keys: set[str] = set()
+    for section in script.get("sections", []) or []:
+        if not isinstance(section, dict) or not section.get("key"):
+            continue
+        key = str(section["key"])
+        keys.add(rapport_turn_key(key))
+        questions = section.get("questions") or []
+        for idx in range(max(1, len(questions))):
+            keys.add(rapport_turn_key(key, idx))
+    return frozenset(keys)
+
+
+def rapport_identity_question_indices(script: dict, section_key: str) -> frozenset[int]:
+    section = next((row for row in script.get("sections", []) or []
+                    if isinstance(row, dict) and row.get("key") == section_key), None)
+    if section is None:
+        return frozenset()
+    return frozenset(
+        idx for idx, question in enumerate(section.get("questions") or [])
+        if isinstance(question, dict)
+        and question.get("slot_field") in RAPPORT_IDENTITY_SLOT_FIELDS)
+
+
+def rapport_turn_requires_identity_flag(script: dict, turn_key: str | None) -> bool:
+    """这段录音是否必须整段标记含直接标识:自我介绍节的姓名/年龄两问;旧版按节绑定的
+    自我介绍录音分不清是哪一问,一律要求(与撤回/导出红线同口径)。"""
+    parsed = parse_rapport_turn_key(turn_key)
+    if parsed is None:
+        return False
+    section, idx = parsed
+    identity = rapport_identity_question_indices(script, section)
+    if not identity:
+        return False
+    return idx is None or idx in identity
+
+
 def rapport_reply_allowed_here(bank: dict, section_key: str, question_idx: int) -> bool:
     """这一问是否开放选句。姓名/年龄那两问永远不在里面——回答是直接身份信息。"""
     for row in bank.get("applies_to") or []:

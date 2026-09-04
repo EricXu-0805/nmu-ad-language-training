@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from typing import Callable, Iterable, Protocol
 
 from .runtime import SessionPlan
+from . import patient_presentation
 
 
 class ItemRow(Protocol):
@@ -218,7 +219,7 @@ def assess_rapport_completion(
 
     sections = [row for row in script.get("sections", [])
                 if isinstance(row, dict) and row.get("key")]
-    section_keys = {f"关系建立·{row['key']}" for row in sections}
+    section_keys = patient_presentation.rapport_allowed_turn_keys(script)
     farewell = sections[-1] if sections else None
     script_valid = bool(
         farewell
@@ -299,11 +300,11 @@ def assess_rapport_completion(
                 **issue_kwargs,
             ))
             continue
-        if (audio.turn_key == f"关系建立·{RAPPORT_IDENTITY_SECTION_KEY}"
+        if (patient_presentation.rapport_turn_requires_identity_flag(script, audio.turn_key)
                 and audio.contains_direct_identifier is not True):
             issues.append(CompletionIssue(
                 code="rapport_identity_flag_missing",
-                detail="自我介绍节录音必须整段标记含直接标识，否则导出红线失效",
+                detail="自我介绍节姓名/年龄两问的录音必须整段标记含直接标识，否则导出红线失效",
                 **issue_kwargs,
             ))
             continue

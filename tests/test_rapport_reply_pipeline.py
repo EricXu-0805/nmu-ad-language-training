@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import asr, audio_store, db, rapport_reply, tts
+from app import asr, audio_store, db, rapport_reply, tts, patient_presentation
 from app.asr import AsrResult
 from app.main import app
 from app.models import (
@@ -92,24 +92,28 @@ def _seed_scene(client: TestClient, *, patient="P-PIPE", session="S-PIPE") -> No
 
 
 def _seed_audio(client: TestClient, *, session_id: str, raw_id: str,
-                section: str) -> None:
+                section: str, question: int | None = 0) -> None:
+    """默认按问绑定(「关系建立·<节>#<问>」,2026-09-04 起设备开麦即锁存问位);
+    question=None 造旧版按节绑定的录音。"""
     payload = b"fake-webm-bytes-" + raw_id.encode()
     (client.audio_dir / f"{raw_id}.webm").write_bytes(payload)
+    turn_key = patient_presentation.rapport_turn_key(section, question)
+    identity = section == "自我介绍" and (question is None or question in (0, 1))
     with Session(client.test_engine) as s:
         s.add(AudioAssetRow(
             raw_audio_id=raw_id, session_id=session_id,
-            turn_key=f"关系建立·{section}", audio_format="webm",
+            turn_key=turn_key, audio_format="webm",
             is_simulation=True, data_classification="simulation",
-            contains_direct_identifier=section == "自我介绍",
+            contains_direct_identifier=identity,
             byte_count=len(payload), checksum="c" * 64,
             uploaded_at=datetime.now(),
         ))
         s.add(AudioCaptureReceipt(
             raw_audio_id=raw_id, session_id=session_id,
-            turn_key=f"关系建立·{section}", duration_seconds=2.0,
+            turn_key=turn_key, duration_seconds=2.0,
             byte_count=len(payload), checksum="c" * 64,
             data_classification="simulation", is_simulation=True,
-            contains_direct_identifier=section == "自我介绍",
+            contains_direct_identifier=identity,
         ))
         s.commit()
 
@@ -321,7 +325,7 @@ def test_multi_round_counts_history_and_stops_at_limit(pipeline_client, monkeypa
     assert again.json()["round"] == 2 and again.json()["maxRounds"] == 2
     assert asr_stub.calls == 2
     # 换一问,轮次从 1 重数。
-    _seed_audio(client, session_id="S-PIPE", raw_id="aud-q1", section="介绍机构环境")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-q1", section="介绍机构环境", question=1)
     fresh = _create_reply(client, "S-PIPE", {
         "sectionKey": "介绍机构环境", "questionIdx": 1, "mode": "auto",
         "rawAudioId": "aud-q1"})
@@ -497,7 +501,7 @@ def test_unusable_transcript_falls_back_to_frozen_bank(
     client = pipeline_client
     _seed_scene(client)
     _seed_audio(client, session_id="S-PIPE", raw_id="aud-deg-1",
-                section="介绍机构环境")
+                section="介绍机构环境", question=1)
     monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr(asr_text))
     _use_reply_stub(monkeypatch, "不该被用到的句子")
 
@@ -515,7 +519,7 @@ def test_llm_unavailable_still_answers_from_the_bank(pipeline_client, monkeypatc
     client = pipeline_client
     _seed_scene(client)
     _seed_audio(client, session_id="S-PIPE", raw_id="aud-off-1",
-                section="介绍机构环境")
+                section="介绍机构环境", question=2)
     monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我喜欢下棋"))
     monkeypatch.setenv("RAPPORT_REPLY", "off")
 
@@ -535,7 +539,7 @@ def test_cloud_asr_without_subject_authorization_stays_local(
     client = pipeline_client
     _seed_scene(client)
     _seed_audio(client, session_id="S-PIPE", raw_id="aud-cloud-1",
-                section="介绍机构环境")
+                section="介绍机构环境", question=3)
 
     class _CloudAsr(_StubAsr):
         data_boundary = "cloud"
@@ -732,25 +736,74 @@ def test_whitelist_bypass_only_exists_for_persisted_utterance_synthesis(
     assert version == "stub-cloud/1"
 
 
-def test_identity_section_recording_cannot_ride_an_open_question(
+def test_identity_recording_cannot_ride_an_open_question(
         pipeline_client, monkeypatch):
-    """P1 复核发现:录音只绑到节——自我介绍节的录音顶着开放问位名义也必须被拒。"""
+    """姓名那一问的录音(设备开麦时锁存 #0)顶着开放问位(#3)的名义请求自动回应:
+    服务端按录音自己的问级键拒绝,一个字节不进 ASR。旧版按节绑定的录音分不清是
+    哪一问,同样不开放。"""
     client = pipeline_client
     _seed_scene(client)
     _seed_audio(client, session_id="S-PIPE", raw_id="aud-ride-1",
-                section="自我介绍")
+                section="自我介绍", question=0)
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-legacy-1",
+                section="自我介绍", question=None)
     stub = _StubAsr("我叫王秀兰")
     monkeypatch.setattr(asr, "get_engine", lambda: stub)
     _use_reply_stub(monkeypatch, "不该被用到的句子")
 
-    refused = _create_reply(client, "S-PIPE", {
-        "sectionKey": "自我介绍", "questionIdx": 3, "mode": "auto",
-        "rawAudioId": "aud-ride-1"})
-    assert refused.status_code == 409, refused.text
-    assert "不开放自动回应" in refused.text
+    for raw in ("aud-ride-1", "aud-legacy-1"):
+        refused = _create_reply(client, "S-PIPE", {
+            "sectionKey": "自我介绍", "questionIdx": 3, "mode": "auto",
+            "rawAudioId": raw})
+        assert refused.status_code == 409, refused.text
+        assert "不属于当前一问" in refused.text, raw
     assert stub.calls == 0
     with Session(client.test_engine) as s:
         assert list(s.exec(select(RapportUtteranceEvent))) == []
+
+
+def test_zodiac_interest_activity_questions_run_the_auto_pipeline(
+        pipeline_client, monkeypatch):
+    """2026-09-04 Eric 拍板:自我介绍节的属相/兴趣/活动三问放行进云。录音绑到问之后,
+    这三问走完整的 ASR→现编链;姓名/年龄两问仍在同一节里、仍被拒。"""
+    client = pipeline_client
+    _seed_scene(client)
+    stub = _StubAsr("属牛")
+    monkeypatch.setattr(asr, "get_engine", lambda: stub)
+    _use_reply_stub(monkeypatch, "属牛的人踏实，您平时也这样吧？")
+    for q in (2, 3, 4):
+        _seed_audio(client, session_id="S-PIPE", raw_id=f"aud-open-{q}",
+                    section="自我介绍", question=q)
+        created = _create_reply(client, "S-PIPE", {
+            "sectionKey": "自我介绍", "questionIdx": q, "mode": "auto",
+            "rawAudioId": f"aud-open-{q}"})
+        assert created.status_code == 200, (q, created.text)
+        assert created.json()["source"] == "llm", q
+    assert stub.calls == 3
+    with Session(client.test_engine) as s:
+        rows = list(s.exec(select(RapportUtteranceEvent)))
+        assert [r.question_idx for r in rows] == [2, 3, 4]
+        assets = {a.raw_audio_id: a for a in s.exec(select(AudioAssetRow))}
+    assert all(assets[f"aud-open-{q}"].contains_direct_identifier is False for q in (2, 3, 4))
+
+
+def test_rapport_turn_key_helpers_pin_the_contract():
+    from app import content
+    script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
+    keys = patient_presentation.rapport_allowed_turn_keys(script)
+    assert "关系建立·自我介绍" in keys and "关系建立·自我介绍#4" in keys
+    assert "关系建立·自我介绍#5" not in keys
+    assert "关系建立·道别" in keys and "关系建立·道别#0" in keys and "关系建立·道别#1" not in keys
+    assert patient_presentation.parse_rapport_turn_key("关系建立·自我介绍#2") == ("自我介绍", 2)
+    assert patient_presentation.parse_rapport_turn_key("关系建立·自我介绍") == ("自我介绍", None)
+    assert patient_presentation.parse_rapport_turn_key("SE_锚#1") is None
+    assert patient_presentation.parse_rapport_turn_key("关系建立·") is None
+    assert patient_presentation.rapport_identity_question_indices(script, "自我介绍") == frozenset({0, 1})
+    assert patient_presentation.rapport_identity_question_indices(script, "介绍机构环境") == frozenset()
+    for key, expected in (("关系建立·自我介绍", True), ("关系建立·自我介绍#0", True),
+                          ("关系建立·自我介绍#1", True), ("关系建立·自我介绍#2", False),
+                          ("关系建立·介绍机构环境#0", False), ("关系建立·道别", False)):
+        assert patient_presentation.rapport_turn_requires_identity_flag(script, key) is expected, key
 
 
 def test_manual_modes_reject_raw_audio_id(pipeline_client):

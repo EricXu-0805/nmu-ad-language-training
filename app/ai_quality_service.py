@@ -41,6 +41,7 @@ from .ai_quality_metrics import (
     TurnQualityEvidence,
     aggregate_ai_quality,
 )
+from . import patient_presentation
 from .enums import AudioStatus, ConsentType
 from .models import (
     AttemptEvent,
@@ -993,13 +994,7 @@ def _week1_relationship_item_ids(session: TrainSession) -> frozenset[str]:
         return frozenset()
     script = content.load_week1_script(
         content.CONTENT_DIR / "week1_script.json")
-    return frozenset(
-        f"关系建立·{section['key']}"
-        for section in script.get("sections", [])
-        if isinstance(section, dict)
-        and isinstance(section.get("key"), str)
-        and section["key"]
-    )
+    return patient_presentation.rapport_allowed_turn_keys(script)
 
 
 def _structural_evidence_invalid(
