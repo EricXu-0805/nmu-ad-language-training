@@ -57,7 +57,7 @@ from . import (access_policy, assessment_bundles, assessment_contract,
 from .autopilot_ledger import utc_now_naive
 from .auth import COOKIE_NAME, CSRF_COOKIE_NAME
 from .db import get_session, init_db
-from .enums import AudioStatus, ConsentType
+from .enums import AnswerType, AudioStatus, ConsentType
 from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      AssessmentRecordingAuthorization,
                      AttemptCaptureProcessing,
@@ -10436,6 +10436,11 @@ def _load_turn(turn_id: int, s: DBSession) -> TurnEvent:
     return t
 
 
+# 回答里已经有目标词/可接受表达时,这三类初评与事实矛盾(0 分类型的前提都是
+# 「没答到目标词」),不能采信——见 _classify_operational。
+_LLM_TYPES_IMPOSSIBLE_WITH_TARGET = frozenset({"重复", "偏题", "未识别"})
+
+
 class ClassifyIn(BaseModel):
     """自动驾驶逐轮判类输入:题号+环节角色+该轮 ASR 文本,无画像、无患者字段。"""
     model_config = ConfigDict(extra="forbid")
@@ -10465,9 +10470,15 @@ def _classify_operational(*, item_id: str, response_role: str,
         return _classify_with_operational_rubric(rubric, text)
 
     raw_text = text or ""
-    contains = target in raw_text or any(
-        candidate and candidate in raw_text
-        for candidate in (bank_item.get("acceptable_expressions") or []))
+    # 归一化后再看含不含:ASR 在词中间塞个标点/空格(「胡萝，卜」)不该让「正确/target」
+    # 与 contains_target=False 撞上 LEGACY_RULE_JUDGEMENTS(复核 2026-09-04);比原文
+    # 子串只松不紧——原文含它,去掉标点后一定还含它。
+    resp_norm = rule_judge.normalize(raw_text)
+    acceptable_terms = [candidate for candidate in
+                        (bank_item.get("acceptable_expressions") or []) if candidate]
+    contains = bool(resp_norm) and (
+        rule_judge.normalize(target) in resp_norm or any(
+            rule_judge.normalize(candidate) in resp_norm for candidate in acceptable_terms))
     ji = judging.build_judge_input(
         item_id=item_id, task_type=task_type, target_word=target,
         acceptable_expressions=tuple(bank_item.get("acceptable_expressions", []) or []),
@@ -10479,9 +10490,16 @@ def _classify_operational(*, item_id: str, response_role: str,
         asr_text=text,
     )
     engine = (llm_engine or llm_judge.get_engine()) if allow_llm else None
+    rule_result = rule_judge.judge_rule_based(ji)
     if not raw_text.strip():
         # 空转写没有可判的语义:沉默由确定式规则冻结判定,也没有理由把一个空
         # 载荷推过云边界。
+        engine = None
+    elif rule_result.matched_on in {"target", "acceptable", "dialect"}:
+        # 整句就是目标词/可接受表达/方言俗名(含说两遍、带语气词):确定事实,不问 LLM。
+        # 2026-08-31~09-04 生产上 49 次「窗帘，窗帘。」这类回答被云判分判成「重复」
+        # 0 分(25% 的作答)。自动带练按 contains_target 推进,流程没走错;错的是
+        # 研究者屏上的 AI 初评与复核时的初评建议——答对了却写着「重复 0 分」。
         engine = None
     elif rule_judge.normalize(raw_text) in {
             rule_judge.normalize(term) for term in ji.upper_terms}:
@@ -10498,6 +10516,21 @@ def _classify_operational(*, item_id: str, response_role: str,
             # 没有逐人有效授权时不外发回答文本；确定式规则仍可安全完成运行判类。
             engine = None
     llm_result = engine.judge(ji) if engine is not None else None
+    if (llm_result is not None
+            and llm_result.answer_type.value in _LLM_TYPES_IMPOSSIBLE_WITH_TARGET
+            and (rule_judge.word_present(raw_text, target)
+                 or any(rule_judge.word_present(raw_text, candidate)
+                        for candidate in acceptable_terms))):
+        # 老人把目标词当作一个完整的词说了出来(「大胡萝卜」「胡萝卜，不对，萝卜」),
+        # 初评却是「重复/偏题/未识别」这三个「没答到目标词」前提的 0 分类型——与事实
+        # 矛盾。改判为部分正确待复核,但仍记成 LLM 辅助、留引擎版本、把原初评写进理由:
+        # 云确实看过这段文本,出网记录不能因为改判而消失(复核 2026-09-04)。
+        # 「花瓶」之于「花」、「书架」之于「书」、「不是窗帘」不算说出了目标词,
+        # LLM 的偏题/重复照单全收(word_present 按词边界与否定判)。
+        llm_result = llm_judge.LlmJudgement(
+            answer_type=AnswerType.部分正确, ai_score=0.5, ai_needs_review=True,
+            reason=llm_judge.contradiction_reason(
+                target, llm_result.answer_type.value, llm_result.reason))
     if llm_result is not None:
         return {
             "answer_type": llm_result.answer_type.value,
@@ -10518,7 +10551,6 @@ def _classify_operational(*, item_id: str, response_role: str,
             "judge_portrait_used": False,
             "truth_scope": "operational_only",
         }
-    rule_result = rule_judge.judge_rule_based(ji)
     return {
         "answer_type": (rule_result.answer_type.value
                         if rule_result.answer_type else rule_result.interaction_state),

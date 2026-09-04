@@ -2434,16 +2434,19 @@ class _WorkerAsr:
     data_boundary = "local"
     provider_id = None
 
-    def __init__(self, *, fails: bool = False):
+    def __init__(self, *, fails: bool = False, text: str = "胡萝卜"):
         self.fails = fails
+        self.text = text
         self.calls = 0
 
     def transcribe(self, _audio_bytes, _hotwords):
         self.calls += 1
         if self.fails:
             raise RuntimeError("injected provider failure")
+        # 默认裸目标词「胡萝卜」:2026-09-04 起整句就是目标词由确定式规则定、不问 LLM。
+        # 要驱动 LLM 判分阶段的测试传 text="大胡萝卜"(含目标词、仍问 LLM)。
         return asr.AsrResult(
-            "胡萝卜", 0.96, self.version, hotword_hit=True)
+            self.text, 0.96, self.version, hotword_hit=True)
 
 
 class _EmptyTranscriptAsr(_WorkerAsr):
@@ -3375,7 +3378,7 @@ def test_late_generation_result_after_newer_generation_materializes_is_observati
             ).values(processing_lease_expires_at=datetime.now() - timedelta(seconds=1)))
             session.commit()
 
-        b_asr = _WorkerAsr()
+        b_asr = _WorkerAsr(text="大胡萝卜")   # 要走到 LLM 判分阶段
         monkeypatch.setattr(asr, "get_engine", lambda: b_asr)
         monkeypatch.setattr(llm_judge, "get_engine", lambda: b_judge)
         worker_b = pool.submit(_run_p0a_attempt_worker, SESSION_ID)

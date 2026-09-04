@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Optional
@@ -47,6 +48,127 @@ def _is_refusal(raw: Optional[str]) -> bool:
     return bool(raw) and any(m in raw for m in _REFUSAL_MARKERS)
 
 
+# 老人答题时常见的语气/指示垫词。它们不改变「说的是哪个词」,只在判「这一段是不是
+# 只有目标词」时从两端剥掉;长词在前,免得「这是」被拆成「这」「是」后残留。
+_FILLER_TOKENS = ("应该是", "好像是", "这个是", "那个是", "这就是", "就是", "这是",
+                  "那是", "这个", "那个", "嗯", "呃", "啊", "哦", "哎", "唉", "是",
+                  "对", "吧", "的", "了", "呀", "嘛", "呢", "哈")
+# 单字目标词旁边的单字垫词不剥(见 _peel_fillers):「对门」「花呢」「针对」是别的词,
+# 不是「门」「花」「针」带语气(复核 2026-09-04)。「对，门」按标点分段后「对」是独立的
+# 一段,照样算垫词。
+# 否定/纠正:「不是窗帘」「没有花」不算说出了目标词。
+_NEGATION_MARKERS = ("不是", "不对", "没有", "不", "没", "别", "非")
+
+
+def _segments(raw: Optional[str]) -> list[str]:
+    """按标点/空白切段,段内 NFKC+小写。分段保留了说话的边界,单靠 normalize 会把
+    「对，门」和「对门」压成一样。"""
+    if not raw:
+        return []
+    text = unicodedata.normalize("NFKC", raw).lower()
+    out, cur = [], []
+    for ch in text:
+        if ch in _STRIP_CHARS:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _peel_fillers(seg: str, word: str) -> str:
+    """从段的两端剥语气垫词;目标词是单字时只剥多字垫词。"""
+    allow_single = len(word) >= 2
+    changed = True
+    while changed and seg:
+        changed = False
+        for tok in _FILLER_TOKENS:
+            if len(tok) == 1 and not allow_single:
+                continue
+            if seg.startswith(tok) and seg != word:
+                seg = seg[len(tok):]
+                changed = True
+            if seg.endswith(tok) and seg != word:
+                seg = seg[:-len(tok)]
+                changed = True
+    return seg
+
+
+def _is_word_repeated(seg: str, word: str) -> bool:
+    """段就是 word 本身或 word 连说 k 遍(「窗帘窗帘」「花花」「汽车汽车汽车」)。"""
+    return bool(word) and bool(seg) and len(seg) % len(word) == 0 \
+        and seg == word * (len(seg) // len(word))
+
+
+# 「一把刀」「一朵花」「这本书」:量词短语是命名的正常说法,不是别的词。只认这张闭集
+# 里的量词,且只在段首、紧贴目标词之前。
+_CLASSIFIER_PHRASE = re.compile(
+    r"^(?:一|这|那|一个|这个|那个)?[个把朵只本条张根辆件双顶台座棵头匹块支枝扇盏面部颗粒片串杯碗瓶壶艘架幅尾口位]")
+
+
+def _strip_classifier(seg: str, word: str) -> str:
+    m = _CLASSIFIER_PHRASE.match(seg)
+    if m and seg != word and seg[m.end():]:
+        return seg[m.end():]
+    return seg
+
+
+def _segment_says_word(seg: str, word: str) -> bool:
+    if any(m in seg for m in _NEGATION_MARKERS):
+        return False
+    peeled = _peel_fillers(seg, word)
+    return (_is_word_repeated(peeled, word)
+            or _is_word_repeated(_strip_classifier(peeled, word), word))
+
+
+def _only_this_word(raw: Optional[str], word: str) -> bool:
+    """整句是否只由 word(可连说多遍、分段重复)加语气垫词构成。
+
+    「窗帘，窗帘。」「嗯，茶杯，茶杯。」「花花」「对，门」都算就是那个词——痴呆老人
+    把目标词说两遍是常态,临床口径里「重复」指的是照搬上一题答案或复述问句,不是
+    把正确的词多说一遍(0628 行为指标:「重复一题答案」)。
+    「对门」「花瓶」「大树」「不是窗帘」都不是:它们进子串分支交人工,或留给 LLM。
+    """
+    if not word:
+        return False
+    segs = _segments(raw)
+    if not segs:
+        return False
+    said = False
+    for seg in segs:
+        if _segment_says_word(seg, word):
+            said = True
+        elif _peel_fillers(seg, "__") != "":
+            # 这一段既不是目标词也不是纯垫词段(「对，门」里的「对」是纯垫词段,可以;
+            # 「锚，不对，轮船」里的「轮船」不行)。"__" 只是让剥词按多字规则全剥。
+            return False
+    return said
+
+
+def word_present(raw: Optional[str], word: str) -> bool:
+    """老人是否把 word 当作一个完整的词说了出来(供「初评与事实矛盾」闸使用)。
+
+    多字目标词:某一段里含它即可(「大胡萝卜」也算说到了,带修饰归部分正确);
+    单字目标词:必须是独立的一段(剥掉多字垫词后就是它),「花瓶」「书架」「鲸鱼」
+    里的「花」「书」「鱼」不算——那是别的词,LLM 判偏题/重复是对的。
+    任何一段带否定(「不是窗帘」)都不算。
+    """
+    word = normalize(word)
+    if not word:
+        return False
+    for seg in _segments(raw):
+        if any(m in seg for m in _NEGATION_MARKERS):
+            continue
+        if _segment_says_word(seg, word):
+            return True
+        if len(word) >= 2 and word in seg:
+            return True
+    return False
+
+
 def judge_rule_based(ji: JudgeInput) -> RuleJudgeResult:
     """确定式判分。JudgeInput 结构上不含画像；judge_portrait_used 恒 False。"""
     raw = resolve_response_text(ji)
@@ -64,13 +186,20 @@ def judge_rule_based(ji: JudgeInput) -> RuleJudgeResult:
     if resp == target or resp in accept:
         return RuleJudgeResult(AnswerType.正确, None, 1.0, False,
                                matched_on="target" if resp == target else "acceptable")
-    if resp in dialect:
+    # 目标词/可接受表达说了不止一遍、或前后带语气垫词(「窗帘，窗帘。」「嗯，茶杯」):
+    # 仍然就是那个词。生产 2026-08-31~09-04 有 49 次这样的回答被云判分判成「重复」0 分,
+    # 全部含目标词——这一格必须由确定式规则定,不问 LLM。
+    if _only_this_word(raw, target):
+        return RuleJudgeResult(AnswerType.正确, None, 1.0, False, matched_on="target")
+    if any(word and _only_this_word(raw, word) for word in accept):
+        return RuleJudgeResult(AnswerType.正确, None, 1.0, False, matched_on="acceptable")
+    if resp in dialect or any(word and _only_this_word(raw, word) for word in dialect):
         # 方言俗名视为正确，但留人工复核（口径可能因地区而异）。
         return RuleJudgeResult(AnswerType.正确, None, 1.0, True, matched_on="dialect")
     if resp in upper:
         return RuleJudgeResult(AnswerType.上位词或相关词, None, 0.5, True, matched_on="upper")
-    if target and (target in resp or resp in target):
-        # 含目标词但不精确（多字/少字）——部分正确，交人工定夺。
+    if any(word and (word in resp or resp in word) for word in (target, *accept)):
+        # 含目标词/可接受表达但不精确(多字/少字)——部分正确,交人工定夺。
         return RuleJudgeResult(AnswerType.部分正确, None, 0.5, True, matched_on="substring")
     return RuleJudgeResult(AnswerType.未识别, None, 0.0, True, matched_on=None)
 

@@ -111,7 +111,9 @@ class _FakeAsr:
     data_boundary = "local"
     provider_id = None
 
-    def __init__(self, text: str | None = "锚", *, raises: bool = False):
+    # 「大锚」而不是裸「锚」:2026-09-04 起整句就是目标词(含量词/语气词)由确定式规则定、不问 LLM,
+    # 这些测试守的是 LLM 路径(合法性闸/畸形应答/阻塞判分),夹具要留在会问 LLM 的格子里。
+    def __init__(self, text: str | None = "大锚", *, raises: bool = False):
         self.text = text
         self.raises = raises
         self.calls = 0
@@ -161,7 +163,7 @@ def _seed_recoverable_attempt(engine, raw_audio_id: str, *, stage: str,
             processing_lease_expires_at=lease_expires_at,
             processing_claimed_at=now - timedelta(minutes=5),
             processing_generation=generation,
-            asr_text="锚" if stage == "asr_completed" else None,
+            asr_text="大锚" if stage == "asr_completed" else None,   # 含目标词但要问 LLM
             asr_confidence=0.91 if stage == "asr_completed" else None,
             asr_engine_version="crashed-asr-1" if stage == "asr_completed" else None,
             created_at=now - timedelta(minutes=5), is_simulation=True,
@@ -203,7 +205,7 @@ def test_process_persists_provenance_and_raw_audio_is_idempotency_key(client_db,
     attempt = body["attempt"]
     assert body["status"] == "completed" and body["idempotent"] is False
     assert body["truth_scope"] == "operational_only"
-    assert attempt["attempt_seq"] == 1 and attempt["asr_text"] == "锚"
+    assert attempt["attempt_seq"] == 1 and attempt["asr_text"] == "大锚"
     assert attempt["asr_engine_version"] == "fake-asr-1"
     assert attempt["operational_answer_type"] == "正确"
     assert attempt["judge_mode"] == "LLM辅助"
@@ -799,7 +801,7 @@ def test_rule_fallback_records_actual_engine_and_matched_on(client_db, monkeypat
     client, _engine = client_db
     _seed_session(client)
     _seed_audio(client, "rule-provenance")
-    fake_asr = _FakeAsr("锚")
+    fake_asr = _FakeAsr("锚")   # 精确命中:规则来源要记 matched_on=target(LLM 本来就关着)
     monkeypatch.setattr("app.main.asr.get_engine", lambda: fake_asr)
     monkeypatch.setenv("LLM_JUDGE", "off")
     response = client.post(

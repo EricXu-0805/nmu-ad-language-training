@@ -55,6 +55,10 @@ from test_repeat_intent_protocol import (
 
 
 TARGET_WORD = "胡萝卜"
+# 夹具里老人「说」的话:整句就是目标词自 2026-09-04 起由确定式规则定、不问 LLM,
+# 这些测试守的是 LLM 判分路径,所以说的是带修饰的「大胡萝卜」(含目标词,仍会问 LLM;
+# 「一个胡萝卜」这种量词短语也算就是目标词,同样不问 LLM)。
+SPOKEN_TEXT = "大" + TARGET_WORD
 
 
 class _CountingAsr:
@@ -64,7 +68,7 @@ class _CountingAsr:
     data_boundary = "local"
     provider_id = None
 
-    def __init__(self, text: str = TARGET_WORD, *, before=None):
+    def __init__(self, text: str = SPOKEN_TEXT, *, before=None):
         self.text = text
         self.calls = 0
         self._before = before
@@ -496,14 +500,14 @@ def test_pause_projection_fault_rolls_back_the_whole_transaction(legacy_env):
 
 
 @pytest.mark.parametrize("result", [
-    pytest.param(asr.AsrResult(TARGET_WORD, 0.9, ""), id="blank-engine"),
-    pytest.param(asr.AsrResult(TARGET_WORD, 0.9, None), id="null-engine"),
-    pytest.param(asr.AsrResult(TARGET_WORD, "0.9", "v1"), id="string-confidence"),
-    pytest.param(asr.AsrResult(TARGET_WORD, True, "v1"), id="bool-confidence"),
-    pytest.param(asr.AsrResult(TARGET_WORD, float("nan"), "v1"),
+    pytest.param(asr.AsrResult(SPOKEN_TEXT, 0.9, ""), id="blank-engine"),
+    pytest.param(asr.AsrResult(SPOKEN_TEXT, 0.9, None), id="null-engine"),
+    pytest.param(asr.AsrResult(SPOKEN_TEXT, "0.9", "v1"), id="string-confidence"),
+    pytest.param(asr.AsrResult(SPOKEN_TEXT, True, "v1"), id="bool-confidence"),
+    pytest.param(asr.AsrResult(SPOKEN_TEXT, float("nan"), "v1"),
                  id="nonfinite-confidence"),
-    pytest.param(asr.AsrResult(TARGET_WORD, 1.5, "v1"), id="out-of-range-confidence"),
-    pytest.param(asr.AsrResult(TARGET_WORD, 0.9, "v1", "yes"), id="non-bool-hotword"),
+    pytest.param(asr.AsrResult(SPOKEN_TEXT, 1.5, "v1"), id="out-of-range-confidence"),
+    pytest.param(asr.AsrResult(SPOKEN_TEXT, 0.9, "v1", "yes"), id="non-bool-hotword"),
     pytest.param(asr.AsrResult(None, 0.9, "v1"), id="null-text"),
 ])
 def test_malformed_asr_result_leaves_no_durable_change(legacy_env, result):
@@ -533,7 +537,7 @@ def test_a_valid_retry_after_a_malformed_result_still_succeeds(legacy_env):
     class _Bad(_CountingAsr):
         def transcribe(self, _audio_bytes, _hotwords):
             self.calls += 1
-            return asr.AsrResult(TARGET_WORD, 2.0, "v1")
+            return asr.AsrResult(SPOKEN_TEXT, 2.0, "v1")
 
     bad = _Bad()
     import app.asr as asr_module
@@ -751,6 +755,9 @@ FORGED_JUDGEMENTS = [
 @pytest.mark.parametrize("columns", FORGED_JUDGEMENTS)
 def test_a_forged_judgement_closes_every_terminal_path(legacy_env, columns):
     """判分结果被改成产线永远不会输出的形状：三个终态读取者都必须拒绝。"""
+    # 伪造的形状是相对「正确/target/不复核/含目标词」这一格定义的:用裸目标词让这次
+    # 运行真实产出正是这一格(2026-09-04 起它由确定式规则定,不经 LLM)。
+    legacy_env.asr_engine.text = TARGET_WORD
     _run_legacy_repeat_recovery_worker(legacy_env.chain.session_id)
     assert _terminal_paths_accept(legacy_env)["drain"] is True
 
@@ -764,6 +771,7 @@ def test_a_forged_judgement_closes_every_terminal_path(legacy_env, columns):
 
 def test_the_real_rule_judgement_this_run_produced_is_accepted(legacy_env):
     """正例：本次运行真实产出的规则判分必须被接受，负例才有意义。"""
+    legacy_env.asr_engine.text = TARGET_WORD
     _run_legacy_repeat_recovery_worker(legacy_env.chain.session_id)
 
     attempt = _rows(legacy_env, AttemptEvent)[0]
@@ -1108,7 +1116,7 @@ FORGED_ASR_FACTS = [
 @pytest.mark.parametrize("facts", FORGED_ASR_FACTS)
 def test_the_asr_contract_rejects_the_same_shape_on_both_sides(facts):
     """先独立证明：这些形状在预写门禁处本来就非法。"""
-    legal = {"text": TARGET_WORD, "confidence": 0.9,
+    legal = {"text": SPOKEN_TEXT, "confidence": 0.9,
              "engine_version": "v1", "hotword_hit": False}
     assert autopilot_service.legacy_asr_facts_are_legal(**legal) is True
     assert autopilot_service.legacy_asr_facts_are_legal(
@@ -2527,7 +2535,7 @@ def test_transcript_drift_after_judging_closes_the_durable_checkpoint(
     attempt_id = attempts[0].id
     assert attempts[0].processing_status == "asr_completed"
     assert attempts[0].processing_generation == 1
-    assert attempts[0].asr_text == TARGET_WORD
+    assert attempts[0].asr_text == SPOKEN_TEXT
     _expire_attempt_lease(legacy_env, attempt_id)
 
     arrived, release = threading.Event(), threading.Event()

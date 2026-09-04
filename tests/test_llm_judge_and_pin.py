@@ -265,3 +265,24 @@ def test_pin_gate_blocks_writes_allows_reads(client, monkeypatch):
 def test_no_pin_configured_means_open(client, monkeypatch):
     monkeypatch.delenv("CONSOLE_PIN", raising=False)
     assert client.post("/patients", json={"patient_id": "PQ"}).status_code == 200
+
+
+def test_prompt_defines_every_answer_type_and_pins_repeat_meaning():
+    """2026-09-04:qwen-plus 自己给「重复」下了「把目标词说两遍」的定义,49 次正确
+    回答被判 0 分;双要素题它又把「双要素」读成「回答里要有两个要素」。类型定义
+    必须在 prompt 里写死,而且要按临床口径(重复=照搬上一题答案/复述问句)。"""
+    from app.judging import build_judge_input
+    ji = build_judge_input(item_id="DE_x", task_type="双要素", target_word="窗帘",
+                           acceptable_expressions=(), asr_text="窗帘，窗帘。")
+    p = build_judge_prompt(ji)
+    for answer_type in ("正确", "部分正确", "上位词或相关词", "偏题", "重复", "未识别"):
+        assert f"- {answer_type}(" in p, answer_type
+    assert "把同一个词说两遍" in p and "仍然是正确" in p
+    assert "照搬上一题的答案" in p and "把目标词本身说两遍不算重复" in p
+    # 词级而不是字级:「花」答「花瓶」是偏题,不是「含目标词」(复核 2026-09-04)
+    assert "没有把目标词当作一个完整的词说出来" in p and "「花」答「花瓶」" in p
+    assert "照搬本题另一个要素" in p
+    assert "不要求回答里出现两个要素" in p
+    # JSON 形状与只产初评的口径不变
+    assert '"answer_type": "正确|部分正确|上位词或相关词|偏题|重复|未识别"' in p
+    assert "拿不准一律 needs_review=true" in p

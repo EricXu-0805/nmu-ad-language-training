@@ -71,10 +71,15 @@ def test_judge_classify_correct_answer(client):
                                                  "text": "胡萝卜"}).json()
     assert exact["answer_type"] == "正确" and exact["judge_mode"] == "规则确定式"
     assert exact["contains_target"] is True
-    # 含完整目标词的长句:判"部分正确"但 contains_target 真 → 自动驾驶算说对(表扬)
+    # 「这是胡萝卜」:垫词不改变说的是哪个词,2026-09-04 起判"正确"(以前是子串规则的
+    # "部分正确");contains_target 真 → 自动驾驶算说对(表扬),这一点前后不变
     contains = client.post("/judge/classify", json={"item_id": "SE_胡萝卜", "response_role": "命名",
                                                     "text": "这是胡萝卜"}).json()
-    assert contains["answer_type"] == "部分正确" and contains["contains_target"] is True
+    assert contains["answer_type"] == "正确" and contains["contains_target"] is True
+    # 带修饰的长句仍是子串规则的"部分正确"交人工,不抬成满分
+    modified = client.post("/judge/classify", json={"item_id": "SE_胡萝卜", "response_role": "命名",
+                                                    "text": "一根大胡萝卜"}).json()
+    assert modified["answer_type"] == "部分正确" and modified["contains_target"] is True
     # 只说"萝卜":题库把它列进 related_but_inaccurate,所以判"上位词或相关词"而不是
     # 泛化子串规则的"部分正确"。关键不变量仍是 contains_target 假 → 按不准确升级,
     # 不当成功;两种类型在冻结分支里也都落 close。
@@ -280,3 +285,186 @@ def test_cursor_rejects_unknown_fb_key_and_free_text(client):
         "fbText": "你答对了", "wseq": 13,
     }})
     assert free_text.status_code == 422               # extra=forbid
+
+
+# ── 2026-09-04 钱凯:「回答正确但 AI 判定为 0 分」──────────────────────────────
+# 生产 8/31~9/4 完成的 196 次作答里 49 次(25%)被云判分判成「重复」0 分,49 次全部
+# 含目标词(「窗帘，窗帘。」「嗯，茶杯，茶杯。」「花花」)。自动带练按 contains_target
+# 推进,流程没走错;错的是研究者屏上的 AI 初评与复核时的初评建议。两道闸:整句就是
+# 目标词→确定式规则定、不问 LLM;老人把目标词当完整的词说了出来而初评却是 0 分类型
+# →改判部分正确待复核,但仍记 LLM 辅助+引擎版本+原初评理由(出网记录不消失)。
+
+class _ZeroVerdictEngine:
+    version = "fake-zero-1"
+    data_boundary = "local"
+    provider_id = None
+
+    def __init__(self, verdict: str = "重复"):
+        from app.enums import AnswerType
+        self.verdict = AnswerType(verdict)
+        self.calls = 0
+
+    def judge(self, _ji):
+        from app.llm_judge import LlmJudgement
+        self.calls += 1
+        return LlmJudgement(answer_type=self.verdict, ai_score=0.0,
+                            ai_needs_review=False, reason="完全复述目标词两次")
+
+
+def _legal(result) -> bool:
+    from app.autopilot_service import legacy_judgement_result_is_legal
+    return legacy_judgement_result_is_legal(result)
+
+
+def test_target_said_twice_never_reaches_the_llm():
+    from app.main import _classify_operational
+    engine = _ZeroVerdictEngine()
+    for text in ("胡萝卜，胡萝卜。", "嗯，胡萝卜。", "胡萝卜胡萝卜胡萝卜。", "这是胡萝卜。",
+                 "一个胡萝卜。", "胡萝，卜。"):
+        result = _classify_operational(
+            item_id="SE_胡萝卜", response_role="命名", text=text,
+            bank=BANK, llm_engine=engine, cloud_llm_allowed=True)
+        assert engine.calls == 0, text
+        assert result["judge_mode"] == "规则确定式", text
+        assert (result["answer_type"], result["ai_score"], result["matched_on"]) == (
+            "正确", 1.0, "target"), text
+        assert result["contains_target"] is True and result["needs_review"] is False
+        assert _legal(result), text   # 「胡萝，卜」:contains 按归一化文本算,契约不撞
+    # 被标点拆开又带垫词:分段后不是整词,走子串分支并问 LLM;契约仍合法(contains 归一化为真)
+    split = _classify_operational(
+        item_id="SE_胡萝卜", response_role="命名", text="嗯，胡萝，卜。",
+        bank=BANK, allow_llm=False)
+    assert (split["answer_type"], split["matched_on"], split["contains_target"]) == ("部分正确", "substring", True)
+    assert _legal(split)
+
+
+@pytest.mark.parametrize("verdict", ["重复", "偏题", "未识别"])
+def test_llm_zero_verdict_contradicting_spoken_target_is_reverdicted(verdict):
+    from app.main import _classify_operational
+    engine = _ZeroVerdictEngine(verdict)
+    # 含目标词但还有别的字:要问 LLM;它答 0 分类型与「老人说出了目标词」矛盾 →
+    # 改判部分正确待复核,仍记 LLM 辅助、留引擎版本、原初评进理由(出网记录不消失)。
+    result = _classify_operational(
+        item_id="SE_胡萝卜", response_role="命名", text="大胡萝卜，这是大胡萝卜。",
+        bank=BANK, llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 1
+    assert result["judge_mode"] == "LLM辅助" and result["judge_engine_version"] == "fake-zero-1"
+    assert (result["answer_type"], result["ai_score"], result["needs_review"]) == ("部分正确", 0.5, True)
+    assert result["matched_on"] is None and result["contains_target"] is True
+    assert result["judge_reason"].startswith("含目标词「胡萝卜」，初评「" + verdict + "」不采信")
+    assert "完全复述目标词两次" in result["judge_reason"]
+    assert _legal(result)
+
+
+def test_llm_zero_verdict_without_target_is_still_trusted():
+    from app.main import _classify_operational
+    engine = _ZeroVerdictEngine()
+    result = _classify_operational(
+        item_id="SE_胡萝卜", response_role="命名", text="一个红色的东西",
+        bank=BANK, llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 1
+    assert result["judge_mode"] == "LLM辅助" and result["answer_type"] == "重复"
+    assert result["contains_target"] is False and result["judge_reason"] == "完全复述目标词两次"
+
+
+@pytest.mark.parametrize("week,item,role,text,verdict", [
+    (4, "DE_书包+书", "右命名", "书包。", "重复"),     # 照搬本题另一个要素=临床的重复
+    (3, "DE_书架+书", "右命名", "书架", "重复"),
+    (5, "DE_手+手套", "右命名", "手套，手套。", "重复"),
+    (6, "SE_鱼", "命名", "鲸鱼。", "偏题"),           # 单字目标词藏在别的词里=别的东西
+    (4, "SE_花", "命名", "花生。", "偏题"),
+    (4, "SE_窗帘", "命名", "不是窗帘。", "偏题"),     # 否定
+])
+def test_single_char_or_negated_target_keeps_llm_zero_verdict(week, item, role, text, verdict):
+    """「花瓶」里的「花」、「书架」里的「书」不算说出了目标词;LLM 判偏题/重复是对的,
+    不改判(复核 2026-09-04)。contains_target 仍按字面子串——那是推进契约,不在此改。"""
+    from app.main import _classify_operational
+    engine = _ZeroVerdictEngine(verdict)
+    result = _classify_operational(
+        item_id=item, response_role=role, text=text,
+        bank=content.load_item_bank_for_week(week), llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 1, (item, text)
+    assert result["judge_mode"] == "LLM辅助" and result["answer_type"] == verdict, (item, text)
+    assert result["judge_reason"] == "完全复述目标词两次"
+    assert _legal(result)
+
+
+@pytest.mark.parametrize("week,item,role,text", [
+    (4, "DE_窗户+窗帘", "左命名", "窗帘，窗帘。"),   # 生产原样(9/4 钱凯截图那一题的双要素版)
+    (4, "DE_窗户+窗帘", "右命名", "嗯，窗户。"),
+    (2, "DE_狐狸+鸡", "右命名", "鸡鸡。"),          # 单字目标词叠音
+    (7, "SE_门", "命名", "对，门。"),                # 单字目标词 + 独立的单字垫词段
+])
+def test_de_roles_and_single_char_targets_are_decided_by_rules_and_stay_legal(week, item, role, text):
+    from app.main import _classify_operational
+    engine = _ZeroVerdictEngine()
+    result = _classify_operational(
+        item_id=item, response_role=role, text=text,
+        bank=content.load_item_bank_for_week(week), llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 0, (item, text)
+    assert (result["judge_mode"], result["answer_type"], result["matched_on"]) == (
+        "规则确定式", "正确", "target"), (item, text)
+    assert result["contains_target"] is True and _legal(result)
+
+
+def test_single_char_compound_is_not_the_target():
+    """「对门」不是「门」:单字目标词旁的单字垫词不剥,走子串分支交人工。"""
+    from app.main import _classify_operational
+    engine = _ZeroVerdictEngine("偏题")
+    result = _classify_operational(
+        item_id="SE_门", response_role="命名", text="对门。",
+        bank=content.load_item_bank_for_week(7), llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 1
+    # LLM 的偏题保留(「对门」不算说出了「门」)
+    assert result["judge_mode"] == "LLM辅助" and result["answer_type"] == "偏题"
+    rule_only = _classify_operational(
+        item_id="SE_门", response_role="命名", text="对门。",
+        bank=content.load_item_bank_for_week(7), allow_llm=False)
+    assert (rule_only["answer_type"], rule_only["matched_on"]) == ("部分正确", "substring")
+
+
+def test_acceptable_expression_only_text_through_classify():
+    """SE_刀子 的可接受表达是「刀」:「嗯，刀，刀。」由规则定正确;「一把刀」带修饰
+    走子串分支部分正确(以前漏了可接受表达,落成未识别 0 分而 contains_target 却为真)。"""
+    from app.main import _classify_operational
+    bank3 = content.load_item_bank_for_week(3)
+    engine = _ZeroVerdictEngine()
+    only = _classify_operational(item_id="SE_刀子", response_role="命名", text="嗯，刀，刀。",
+                                 bank=bank3, llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 0 and (only["answer_type"], only["matched_on"]) == ("正确", "acceptable")
+    assert only["contains_target"] is True and _legal(only)
+    # 「一把刀」:量词短语就是那个词,同样由规则定
+    phrase = _classify_operational(item_id="SE_刀子", response_role="命名", text="一把刀。",
+                                   bank=bank3, llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 0 and (phrase["answer_type"], phrase["matched_on"]) == ("正确", "acceptable")
+    # 「小刀」:带修饰的可接受表达走子串分支部分正确(以前漏了可接受表达,落成未识别 0 分而
+    # contains_target 却为真);单字「刀」藏在「小刀」里不算整词,LLM 的偏题保留
+    partial = _classify_operational(item_id="SE_刀子", response_role="命名", text="小刀。",
+                                    bank=bank3, allow_llm=False)
+    assert (partial["answer_type"], partial["matched_on"]) == ("部分正确", "substring")
+    assert partial["contains_target"] is True and _legal(partial)
+    engine2 = _ZeroVerdictEngine("偏题")
+    kept = _classify_operational(item_id="SE_刀子", response_role="命名", text="小刀。",
+                                 bank=bank3, llm_engine=engine2, cloud_llm_allowed=True)
+    assert engine2.calls == 1 and kept["answer_type"] == "偏题" and kept["judge_mode"] == "LLM辅助"
+    # 多字可接受表达带修饰时初评矛盾才改判:用「刀子」本身
+    engine3 = _ZeroVerdictEngine("偏题")
+    reverdicted = _classify_operational(item_id="SE_刀子", response_role="命名", text="一把小刀子。",
+                                        bank=bank3, llm_engine=engine3, cloud_llm_allowed=True)
+    assert engine3.calls == 1 and reverdicted["answer_type"] == "部分正确"
+    assert reverdicted["needs_review"] is True and reverdicted["judge_mode"] == "LLM辅助" and _legal(reverdicted)
+
+
+def test_dialect_repeat_is_decided_by_rules_with_review():
+    """方言俗名连说两遍:规则定正确(留复核),不问 LLM。题库今天没有方言行,用改写的题。"""
+    import copy
+    from app.main import _classify_operational
+    bank = copy.deepcopy(BANK)
+    item = next(it for it in bank.single_element if it["item_id"] == "SE_胡萝卜")
+    item["dialect_synonyms"] = ["红萝卜"]
+    engine = _ZeroVerdictEngine()
+    result = _classify_operational(item_id="SE_胡萝卜", response_role="命名", text="红萝卜，红萝卜。",
+                                   bank=bank, llm_engine=engine, cloud_llm_allowed=True)
+    assert engine.calls == 0
+    assert (result["answer_type"], result["matched_on"], result["needs_review"]) == ("正确", "dialect", True)
+    assert _legal(result)
