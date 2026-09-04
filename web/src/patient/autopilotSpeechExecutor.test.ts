@@ -238,3 +238,116 @@ test("cancel while fetch is pending prevents URL creation when bytes arrive late
   assert.deepEqual(run.revoked, []);
   assert.equal(run.audio.playCalls, 0);
 });
+
+// ── 浏览器要手势才肯放声(2026-09-04 生产三台设备:第一句能放,答完之后的反馈句
+//    play() 一律 NotAllowedError → 整场被当设备故障安全暂停)──────────────────
+class GestureAudioDouble extends AudioDouble {
+  playResults: Promise<void>[] = [];
+  override play(): Promise<void> {
+    this.playCalls += 1;
+    this.paused = false;
+    return this.playResults.shift() ?? Promise.resolve();
+  }
+}
+
+function notAllowed(): DOMException {
+  return new DOMException("play() failed because the user didn't interact", "NotAllowedError");
+}
+
+function gestureHarness(playResults: Promise<void>[]) {
+  const audio = new GestureAudioDouble();
+  audio.playResults = playResults;
+  const announced: boolean[] = [];
+  let waiting: { fire(): void } | null = null;
+  const revoked: string[] = [];
+  const ports: AutopilotSpeechBrowserPorts = {
+    enabled: () => true,
+    stopSpeaking: () => {},
+    fetchTts: () => Promise.resolve(new Blob(["tts"], { type: "audio/wav" })),
+    createAudio: () => audio as unknown as HTMLAudioElement,
+    createObjectUrl: () => "blob:test-1",
+    revokeObjectUrl: (url) => { revoked.push(url); },
+    now: () => 100,
+    playOnNextGesture: (element, signal) => new Promise<void>((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      waiting = { fire: () => resolve(element.play()) };
+    }),
+    announceGestureNeeded: (needed) => { announced.push(needed); },
+  };
+  const executor = new BrowserAutopilotSpeechExecutor("S-SPEECH", ports);
+  return {
+    audio, announced, revoked,
+    start: () => executor.start(question()),
+    tap: () => { waiting?.fire(); waiting = null; },
+    waiting: () => waiting !== null,
+  };
+}
+
+test("NotAllowedError 不算设备故障:亮出「点一下」,在那一下里重放,之后照常起播/播完", async () => {
+  const run = gestureHarness([Promise.reject(notAllowed())]);
+  const playback = run.start();
+  const started = observe(playback.started);
+  await flush();
+  assert.equal(run.audio.playCalls, 1);
+  assert.equal(started.settled, false, "被拒不能直接判失败");
+  assert.deepEqual(run.announced, [true]);
+  assert.equal(run.waiting(), true);
+
+  run.tap();
+  await flush();
+  assert.equal(run.audio.playCalls, 2, "手势里同步重放一次");
+  assert.deepEqual(run.announced, [true, false]);
+  run.audio.playing();
+  await flush();
+  assert.equal(started.settled, true);
+  assert.equal(started.error, undefined);
+  run.audio.ended();
+  await playback.ended;
+  await playback.closed;
+});
+
+test("点屏后仍被拒才是 play_rejected", async () => {
+  const run = gestureHarness([Promise.reject(notAllowed()), Promise.reject(notAllowed())]);
+  const playback = run.start();
+  await flush();
+  run.tap();
+  const playRejected = (error: unknown) => error instanceof AutopilotMediaError
+    && error.failureStage === "play_rejected"
+    && /点屏后仍被拒/.test(error.message);
+  await Promise.all([
+    assert.rejects(playback.started, playRejected),
+    assert.rejects(playback.ended, playRejected),
+    playback.closed,
+  ]);
+  assert.deepEqual(run.announced, [true, false]);
+  assert.deepEqual(run.revoked, ["blob:test-1"]);
+});
+
+test("等手势期间被取消(控制器 15 秒起播期限/换命令):AbortError 收口,覆层收走,不伪造 play_rejected", async () => {
+  const run = gestureHarness([Promise.reject(notAllowed())]);
+  const playback = run.start();
+  playback.started.catch(() => {});
+  playback.ended.catch(() => {});
+  await flush();
+  assert.equal(run.waiting(), true);
+  playback.cancel();
+  await playback.closed;
+  await flush();
+  await assert.rejects(playback.started, (error: unknown) =>
+    error instanceof DOMException && error.name === "AbortError");
+  assert.deepEqual(run.announced, [true, false]);
+  assert.equal(run.audio.playCalls, 1);
+});
+
+test("不是手势问题的 play() 拒绝(NotSupportedError 等)仍直接 play_rejected,不等手势", async () => {
+  const run = gestureHarness([Promise.reject(new DOMException("no source", "NotSupportedError"))]);
+  const playback = run.start();
+  await Promise.all([
+    assert.rejects(playback.started, (error: unknown) => error instanceof AutopilotMediaError
+      && error.failureStage === "play_rejected"),
+    playback.ended.catch(() => {}),
+    playback.closed,
+  ]);
+  assert.deepEqual(run.announced, []);
+  assert.equal(run.waiting(), false);
+});

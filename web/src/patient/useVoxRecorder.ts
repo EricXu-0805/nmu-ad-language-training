@@ -97,6 +97,7 @@ export function useVoxRecorder(opts: {
   suspended?: boolean; // 场次级暂停等"无游标边沿"的挂起:必须立即封存许可+停麦(热麦红线)
   selfStartAllowed?: boolean; // 自助开录的当前授权；变 false 时在途许可与活麦一并收回
   stopRequested?: boolean; // thanks/done/终态/收尾等无关 recSeq 的强制停麦信号
+  maxRecordingMs?: number; // 单段录音上限,到点自动停并保存(老人没按「我说好了」流程也走得下去)
 }) {
   const recRef = useRef<Recorder>(new Recorder());
   // ★元数据在 arm 时刻锁存:录音中操作端直接跳节/跳题时,stop 消息与新指针同帧到达,
@@ -144,6 +145,7 @@ export function useVoxRecorder(opts: {
   const {
     sessionId, recording, recSeq, commandSeq, turnKey, containsDirectIdentifier,
     connectionReady = true, suspended = false, selfStartAllowed = false, stopRequested = false,
+    maxRecordingMs,
   } = opts;
   const sessionUiFence = useRef<AudioRecoveryUiFence>({ sessionId, generation: 0 });
   if (sessionUiFence.current.sessionId !== sessionId) {
@@ -154,11 +156,11 @@ export function useVoxRecorder(opts: {
   }
   const latest = useRef({
     sessionId, recording, recSeq, commandSeq, turnKey, containsDirectIdentifier,
-    connectionReady, suspended, selfStartAllowed, stopRequested,
+    connectionReady, suspended, selfStartAllowed, stopRequested, maxRecordingMs,
   });
   latest.current = {
     sessionId, recording, recSeq, commandSeq, turnKey, containsDirectIdentifier,
-    connectionReady, suspended, selfStartAllowed, stopRequested,
+    connectionReady, suspended, selfStartAllowed, stopRequested, maxRecordingMs,
   };
   const mountedRef = useRef(true);
   const startGeneration = useRef(0);
@@ -862,7 +864,7 @@ export function useVoxRecorder(opts: {
       recordingLimit.current = window.setTimeout(() => {
         recordingLimit.current = null;
         if (recRef.current.active) void stopAndSave();
-      }, MAX_RECORDING_MS);
+      }, latest.current.maxRecordingMs ?? MAX_RECORDING_MS);
     } catch (error) {
       reportStartFailure(permit, classifyRecordingStartFailure(
         failurePhase === "authorization" ? { kind: "authorization" } : { kind: "microphone", error },

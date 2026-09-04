@@ -1,6 +1,7 @@
 // 自动跟场循环:设备存有受试者绑定、且当前没有场次能力时,按 ATTACH_POLL_MS 静默尝试
 // /device/attach。接上后交回既有 live 轮询;绑定死亡即停并清除。
-// 老人端契约不变:这里永不抛错、永不改画面,只回一个"已绑定"布尔给问候页。
+// 老人端契约不变:这里永不抛错、永不改画面,只回"已绑定"布尔和一句给工作人员
+// 看的提示(别的设备连着 / 这位受试者没有场次)给问候页。
 import { useEffect, useState } from "react";
 import {
   api,
@@ -9,10 +10,11 @@ import {
   getPatientBinding,
   PATIENT_BINDING_UPDATED_EVENT,
 } from "../api";
-import { ATTACH_POLL_MS, shouldAttemptAttach } from "./bindingAttachPolicy";
+import { ATTACH_POLL_MS, shouldAttemptAttach, type AttachHint } from "./bindingAttachPolicy";
 
-export function usePatientBinding(): { bound: boolean } {
+export function usePatientBinding(): { bound: boolean; hint: AttachHint } {
   const [bound, setBound] = useState(() => getPatientBinding() !== null);
+  const [hint, setHint] = useState<AttachHint>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -31,7 +33,9 @@ export function usePatientBinding(): { bound: boolean } {
       inFlight = true;
       // attachPatientDevice 自己负责保存能力/清绑定并广播事件;
       // 这里只保证同一时刻至多一个在途请求。
-      void api.attachPatientDevice().finally(() => {
+      void api.attachPatientDevice().then((result) => {
+        if (!cancelled) setHint(result.hint);
+      }).finally(() => {
         inFlight = false;
         refreshBound();
       });
@@ -49,5 +53,5 @@ export function usePatientBinding(): { bound: boolean } {
     };
   }, []);
 
-  return { bound };
+  return { bound, hint };
 }

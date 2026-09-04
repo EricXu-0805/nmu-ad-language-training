@@ -174,6 +174,11 @@ _OPERATIONAL_ERROR_CODES = frozenset({
     "audit_append_failed",
     "login_audit_append_failed",
     "audio_rollback_cleanup_failed",
+    # 老人端自动跟场被拒的三种真相(2026-09-04 生产上 40 次 409 在日志里一模一样,
+    # 查不出是没场次、别人的场次还是别的设备占着)。只有闭集里的 code,无任何标识。
+    "device_attach_refused_no_session",
+    "device_attach_refused_device_busy",
+    "device_attach_refused_other",
 })
 
 
@@ -5148,6 +5153,20 @@ def device_attach(body: DeviceAttachIn, request: Request, response: Response,
     except HTTPException as exc:
         if exc.status_code != 409:
             raise
+        inner = exc.detail.get("code") if isinstance(exc.detail, dict) else None
+        # 拒因只进服务器日志(唯一的运行输出出口,闭集 code、零标识),不进响应。
+        _emit_operational_error(
+            "device_attach_refused_device_busy" if inner == "device_attach_device_busy"
+            else "device_attach_refused_no_session" if inner == "device_pair_no_live_session"
+            else "device_attach_refused_other")
+        if inner == "device_attach_device_busy":
+            # 这一码只对本人绑定成立(受试者已在上面核对过),不泄露别的受试者的任何事;
+            # 拿到它的是同一位受试者的另一台设备,告诉它「有台设备连着」不算泄露。
+            # 不区分的代价是工作人员面对一台永远「等待训练开始」的平板无从下手。
+            raise HTTPException(409, detail={
+                "code": "device_attach_device_busy",
+                "message": "这一场已连在另一台设备上；要改用这台，请重新输入配对码",
+            }) from None
         raise HTTPException(409, detail={
             "code": "device_attach_no_session",
             "message": "当前没有可自动连接的训练场次",

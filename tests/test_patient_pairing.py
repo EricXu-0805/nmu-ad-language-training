@@ -246,8 +246,13 @@ def test_attach_never_steals_another_devices_live_capability(
     denied = pairing_client.post("/device/attach", json={
         "deviceId": "patient-one-tablet-old1", "binding": old_binding})
     assert denied.status_code == 409, denied.text
-    # 对外与「没有场次」不可区分,不泄露另一台设备的存在。
-    assert denied.json()["detail"]["code"] == "device_attach_no_session"
+    # 2026-09-04 起对**本人**绑定说实话:另一台设备连着这一场。拿到这一码的必须
+    # 已通过同一受试者的绑定令牌验签(服务端先核对受试者再查占用),别的受试者
+    # 的令牌仍只得到「没有场次」(见 test_other_patient_pin_gets_binding_only_...)。
+    # 不说实话的代价是工作人员面对一台永远「等待训练开始」的平板无从下手。
+    assert denied.json()["detail"]["code"] == "device_attach_device_busy"
+    assert "P-ONE" not in denied.text and "S-ONE" not in denied.text
+    assert "tablet-new1" not in denied.text
 
     alive = pairing_client.get(
         "/live/state", headers={"X-Device-Capability": new_capability})
@@ -358,3 +363,61 @@ def test_pairing_code_absent_without_console_pin(pairing_client, monkeypatch):
     _seed_two_sessions(pairing_client)
     rows = pairing_client.get("/patients").json()
     assert all(row["pairing_code"] is None for row in rows)
+
+
+def test_other_patient_binding_never_learns_device_busy(pairing_client, monkeypatch):
+    """busy 这一码只对本人绑定成立:别的受试者的令牌撞上被占用的场次,仍只看到
+    「没有场次」——受试者核对在占用检查之前,泄露面没有扩大。"""
+    _seed_two_sessions(pairing_client)
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    own = pairing_client.post(
+        "/device/pair", headers={"X-Console-Pin": patient_pairing.derive_patient_pin("P-ONE")},
+        json={"deviceId": "patient-one-tablet-live1"})
+    assert own.status_code == 200 and "capability" in own.json(), own.text
+    other = pairing_client.post(
+        "/device/pair", headers={"X-Console-Pin": patient_pairing.derive_patient_pin("P-TWO")},
+        json={"deviceId": "patient-two-tablet-0001"})
+    assert set(other.json()) == {"binding"}
+    denied = pairing_client.post("/device/attach", json={
+        "deviceId": "patient-two-tablet-0001", "binding": other.json()["binding"]})
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "device_attach_no_session"
+
+
+def test_attach_succeeds_right_after_stale_slot_takeover(pairing_client, monkeypatch):
+    """2026-09-04 生产:遗弃场被新场接管后,本人平板的自动跟场必须马上接上——
+    接管路径(安全暂停旧场 + 换槽)不能留下任何让 attach 409 的残余。"""
+    from datetime import timedelta
+
+    from app.models import LiveState, PatientDeviceCapability
+
+    _seed_two_sessions(pairing_client)
+    # 同一受试者两场:S-ONE 是被遗弃的旧场,S-ONE-B 是新场。
+    assert pairing_client.post("/sessions", json={
+        "session_id": "S-ONE-B", "patient_id": "P-ONE", "week_no": 2,
+        "phase_type": "正式训练", "event_line": "正式训练",
+        "item_bank_version_id": "wk2-v1-20260707", "is_simulation": True,
+    }).status_code == 200
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    code = patient_pairing.derive_patient_pin("P-ONE")
+    tablet = pairing_client.post("/device/pair", headers={"X-Console-Pin": code},
+                                 json={"deviceId": "patient-one-tablet-yday"})
+    assert "capability" in tablet.json(), tablet.text
+    laptop = pairing_client.post("/device/pair", headers={"X-Console-Pin": code},
+                                 json={"deviceId": "patient-one-laptop-0001"})
+    assert "capability" in laptop.json(), laptop.text
+    with Session(pairing_client.test_engine) as s:
+        for row in s.exec(select(PatientDeviceCapability)):
+            row.expires_at = datetime.now() - timedelta(hours=2)   # 昨天的能力早过期
+            s.add(row)
+        live = s.exec(select(LiveState)).one()
+        live.updated_at = datetime.now() - timedelta(minutes=30)   # 控制台关页签走人
+        s.add(live)
+        s.commit()
+    monkeypatch.delenv("CONSOLE_PIN")
+    _switch_live(pairing_client, "S-ONE-B")   # 新场握手:遗弃接管
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    attached = pairing_client.post("/device/attach", json={
+        "deviceId": "patient-one-laptop-0001", "binding": laptop.json()["binding"]})
+    assert attached.status_code == 200, attached.text
+    assert attached.json()["sessionId"] == "S-ONE-B"

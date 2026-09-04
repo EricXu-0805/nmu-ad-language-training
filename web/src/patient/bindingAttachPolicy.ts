@@ -24,6 +24,15 @@ export function classifyAttachOutcome(
   return "quiet_retry";
 }
 
+// 问候页给工作人员看的一句实话。busy 只对本人绑定成立(服务端只对同一受试者的
+// 令牌区分「别的设备连着」),其余 409 仍是「这位受试者现在没有场次」。
+export type AttachHint = "busy" | "no_session" | null;
+
+export function attachHintFor(status: number, code: string | null): AttachHint {
+  if (status !== 409) return null;
+  return code === "device_attach_device_busy" ? "busy" : "no_session";
+}
+
 // 只有"没有场次能力、但有绑定"的老人端才轮询 attach;有能力时 live 轮询接管。
 export function shouldAttemptAttach(
   hasBinding: boolean,

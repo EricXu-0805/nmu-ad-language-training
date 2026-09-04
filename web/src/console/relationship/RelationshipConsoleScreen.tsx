@@ -10,7 +10,8 @@ import { useSessionRuntime } from "../../hooks/useSessionRuntime";
 import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
 import { isPatientRecFailure, type RapportBeat, type RecState } from "../../sync/messages";
 import {
-  afterReplyAction, nextQuestionArmDelayMs, roundLabel, speechDelayMs,
+  afterReplyAction, autoAdvanceTarget, nextQuestionArmDelayMs, roundLabel,
+  shouldAutoArmOnEntry, speechDelayMs,
 } from "./rapportRounds";
 import type { Session } from "../../types";
 import { SessionControlBar } from "../SessionControlBar";
@@ -64,10 +65,11 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const replyBeatRef = useRef<{ beat: RapportBeat; utteranceId: number | null }>(
     { beat: "ask", utteranceId: null });
   const [replyMeta, setReplyMeta] = useState<string | null>(null);
-  // 默认开:老人说完,系统自动生成一句回应(AI 听完现编;不可用时落回句库)。
+  // 默认开:自动带练——问句念完自动开麦,老人说完系统自动回应(开放 AI 的节现编,
+  // 身份问询的节照脚本),说完自动问下一问、问完自动进下一节。像第2-8周那样。
   const [autoReply, setAutoReply] = useState(true);
   const [replyPending, setReplyPending] = useState(false);
-  // 多轮:机器人说完后的自动动作(续麦/换问)用定时器等它说完;任何人为操作都取消。
+  // 机器人说完后的自动动作(开麦/续麦/换问/换节)用定时器等它说完;任何人为操作都取消。
   const [roundNote, setRoundNote] = useState<string | null>(null);
   const afterReplyTimer = useRef<number | null>(null);
   // 定时器回调来自旧渲染的闭包:动作函数与开关状态一律经 ref 取最新值。
@@ -76,6 +78,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     armRecording: () => {}, go: (_s: number, _q: number) => {},
     autoReply: true, autoOpenHere: false, questionCount: 0, sectionIdx: 0,
     interactionBlocked: false, askAt: (_q: number): string | null => null,
+    sections: [] as { speaker: string | undefined; questionCount: number }[],
   });
   // 保持当前拍不变的那些写(老人自停回写 idle、研究者停止录音)必须原样带回
   // 当前拍与发声行,不能让默认值把话拍悄悄打回 ask。
@@ -106,10 +109,13 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const replyLine = section?.speaker === "机器人" ? (questions[qIdx]?.success ?? null) : null;
   const openReplyHere = Boolean(replyBank?.applies_to.some(
     (row) => row.section_key === section?.key && row.question_idx === qIdx));
-  // 自动回应按节判定:录音只绑到节,节内含身份问询问位(自我介绍)整节退回手点。
+  // AI 现编按节判定:录音只绑到节,节内含身份问询问位(自我介绍)整节不进云——
+  // 那一节老人答完由机器人照冻结脚本回应(不转写、不出网),流程照样自动往下走。
   const autoOpenHere = Boolean(openReplyHere && questions.length > 0
     && questions.every((_q, i) => replyBank?.applies_to.some(
       (row) => row.section_key === section?.key && row.question_idx === i)));
+  // 自动带练在每个机器人节都开得了:AI 现编(autoOpenHere)或脚本回应二选一。
+  const autoModeHere = section?.speaker === "机器人" && questions.length > 0;
   const recSeq = useRef(0);
   // 自动回应回来时研究者可能已换问:回应只写回它出发时的那一问。
   const posRef = useRef("");
@@ -336,10 +342,11 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       toast("回应句没有送到老人端——检查场次状态后可点分组重试", "warn");
       return;
     }
-    // 多轮只接在自动回应之后:手点句库仍由研究者掌控节奏。
+    // 自动推进只接在自动回应之后:手点句库/手点脚本回应仍由研究者掌控节奏。
     if (!viaAuto || u.round === undefined || u.maxRounds === undefined
       || u.final === undefined) return;
     const now = latest.current;
+    if (!now.autoReply) return;
     if (u.degradedReason === "round_limit") {
       // 研究者主动回到已聊满的问位(想让老人补一句):这一段录音不会被转写,
       // 机器人只说了句无关的收束话。不能当成"聊完了"自动把他推回下一问——
@@ -349,11 +356,12 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       return;
     }
     const action = afterReplyAction({
-      autoReply: now.autoReply, autoOpenHere: now.autoOpenHere, final: u.final,
+      autoMode: now.autoReply, final: u.final,
       invitesMore: u.invitesMore === true, qIdx: qi, questionCount: now.questionCount,
     });
     const posAt = posRef.current;
-    const label = roundLabel(u.round, u.maxRounds);
+    // 脚本回应(不进云的问位)没有轮次可言,屏上不标「第 1 / 2 轮」误导研究者。
+    const label = u.source === "script" ? "照脚本回应" : roundLabel(u.round, u.maxRounds);
     // 定时器回调持有的是排定那一帧的闭包:动作与闸门一律经 latest/ref 取最新值,
     // 并且必须自己再查一遍在途/阻断状态——否则暂停、收尾、卸载后它照样开麦。
     const stillOurs = () => (
@@ -379,20 +387,23 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
         afterReplyTimer.current = null;
         if (!stillOurs()) return;
         setRoundNote(null);
+        // 换问后的自动开麦由 go 统一安排:前几轮已经把老人训练成「小语说完就该
+        // 我说」,这里不开麦=老人对着关着的麦回答(钱凯最初报的那个现象)。
         latest.current.go(latest.current.sectionIdx, qi + 1);
-        // 换问后也自动开麦:前几轮已经把老人训练成「小语说完就该我说」,
-        // 这里不开麦=老人对着关着的麦回答(钱凯最初报的那个现象)。
-        const nextPos = `${sk}#${qi + 1}`;
-        const nextAsk = latest.current.askAt(qi + 1);
-        afterReplyTimer.current = window.setTimeout(() => {
-          afterReplyTimer.current = null;
-          if (posRef.current !== nextPos || recStateRef.current !== "idle"
-            || latest.current.interactionBlocked || !latest.current.autoReply) return;
-          latest.current.armRecording();
-        }, nextQuestionArmDelayMs(nextAsk));
       }, speechDelayMs(u.text));
     } else if (action === "section_done") {
-      setRoundNote(`${label} · 本节问完了，请点「下一节」`);
+      const target = autoAdvanceTarget(now.sections, now.sectionIdx);
+      if (target === null) {
+        setRoundNote(`${label} · 本节问完了，下一节要研究者当面说，请点「下一节」`);
+        return;
+      }
+      setRoundNote(`${label} · 本节问完，小语说完会自动进下一节`);
+      afterReplyTimer.current = window.setTimeout(() => {
+        afterReplyTimer.current = null;
+        if (!stillOurs()) return;
+        setRoundNote(null);
+        latest.current.go(target, 0);
+      }, speechDelayMs(u.text));
     }
   };
   // 老人端录音落库回报 → 记入作业日志(收尾屏音频闸门据此列出)
@@ -424,21 +435,27 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     }
     setRecState("idle");
     toast(`录音已保存（${m.durationSeconds.toFixed(1)} 秒）${m.containsDirectIdentifier ? "。这段录音含直接身份信息，导出时会被拦下" : ""}`, "ok");
-    // 互动态:录音一落账,机器人自己接话。失败不打断流程,研究者还能手点分组。
-    if (autoReply && autoOpenHere && !interactionBlocked && replyBank
-      && !replyBusyRef.current && lastArmedPosRef.current === posRef.current) {
+    // 自动带练:录音一落账,机器人自己接话。开放 AI 的节走「云 ASR → 现编」;
+    // 含姓名/年龄等身份问询的节一个字节都不进云,照冻结脚本回应,流程照样往下走。
+    // 失败不打断流程,研究者还能手点分组/脚本回应。
+    if (autoReply && !interactionBlocked && !replyBusyRef.current
+      && lastArmedPosRef.current === posRef.current
+      && ((autoOpenHere && replyBank) || (!autoOpenHere && replyLine))) {
       const sk = section?.key ?? "";
       const qi = qIdx;
       const posAt = posRef.current;
       replyBusyRef.current = true;
       setReplyPending(true);
-      api.rapportReplyCreate(session.session_id, {
-        sectionKey: sk, questionIdx: qi, mode: "auto", rawAudioId: m.rawAudioId,
-      }).then((u) => {
+      const request = autoOpenHere
+        ? { sectionKey: sk, questionIdx: qi, mode: "auto" as const, rawAudioId: m.rawAudioId }
+        : { sectionKey: sk, questionIdx: qi, mode: "script" as const };
+      api.rapportReplyCreate(session.session_id, request).then((u) => {
         if (posRef.current !== posAt) return;
         void applyReply(u, sk, qi, true);
       }).catch(() => {
-        toast("自动回应没有生成——可以点下面的分组，让机器人照句库说一句", "warn");
+        toast(autoOpenHere
+          ? "自动回应没有生成——可以点下面的分组，让机器人照句库说一句"
+          : "自动回应没有生成——可以点「让机器人回应」再试一次", "warn");
       }).finally(() => { replyBusyRef.current = false; setReplyPending(false); });
     }
   });
@@ -462,6 +479,22 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setReplyMeta(null);
     setRapportFlags(nextFlags);
     postRapport({ sectionKey: s?.key ?? "", questionIdx: q, beat: "ask", recording: "idle", recSeq: recSeq.current, ...nextFlags });
+    // 自动带练:进到一问就像第2-8周那样,问句念完自动开麦,不用研究者再点录音。
+    // 研究者手点上一问/下一问/换节也走这里——他换到哪一问,老人就在哪一问作答。
+    if (!shouldAutoArmOnEntry({
+      autoMode: autoReply, speaker: s?.speaker, questionCount: s?.questions?.length ?? 0, qIdx: q,
+    })) return;
+    const pos = `${s?.key ?? ""}#${q}`;
+    const ask = s?.questions?.[q]?.ask ?? null;
+    setRoundNote("小语问完会自动开麦，让老人回答");
+    afterReplyTimer.current = window.setTimeout(() => {
+      afterReplyTimer.current = null;
+      if (posRef.current !== pos || recStateRef.current !== "idle"
+        || latest.current.interactionBlocked || !latest.current.autoReply
+        || replyBusyRef.current) return;
+      setRoundNote(null);
+      latest.current.armRecording();
+    }, nextQuestionArmDelayMs(ask));
   };
 
   const armRecording = () => {
@@ -557,6 +590,9 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     armNextRound, armRecording, go, autoReply, autoOpenHere,
     questionCount: questions.length, sectionIdx, interactionBlocked,
     askAt: (q: number) => questions[q]?.ask ?? null,
+    sections: script.sections.map((row) => ({
+      speaker: row.speaker, questionCount: row.questions?.length ?? 0,
+    })),
   };
   const stopRecording = () => {
     cancelAfterReply();
@@ -695,18 +731,23 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
               </div>
               <span className="muted">第 {qIdx + 1} / {questions.length} 问</span>
             </div>
+            {autoModeHere && (
+              <label className="row rapport-auto-toggle">
+                <input type="checkbox" checked={autoReply}
+                  onChange={(e) => { setAutoReply(e.target.checked); if (!e.target.checked) cancelAfterReply(); }} />
+                <span>{autoOpenHere
+                  ? "自动带练：问完自动开麦，老人说完 AI 听完现编接着聊，每问最多聊几轮后自动问下一问；听不清或 AI 不可用时改用句库"
+                  : "自动带练：问完自动开麦，老人说完机器人照脚本回应后自动问下一问（本节含姓名、年龄等身份信息，回答不进云、不转写）"}</span>
+              </label>
+            )}
+            {autoModeHere && !autoReply && (
+              <p className="muted">已关自动带练：每一问要手点「开始受试者端录音」，老人说完再点回应。</p>
+            )}
             {openReplyHere && replyBank && (
               <div className="rapport-reply-picker">
-                {autoOpenHere && (
-                  <label className="row">
-                    <input type="checkbox" checked={autoReply}
-                      onChange={(e) => { setAutoReply(e.target.checked); if (!e.target.checked) cancelAfterReply(); }} />
-                    <span>老人说完自动回应并接着聊（AI 听完现编，每问最多聊几轮后自动换下一问；听不清或 AI 不可用时改用句库）</span>
-                  </label>
-                )}
                 <p className="muted">{autoOpenHere
                   ? "也可以手点：刚才是哪种情况？点一下，机器人就照句库说一句。"
-                  : "本节含身份问询问位，不开自动回应——刚才是哪种情况？点一下，机器人就照句库说一句。"}</p>
+                  : "这一问也可以手点句库：刚才是哪种情况？点一下，机器人就照句库说一句。"}</p>
                 <div className="row wrap">
                   {replyBank.groups.map((g) => (
                     <Button key={g.key} variant={g.key === "接着聊" ? "primary" : undefined}

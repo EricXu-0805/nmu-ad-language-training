@@ -16,6 +16,7 @@ import {
   type BedsideSafetyLatch,
 } from "./bedsideSafetyLatch";
 import { canSignalBedsideActivation } from "./autopilotAdmission";
+import { unlockAutopilotPlayback } from "./autopilotBrowserSpeechPorts";
 import { PatientAutopilotStage } from "./PatientAutopilotStage";
 import { PatientStage } from "./PatientStage";
 import { parsePatientSessionPlan, type PatientSessionPlan } from "./patientPlan";
@@ -40,9 +41,11 @@ import {
   currentVoiceName,
   setTtsContext,
   setTtsEnabled,
+  PLAYBACK_NEEDS_GESTURE_EVENT,
   speakSample,
   stopSpeaking,
   ttsEnabled,
+  unlockTtsPlayback,
 } from "./tts";
 import type { TtsPlaybackContextKey } from "./ttsContext";
 import { usePatientAutopilot, type PatientAutopilotView } from "./usePatientAutopilot";
@@ -66,7 +69,16 @@ function withPatientPauseStorageLock<T>(
 // 无 session 超时、无自动黑屏、对沉默与错误宽容(永不报错、永不闪红)。
 export function PatientShell() {
   const { session, cursor, rapportStep, connection } = useLiveCursor();
-  const { bound: patientBindingActive } = usePatientBinding();
+  const { bound: patientBindingActive, hint: attachHint } = usePatientBinding();
+  // 浏览器要手势才肯放声(生产三台设备实证):自动带练那条话术在等老人点一下屏。
+  const [playbackNeedsTap, setPlaybackNeedsTap] = useState(false);
+  useEffect(() => {
+    const onNeed = (event: Event) => {
+      setPlaybackNeedsTap(Boolean((event as CustomEvent<{ needed?: boolean }>).detail?.needed));
+    };
+    window.addEventListener(PLAYBACK_NEEDS_GESTURE_EVENT, onNeed);
+    return () => window.removeEventListener(PLAYBACK_NEEDS_GESTURE_EVENT, onNeed);
+  }, []);
   const terminal = isSessionTerminalStatus(session?.runtimeStatus);
   const connectionReady = connection === "connected";
   const [patientActivated, setPatientActivated] = useState(false);
@@ -472,9 +484,21 @@ export function PatientShell() {
         <div className="target">您好</div>
         <p className="question">准备好了我们就开始</p>
         {patientBindingActive && (
-          <p className="question" role="status" aria-live="polite">
-            已连接 · 等待训练开始
-          </p>
+          <>
+            <p className="question" role="status" aria-live="polite">
+              {attachHint === "busy" ? "这一场已经连在另一台设备上" : "已连接 · 等待训练开始"}
+            </p>
+            {/* 已配对却一直接不上的两种真相都要说出来(2026-09-04 生产:一台平板
+                对着「等待训练开始」轮询了 40 次,工作人员断定「要两台设备」):
+                别的设备连着这一场 / 这台配的是另一位受试者。入口常驻,不依赖刷新。 */}
+            <button type="button" className="patient-pair-entry patient-pair-entry--quiet"
+              onClick={() => window.dispatchEvent(new Event(PIN_PROMPT_MANUAL_OPEN_EVENT))}>
+              {attachHint === "busy" ? "改用这台平板" : "换一位受试者或重新配对"}
+              <small>{attachHint === "busy"
+                ? "请工作人员点这里重新输入配对码，这一场会切到这台"
+                : "控制台已开场却没连上？可能这台配的是另一位受试者，请工作人员点这里重新配对"}</small>
+            </button>
+          </>
         )}
         {!devicePaired && (
           // 「暂不配对」之后的可见找回路径:不弹错、不吓老人,一个安静的入口,
@@ -553,6 +577,11 @@ export function PatientShell() {
       </button>
     )}
     <TapToStart tapped={patientActivated} onTap={() => {
+      // 在这一下手势里把两个播放元素都放一段静音解锁:有些浏览器只认「在手势里
+      // 放过声的那个元素」,元素一换就要重新要手势——老人答完之后的反馈句正是
+      // 这样被拒掉、被当成设备故障安全暂停的(2026-09-04 生产)。
+      unlockAutopilotPlayback();
+      unlockTtsPlayback();
       activatedForSession.current = session?.sessionId ?? null;
       setPatientActivated(true);
       // 这一次点击同时把朗读打开,主流程不再需要第二次触碰。
@@ -562,6 +591,12 @@ export function PatientShell() {
         setTtsOn(true);
       }
     }} />
+    {patientActivated && playbackNeedsTap && (
+      // 自动带练的话术在等手势:document 上的 pointerdown 监听(捕获阶段)先在这一下
+      // 里把它放出来,这里只顺手解锁。覆层由执行器的 announceGestureNeeded(false) 收走。
+      <TapToStart tapped={false} label="点一下，接着听" sub="小语的话还没放出来"
+        onTap={() => { unlockAutopilotPlayback(); unlockTtsPlayback(); }} />
+    )}
     <TtsToggle on={ttsOn} onChange={setTtsOn} sampleContextKey={ttsContextKey}
       mode={autopilot.mode} />
     <PinPrompt />
@@ -571,14 +606,16 @@ export function PatientShell() {
 // 点击式启动:浏览器要求页面有过一次点击才放行语音(user activation)。
 // 与其让研究者记住"先摸一下屏幕"这条隐性规则,不如给一个明确的可点落点;
 // 点击本身即授予激活,tts 的 pointerdown 补读会把当前该读的话读出来。
-function TapToStart({ tapped, onTap }: { tapped: boolean; onTap(): void }) {
+function TapToStart({ tapped, onTap, label = "点一下，开始", sub = "开始后会听到声音" }: {
+  tapped: boolean; onTap(): void; label?: string; sub?: string;
+}) {
   if (tapped) return null;
   return (
-    <button type="button" className="tap-overlay" aria-label="点一下，开始" onClick={onTap}>
+    <button type="button" className="tap-overlay" aria-label={label} onClick={onTap}>
       <div className="tap-overlay-inner">
         <div className="tap-overlay-mark" aria-hidden="true">语</div>
-        <div>点一下，开始</div>
-        <div className="tap-overlay-sub">开始后会听到声音</div>
+        <div>{label}</div>
+        <div className="tap-overlay-sub">{sub}</div>
       </div>
     </button>
   );

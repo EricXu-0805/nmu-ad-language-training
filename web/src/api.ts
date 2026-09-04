@@ -23,8 +23,10 @@ import {
   type PatientBindingRecord,
 } from "./security/patientBinding";
 import {
+  attachHintFor,
   classifyAttachOutcome,
   type AttachDisposition,
+  type AttachHint,
 } from "./patient/bindingAttachPolicy";
 import { csrfHeader } from "./security/csrf";
 import {
@@ -393,9 +395,14 @@ const ATTACH_REQUEST_TIMEOUT_MS = 8_000;
 
 // 自动跟场:绑定令牌换当前本人 live 场次能力。全部失败形态按纯策略层分派;
 // 老人端调用方只看处置结果,永不弹错误。
-async function attachPatientDevice(): Promise<AttachDisposition> {
+export interface AttachResult {
+  disposition: AttachDisposition;
+  hint: AttachHint;
+}
+
+async function attachPatientDevice(): Promise<AttachResult> {
   const bindingRecord = patientBindingStore.get();
-  if (!bindingRecord) return "drop_binding";
+  if (!bindingRecord) return { disposition: "drop_binding", hint: null };
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), ATTACH_REQUEST_TIMEOUT_MS);
   try {
@@ -411,16 +418,18 @@ async function attachPatientDevice(): Promise<AttachDisposition> {
       }),
     });
     const text = await res.text();
-    const disposition = classifyAttachOutcome(res.status, errorCodeFromText(text));
+    const code = errorCodeFromText(text);
+    const disposition = classifyAttachOutcome(res.status, code);
+    const hint = attachHintFor(res.status, code);
     if (disposition === "attached") {
       try {
         deviceStore.save(JSON.parse(text) as unknown);
       } catch {
         // 响应损坏不等于绑定已死:保留绑定,下一轮再试。
-        return "quiet_retry";
+        return { disposition: "quiet_retry", hint: null };
       }
       queueMicrotask(() => window.dispatchEvent(new Event(DEVICE_CAPABILITY_UPDATED_EVENT)));
-      return "attached";
+      return { disposition: "attached", hint: null };
     }
     if (disposition === "drop_binding") {
       patientBindingStore.clear();
@@ -430,9 +439,9 @@ async function attachPatientDevice(): Promise<AttachDisposition> {
         if (!deviceStore.get()) window.dispatchEvent(new Event(DEVICE_PAIR_REQUIRED_EVENT));
       });
     }
-    return disposition;
+    return { disposition, hint };
   } catch {
-    return "quiet_retry";
+    return { disposition: "quiet_retry", hint: null };
   } finally {
     window.clearTimeout(timeout);
   }

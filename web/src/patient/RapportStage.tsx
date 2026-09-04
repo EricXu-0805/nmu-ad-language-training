@@ -11,6 +11,10 @@ import { onSpeechSettled, ttsEnabled } from "./tts";
 // 播放收口信号的兜底上限。迟开麦研究者能手点补救,永不开麦不能。
 // 云合成冷启的上界够用即可;等太久老人会以为没人理他,而迟开麦研究者能手点补救。
 const SPEECH_SETTLE_TIMEOUT_MS = 12000;
+// 第1周单段回答上限。自动带练要靠「说完了就往下走」:老人不按「我说好了」时,
+// 到点自动停麦保存,机器人照常接话。第2-8周的作答窗是 15 秒;第1周是聊天,给宽些。
+// 研究者随时能在控制台点「停止受试者端录音」提前收麦。
+const RAPPORT_MAX_RECORDING_MS = 30_000;
 
 type SpeechGate = { identity: string; settled: boolean } | null;
 import { useVoxRecorder } from "./useVoxRecorder";
@@ -148,6 +152,7 @@ export function RapportStage({
     // 没有——不挡住就是一支看不见的热麦。闪断(error 为空、只是在途)不受影响。
     suspended: sessionPaused || sessionTerminal || !positionConfirmed || Boolean(error),
     stopRequested: isPaused || sessionTerminal || !positionConfirmed,
+    maxRecordingMs: RAPPORT_MAX_RECORDING_MS,
   });
   useLayoutEffect(() => {
     registerImmediateDiscard?.(discardForPatientPause);

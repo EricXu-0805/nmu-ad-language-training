@@ -248,6 +248,14 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   font-weight: normal;
   color: var(--c-fg-muted, #6e675c);
 }
+/* 已配对但还没接上场次时的换人/重配入口:更小更安静,老人不会误当主按钮。 */
+.patient-pair-entry--quiet {
+  margin-top: 40px;
+  padding: 10px 22px;
+  font-size: clamp(16px, 2.2vw, 20px);
+  font-weight: normal;
+  box-shadow: none;
+}
 
 /* 老人自己的安全暂停：一直在主视线下方，比“点一下开始”和
    断线提示更高，因为断网/未激活时也必须能立即物理关麦。PIN 对话仍在其上。 */

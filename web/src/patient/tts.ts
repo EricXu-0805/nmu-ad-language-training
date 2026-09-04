@@ -84,6 +84,7 @@ function interrupt(): void {
   const interruptedTag = pending?.tag ?? "";
   gen += 1;
   busy = false;
+  ttsGesture(false);   // 被打断/换话的句子不再等手势
   if (audioEl && !audioEl.paused) audioEl.pause();
   if (curUrl) { URL.revokeObjectURL(curUrl); curUrl = null; }
   if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
@@ -185,6 +186,7 @@ async function playItem(item: Line, g: number): Promise<void> {
         };
         await audioEl.play();
         audit(`start@${engineTag || "neural"}`, item.tag, item.text);
+        ttsGesture(false);
         return;                                     // 播放中,后续由 onended 续驱
       }
       else if (++neuralFails >= NEURAL_FAIL_LATCH) {   // 连败:整场降级,本句落回退
@@ -196,10 +198,13 @@ async function playItem(item: Line, g: number): Promise<void> {
       if (url) { URL.revokeObjectURL(url); if (curUrl === url) curUrl = null; }
       if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
       if (e instanceof DOMException && e.name === "NotAllowedError") {
-        // 无用户激活:句子退回队首,触屏后按原顺序补读(问句仍在线索前面)
+        // 无用户激活:句子退回队首,触屏后按原顺序补读(问句仍在线索前面)。
+        // 同时把「点一下，接着听」亮出来——否则老人对着一句没放出来的话干等,
+        // 第1周的开麦闭环也要等到 12 秒超时才放行麦克风。
         audit("error:not-allowed", item.tag, item.text);
         queue.unshift(item);
         busy = false;
+        ttsGesture(true);
         return;
       }
       if (e instanceof DOMException && e.name === "AbortError") {
@@ -371,6 +376,37 @@ export function stopSpeaking(): void {
   pending = null;
   queue = [];
   interrupt();
+}
+
+/** 老人端「点一下，接着听」覆层据此出现/消失(detail: { needed: boolean })。 */
+export const PLAYBACK_NEEDS_GESTURE_EVENT = "nmu:playback-needs-gesture";
+
+export function announceGestureNeeded(needed: boolean): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(PLAYBACK_NEEDS_GESTURE_EVENT, { detail: { needed } }));
+}
+
+// 本模块自己亮过的覆层才由本模块收:interrupt() 每次换话都会跑,若无条件广播 false,
+// 会把自动带练执行器正在等手势的覆层一并收掉(两条播放链共用同一个事件)。
+let ttsWaitingForGesture = false;
+function ttsGesture(needed: boolean): void {
+  if (ttsWaitingForGesture === needed) return;
+  ttsWaitingForGesture = needed;
+  announceGestureNeeded(needed);
+}
+
+// 8 kHz 单声道 8 个采样的静音 WAV(60 字节)。只用来在用户手势里「解锁」播放元素:
+// 有些浏览器只认在手势里放过声的那个元素,之后同一元素上的 play() 才不要手势。
+export const SILENT_WAV_DATA_URI =
+  "data:audio/wav;base64,UklGRjQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YRAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/** 必须在用户手势处理器里同步调用;正在出声时不动它。失败静默(解锁只是补强)。 */
+export function unlockTtsPlayback(): void {
+  if (!audioEl || busy || !audioEl.paused) return;
+  audioEl.onended = null;
+  audioEl.onerror = null;
+  audioEl.src = SILENT_WAV_DATA_URI;
+  void audioEl.play().catch(() => { /* 没解锁成,pointerdown 补读那条路还在 */ });
 }
 
 // 补读:语音表就绪(voiceschanged)或获得用户激活(首次触屏)时,把没读出去的接着读。

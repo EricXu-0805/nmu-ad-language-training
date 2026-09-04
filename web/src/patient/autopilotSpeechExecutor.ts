@@ -15,6 +15,17 @@ export interface AutopilotSpeechBrowserPorts {
   createObjectUrl(blob: Blob): string;
   revokeObjectUrl(url: string): void;
   now(): number;
+  /**
+   * play() 被浏览器以「无用户手势」拒绝时的第二条路:等下一次点屏,在那个手势
+   * 处理器里**同步**再 play() 一次并把它的 promise 交回来。signal 中止即拒绝。
+   */
+  playOnNextGesture?(audio: HTMLAudioElement, signal: AbortSignal): Promise<void>;
+  /** 让老人端把「点一下，接着听」亮出来/收起来。 */
+  announceGestureNeeded?(needed: boolean): void;
+}
+
+function isGestureRequired(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "NotAllowedError";
 }
 
 function deferred<T>(): {
@@ -130,9 +141,25 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
         await this.audio.play();
       } catch (error) {
         // NotAllowedError / NotSupportedError 等 play() 拒绝在这里统一定阶段。
-        throw new AutopilotMediaError(
-          "audio_playback_failed", "浏览器拒绝开始播放合成语音",
-          { cause: error, failureStage: "play_rejected" });
+        if (this.terminal || !isGestureRequired(error) || !this.ports.playOnNextGesture) {
+          throw new AutopilotMediaError(
+            "audio_playback_failed", "浏览器拒绝开始播放合成语音",
+            { cause: error, failureStage: "play_rejected" });
+        }
+        // 浏览器要手势才肯出声(生产三台设备实证):这不是设备坏了,把整场
+        // 安全暂停等于让老人为浏览器策略背锅。亮出「点一下，接着听」,在那一下
+        // 里重放;取消/超时(控制器 15 秒起播期限)照旧走 AbortError 收口。
+        this.ports.announceGestureNeeded?.(true);
+        try {
+          await this.ports.playOnNextGesture(this.audio, this.abortController.signal);
+        } catch (retryError) {
+          if (this.terminal) return;
+          throw new AutopilotMediaError(
+            "audio_playback_failed", "浏览器拒绝开始播放合成语音（点屏后仍被拒）",
+            { cause: retryError, failureStage: "play_rejected" });
+        } finally {
+          this.ports.announceGestureNeeded?.(false);
+        }
       }
     } catch (error) {
       this.fail(error);
