@@ -7,6 +7,14 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+> **2026-09-04 06:44 UTC 已上线 `6c8be73`（= `a819713` + 记账；零迁移；库头仍 `d0c22a6dae2a`）。**
+> 钱凯 9/4 三问：老人端播放解锁（反馈句 `play()` 被浏览器拒→不再当设备故障安全暂停）、
+> 第 1 周自动带练（进问自动开麦、说完自动回应、自动换问换节、30 秒录音上限）、
+> 自动跟场说实话（本人绑定区分 `device_attach_device_busy`，拒因进 `[ops]` 日志，问候页常驻重配入口）。
+> 部署树 `MATCH revision=6c8be73 files=90 identical=90`；十一步全过；preflight **8/8 退出码 0**；
+> 依赖锁/迁移图/备份校验器零变化 → 没停定时器、没碰 venv、异地校验器免重装。Claude 执行，Eric 授权。
+> 执行记录见收据 247 §六。
+>
 > **2026-09-03 22:0x UTC 已上线 `f76cd21`（零迁移；库头仍 `d0c22a6dae2a`）。**
 > 三件事一次上线：床旁槽自动让位（关页签走人的弃场不再把下一场挡死）、AI 使用汇总
 > 补第 1 周互动态、**第 1 周每问多轮对话**（默认 2 轮，开麦闭环）。
@@ -47,8 +55,8 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `f76cd21`（2026-09-03 22:0x UTC 上线；此前依次 `feec0d7` → `eb6dcd1` → `a986f54` → `74532be`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision f76cd21` 应输出 `MATCH … identical=90`（2026-09-03 22:1x UTC 实测通过） |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff f76cd21..main -- app web alembic` 应为空 |
+| 应用代码版本 | `6c8be73`（2026-09-04 06:44 UTC 上线；此前依次 `f76cd21` → `feec0d7` → `eb6dcd1` → `a986f54`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 6c8be73` 应输出 `MATCH … identical=90`（2026-09-04 06:46 UTC 实测通过） |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff 6c8be73..main -- app web alembic` 应为空 |
 | 云 TTS 语速 | `TTS_CLOUD_RATE=1.0`（2026-08-31 Eric 拍板终态；收据 237 重启已生效，1.0 缓存 1290/1290 全命中；0.9/1.0 两套缓存都留盘、可即切） | `grep ^TTS_CLOUD_RATE= /opt/nmu/app/.env`；缓存键带语速，改完必须重跑 `scripts/presynthesize_tts.py`，否则每句新话术都要现场云调用 |
 | 数据库结构版本 | `d0c22a6dae2a`（2026-08-31 23:38 由 `c8e5a1f3b209` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `c27cd1731aed7bf35c1b`（2026-08-31 随头前进；异地已重装并核对一致） | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
@@ -137,13 +145,17 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**收据 247 = `a819713`（零迁移；库头仍 `d0c22a6dae2a`；依赖锁/迁移图/校验器零变化）**：钱凯 9/4 三问。
-① 老人端播放解锁：自动带练所有话术共用一个 `<audio>`，「点一下，开始」里先放静音解锁；
-`play()` 仍被拒时亮「点一下，接着听」在手势里重放，不再当设备故障安全暂停（生产 12 次
-`play_rejected` 全是这个）。② 第1周自动带练：进问自动开麦、说完自动回应、自动换问换节；
-身份问询节照脚本回应不进云；单段录音 30 秒上限。③ `/device/attach` 对本人绑定区分
-`device_attach_device_busy`，拒因进服务器日志；老人端问候页常驻「换一位受试者或重新配对」。
-上线用 `247-上线命令_播放解锁_自动带练.sh`（与 245 同结构）。
+（无。）
+
+## 2026-09-04 上线记录（`6c8be73`：播放解锁 + 第1周自动带练 + 跟场说实话，零迁移）
+
+**2026-09-04 06:44 UTC 由 Claude 执行收据 247 脚本（Eric 授权），十一步全过；树核 `MATCH revision=6c8be73 files=90 identical=90`；preflight 8/8 退出码 0；上线前 10 分钟生产零请求。**
+
+- `a819713` 三件事，根因与证据在收据 247 §一：
+  - 老人端：自动带练共用一个 `<audio>`，「点一下，开始」里放静音解锁；`NotAllowedError` 亮「点一下，接着听」在手势里重放（生产七天 12 次 `play_rejected` 全在钱凯三台设备，8/31 就有）。
+  - 第 1 周：每个机器人节默认「自动带练」，身份节照脚本不进云，开放节 AI 多轮；`RAPPORT_MAX_RECORDING_MS=30_000`。真 Chrome 走查 37/37。
+  - 跟场：`/device/attach` 对本人绑定回 `device_attach_device_busy`；拒因走 `[ops] code=device_attach_refused_{no_session,device_busy,other}` 闭集出口；老人端问候页常驻「换一位受试者或重新配对」。
+- 生产未验的两条：「点一下，接着听」覆层与同元素解锁只有执行器单测（本机 headless 关了自动播放策略、无 TTS 引擎）——等钱凯真机。
 
 ## 2026-09-03 上线记录（`f76cd21`：床旁槽让位 + AI 汇总补第1周 + 每问多轮对话，零迁移）
 
