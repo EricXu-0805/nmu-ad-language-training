@@ -7,6 +7,12 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+> **2026-09-04 07:47 UTC 已上线 `47053fd`（零迁移；库头仍 `d0c22a6dae2a`）。**
+> 收据 247 §七 第二批：第 1 周触屏补读改「先静音解锁再补读」（同一手势里）；同一浏览器
+> 再开一个老人端页签先探询（`capabilityProbe`/`capabilityHeld`），不抢能力、不轮换、不安全暂停；
+> 总线消息 sessionId 显式收窄。部署树 `MATCH revision=47053fd files=90 identical=90`；十一步全过；
+> preflight **8/8 退出码 0**；上线前 10 分钟生产零请求。Claude 执行，Eric 授权。真 Chrome 走查 41/41。
+>
 > **2026-09-04 06:44 UTC 已上线 `6c8be73`（= `a819713` + 记账；零迁移；库头仍 `d0c22a6dae2a`）。**
 > 钱凯 9/4 三问：老人端播放解锁（反馈句 `play()` 被浏览器拒→不再当设备故障安全暂停）、
 > 第 1 周自动带练（进问自动开麦、说完自动回应、自动换问换节、30 秒录音上限）、
@@ -55,8 +61,8 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `6c8be73`（2026-09-04 06:44 UTC 上线；此前依次 `f76cd21` → `feec0d7` → `eb6dcd1` → `a986f54`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 6c8be73` 应输出 `MATCH … identical=90`（2026-09-04 06:46 UTC 实测通过） |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff 6c8be73..main -- app web alembic` 应为空 |
+| 应用代码版本 | `47053fd`（2026-09-04 07:47 UTC 上线；此前依次 `6c8be73` → `f76cd21` → `feec0d7` → `eb6dcd1`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 47053fd` 应输出 `MATCH … identical=90`（2026-09-04 07:48 UTC 实测通过） |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff 47053fd..main -- app web alembic` 应为空 |
 | 云 TTS 语速 | `TTS_CLOUD_RATE=1.0`（2026-08-31 Eric 拍板终态；收据 237 重启已生效，1.0 缓存 1290/1290 全命中；0.9/1.0 两套缓存都留盘、可即切） | `grep ^TTS_CLOUD_RATE= /opt/nmu/app/.env`；缓存键带语速，改完必须重跑 `scripts/presynthesize_tts.py`，否则每句新话术都要现场云调用 |
 | 数据库结构版本 | `d0c22a6dae2a`（2026-08-31 23:38 由 `c8e5a1f3b209` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `c27cd1731aed7bf35c1b`（2026-08-31 随头前进；异地已重装并核对一致） | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
@@ -145,11 +151,15 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**收据 247 §七 第二批（零迁移；库头仍 `d0c22a6dae2a`；依赖锁/迁移图/校验器零变化）**：
-① 第1周播放链的触屏补读改为「先静音解锁再补读」（同一手势里），否则只认手势元素的浏览器
-上老人点多少次都出不了声；② 同一浏览器再开一个老人端页签先在页签间探询
-（`capabilityProbe`/`capabilityHeld`），有页签连着就不去 attach、不轮换、不安全暂停，问候页说明；
-③ 老人端/游标两处「总线消息必有 sessionId」的假设改显式收窄。上线用 `248-上线命令_247第二批.sh`。
+（无。）
+
+## 2026-09-04 上线记录（`47053fd`：收据 247 §七 第二批，零迁移）
+
+**2026-09-04 07:47 UTC 由 Claude 执行收据 248 脚本（Eric 授权），十一步全过；树核 `MATCH revision=47053fd files=90 identical=90`；preflight 8/8 退出码 0；上线前 10 分钟生产零请求。**
+
+- 第 1 周播放链的触屏补读是「fetch 之后才 play()」，那一刻早已不在手势里；只认手势元素的浏览器会反复拒掉，老人点多少次都出不了声（这是 `a819713` 那批修复自己留下的缝）。现在 pointerdown 里先放静音解锁再补读。
+- 同一浏览器再开一个老人端页签会把上一页的能力轮换掉并让自动带练安全暂停（9/4 03:48 生产 `autopilot_device_rotated`）。现在新页 attach 前先在同源页签间探询 400 ms，有页签连着就不去 attach，问候页写「这一场已经在本机另一个页签打开着 / 改用这个页签」。旧页已关（无人应答）时照旧接上，那一次服务端安全暂停仍会发生——设备侧证明不了「旧页已死」。
+- 顺带停用了 9/3 烟测留下的临时账号 `smokeopt`（会话已吊销）。
 
 ## 2026-09-04 上线记录（`6c8be73`：播放解锁 + 第1周自动带练 + 跟场说实话，零迁移）
 
