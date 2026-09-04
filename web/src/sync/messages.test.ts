@@ -34,10 +34,15 @@ const patientPauseStop = {
   type: "patientPauseStop", sessionId: "S-1",
   idempotencyKey: "patient_pause:0123456789abcdef0123456789abcdef",
 };
+const capabilityProbe = { type: "capabilityProbe", nonce: "0123456789abcdef0123456789abcdef" };
+const capabilityHeld = {
+  type: "capabilityHeld", nonce: "0123456789abcdef0123456789abcdef", sessionId: "S-1",
+};
 
 test("every SyncMsg variant passes a strict runtime schema", () => {
   for (const message of [
     session, cursor, rapport, audioSaved, patientRec, safetyStop, patientPauseStop,
+    capabilityProbe, capabilityHeld,
   ]) {
     assert.deepEqual(parseSyncMsg(message), message);
   }
@@ -46,6 +51,7 @@ test("every SyncMsg variant passes a strict runtime schema", () => {
 test("every SyncMsg variant rejects extra properties", () => {
   for (const message of [
     session, cursor, rapport, audioSaved, patientRec, safetyStop, patientPauseStop,
+    capabilityProbe, capabilityHeld,
   ]) {
     assert.equal(parseSyncMsg({ ...message, injected: "field" }), null);
   }
@@ -56,6 +62,16 @@ test("safetyStop is a closed session-bound reduction-only bus signal", () => {
   assert.equal(parseSyncMsg({ ...safetyStop, sessionId: "S-1\nother" }), null);
   // It is intentionally absent from server live-state payloads.
   assert.equal(parseSyncPayload("cursor", safetyStop), null);
+});
+
+test("capabilityProbe/capabilityHeld 只在同源页签间问答:随机数闭集形状,不进服务端投影", () => {
+  assert.deepEqual(parseSyncMsg(capabilityProbe), capabilityProbe);
+  assert.deepEqual(parseSyncMsg(capabilityHeld), capabilityHeld);
+  assert.equal(parseSyncMsg({ ...capabilityProbe, nonce: "short" }), null);
+  assert.equal(parseSyncMsg({ ...capabilityProbe, nonce: "x".repeat(65) }), null);
+  assert.equal(parseSyncMsg({ ...capabilityHeld, sessionId: "" }), null);
+  assert.equal(parseSyncMsg({ type: "capabilityHeld", nonce: capabilityHeld.nonce }), null);
+  assert.equal(parseSyncPayload("session", capabilityHeld), null);
 });
 
 test("patientPauseStop is exact-session, non-secret, and strictly shaped", () => {

@@ -304,7 +304,8 @@ export function PatientShell() {
     connectionReady, capabilityEpoch]);
 
   useLayoutEffect(() => bus.subscribe((message) => {
-    if (message.sessionId !== session?.sessionId) return;
+    // 页签间的能力探询不带场次,与本页无关;其余消息必须是本场的。
+    if (!("sessionId" in message) || !session || message.sessionId !== session.sessionId) return;
     if (message.type === "patientPauseStop") {
       // A background tab may receive this before its own live poll sees the
       // pause, but must reject it after the shared exact key has completed an
@@ -486,17 +487,24 @@ export function PatientShell() {
         {patientBindingActive && (
           <>
             <p className="question" role="status" aria-live="polite">
-              {attachHint === "busy" ? "这一场已经连在另一台设备上" : "已连接 · 等待训练开始"}
+              {attachHint === "busy" ? "这一场已经连在另一台设备上"
+                : attachHint === "other_tab" ? "这一场已经在本机另一个页签打开着"
+                  : "已连接 · 等待训练开始"}
             </p>
-            {/* 已配对却一直接不上的两种真相都要说出来(2026-09-04 生产:一台平板
+            {/* 已配对却一直接不上的三种真相都要说出来(2026-09-04 生产:一台平板
                 对着「等待训练开始」轮询了 40 次,工作人员断定「要两台设备」):
-                别的设备连着这一场 / 这台配的是另一位受试者。入口常驻,不依赖刷新。 */}
+                别的设备连着这一场 / 本机另一个页签连着 / 这台配的是另一位受试者。
+                入口常驻,不依赖刷新。 */}
             <button type="button" className="patient-pair-entry patient-pair-entry--quiet"
               onClick={() => window.dispatchEvent(new Event(PIN_PROMPT_MANUAL_OPEN_EVENT))}>
-              {attachHint === "busy" ? "改用这台平板" : "换一位受试者或重新配对"}
+              {attachHint === "busy" ? "改用这台平板"
+                : attachHint === "other_tab" ? "改用这个页签"
+                  : "换一位受试者或重新配对"}
               <small>{attachHint === "busy"
                 ? "请工作人员点这里重新输入配对码，这一场会切到这台"
-                : "控制台已开场却没连上？可能这台配的是另一位受试者，请工作人员点这里重新配对"}</small>
+                : attachHint === "other_tab"
+                  ? "请回到那个页签，或把它关掉；一定要在这个页签上继续，请工作人员点这里重新配对"
+                  : "控制台已开场却没连上？可能这台配的是另一位受试者，请工作人员点这里重新配对"}</small>
             </button>
           </>
         )}

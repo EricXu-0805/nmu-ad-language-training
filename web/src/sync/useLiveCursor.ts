@@ -134,7 +134,8 @@ export function useLiveCursor(): LiveState {
       if (!serverProjectionAuthorized) return;
       // A successful /live/state authorizes exactly its returned session.  A
       // console BroadcastChannel switch is ignored until the server confirms it.
-      if (!authorizedSessionId || msg.sessionId !== authorizedSessionId) return;
+      if (!authorizedSessionId || !("sessionId" in msg)
+        || msg.sessionId !== authorizedSessionId) return;
       // bus 只送内容,不当连接信号:BroadcastChannel 是浏览器层通道,后端进程死了它照样通,
       // 若据此 markConnected 会压制断线判定——录音保存必失败却不显示"正在重新连接"。
       const prev = stateRef.current;

@@ -428,5 +428,12 @@ function retryPending(): void {
 if (typeof window !== "undefined" && "speechSynthesis" in window) {
   window.speechSynthesis.getVoices(); // 触发 Chrome 异步加载
   window.speechSynthesis.onvoiceschanged = retryPending;
-  document.addEventListener("pointerdown", () => retryPending());
+  // 先解锁再补读:补读的神经路径是「fetch 之后才 play()」,play() 那一刻早已不在
+  // 手势里;只认「手势里放过声的元素」的浏览器会再拒一次→再退回队首→再亮覆层,
+  // 老人点多少次都出不了声。把静音那一下放在同一个 pointerdown 里,元素解锁后
+  // 迟到的 play() 才被放行。unlockTtsPlayback 在忙/正在出声时自己让开。
+  document.addEventListener("pointerdown", () => {
+    unlockTtsPlayback();
+    retryPending();
+  });
 }

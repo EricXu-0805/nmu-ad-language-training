@@ -46,6 +46,11 @@ export type SyncMsg =
   // 老人端自己按下暂停。和 safetyStop 分开，因为它必须在每个标签页
   // 丢弃尚未完成的录音，不得沿用人工暂停的保存语义。幂等键不是凭据。
   | { type: "patientPauseStop"; sessionId: string; idempotencyKey: string }
+  // 同一浏览器再开一个老人端页签时,先问一句「本机是否已有页签连着场次」:有就不去
+  // /device/attach——同一 deviceId 再签发会轮换掉那一页的能力并把自动带练安全暂停
+  // (2026-09-04 生产 autopilot_device_rotated)。只在同源页签间瞬时问答,不持久化。
+  | { type: "capabilityProbe"; nonce: string }
+  | { type: "capabilityHeld"; nonce: string; sessionId: string }
   // recSeq:每次 arm 递增。armed→armed 重发(老人自停后再示意)靠它触发老人端 effect;无它则依赖值不变、麦克风永不重开。
   // selfStart:操作端按录音资格(recording_allowed)判定后下发——老人端只有收到 true 才显示
   // "点这里,开始回答"自助开录按钮。缺省/false 一律不显示(fail-closed:合规闸门不被老人端绕过)。
@@ -64,8 +69,11 @@ export type RapportMsg = Extract<SyncMsg, { type: "rapportStep" }>;
 export type AudioSavedMsg = Extract<SyncMsg, { type: "audioSaved" }>;
 export type SafetyStopMsg = Extract<SyncMsg, { type: "safetyStop" }>;
 export type PatientPauseStopMsg = Extract<SyncMsg, { type: "patientPauseStop" }>;
+export type CapabilityProbeMsg = Extract<SyncMsg, { type: "capabilityProbe" }>;
+export type CapabilityHeldMsg = Extract<SyncMsg, { type: "capabilityHeld" }>;
 
-type SyncType = Exclude<SyncMsg["type"], "safetyStop" | "patientPauseStop">;
+type SyncType = Exclude<
+  SyncMsg["type"], "safetyStop" | "patientPauseStop" | "capabilityProbe" | "capabilityHeld">;
 type UnknownRecord = Record<string, unknown>;
 
 const CONTROL_CHARACTER = /[\p{Cc}\p{Cf}]/u;
@@ -181,6 +189,25 @@ function parsePatientPauseStop(
     sessionId: row.sessionId,
     idempotencyKey: row.idempotencyKey,
   };
+}
+
+const PROBE_NONCE = /^[A-Za-z0-9_-]{8,64}$/;
+
+function parseCapabilityProbe(value: unknown, withType: boolean): CapabilityProbeMsg | null {
+  const row = record(value);
+  if (!row || !exactKeys(row, ["nonce"], [], withType)
+      || (withType && row.type !== "capabilityProbe")
+      || typeof row.nonce !== "string" || !PROBE_NONCE.test(row.nonce)) return null;
+  return { type: "capabilityProbe", nonce: row.nonce };
+}
+
+function parseCapabilityHeld(value: unknown, withType: boolean): CapabilityHeldMsg | null {
+  const row = record(value);
+  if (!row || !exactKeys(row, ["nonce", "sessionId"], [], withType)
+      || (withType && row.type !== "capabilityHeld")
+      || typeof row.nonce !== "string" || !PROBE_NONCE.test(row.nonce)
+      || !boundedText(row.sessionId, 128)) return null;
+  return { type: "capabilityHeld", nonce: row.nonce, sessionId: row.sessionId };
 }
 
 function parseCursor(value: unknown, withType: boolean): CursorMsg | null {
@@ -325,6 +352,8 @@ export function parseSyncMsg(value: unknown): SyncMsg | null {
     case "session": return parseSession(row, true);
     case "safetyStop": return parseSafetyStop(row, true);
     case "patientPauseStop": return parsePatientPauseStop(row, true);
+    case "capabilityProbe": return parseCapabilityProbe(row, true);
+    case "capabilityHeld": return parseCapabilityHeld(row, true);
     case "cursor": return parseCursor(row, true);
     case "rapportStep": return parseRapport(row, true);
     case "audioSaved": return parseAudioSaved(row, true);

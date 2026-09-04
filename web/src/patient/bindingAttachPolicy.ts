@@ -1,7 +1,38 @@
 // 自动跟场轮询的纯决策层:对 /device/attach 的每种结果给出唯一处置。
 // 老人端永不报错、永不闪红;这里只区分"接上了/安静重试/放弃绑定"。
+import type { SyncMsg } from "../sync/messages";
 
 export const ATTACH_POLL_MS = 2000;
+
+// 同一浏览器再开一个老人端页签:两页共用同一份绑定与 deviceId,新页一去 attach 就把
+// 旧页的能力轮换掉并让自动带练安全暂停(2026-09-04 生产 autopilot_device_rotated)。
+// 所以先在同源页签间问一句,有人应答就不去 attach,由问候页告诉工作人员。
+export const OTHER_TAB_PROBE_MS = 400;
+
+/** 等 timeoutMs 内有没有别的页签用同一 nonce 回「我连着 sessionId」;没有就 null。 */
+export function probeOtherTabs(
+  post: (msg: SyncMsg) => void,
+  subscribe: (handler: (msg: SyncMsg) => void) => () => void,
+  timeoutMs: number,
+  nonce: string,
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    let done = false;
+    let unsubscribe = () => {};
+    const finish = (held: string | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(held);
+    };
+    unsubscribe = subscribe((msg) => {
+      if (msg.type === "capabilityHeld" && msg.nonce === nonce) finish(msg.sessionId);
+    });
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    post({ type: "capabilityProbe", nonce });
+  });
+}
 
 export type AttachDisposition =
   | "attached"          // 200:能力已到手,停止轮询交回既有 live 流程
@@ -25,8 +56,9 @@ export function classifyAttachOutcome(
 }
 
 // 问候页给工作人员看的一句实话。busy 只对本人绑定成立(服务端只对同一受试者的
-// 令牌区分「别的设备连着」),其余 409 仍是「这位受试者现在没有场次」。
-export type AttachHint = "busy" | "no_session" | null;
+// 令牌区分「别的设备连着」),其余 409 仍是「这位受试者现在没有场次」;
+// other_tab 是本机判的:同一浏览器另一个页签已经连着场次,这个页签根本没去 attach。
+export type AttachHint = "busy" | "no_session" | "other_tab" | null;
 
 export function attachHintFor(status: number, code: string | null): AttachHint {
   if (status !== 409) return null;
