@@ -7,6 +7,12 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+> **2026-09-05 09:07 UTC 已上线 `c2fd7fd`（零迁移；库头仍 `d0c22a6dae2a`）。**
+> 收据 251 §六：属相一问单轮（Eric 拍板）——回应库 `applies_to` 行可选 `max_rounds`，属相问位 1；
+> 服务端每问上限 = min(全局, 问位)，只管 AI 现编，手点句库/脚本不受；老人答完属相机器人只接一句、不追问、不再开麦。
+> 部署树 `MATCH revision=c2fd7fd files=90 identical=90`；十一步全过；preflight **8/8 退出码 0**；
+> 上线前 10 分钟生产零非轮询请求。真 Chrome 走查 47/47。两路对抗复核 6 条全处置。Claude 执行，Eric 授权。
+>
 > **2026-09-05 06:27 UTC 已上线 `3f54b58`（零迁移；库头仍 `d0c22a6dae2a`）。**
 > 收据 251：第 1 周录音从「绑到节」改为「绑到问」（设备开麦那一刻锁存 `关系建立·<节>#<问>`；旧节级键只读兼容），
 > 服务端只对录音自己的问位放行自动回应；Eric 拍板放行自我介绍节的属相/兴趣/活动三问进云，姓名/年龄两问的录音永不进云。
@@ -77,8 +83,8 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `3f54b58`（2026-09-05 06:27 UTC 上线；此前依次 `a8f1675` → `47053fd` → `6c8be73` → `f76cd21` → `feec0d7`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 3f54b58` 应输出 `MATCH … identical=90`（2026-09-05 06:30 UTC 实测通过） |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff 3f54b58..main -- app web alembic` 应为空 |
+| 应用代码版本 | `c2fd7fd`（2026-09-05 09:07 UTC 上线；此前依次 `3f54b58` → `a8f1675` → `47053fd` → `6c8be73` → `f76cd21`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision c2fd7fd` 应输出 `MATCH … identical=90`（2026-09-05 09:08 UTC 实测通过） |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff c2fd7fd..main -- app web alembic` 应为空 |
 | 云 TTS 语速 | `TTS_CLOUD_RATE=1.0`（2026-08-31 Eric 拍板终态；收据 237 重启已生效，1.0 缓存 1290/1290 全命中；0.9/1.0 两套缓存都留盘、可即切） | `grep ^TTS_CLOUD_RATE= /opt/nmu/app/.env`；缓存键带语速，改完必须重跑 `scripts/presynthesize_tts.py`，否则每句新话术都要现场云调用 |
 | 数据库结构版本 | `d0c22a6dae2a`（2026-08-31 23:38 由 `c8e5a1f3b209` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `c27cd1731aed7bf35c1b`（2026-08-31 随头前进；异地已重装并核对一致） | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
@@ -167,10 +173,17 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**收据 251 §六（零迁移；库头仍 `d0c22a6dae2a`）**：属相一问单轮（Eric 2026-09-05 拍板）——回应库 `applies_to`
-新增可选 `max_rounds`，属相问位定 1；服务端每问上限 = min(全局 `RAPPORT_MAX_ROUNDS`, 问位上限)，
-回应字段 `round/maxRounds/final/invitesMore` 随之为 1/1/true/false，控制台据此直接换问、不续麦。上线用
-`253-上线命令_属相单轮.sh`。
+无（2026-09-05 09:07 UTC `c2fd7fd` 已上线）。
+
+## 2026-09-05 上线记录（`c2fd7fd`：属相一问单轮，零迁移）
+
+**2026-09-05 09:07 UTC 由 Claude 执行收据 253 脚本（Eric 授权），十一步全过；树核 `MATCH revision=c2fd7fd files=90 identical=90`；preflight 8/8 退出码 0；上线前 10 分钟生产零非轮询请求。**
+
+- 为什么：属相之后最顺口的追问就是「哪一年的」「高寿」，老人一答就是被排除在云外的出生年份/年龄；两道身份守卫是概率性防线，单轮把这条路直接关掉。Eric 2026-09-05 拍板。
+- 改法：回应库 `applies_to` 行新增可选 `max_rounds`（冻结 schema，≥1 整数），属相问位 1；`patient_presentation.rapport_round_limit` = min(全局 `RAPPORT_MAX_ROUNDS`, 问位)；`rapport_reply_create` auto 模式装完 bank 即算 `round_limit`，聊满/final/生成器上限/并发占满/三条返回路径共用；手点句库/脚本不受问位上限。控制台不改。
+- 效果：老人答完属相，机器人只接一句（prompt 走末轮分支，句尾不许问号），不再开麦，自动换到兴趣那一问；属相那一问进云的只有老人答属相的那一段。兴趣/活动仍 2 轮。
+- 复核坐实一条（手点句在属相问位被标 final）已改；覆盖补齐：第 1 轮按末轮守、重放轮次字段、schema 负例、随包库只有属相设上限。并发占满那条路只有全局上限的既有测试，问位上限下没单独造竞态。
+- 交接文档「残余风险」段改为已关闭。
 
 ## 2026-09-05 上线记录（`3f54b58`：第 1 周录音绑到问，属相/兴趣/活动进云，零迁移）
 
