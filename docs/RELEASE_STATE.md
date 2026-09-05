@@ -7,6 +7,14 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+> **2026-09-05 06:27 UTC 已上线 `3f54b58`（零迁移；库头仍 `d0c22a6dae2a`）。**
+> 收据 251：第 1 周录音从「绑到节」改为「绑到问」（设备开麦那一刻锁存 `关系建立·<节>#<问>`；旧节级键只读兼容），
+> 服务端只对录音自己的问位放行自动回应；Eric 拍板放行自我介绍节的属相/兴趣/活动三问进云，姓名/年龄两问的录音永不进云。
+> 对抗复核后又改四处：登记新鲜度检查第 1 周按节比对（迟到一问不 409）；含直接标识的录音自动回应一律 409；
+> 第 1 周麦克风故障上报此前一律 422（既有缺陷）现落账+暂停；属相之后「哪一年的/高寿」类追问加模式兜底（概率性防线，残余风险进报备）。
+> 部署树 `MATCH revision=3f54b58 files=90 identical=90`；十一步全过；preflight **8/8 退出码 0**；
+> 上线前 10 分钟生产零非轮询请求。真 Chrome 走查 48/48（两次）。Claude 执行，Eric 授权。
+>
 > **2026-09-04 18:11 UTC 已上线 `a8f1675`（零迁移；库头仍 `d0c22a6dae2a`）。**
 > 收据 249：「回答正确但 AI 判 0 分」——云判分把「目标词说两遍」当成「重复」（生产 49/196 次）。
 > 确定式规则先定「整句就是那个词」（分段、量词短语、单字目标词不吃单字垫词、否定不算）；
@@ -69,8 +77,8 @@
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `a8f1675`（2026-09-04 18:11 UTC 上线；此前依次 `47053fd` → `6c8be73` → `f76cd21` → `feec0d7`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision a8f1675` 应输出 `MATCH … identical=90`（2026-09-04 18:12 UTC 实测通过） |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff a8f1675..main -- app web alembic` 应为空 |
+| 应用代码版本 | `3f54b58`（2026-09-05 06:27 UTC 上线；此前依次 `a8f1675` → `47053fd` → `6c8be73` → `f76cd21` → `feec0d7`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision 3f54b58` 应输出 `MATCH … identical=90`（2026-09-05 06:30 UTC 实测通过） |
+| 部署树后续同步 | 已与 `main` 一致 | `git diff 3f54b58..main -- app web alembic` 应为空 |
 | 云 TTS 语速 | `TTS_CLOUD_RATE=1.0`（2026-08-31 Eric 拍板终态；收据 237 重启已生效，1.0 缓存 1290/1290 全命中；0.9/1.0 两套缓存都留盘、可即切） | `grep ^TTS_CLOUD_RATE= /opt/nmu/app/.env`；缓存键带语速，改完必须重跑 `scripts/presynthesize_tts.py`，否则每句新话术都要现场云调用 |
 | 数据库结构版本 | `d0c22a6dae2a`（2026-08-31 23:38 由 `c8e5a1f3b209` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `c27cd1731aed7bf35c1b`（2026-08-31 随头前进；异地已重装并核对一致） | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
@@ -159,14 +167,17 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-**收据 251（零迁移；库头仍 `d0c22a6dae2a`；依赖锁/迁移图/校验器零变化）**：第 1 周录音从「绑到节」改为
-「绑到问」（设备开麦那一刻锁存 `关系建立·<节>#<问>`；旧节级键只读兼容），服务端只对录音自己的问位放行
-自动回应；Eric 拍板放行自我介绍节的属相/兴趣/活动三问进云（reply bank applies_to 加 q2），姓名/年龄两问的
-录音永不进云、整段含直接标识；收尾闸/AI 质量/患者端故障键同步认问级键。对抗复核后又改四处：登记新鲜度
-检查第 1 周按节比对（迟到一问的登记与故障上报按设备锁存的问位落账，旧老人端节级键不卡死）；自动回应先看
-资产自带的含直接标识标记，标了就 409；第 1 周麦克风故障上报此前一律 422（喂给自动带练围栏）——既有缺陷，
-现在第 1 周不过围栏；属相之后「哪一年的/高寿」类追问加按模式兜底 + prompt 明禁（仍是概率性防线，残余风险
-要进报备）。上线用 `252-上线命令_录音绑到问.sh`。
+无（2026-09-05 06:27 UTC `3f54b58` 已上线）。
+
+## 2026-09-05 上线记录（`3f54b58`：第 1 周录音绑到问，属相/兴趣/活动进云，零迁移）
+
+**2026-09-05 06:27 UTC 由 Claude 执行收据 252 脚本（Eric 授权），十一步全过；树核 `MATCH revision=3f54b58 files=90 identical=90`；preflight 8/8 退出码 0；上线前 10 分钟生产零非轮询请求（1 次健康检查）。**
+
+- 契约：录音 turn_key 从 `关系建立·<节>` 改为设备开麦那一刻锁存的 `关系建立·<节>#<问>`；`rapport_reply_create` auto 要求 `asset.turn_key == rapport_turn_key(section, q)`，旧节级键只读兼容、不开放自动回应；一处定义四处共用（`patient_presentation.rapport_turn_key/parse/allowed_turn_keys/identity_question_indices/turn_requires_identity_flag`）。含直接标识按问标（脚本槽位 preferred_appellation/age）；回应库 applies_to 加自我介绍 q2，excluded 只剩姓名/年龄（库仍 draft 待钱凯签）。
+- 伦理边界扩：进云原话从机构环境四问扩到 +属相/兴趣/活动三问（属相≈出生年份准标识符）；姓名/年龄一个字节没松。**要进报备。**
+- 复核后四处修正：`_device_turn_matches_current` 第 1 周按节比对（老人还在说、研究者点下一问，迟到登记按设备锁存的问位落账；旧老人端节级键不卡死）；自动回应先看资产 `contains_direct_identifier`；第 1 周麦克风故障上报不再过自动带练围栏（此前一律 422、不落账不暂停——既有缺陷）；`_IDENTITY_PROBE_RE` 兜「哪一年的/高寿/几零年生的/比我大多少」类追问 + prompt 明禁。
+- 残余风险（进报备）：现编句有极小概率绕过两道守卫问出年份，老人若答，那一段以 `#2` 名义、不带含标识标记进云 ASR；降到零只能属相单轮，产品口径待定。
+- 部署后老人端页面要刷新一次（老版页面用节级键登记，能收下但不开自动回应）。云端实际效果（属相答案经 qwen3-asr → qwen-plus 现编什么）等下一场第 1 周。
 
 ## 2026-09-04 上线记录（`a8f1675`：判分口径——目标词说两遍不是「重复」，零迁移）
 
