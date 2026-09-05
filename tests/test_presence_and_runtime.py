@@ -1243,10 +1243,20 @@ def test_audio_turn_key_recovers_without_turn_event_and_rejects_unbound_keys(cli
         "raw_audio_id": "audio-rap", "session_id": "S-AUDIO-RAP",
         "turn_key": "关系建立·自我介绍",
     }).status_code == 200
-    assert client.post("/audio", json={
-        "raw_audio_id": "audio-rap-bad", "session_id": "S-AUDIO-RAP",
-        "turn_key": "关系建立·不存在",
-    }).status_code == 422
+    # 2026-09-04 起录音绑到问:「节#问」在脚本范围内即合法,无问的节只许 #0。
+    for n, key in enumerate(("关系建立·自我介绍#0", "关系建立·自我介绍#4",
+                             "关系建立·介绍机构环境#3", "关系建立·道别#0")):
+        assert client.post("/audio", json={
+            "raw_audio_id": f"audio-rap-q{n}", "session_id": "S-AUDIO-RAP",
+            "turn_key": key,
+        }).status_code == 200, key
+    for n, key in enumerate(("关系建立·不存在", "关系建立·自我介绍#5", "关系建立·道别#1",
+                             "关系建立·自我介绍#01", "关系建立·自我介绍#-1",
+                             "关系建立·自我介绍#", "关系建立·#0")):
+        assert client.post("/audio", json={
+            "raw_audio_id": f"audio-rap-bad{n}", "session_id": "S-AUDIO-RAP",
+            "turn_key": key,
+        }).status_code == 422, key
 
 
 def test_runtime_cursor_expected_revision_blocks_stale_writer(client):

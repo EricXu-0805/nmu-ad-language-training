@@ -61,3 +61,28 @@ export function nextQuestionArmDelayMs(nextAsk: string | null | undefined): numb
 export function roundLabel(round: number, maxRounds: number): string {
   return `第 ${round} / ${maxRounds} 轮`;
 }
+
+// 自我介绍节里哪几问是直接身份信息(姓名/年龄):按冻结脚本的槽位判,不按问号硬写。
+// 这两问的录音整段标「含直接标识」、永不进云;属相/兴趣/活动三问 2026-09-04 Eric 拍板
+// 放行进云。与服务端 patient_presentation.RAPPORT_IDENTITY_SLOT_FIELDS 是同一份口径,
+// 后端有测试钉着两边一致。
+export const IDENTITY_SLOT_FIELDS: ReadonlySet<string> = new Set(["preferred_appellation", "age"]);
+
+export interface IdentitySectionShape {
+  key: string;
+  questions?: ReadonlyArray<{ slot_field?: string }>;
+}
+
+export function isIdentityQuestion(section: IdentitySectionShape | undefined, qIdx: number): boolean {
+  const field = section?.questions?.[qIdx]?.slot_field;
+  return section?.key === "自我介绍" && field !== undefined && IDENTITY_SLOT_FIELDS.has(field);
+}
+
+export function defaultRapportFlags(sectionKey: string, qIdx: number, section?: IdentitySectionShape): {
+  assentGate: boolean; containsDirectIdentifier: boolean;
+} {
+  return {
+    assentGate: sectionKey === "认识机器人",
+    containsDirectIdentifier: isIdentityQuestion(section, qIdx),
+  };
+}

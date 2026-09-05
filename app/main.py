@@ -5594,8 +5594,25 @@ def _require_current_patient_turn_for_device(
     if live is None:
         raise HTTPException(409, "服务端尚无可绑定的当前录音位置")
     expected, _item_id, _turn_seq = _current_patient_rec_turn(sess, live, state)
-    if canonical_turn_key != expected:
+    if not _device_turn_matches_current(sess, canonical_turn_key, expected):
         raise HTTPException(409, "设备 turn ref 与服务端当前冻结位置不一致")
+
+
+def _device_turn_matches_current(
+        sess: TrainSession, device_turn_key: str, current_turn_key: str) -> bool:
+    """第1周按节比对,2-8 周精确等于当前冻结位置。
+
+    第1周的录音键在设备开麦那一刻锁存问位;老人还在说、研究者已点到下一问(或上一问)时,
+    迟到的登记/故障上报仍按它自己的问位落账,不能因为服务端指针已动就把整段录音拒掉
+    (改成按问之前就是按节比对,这里不收紧)。换节、伪造别的节照旧拒。
+    """
+    if device_turn_key == current_turn_key:
+        return True
+    if sess.week_no != 1:
+        return False
+    mine = patient_presentation.parse_rapport_turn_key(device_turn_key)
+    current = patient_presentation.parse_rapport_turn_key(current_turn_key)
+    return mine is not None and current is not None and mine[0] == current[0]
 
 
 def _validate_audio_turn_key(session_id: str | None, turn_key: str | None,
@@ -5990,6 +6007,10 @@ def rapport_reply_create(
         if asset.turn_key != patient_presentation.rapport_turn_key(
                 body.sectionKey, body.questionIdx):
             raise HTTPException(409, "录音不属于当前一问，不开放自动回应")
+        # 老人端开麦那一刻锁存的「含直接标识」是这段录音自己的事实(研究者按问手标、
+        # 旧版整节标记的场次恢复后也会带着它):标了就一个字节不进云,不看问位是否放行。
+        if asset.contains_direct_identifier:
+            raise HTTPException(409, "这段录音标记含直接标识，不进云、不开放自动回应")
         _ensure_audio_read_allowed(asset, s, sess=sess)
         receipt = s.exec(select(AudioCaptureReceipt).where(
             AudioCaptureReceipt.raw_audio_id == body.rawAudioId)).first()
@@ -6596,27 +6617,33 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                 # 新 ID 才必须和服务端当前转位一致，禁止设备伪造/滞后环节。
                 current_turn_key, item_id, turn_seq = _current_patient_rec_turn(
                     sess, row, state)
-                if payload["turnKey"] != current_turn_key:
+                if not _device_turn_matches_current(sess, payload["turnKey"], current_turn_key):
                     raise HTTPException(409, "patientRec 失败与当前训练环节不一致")
+                if sess.week_no == 1:
+                    # 故障发生在设备锁存的那一问(迟到一问的上报按它自己的问位落账)。
+                    item_id = payload["turnKey"]
                 if state.status == "paused":
                     # 暂停后的迟到新 ID 不能覆盖首个故障证据，更不能重复记账。
                     return row, command_wseq, capture_receipt, True
 
-                try:
-                    autopilot_service.fence_autonomous_scope_for_external_stop(
-                        s,
-                        session_id=sess.session_id,
-                        reason_code=payload["failureCode"],
-                        source="patient_rec_failure",
-                        actor_type="device",
-                        capability_token_hash=_require_device_capability_token_hash(
-                            request, "上报麦克风技术失败"),
-                        expected_item_id=item_id,
-                        expected_turn_seq=turn_seq,
-                        idempotency_token=payload["failureId"],
-                    )
-                except autopilot_service.AutopilotServiceError as exc:
-                    _autopilot_write_failure(s, exc)
+                # 第1周没有自动带练作用域:关系建立的位置是「节#问」而不是题号+环节,
+                # 围栏要求两者同有同无,喂进去必 422,故障既不落账也不暂停(收据 251 复核坐实)。
+                if sess.week_no != 1:
+                    try:
+                        autopilot_service.fence_autonomous_scope_for_external_stop(
+                            s,
+                            session_id=sess.session_id,
+                            reason_code=payload["failureCode"],
+                            source="patient_rec_failure",
+                            actor_type="device",
+                            capability_token_hash=_require_device_capability_token_hash(
+                                request, "上报麦克风技术失败"),
+                            expected_item_id=item_id,
+                            expected_turn_seq=turn_seq,
+                            idempotency_token=payload["failureId"],
+                        )
+                    except autopilot_service.AutopilotServiceError as exc:
+                        _autopilot_write_failure(s, exc)
 
                 _append_interaction(
                     s, sess, "technical_pause",

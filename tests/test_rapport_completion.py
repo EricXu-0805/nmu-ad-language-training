@@ -91,11 +91,15 @@ def _rapport(client: TestClient, section_key: str, *,
 def _upload_rapport_audio(
         client: TestClient, raw_audio_id: str, section_key: str, *,
         contains_direct_identifier: bool,
-        session_id: str = "S-RAPPORT") -> None:
+        session_id: str = "S-RAPPORT", question_idx: int | None = None) -> None:
+    """question_idx=None 造旧版按节绑定的录音;给问号即 2026-09-04 起的按问绑定。"""
+    turn_key = f"关系建立·{section_key}"
+    if question_idx is not None:
+        turn_key = f"{turn_key}#{question_idx}"
     assert client.post("/audio", json={
         "raw_audio_id": raw_audio_id,
         "session_id": session_id,
-        "turn_key": f"关系建立·{section_key}",
+        "turn_key": turn_key,
         "contains_direct_identifier": contains_direct_identifier,
     }).status_code == 200
     assert client.put(
@@ -391,3 +395,38 @@ def test_assess_rapport_completion_unit_boundaries():
     # 停在道别以外的位置(含道别节的非 0 问号)一律不放行。
     result = assess(rapport={"sectionKey": FAREWELL_KEY, "questionIdx": 2})
     assert result.at_farewell is False
+
+
+def test_per_question_rows_close_out_alongside_legacy_section_rows():
+    """生产里已有按节绑定的旧行;新行按问绑定。同一场混着两种键要能收尾,
+    且「含直接标识」只对姓名/年龄两问要求:属相/兴趣/活动不标也算核验通过。"""
+    client = _setup()
+    _rapport(client, IDENTITY_KEY, question_idx=1)
+    _upload_rapport_audio(client, "legacy-intro", IDENTITY_KEY,
+                          contains_direct_identifier=True)
+    _upload_rapport_audio(client, "q0-name", IDENTITY_KEY,
+                          contains_direct_identifier=True, question_idx=0)
+    _upload_rapport_audio(client, "q1-age", IDENTITY_KEY,
+                          contains_direct_identifier=True, question_idx=1)
+    _upload_rapport_audio(client, "q2-zodiac", IDENTITY_KEY,
+                          contains_direct_identifier=False, question_idx=2)
+    _upload_rapport_audio(client, "env-q3", "介绍机构环境",
+                          contains_direct_identifier=False, question_idx=3)
+    _rapport(client, FAREWELL_KEY)
+    finished = _finish(client)
+    assert finished.status_code == 200, finished.text
+    assessment = finished.json()["interventionAssessment"]
+    assert assessment["audio_total"] == 5
+    assert assessment["audio_verified"] == 5
+
+
+@pytest.mark.parametrize("question_idx", [0, 1, None])
+def test_unflagged_name_or_age_recording_blocks_completion(question_idx):
+    """姓名/年龄那一问(或分不清是哪一问的旧节级行)不带含直接标识 → 红线钉。"""
+    client = _setup()
+    _upload_rapport_audio(client, "unflagged-identity", IDENTITY_KEY,
+                          contains_direct_identifier=False, question_idx=question_idx)
+    _rapport(client, FAREWELL_KEY)
+    denied = _finish(client)
+    assert denied.status_code == 409, denied.text
+    assert "rapport_identity_flag_missing" in _issue_codes(denied)

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseSyncMsg, parseSyncPayload } from "./messages.ts";
+import { parseSyncMsg, parseSyncPayload, rapportTurnKey } from "./messages.ts";
 
 const session = {
   type: "session", sessionId: "S-1", weekNo: 2, eventLine: "正式训练",
@@ -20,7 +20,7 @@ const audioSaved = {
   turnKey: "SE_锚#1", sessionId: "S-1", containsDirectIdentifier: false,
 };
 const patientRec = {
-  type: "patientRec", active: true, turnKey: "关系建立·自我介绍", sessionId: "S-1",
+  type: "patientRec", active: true, turnKey: rapportTurnKey("自我介绍", 2), sessionId: "S-1",
 };
 const patientRecFailure = {
   type: "patientRec", active: false, turnKey: "SE_锚#1", sessionId: "S-1",
@@ -200,4 +200,12 @@ test("回应句编号是闭集小写短串，且只在回应拍上出现", () =>
     type: "rapportStep", sessionId: "S-1", sectionKey: "自我介绍", questionIdx: 3,
     beat: "reply", replyId: "b2", recording: "idle", containsDirectIdentifier: false,
   });
+});
+
+test("rapportTurnKey binds a week-1 recording to the question, not just the section", () => {
+  assert.equal(rapportTurnKey("自我介绍", 0), "关系建立·自我介绍#0");
+  assert.equal(rapportTurnKey("介绍机构环境", 3), "关系建立·介绍机构环境#3");
+  // 无问的节(道别)也带 #0,与服务端 rapport_allowed_turn_keys 的口径一致。
+  assert.equal(rapportTurnKey("道别", 0), "关系建立·道别#0");
+  assert.notEqual(rapportTurnKey("自我介绍", 0), rapportTurnKey("自我介绍", 2));
 });

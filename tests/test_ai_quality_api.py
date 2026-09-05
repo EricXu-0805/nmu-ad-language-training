@@ -960,11 +960,13 @@ def test_patient_microphone_failure_pause_is_counted_from_closed_device_fact(
         "structural_invalid_evidence_records"] == 0
 
 
+@pytest.mark.parametrize("question_suffix", ["", "#0"])
 def test_week1_microphone_failure_uses_frozen_relationship_section(
-        quality_env):
+        quality_env, question_suffix):
+    """故障位置既可能是旧版节级键,也可能是 2026-09-04 起的问级键,都算结构合法。"""
     script = content.load_week1_script(
         content.CONTENT_DIR / "week1_script.json")
-    section_key = script["sections"][0]["key"]
+    section_key = script["sections"][0]["key"] + question_suffix
     with Session(quality_env.engine) as session:
         _seed_patient(session, "P-WEEK1-DEVICE-PAUSE", simulation=True)
         _seed_session(

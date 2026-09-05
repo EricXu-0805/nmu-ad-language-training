@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import unicodedata
 from typing import Optional, Protocol
 
@@ -30,6 +31,15 @@ _FORBIDDEN_SUBSTRINGS = (
     "您叫什么", "你叫什么", "贵姓", "姓什么", "您的名字", "你的名字",
     "多大年纪", "几岁了", "多少岁", "哪年出生", "出生年",
     "身份证", "住在哪", "家住哪", "住址", "地址", "电话",
+)
+# 2026-09-04 起属相/兴趣/活动三问进云:属相之后最顺口的追问就是「哪一年的」「高寿」,
+# 老人一答就是出生年份/年龄——正是被排除在云外的两问。上面的子串黑名单兜不住这些
+# 变体(复核实测「您是哪一年的？」「您今年高寿？」「几零年生的呀？」「比我大多少呀？」
+# 全部放行),这里再加一道按模式的兜底;命中即回落句库,误伤的代价只是少一句现编。
+_IDENTITY_PROBE_RE = re.compile(
+    r"哪一?年|几零年|几几年|出生|生于|生日|年纪|年龄|高寿|贵庚|周岁|虚岁|岁数"
+    r"|多大|多少岁|几岁|比我大|比我小|生的[呀啊吧呢吗?？]"
+    r"|怎么称呼|尊姓|大名|全名|家住|住在|住哪|哪个小区|门牌|手机号|身份证"
 )
 MAX_ROUNDS_DEFAULT = 2
 MAX_ROUNDS_CEILING = 5
@@ -82,6 +92,8 @@ def validate_reply_text(raw: object, *, final: bool = False) -> Optional[str]:
         return None
     if any(sub in text for sub in _FORBIDDEN_SUBSTRINGS):
         return None
+    if _IDENTITY_PROBE_RE.search(text):
+        return None
     return text
 
 
@@ -111,7 +123,8 @@ def build_reply_prompt(ask: str, asr_text: str, history: History = (),
                      "**不要再提任何问题,句尾不能是问号**——这句之后不再开麦。")
     else:
         lines.append("2. 先接住长者说的内容(可以轻轻复述其中一个词),再给一个轻的开放式追问,让长者能接着说。")
-    lines.append("3. 绝不询问姓名、年龄、住址、身份证等身份信息;绝不给医疗建议;绝不纠正或否定长者。")
+    lines.append("3. 绝不询问姓名、年龄、出生年份、住址、身份证等身份信息——长者说了属相也不许"
+                 "追问或推算是哪一年生的、多大年纪;绝不给医疗建议;绝不纠正或否定长者。")
     lines.append("4. 转写明显不通顺时按大意回应,不逐字复述;完全看不懂就说一句温和的承接话。")
     lines.append("5. 不用感叹号连用,不用“哇”“太棒了”这类夸张词。")
     return "\n".join(lines)

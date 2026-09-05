@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app import rapport_reply
 
 
@@ -196,3 +198,28 @@ def test_inviting_tails_carry_no_stray_alphabet():
     """这张表被逐项核过:里面只能是中文语气词(曾混进过一个西里尔字母串)。"""
     for tail in rapport_reply._INVITING_TAILS:
         assert all("\u4e00" <= ch <= "\u9fff" for ch in tail), tail
+
+
+@pytest.mark.parametrize("probe", [
+    "您属牛啊，那您是哪一年的？",
+    "属牛好，您今年高寿？",
+    "您是几零年生的呀？",
+    "属牛的，那您比我大多少呀？",
+    "您贵庚了？",
+    "您是哪年出生的呢",
+    "您家住在哪个小区呀？",
+])
+def test_identity_probes_hidden_behind_the_zodiac_question_are_refused(probe):
+    """属相进云之后最顺口的追问就是年份/年纪——老人一答就是被排除在云外的那两问。
+    子串黑名单兜不住这些变体(收据 251 复核实测全部放行),按模式的兜底必须拒。"""
+    assert rapport_reply.validate_reply_text(probe) is None
+
+
+@pytest.mark.parametrize("line", [
+    "属牛的人踏实，您平时也这样吧？",
+    "您孙子五岁了呀，正是好玩的时候。",
+    "您平时喜欢做点什么呢？",
+    "早上都去哪儿散步呀？",
+])
+def test_ordinary_follow_ups_still_pass_the_identity_guard(line):
+    assert rapport_reply.validate_reply_text(line) == line

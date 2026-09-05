@@ -4,37 +4,18 @@ import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { StatusPill } from "../../components/StatusPill";
 import { useToast } from "../../components/ToastContext";
-import { useWeek1ReplyBank, useWeek1Script, type Week1Section } from "../../content/bundle";
+import { useWeek1ReplyBank, useWeek1Script } from "../../content/bundle";
 import { useSessionJournal } from "../../hooks/useSessionJournal";
 import { useSessionRuntime } from "../../hooks/useSessionRuntime";
 import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "../../sync/useCursorWriter";
 import { isPatientRecFailure, rapportTurnKey, type RapportBeat, type RecState } from "../../sync/messages";
 import {
-  afterReplyAction, autoAdvanceTarget, nextQuestionArmDelayMs, roundLabel,
-  shouldAutoArmOnEntry, speechDelayMs,
+  afterReplyAction, autoAdvanceTarget, defaultRapportFlags, isIdentityQuestion,
+  nextQuestionArmDelayMs, roundLabel, shouldAutoArmOnEntry, speechDelayMs,
 } from "./rapportRounds";
 import type { Session } from "../../types";
 import { SessionControlBar } from "../SessionControlBar";
 import { SessionAbortControl } from "../SessionAbortControl";
-
-// 自我介绍节里回答本身就是直接身份信息的问位(脚本槽位名 preferred_appellation/age):
-// 这两问的录音整段标记含直接标识、永不进云。属相/兴趣/活动不在其列
-// (2026-09-04 Eric 拍板放行进云;与服务端 RAPPORT_IDENTITY_SLOT_FIELDS 同一口径)。
-const IDENTITY_SLOT_FIELDS = new Set(["preferred_appellation", "age"]);
-
-function isIdentityQuestion(section: Week1Section | undefined, qIdx: number): boolean {
-  const field = section?.questions?.[qIdx]?.slot_field;
-  return section?.key === "自我介绍" && field !== undefined && IDENTITY_SLOT_FIELDS.has(field);
-}
-
-function defaultRapportFlags(sectionKey: string, qIdx: number, section?: Week1Section): {
-  assentGate: boolean; containsDirectIdentifier: boolean;
-} {
-  return {
-    assentGate: sectionKey === "认识机器人",
-    containsDirectIdentifier: isIdentityQuestion(section, qIdx),
-  };
-}
 
 // week1 关系建立驱动屏:plan 无评分题,本就无判分 UI(与 scoring 零 import)。
 // 逐节/逐问广播 rapportStep 推进老人端;录音同训练屏 arm/stop 模式(老人端 VOX 实采字节)。

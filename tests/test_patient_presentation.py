@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import auth, content, db, patient_presentation
 from app.main import app
@@ -596,15 +597,19 @@ def _reply_bank():
 
 
 def test_open_reply_bank_never_applies_to_the_name_and_age_questions():
-    """姓名/年龄那两问的回答是直接身份信息——不进选句这条路。"""
+    """姓名/年龄那两问的回答是直接身份信息——不进选句这条路。
+
+    属相/兴趣/活动(q2-4)自 2026-09-04 起进云(收据 251),排除名单只剩这两问。
+    """
     bank = _reply_bank()
-    for idx in (0, 1, 2):
+    for idx in (0, 1):
         assert not patient_presentation.rapport_reply_allowed_here(
             bank, "自我介绍", idx)
-    assert patient_presentation.rapport_reply_allowed_here(bank, "自我介绍", 3)
+    for idx in (2, 3, 4):
+        assert patient_presentation.rapport_reply_allowed_here(bank, "自我介绍", idx)
     assert patient_presentation.rapport_reply_allowed_here(bank, "介绍机构环境", 0)
     excluded = {(row["section_key"], row["question_idx"]) for row in bank["excluded"]}
-    assert ("自我介绍", 0) in excluded and ("自我介绍", 1) in excluded
+    assert excluded == {("自我介绍", 0), ("自我介绍", 1)}
 
 
 def test_every_open_reply_can_be_spoken_by_the_cloud_voice():
@@ -658,3 +663,103 @@ def test_a_reply_id_from_another_question_is_refused(
     assert projected["text"] == "这个挺好的，您再多讲一点吧。"
     # 编号是内部键，不该跟着投影下去让配对设备去枚举整个回应库。
     assert "replyId" not in projected and "a1" not in json.dumps(projected)
+
+
+_ROUNDS_TS = Path(__file__).resolve().parents[1] / "web" / "src" / "console" / "relationship" / "rapportRounds.ts"
+
+
+def test_identity_slot_fields_match_between_console_and_server():
+    """哪几问是直接身份信息,前端(rapportRounds.ts)与服务端各钉一份;两份不同步时
+    前端会把不该进云的问位当成可自动回应、或把能进云的问位整段标成含标识。"""
+    import re
+    source = _ROUNDS_TS.read_text(encoding="utf-8")
+    match = re.search(r"IDENTITY_SLOT_FIELDS[^=]*=\s*new Set\(\[([^\]]*)\]\)", source)
+    assert match, "rapportRounds.ts 里找不到 IDENTITY_SLOT_FIELDS 字面量"
+    frontend = frozenset(re.findall(r'"([^"]+)"', match.group(1)))
+    assert frontend == patient_presentation.RAPPORT_IDENTITY_SLOT_FIELDS
+
+
+def _rapport_step(client: TestClient, session_id: str, *, section: str, qidx: int,
+                  recording: str = "idle") -> None:
+    response = client.put("/live/state", json={"kind": "rapportStep", "payload": {
+        "sessionId": session_id, "sectionKey": section, "questionIdx": qidx,
+        "recording": recording, "recSeq": 1,
+        "containsDirectIdentifier": section == "自我介绍" and qidx in (0, 1),
+    }})
+    assert response.status_code == 200, response.text
+
+
+def test_week1_device_registration_keeps_the_arm_time_question_after_advance(
+        presentation_client, monkeypatch):
+    """老人还在说、研究者已点到下一问:设备用开麦那一刻锁存的问位登记,服务端指针
+    已经在下一问也要收下(改成按问之前就是按节比对,这里不能收紧);换节仍拒。
+    旧版页面(节级键)登记也走同一道按节比对,部署后没刷新的老人端不会卡死。"""
+    client = presentation_client
+    _create_patient(client, "P-LATE")
+    _create_session(client, session_id="S-LATE", patient_id="P-LATE", week_no=1)
+    _post_live_session(client, "S-LATE", week_no=1)
+    _rapport_step(client, "S-LATE", section="自我介绍", qidx=1)
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    capability = _pair(client, "late-register-device-0001")
+
+    late = client.post("/audio", headers=capability, json={
+        "raw_audio_id": "late-q0", "session_id": "S-LATE",
+        "turn_key": "关系建立·自我介绍#0", "contains_direct_identifier": True,
+    })
+    assert late.status_code == 200, late.text
+    assert late.json() == {"raw_audio_id": "late-q0", "registered": True}
+
+    other_section = client.post("/audio", headers=capability, json={
+        "raw_audio_id": "wrong-section", "session_id": "S-LATE",
+        "turn_key": "关系建立·介绍机构环境#0",
+    })
+    assert other_section.status_code == 409, other_section.text
+    assert "当前冻结位置" in other_section.json()["detail"]
+
+    legacy = client.post("/audio", headers=capability, json={
+        "raw_audio_id": "legacy-bundle", "session_id": "S-LATE",
+        "turn_key": "关系建立·自我介绍", "contains_direct_identifier": True,
+    })
+    assert legacy.status_code == 200, legacy.text
+    with Session(client.test_engine) as s:
+        keys = {a.raw_audio_id: a.turn_key for a in s.exec(select(AudioAssetRow).where(
+            AudioAssetRow.session_id == "S-LATE"))}
+    assert keys == {"late-q0": "关系建立·自我介绍#0", "legacy-bundle": "关系建立·自我介绍"}
+
+
+def test_week1_microphone_failure_from_the_tablet_pauses_the_session(
+        presentation_client, monkeypatch):
+    """第1周老人端麦克风失败上报必须落账并暂停场次。此前这条路把「节#问」喂给自动
+    带练围栏(要求题号与环节同有同无)一律 422:故障不落账、场次不暂停(收据 251 复核坐实)。
+    迟到一问的上报(设备锁存的问位比服务端指针早一问)同样收下。"""
+    from app.models import InteractionEvent, SessionRuntimeState
+    client = presentation_client
+    _create_patient(client, "P-MIC")
+    _create_session(client, session_id="S-MIC", patient_id="P-MIC", week_no=1)
+    _post_live_session(client, "S-MIC", week_no=1)
+    _rapport_step(client, "S-MIC", section="自我介绍", qidx=3, recording="armed")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    capability = _pair(client, "mic-failure-device-0001")
+
+    failure = client.put("/live/state", headers=capability, json={
+        "kind": "patientRec", "payload": {
+            "active": False, "turnKey": "关系建立·自我介绍#2", "sessionId": "S-MIC",
+            "failureCode": "microphone_permission_denied",
+            "failureId": "123e4567-e89b-42d3-a456-426614174000",
+        }})
+    assert failure.status_code == 200, failure.text
+    with Session(client.test_engine) as s:
+        state = s.get(SessionRuntimeState, "S-MIC")
+        assert state is not None and state.status == "paused"
+        events = [e for e in s.exec(select(InteractionEvent).where(
+            InteractionEvent.session_id == "S-MIC"))
+            if e.event_type == "technical_pause"]
+    assert [(e.item_id, e.turn_seq) for e in events] == [("关系建立·自我介绍#2", None)]
+
+    foreign = client.put("/live/state", headers=capability, json={
+        "kind": "patientRec", "payload": {
+            "active": False, "turnKey": "关系建立·介绍机构环境#0", "sessionId": "S-MIC",
+            "failureCode": "microphone_permission_denied",
+            "failureId": "223e4567-e89b-42d3-a456-426614174000",
+        }})
+    assert foreign.status_code == 409, foreign.text

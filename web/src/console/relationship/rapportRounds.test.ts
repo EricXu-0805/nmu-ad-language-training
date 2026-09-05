@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  afterReplyAction, autoAdvanceTarget, nextQuestionArmDelayMs, roundLabel,
-  shouldAutoArmOnEntry, speechDelayMs,
+  IDENTITY_SLOT_FIELDS, afterReplyAction, autoAdvanceTarget, defaultRapportFlags,
+  isIdentityQuestion, nextQuestionArmDelayMs, roundLabel, shouldAutoArmOnEntry, speechDelayMs,
 } from "./rapportRounds.ts";
 
 const base = {
@@ -85,4 +85,29 @@ test("nextQuestionArmDelayMs: 按下一问真实长度估时,长问句给得更�
 
 test("roundLabel", () => {
   assert.equal(roundLabel(1, 2), "第 1 / 2 轮");
+});
+
+// 自我介绍节按冻结脚本的槽位:姓名/年龄两问是直接身份信息,属相/兴趣/活动三问不是。
+const selfIntro = {
+  key: "自我介绍",
+  questions: [
+    { slot_field: "preferred_appellation" }, { slot_field: "age" }, { slot_field: "zodiac" },
+    { slot_field: "interests" }, { slot_field: "daily_activities" },
+  ],
+};
+
+test("isIdentityQuestion: only the name/age slots of 自我介绍 count", () => {
+  assert.deepEqual([0, 1, 2, 3, 4].map((q) => isIdentityQuestion(selfIntro, q)),
+    [true, true, false, false, false]);
+  assert.equal(isIdentityQuestion(selfIntro, 5), false);
+  assert.equal(isIdentityQuestion(undefined, 0), false);
+  // 同样的槽位名出现在别的节里不算身份问(只有自我介绍节问的是老人自己)。
+  assert.equal(isIdentityQuestion({ key: "介绍机构环境", questions: [{ slot_field: "age" }] }, 0), false);
+  assert.deepEqual([...IDENTITY_SLOT_FIELDS].sort(), ["age", "preferred_appellation"]);
+});
+
+test("defaultRapportFlags: identity flag follows the question, assent gate follows the section", () => {
+  assert.deepEqual(defaultRapportFlags("自我介绍", 1, selfIntro), { assentGate: false, containsDirectIdentifier: true });
+  assert.deepEqual(defaultRapportFlags("自我介绍", 2, selfIntro), { assentGate: false, containsDirectIdentifier: false });
+  assert.deepEqual(defaultRapportFlags("认识机器人", 0, { key: "认识机器人" }), { assentGate: true, containsDirectIdentifier: false });
 });

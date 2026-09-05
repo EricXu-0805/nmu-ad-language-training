@@ -92,13 +92,16 @@ def _seed_scene(client: TestClient, *, patient="P-PIPE", session="S-PIPE") -> No
 
 
 def _seed_audio(client: TestClient, *, session_id: str, raw_id: str,
-                section: str, question: int | None = 0) -> None:
+                section: str, question: int | None = 0,
+                identity: bool | None = None) -> None:
     """默认按问绑定(「关系建立·<节>#<问>」,2026-09-04 起设备开麦即锁存问位);
-    question=None 造旧版按节绑定的录音。"""
+    question=None 造旧版按节绑定的录音。identity 显式给值即覆盖默认的标记规则
+    (造「研究者按问手标含标识」或旧版整节标记的行)。"""
     payload = b"fake-webm-bytes-" + raw_id.encode()
     (client.audio_dir / f"{raw_id}.webm").write_bytes(payload)
     turn_key = patient_presentation.rapport_turn_key(section, question)
-    identity = section == "自我介绍" and (question is None or question in (0, 1))
+    if identity is None:
+        identity = section == "自我介绍" and (question is None or question in (0, 1))
     with Session(client.test_engine) as s:
         s.add(AudioAssetRow(
             raw_audio_id=raw_id, session_id=session_id,
@@ -783,8 +786,27 @@ def test_zodiac_interest_activity_questions_run_the_auto_pipeline(
     with Session(client.test_engine) as s:
         rows = list(s.exec(select(RapportUtteranceEvent)))
         assert [r.question_idx for r in rows] == [2, 3, 4]
-        assets = {a.raw_audio_id: a for a in s.exec(select(AudioAssetRow))}
-    assert all(assets[f"aud-open-{q}"].contains_direct_identifier is False for q in (2, 3, 4))
+
+
+def test_recording_flagged_as_direct_identifier_never_reaches_the_cloud(
+        pipeline_client, monkeypatch):
+    """录音自己带的「含直接标识」是老人端开麦那一刻锁存的事实(研究者按问手标、或旧版
+    整节标记的场次恢复后带着它):标了就一个字节不进云,哪怕这一问本身放行。"""
+    client = pipeline_client
+    _seed_scene(client)
+    stub = _StubAsr("我叫张三")
+    monkeypatch.setattr(asr, "get_engine", lambda: stub)
+    _use_reply_stub(monkeypatch, "不该被叫到")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-flagged-q2",
+                section="自我介绍", question=2, identity=True)
+    refused = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 2, "mode": "auto",
+        "rawAudioId": "aud-flagged-q2"})
+    assert refused.status_code == 409, refused.text
+    assert "含直接标识" in refused.json()["detail"]
+    assert stub.calls == 0
+    with Session(client.test_engine) as s:
+        assert list(s.exec(select(RapportUtteranceEvent))) == []
 
 
 def test_rapport_turn_key_helpers_pin_the_contract():
