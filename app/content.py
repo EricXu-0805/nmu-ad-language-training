@@ -898,6 +898,9 @@ class _Week1ReplyGroupSchema(_FrozenContentSchema):
 class _Week1ReplyPositionSchema(_FrozenContentSchema):
     section_key: str = Field(min_length=1)
     question_idx: int = Field(ge=0)
+    # 这一问最多聊几轮(缺省用全局 RAPPORT_MAX_ROUNDS);属相一问定 1——答一轮就换问、
+    # 不追问,免得现编句问出出生年份(2026-09-05 Eric 拍板)。
+    max_rounds: int | None = Field(default=None, ge=1)
 
 
 class _Week1ReplyExclusionSchema(_Week1ReplyPositionSchema):

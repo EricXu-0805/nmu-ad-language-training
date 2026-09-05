@@ -167,7 +167,10 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-无（2026-09-05 06:27 UTC `3f54b58` 已上线）。
+**收据 251 §六（零迁移；库头仍 `d0c22a6dae2a`）**：属相一问单轮（Eric 2026-09-05 拍板）——回应库 `applies_to`
+新增可选 `max_rounds`，属相问位定 1；服务端每问上限 = min(全局 `RAPPORT_MAX_ROUNDS`, 问位上限)，
+回应字段 `round/maxRounds/final/invitesMore` 随之为 1/1/true/false，控制台据此直接换问、不续麦。上线用
+`253-上线命令_属相单轮.sh`。
 
 ## 2026-09-05 上线记录（`3f54b58`：第 1 周录音绑到问，属相/兴趣/活动进云，零迁移）
 

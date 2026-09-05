@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import re
+
+from . import rapport_reply
 from typing import Any
 
 
@@ -241,6 +243,23 @@ def rapport_reply_allowed_here(bank: dict, section_key: str, question_idx: int) 
                 and row.get("question_idx") == question_idx):
             return True
     return False
+
+
+def rapport_round_limit(bank: dict, section_key: str, question_idx: int) -> int:
+    """这一问最多聊几轮:全局上限与回应库里该问位的 max_rounds 取小。
+
+    属相一问是 1:老人答完属相,机器人只接一句、不追问——属相之后最顺口的追问就是
+    「哪一年的」「高寿」,老人一答就是被排除在云外的出生年份/年龄(2026-09-05 Eric 拍板)。
+    """
+    limit = rapport_reply.max_rounds()
+    for row in bank.get("applies_to") or []:
+        if (isinstance(row, dict) and row.get("section_key") == section_key
+                and row.get("question_idx") == question_idx):
+            cap = row.get("max_rounds")
+            if isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1:
+                return min(limit, cap)
+            return limit
+    return limit
 
 
 def rapport_bank_reply_line(bank: dict, reply_id: str,

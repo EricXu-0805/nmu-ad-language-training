@@ -610,6 +610,11 @@ def test_open_reply_bank_never_applies_to_the_name_and_age_questions():
     assert patient_presentation.rapport_reply_allowed_here(bank, "介绍机构环境", 0)
     excluded = {(row["section_key"], row["question_idx"]) for row in bank["excluded"]}
     assert excluded == {("自我介绍", 0), ("自我介绍", 1)}
+    caps = {(row["section_key"], row["question_idx"]): row.get("max_rounds")
+            for row in bank["applies_to"]}
+    # 属相一问单轮(2026-09-05 Eric 拍板);其余问位不设问位上限。
+    assert caps[("自我介绍", 2)] == 1
+    assert all(cap is None for key, cap in caps.items() if key != ("自我介绍", 2))
 
 
 def test_every_open_reply_can_be_spoken_by_the_cloud_voice():

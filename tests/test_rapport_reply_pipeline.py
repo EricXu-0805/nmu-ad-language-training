@@ -773,7 +773,8 @@ def test_zodiac_interest_activity_questions_run_the_auto_pipeline(
     _seed_scene(client)
     stub = _StubAsr("属牛")
     monkeypatch.setattr(asr, "get_engine", lambda: stub)
-    _use_reply_stub(monkeypatch, "属牛的人踏实，您平时也这样吧？")
+    # 属相一问单轮:第 1 轮就是末轮,末轮句尾不许问号(留问号会回落句库)。
+    _use_reply_stub(monkeypatch, "属牛的人踏实，真好。")
     for q in (2, 3, 4):
         _seed_audio(client, session_id="S-PIPE", raw_id=f"aud-open-{q}",
                     section="自我介绍", question=q)
@@ -905,3 +906,116 @@ def test_revoked_cloud_consent_keeps_reply_synthesis_local(
     assert served.status_code == 200, served.text
     # 受试者从未授权云处理(policy 也未配):合成必须被按到本地链。
     assert captured.get("allow_cloud") is False
+
+
+def test_zodiac_question_is_single_round_and_never_invites_a_follow_up(
+        pipeline_client, monkeypatch):
+    """2026-09-05 Eric 拍板:属相一问只聊一轮。答完属相机器人只接一句(final、不续麦),
+    生成器拿到的上限是 1;同一问再来一次自动请求 → 聊满收束、ASR 不再调。兴趣那一问不受影响。"""
+    client = pipeline_client
+    _seed_scene(client)
+    stub = _StubAsr("属牛")
+    monkeypatch.setattr(asr, "get_engine", lambda: stub)
+    reply = _use_reply_stub(monkeypatch, "属牛的人踏实，真好。")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-zodiac", section="自我介绍", question=2)
+    first = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 2, "mode": "auto", "rawAudioId": "aud-zodiac"})
+    assert first.status_code == 200, first.text
+    row = first.json()
+    assert row["source"] == "llm"
+    assert (row["round"], row["maxRounds"], row["final"], row["invitesMore"]) == (1, 1, True, False)
+    assert reply.calls[-1]["max"] == 1 and reply.calls[-1]["round"] == 1
+    assert stub.calls == 1
+
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-zodiac-2", section="自我介绍", question=2)
+    again = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 2, "mode": "auto", "rawAudioId": "aud-zodiac-2"})
+    assert again.status_code == 200, again.text
+    assert again.json()["degradedReason"] == "round_limit"
+    assert again.json()["final"] is True
+    assert stub.calls == 1 and len(reply.calls) == 1
+
+    # 同一段录音重放:幂等返回也按问位上限报轮次,控制台不会因重放而续麦。
+    replay = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 2, "mode": "auto", "rawAudioId": "aud-zodiac"})
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["idempotent"] is True
+    assert (replay.json()["maxRounds"], replay.json()["final"], replay.json()["invitesMore"]) == (1, True, False)
+    assert stub.calls == 1 and len(reply.calls) == 1
+
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-interest", section="自我介绍", question=3)
+    interest = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 3, "mode": "auto", "rawAudioId": "aud-interest"})
+    assert interest.status_code == 200, interest.text
+    assert interest.json()["maxRounds"] == rapport_reply.max_rounds() == 2
+    assert interest.json()["final"] is False
+
+
+def test_rapport_round_limit_helper_pins_the_contract(monkeypatch):
+    from app import content
+    bank = content.load_week1_reply_bank(content.CONTENT_DIR / "week1_reply_bank_v1.json")
+    monkeypatch.delenv("RAPPORT_MAX_ROUNDS", raising=False)
+    assert patient_presentation.rapport_round_limit(bank, "自我介绍", 2) == 1
+    assert patient_presentation.rapport_round_limit(bank, "自我介绍", 3) == 2
+    assert patient_presentation.rapport_round_limit(bank, "介绍机构环境", 0) == 2
+    # 全局上限只会把问位上限压得更低,不会抬高。
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "3")
+    assert patient_presentation.rapport_round_limit(bank, "自我介绍", 2) == 1
+    assert patient_presentation.rapport_round_limit(bank, "自我介绍", 3) == 3
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "1")
+    assert patient_presentation.rapport_round_limit(bank, "自我介绍", 3) == 1
+    # 不开放的问位也给全局值(调用方先用 rapport_reply_allowed_here 挡),不会崩。
+    assert patient_presentation.rapport_round_limit(bank, "自我介绍", 0) == 1
+
+
+def test_manual_replies_on_the_zodiac_question_keep_the_global_round_fields(
+        pipeline_client, monkeypatch):
+    """问位上限只管 AI 现编。研究者手点一句「再多讲一点」是人定稿的句子,老人端该续麦;
+    不能因为属相是单轮就把手点句标成收束、直接换问(复核坐实)。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.delenv("RAPPORT_MAX_ROUNDS", raising=False)
+    banked = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 2, "mode": "bank", "replyId": "a1"})
+    assert banked.status_code == 200, banked.text
+    body = banked.json()
+    assert (body["maxRounds"], body["final"], body["invitesMore"]) == (2, False, True)
+    scripted = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 0, "mode": "script"})
+    assert scripted.status_code == 200, scripted.text
+    assert scripted.json()["source"] == "script" and scripted.json()["invitesMore"] is False
+
+
+def test_zodiac_first_round_is_guarded_like_a_final_round(pipeline_client, monkeypatch):
+    """属相单轮:第 1 轮就按末轮守——LLM 仍抛问题 → 拒、回落不带问号的收束句;
+    ASR 失败 → 不用带问号的 j1,直接 j2。两条都不许把话头递回老人。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.delenv("RAPPORT_MAX_ROUNDS", raising=False)
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-z-q", section="自我介绍", question=2)
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("属牛"))
+    _use_reply_stub(monkeypatch, None)   # 引擎守卫(final=True)已拒掉带问号的句子
+    refused = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 2, "mode": "auto", "rawAudioId": "aud-z-q"})
+    assert refused.status_code == 200, refused.text
+    body = refused.json()
+    assert body["final"] is True and body["invitesMore"] is False
+    assert body["degradedReason"] == "llm_unavailable"
+    assert "？" not in body["text"] and "?" not in body["text"]
+
+    _seed_scene(client, patient="P-PIPE-2", session="S-PIPE-2")
+    _seed_audio(client, session_id="S-PIPE-2", raw_id="aud-z-unclear", section="自我介绍", question=2)
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr(None))
+    unclear = _create_reply(client, "S-PIPE-2", {
+        "sectionKey": "自我介绍", "questionIdx": 2, "mode": "auto", "rawAudioId": "aud-z-unclear"})
+    assert unclear.status_code == 200, unclear.text
+    body = unclear.json()
+    assert body["degradedReason"] == "asr_failed" and body["final"] is True
+    assert body["replyId"] == "j2" and "？" not in body["text"]
+
+
+def test_llm_prompt_for_the_zodiac_question_is_built_as_final():
+    """生成器拿到 round=1/max=1 时 prompt 走末轮分支:明说不许再提问、句尾不能是问号。"""
+    prompt = rapport_reply.build_reply_prompt("您属什么呀？", "属牛", (), 1, 1)
+    assert "最后一轮" in prompt and "不要再提任何问题" in prompt
+    assert "开放式追问" not in prompt

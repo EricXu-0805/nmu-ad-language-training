@@ -708,3 +708,22 @@ def test_frozen_schema_rejects_nested_type_confusion_and_extra_fields(
 
     with pytest.raises(ValueError, match="结构不合法"):
         loader(path)
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, "1", 1.5], ids=["zero", "negative", "bool", "str", "float"])
+def test_week1_reply_bank_rejects_illegal_per_question_round_caps(tmp_path, bad):
+    """回应库问位的 max_rounds 只收 ≥1 的整数:写 0(自然读法「不聊」)会被 helper 当成
+    无上限回落全局 2 轮,与本意相反,所以在冻结 schema 这一层就拒。"""
+    bank = json.loads((CONTENT_DIR / "week1_reply_bank_v1.json").read_text(encoding="utf-8"))
+    bank["applies_to"][0]["max_rounds"] = bad
+    path = tmp_path / "bank.json"
+    path.write_text(json.dumps(bank, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(content.FrozenContentUnavailable):
+        load_week1_reply_bank(path)
+
+
+def test_week1_reply_bank_shipped_caps_only_the_zodiac_question():
+    bank = load_week1_reply_bank(CONTENT_DIR / "week1_reply_bank_v1.json")
+    capped = [(r["section_key"], r["question_idx"], r["max_rounds"])
+              for r in bank["applies_to"] if "max_rounds" in r]
+    assert capped == [("自我介绍", 2, 1)]

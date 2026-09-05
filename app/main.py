@@ -5877,8 +5877,8 @@ def _rapport_invites_more(bank: dict, source: str, reply_id: str | None,
     return False
 
 
-def _rapport_round_fields(prior_count: int, *, invites_more: bool = False) -> dict:
-    limit = rapport_reply.max_rounds()
+def _rapport_round_fields(prior_count: int, *, limit: int,
+                          invites_more: bool = False) -> dict:
     # 聊满后的收束行不是"第 N+1 轮":屏上不能出现「第 3 / 2 轮」。
     round_no = min(prior_count + 1, limit)
     final = prior_count + 1 >= limit
@@ -5936,6 +5936,12 @@ def rapport_reply_create(
     question = _rapport_validate_script_position(
         script, body.sectionKey, body.questionIdx)
     bank = _week1_reply_bank()
+    # 这一问最多聊几轮:全局上限与回应库里该问位的 max_rounds 取小(属相一问是 1)。
+    # 问位上限只管 AI 现编:手点句库/脚本句是人事先定稿的,不会问出年份,研究者点了
+    # 一句「再多讲一点」老人端就该续麦,不能因为问位是单轮就把它标成收束、直接换问。
+    round_limit = (patient_presentation.rapport_round_limit(
+        bank, body.sectionKey, body.questionIdx)
+        if body.mode == "auto" else rapport_reply.max_rounds())
 
     source: str
     reply_id: str | None = None
@@ -5978,14 +5984,13 @@ def rapport_reply_create(
                 utteranceId=existing.id, text=existing.text,
                 source=existing.source, replyId=existing.reply_id,
                 degradedReason=existing.degraded_reason, idempotent=True,
-                **_rapport_round_fields(prior_n, invites_more=(
+                **_rapport_round_fields(prior_n, limit=round_limit, invites_more=(
                     _rapport_invites_more(bank, existing.source,
                                           existing.reply_id,
                                           existing.degraded_reason,
                                           existing.text))))
         prior_rounds = _rapport_auto_rounds_before(
             s, session_id, body.sectionKey, body.questionIdx)
-        round_limit = rapport_reply.max_rounds()
         history: rapport_reply.History = tuple(
             (row.asr_text, row.text) for row in prior_rounds)
         round_no = len(prior_rounds) + 1
@@ -6128,7 +6133,7 @@ def rapport_reply_create(
             return RapportReplyCreateOut(
                 utteranceId=raced.id, text=raced.text, source=raced.source,
                 replyId=raced.reply_id, degradedReason=raced.degraded_reason,
-                idempotent=True, **_rapport_round_fields(prior_n, invites_more=(
+                idempotent=True, **_rapport_round_fields(prior_n, limit=round_limit, invites_more=(
                     _rapport_invites_more(bank, raced.source, raced.reply_id,
                                           raced.degraded_reason, raced.text))))
     # 落账段串行化:provider 窗口里并发的另一次 auto 可能已把轮次推进,
@@ -6138,7 +6143,7 @@ def rapport_reply_create(
         s.expire_all()
         prior_now = len(_rapport_auto_rounds_before(
             s, session_id, body.sectionKey, body.questionIdx))
-        if body.mode == "auto" and prior_now >= rapport_reply.max_rounds():
+        if body.mode == "auto" and prior_now >= round_limit:
             # 轮次在 provider 窗口内被别的请求占满:本次结果作废,改落收束句,
             # 老人仍然有回应(不再调云,字节不出网)。
             source, reply_id, text, degraded = _rapport_bank_or_frozen_fallback(
@@ -6177,7 +6182,7 @@ def rapport_reply_create(
     return RapportReplyCreateOut(
         utteranceId=row.id, text=text, source=source, replyId=reply_id,
         degradedReason=degraded,
-        **_rapport_round_fields(prior_now, invites_more=_rapport_invites_more(
+        **_rapport_round_fields(prior_now, limit=round_limit, invites_more=_rapport_invites_more(
             bank, source, reply_id, degraded, text)))
 
 
