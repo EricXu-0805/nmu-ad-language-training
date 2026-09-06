@@ -93,7 +93,7 @@ export function useCursorWriter(sessionId: string) {
     };
   }, [sessionId]);
 
-  const enqueue = useCallback((kind: LiveWriteKind, payload: object): Promise<boolean> => {
+  const enqueue = useCallback((kind: LiveWriteKind, payload: object, onCommitted?: (wseq: number) => void): Promise<boolean> => {
     const writeSessionId = sessionId;
     const writeSafetyEpoch = liveWriteSafetyEpoch;
     const write = async (): Promise<boolean> => {
@@ -113,6 +113,7 @@ export function useCursorWriter(sessionId: string) {
         const serverWseq = requireServerWseq(ack.wseq);
         observeWseq(serverWseq);
         broadcastCommitted(kind, payload, serverWseq);
+        onCommitted?.(serverWseq);
         // Writes are globally ordered. A later ACK also proves that any earlier
         // ambiguous handshake already established sufficient server context.
         failedWrite.current = null;
@@ -156,6 +157,13 @@ export function useCursorWriter(sessionId: string) {
     if (activeConsoleSessionId !== sessionId) return Promise.resolve(false);
     const stamped = { ...m, sessionId, wseq: nextWseq() };
     return enqueue("rapportStep", stamped);
+  }, [enqueue, sessionId]);
+  const postRapportWithReceipt = useCallback(async (m: Omit<RapportMsg, "type" | "wseq" | "sessionId">): Promise<RapportMsg | null> => {
+    if (activeConsoleSessionId !== sessionId) return null;
+    const stamped = { ...m, sessionId, wseq: nextWseq() };
+    let committed: RapportMsg | null = null;
+    await enqueue("rapportStep", stamped, (wseq) => { committed = { type: "rapportStep", ...stamped, wseq }; });
+    return committed;
   }, [enqueue, sessionId]);
   const beginSafetyPause = useCallback(() => {
     // 先在同源老人端建立一个不可被旧游标解除的本地关麦闩，再撤销本 writer
@@ -280,6 +288,7 @@ export function useCursorWriter(sessionId: string) {
     postSession,
     postCursor,
     postRapport,
+    postRapportWithReceipt,
     beginSafetyPause,
     releaseSafetyPause,
     publishCommittedCursor,
@@ -412,6 +421,7 @@ export function useAudioSaved(handler: (m: AudioSavedMsg) => void): void {
                   turnKey: receipt.turn_key,
                   sessionId: receipt.session_id,
                   containsDirectIdentifier: receipt.contains_direct_identifier,
+                  ...(receipt.recording_wseq == null ? {} : { recordingWseq: receipt.recording_wseq }),
                 });
                 if (!message) throw new Error("服务端录音收据字段无效");
                 expectedGreaterThan = receipt.server_seq;

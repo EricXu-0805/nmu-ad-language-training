@@ -25,12 +25,13 @@ const prefixProxyPaths = [
   '/health', '/auth', '/patients', '/sessions', '/cloud-processing',
   '/score', '/judge', '/audio', '/items', '/turns', '/asr', '/live', '/tts',
   '/audit', '/ai', '/visit-plans', '/assessment-events', '/assessment-instances',
-  '/exports', '/governance', '/questionnaires', '/questionnaire-records',
+  '/exports', '/governance', '/caregiver', '/research', '/questionnaires', '/questionnaire-records',
 ]
 const exactContentProxyPaths = [
   '/content/item-bank',
   '/content/item-bank-bundle',
   '/content/week1-script',
+  '/content/week1-reply-bank',
   '/content/autopilot-protocol',
   '/content/scale-protocol',
 ]

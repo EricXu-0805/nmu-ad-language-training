@@ -263,6 +263,7 @@ def append_receipt(
             and existing.data_classification == row.data_classification
             and existing.is_simulation == row.is_simulation
             and existing.contains_direct_identifier == row.contains_direct_identifier
+            and existing.recording_wseq == row.recording_wseq
         )
         if not same:
             raise AudioCaptureIntegrityError("同一 raw_audio_id 已有不同的服务端采集收据")
@@ -278,6 +279,7 @@ def append_receipt(
         data_classification=row.data_classification,
         is_simulation=row.is_simulation,
         contains_direct_identifier=row.contains_direct_identifier,
+        recording_wseq=row.recording_wseq,
     )
     s.add(receipt)
     return receipt, False
@@ -316,6 +318,7 @@ def existing_receipt_ack(
         and row.data_classification == existing.data_classification
         and row.is_simulation == existing.is_simulation
         and row.contains_direct_identifier == existing.contains_direct_identifier
+        and row.recording_wseq == existing.recording_wseq
     )
     if not same:
         raise AudioCaptureIntegrityError(

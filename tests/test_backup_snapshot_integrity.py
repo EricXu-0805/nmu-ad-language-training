@@ -1421,7 +1421,8 @@ def test_publish_parent_fsync_failure_rolls_back_to_staging(monkeypatch, tmp_pat
 # --------------------------------------------------------------------------
 
 
-CURRENT_HEAD = "d0c22a6dae2a"
+LEGACY_HEAD = "d0c22a6dae2a"
+CURRENT_HEAD = "e2a6d8f0b419"
 COVARIATES_HEAD = "c8e5a1f3b209"
 QUALITY_RELEASE_HEAD = "141bc30e4580"
 DISPOSAL_HEAD = "f7c2e8a4d105"
@@ -1531,8 +1532,9 @@ def _drop_profile_column(
     return dependent
 
 
-def test_recovery_contract_pins_the_current_head_only():
+def test_recovery_contract_defaults_to_current_head_only():
     assert _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS == frozenset({CURRENT_HEAD})
+    assert LEGACY_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert COVARIATES_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert QUALITY_RELEASE_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
     assert DISPOSAL_HEAD not in _GUARD_MODULE.SUPPORTED_ALEMBIC_HEADS
@@ -1559,6 +1561,7 @@ def test_recovery_fingerprint_literal_matches_a_fresh_current_head(tmp_path):
 
 
 @pytest.mark.parametrize("stale_head", [
+    LEGACY_HEAD,
     PRE_PROFILE_HEAD,
     PROFILE_HEAD,
     DISPOSAL_HEAD,

@@ -36,6 +36,7 @@ interface ArmedMeta {
   sessionId: string;
   turnKey: string;
   containsDirectIdentifier: boolean;
+  recordingWseq?: number;
 }
 
 interface PendingSave {
@@ -58,6 +59,7 @@ function pendingFromOutbox(entry: AudioOutboxEntry, blob: Blob): PendingSave {
       sessionId: entry.sessionId,
       turnKey: entry.turnKey,
       containsDirectIdentifier: entry.containsDirectIdentifier,
+      recordingWseq: entry.recordingWseq,
     },
     entry,
     localSaved: true,
@@ -97,6 +99,7 @@ export function useVoxRecorder(opts: {
   suspended?: boolean; // 场次级暂停等"无游标边沿"的挂起:必须立即封存许可+停麦(热麦红线)
   selfStartAllowed?: boolean; // 自助开录的当前授权；变 false 时在途许可与活麦一并收回
   stopRequested?: boolean; // thanks/done/终态/收尾等无关 recSeq 的强制停麦信号
+  requireRecordingWseq?: boolean;
   maxRecordingMs?: number; // 单段录音上限,到点自动停并保存(老人没按「我说好了」流程也走得下去)
 }) {
   const recRef = useRef<Recorder>(new Recorder());
@@ -145,7 +148,7 @@ export function useVoxRecorder(opts: {
   const {
     sessionId, recording, recSeq, commandSeq, turnKey, containsDirectIdentifier,
     connectionReady = true, suspended = false, selfStartAllowed = false, stopRequested = false,
-    maxRecordingMs,
+    maxRecordingMs, requireRecordingWseq = false,
   } = opts;
   const sessionUiFence = useRef<AudioRecoveryUiFence>({ sessionId, generation: 0 });
   if (sessionUiFence.current.sessionId !== sessionId) {
@@ -156,11 +159,11 @@ export function useVoxRecorder(opts: {
   }
   const latest = useRef({
     sessionId, recording, recSeq, commandSeq, turnKey, containsDirectIdentifier,
-    connectionReady, suspended, selfStartAllowed, stopRequested, maxRecordingMs,
+    connectionReady, suspended, selfStartAllowed, stopRequested, maxRecordingMs, requireRecordingWseq,
   });
   latest.current = {
     sessionId, recording, recSeq, commandSeq, turnKey, containsDirectIdentifier,
-    connectionReady, suspended, selfStartAllowed, stopRequested, maxRecordingMs,
+    connectionReady, suspended, selfStartAllowed, stopRequested, maxRecordingMs, requireRecordingWseq,
   };
   const mountedRef = useRef(true);
   const startGeneration = useRef(0);
@@ -391,6 +394,7 @@ export function useVoxRecorder(opts: {
           session_id: pending.meta.sessionId,
           turn_key: pending.meta.turnKey,
           contains_direct_identifier: pending.meta.containsDirectIdentifier,
+          ...(pending.meta.recordingWseq === undefined ? {} : { recording_wseq: pending.meta.recordingWseq }),
         });
       } catch (error) {
         if (error instanceof ApiError && error.status === 409) {
@@ -631,6 +635,7 @@ export function useVoxRecorder(opts: {
           sessionId: meta.sessionId,
           turnKey: meta.turnKey,
           containsDirectIdentifier: meta.containsDirectIdentifier,
+          recordingWseq: meta.recordingWseq,
           durationSeconds: rec.durationSeconds,
           blob: rec.blob,
         });
@@ -817,7 +822,8 @@ export function useVoxRecorder(opts: {
       // 场次暂停/终态或准入失效均不得弹出浏览器麦克风权限。
       const authorization = await api.recordingAuthorization(permit.sessionId, { device: true });
       if (!permitIsCurrent(permit)) return;
-      if (!authorizesMicrophoneStart(authorization)) {
+      if (!authorizesMicrophoneStart(authorization) || (now.requireRecordingWseq
+        && (!Number.isSafeInteger(permit.commandSeq) || Number(permit.commandSeq) < 1 || authorization.recording_wseq !== permit.commandSeq))) {
         reportStartFailure(permit, classifyRecordingStartFailure({ kind: "authorization" }));
         return;
       }
@@ -825,6 +831,7 @@ export function useVoxRecorder(opts: {
         sessionId: now.sessionId,
         turnKey: now.turnKey,
         containsDirectIdentifier: now.containsDirectIdentifier ?? false,
+        ...(now.requireRecordingWseq ? { recordingWseq: permit.commandSeq } : {}),
       };
       failurePhase = "microphone";
       let started = await recRef.current.start();

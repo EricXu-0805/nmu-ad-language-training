@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { observeRapportSpeech } from "./rapportSpeechCycle.ts";
 import { ttsEngineLabel, ttsToggleTitle } from "./ttsEngineLabel.ts";
 
 test("云端 Qwen 音频不会被误标成本地神经语音", () => {
@@ -66,11 +67,27 @@ test("切受试者、切运行平面和安全暂停都会在 paint 前撤销旧�
   assert.match(silence[0], /isPaused/);
   assert.match(silence[0], /ttsContextKey/);
   assert.match(rapport, /if \(mustSilence \|\|[\s\S]*?\) \{\s*stopSpeaking\(\);/);
-  // 但**只有内容真的换了**才打断:开麦会重签 wseq,把它算进判据会掐断正在播
-  // 的那句并从头重念一遍,而这一遍常发生在麦克风已开之后(机器人自己的声音
-  // 会被录进老人的答句)。所以判据是 contentIdentity,且它不含 wseq。
+  // 内容身份独立于写回序号；播放身份还包含显式重播意图。
   const identity = rapport.match(/const contentIdentity =[\s\S]*?;\n/);
   assert.ok(identity, "RapportStage 缺少内容身份");
   assert.doesNotMatch(identity[0], /wseq/);
-  assert.match(rapport, /spokenIdentityRef\.current === contentIdentity\) return;/);
+  assert.match(rapport, /speechCycle\.current = observeRapportSpeech/);
+});
+
+test("开麦重签与保存不重读；同题显式重播会产生新的播放身份", () => {
+  const first = observeRapportSpeech(null, {
+    content: "认识机器人#0#ask", recSeq: 1, recording: "idle", wseq: 10,
+  });
+  const armed = observeRapportSpeech(first, {
+    content: "认识机器人#0#ask", recSeq: 2, recording: "armed", wseq: 11,
+  });
+  assert.equal(armed.key, first.key, "开麦写不得截断或重读刚才的问句");
+  const saved = observeRapportSpeech(armed, {
+    content: "认识机器人#0#ask", recSeq: 2, recording: "idle", wseq: 12,
+  });
+  assert.equal(saved.key, first.key, "保存写不得把原问句插在老人回答后");
+  const replay = observeRapportSpeech(saved, {
+    content: "认识机器人#0#ask", recSeq: 3, recording: "idle", wseq: 13,
+  });
+  assert.notEqual(replay.key, first.key, "重新播放本问必须产生新一轮播放与回执");
 });

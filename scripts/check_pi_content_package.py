@@ -17,14 +17,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import (  # noqa: E402
     assessment_bundles,
+    assessment_definitions,
     assessment_workflow_policy,
+    content,
     scale_protocol,
 )
 
@@ -49,7 +53,9 @@ def _present(content_dir: Path, relative: str) -> bool:
     return (content_dir / relative).exists()
 
 
-def inspect(content_dir: Path) -> dict[str, object]:
+def _inspect_candidate(content_dir: Path) -> dict[str, object]:
+    """Only called in a fresh process; runtime globals never affect the caller."""
+    content.CONTENT_DIR = content_dir
     files = [
         {"title": title, "path": relative, "present": _present(content_dir, relative),
          "what_it_must_contain": needs}
@@ -57,21 +63,47 @@ def inspect(content_dir: Path) -> dict[str, object]:
     ]
 
     loaders: list[dict[str, object]] = []
-    try:
-        policy = assessment_workflow_policy.load_workflow_policy(content_dir)
-        loaders.append({
-            "piece": assessment_workflow_policy.ASSESSMENT_WORKFLOW_POLICY_FILE,
-            "loaded": policy is not None,
-            "detail": "文件不存在（尚未交付，不是错误）" if policy is None else "结构合法",
-        })
-    except Exception as error:  # noqa: BLE001 — 坏档要原样报出来，不能吞
-        loaders.append({
-            "piece": assessment_workflow_policy.ASSESSMENT_WORKFLOW_POLICY_FILE,
-            "loaded": False,
-            "detail": f"文件存在但结构不合法：{type(error).__name__}",
-        })
+    def load(relative, loader):
+        if not _present(content_dir, relative):
+            loaders.append({"piece": relative, "loaded": False,
+                            "broken": False, "detail": "文件不存在（尚未交付，不是错误）"})
+            return None
+        try:
+            value = loader()
+        except Exception as error:  # fixed type only: never print item words
+            loaders.append({"piece": relative, "loaded": False,
+                            "broken": True,
+                            "detail": f"文件存在但结构或交叉校验不合法：{type(error).__name__}"})
+            return None
+        loaders.append({"piece": relative, "loaded": True,
+                        "broken": False, "detail": "真实装载与交叉校验通过"})
+        return value
 
-    readiness = scale_protocol.scale_protocol_readiness()
+    manifest = load(scale_protocol.SCALE_PROTOCOL_MANIFEST_FILE,
+                    scale_protocol._load_manifest)
+    load(assessment_workflow_policy.ASSESSMENT_WORKFLOW_POLICY_FILE,
+         lambda: assessment_workflow_policy.load_workflow_policy(content_dir))
+
+    def install_bundles():
+        bundles, active_id, raw = assessment_bundles.load_bundle_packages(content_dir)
+        assessment_bundles.assert_training_isolation(raw, content_dir)
+        assessment_definitions.install_production_bundles(
+            bundles, active_bundle_id=active_id)
+        return active_id
+
+    load(f"{assessment_bundles.ASSESSMENT_BUNDLE_DIR}/"
+         f"{assessment_bundles.ASSESSMENT_BUNDLE_INDEX_FILE}", install_bundles)
+
+    # A malformed supplied manifest must not be reloaded or replaced with a
+    # healthy default directory. The empty contract still names missing facts.
+    readiness = (scale_protocol.scale_protocol_readiness()
+                 if manifest is not None and not any(row["broken"] for row in loaders)
+                 else scale_protocol.evaluate_scale_protocol_manifest(
+                     manifest or scale_protocol._MANIFEST, registered_definition_bundles=()))
+    if not all(row["loaded"] for row in loaders):
+        for key in ("ready_for_research", "instance_creation_enabled",
+                    "automatic_scoring_enabled"):
+            readiness[key] = False
     return {
         "content_dir": str(content_dir),
         "files": files,
@@ -90,6 +122,19 @@ def inspect(content_dir: Path) -> dict[str, object]:
                         "automatic_scoring_enabled")
         },
     }
+
+
+def inspect(content_dir: Path) -> dict[str, object]:
+    """Inspect this candidate with a fresh registry and no cloud credentials."""
+    environment = {key: value for key, value in os.environ.items()
+                   if key in {"PATH", "SYSTEMROOT", "LANG", "LC_ALL", "TZ"}}
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", str(Path(__file__).resolve()),
+         "--_inspect-candidate", str(content_dir.resolve())],
+        capture_output=True, text=True, env=environment, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError("候选内容检查进程未完成")
+    return json.loads(result.stdout)
 
 
 def render(report: dict[str, object]) -> str:
@@ -139,8 +184,8 @@ def render(report: dict[str, object]) -> str:
     lines.append("")
     lines.append("说明：工程侧不生成、不猜、不代填任何内容——量表的工具名、版本、"
                  "许可、逐题内容与计分规则都是临床与版权决策。")
-    lines.append("三份文件放进内容目录并重启服务后，正式评估录入与自动计分即开，"
-                 "不需要改任何代码。")
+    lines.append("检查覆盖指定目录中的三件套及其训练词表隔离；"
+                 "文件存在不代表已通过绑定、许可或临床签署。")
     return "\n".join(lines)
 
 
@@ -151,7 +196,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    report = inspect(args.content_dir)
+    try:
+        report = inspect(args.content_dir)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        print("候选内容检查未完成，不能判定交付就绪", file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     else:
@@ -162,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     files = report["files"]
     assert isinstance(files, list)
     broken = any(
-        entry["loaded"] is False and "结构不合法" in str(entry["detail"])
+        entry.get("broken", False)
         for entry in loaders)
     if broken:
         return 2
@@ -170,4 +219,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if len(sys.argv) == 3 and sys.argv[1] == "--_inspect-candidate":
+        print(json.dumps(_inspect_candidate(Path(sys.argv[2])), ensure_ascii=False))
+    else:
+        raise SystemExit(main())

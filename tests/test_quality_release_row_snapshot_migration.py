@@ -14,7 +14,7 @@ from sqlmodel import Session, SQLModel, select
 from app.models import QualityReleaseEpoch, QualityReleaseEpochRowSnapshot
 
 
-HEAD = "d0c22a6dae2a"
+HEAD = "e2a6d8f0b419"
 # 被测层（研究行快照迁移）自身的修订边界：拒绝断言必须钉在这一层，
 # 全局头再往前走也不许把上层空表 DDL 混进「本层 DDL 前拒绝」的观察窗。
 SNAPSHOT_REV = "6f2a9c4d8e17"

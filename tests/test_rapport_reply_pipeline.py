@@ -108,13 +108,13 @@ def _seed_audio(client: TestClient, *, session_id: str, raw_id: str,
             turn_key=turn_key, audio_format="webm",
             is_simulation=True, data_classification="simulation",
             contains_direct_identifier=identity,
-            byte_count=len(payload), checksum="c" * 64,
+            byte_count=len(payload), checksum=hashlib.sha256(payload).hexdigest(),
             uploaded_at=datetime.now(),
         ))
         s.add(AudioCaptureReceipt(
             raw_audio_id=raw_id, session_id=session_id,
             turn_key=turn_key, duration_seconds=2.0,
-            byte_count=len(payload), checksum="c" * 64,
+            byte_count=len(payload), checksum=hashlib.sha256(payload).hexdigest(),
             data_classification="simulation", is_simulation=True,
             contains_direct_identifier=identity,
         ))

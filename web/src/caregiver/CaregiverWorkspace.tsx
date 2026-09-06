@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { bus } from "../sync/bus";
+import { PriorityActionFence } from "./priorityActionFence";
 import { isProviderReadinessPrewriteConflict } from "../autopilot/providerReadiness";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
@@ -172,6 +174,17 @@ function SessionScreen({
   onTakeOver: () => void;
   onEnd: () => void;
 }) {
+  const safetyBar = useRef<HTMLDivElement | null>(null);
+  const [safetyHeight, setSafetyHeight] = useState(108);
+  useLayoutEffect(() => {
+    const bar = safetyBar.current;
+    if (!bar) return;
+    const measure = () => setSafetyHeight(Math.ceil(bar.getBoundingClientRect().height));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(bar);
+    return () => observer.disconnect();
+  }, []);
   const presentation = status ? caregiverStatusPresentation(status) : null;
   const actions = status ? caregiverActionAvailability(status) : null;
   const operationalDemoReady = session.operationalDemoReady
@@ -189,7 +202,31 @@ function SessionScreen({
     && (status.practiceState === "pausing" || status.practiceState === "paused");
 
   return (
-    <section className="page-shell page-shell--medium" aria-labelledby="caregiver-session-title">
+    <section className="page-shell page-shell--medium caregiver-session" style={{ paddingBottom: safetyHeight + 24 }} aria-labelledby="caregiver-session-title">
+      <div ref={safetyBar} className="caregiver-safety-bar" role="group" aria-label="现场安全操作">
+            {showPause && (
+              <Button
+                type="button"
+                variant="danger"
+                size="lg"
+                fullWidth
+                disabled={busyAction === "pause" || (actions !== null && !actions.pause)}
+                onClick={onPause}
+              >
+                {busyAction === "pause" ? "正在暂停…" : "暂停练习"}
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="secondary"
+              size="lg"
+              fullWidth
+              disabled={busy || (actions !== null && !actions.help)}
+              onClick={onHelp}
+            >
+              请求协助
+            </Button>
+      </div>
       <header className="page-header-block">
         <div>
           <p className="page-kicker">本次进行中</p>
@@ -239,7 +276,7 @@ function SessionScreen({
             </div>
           </div>
 
-          {/* 固定两列、暂停恒在第一格：按钮位置不随状态漂移，肌肉记忆才有效。 */}
+          {/* 普通操作与始终可见的安全操作区分开。 */}
           <div
             style={{
               display: "grid",
@@ -247,18 +284,6 @@ function SessionScreen({
               gap: "var(--sp-3)",
             }}
           >
-            {showPause && (
-              <Button
-                type="button"
-                variant="danger"
-                size="lg"
-                fullWidth
-                disabled={busy || (actions !== null && !actions.pause)}
-                onClick={onPause}
-              >
-                {busyAction === "pause" ? "正在暂停…" : "暂停练习"}
-              </Button>
-            )}
             {showStart && (
               <div className="col" style={{ gap: "var(--sp-1)" }}>
                 <Button
@@ -279,16 +304,6 @@ function SessionScreen({
                 )}
               </div>
             )}
-            <Button
-              type="button"
-              variant="secondary"
-              size="lg"
-              fullWidth
-              disabled={busy || (actions !== null && !actions.help)}
-              onClick={onHelp}
-            >
-              请求协助
-            </Button>
             {showTakeOver && (
               <div className="col" style={{ gap: "var(--sp-1)" }}>
                 <Button
@@ -392,6 +407,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
   const [helpReason, setHelpReason] = useState<CaregiverHelpReasonCode | null>(null);
   const [endOpen, setEndOpen] = useState(false);
   const [endSelection, setEndSelection] = useState<CaregiverEndSelection | null>(null);
+  const actionFence = useRef(new PriorityActionFence());
   const requestKeys = useRef(new Map<string, string>());
   const todayRequest = useRef(0);
   const currentSessionId = current?.sessionId ?? null;
@@ -520,6 +536,8 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
   const startPlan = async (plan: CaregiverPlan) => {
     if (busyAction) return;
     const scope = `start:${plan.planId}:${plan.revision}`;
+    const operation = actionFence.current.begin("ordinary");
+    if (operation === null) return;
     setBusyAction("start");
     setStartingPlanId(plan.planId);
     setOperationProblem(null);
@@ -529,6 +547,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         idempotencyKey: keyFor(scope),
         expectedRevision: plan.revision,
       });
+      if (!actionFence.current.current(operation)) return;
       clearKey(scope);
       setCurrent(session);
       setToday((previous) => previous
@@ -536,13 +555,14 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         : previous);
       setNotice("已开始。请确认老人画面已打开。");
     } catch (error) {
+      if (!actionFence.current.current(operation)) return;
       if (isProviderReadinessPrewriteConflict(error)) {
         setOperationProblem(PROVIDER_NOT_READY_MESSAGE);
       } else {
         reportUnconfirmed("开始本次");
       }
     } finally {
-      setBusyAction(null);
+      if (actionFence.current.finish(operation)) setBusyAction(null);
       setStartingPlanId(null);
     }
   };
@@ -552,6 +572,8 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
     const actions = caregiverActionAvailability(status);
     if (!current.operationalDemoReady || !actions.startPractice) return;
     const scope = `start-practice:${current.sessionId}`;
+    const operation = actionFence.current.begin("ordinary");
+    if (operation === null) return;
     setBusyAction("start-practice");
     setOperationProblem(null);
     setNotice(null);
@@ -560,34 +582,42 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         idempotencyKey: keyFor(scope),
         expectedRevision: status.practiceRevision,
       });
+      if (!actionFence.current.current(operation)) return;
       clearKey(scope);
       adoptStatus(next);
       setNotice("练习已开始。请留在老人旁边观察。");
     } catch (error) {
+      if (!actionFence.current.current(operation)) return;
       if (isProviderReadinessPrewriteConflict(error)) {
         setOperationProblem(PROVIDER_NOT_READY_MESSAGE);
       } else {
         reportUnconfirmed("开始练习");
       }
     } finally {
-      setBusyAction(null);
+      if (actionFence.current.finish(operation)) setBusyAction(null);
     }
   };
 
   const pausePractice = async () => {
-    if (!current || busyAction) return;
+    if (!current) return;
     if (status && (caregiverSessionIsTerminal(status) || status.runtimeState === "paused")) return;
+    const operation = actionFence.current.begin("pause");
+    if (operation === null) return;
+    try { bus.post({ type: "safetyStop", sessionId: current.sessionId }); }
+    catch { /* The server safety request must still run if local transport fails. */ }
     setBusyAction("pause");
     setOperationProblem(null);
     setNotice(null);
     try {
       const next = await api.pauseSession(current.sessionId);
+      if (!actionFence.current.current(operation)) return;
       adoptStatus(next);
       setNotice("已暂停。请先照顾老人，再选择下一步。");
     } catch {
+      if (!actionFence.current.current(operation)) return;
       reportUnconfirmed("暂停练习");
     } finally {
-      setBusyAction(null);
+      if (actionFence.current.finish(operation)) setBusyAction(null);
     }
   };
 
@@ -595,6 +625,8 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
     if (!current || !helpReason || busyAction) return;
     if (status && !caregiverActionAvailability(status).help) return;
     const scope = `help:${current.sessionId}:${helpReason}`;
+    const operation = actionFence.current.begin("ordinary");
+    if (operation === null) return;
     setBusyAction("help");
     setOperationProblem(null);
     setNotice(null);
@@ -603,14 +635,18 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         reasonCode: helpReason,
         idempotencyKey: keyFor(scope),
       });
+      if (!actionFence.current.current(operation)) return;
       clearKey(scope);
       adoptStatus(receipt.status);
       setHelpOpen(false);
       setHelpReason(null);
       setNotice(null);
       try {
-        setHelpStatus(await api.getHelpStatus(current.sessionId, receipt.requestId));
+        const help = await api.getHelpStatus(current.sessionId, receipt.requestId);
+        if (!actionFence.current.current(operation)) return;
+        setHelpStatus(help);
       } catch {
+        if (!actionFence.current.current(operation)) return;
         // 读不到四态投影不影响"已经登记"这个事实，但不能因此说得更乐观。
         setHelpStatus({
           requestId: receipt.requestId, state: "recorded",
@@ -618,26 +654,32 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         });
       }
     } catch {
+      if (!actionFence.current.current(operation)) return;
       setHelpOpen(false);
       setHelpReason(null);
       reportUnconfirmed("请求协助");
     } finally {
-      setBusyAction(null);
+      if (actionFence.current.finish(operation)) setBusyAction(null);
     }
   };
 
   const recordHelpDisposition = async (state: CaregiverHelpHumanState) => {
     if (!current || !helpStatus || busyAction) return;
+    const operation = actionFence.current.begin("ordinary");
+    if (operation === null) return;
     setBusyAction("help");
     setOperationProblem(null);
     try {
-      setHelpStatus(await api.recordHelpDisposition(
+      const help = await api.recordHelpDisposition(
         current.sessionId, helpStatus.requestId,
-        { state, note: state === "acknowledged" ? "工作人员已到场" : "现场已处理" }));
+        { state, note: state === "acknowledged" ? "工作人员已到场" : "现场已处理" });
+      if (!actionFence.current.current(operation)) return;
+      setHelpStatus(help);
     } catch {
+      if (!actionFence.current.current(operation)) return;
       reportUnconfirmed(state === "acknowledged" ? "记录到场" : "记录处理完成");
     } finally {
-      setBusyAction(null);
+      if (actionFence.current.finish(operation)) setBusyAction(null);
     }
   };
 
@@ -646,6 +688,8 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
     const actions = caregiverActionAvailability(status);
     if (!actions.takeOver) return;
     const scope = `take-over:${current.sessionId}`;
+    const operation = actionFence.current.begin("ordinary");
+    if (operation === null) return;
     setBusyAction("take-over");
     setOperationProblem(null);
     setNotice(null);
@@ -654,13 +698,15 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         idempotencyKey: keyFor(scope),
         expectedRevision: status.practiceRevision,
       });
+      if (!actionFence.current.current(operation)) return;
       clearKey(scope);
       adoptStatus(next);
       setNotice("已接管。系统已停止自动练习。");
     } catch {
+      if (!actionFence.current.current(operation)) return;
       reportUnconfirmed("接管练习");
     } finally {
-      setBusyAction(null);
+      if (actionFence.current.finish(operation)) setBusyAction(null);
     }
   };
 
@@ -669,6 +715,8 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
     const actions = caregiverActionAvailability(status);
     if (!actions.end) return;
     const scope = `end:${current.sessionId}:${endSelection}`;
+    const operation = actionFence.current.begin("ordinary");
+    if (operation === null) return;
     setBusyAction("end");
     setOperationProblem(null);
     setNotice(null);
@@ -677,6 +725,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         current.sessionId,
         makeCaregiverEndRequest(endSelection, status, keyFor(scope)),
       );
+      if (!actionFence.current.current(operation)) return;
       clearKey(scope);
       setEndOpen(false);
       setEndSelection(null);
@@ -685,16 +734,19 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
         setOperationProblem("正在确认结束，请留在本页稍候。");
       }
     } catch {
+      if (!actionFence.current.current(operation)) return;
       setEndOpen(false);
       setEndSelection(null);
       reportUnconfirmed("结束本次");
     } finally {
-      setBusyAction(null);
+      if (actionFence.current.finish(operation)) setBusyAction(null);
     }
   };
 
   const logoutSafely = async () => {
     if (busyAction) return;
+    const operation = actionFence.current.begin("ordinary");
+    if (operation === null) return;
     setBusyAction("logout");
     setOperationProblem(null);
     setNotice(null);
@@ -711,6 +763,7 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
             return;
           }
           const paused = await api.pauseSession(current.sessionId);
+          if (!actionFence.current.current(operation)) return;
           if (paused.runtimeState !== "paused") {
             adoptStatus(paused);
             setOperationProblem("本次还没有确认安全暂停，已阻止退出。");
@@ -719,11 +772,13 @@ export function CaregiverWorkspace({ api, identity, onLogout }: CaregiverWorkspa
           adoptStatus(paused);
         }
       }
+      if (!actionFence.current.current(operation)) return;
       await onLogout();
     } catch {
+      if (!actionFence.current.current(operation)) return;
       reportUnconfirmed("安全退出");
     } finally {
-      setBusyAction(null);
+      if (actionFence.current.finish(operation)) setBusyAction(null);
     }
   };
 

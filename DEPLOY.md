@@ -1,4 +1,8 @@
-# 部署手册 · 自有 VPS(Docker Compose)
+# 部署手册 · 现役 VPS 与目标 Docker Compose
+
+> **拓扑状态（2026-09-06）**：最近书面上线记录仍为 systemd 裸机 `nmu` + `nmu-caddy`，应用 `c2fd7fd`、库头 `d0c22a6dae2a`，详见 `docs/RELEASE_STATE.md`；本轮未重新 SSH 核验。本文 Docker Compose 部分是目标交付方案，尚不代表现役服务器已完成容器迁移。现役值班与恢复先查 `docs/handover/运维交接_值班与故障处置.md`。
+>
+> 本文禁止的 dirty-tree、删除式同步和现场依赖变更仍然禁止。容器候选卷预检与读取真实容器卷的自动备份尚未完成时，不得用裸机脚本的绿色结果替代容器验收；也不得在未迁移的现役服务器上套用容器命令。
 
 面向：把本平台部署到课题组自有 VPS，供研究者进行开发、模拟预演和受控技术验证。
 
@@ -12,7 +16,7 @@
 | ASR | **受试者原始回答音频** + 题库目标词等识别上下文 | 请求不附受试者编号/画像，但声纹与回答内容本身是敏感受试者数据 |
 | LLM 初评 | 题目类型、目标/可接受表达等判分上下文 + **受试者回答文本** | JudgeInput 禁止画像和直接受试者字段；云结果只作实时运营决策/初评，不是研究真值 |
 | LLM 量表初评（仅 SFACS） | 量表条目原文 + 该受试者训练场次的**聚合数字统计** | 载荷不含受试者编号/姓名/画像，也不含逐题回答文本与时间戳；建议值必须由施测者逐项人工核验才能锁定 |
-| LLM 回应生成（仅第 1 周关系建立） | 当前问句 + 老人该段回答的 **ASR 转写文本** | 自我介绍节（含姓名/年龄问）整节不进此管线；prompt 不含编号/画像；生成句经闭集守卫，越界落回冻结句库 |
+| LLM 回应生成（仅第 1 周关系建立） | 当前问句 + 老人该段回答的 **ASR 转写文本** | 按具体问位绑定录音：姓名/年龄两问和标记含直接标识的录音禁止进云；属相/兴趣/活动及机构环境问位在独立云授权下可进云，属相限制一轮。prompt 不含编号/画像；生成句受守卫，越界落回冻结句库。自由回答仍可能自述身份信息，不能据此宣称绝无个人信息外发 |
 
 浏览器端只访问平台同源接口；上述外发发生在 FastAPI 后端。云 ASR/LLM 已经过按受试者保存的 provider、告知版本、明确允许与撤销时间门禁，且每次外呼前重读；未同意或已撤销时 fail-closed。这个技术门禁不代表已获得伦理许可：正式研究前仍必须由伦理批件和同意材料覆盖云 ASR 声纹、云 LLM 回答文本和云 TTS 固定话术，并核清供应商的数据区域、日志、留存、二次使用和删除条款。
 
@@ -251,7 +255,7 @@ qwen-plus；如切龙媛还需 cosyvoice-v2——`cosyvoice-v3-plus` 需单独�
 5. 其他账号可只读 `GET /ai/provider-readiness`；只有 admin 可 `POST /ai/provider-readiness/probe`。缺失、过期、配置不匹配或必需能力失败时，`POST /sessions/{session_id}/autopilot/start` 在取得控制权前返回结构化 409。
    合成检查是付费高成本操作，应用内每个管理员/IP 限制为最多每分钟一次；反向代理仍应设置第二层配额。
 
-当前 `autopilot/start` 所能进入的唯一服务范围是 **P0a 模拟切片**。正式研究级 autopilot scope 尚未实现，这是代码内部阻断项，不是部署开关；不得删除 simulation guard、修改受试者分类或放宽启动门禁来“启用正式研究”。
+当前 `autopilot/start` 已有独立的模拟与真实研究场次准入分支。P0a 演示只能使用专用模拟档案；真实分支必须显式启用 `ENABLE_AUTOPILOT_REAL_SESSIONS` 且满足其全部前置。这个代码通道不构成正式研究批准，本轮仍只做内部合成演练；不得删除 simulation guard、修改受试者分类或放宽启动门禁来“启用正式研究”。
 受控模拟环境必须同时显式设置 `ALLOW_SIMULATION_DATA=1` 与 `ENABLE_AUTOPILOT_P0A_SIMULATION=1`；后者默认关闭。两者都不会绕过 VisitPlan、provider readiness 或设备 capability。精确绑定的 `week2-single20-demo-v1` 可在双开关下运行 20 题合成模拟计划；默认 canonical 整计划（78 题位，2026-08-21 交互数据包闭合后 `content_freeze_report` 实算 0 个交付缺口）在双开关下同样可跑。这不是真人或正式研究的放行开关——真实场次自动带练由 `ENABLE_AUTOPILOT_REAL_SESSIONS=1` 独立控制，并要求云处理 policy（`CLOUD_PROCESSING_PROVIDER_ID`/`CLOUD_PROCESSING_NOTICE_VERSION`）与逐受试者云授权在案。
 
 ### 7.2 去标识导出 HMAC 密钥
@@ -438,9 +442,9 @@ docker compose ps
 
 4. 用旧版本验证器复核旧 head、integrity/FK、健康和核心聚合数。候选卷中的任何新数据只能进入具名数据治理/对账流程，不得手工合并回旧卷。
 
-**源码目录的 rsync/覆盖发布路径已取消。** 历史上曾因删除式同步遗漏 `.env`
-排除而删掉密钥配置；本轮只接受受审查的不可变镜像和显式外部卷指针，不保留
-任何可执行的 `rsync --delete`、现场 build 或 dirty-tree 部署命令。
+**目标 Compose 交付不接受源码覆盖发布。** 历史上曾因删除式同步遗漏 `.env`
+排除而删掉密钥配置，因此本手册不提供 `rsync --delete`、现场 build 或 dirty-tree 部署命令。
+最近上线记录仍是裸机形态；其维护必须单独绑定已审查提交、完整发布文件清单、匹配的库头/校验器和回滚快照，不能据本文宣称镜像迁移已经完成。
 
 ## 10. 数据库选型
 
@@ -484,8 +488,7 @@ docker compose ps
 最后一行同理：tag 可以被移动，被移动之后没有任何本地信号，而这些 action 在 CI
 里拿得到仓库内容。它们不能比依赖松。
 
-**锁以当前不可变镜像的 Python 3.12 为运行下限。** 历史裸机解释器不再是支持的发布
-路径，也不能反过来决定新镜像的依赖口径。
+**锁以目标不可变镜像的 Python 3.12 为运行下限。** 当前 CI 同时验证 Python 3.12 和现役裸机所用的 3.14；两条运行环境的绿色证据分别记录。裸机解释器不能反过来改变镜像的依赖口径。
 
 下限不是装饰：按 3.12 编译的锁装到 3.10 上会缺 `tomli`/`exceptiongroup`/
 `async-timeout` 三个垫片，反过来则可以，所以 `supply_chain_check.py` 把
@@ -508,10 +511,11 @@ Python 环境，本机缓存不足时仍可能访问包源。脚本本身不会�
 前端共享门会先校验 Node major 是否与 CI 一致（当前为 25），再使用已有
 `node_modules` 运行 lint / pretest / test / build，不会隐式执行 `npm install`。
 
+2026-09-06 已在 GitHub `main` 启用五个实际检查：`backend (3.12)`、`backend (3.14)`、`frontend`、`supply-chain`、`image`，限定由 GitHub Actions 提供；分支必须与基线同步，管理员也受约束，并禁止强推/删除。修改走 PR，但不强制增加第二名审批者。配置文件为 `.github/branch-protection.json`，应用后的独立回读结果见 `docs/audits/2026-09-06-branch-protection.md`。仓库中的配置不会自动同步 GitHub，检查名称变更时必须同时更新托管规则并回读。
+
 - **锁 ↔ 运行环境**：`scripts/supply_chain_check.py --python <解释器>`。锁只在
   安装那一刻起作用；这条守的是"安装之后有没有人手工往里加东西"。已接进
-  `preflight_check.py --lock …`。历史 `deploy_baremetal.sh` 已硬停用，不再存在可执行的
-  rsync 发布或裸机回滚路径；不可以该历史脚本的输出充当当前发布证据。
+  `preflight_check.py --lock …`。历史 `deploy_baremetal.sh` 已硬停用，不可以该历史脚本的输出充当发布证据。现役裸机的受控维护事实另见发布记录；该停用脚本不代表现役已经迁移为容器。
 - **SBOM ↔ 依赖**：`scripts/generate_sbom.py --check`。改了依赖没重出 SBOM 就红。
   输出不带时间戳、serialNumber 由内容摘要推出，所以"无 diff"是个可靠判据。
 - **漏洞**：`scripts/vuln_scan.py` 打 OSV。只发包名和版本号（都是公开信息），
@@ -520,12 +524,12 @@ Python 环境，本机缓存不足时仍可能访问包源。脚本本身不会�
 
 ### 12.3 依赖升级只进入不可变镜像
 
-当前唯一发布形态是第 3、8、9 章定义的“受审查镜像 + 显式候选数据卷”。依赖升级必须在
+目标 Compose 发布形态是第 3、8、9 章定义的“受审查镜像 + 显式候选数据卷”，现役裸机尚未迁移。依赖升级必须在
 受控构建环境重出锁、SBOM、镜像和安全扫描结果，再以镜像 digest 进入候选环境。生产机上
 不得手工 `pip install`、新建或替换 venv、源码编译 Python、现场 build、rsync 源码、直接
 改 shebang 或用 systemd 切换一套未绑定镜像的解释器。
 
-2026-08-06 的裸机 venv 和自编译 Python 记录只作为历史事故背景保存于版本历史，不再
+2026-08-06 的裸机 venv 和自编译 Python 操作记录只作为历史事故背景保存于版本历史，不再
 提供可复制执行的命令。`scripts/deploy_baremetal.sh` 也只剩不可绕过的停用 stub。
 
 ### 12.4 已知的、还没解决的
@@ -641,7 +645,7 @@ FAIL 或 SKIP 都非零退出。
 - [ ] AI 质量口径已确认：`prompt_level=3` 只表示录音尝试所处提示上下文；在床旁答案呈现收据实现前，告知答案次数/比例必须保持未知；延迟只称“录音上传完成→判类完成”，不得包装成完整交互时延
 - [ ] 双真相已执行：AI 只驱动实时流程/初评；人工确认和锁分只发生在 `intervention_completed` 复核窗，现场 closeout 已独立保存，最终完成时与研究真值一起锁定
 - [ ] 58 个自动执行协议缺口已于 2026-08-21 由交互数据包清零（`operational_autopilot_ready=true`，工程侧达成），但数据包 qc_status=draft——本条在正式发布口径下要求**结构冻结获钱凯/丁老师书面双签**后才能勾选
-- [ ] 正式研究级 autopilot scope 已独立实现、审核并在合成研究切片验收；当前 P0a 模拟实现不得通过移除 simulation guard 获得放行
+- [ ] 现有独立真实研究通道已按批准方案审核并完成目标场景验收；开关存在或本地模拟通过不能代替批准，P0a 演示不得通过移除 simulation guard 获得放行
 - [ ] 两类正式结局工具的具体名称、版本、授权、条目、施测/缺失/中止规则、计分算法和批准事实已由 PI/临床团队冻结；已实现的通用 `AssessmentEvent` / `AssessmentInstance` / `ItemResponse` / `ScoringEvidence` / `approved-deferred` / `closeout` / `switch` / 幂等命令合同已在目标环境验收；真实定义与计分制品、逐题录音服务端收据（绑定 patient/event/instance/item/revision 且不可复用）及冻结工作流政策均已安装为可信执行适配器。definitions 完整本身不得显示为“已冻结可用”
 - [ ] 逐次录音、转写、AI 判断、提示和接管可追溯
 - [ ] 确认由课题组自有 VPS 承载本项目持久化数据已获批准；导出走去标识化通道

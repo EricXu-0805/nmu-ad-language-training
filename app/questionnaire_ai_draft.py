@@ -20,12 +20,21 @@ from typing import Optional
 
 from sqlmodel import Session as DBSession, select
 
+from . import cloud_processing
 from .models import ItemEvent, Patient, Session as TrainSession, TurnEvent
 from .questionnaires import QuestionnaireDefinition
 
 DRAFT_ENGINE_ID = "dashscope/qwen-plus/questionnaire-draft.v1"
 _MODEL = "qwen-plus"
 _MAX_RATIONALE_CHARS = 200
+
+
+class DraftProvider:
+    data_boundary = "cloud"
+    provider_id = "aliyun-dashscope"
+
+
+PROVIDER = DraftProvider()
 
 
 @dataclass(frozen=True)
@@ -39,11 +48,20 @@ class DraftOutcome:
     status: str  # generated / not_applicable / unavailable_no_data / unavailable_not_authorized / failed
     engine: Optional[str]
     items: dict[str, DraftItem] = field(default_factory=dict)
+    authorization_snapshot: tuple | None = None
+
+
+def authorization_snapshot(patient: Patient) -> tuple:
+    """A new consent is a new authority, even for the same provider and notice."""
+    return (patient.governance_revision, patient.withdrawal_status,
+            patient.cloud_processing_allowed, patient.cloud_processing_provider_id,
+            patient.cloud_processing_notice_version, patient.cloud_processing_consented_at,
+            patient.cloud_processing_revoked_at)
 
 
 def _cloud_authorized(patient: Patient) -> bool:
-    return (patient.cloud_processing_allowed is True
-            and patient.cloud_processing_revoked_at is None)
+    return (not (patient.withdrawal_status or "").strip()
+            and not cloud_processing.authorization_issues(patient, PROVIDER))
 
 
 def build_evidence(s: DBSession, patient_id: str) -> dict | None:
@@ -180,14 +198,31 @@ def generate_draft(s: DBSession, patient: Patient,
         return DraftOutcome(status="unavailable_not_authorized", engine=None)
     if not os.environ.get("DASHSCOPE_API_KEY"):
         return DraftOutcome(status="failed", engine=DRAFT_ENGINE_ID)
-    evidence = build_evidence(s, patient.patient_id)
+    patient_id = patient.patient_id
+    evidence = build_evidence(s, patient_id)
     if evidence is None:
         return DraftOutcome(status="unavailable_no_data", engine=None)
+    # No caller transaction or stale Patient instance may authorize egress.
+    # Revocation uses this same subject lock and Patient row lock: once it has
+    # returned successfully, a delayed draft cannot begin a provider call.
+    s.rollback()
     try:
-        raw = _call_llm(_build_prompt(definition, evidence))
+        with cloud_processing.serialized_subject_egress(patient_id, bind=s.get_bind()):
+            with DBSession(s.get_bind()) as gate:
+                current = gate.exec(select(Patient).where(
+                    Patient.patient_id == patient_id).with_for_update()).first()
+                if current is None or not _cloud_authorized(current):
+                    return DraftOutcome(
+                        status="unavailable_not_authorized", engine=None)
+                authorization = authorization_snapshot(current)
+                try:
+                    raw = _call_llm(_build_prompt(definition, evidence))
+                finally:
+                    gate.rollback()
     except Exception:  # noqa: BLE001 — 云端任何异常都只降级为 failed，不冒充结果
         return DraftOutcome(status="failed", engine=DRAFT_ENGINE_ID)
     parsed = _parse_drafts(raw, definition)
     if parsed is None:
         return DraftOutcome(status="failed", engine=DRAFT_ENGINE_ID)
-    return DraftOutcome(status="generated", engine=DRAFT_ENGINE_ID, items=parsed)
+    return DraftOutcome(status="generated", engine=DRAFT_ENGINE_ID, items=parsed,
+                        authorization_snapshot=authorization)

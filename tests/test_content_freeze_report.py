@@ -51,17 +51,21 @@ def staged_draft_bank_path(tmp_path) -> Path:
     return path
 
 
-def test_the_shipped_bank_is_reported_as_deliverable_and_cli_exits_zero(capsys):
+def test_shipped_bank_structure_does_not_imply_formal_approval(capsys):
     # 2026-08-19 内容交付钉：冻结、rubric 全齐、零未结构化题位，报告放行。
     report = report_script.collect(_bank())
 
-    assert report["ready_for_research"] is True
+    assert report["structure_ready"] is True
+    assert report["ready_for_research"] is False
+    assert report["formal_approval_verified"] is False
     assert report["blocking_groups"] == []
     assert report["qc_status"] == "frozen"
     assert report["delivery_gap"]["unstructured_source_positions"] == 0
 
-    assert report_script.main([]) == 0
-    assert "没有阻断项" in capsys.readouterr().out
+    assert report_script.main([]) == 1
+    assert "不能据此放行真实受试者" in capsys.readouterr().out
+    assert report_script.main(["--structure-only"]) == 0
+    assert "没有结构性阻断项" in capsys.readouterr().out
 
 
 def test_a_staged_draft_bank_is_reported_as_not_deliverable(
@@ -146,5 +150,6 @@ def test_a_ready_bank_reports_no_blockers_and_exits_zero(monkeypatch, capsys):
     report = report_script.collect(bank)
 
     assert report["blocking_groups"] == []
-    assert report["ready_for_research"] is True
-    assert "没有阻断项" in report_script.render(report, max_items=5)
+    assert report["structure_ready"] is True
+    assert report["ready_for_research"] is False
+    assert "没有结构性阻断项" in report_script.render(report, max_items=5)

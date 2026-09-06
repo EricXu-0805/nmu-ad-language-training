@@ -1,3 +1,4 @@
+import { parsePlaybackReceipt, type RapportPlaybackReceipt } from "./rapportPlayback";
 // 强类型 API 客户端——逐个后端路由一个函数。相对路径:dev 走 Vite 代理、生产由 FastAPI 同源托管。
 // 浏览器只访问同源后端；后端可按部署配置调用云 TTS/ASR/LLM。任何非 2xx 都明确抛错。
 import type {
@@ -936,8 +937,14 @@ export const api = {
       `/sessions/${encodeURIComponent(sid)}/autopilot/resume`,
       buildAutopilotResumeRequest(sid, stateRevision),
     )),
+  rapportPlayback: async (sid: string) => parsePlaybackReceipt(await req<unknown>(
+    "GET", `/sessions/${encodeURIComponent(sid)}/rapport/playback`, undefined,
+    DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true })),
+  reportRapportPlayback: async (sid: string, receipt: RapportPlaybackReceipt) => parsePlaybackReceipt(await req<unknown>(
+    "PUT", `/sessions/${encodeURIComponent(sid)}/rapport/playback`, receipt,
+    DEFAULT_REQUEST_TIMEOUT_MS, { device: true, deviceSessionId: sid })),
   recordingAuthorization: (sid: string, opts?: { device?: boolean }) =>
-    req<{ allowed: boolean; runtime_status: SessionRuntimeStatus; is_simulation: boolean }>(
+    req<{ allowed: boolean; runtime_status: SessionRuntimeStatus; is_simulation: boolean; recording_wseq?: number | null }>(
       "POST", `/sessions/${encodeURIComponent(sid)}/recording-authorization`, undefined,
       DEFAULT_REQUEST_TIMEOUT_MS, opts?.device ? { ...opts, deviceSessionId: sid } : opts),
 
@@ -1280,7 +1287,7 @@ export const api = {
     req<ExportResult>("GET", `/exports/${encodeURIComponent(batchId)}`),
 
   // 音频闸门
-  createAudio: (body: { raw_audio_id: string; turn_key: string; session_id?: string | null; is_reliability_sample?: boolean; contains_direct_identifier?: boolean }) =>
+  createAudio: (body: { raw_audio_id: string; turn_key: string; session_id?: string | null; is_reliability_sample?: boolean; contains_direct_identifier?: boolean; recording_wseq?: number }) =>
     req<{ raw_audio_id: string; registered: true }>("POST", "/audio", body, DEFAULT_REQUEST_TIMEOUT_MS, {
       device: true,
       deviceSessionId: body.session_id ?? undefined,

@@ -8,7 +8,8 @@
 
 工程侧不得代填任何临床话术或判分规则，所以这里只统计和呈现，一个字不生成。
 
-退出码：0 = 题库已满足真实受试者交付条件；1 = 仍有阻断项；2 = 内容文件读不了。
+退出码：0 = 显式 --structure-only 且结构齐备；1 = 仍有阻断或正式批准未验证；
+2 = 内容文件读不了。结构冻结不能代替具名临床签署与正式发布门禁。
 """
 from __future__ import annotations
 
@@ -144,7 +145,10 @@ def collect(bank: content.ItemBank) -> dict[str, object]:
         "draft_revision": meta.get("draft_revision"),
         "qc_status": bank.qc_status,
         "source_protocol_position_count": readiness["source_protocol_position_count"],
-        "ready_for_research": readiness["ready_for_research"],
+        "structure_ready": readiness["ready_for_research"],
+        "ready_for_research": False,
+        "formal_approval_verified": False,
+        "formal_approval_status": "not_verified_by_this_structure_check",
         "operational_autopilot_ready": readiness["operational_autopilot_ready"],
         "blocking_groups": groups,
     }
@@ -164,14 +168,14 @@ def render(report: dict[str, object], *, max_items: int) -> str:
         f" + 源协议未结构化 {gap['unstructured_source_positions']}）",
         f"  计划内 {gap['in_plan_positions']} 个题位里，"
         f"冻结自动化能跑的只有 {gap['runnable_by_frozen_automation']} 个",
-        f"  可用于真实受试者：{'是' if report['ready_for_research'] else '否'}",
+        f"  内容结构与运行合同齐备：{'是' if report['structure_ready'] else '否'}",
+        "  正式使用批准：本检查未验证，不能据此放行真实受试者",
         "",
     ]
     groups = report["blocking_groups"]
     assert isinstance(groups, list)
     if not groups:
-        lines.append("没有阻断项。")
-        return "\n".join(lines)
+        lines.append("没有结构性阻断项；仍需内容负责人、PI 的具名签署与正式发布验收。")
 
     for index, group in enumerate(groups, start=1):
         items = group["items"]
@@ -194,6 +198,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bank", type=Path,
                         default=content.CONTENT_DIR / "item_bank_v1.json")
     parser.add_argument("--json", action="store_true", help="输出机器可读全量")
+    parser.add_argument("--structure-only", action="store_true",
+                        help="退出码只判断内容结构；不构成真实受试者使用批准")
     parser.add_argument("--max-items", type=int, default=12,
                         help="文本模式下每组最多列出几项")
     args = parser.parse_args(argv)
@@ -209,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print(render(report, max_items=args.max_items))
-    return 0 if report["ready_for_research"] else 1
+    return 0 if args.structure_only and report["structure_ready"] else 1
 
 
 if __name__ == "__main__":
