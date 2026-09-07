@@ -109,3 +109,19 @@ jobs:
           exit-code: "1"
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+      - name: 提取已扫描镜像的前端发布构件
+        run: |
+          artifact_dir="$RUNNER_TEMP/nmu-release-artifacts"
+          install -d -m 700 "$artifact_dir"
+          docker create --name nmu-ci-dist nmu-platform:ci
+          docker cp nmu-ci-dist:/app/web/dist "$artifact_dir/dist"
+          docker rm nmu-ci-dist
+          python scripts/verify_browser_dist.py --source-root "$GITHUB_WORKSPACE" "$artifact_dir/dist"
+          docker image inspect nmu-platform:ci --format '{{.Id}}' > "$artifact_dir/image-id.txt"
+          printf '%s\n' "$GITHUB_SHA" > "$artifact_dir/source-commit.txt"
+      - name: 归档同一镜像生成的前端构件与来源
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: nmu-release-artifacts
+          path: ${{ runner.temp }}/nmu-release-artifacts
+          if-no-files-found: error

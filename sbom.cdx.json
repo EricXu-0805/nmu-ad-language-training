@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:76c14f38-2ac1-974a-5b8b-a946d2852ef0",
+  "serialNumber": "urn:uuid:5cc41e43-71d7-5053-48e6-6455434e7b6b",
   "version": 1,
   "metadata": {
     "component": {
@@ -9251,6 +9251,13 @@
       "version": "3.5.8-r0",
       "purl": "pkg:apk/alpine/libssl3@3.5.8-r0",
       "bom-ref": "pkg:apk/alpine/libssl3@3.5.8-r0"
+    },
+    {
+      "type": "operating-system",
+      "name": "libuuid",
+      "version": "2.42.3-r1",
+      "purl": "pkg:apk/alpine/libuuid@2.42.3-r1",
+      "bom-ref": "pkg:apk/alpine/libuuid@2.42.3-r1"
     }
   ]
 }

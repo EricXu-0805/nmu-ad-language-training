@@ -96,7 +96,7 @@ Docker 发布端口时会创建宿主 iptables 规则，单纯配置 UFW 不足�
 ## 2. 取代码 + 配 .env
 
 ```bash
-git clone <你的私有仓库> nmu && cd nmu/platform   # 仓库须私有
+git clone <经批准的源码仓库> nmu && cd nmu/platform   # 密钥和运行数据不得入库
 cp .env.example .env
 chmod 600 .env
 vi .env
@@ -110,7 +110,7 @@ vi .env
 - `SITE_ADDRESS=`：有域名填域名(自动证书)；仅 IP 填 `https://你的IP` 并按第 5 节改 Caddyfile。
 - `TRUSTED_HOSTS=`：填与浏览器访问一致的精确域名或 IP（不含 `https://`、端口或通配符）；Compose 缺失时直接拒绝启动。
 - `DASHSCOPE_API_KEY=`：不填仍可运行基础管理、受监督模拟和本地降级能力，但云 ASR/LLM 不可用，不能据此启用全自动干预。**密钥的两种放法见第 7 节。**
-- `RAPPORT_MAX_ROUNDS=`（默认 2，夹在 1..5）：第 1 周互动态每一问最多聊几轮。老人答完→机器人现编一句→（非末轮**且这句确实在邀请老人接着说**）自动再开麦；末轮那句只做收束不再提问（凡把话头递回老人的句子——问号、「吗/呢/吧/么」结尾、「再讲讲…」这类邀请式——一律拒绝并回落 k1 收束句，端点兜底复核不只靠引擎自身），之后按下一问的真实字数估时自动换问并开麦；本节最后一问聊完提示换节。收束句（j2/k1）说完不续麦；同一问位只请老人重说一次。服务端按发声账本数轮次，不另存列；聊满后仍落一句冻结收束句（`degraded_reason=round_limit`，不调云、不计入轮次），老人永远有回应。设 1 = 退回一问一答一回应。多轮=机器人对老人说更多未预审句子，伦理报备口径见 handover §七。
+- `RAPPORT_MAX_ROUNDS=`（默认 2，夹在 1..5）：第 1 周互动态每一问最多聊几轮。老人答完→机器人现编一句→（非末轮**且这句确实在邀请老人接着说**）自动再开麦；末轮那句只做收束不再提问（凡把话头递回老人的句子——问号、「吗/呢/吧/么」结尾、「再讲讲…」这类邀请式——一律拒绝并回落 k1 收束句，端点兜底复核不只靠引擎自身），之后自动换问，并等待当前有效设备对下一问的实际播放结束回执才开麦；本节最后一问聊完提示换节。收束句（j2/k1）说完不续麦；同一问位只请老人重说一次。服务端按发声账本数轮次，不另存列；聊满后仍落一句冻结收束句（`degraded_reason=round_limit`，不调云、不计入轮次），老人永远有回应。设 1 = 退回一问一答一回应。多轮=机器人对老人说更多未预审句子，伦理报备口径见 handover §七。
 - `RAPPORT_REPLY=` / `RAPPORT_REPLY_MODEL=`（默认 auto / qwen-plus）：第 1 周互动态的回应生成引擎。auto=有 `DASHSCOPE_API_KEY` 则走 qwen；设 off 或引擎不可用时，自动回应一律落回冻结句库（j1/j2/k1），链路不断。LLM 现编句只经「按持久行合成」端点发声，客户端递不进文本。
 - `PROVIDER_READINESS_FINGERPRINT_KEY=`：配置云 Key 时必设的独立随机秘密（至少 32 bytes，不得复用 API Key/PIN/密码）。平台用它在内存中生成凭据世代 HMAC，再只持久化整体配置指纹；轮换任一秘密都会让旧检查立即失效。
 - `PROVIDER_READINESS_TTL_MINUTES=30`：AI 服务合成检查的有效期（5..1440 分钟）。过期或配置指纹变化后，自动干预启动 fail-closed。
@@ -147,7 +147,7 @@ docker compose pull app caddy
 
 发布构件有三层固定边界：Node、Python、Caddy 基础镜像均按 OCI digest 固定；前端使用 `npm ci` 和仓库 lockfile；Python 只从 `requirements-deploy.lock.txt` 以 `--require-hashes` 安装完整传递依赖。不要在服务器上手工补包或改 lock。依赖升级必须在受控分支重新生成 lock、审查版本/哈希差异、完成全量回归后再替换固定构件。
 
-前端构建会同时生成 `build-provenance.json` 与 `browser-dist-sha256.json`。前者分开记录 lock 声明的 Vite/TypeScript/React 插件版本与本次实际解析到的安装版本（任一不一致立即中止构建），并记录实际 Node/V8/平台/架构和 Dockerfile/Compose 声明的三层固定镜像；后者按字节排序覆盖最终 `dist/` 的每个普通文件，并明确只排除清单自身以避免递归悖论。`build-fingerprint.sha256` **只标识代码中明确枚举的输入字节**，不等于跨环境可复现证明、基础镜像证明、依赖漏洞扫描、SBOM、签名或供应链证明。正式发布构建必须在固定 Node 22 builder 内重建，确认 provenance 的 `node_major_matches_declared_release_builder=true`，逐文件复核 dist 清单，并另外保存镜像 digest、SBOM/扫描和签名证据；本机 Node 不匹配时的绿色构建只能作为开发回归。
+前端构建会同时生成 `build-provenance.json` 与 `browser-dist-sha256.json`。前者分开记录 lock 声明的 Vite/TypeScript/React 插件版本与本次实际解析到的安装版本（任一不一致立即中止构建），并记录实际 Node/V8/平台/架构和 Dockerfile/Compose 声明的三层固定镜像；后者按字节排序覆盖最终 `dist/` 的每个普通文件，并明确只排除清单自身以避免递归悖论。`build-fingerprint.sha256` **只标识代码中明确枚举的输入字节**，不等于跨环境可复现证明、基础镜像证明、依赖漏洞扫描、SBOM、签名或供应链证明。正式发布构建必须在固定 Node 22 builder 内重建，确认 provenance 的 `node_major_matches_declared_release_builder=true`，逐文件复核 dist 清单，并另外保存镜像 digest、SBOM/扫描和签名证据。CI image 任务会在扫描通过后归档镜像中提取的 `nmu-release-artifacts`（前端构件、镜像 ID、源码提交）；部署需从对应成功运行独立下载并复验，不能从现役机器反取可信清单。镜像 ID 不等于注册表签名或 OCI 发布证明。本机 Node 不匹配时的绿色构建只能作为开发回归。
 
 默认容器不复制工作区 `data/`，也不安装可选 Piper。若部署本地 Piper 模型，必须把模型与固定版本 `piper-tts` 作为同一个受审查镜像变更安装并完成实际合成验收；不能只挂模型、也不能只装包。未做该变更时系统应明确降级到已配置云 TTS 或浏览器语音，不得把缺包伪装成已具备本地音色。
 
