@@ -276,7 +276,7 @@ test("pointerdown orders physical stop before storage/network and legacy path di
   assert.match(shell, /onPointerDown=\{requestPatientPause\}/);
   assert.match(shell, /type: "patientPauseStop"/);
   assert.match(shell,
-    /stopLocallyForPatientPause\(message\.sessionId, session\.paused === true\)/);
+    /stopLocallyForPatientPause\(message\.sessionId, safetyServerPaused\)/);
   assert.match(shell, /useLayoutEffect\(\(\) => bus\.subscribe/);
   assert.match(shell, /patientPauseOutboxForStopSignal/);
   assert.match(shell, /session\?\.wseq/);

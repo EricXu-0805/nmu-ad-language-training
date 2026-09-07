@@ -29,6 +29,9 @@ services:
       # 镜像引用传入容器后由入口脚本二次校验；只有
       # name@sha256:<64 hex> 可以启动，浮动 tag 会在服务监听前 fail-closed。
       NMU_RELEASE_IMAGE: "${APP_IMAGE:?set immutable APP_IMAGE with @sha256 digest}"
+      # 镜像是否发布/已审查必须由独立 edge 发布证据证明。无值时入口拒绝启动。
+      NMU_EDGE_MODE: "embedded"
+      NMU_EDGE_IMAGE: "${CADDY_IMAGE:-}"
       # 兜底:即便 .env 漏了,也强制认证生效(公网 fail-closed)。
       REQUIRE_AUTH: "1"
       SESSION_COOKIE_SECURE: "1"     # 经 TLS 反代 → 会话 cookie 打 Secure
@@ -62,9 +65,15 @@ services:
       - nmunet
 
   caddy:
-    # 固定到已含 2026 安全修复且支持 request_body 的版本；升级时先在预演环境
-    # `caddy validate`，再显式改版本，避免浮动 tag 无审查改变代理行为。
-    image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    # 原 Caddy 2.11.4 镜像所带 Go 已确认受影响，不能继续作为默认值。
+    # 新镜像尚未发布：必须显式提供经扫描的 @sha256 引用。空值使用保留
+    # invalid 域的不可运行占位，不宣称已有构件；app 入口也会先 fail-closed。
+    # 不使用 ${CADDY_IMAGE:?}，以允许 host-caddy 覆盖文件完全禁用此服务。
+    image: "${CADDY_IMAGE:-invalid.invalid/nmu-caddy-release-not-approved:blocked}"
+    # 代理自身也须先验实际 Caddy/Go，只有通过后才启动 TLS listener。
+    # 不依赖 app 的健康状态或镜像标签来证明 edge 二进制安全。
+    entrypoint: ["sh", "/usr/local/libexec/nmu-caddy-entrypoint.sh"]
+    command: []
     restart: unless-stopped
     stop_grace_period: 30s
     # 只给反代它需要的 SITE_ADDRESS(compose 从 .env 插值),不灌整份 .env——
@@ -76,6 +85,7 @@ services:
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./scripts/caddy-entrypoint.sh:/usr/local/libexec/nmu-caddy-entrypoint.sh:ro
       - caddydata:/data              # 证书(自动 Let's Encrypt 或内部自签 CA)
       - caddyconfig:/config
     depends_on:
@@ -112,6 +122,9 @@ services:
     env_file: "${APP_ENV_FILE:-.env}"
     environment:
       NMU_RELEASE_IMAGE: "${APP_IMAGE:?set immutable APP_IMAGE with @sha256 digest}"
+      NMU_EDGE_MODE: "embedded"
+      NMU_EDGE_IMAGE: "${CADDY_IMAGE:-}"
+      FORWARDED_ALLOW_IPS: "172.28.0.10"
     entrypoint: ["bash", "scripts/docker-migrate.sh"]
     command: []
     volumes:

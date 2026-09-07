@@ -1,5 +1,6 @@
 import { Component, lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { HoldToConfirm } from "./components/holdToConfirm";
 import { clearConsoleWorkspaceState } from "./security/localSensitiveState";
 import { CONSOLE_NOTE_EVENT, PATIENT_VIEW_EVENT, PATIENT_VIEW_EXIT_EVENT, PATIENT_VIEW_REC_EVENT } from "./sync/messages";
 
@@ -184,8 +185,13 @@ function HoldToExit({ onExit }: { onExit: () => void }) {
   const [armed, setArmed] = useState(false);
   const [recActive, setRecActive] = useState(false);
   const [noteCount, setNoteCount] = useState(0);
-  const timer = useRef<number | null>(null);
-  const disarmTimer = useRef<number | null>(null);
+  const confirmButton = useRef<HTMLButtonElement | null>(null);
+  const hold = useRef<HoldToConfirm | null>(null);
+  if (!hold.current) hold.current = new HoldToConfirm({
+    schedule: (callback, delay) => window.setTimeout(callback, delay),
+    cancel: (timer) => window.clearTimeout(timer),
+    showHolding: setHolding, showArmed: setArmed,
+  });
   const pointerId = useRef<number | null>(null);
 
   useEffect(() => {
@@ -198,31 +204,29 @@ function HoldToExit({ onExit }: { onExit: () => void }) {
       window.removeEventListener(CONSOLE_NOTE_EVENT, onNote);
     };
   }, []);
-  useEffect(() => () => {
-    if (timer.current !== null) clearTimeout(timer.current);
-    if (disarmTimer.current !== null) clearTimeout(disarmTimer.current);
-  }, []);
-
-  const start = (e: React.PointerEvent<HTMLButtonElement>) => {
-    // 只认主指针且不可重入:手掌/第二指的 pointerdown 若覆盖计时器,会留下孤儿计时器
-    // 在手抬起后照样触发退出——恰好击穿防误触门槛。
-    if (!e.isPrimary || timer.current !== null || armed) return;
-    pointerId.current = e.pointerId;
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setHolding(true);
-    timer.current = window.setTimeout(() => {
-      timer.current = null;
-      pointerId.current = null;
-      setHolding(false);
-      setArmed(true);
-      disarmTimer.current = window.setTimeout(() => { disarmTimer.current = null; setArmed(false); }, 4000);
-    }, 2500);
+  useEffect(() => () => hold.current?.reset(), []);
+  useEffect(() => { if (armed) confirmButton.current?.focus(); }, [armed]);
+  const keyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== " " && event.key !== "Enter") return;
+    event.preventDefault();
+    if (!event.repeat) hold.current?.press();
   };
-  const cancel = (e: React.PointerEvent) => {
-    if (pointerId.current !== null && e.pointerId !== pointerId.current) return;
+  const keyUp = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== " " && event.key !== "Enter") return;
+    event.preventDefault();
+    hold.current?.release();
+    if (hold.current?.confirm()) onExit();
+  };
+  const start = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!event.isPrimary || pointerId.current !== null) return;
+    pointerId.current = event.pointerId;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    hold.current?.press();
+  };
+  const cancel = (event: React.PointerEvent) => {
+    if (pointerId.current !== null && event.pointerId !== pointerId.current) return;
     pointerId.current = null;
-    setHolding(false);
-    if (timer.current !== null) { clearTimeout(timer.current); timer.current = null; }
+    hold.current?.release();
   };
   const move = (e: React.PointerEvent<HTMLButtonElement>) => {
     // 触屏隐式 pointer capture 会吃掉 pointerleave:滑出按钮范围就地取消按住。
@@ -233,12 +237,10 @@ function HoldToExit({ onExit }: { onExit: () => void }) {
 
   if (armed) {
     return (
-      <button type="button" className="patient-exit-hold is-armed" aria-label="确认返回操作端"
-        onClick={() => {
-          setArmed(false);
-          if (disarmTimer.current !== null) { clearTimeout(disarmTimer.current); disarmTimer.current = null; }
-          onExit();
-        }}>
+      <button ref={confirmButton} type="button" className="patient-exit-hold is-armed" aria-label="确认返回操作端"
+        onPointerDown={start} onPointerUp={cancel} onPointerCancel={() => hold.current?.reset()}
+        onKeyDown={keyDown} onKeyUp={keyUp}
+        onClick={() => { if (hold.current?.confirm()) onExit(); }}>
         点此返回操作端
       </button>
     );
@@ -247,6 +249,7 @@ function HoldToExit({ onExit }: { onExit: () => void }) {
     <button type="button" className={`patient-exit-hold${holding ? " is-holding" : ""}`}
       aria-label={`研究者按住 2.5 秒后确认返回操作端${noteCount > 0 ? ";有待处理提示" : ""}`}
       onPointerDown={start} onPointerUp={cancel} onPointerCancel={cancel} onPointerMove={move}
+      onKeyDown={keyDown} onKeyUp={keyUp} onBlur={() => hold.current?.release()}
       onContextMenu={(e) => e.preventDefault()}>
       <span aria-hidden="true">{holding && recActive ? "录音中 · " : ""}研究者 · 按住返回</span>
       {noteCount > 0 && <span className="patient-exit-hold__note" aria-hidden="true" />}

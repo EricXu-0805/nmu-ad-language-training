@@ -6,6 +6,7 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { EnumSelect, Field, TextInput, TriStateField } from "../components/Field";
 import { StatusPill } from "../components/StatusPill";
 import { useToast } from "../components/ToastContext";
+import { parseIntegerInput } from "./integerInput";
 import { CONSENT_TYPES } from "../types";
 import type { CloudProcessingPolicy, Patient } from "../types";
 import {
@@ -24,14 +25,6 @@ import type { DuplicateIntakeAssessment } from "./patientIntakeDuplicate";
 const CONSENT_STATUSES = ["已同意", "未同意", "已撤回"] as const;
 const SEX_OPTIONS = ["男", "女", "其他", "未记录"] as const;
 
-function intFieldValue(raw: string): number | null {
-  // 只留数字位:误触一个符号/字母不清空已输内容(iPad 输入法极易误触),
-  // 也顺带堵掉 "0x" 十六进制歧义;越界仍由服务端边界报中文人话。
-  const digits = raw.replace(/[^0-9]/g, "");
-  if (!digits) return null;
-  const parsed = Number(digits);
-  return Number.isSafeInteger(parsed) ? parsed : null;
-}
 
 interface DuplicateReview {
   submitted: Patient;
@@ -61,6 +54,10 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
   const [purposeConfirmed, setPurposeConfirmed] = useState<"research" | "simulation" | null>(null);
   const [simulationAcknowledged, setSimulationAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [birthYearInput, setBirthYearInput] = useState("");
+  const [educationInput, setEducationInput] = useState("");
+  const birthYear = parseIntegerInput(birthYearInput, "出生年份", 1900, 2100);
+  const education = parseIntegerInput(educationInput, "受教育年限", 0, 30);
   const [cloudPolicy, setCloudPolicy] = useState<CloudProcessingPolicy | null>(null);
   const [cloudPolicyError, setCloudPolicyError] = useState<string | null>(null);
   const [duplicateReview, setDuplicateReview] = useState<DuplicateReview | null>(null);
@@ -84,6 +81,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
 
   async function submit(then: (patientId: string) => void) {
     if (busy) return;
+    if (birthYear.error || education.error) { toast(birthYear.error ?? education.error ?? "请核对数字输入", "warn"); return; }
     const errors: { patientId?: string; purpose?: string; simulationAck?: string } = {};
     if (purposeConfirmed == null) errors.purpose = "请选择“真实研究档案”或“专用模拟档案”";
     if (p.is_simulation_subject && !simulationAcknowledged) errors.simulationAck = "保存前请勾选此项确认";
@@ -106,7 +104,7 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
     setFieldErrors({});
     const cloudIssue = cloudProcessingChoiceIssue(p.cloud_processing_allowed, cloudPolicy);
     if (cloudIssue) { toast(cloudIssue, "danger"); return; }
-    const submitted = capturePatientIntakeSubmission(p);
+    const submitted = capturePatientIntakeSubmission({ ...p, birth_year: birthYear.value, education_years: education.value });
     setBusy(true);
     try {
       // provider/version/time 均为服务器字段；建档 POST 不携带，随后用具名账号 PATCH
@@ -371,18 +369,18 @@ export function PatientIntakeScreen({ onReady, onCreatePlan, onNextTask, context
               <TextInput value={p.dementia_severity ?? ""} onChange={(e) => set("dementia_severity", e.target.value || null)} placeholder="例如：轻度 / 中度" />
             </Field>
             <TriStateField label="是否符合普通话训练要求" value={p.mandarin_eligible} onChange={(v) => set("mandarin_eligible", v)} />
-            <Field label="出生年份" hint="统计分析用的协变量；只填年份（如 1948），不填出生日期">
-              <TextInput inputMode="numeric" value={p.birth_year == null ? "" : String(p.birth_year)}
-                onChange={(e) => set("birth_year", intFieldValue(e.target.value))}
+            <Field label="出生年份" error={birthYear.error} hint="统计分析用的协变量；只填年份（如 1948），不填出生日期">
+              <TextInput inputMode="numeric" value={birthYearInput} aria-invalid={Boolean(birthYear.error)}
+                onChange={(e) => { setDuplicateReview(null); setDuplicateConfirm(null); setBirthYearInput(e.target.value); }}
                 placeholder="例如 1948" autoComplete="off" />
             </Field>
             <Field label="性别">
               <EnumSelect options={SEX_OPTIONS} value={p.sex ?? null}
                 onChange={(v) => set("sex", v)} placeholder="请选择（可留空）" />
             </Field>
-            <Field label="受教育年限" hint="按完成的正规教育年数填写，0–30 年">
-              <TextInput inputMode="numeric" value={p.education_years == null ? "" : String(p.education_years)}
-                onChange={(e) => set("education_years", intFieldValue(e.target.value))}
+            <Field label="受教育年限" error={education.error} hint="按完成的正规教育年数填写，0–30 年">
+              <TextInput inputMode="numeric" value={educationInput} aria-invalid={Boolean(education.error)}
+                onChange={(e) => { setDuplicateReview(null); setDuplicateConfirm(null); setEducationInput(e.target.value); }}
                 placeholder="例如 9" autoComplete="off" />
             </Field>
             <Field label="研究分组标签" hint="按研究方案填写，例如：训练组 / 对照组；未分组可留空">

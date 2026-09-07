@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   IDENTITY_SLOT_FIELDS, afterReplyAction, autoAdvanceTarget, defaultRapportFlags,
-  isIdentityQuestion, nextQuestionArmDelayMs, roundLabel, shouldAutoArmOnEntry, speechDelayMs,
+  isIdentityQuestion, roundLabel, shouldAutoArmOnEntry,
 } from "./rapportRounds.ts";
 
 const base = {
@@ -66,21 +66,6 @@ test("shouldAutoArmOnEntry: 自动带练下进到机器人节的任一问都自�
   assert.equal(shouldAutoArmOnEntry({ autoMode: true, speaker: "机器人", questionCount: 0, qIdx: 0 }), false);
   assert.equal(shouldAutoArmOnEntry({ autoMode: true, speaker: "研究者", questionCount: 0, qIdx: 0 }), false);
   assert.equal(shouldAutoArmOnEntry({ autoMode: false, speaker: "机器人", questionCount: 5, qIdx: 0 }), false);
-});
-
-test("speechDelayMs: 起播余量够盖住轮询+云合成,长句封顶,随字数增长", () => {
-  assert.ok(speechDelayMs("好") >= 4000);
-  assert.equal(speechDelayMs("好".repeat(100)), 16000);
-  assert.ok(speechDelayMs("好".repeat(20)) > speechDelayMs("好".repeat(10)));
-});
-
-test("nextQuestionArmDelayMs: 按下一问真实长度估时,长问句给得更久", () => {
-  const short = nextQuestionArmDelayMs("您平时喜欢做些什么呢？");
-  const long = nextQuestionArmDelayMs("这里有没有您熟悉的朋友、同伴或者工作人员呢？");
-  assert.ok(long > short);
-  // 22 字那条光念就约 6.6 秒:旧的固定 7000 会在问句念完前开麦。
-  assert.ok(long > 7000);
-  assert.ok(nextQuestionArmDelayMs(null) >= 4000);
 });
 
 test("roundLabel", () => {

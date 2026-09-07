@@ -1,4 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { observeRapportSpeech, type RapportSpeechCycle } from "./rapportSpeechCycle";
+import { api } from "../api";
+import { playbackIdentity, type RapportPlaybackReceipt } from "../rapportPlayback";
 import { MicButton } from "../components/MicButton";
 import { rapportTurnKey, type RapportMsg } from "../sync/messages";
 import { Centered } from "./Centered";
@@ -8,15 +11,14 @@ import { speak, stopSpeaking } from "./tts";
 import { usePatientPresentation } from "./usePatientPresentation";
 import { onSpeechSettled, ttsEnabled } from "./tts";
 
-// 播放收口信号的兜底上限。迟开麦研究者能手点补救,永不开麦不能。
-// 云合成冷启的上界够用即可;等太久老人会以为没人理他,而迟开麦研究者能手点补救。
-const SPEECH_SETTLE_TIMEOUT_MS = 12000;
+// 失败上限只会停止播放并保持关麦，绝不伪装播放完成。
+const SPEECH_SETTLE_TIMEOUT_MS = 45_000;
 // 第1周单段回答上限。自动带练要靠「说完了就往下走」:老人不按「我说好了」时,
 // 到点自动停麦保存,机器人照常接话。第2-8周的作答窗是 15 秒;第1周是聊天,给宽些。
 // 研究者随时能在控制台点「停止受试者端录音」提前收麦。
 const RAPPORT_MAX_RECORDING_MS = 30_000;
 
-type SpeechGate = { identity: string; settled: boolean } | null;
+type SpeechGate = { identity: string; outcome: "pending" | "played" | "failed" } | null;
 import { useVoxRecorder } from "./useVoxRecorder";
 import type { TtsPlaybackContextKey } from "./ttsContext";
 
@@ -72,50 +74,81 @@ export function RapportStage({
   const utteranceId = rapportStep?.utteranceId;
   const contentIdentity =
     `${rapportStep?.sectionKey ?? ""}#${qIdx}#${beat}#${utteranceId ?? ""}`;
-  const confirmedPositionRef = useRef<string | null>(null);
-  if (contentReady) confirmedPositionRef.current = contentIdentity;
-  const positionConfirmed = confirmedPositionRef.current === contentIdentity;
-  // 已经念过的那一句(按内容身份)。开麦重签 wseq 不改变它,所以不会重念。
+  const confirmedPresentation = useRef<{ identity: string; isRobot: boolean } | null>(null);
+  if (contentReady) confirmedPresentation.current = { identity: contentIdentity, isRobot };
+  const positionConfirmed = confirmedPresentation.current?.identity === contentIdentity;
+  // A wseq refresh masks the old presentation while its replacement loads.
+  // Keep the verified speaker for this content: "not loaded" never means "not a robot".
+  const confirmedRobot = positionConfirmed ? confirmedPresentation.current?.isRobot : undefined;
+  const speechCycle = useRef<RapportSpeechCycle>(null);
+  speechCycle.current = observeRapportSpeech(speechCycle.current, {
+    content: contentIdentity, recSeq: rapportStep?.recSeq,
+    recording: rapportStep?.recording ?? "idle", wseq: rapportStep?.wseq,
+  });
+  const speechIdentity = speechCycle.current.key;
+  const speechRunCounter = useRef(0);
+  // Arm/stop rewrites retain this identity; an explicit idle replay receives a new one.
   const spokenIdentityRef = useRef<string | null>(null);
   // ★开麦闭环:小语这句还没播完就不放行麦克风。
-  // 控制台那边的"等它说完"只能开环估时,而云合成冷启没有上界——抢话时机器人
+  // 控制台也必须等本设备的完成回执；云合成冷启没有上界，抢话时机器人
   // 自己的声音会被录进老人的答句,再被云 ASR 当成老人说的话写进研究账本、
   // 喂进下一轮 prompt。播放收口(播完/失败/被打断)才是唯一可靠的信号。
   const speakingTagRef = useRef<string | null>(null);
   const [speechGate, setSpeechGate] = useState<SpeechGate>(null);
-  useEffect(() => onSpeechSettled((tag) => {
-    if (tag && tag === speakingTagRef.current) {
-      setSpeechGate((gate: SpeechGate) => (gate && !gate.settled ? { ...gate, settled: true } : gate));
-    }
+  const speechRun = useRef<{ identity: string; receipt: Omit<RapportPlaybackReceipt, "outcome">; settled: boolean } | null>(null);
+  const finishSpeech = (outcome: "played" | "failed") => {
+    const run = speechRun.current;
+    if (!run || run.settled) return;
+    run.settled = true;
+    setSpeechGate({ identity: run.identity, outcome });
+    // The exact device receipt is required by the console before it can advance.
+    // Retry the same fact; never turn an uncertain write into a played claim.
+    const receipt = { ...run.receipt, outcome };
+    const deliver = async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (speechRun.current !== run) return;
+        try { await api.reportRapportPlayback(sessionId, receipt); return; }
+        catch { if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 1000)); }
+      }
+    };
+    void deliver();
+  };
+  const finishSpeechRef = useRef(finishSpeech);
+  finishSpeechRef.current = finishSpeech;
+  useEffect(() => onSpeechSettled((tag, outcome) => {
+    if (tag && tag === speakingTagRef.current) finishSpeechRef.current(outcome === "played" ? "played" : "failed");
   }), []);
-  // 收口信号万一没来(引擎异常/订阅错过),不能把麦克风永久锁死:超时即放行。
-  // 迟开麦是可恢复的(研究者能手点),永不开麦不是。
   useEffect(() => {
-    if (!speechGate || speechGate.settled) return;
+    if (!speechGate || speechGate.outcome !== "pending") return;
     const timer = window.setTimeout(() => {
-      setSpeechGate((gate: SpeechGate) => (gate && !gate.settled ? { ...gate, settled: true } : gate));
+      finishSpeechRef.current("failed");
+      stopSpeaking();
     }, SPEECH_SETTLE_TIMEOUT_MS);
     return () => window.clearTimeout(timer);
   }, [speechGate]);
+  useEffect(() => () => { speechRun.current = null; }, []);
   // 小语开口:机器人节话术变了就读;研究者节/脚本未就绪/校验失败一律不读。
   useLayoutEffect(() => {
     // 断线/暂停/这一拍本就不该出声时必须立刻收声;此外只有「内容真的换了」
     // 才打断——仅 wseq 重签造成的呈现闪断不算换内容。
     const mustSilence = !connectionReady || isPaused
       || (contentReady && (!isRobot || !text || !ttsContextKey));
-    if (mustSilence || contentIdentity !== spokenIdentityRef.current) {
+    if (mustSilence || speechIdentity !== spokenIdentityRef.current) {
       stopSpeaking();
     }
     if (!connectionReady || isPaused) spokenIdentityRef.current = null;
-  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, contentIdentity]);
+  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, speechIdentity]);
   useEffect(() => {
     if (!(connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey)) return;
-    if (spokenIdentityRef.current === contentIdentity) return;   // 同一句不重念
-    spokenIdentityRef.current = contentIdentity;
-    const speechTag = `rapport:${rapportPresentation?.section_key ?? ""}:${qIdx}:${beat}`;
+    if (spokenIdentityRef.current === speechIdentity) return;   // 同一句不重念
+    spokenIdentityRef.current = speechIdentity;
+    const speechTag = `rapport:${sessionId}:${speechIdentity}:${++speechRunCounter.current}`;
     speakingTagRef.current = speechTag;
-    // 语音关着时没有播放可等,直接算收口。
-    setSpeechGate({ identity: contentIdentity, settled: !ttsEnabled() });
+    const identity = rapportStep && playbackIdentity(rapportStep);
+    if (!identity) return;
+    speechRun.current = { identity: speechIdentity, receipt: identity, settled: false };
+    setSpeechGate({ identity: speechIdentity, outcome: "pending" });
+    if (!ttsEnabled()) { finishSpeechRef.current("failed"); return; }
     speak(text, {
       contextKey: ttsContextKey,
       tag: speechTag,
@@ -125,17 +158,16 @@ export function RapportStage({
         : undefined,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, contentIdentity]);
+  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, speechIdentity]);
 
   // 小语正在念这一句:麦克风等它说完再开。
   // ★不能走 suspended:那是「永久挂起」语义,armed 到达时为真会让 useVoxRecorder
   // 的封存闩用**这条 arm 自己的 recSeq** 把它永久封死(六十轮那个坑的同一机制)。
   // 等播完是「临时等待」——对录音链先把 armed 压成 idle,播完再放行,recSeq 不变,
   // recording 的 idle→armed 边沿会正常触发开麦。
-  const speechInFlight = speechGate !== null
-    && speechGate.identity === contentIdentity && !speechGate.settled;
+  const speechInFlight = confirmedRobot !== false && (speechGate?.identity !== speechIdentity || speechGate.outcome !== "played");
   const recording = rapportStep?.recording ?? "idle";
-  const gatedRecording = speechInFlight && recording === "armed" ? "idle" : recording;
+  const gatedRecording = speechInFlight && (recording === "armed" || recording === "recording") ? "idle" : recording;
   const {
     stopAndSave, discardForPatientPause, retrySave, saving, canRetry, recActive, micError, saveError,
     starting, remoteCommandBlocked, blockReason,
@@ -153,6 +185,7 @@ export function RapportStage({
     suspended: sessionPaused || sessionTerminal || !positionConfirmed || Boolean(error),
     stopRequested: isPaused || sessionTerminal || !positionConfirmed,
     maxRecordingMs: RAPPORT_MAX_RECORDING_MS,
+    requireRecordingWseq: true,
   });
   useLayoutEffect(() => {
     registerImmediateDiscard?.(discardForPatientPause);
@@ -191,6 +224,7 @@ export function RapportStage({
       <div className="patient-stage-body rapport-body">
         <div className="rapport-brand" aria-hidden="true">语</div>
         <p className="question" aria-live="polite" aria-atomic="true" style={{ maxWidth: "80vw" }}>{text}</p>
+        {speechGate?.identity === speechIdentity && speechGate.outcome === "failed" && <p className="cue" role="status">请稍等，工作人员会检查声音并重新播放</p>}
         {rapportStep?.assentGate && (
           <p className="cue" role="status" aria-live="polite" style={{ color: "var(--c-primary)" }}>等您点头同意，我们再开始</p>
         )}

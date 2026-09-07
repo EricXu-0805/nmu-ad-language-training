@@ -37,6 +37,18 @@ ACTOR_WORK_WRITE_LOCK = threading.RLock()
 _ADVISORY_KEY_DOMAIN = "nmu-governance-fence-v1"
 
 
+def begin_sqlite_write_fence(db) -> None:
+    """Begin a fresh SQLite writer transaction before reading write authority.
+
+    Call only after rollback, inside the process fence. SQLite ignores FOR UPDATE;
+    BEGIN IMMEDIATE serializes these short admission/commit sections across
+    processes as well. Never hold this transaction across a provider call.
+    PostgreSQL callers already hold the subject transaction advisory lock.
+    """
+    if db.get_bind().dialect.name == "sqlite":
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+
 def stable_advisory_key(namespace: str, identity: str) -> int:
     """Return a deterministic signed int64 key namespaced for PostgreSQL.
 

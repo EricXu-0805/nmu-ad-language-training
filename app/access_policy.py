@@ -110,6 +110,10 @@ _ROUTE_RULES = (
     _route({"POST"}, r"/sessions/[^/]+/rapport/utterances/[^/]+/tts",
            AccessKind.DEVICE, roles=TRAINING_OPERATION_ROLES,
            label="合成关系建立回应话术"),
+    _route({"PUT"}, r"/sessions/[^/]+/rapport/playback", AccessKind.DEVICE,
+           roles=TRAINING_OPERATION_ROLES, label="回报当前关系建立话术播放结果"),
+    _route({"GET", "HEAD"}, r"/sessions/[^/]+/rapport/playback", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="核对当前关系建立话术播放结果"),
     _route(
         {"POST"},
         r"/sessions/[^/]+/autopilot/commands/[^/]+/recording-authorization",

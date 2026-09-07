@@ -303,9 +303,11 @@ export function PatientShell() {
   }, [patientPauseLatch, session?.sessionId, session?.paused, session?.wseq, terminal,
     connectionReady, capabilityEpoch]);
 
+  const safetySessionId = session?.sessionId;
+  const safetyServerPaused = session?.paused === true;
   useLayoutEffect(() => bus.subscribe((message) => {
     // 页签间的能力探询不带场次,与本页无关;其余消息必须是本场的。
-    if (!("sessionId" in message) || !session || message.sessionId !== session.sessionId) return;
+    if (!("sessionId" in message) || !safetySessionId || message.sessionId !== safetySessionId) return;
     if (message.type === "patientPauseStop") {
       // A background tab may receive this before its own live poll sees the
       // pause, but must reject it after the shared exact key has completed an
@@ -316,7 +318,7 @@ export function PatientShell() {
       // resolved keys are stale/unrecoverable hints and must not recreate a
       // pause epoch after an authorized resume.
       if (!pending) return;
-      stopLocallyForPatientPause(message.sessionId, session.paused === true);
+      stopLocallyForPatientPause(message.sessionId, safetyServerPaused);
       setPatientPauseLatch(pending);
       return;
     }
@@ -326,11 +328,11 @@ export function PatientShell() {
     clearTtsContext();
     stopAutopilotMediaRef.current();
     setSafetyLatch(() => reconcileBedsideSafetyLatch(
-      latchBedsideSafetyStop(session.sessionId, message.sessionId),
-      session.sessionId,
-      session.paused === true,
+      latchBedsideSafetyStop(safetySessionId, message.sessionId),
+      safetySessionId,
+      safetyServerPaused,
     ));
-  }), [session?.sessionId, session?.paused, stopLocallyForPatientPause]);
+  }), [safetySessionId, safetyServerPaused, stopLocallyForPatientPause]);
 
   useLayoutEffect(() => {
     if (safetyLatch?.sessionId === session?.sessionId

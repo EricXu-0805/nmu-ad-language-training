@@ -551,6 +551,18 @@ def test_unknown_questionnaire_is_a_409_naming_the_registered_catalog(api_env):
 
 def test_value_source_tracks_ai_accept_override_and_human_direct(api_env,
                                                                  monkeypatch):
+    from datetime import datetime
+    from app import cloud_processing
+    monkeypatch.setenv(cloud_processing.PROVIDER_ID_ENV, "aliyun-dashscope")
+    monkeypatch.setenv(cloud_processing.NOTICE_VERSION_ENV, "test-notice-v1")
+    with Session(api_env) as consent_session:
+        patient = consent_session.get(Patient, "P-Q1")
+        patient.cloud_processing_allowed = True
+        patient.cloud_processing_provider_id = "aliyun-dashscope"
+        patient.cloud_processing_notice_version = "test-notice-v1"
+        patient.cloud_processing_consented_at = datetime.now()
+        consent_session.add(patient)
+        consent_session.commit()
     researcher = _client("research-a")
     record = _create_record(researcher, "P-Q1", "sfacs_v1")
     record_id = record["record_id"]
@@ -558,6 +570,7 @@ def test_value_source_tracks_ai_accept_override_and_human_direct(api_env,
     def fixed_draft(_s, _patient, definition):
         assert definition.questionnaire_id == "sfacs_v1"
         return DraftOutcome(status="generated", engine="test/fixed-draft.v1",
+                            authorization_snapshot=questionnaire_ai_draft.authorization_snapshot(_patient),
                             items={
                                 "sfacs_01": DraftItem(value="7", rationale="固定草稿"),
                                 "sfacs_02": DraftItem(value="5", rationale="固定草稿"),

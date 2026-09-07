@@ -23,7 +23,10 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 # libcrypto3/libssl3 显式钉在底座之上：底座那层是 2026-06-16 构建的，带 3.5.7-r0，
 # 而 CVE-2026-14456 的修复 3.5.8-r0 是 2026-08-25 才进 Alpine 3.24 的。等底座重建
 # 追上之后这两项会变成同版本的空操作，但仍然留着——底座换 digest 时它是硬下限。
-RUN apk add --no-cache bash=5.3.9-r1 libcrypto3=3.5.8-r0 libssl3=3.5.8-r0
+# libuuid 来自 util-linux；2026-09-05 的 2.42.3-r1 包含本次镜像扫描命中的七项
+# util-linux HIGH 修复（r0 修复六项，r1 补上 CVE-2026-78408）。不豁免底座旧包。
+# 官方修复记录：https://secdb.alpinelinux.org/v3.24/main.json
+RUN apk add --no-cache bash=5.3.9-r1 libcrypto3=3.5.8-r0 libssl3=3.5.8-r0 libuuid=2.42.3-r1
 
 # 云端为主：默认只装核心运行依赖(不含 pytest/piper)。要本地神经兜底音色可另装 piper。
 COPY requirements-deploy.txt requirements-deploy.lock.txt ./

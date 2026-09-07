@@ -6,6 +6,7 @@ export interface AudioOutboxEntry {
   sessionId: string;
   turnKey: string;
   containsDirectIdentifier: boolean;
+  recordingWseq?: number;
   durationSeconds: number;
   blobBytes: number;
   mimeType: string;
@@ -25,7 +26,7 @@ const HAS_CONTROL_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 const ENTRY_KEYS = new Set([
   "schemaVersion", "rawAudioId", "sessionId", "turnKey", "containsDirectIdentifier",
   "durationSeconds", "blobBytes", "mimeType", "phase", "checksum", "createdAtMs", "updatedAtMs",
-  "autopilotStopReason", "captureReceiptServerSeq",
+  "autopilotStopReason", "captureReceiptServerSeq", "recordingWseq",
 ]);
 const PHASE_ORDER: Record<AudioOutboxPhase, number> = {
   captured: 0,
@@ -82,6 +83,9 @@ export function parseAudioOutboxEntry(value: unknown): AudioOutboxEntry {
         || row.captureReceiptServerSeq <= 0)) {
     throw new Error("录音 outbox 服务器采集收据非法");
   }
+  if (row.recordingWseq !== undefined && (!Number.isSafeInteger(row.recordingWseq) || row.recordingWseq < 1)) {
+    throw new Error("录音 outbox 开麦指令编号无效");
+  }
   return row as AudioOutboxEntry;
 }
 
@@ -90,6 +94,7 @@ export function createAudioOutboxEntry(input: {
   sessionId: string;
   turnKey: string;
   containsDirectIdentifier: boolean;
+  recordingWseq?: number;
   durationSeconds: number;
   blob: Blob;
   nowMs?: number;
@@ -101,6 +106,7 @@ export function createAudioOutboxEntry(input: {
     sessionId: input.sessionId,
     turnKey: input.turnKey,
     containsDirectIdentifier: input.containsDirectIdentifier,
+    ...(input.recordingWseq === undefined ? {} : { recordingWseq: input.recordingWseq }),
     durationSeconds: input.durationSeconds,
     blobBytes: input.blob.size,
     mimeType: input.blob.type || "audio/webm",

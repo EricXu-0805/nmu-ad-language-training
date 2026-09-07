@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import re
 import shutil
@@ -17,6 +18,16 @@ from scripts import check_database_head, check_release_contract
 
 ROOT = Path(__file__).resolve().parents[1]
 VALID_IMAGE = "registry.invalid/nmu/app@sha256:" + "a" * 64
+EDGE_DEPENDENCIES = {
+    "golang.org/x/crypto": "v0.55.0",
+    "golang.org/x/net": "v0.57.0",
+    "golang.org/x/text": "v0.41.0",
+    "google.golang.org/grpc": "v1.83.1",
+}
+EDGE_DEPENDENCY_LINES = "".join(
+    f"\tdep\t{module}\t{version}\th1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+    for module, version in EDGE_DEPENDENCIES.items()
+)
 
 
 def test_caddy_large_body_limit_is_scoped_to_canonical_audio_put():
@@ -98,11 +109,102 @@ def test_release_image_contract_accepts_digest_without_echoing_private_reference
     private_reference = "private.registry.invalid/study/app:v1@sha256:" + "b" * 64
     monkeypatch.setenv("NMU_RELEASE_IMAGE", private_reference)
     monkeypatch.setenv("FORWARDED_ALLOW_IPS", "172.28.0.10")
+    monkeypatch.setenv("NMU_EDGE_MODE", "embedded")
+    monkeypatch.setenv("NMU_EDGE_IMAGE", "private.registry.invalid/edge@sha256:" + "c" * 64)
 
     assert check_release_contract.main() == 0
     output = capsys.readouterr()
     assert private_reference not in output.out + output.err
     assert output.out.strip() == "OK release_image_immutable"
+
+
+@pytest.mark.parametrize("mode,image,code", (
+    (None, None, "edge_mode_not_explicit"),
+    ("", None, "edge_mode_not_explicit"),
+    ("embedded", None, "edge_image_not_immutable"),
+    ("embedded", "", "edge_image_not_immutable"),
+    ("embedded", "caddy:2.11.4", "edge_image_not_immutable"),
+    ("embedded", "private.invalid/renamed@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648", "edge_image_known_vulnerable"),
+    ("host", VALID_IMAGE, "host_edge_image_must_be_unset"),
+))
+def test_edge_contract_rejects_missing_mutable_or_known_bad_images(mode, image, code):
+    with pytest.raises(check_release_contract.ReleaseContractError, match=code):
+        check_release_contract.validate_edge_contract(mode, image)
+
+
+@pytest.mark.parametrize("mode,image", (("host", None), ("host", ""), ("embedded", VALID_IMAGE)))
+def test_edge_topology_contract_accepts_only_explicit_modes(mode, image):
+    check_release_contract.validate_edge_contract(mode, image)
+
+
+def _run_edge_stub(tmp_path, build_info, version="v2.11.4"):
+    stub = tmp_path / "caddy"
+    marker = tmp_path / "listener-started"
+    stub.write_text(
+        "#!/bin/sh\ncase \"$1\" in\n"
+        "version) printf '%s\\n' \"$TEST_CADDY_VERSION\" ;;\n"
+        "build-info) printf '%s' \"$TEST_CADDY_BUILD\" ;;\n"
+        "run) printf '%s\\n' \"$*\" > \"$TEST_CADDY_RUN_MARKER\" ;;\n"
+        "*) exit 2 ;;\nesac\n", encoding="utf-8")
+    stub.chmod(0o700)
+    result = subprocess.run(["sh", str(ROOT / "scripts/caddy-entrypoint.sh")],
+                            env={"PATH": f"{tmp_path}:/usr/bin:/bin", "TEST_CADDY_VERSION": version,
+                                 "TEST_CADDY_BUILD": build_info, "TEST_CADDY_RUN_MARKER": str(marker)},
+                            capture_output=True, text=True, check=False)
+    return result, marker
+
+
+@pytest.mark.parametrize("go_lines,version,accepted", (
+    ("go\tgo1.26.8\n", "v2.11.4", True),
+    ("go\tgo1.26.3\n", "v2.11.4", False),
+    ("go\tgo1.26.8\ngo\tgo1.26.3\n", "v2.11.4", False),
+    ("go\tgo1.26.8\n", "v2.11.3", False),
+    ("mod\tprivate-provider\n", "v2.11.4", False),
+    ("go\tgo1.26.8 extra\n", "v2.11.4", False),
+))
+def test_edge_process_never_runs_listener_before_actual_build_check(tmp_path, go_lines, version, accepted):
+    result, marker = _run_edge_stub(tmp_path, go_lines + EDGE_DEPENDENCY_LINES, version)
+    assert (result.returncode == 0) is accepted
+    assert marker.exists() is accepted
+    if accepted:
+        assert marker.read_text().strip() == "run --config /etc/caddy/Caddyfile --adapter caddyfile"
+    else:
+        assert result.returncode == 78
+        assert result.stderr.strip() == "REJECTED code=edge_binary_build_not_approved"
+        assert "private-provider" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("module", EDGE_DEPENDENCIES)
+@pytest.mark.parametrize("mutation", ("missing", "old_version", "duplicate", "replacement", "no_checksum"))
+def test_edge_process_rejects_unapproved_actual_dependency_before_listener(tmp_path, module, mutation):
+    line = next(line for line in EDGE_DEPENDENCY_LINES.splitlines(keepends=True) if f"\t{module}\t" in line)
+    replacement = {
+        "missing": "",
+        "old_version": line.replace(EDGE_DEPENDENCIES[module], "v0.0.1"),
+        "duplicate": line + line,
+        "replacement": line + "\t=>\tprivate.invalid/unapproved\tv1.0.0\th1:AAAA=\n",
+        "no_checksum": "\t".join(line.strip().split("\t")[:3]) + "\n",
+    }[mutation]
+    build_info = "go\tgo1.26.8\n" + EDGE_DEPENDENCY_LINES.replace(line, replacement)
+    result, marker = _run_edge_stub(tmp_path, build_info)
+    assert result.returncode == 78
+    assert not marker.exists()
+    assert result.stderr.strip() == "REJECTED code=edge_binary_build_not_approved"
+    assert "private.invalid" not in result.stdout + result.stderr
+
+
+def test_edge_build_gate_matches_independent_source_contract():
+    pin = json.loads((ROOT / "deploy/caddy-build.json").read_text(encoding="utf-8"))
+    entrypoint = (ROOT / "scripts/caddy-entrypoint.sh").read_text(encoding="utf-8")
+    provenance = (ROOT / "web/scripts/build-integrity.mjs").read_text(encoding="utf-8")
+    assert pin["schema_version"] == "nmu.caddy-build.v1"
+    assert pin["dependency_pins"] == EDGE_DEPENDENCIES
+    for module, version in EDGE_DEPENDENCIES.items():
+        assert f'expected["{module}"] = "{version}"' in entrypoint
+    assert repr(pin["caddy"]["version"]) in entrypoint
+    assert '"go' + pin["go"]["version"] + '"' in entrypoint
+    assert 'caddy_version: "' + pin["caddy"]["version"] + '"' in provenance
+    assert 'go_version: "' + pin["go"]["version"] + '"' in provenance
 
 
 @pytest.mark.parametrize(
@@ -191,7 +293,9 @@ def test_database_head_contract_rejects_missing_database_without_path_leak(
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker missing")
-def test_compose_contract_parses_without_reading_production_env():
+@pytest.mark.parametrize("host_mode", (False, True))
+@pytest.mark.parametrize("edge_image", ("", "caddy:latest", VALID_IMAGE))
+def test_compose_contract_parses_without_reading_production_env(host_mode, edge_image):
     environment = os.environ.copy()
     environment.update({
         "APP_IMAGE": VALID_IMAGE,
@@ -201,6 +305,9 @@ def test_compose_contract_parses_without_reading_production_env():
         "APP_ENV_FILE": ".env.example",
         "SITE_ADDRESS": "training.invalid",
         "TRUSTED_HOSTS": "training.invalid",
+        "CADDY_IMAGE": edge_image,
+        "APP_HOST_PORT": "18000",
+        "HOST_CADDY_BRIDGE_IP": "172.28.0.1",
     })
     version = subprocess.run(
         ["docker", "compose", "version"], cwd=ROOT, env=environment,
@@ -208,8 +315,30 @@ def test_compose_contract_parses_without_reading_production_env():
     if version.returncode != 0:
         pytest.skip("docker compose missing")
 
+    command = ["docker", "compose", "--env-file", ".env.example", "--profile", "maintenance",
+               "-f", "docker-compose.yml"]
+    if host_mode:
+        command.extend(("-f", "docker-compose.host-caddy.yml"))
     result = subprocess.run(
-        ["docker", "compose", "--env-file", ".env.example", "config", "--quiet"],
+        command + ["config", "--format", "json"],
         cwd=ROOT, env=environment, check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == ""
+    services = json.loads(result.stdout)["services"]
+    for service in ("app", "migrate"):
+        configured = services[service]["environment"]
+        assert configured["NMU_EDGE_MODE"] == ("host" if host_mode else "embedded")
+        assert configured["NMU_EDGE_IMAGE"] == ("" if host_mode else edge_image)
+        check_release_contract.validate_forwarded_allow_ips(configured["FORWARDED_ALLOW_IPS"])
+        if host_mode or edge_image == VALID_IMAGE:
+            check_release_contract.validate_edge_contract(configured["NMU_EDGE_MODE"], configured["NMU_EDGE_IMAGE"])
+        else:
+            with pytest.raises(check_release_contract.ReleaseContractError, match="edge_image_not_immutable"):
+                check_release_contract.validate_edge_contract(configured["NMU_EDGE_MODE"], configured["NMU_EDGE_IMAGE"])
+    if host_mode:
+        assert "caddy" not in services
+    else:
+        assert services["caddy"]["entrypoint"] == ["sh", "/usr/local/libexec/nmu-caddy-entrypoint.sh"]
+        assert services["caddy"]["command"] == []
+        mounted = next(row for row in services["caddy"]["volumes"]
+                       if row["target"] == "/usr/local/libexec/nmu-caddy-entrypoint.sh")
+        assert mounted["read_only"] is True

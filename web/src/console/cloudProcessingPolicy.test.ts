@@ -40,7 +40,9 @@ test("建档提交快照不受网络等待期间的草稿编辑影响", () => {
 test("409 核对固定使用 submitted 快照，busy fieldset 不包住重复档案确认区", () => {
   const source = readFileSync(new URL("./PatientIntakeScreen.tsx", import.meta.url), "utf8");
 
-  assert.match(source, /const submitted = capturePatientIntakeSubmission\(p\);/);
+  // The actual async submit/409 behavior (including validated numeric fields)
+  // is exercised in frontendSafetyRegression.test.mjs; do not bind this check
+  // to the draft expression used to construct the immutable submission.
   assert.match(source, /await resolveExisting\(submitted, then\);/);
   assert.doesNotMatch(source, /resolveExisting\(\{\s*\.\.\.p/);
   assert.match(source, /<fieldset[\s\S]*disabled=\{busy\}[\s\S]*aria-busy=\{busy\}/);

@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
 
-HEAD = "d0c22a6dae2a"      # 本层=当前全仓头
+HEAD = "d0c22a6dae2a"      # 本层历史迁移头；全仓头由独立断言验证
 PARENT = "c8e5a1f3b209"
 
 
@@ -48,7 +48,7 @@ def _insert_utterance(connection, *, event_seq: int = 1,
 
 def test_migration_reaches_exactly_one_repo_head(tmp_path):
     config = _config(tmp_path / "app.db")
-    assert ScriptDirectory.from_config(config).get_heads() == [HEAD]
+    assert ScriptDirectory.from_config(config).get_heads() == ["e2a6d8f0b419"]
 
 
 def test_upgrade_creates_ledger_with_exact_constraints(tmp_path):
@@ -160,13 +160,13 @@ def test_clean_downgrade_roundtrips(tmp_path):
     def fingerprint() -> str:
         conn = sqlite3.connect(db)
         try:
-            return guard._schema_contract_fingerprint(conn)
+            return guard._schema_contract_fingerprint(conn, guard.LEGACY_RECOVERY_SCHEMA_TABLES)
         finally:
             conn.close()
 
     first = fingerprint()
     # 首次升级出来的库必须逐字符匹配钉死的恢复指纹(生产要走的正是这条)。
-    assert first == guard.CURRENT_RECOVERY_SCHEMA_SHA256
+    assert first == guard.LEGACY_RECOVERY_SCHEMA_SHA256
     names_before = set(inspect(engine).get_table_names())
 
     command.downgrade(config, PARENT)

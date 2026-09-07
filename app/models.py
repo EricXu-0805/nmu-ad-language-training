@@ -17,7 +17,7 @@ from typing import Optional
 from sqlalchemy import (
     BigInteger, CheckConstraint, Column, ForeignKey, ForeignKeyConstraint,
     Index, Integer, UniqueConstraint, event as sa_event,
-    inspect as sa_inspect,
+    inspect as sa_inspect, text as sa_text,
 )
 from sqlmodel import Field, SQLModel  # type: ignore
 
@@ -958,18 +958,22 @@ def _reject_interaction_presentation_receipt_mutation(*_args) -> None:
 class RapportUtteranceEvent(SQLModel, table=True):
     """第1周关系建立:机器人在回应拍定稿待说的那句话——只追加发声账本。
 
-    行落库在开口**之前**;是否真读给老人听,以 ttsserveevidence
-    (source='rapport_utterance', utterance_id=本行 id) 为准——两表合看才是
-    「说了什么+是否说出」的完整还原。
+    行落库在开口之前，仅证明回应已定稿。ttsserveevidence
+    (source='rapport_utterance', utterance_id=本行 id) 仅证明音频字节已服务；
+    RapportPlaybackReceipt 的 played 仅证明设备报告播放结束。
+    这些证据均不能证明老人实际听见或理解。
 
     补的缺口:回应句从「照脚本可还原」变成「可选/可生成」之后,不落库就无法
-    还原机器人对老人说过什么。``text`` 恒为最终说出口的成句(槽位已回落);
+    还原机器人定稿了什么。``text`` 为待发声的最终成句(槽位已回落);
     ``asr_text`` 仅 llm 来源持有,是喂给生成器的老人转写——属患者数据,
     不进任何研究导出/研究只读接口。
     """
     __table_args__ = (
         UniqueConstraint("session_id", "event_seq",
                          name="uq_rapport_utterance_session_event_seq"),
+        Index("uq_rapport_auto_audio", "session_id", "raw_audio_id", unique=True,
+              sqlite_where=sa_text("origin = 'auto' AND raw_audio_id IS NOT NULL"),
+              postgresql_where=sa_text("origin = 'auto' AND raw_audio_id IS NOT NULL")),
         CheckConstraint("event_seq >= 1",
                         name="ck_rapport_utterance_event_seq_positive"),
         CheckConstraint("source IN ('script','bank','llm','fallback')",
@@ -990,7 +994,7 @@ class RapportUtteranceEvent(SQLModel, table=True):
     source: str = Field(index=True)     # script/bank/llm/fallback
     origin: str = "manual"              # auto=系统自动回应 manual=研究者手点
     reply_id: Optional[str] = None      # bank 来源:28句库句 id
-    text: str                           # 最终说出口的成句
+    text: str                           # 定稿待发声的成句，不证明播放发生
     asr_text: Optional[str] = None      # llm 来源:喂给生成器的老人转写(患者数据)
     asr_engine_version: Optional[str] = None
     reply_engine_version: Optional[str] = None
@@ -1005,6 +1009,39 @@ class RapportUtteranceEvent(SQLModel, table=True):
 @sa_event.listens_for(RapportUtteranceEvent, "before_delete")
 def _reject_rapport_utterance_mutation(*_args) -> None:
     raise RuntimeError("RapportUtteranceEvent 是只追加发声证据，禁止更新或删除")
+
+
+class RapportPlaybackReceipt(SQLModel, table=True):
+    """One device-reported playback outcome for an exact issued presentation.
+
+    This records the device's completion report, not proof of human attention.
+    A new wseq or runtime revision makes the previous outcome inapplicable.
+    """
+    __table_args__ = (
+        UniqueConstraint("session_id", "wseq", name="uq_rapport_playback_generation"),
+        CheckConstraint("wseq >= 1 AND runtime_revision >= 0",
+                        name="ck_rapport_playback_generation"),
+        CheckConstraint("outcome IN ('played','failed')",
+                        name="ck_rapport_playback_outcome"),
+        CheckConstraint("question_idx >= 0", name="ck_rapport_playback_question"),
+    )
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: str = Field(foreign_key="session.session_id", index=True)
+    wseq: int = Field(sa_column=Column(BigInteger, nullable=False))
+    runtime_revision: int
+    section_key: str
+    question_idx: int
+    beat: str
+    utterance_id: Optional[int] = None
+    outcome: str
+    device_token_hash: str
+    received_at: datetime = Field(default_factory=_utc_now_naive)
+
+
+@sa_event.listens_for(RapportPlaybackReceipt, "before_update")
+@sa_event.listens_for(RapportPlaybackReceipt, "before_delete")
+def _reject_rapport_playback_mutation(*_args) -> None:
+    raise RuntimeError("RapportPlaybackReceipt 是只追加证据，禁止更新或删除")
 
 
 class TechnicalPauseReceipt(SQLModel, table=True):
@@ -1479,6 +1516,8 @@ class AudioAssetRow(SQLModel, table=True):
     # 1=升级前设备曾持有 canonical turn_key；2=设备仅持有 opaque
     # 题位 ref。这是非秘密迁移标记，只用于精确恢复旧 outbox。
     patient_turn_ref_version: int = 2
+    recording_wseq: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True))
     audio_format: str = "mp3"                     # 信度/争议子集用 wav（无损/高码率）
     status: AudioStatus = AudioStatus.recorded
     is_reliability_sample: bool = False
@@ -1519,6 +1558,8 @@ class AudioCaptureReceipt(SQLModel, table=True):
     raw_audio_id: str = Field(foreign_key="audioassetrow.raw_audio_id", index=True)
     session_id: str = Field(foreign_key="session.session_id", index=True)
     turn_key: str
+    recording_wseq: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True))
     # Keep evidence chronology on the same UTC-naive basis as device
     # capabilities and server-authoritative commands.  Local-naive timestamps
     # make a valid receipt appear hours in the future on non-UTC deployments.

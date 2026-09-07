@@ -549,6 +549,7 @@ export interface AudioCaptureReceipt {
   data_classification: "research" | "simulation";
   is_simulation: boolean;
   contains_direct_identifier: boolean;
+  recording_wseq?: number | null;
 }
 
 // 判分侧运行时守卫用:这些键一旦出现在 lock 载荷/判分视图 = 违反『画像不进判分』。

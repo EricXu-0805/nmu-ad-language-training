@@ -1,4 +1,6 @@
+import { receiptMatchesRapportArm } from "./rapportRecordingAuthority";
 import { useEffect, useRef, useState } from "react";
+import { playbackIdentity, waitForRapportPlayback, type RapportPlaybackIdentity } from "../../rapportPlayback";
 import { api, ApiError } from "../../api";
 import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
@@ -11,7 +13,7 @@ import { useAudioSaved, useCursorWriter, usePatientRec, useSaveWatchdog } from "
 import { isPatientRecFailure, rapportTurnKey, type RapportBeat, type RecState } from "../../sync/messages";
 import {
   afterReplyAction, autoAdvanceTarget, defaultRapportFlags, isIdentityQuestion,
-  nextQuestionArmDelayMs, roundLabel, shouldAutoArmOnEntry, speechDelayMs,
+  roundLabel, shouldAutoArmOnEntry,
 } from "./rapportRounds";
 import type { Session } from "../../types";
 import { SessionControlBar } from "../SessionControlBar";
@@ -29,7 +31,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const toast = useToast();
   const { script, error: scriptError } = useWeek1Script();
   const {
-    postSession, postRapport, beginSafetyPause, releaseSafetyPause,
+    postSession, postRapport, postRapportWithReceipt, beginSafetyPause, releaseSafetyPause,
     resetSession, syncError, retrySync,
   } = useCursorWriter(session.session_id);
   const { journal, upsertAudio, hydrateFromServer } = useSessionJournal(session.session_id);
@@ -62,10 +64,11 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   // 身份问询的节照脚本),说完自动问下一问、问完自动进下一节。像第2-8周那样。
   const [autoReply, setAutoReply] = useState(true);
   const [replyPending, setReplyPending] = useState(false);
-  // 机器人说完后的自动动作(开麦/续麦/换问/换节)用定时器等它说完;任何人为操作都取消。
+  // 自动动作只接受当前播放代次的设备完成回执；任何人为操作都取消等待。
+  const [playbackProblem, setPlaybackProblem] = useState(false);
   const [roundNote, setRoundNote] = useState<string | null>(null);
-  const afterReplyTimer = useRef<number | null>(null);
-  // 定时器回调来自旧渲染的闭包:动作函数与开关状态一律经 ref 取最新值。
+  const playbackWaitEpoch = useRef(0);
+  // 异步回执来自旧渲染的闭包，动作与开关经 ref 取最新值。
   const latest = useRef({
     armNextRound: (_sk: string, _qi: number, _uid: number) => {},
     armRecording: () => {}, go: (_s: number, _q: number) => {},
@@ -80,13 +83,23 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       ? { beat: "reply" as const, utteranceId: replyBeatRef.current.utteranceId }
       : { beat: "ask" as const });
   const cancelAfterReply = () => {
-    if (afterReplyTimer.current !== null) {
-      window.clearTimeout(afterReplyTimer.current);
-      afterReplyTimer.current = null;
-    }
+    playbackWaitEpoch.current += 1;
     setRoundNote(null);
   };
-  const { bank: replyBank } = useWeek1ReplyBank();
+  const waitForSpeech = async (expected: RapportPlaybackIdentity, epoch: number) => {
+    const result = await waitForRapportPlayback(expected, {
+      read: () => api.rapportPlayback(session.session_id),
+      isCurrent: () => playbackWaitEpoch.current === epoch && !latest.current.interactionBlocked,
+      now: () => Date.now(), sleep: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
+    });
+    if (result === "failed" || result === "timeout") {
+      setPlaybackProblem(true);
+      await pauseRapport();
+      setRoundNote("朗读未完成，已请求暂停。检查声音并恢复场次后，请重新播放本问。");
+    }
+    return result === "played";
+  };
+  const { bank: replyBank, error: replyBankError } = useWeek1ReplyBank();
   // 同一组连点两次不该说同一句;按组各记一个游标,轮着来。
   const replyCursor = useRef<Record<string, number>>({});
   const patientRec = usePatientRec(session.session_id);
@@ -108,6 +121,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   // 自动带练在每个机器人节都开得了:AI 现编(autoOpenHere)或脚本回应二选一。
   const autoModeHere = section?.speaker === "机器人" && questions.length > 0;
   const recSeq = useRef(0);
+  const armedWseq = useRef<number | null>(null);
   // 自动回应回来时研究者可能已换问:回应只写回它出发时的那一问。
   const posRef = useRef("");
   posRef.current = `${section?.key ?? ""}#${qIdx}`;
@@ -125,9 +139,10 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   // 看门狗守"哪一节的回报":录音中换节/暂停守的是旧节,旧节回报到达即达成——
   // 若按"是否当前节"判清,保存成功也弹假警报。
   const watchdogFor = useRef<string | null>(null);
+  const watchdogWseq = useRef<number | null>(null);
   const lastArmedKey = useRef<string | null>(null);
   const handledDeviceFailureId = useRef<string | null>(null);
-  const armWatchdog = (k: string | null) => { watchdogFor.current = k; watchdog.start(); };
+  const armWatchdog = (k: string | null) => { watchdogFor.current = k; watchdogWseq.current = armedWseq.current; watchdog.start(); };
 
   useEffect(() => {
     let cancelled = false;
@@ -159,13 +174,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     || Boolean(recoveryError) || Boolean(patientDeviceFailure);
   // 暂停/设备失败/终态/收尾一旦生效,待定的续麦或换问必须立刻作废:定时器回调
   // 持有的是旧闭包,里面的 interactionBlocked 永远是排定那一帧的值。
-  useEffect(() => {
-    if (interactionBlocked && afterReplyTimer.current !== null) {
-      window.clearTimeout(afterReplyTimer.current);
-      afterReplyTimer.current = null;
-      setRoundNote(null);
-    }
-  }, [interactionBlocked]);
+  useEffect(() => { if (interactionBlocked) cancelAfterReply(); }, [interactionBlocked]);
   const retryRecovery = () => {
     setJournalRetry((n) => n + 1);
     void runtimeControl.refresh();
@@ -293,10 +302,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   useEffect(() => () => withdrawRef.current(), []);
   // 定时器必须随组件一起消失:收尾/退出后旧实例的回调仍持有旧闭包,
   // 能把老人端麦克风打开而新实例屏上显示未录音(复核 P1 热麦路径)。
-  useEffect(() => () => {
-    if (afterReplyTimer.current !== null) window.clearTimeout(afterReplyTimer.current);
-    afterReplyTimer.current = null;
-  }, []);
+  useEffect(() => () => { playbackWaitEpoch.current += 1; }, []);
   useEffect(() => { if (recoveryError) withdrawRef.current(); }, [recoveryError]);
 
   const replySourceLabel = (source: string, reason: string | null): string => {
@@ -315,14 +321,16 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
          round?: number; maxRounds?: number; final?: boolean; invitesMore?: boolean },
     sk: string, qi: number, viaAuto = false,
   ) => {
-    if (recStateRef.current !== "idle") return; // 已重新示意录音:不许回应句顶掉 armed
+    if (recStateRef.current !== "idle" || latest.current.interactionBlocked) return; // 已重新示意录音:不许回应句顶掉 armed
     cancelAfterReply();
+    const epoch = playbackWaitEpoch.current;
     const beatBefore = replyBeatRef.current;
     setBeat("reply");
     replyBeatRef.current = { beat: "reply", utteranceId: u.utteranceId };
     setSpokenReply(u.text);
     setReplyMeta(replySourceLabel(u.source, u.degradedReason));
-    const accepted = await postRapport({ sectionKey: sk, questionIdx: qi, beat: "reply", utteranceId: u.utteranceId, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
+    const accepted = await postRapportWithReceipt({ sectionKey: sk, questionIdx: qi, beat: "reply", utteranceId: u.utteranceId, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
+    if (playbackWaitEpoch.current !== epoch) return;
     if (!accepted) {
       // 落库被拒=机器人没开口;「刚说了」的断言必须收回,不许屏上说谎。
       setSpokenReply(null);
@@ -334,6 +342,10 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       toast("回应句没有送到老人端——检查场次状态后可点分组重试", "warn");
       return;
     }
+    const expected = playbackIdentity(accepted);
+    if (!expected) return;
+    if (!await waitForSpeech(expected, epoch) || playbackWaitEpoch.current !== epoch
+      || recStateRef.current !== "idle" || latest.current.interactionBlocked) return;
     // 自动推进只接在自动回应之后:手点句库/手点脚本回应仍由研究者掌控节奏。
     if (!viaAuto || u.round === undefined || u.maxRounds === undefined
       || u.final === undefined) return;
@@ -351,52 +363,17 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       autoMode: now.autoReply, final: u.final,
       invitesMore: u.invitesMore === true, qIdx: qi, questionCount: now.questionCount,
     });
-    const posAt = posRef.current;
-    // 脚本回应(不进云的问位)没有轮次可言,屏上不标「第 1 / 2 轮」误导研究者。
     const label = u.source === "script" ? "照脚本回应" : roundLabel(u.round, u.maxRounds);
-    // 定时器回调持有的是排定那一帧的闭包:动作与闸门一律经 latest/ref 取最新值,
-    // 并且必须自己再查一遍在途/阻断状态——否则暂停、收尾、卸载后它照样开麦。
-    const stillOurs = () => (
-      posRef.current === posAt
-      && recStateRef.current === "idle"
-      && !latest.current.interactionBlocked
-      && !replyBusyRef.current
-      && latest.current.autoReply
-    );
-    if (action === "rearm") {
-      setRoundNote(`${label} · 小语说完会自动开麦，让老人接着说`);
-      afterReplyTimer.current = window.setTimeout(() => {
-        afterReplyTimer.current = null;
-        if (!stillOurs()) return;
-        setRoundNote(null);
-        // 留在回应拍上开麦:老人屏继续显示小语刚说的那句。若打回 ask 拍,
-        // 老人端会把本问的原问句再念一遍(还可能掐断正在播的追问)。
-        latest.current.armNextRound(sk, qi, u.utteranceId);
-      }, speechDelayMs(u.text));
-    } else if (action === "advance") {
-      setRoundNote(`${label} · 本问聊完，小语说完会自动问下一问`);
-      afterReplyTimer.current = window.setTimeout(() => {
-        afterReplyTimer.current = null;
-        if (!stillOurs()) return;
-        setRoundNote(null);
-        // 换问后的自动开麦由 go 统一安排:前几轮已经把老人训练成「小语说完就该
-        // 我说」,这里不开麦=老人对着关着的麦回答(钱凯最初报的那个现象)。
-        latest.current.go(latest.current.sectionIdx, qi + 1);
-      }, speechDelayMs(u.text));
-    } else if (action === "section_done") {
-      const target = autoAdvanceTarget(now.sections, now.sectionIdx);
-      if (target === null) {
-        setRoundNote(`${label} · 本节问完了，下一节要研究者当面说，请点「下一节」`);
-        return;
-      }
-      setRoundNote(`${label} · 本节问完，小语说完会自动进下一节`);
-      afterReplyTimer.current = window.setTimeout(() => {
-        afterReplyTimer.current = null;
-        if (!stillOurs()) return;
-        setRoundNote(null);
-        latest.current.go(target, 0);
-      }, speechDelayMs(u.text));
+    setRoundNote(`${label} · 朗读已完成`);
+    setRoundNote(null);
+    if (action === "rearm") latest.current.armNextRound(sk, qi, u.utteranceId);
+    else if (action === "advance") latest.current.go(latest.current.sectionIdx, qi + 1);
+    else if (action === "section_done") {
+      const target = autoAdvanceTarget(latest.current.sections, latest.current.sectionIdx);
+      if (target === null) setRoundNote("本节问完了，下一节请研究者当面说，并点「下一节」");
+      else latest.current.go(target, 0);
     }
+
   };
   // 老人端录音落库回报 → 记入作业日志(收尾屏音频闸门据此列出)
   useAudioSaved((m) => {
@@ -411,12 +388,14 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       durationSeconds: m.durationSeconds,
     });
     // 看门狗按"守的节"清:录音中换节/暂停守的是旧节,旧节的成功回报必须能清掉它。
-    if (!isReplay && m.turnKey === watchdogFor.current) {
+    if (!isReplay && m.turnKey === watchdogFor.current
+      && receiptMatchesRapportArm(m.recordingWseq, watchdogWseq.current)) {
       watchdog.clear();
       watchdogFor.current = null;
     }
     // 上一问迟到或刷新重放的回报只记账；不收当前麦克风。
-    if (m.turnKey !== expectedTurnKey || isReplay) return;
+    if (m.turnKey !== expectedTurnKey || isReplay || !receiptMatchesRapportArm(m.recordingWseq, armedWseq.current)) return;
+    armedWseq.current = null;
     if (recState !== "idle" && !interactionBlocked) {
       // 老人自己按"我说好了"停的:把 idle 写回镜像/服务端真值源,否则 armed 残留会让老人端刷新后自动开麦。
       postRapport({
@@ -430,21 +409,23 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     // 自动带练:录音一落账,机器人自己接话。开放 AI 的节走「云 ASR → 现编」;
     // 含姓名/年龄等身份问询的节一个字节都不进云,照冻结脚本回应,流程照样往下走。
     // 失败不打断流程,研究者还能手点分组/脚本回应。
-    if (autoReply && !interactionBlocked && !replyBusyRef.current
+    if (autoReply && replyBank && !interactionBlocked && !replyBusyRef.current
       && lastArmedPosRef.current === posRef.current
       && ((autoOpenHere && replyBank) || (!autoOpenHere && replyLine))) {
       const sk = section?.key ?? "";
       const qi = qIdx;
       const posAt = posRef.current;
+      const requestEpoch = playbackWaitEpoch.current;
       replyBusyRef.current = true;
       setReplyPending(true);
       const request = autoOpenHere
         ? { sectionKey: sk, questionIdx: qi, mode: "auto" as const, rawAudioId: m.rawAudioId }
         : { sectionKey: sk, questionIdx: qi, mode: "script" as const };
       api.rapportReplyCreate(session.session_id, request).then((u) => {
-        if (posRef.current !== posAt) return;
+        if (posRef.current !== posAt || playbackWaitEpoch.current !== requestEpoch) return;
         void applyReply(u, sk, qi, true);
       }).catch(() => {
+        if (playbackWaitEpoch.current !== requestEpoch) return;
         toast(autoOpenHere
           ? "自动回应没有生成——可以点下面的分组，让机器人照句库说一句"
           : "自动回应没有生成——可以点「让机器人回应」再试一次", "warn");
@@ -456,12 +437,15 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   if (!script) return <p>加载第 1 周脚本…</p>;
 
   // 统一推进:换节/换问都先停录(老人端收到 idle 自动收尾保存),再广播新指针。
-  const go = (sIdx: number, q: number) => {
+  const go = async (sIdx: number, q: number) => {
     if (interactionBlocked) return;
     cancelAfterReply();
+    if (recState !== "idle") armWatchdog(lastArmedKey.current);
+    armedWseq.current = null;
+    recSeq.current += 1; // Explicit presentation/replay; arm-only rewrites never use this idle generation.
+    setPlaybackProblem(false);
     const s = script.sections[sIdx];
     const nextFlags = defaultRapportFlags(s?.key ?? "", q, s);
-    if (recState !== "idle") armWatchdog(lastArmedKey.current);
     setRecState("idle");
     setSectionIdx(sIdx);
     setQIdx(q);
@@ -470,26 +454,26 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setSpokenReply(null);
     setReplyMeta(null);
     setRapportFlags(nextFlags);
-    postRapport({ sectionKey: s?.key ?? "", questionIdx: q, beat: "ask", recording: "idle", recSeq: recSeq.current, ...nextFlags });
+    const epoch = playbackWaitEpoch.current;
+    const committed = await postRapportWithReceipt({ sectionKey: s?.key ?? "", questionIdx: q, beat: "ask", recording: "idle", recSeq: recSeq.current, ...nextFlags });
+    if (!committed || playbackWaitEpoch.current !== epoch) return;
     // 自动带练:进到一问就像第2-8周那样,问句念完自动开麦,不用研究者再点录音。
     // 研究者手点上一问/下一问/换节也走这里——他换到哪一问,老人就在哪一问作答。
-    if (!shouldAutoArmOnEntry({
-      autoMode: autoReply, speaker: s?.speaker, questionCount: s?.questions?.length ?? 0, qIdx: q,
-    })) return;
-    const pos = `${s?.key ?? ""}#${q}`;
-    const ask = s?.questions?.[q]?.ask ?? null;
-    setRoundNote("小语问完会自动开麦，让老人回答");
-    afterReplyTimer.current = window.setTimeout(() => {
-      afterReplyTimer.current = null;
-      if (posRef.current !== pos || recStateRef.current !== "idle"
-        || latest.current.interactionBlocked || !latest.current.autoReply
-        || replyBusyRef.current) return;
-      setRoundNote(null);
-      latest.current.armRecording();
-    }, nextQuestionArmDelayMs(ask));
+    if (s?.speaker !== "机器人") return;
+    const expected = playbackIdentity(committed);
+    if (!expected) return;
+    setRoundNote("等老人端确认问句读完后自动开麦");
+    if (!await waitForSpeech(expected, epoch) || playbackWaitEpoch.current !== epoch
+      || recStateRef.current !== "idle" || replyBusyRef.current) return;
+    setRoundNote(null);
+    if (shouldAutoArmOnEntry({
+      autoMode: latest.current.autoReply, speaker: s?.speaker,
+      questionCount: s?.questions?.length ?? 0, qIdx: q,
+    })) latest.current.armRecording();
+
   };
 
-  const armRecording = () => {
+  const armRecording = async () => {
     if (interactionBlocked) return;
     if (!recordingEligible) {
       toast(recStatus === "denied" ? "服务器当前未授权本场录音" : "录音授权尚未确认，系统保持关麦", "warn");
@@ -505,7 +489,13 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     replyBeatRef.current = { beat: "ask", utteranceId: null };
     setSpokenReply(null);
     setReplyMeta(null);
-    postRapport({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "ask", recording: "armed", recSeq: recSeq.current, ...rapportFlags });
+    const armSeq = recSeq.current;
+    const armEpoch = playbackWaitEpoch.current;
+    armedWseq.current = null;
+    const committed = await postRapportWithReceipt({ sectionKey: section?.key ?? "", questionIdx: qIdx, beat: "ask", recording: "armed", recSeq: armSeq, ...rapportFlags });
+    if (recSeq.current !== armSeq || playbackWaitEpoch.current !== armEpoch) return;
+    armedWseq.current = committed?.wseq ?? null;
+    if (!committed) setRecState("idle");
   };
   // 多轮续麦:不改话拍、不动屏上那句回应,只把麦克风重新打开。
   // 走 armRecording 会 setBeat("ask") → 老人端 text 从回应句换回问句 → 朗读
@@ -532,10 +522,15 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     // 与 applyReply 同口径:写被拒 = 麦克风没开。有一条完全静默的拒绝路径
     // (409「已暂停」不弹 toast),不看返回值就会出现"控制台显示在录、老人端
     // 麦克风从未打开"——正是这个功能要消灭的那种沉默。
-    void postRapport({
+    const armSeq = recSeq.current;
+    const armEpoch = playbackWaitEpoch.current;
+    armedWseq.current = null;
+    void postRapportWithReceipt({
       sectionKey: sk, questionIdx: qi, beat: "reply", utteranceId,
       recording: "armed", recSeq: recSeq.current, ...rapportFlags,
     }).then((accepted) => {
+      if (recSeq.current !== armSeq || playbackWaitEpoch.current !== armEpoch) return;
+      armedWseq.current = accepted?.wseq ?? null;
       if (accepted) return;
       setRecState("idle");
       setRoundNote("自动开麦没有被服务器接受——请检查场次状态后手动示意录音");
@@ -549,11 +544,12 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     const sk = section?.key ?? "";
     const qi = qIdx;
     const posAt = posRef.current;
+    const requestEpoch = playbackWaitEpoch.current;
     replyBusyRef.current = true;
     setReplyPending(true);
     api.rapportReplyCreate(session.session_id, { sectionKey: sk, questionIdx: qi, mode: "script" })
-      .then((u) => { if (posRef.current === posAt) void applyReply(u, sk, qi); })
-      .catch(() => toast("回应句没有生成，请再试一次", "danger"))
+      .then((u) => { if (posRef.current === posAt && playbackWaitEpoch.current === requestEpoch) void applyReply(u, sk, qi); })
+      .catch(() => { if (playbackWaitEpoch.current === requestEpoch) toast("回应句没有生成，请再试一次", "danger"); })
       .finally(() => { replyBusyRef.current = false; setReplyPending(false); });
   };
   // 研究者点的是「刚才是哪种情况」,系统在那一组里轮一句。他刚听完老人说什么,
@@ -570,12 +566,13 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     const sk = section?.key ?? "";
     const qi = qIdx;
     const posAt = posRef.current;
+    const requestEpoch = playbackWaitEpoch.current;
     replyBusyRef.current = true;
     setReplyPending(true);
     api.rapportReplyCreate(session.session_id, {
       sectionKey: sk, questionIdx: qi, mode: "bank", replyId: chosen.id,
-    }).then((u) => { if (posRef.current === posAt) void applyReply(u, sk, qi); })
-      .catch(() => toast("回应句没有生成，请再试一次", "danger"))
+    }).then((u) => { if (posRef.current === posAt && playbackWaitEpoch.current === requestEpoch) void applyReply(u, sk, qi); })
+      .catch(() => { if (playbackWaitEpoch.current === requestEpoch) toast("回应句没有生成，请再试一次", "danger"); })
       .finally(() => { replyBusyRef.current = false; setReplyPending(false); });
   };
   latest.current = {
@@ -614,6 +611,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     beginSafetyPause();
     setPausePending(true);
     if (recState !== "idle") armWatchdog(lastArmedKey.current);
+    armedWseq.current = null;
     setRecState("idle");
     try {
       const result = await runtimeControl.pause();
@@ -735,6 +733,8 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
             {autoModeHere && !autoReply && (
               <p className="muted">已关自动带练：每一问要手点「开始受试者端录音」，老人说完再点回应。</p>
             )}
+            {replyBankError && <Alert tone="danger" title="回应句库未能加载">请重新进入本场次；自动带练暂不可用。</Alert>}
+            {roundNote && <p className="muted" role="status" aria-live="polite">{roundNote}</p>}
             {openReplyHere && replyBank && (
               <div className="rapport-reply-picker">
                 <p className="muted">也可以手点：刚才是哪种情况？点一下，机器人就照句库说一句。</p>
@@ -747,7 +747,6 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
                   ))}
                 </div>
                 {replyPending && <p className="muted" role="status">小语正在想怎么回应…</p>}
-                {roundNote && <p className="muted" role="status" aria-live="polite">{roundNote}</p>}
               </div>
             )}
             {spokenReply && (
@@ -759,6 +758,11 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
         )}
         {identityHere && <Alert tone="warn" title="这一问的录音包含直接身份信息">姓名、年龄这两问的录音整段标记为含直接标识，不进云、不转写，导出时进入受控处理。</Alert>}
 
+        {playbackProblem && (
+          <Alert tone="warn" title="朗读未完成，自动推进已停止">
+            请检查老人端声音；确认场次已暂停后恢复，再点“重新播放本问”。
+          </Alert>
+        )}
         {patientDeviceFailure && (
           <Alert tone="danger" title="设备失败，场次已安全暂停">
             老人端麦克风未能安全启动。系统已关闭录音入口并保持当前对话位置；
@@ -783,6 +787,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
             ? <Button variant="primary" onClick={armRecording}>开始受试者端录音{identityHere ? "（含标识）" : ""}</Button>
             : <Button variant="danger" onClick={stopRecording}>停止受试者端录音</Button>)}
           {recState !== "idle" && <StatusPill tone="danger">正在等待受试者端保存</StatusPill>}
+          <Button disabled={interactionBlocked || replyPending || recState !== "idle"} onClick={() => go(sectionIdx, qIdx)}>重新播放本问</Button>
           <Button onClick={recordProxyNaming} disabled={interactionBlocked || proxyBusy}>{proxyBusy ? "正在记录…" : "记录研究者代说物品名"}</Button>
         </div>
       </section>

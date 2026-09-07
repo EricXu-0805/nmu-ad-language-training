@@ -58,7 +58,7 @@ export type SyncMsg =
   | { type: "cursor"; sessionId: string; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; selfStart?: boolean; fbKey?: FeedbackKey; fbItemId?: string; fbSeq?: number; wseq?: number }
   | { type: "rapportStep"; sessionId: string; sectionKey: string; questionIdx: number; beat?: RapportBeat; replyId?: string; utteranceId?: number; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; paused?: boolean; wseq?: number }
   // sessionId:操作端凭它丢弃跨场次的迟到/残留回报(live state 里 audioSaved 存到下次握手才清)。
-  | { type: "audioSaved"; rawAudioId: string; durationSeconds: number; byteCount: number; checksum: string; turnKey: string; sessionId: string; containsDirectIdentifier: boolean }
+  | { type: "audioSaved"; rawAudioId: string; durationSeconds: number; byteCount: number; checksum: string; turnKey: string; sessionId: string; containsDirectIdentifier: boolean; recordingWseq?: number }
   // 老人端麦克风真值上报(自助开录时操作端唯一的感知渠道;也用于示意录音的开麦确认)。
   // 这是"上报"不是"显示状态"——老人端仍只读游标,写者规则不变(audioSaved/patientRec 两类上报除外)。
   | PatientRecMsg;
@@ -302,7 +302,7 @@ function parseAudioSaved(value: unknown, withType: boolean): AudioSavedMsg | nul
   const row = record(value);
   if (!row || !exactKeys(row,
     ["rawAudioId", "durationSeconds", "byteCount", "checksum", "turnKey", "sessionId", "containsDirectIdentifier"],
-    [], withType)
+    ["recordingWseq"], withType)
     || (withType && row.type !== "audioSaved")
     || !safeAudioId(row.rawAudioId)
     || typeof row.durationSeconds !== "number" || !Number.isFinite(row.durationSeconds)
@@ -319,6 +319,10 @@ function parseAudioSaved(value: unknown, withType: boolean): AudioSavedMsg | nul
     turnKey: row.turnKey, sessionId: row.sessionId,
     containsDirectIdentifier: row.containsDirectIdentifier,
   };
+  if (row.recordingWseq !== undefined) {
+    if (!Number.isSafeInteger(row.recordingWseq) || Number(row.recordingWseq) < 1) return null;
+    result.recordingWseq = Number(row.recordingWseq);
+  }
   return result;
 }
 

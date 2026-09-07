@@ -109,14 +109,16 @@ export function DeviceCheckScreen() {
   };
 
   return (
-    <main className="page-shell narrow">
+    <main className="page-shell narrow device-check-page">
       <div className="page-header-block">
+        <div>
         <div className="page-kicker">现场准备 · 由工作人员测试</div>
         <h1 className="page-title">设备基础检查</h1>
         <p className="page-description">
           在训练用的设备和房间里做，约 20 秒。只测音量，不保存、不上传录音。
           请由工作人员操作。
         </p>
+        </div>
       </div>
 
       <p style={{ margin: "0 0 var(--sp-3)" }}>

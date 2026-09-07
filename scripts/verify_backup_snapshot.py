@@ -85,9 +85,10 @@ VPS_CONFIG_FILES = frozenset({
     "nmu-backup.service",
     "nmu-backup.timer",
 })
-SUPPORTED_ALEMBIC_HEADS = frozenset({"d0c22a6dae2a"})
+SUPPORTED_ALEMBIC_HEADS = frozenset({"e2a6d8f0b419"})
+LEGACY_RECOVERY_SCHEMA_SHA256 = "847c2b8db25dd910e5b0e03ad0e24c0c0803a93db7b04e4de4d084e4702c0e00"
 CURRENT_RECOVERY_SCHEMA_SHA256 = (
-    "847c2b8db25dd910e5b0e03ad0e24c0c0803a93db7b04e4de4d084e4702c0e00"
+    "dcf7fe26be6f38d62d528f44cc1a46446527f06ce0c9d4171c0aaf94f6b663f2"
 )
 REQUIRED_APPLICATION_TABLES = frozenset({
     "abnormalevent",
@@ -129,6 +130,7 @@ REQUIRED_APPLICATION_TABLES = frozenset({
     "questionnaireitemvalue",
     "questionnairerecord",
     "rapportutteranceevent",
+    "rapportplaybackreceipt",
     "researchuser",
     "runtimecommand",
     "runtimecommandack",
@@ -147,6 +149,7 @@ REQUIRED_APPLICATION_TABLES = frozenset({
     "week1profile",
 })
 RECOVERY_SCHEMA_TABLES = REQUIRED_APPLICATION_TABLES | {"alembic_version"}
+LEGACY_RECOVERY_SCHEMA_TABLES = RECOVERY_SCHEMA_TABLES - {"rapportplaybackreceipt"}
 
 
 class SnapshotError(RuntimeError):
@@ -256,7 +259,8 @@ def _canonical_table_sql(value: object) -> tuple[tuple[str, ...], str]:
 
 
 def _check_constraint_contract(
-        connection: sqlite3.Connection) -> dict[str, list[tuple[str, str]]]:
+        connection: sqlite3.Connection,
+        table_names: frozenset[str] = RECOVERY_SCHEMA_TABLES) -> dict[str, list[tuple[str, str]]]:
     rows = tuple(connection.execute("PRAGMA database_list"))
     database_path = next(
         (str(row[2]) for row in rows if str(row[1]) == "main"), ""
@@ -279,7 +283,7 @@ def _check_constraint_contract(
                 )
                 for item in inspector.get_check_constraints(table_name)
             )
-            for table_name in sorted(RECOVERY_SCHEMA_TABLES)
+            for table_name in sorted(table_names)
         }
     except SnapshotError:
         raise
@@ -289,12 +293,14 @@ def _check_constraint_contract(
         engine.dispose()
 
 
-def _schema_contract(connection: sqlite3.Connection) -> dict[str, object]:
+def _schema_contract(
+        connection: sqlite3.Connection,
+        table_names: frozenset[str] = RECOVERY_SCHEMA_TABLES) -> dict[str, object]:
     """Return recovery-relevant SQLite structure without DDL-order drift."""
 
     contract: dict[str, object] = {}
-    check_constraints = _check_constraint_contract(connection)
-    for table_name in sorted(RECOVERY_SCHEMA_TABLES):
+    check_constraints = _check_constraint_contract(connection, table_names)
+    for table_name in sorted(table_names):
         quoted_table = _quote_identifier(table_name)
         table_row = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
@@ -385,8 +391,10 @@ def _schema_contract(connection: sqlite3.Connection) -> dict[str, object]:
     return contract
 
 
-def _schema_contract_fingerprint(connection: sqlite3.Connection) -> str:
-    contract = _schema_contract(connection)
+def _schema_contract_fingerprint(
+        connection: sqlite3.Connection,
+        table_names: frozenset[str] = RECOVERY_SCHEMA_TABLES) -> str:
+    contract = _schema_contract(connection, table_names)
     encoded = json.dumps(
         contract,
         ensure_ascii=True,

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import os
+import stat
 import threading
 from typing import Protocol
 
@@ -20,16 +21,71 @@ NOTICE_VERSION_ENV = "CLOUD_PROCESSING_NOTICE_VERSION"
 
 # A provider call and a successful consent revocation must have a total order for
 # each subject.  PostgreSQL row locks provide the cross-worker half of that
-# contract (the caller holds the Patient row while invoking the provider); these
-# striped locks provide the same boundary for SQLite and for threads sharing one
-# application process.  A fixed stripe set avoids retaining patient identifiers
+# contract (the caller holds the Patient row while invoking the provider); the
+# striped process locks plus SQLite file locks provide the local boundary.
+# A fixed stripe set avoids retaining patient identifiers
 # or growing a lock registry indefinitely.  A collision only serializes two
 # unrelated subjects; it never weakens the privacy fence.
 _SUBJECT_EGRESS_LOCKS = tuple(threading.RLock() for _ in range(257))
+_HELD_SQLITE_EGRESS_LOCKS = threading.local()
 
 
 @contextmanager
-def serialized_subject_egress(patient_id: str):
+def _sqlite_egress_file_fence(bind, stripe: int):
+    """Cross-process privacy fence without holding SQLite's clinical writer.
+
+    File-backed SQLite uses a bounded set of private advisory lock files beside
+    the canonical database. In-memory SQLite exists only within its process;
+    its explicit contract is the process lock. Unknown file-lock platforms fail
+    closed. Lock files are coordination state, never patient data or evidence.
+    """
+    if bind.dialect.name != "sqlite":
+        yield
+        return
+    from .db import _sqlite_file_path
+    database = _sqlite_file_path(bind.url)
+    if database is None:
+        # Private or shared-cache memory databases cannot be shared by processes.
+        yield
+        return
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError("sqlite_cloud_egress_requires_posix_file_lock") from exc
+    from .storage_security import ensure_private_directory
+    db_path = database.resolve()
+    db_key = hashlib.sha256(str(db_path).encode("utf-8")).hexdigest()[:20]
+    lock_dir = ensure_private_directory(db_path.parent / f".cloud-egress-{db_key}")
+    lock_path = lock_dir / f"stripe-{stripe:03d}.lock"
+    key = str(lock_path)
+    held = getattr(_HELD_SQLITE_EGRESS_LOCKS, "paths", None)
+    if held is None:
+        held = _HELD_SQLITE_EGRESS_LOCKS.paths = set()
+    if key in held:
+        # flock locks independent open descriptions; do not reopen recursively.
+        yield
+        return
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("sqlite_cloud_egress_requires_nofollow")
+    fd = os.open(lock_path, flags | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError("sqlite_cloud_egress_lock_must_be_regular")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.remove(key)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def serialized_subject_egress(patient_id: str, *, bind):
     """Serialize patient-data egress against grant/revoke/withdrawal writes.
 
     Callers must acquire this lock *before* their database governance locks and
@@ -41,10 +97,8 @@ def serialized_subject_egress(patient_id: str):
     if not normalized:
         raise ValueError("patient_id 必须是非空字符串")
     digest = hashlib.sha256(normalized.encode("utf-8")).digest()
-    lock = _SUBJECT_EGRESS_LOCKS[
-        int.from_bytes(digest[:4], "big") % len(_SUBJECT_EGRESS_LOCKS)
-    ]
-    with lock:
+    stripe = int.from_bytes(digest[:4], "big") % len(_SUBJECT_EGRESS_LOCKS)
+    with _SUBJECT_EGRESS_LOCKS[stripe], _sqlite_egress_file_fence(bind, stripe):
         yield
 
 

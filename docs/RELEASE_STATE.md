@@ -1,4 +1,4 @@
-# 生产状态（唯一权威记录）
+# 部署状态索引与历史记录
 
 > 这个仓库过去没有任何字段记录"生产上跑的是哪个版本"，导致 2026-08-09 那轮独立复核
 > 在仓库里**找不到上一次上线的任何证据**，只能靠人的记忆。这份文件就是为了让那件事
@@ -6,6 +6,10 @@
 >
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
+
+> **2026-09-06 候选修复开始，尚未上线。** 分支 `codex/full-audit-fixes-20260906` 从 `3dbf053` 开始，进度与验收见 `audits/2026-09-06-fix-progress.md`。下方 `c2fd7fd` / `d0c22a6dae2a` 是最近书面上线记录，本轮没有 SSH 重验现役后端、库头或配置。
+>
+> **旧部署树收据的证明范围已纠正。** 历史 `MATCH files=90` 等只覆盖 `app/`、`scripts/` 的 Python 文件，遗漏 content、迁移、前端构件等，不能证明整包一致。历史数值保留为当时记录；今后的验收必须使用修复后的完整清单和独立构建产物证据。现役拓扑按最近记录仍是 systemd 裸机，Compose 是尚待验收的目标方案。
 
 > **2026-09-05 09:07 UTC 已上线 `c2fd7fd`（零迁移；库头仍 `d0c22a6dae2a`）。**
 > 收据 251 §六：属相一问单轮（Eric 拍板）——回应库 `applies_to` 行可选 `max_rounds`，属相问位 1；
@@ -79,12 +83,12 @@
 > **CONSOLE_PIN 已轮换成 10 位**——所有旧配对码作废，每位受试者要重新发码。
 > 顺带装了 10 个 OS 补丁（安全积压归零）。执行记录见收据 230/232。
 
-## 当前生产
+## 最近登记的现役状态（不是实时探测）
 
 | 项 | 值 | 怎么核 |
 | --- | --- | --- |
-| 应用代码版本 | `c2fd7fd`（2026-09-05 09:07 UTC 上线；此前依次 `3f54b58` → `a8f1675` → `47053fd` → `6c8be73` → `f76cd21`） | `scripts/verify_deployed_tree.py --manifest <清单> --revision c2fd7fd` 应输出 `MATCH … identical=90`（2026-09-05 09:08 UTC 实测通过） |
-| 部署树后续同步 | 已与 `main` 一致 | `git diff c2fd7fd..main -- app web alembic` 应为空 |
+| 应用代码版本 | `c2fd7fd`（2026-09-05 09:07 UTC 上线；此前依次 `3f54b58` → `a8f1675` → `47053fd` → `6c8be73` → `f76cd21`） | 当时 Python 子集 `identical=90`；今后须重新采集完整发布清单、前端构件清单和库头，不能重用该子集结果 |
+| 部署树后续同步 | 2026-09-06 审计基线 `3dbf053` 与登记版本的差异为文档；当前修复分支另有候选代码变更 | 逐项比较选定提交的完整发布路径，另验实际部署产物；不得把本地 `main` 名称当作部署证明 |
 | 云 TTS 语速 | `TTS_CLOUD_RATE=1.0`（2026-08-31 Eric 拍板终态；收据 237 重启已生效，1.0 缓存 1290/1290 全命中；0.9/1.0 两套缓存都留盘、可即切） | `grep ^TTS_CLOUD_RATE= /opt/nmu/app/.env`；缓存键带语速，改完必须重跑 `scripts/presynthesize_tts.py`，否则每句新话术都要现场云调用 |
 | 数据库结构版本 | `d0c22a6dae2a`（2026-08-31 23:38 由 `c8e5a1f3b209` 迁移，前闸退 78、后闸退 0） | `sqlite3 /opt/nmu/app/data/app.db "select version_num from alembic_version"` |
 | 备份校验器指纹（前 20 位） | `c27cd1731aed7bf35c1b`（2026-08-31 随头前进；异地已重装并核对一致） | `sha256sum /opt/nmu/app/scripts/verify_backup_snapshot.py`；必须与异地拉取机 `~/Library/nmu-backup/runtime/verifier.sha256` 的**第一列**一致。本次上线已重装，`shasum -c ~/Library/nmu-backup/runtime/verifier.sha256` 现在**输出 OK**（2026-08-17 之前那版第二列写的是仓库路径，仓库一往前走就报与事实无关的 FAILED，已修） |
@@ -94,7 +98,7 @@
 | 服务 | `nmu` + `nmu-caddy` 均 active | `systemctl is-active nmu nmu-caddy` |
 | 库里数据（2026-08-27 只读实查） | 3 个演示受试者档案（`demo-001` 已登记撤回、`demo-002`、`Q`）、6 个场次（`data_classification` 全是 `research`）、77 条审计、0 条量表记录 | `sqlite3 …/app.db "select count(*) from patient"` 等。**没有真实入组受试者，但这台机器已经被用过**：云 TTS / ASR / LLM 都有实际使用记录，演示场次也留了录音。原来这一行写「从未被真实使用过」——那句话曾被当成「数据可以随便重建」的依据，删掉 |
 
-最后一次只读核对：**2026-08-27 19:55 UTC**，方法见文首。实测到的：
+历史只读核对：**2026-08-27 19:55 UTC**（以下只保留当时状态，不覆盖上方更新的部署记录）。当时实测到的：
 服务 `nmu` active（02:49:43 UTC 起）；库头 `b6d4f8a2c917`；3 个演示受试者 / 6 个场次；
 `preflight_check.py --require-all --os` **8 项全 PASS、退出码 0**（迁移头一致、备份新鲜度、
 53 个包逐个对上锁、安全补丁积压 0、`/health` 200、安全头齐、红线全 404、受保护路由全 401/403）；
@@ -111,7 +115,9 @@
 `ok snapshots=45 pulled=1`，最新异地副本 `20260827-193521`，`conflicts/` 清零。
 详见 `~/Library/nmu-backup/offsite/AUDIT-ANCHOR-RESET-20260826.md`。
 
-## last-deploy.state 已过期（2026-08-17 发现，未修）
+## 历史事故：last-deploy.state 过期（2026-08-17 发现，8 月 20 日起已补写）
+
+本节原调查保留作事故背景。下文的「未修」「现在」和工具文件数均指 2026-08-17；后续 8 月 20 日上线记录已确认补写，8 月 27 日曾核对一致。当前值仍须与完整发布产物核验，不能单凭索引认定。
 
 `/opt/nmu/last-deploy.state` 的内容是：
 
@@ -173,7 +179,7 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 ## 待上线增量
 
-无（2026-09-05 09:07 UTC `c2fd7fd` 已上线）。
+2026-09-06 综合审计修复候选正在实施，详见 `audits/2026-09-06-fix-progress.md`。本轮未上线，不得沿用上一版本的 CI 或部署回执为候选背书。
 
 ## 2026-09-05 上线记录（`c2fd7fd`：属相一问单轮，零迁移）
 

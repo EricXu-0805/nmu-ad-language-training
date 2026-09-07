@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 import hashlib
 import ipaddress
 import re
@@ -69,7 +69,7 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      Patient, PatientDeviceCapability, PatientPauseReceipt,
                      PatientWithdrawalEvent,
                      QuestionnaireItemValue, QuestionnaireRecord,
-                     RapportUtteranceEvent,
+                     RapportUtteranceEvent, RapportPlaybackReceipt,
                      RuntimeCommand, ScaleResult,
                      SessionAutopilotState,
                      SessionCloseoutReport, SessionOutcomeSummary,
@@ -1504,7 +1504,7 @@ def withdraw_patient(
     # stable, authoritative re-read rather than a pre-lock snapshot.
     s.rollback()
     s.expire_all()
-    with (cloud_processing.serialized_subject_egress(patient_id),
+    with (cloud_processing.serialized_subject_egress(patient_id, bind=s.get_bind()),
           governance_lock.subject_fence(s, patient_id),
           audio_capture.registration_lock(),
           audio_capture.byte_quota_lock(),
@@ -1823,7 +1823,9 @@ def patch_patient_cloud_processing(
     # A successful revoke therefore waits for an already-started provider call,
     # while a call that has not crossed its final authorization fence observes
     # the revocation and never begins egress.
-    with cloud_processing.serialized_subject_egress(patient_id), _LIVE_WRITE_LOCK:
+    s.rollback()
+    s.expire_all()
+    with cloud_processing.serialized_subject_egress(patient_id, bind=s.get_bind()), _LIVE_WRITE_LOCK:
         patient = s.exec(select(Patient).where(
             Patient.patient_id == patient_id).with_for_update()).first()
         if not patient:
@@ -3612,6 +3614,7 @@ class AudioIn(BaseModel):
                                          pattern=r"^[^\r\n\x00]+$")
     is_reliability_sample: bool = False
     contains_direct_identifier: bool = False
+    recording_wseq: int | None = PydanticField(default=None, ge=1, le=9_007_199_254_740_991)
 
 
 class DeviceAudioRegistrationOut(BaseModel):
@@ -3967,11 +3970,17 @@ def recording_authorization(session_id: str, request: Request,
         effective_simulation = _ensure_recording_allowed_for_session(
             session_id, s, is_simulation=sess.is_simulation)
         state = s.get(SessionRuntimeState, session_id)
-        return {
+        result = {
             "allowed": True,
             "runtime_status": state.status if state else "active",
             "is_simulation": effective_simulation,
         }
+        if sess.week_no == 1 and live is not None:
+            current = _json_load(live.rapport_json) or {}
+            recording_wseq = _wseq_from(current)
+            if recording_wseq is not None and recording_wseq > 0:
+                result["recording_wseq"] = recording_wseq
+        return result
 
 
 @app.post(
@@ -4027,6 +4036,7 @@ def create_audio(a: AudioIn, request: Request, s: DBSession = Depends(get_sessio
         return (
             existing.session_id == a.session_id
             and existing.turn_key == resolved_turn_key
+            and existing.recording_wseq == a.recording_wseq
             and existing.is_reliability_sample == a.is_reliability_sample
             and existing.contains_direct_identifier == a.contains_direct_identifier
             and (a.is_simulation is None or existing.is_simulation == a.is_simulation)
@@ -4151,6 +4161,11 @@ def create_audio(a: AudioIn, request: Request, s: DBSession = Depends(get_sessio
         if a.turn_key is not None and not a.turn_key.strip():
             raise HTTPException(422, "turn_key 不得为空白")
         _validate_audio_turn_key(a.session_id, resolved_turn_key, s)
+        if a.recording_wseq is not None:
+            if (not a.session_id or linked_session.week_no != 1
+                    or locked_live is None
+                    or a.recording_wseq > locked_live.command_wseq):
+                raise HTTPException(409, "录音呈现序号不属于已签发的关系建立范围")
         try:
             audio_capture.assert_registration_quota(s, a.session_id, resolved_turn_key)
         except audio_capture.AudioQuotaExceeded as exc:
@@ -5041,7 +5056,9 @@ def _issue_live_session_capability(
             try:
                 fenced = autopilot_service.fence_autonomous_scope_for_device_rotation(
                     s, session_id=session_id)
-                if fenced:
+                # Week1 playback and capture generations must also be fenced:
+                # the replacement device cannot complete the old presentation.
+                if fenced or sess.week_no == 1:
                     _pause_runtime_in_transaction(session_id, s)
             except autopilot_service.AutopilotServiceError as exc:
                 _autopilot_write_failure(s, exc)
@@ -5216,7 +5233,7 @@ _CONSOLE_LIVE_FIELDS = {
     "cursor": _PUBLIC_LIVE_FIELDS["cursor"] | {"rawAudioId", "fbItemId"},
     "rapportStep": _PUBLIC_LIVE_FIELDS["rapportStep"] | {"rawAudioId"},
     "audioSaved": {"rawAudioId", "durationSeconds", "byteCount", "checksum",
-                   "turnKey", "sessionId", "containsDirectIdentifier"},
+                   "turnKey", "sessionId", "containsDirectIdentifier", "recordingWseq"},
     "patientRec": {"active", "turnKey", "sessionId", "failureCode", "failureId"},
 }
 
@@ -5911,6 +5928,73 @@ def _rapport_validate_script_position(
     return questions[question_idx] if questions else {}
 
 
+@contextmanager
+def _rapport_write_scope(
+        request: Request, session_id: str, patient_id: str, s: DBSession,
+        *, expected: tuple | None = None):
+    """Re-read the same runtime/governance authority that pause and abort fence."""
+    s.rollback()
+    s.expire_all()
+    with governance_lock.subject_fence(s, patient_id), _LIVE_WRITE_LOCK:
+        governance_lock.begin_sqlite_write_fence(s)
+        sess = s.exec(select(TrainSession).where(
+            TrainSession.session_id == session_id).with_for_update()).first()
+        if sess is None or sess.patient_id != patient_id or sess.week_no != 1:
+            raise HTTPException(409, "场次状态已变化，回应未保存")
+        _require_session_operator(request, sess, s, "生成第1周回应句")
+        _require_started_visit_plan_session(session_id, s, sess=sess)
+        if _session_read_restriction_reason(sess, s) is not None:
+            raise HTTPException(409, "受试者已撤回或内容受限，回应未保存")
+        state = s.exec(select(SessionRuntimeState).where(
+            SessionRuntimeState.session_id == session_id).with_for_update()).first()
+        if state is not None and state.status != "active":
+            raise HTTPException(409, "场次已暂停或结束，不能生成新的回应")
+        patient = s.get(Patient, patient_id)
+        if patient is None:
+            raise HTTPException(409, "受试者档案不存在")
+        policy = cloud_processing.current_policy()
+        snapshot = (patient_id, sess.trainer_id,
+                    state.revision if state else 0,
+                    patient.governance_revision,
+                    patient.cloud_processing_allowed,
+                    patient.cloud_processing_provider_id,
+                    patient.cloud_processing_notice_version,
+                    patient.cloud_processing_consented_at,
+                    patient.cloud_processing_revoked_at,
+                    policy.provider_id, policy.notice_version)
+        if expected is not None and snapshot != expected:
+            raise HTTPException(409, "场次进度或授权已变化，迟到回应未保存")
+        try:
+            yield sess, snapshot
+        finally:
+            s.rollback()
+
+
+def _rapport_recheck_before_provider(
+        request: Request, session_id: str, patient_id: str,
+        s: DBSession, expected: tuple) -> None:
+    # Provider latency must not hold the clinical pause/abort lock. Each stage
+    # is admitted afresh; its result is fenced again before it becomes evidence.
+    with _rapport_write_scope(
+            request, session_id, patient_id, s, expected=expected):
+        s.rollback()
+
+
+def _rapport_verified_audio_bytes(row: AudioAssetRow, s: DBSession) -> bytes:
+    if not _audio_capture_evidence_is_verified(row, s, require_capture_receipt=True):
+        raise HTTPException(409, "录音原件与采集回执不一致，不能自动回应")
+    try:
+        blob = audio_store.find_blob(row.raw_audio_id)
+        data = blob.read_bytes() if blob else None
+    except (OSError, audio_store.AudioStoreIntegrityError):
+        data = None
+    # Verify the exact bytes being sent, not only a prior filesystem read.
+    if (data is None or len(data) != row.byte_count
+            or audio_store.sha256_hex(data) != row.checksum):
+        raise HTTPException(409, "录音原件完整性已变化，不能自动回应")
+    return data
+
+
 @app.post("/sessions/{session_id}/rapport/replies",
           response_model=RapportReplyCreateOut)
 def rapport_reply_create(
@@ -5922,14 +6006,13 @@ def rapport_reply_create(
     逐受试者云授权门禁;任何一层不可用都落回冻结句库(j1 没听清/j2 没说话/
     k1 兜底),老人永远有回应。生成文本发声走按行合成端点,客户端递不进文本。
     """
+    patient_id = _preauthorize_session_subject_fence(
+        request, session_id, s, "生成第1周回应句")
+    with _rapport_write_scope(request, session_id, patient_id, s) as admitted:
+        sess, processing_snapshot = admitted
+        s.rollback()
     sess = s.get(TrainSession, session_id)
-    if not sess:
-        raise HTTPException(404, "场次不存在")
-    _require_session_operator(request, sess, s, "生成第1周回应句", mutation=True)
-    if sess.week_no != 1:
-        raise HTTPException(409, "回应句发声记录仅属于第1周关系建立场次")
-    if _session_runtime_status(session_id, s) in _DATA_STEWARD_VISIBLE_SESSION_STATUSES:
-        raise HTTPException(409, "场次已结束，发声账本不再追加")
+    assert sess is not None
     if body.mode != "auto" and body.rawAudioId is not None:
         raise HTTPException(422, "rawAudioId 仅用于 auto 模式")
     script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
@@ -5977,18 +6060,32 @@ def rapport_reply_create(
             RapportUtteranceEvent.origin == "auto",
         )).first()
         if existing is not None and existing.id is not None:
-            prior_n = len(_rapport_auto_rounds_before(
-                s, session_id, body.sectionKey, body.questionIdx,
-                before_seq=existing.event_seq))
-            return RapportReplyCreateOut(
-                utteranceId=existing.id, text=existing.text,
-                source=existing.source, replyId=existing.reply_id,
-                degradedReason=existing.degraded_reason, idempotent=True,
-                **_rapport_round_fields(prior_n, limit=round_limit, invites_more=(
-                    _rapport_invites_more(bank, existing.source,
-                                          existing.reply_id,
-                                          existing.degraded_reason,
-                                          existing.text))))
+            with _rapport_write_scope(
+                    request, session_id, patient_id, s, expected=processing_snapshot):
+                # A cached reply still belongs to one exact recording/question;
+                # returning it must re-check withdrawal and recording integrity.
+                existing = s.get(RapportUtteranceEvent, existing.id)
+                asset = s.get(AudioAssetRow, body.rawAudioId)
+                if (existing is None or existing.section_key != body.sectionKey
+                        or existing.question_idx != body.questionIdx
+                        or asset is None or asset.session_id != session_id
+                        or asset.turn_key != patient_presentation.rapport_turn_key(
+                            body.sectionKey, body.questionIdx)):
+                    raise HTTPException(409, "既有回应或录音不属于当前一问")
+                _ensure_audio_read_allowed(asset, s)
+                _rapport_verified_audio_bytes(asset, s)
+                prior_n = len(_rapport_auto_rounds_before(
+                    s, session_id, body.sectionKey, body.questionIdx,
+                    before_seq=existing.event_seq))
+                return RapportReplyCreateOut(
+                    utteranceId=existing.id, text=existing.text,
+                    source=existing.source, replyId=existing.reply_id,
+                    degradedReason=existing.degraded_reason, idempotent=True,
+                    **_rapport_round_fields(prior_n, limit=round_limit, invites_more=(
+                        _rapport_invites_more(bank, existing.source,
+                                              existing.reply_id,
+                                              existing.degraded_reason,
+                                              existing.text))))
         prior_rounds = _rapport_auto_rounds_before(
             s, session_id, body.sectionKey, body.questionIdx)
         history: rapport_reply.History = tuple(
@@ -6017,17 +6114,10 @@ def rapport_reply_create(
         if asset.contains_direct_identifier:
             raise HTTPException(409, "这段录音标记含直接标识，不进云、不开放自动回应")
         _ensure_audio_read_allowed(asset, s, sess=sess)
-        receipt = s.exec(select(AudioCaptureReceipt).where(
-            AudioCaptureReceipt.raw_audio_id == body.rawAudioId)).first()
-        if receipt is None:
-            raise HTTPException(409, "录音尚未落入采集账本，不能自动回应")
-        blob = audio_store.find_blob(body.rawAudioId)
-        if not blob:
-            raise HTTPException(409, "音频字节不存在，不能自动回应")
         ask_line = question.get("ask")
         if not isinstance(ask_line, str) or not ask_line.strip():
             raise HTTPException(409, "当前一问没有可供生成器引用的问句")
-        audio_bytes = blob.read_bytes()
+        audio_bytes = _rapport_verified_audio_bytes(asset, s)
         patient_id = sess.patient_id
         # 铁律:provider I/O 期间不得持有任何数据库事务/行锁。
         s.rollback()
@@ -6039,6 +6129,8 @@ def rapport_reply_create(
         asr_engine = None if round_exhausted else asr.get_engine()
         asr_boundary = (None if asr_engine is None
                         else cloud_processing.provider_boundary(asr_engine))
+        _rapport_recheck_before_provider(
+            request, session_id, patient_id, s, processing_snapshot)
         try:
             if asr_boundary is cloud_processing.DataBoundary.CLOUD:
                 with _serialized_cloud_provider_call(
@@ -6073,6 +6165,8 @@ def rapport_reply_create(
                 engine = rapport_reply.get_engine()
                 generated: str | None = None
                 boundary = cloud_processing.provider_boundary(engine)
+                _rapport_recheck_before_provider(
+                    request, session_id, patient_id, s, processing_snapshot)
                 try:
                     if boundary is cloud_processing.DataBoundary.CLOUD:
                         with _serialized_cloud_provider_call(
@@ -6106,41 +6200,36 @@ def rapport_reply_create(
                         reply_engine_version = engine.version
                         asr_text_saved = asr_text
 
-    # provider I/O 之后重新开事务落账;撤回/隔离在窗口内生效则拒绝——
-    # 账本只追加,落错一行永远删不掉(与第2-8周 commit 围栏同口径)。
-    s.expire_all()
-    sess = s.get(TrainSession, session_id)
-    if sess is None or sess.week_no != 1:
-        raise HTTPException(409, "场次状态已变化，发声记录未落账")
-    if _session_read_restriction_reason(sess, s) is not None:
-        raise HTTPException(409, "受试者已撤回或内容受限，发声记录未落账")
-    if body.rawAudioId is not None:
-        asset_now = s.get(AudioAssetRow, body.rawAudioId)
-        if (asset_now is None or asset_now.withdrawn
-                or (asset_now.withdrawal_status or "").strip()):
-            raise HTTPException(409, "录音已进入撤回/隔离流程，发声记录未落账")
-    if body.mode == "auto" and body.rawAudioId is not None:
-        # provider 窗口内另一次 auto 可能已先落账:丢弃本次结果,回放已入账那句。
-        raced = s.exec(select(RapportUtteranceEvent).where(
-            RapportUtteranceEvent.session_id == session_id,
-            RapportUtteranceEvent.raw_audio_id == body.rawAudioId,
-            RapportUtteranceEvent.origin == "auto",
-        )).first()
-        if raced is not None and raced.id is not None:
-            prior_n = len(_rapport_auto_rounds_before(
-                s, session_id, body.sectionKey, body.questionIdx,
-                before_seq=raced.event_seq))
-            return RapportReplyCreateOut(
-                utteranceId=raced.id, text=raced.text, source=raced.source,
-                replyId=raced.reply_id, degradedReason=raced.degraded_reason,
-                idempotent=True, **_rapport_round_fields(prior_n, limit=round_limit, invites_more=(
-                    _rapport_invites_more(bank, raced.source, raced.reply_id,
-                                          raced.degraded_reason, raced.text))))
-    # 落账段串行化:provider 窗口里并发的另一次 auto 可能已把轮次推进,
-    # 「重数 → 落账」必须在同一把锁里,否则同一问位会落成超轮次的行。
-    ledger_lock = _RAPPORT_LEDGER_LOCK if body.mode == "auto" else nullcontext()
-    with ledger_lock:
-        s.expire_all()
+    # Stop, withdrawal and duplicate requests share this final transaction.
+    with (cloud_processing.serialized_subject_egress(patient_id, bind=s.get_bind()),
+          _rapport_write_scope(request, session_id, patient_id, s,
+                               expected=processing_snapshot) as admitted,
+          _RAPPORT_LEDGER_LOCK):
+        sess, _snapshot = admitted
+        if body.rawAudioId is not None:
+            asset_now = s.get(AudioAssetRow, body.rawAudioId)
+            if (asset_now is None or asset_now.withdrawn
+                    or (asset_now.withdrawal_status or "").strip()):
+                raise HTTPException(409, "录音已进入撤回/隔离流程，发声记录未落账")
+            _ensure_audio_read_allowed(asset_now, s, sess=sess)
+            _rapport_verified_audio_bytes(asset_now, s)
+        if body.mode == "auto" and body.rawAudioId is not None:
+            # provider 窗口内另一次 auto 可能已先落账:丢弃本次结果,回放已入账那句。
+            raced = s.exec(select(RapportUtteranceEvent).where(
+                RapportUtteranceEvent.session_id == session_id,
+                RapportUtteranceEvent.raw_audio_id == body.rawAudioId,
+                RapportUtteranceEvent.origin == "auto",
+            )).first()
+            if raced is not None and raced.id is not None:
+                prior_n = len(_rapport_auto_rounds_before(
+                    s, session_id, body.sectionKey, body.questionIdx,
+                    before_seq=raced.event_seq))
+                return RapportReplyCreateOut(
+                    utteranceId=raced.id, text=raced.text, source=raced.source,
+                    replyId=raced.reply_id, degradedReason=raced.degraded_reason,
+                    idempotent=True, **_rapport_round_fields(prior_n, limit=round_limit, invites_more=(
+                        _rapport_invites_more(bank, raced.source, raced.reply_id,
+                                              raced.degraded_reason, raced.text))))
         prior_now = len(_rapport_auto_rounds_before(
             s, session_id, body.sectionKey, body.questionIdx))
         if body.mode == "auto" and prior_now >= round_limit:
@@ -6184,6 +6273,116 @@ def rapport_reply_create(
         degradedReason=degraded,
         **_rapport_round_fields(prior_now, limit=round_limit, invites_more=_rapport_invites_more(
             bank, source, reply_id, degraded, text)))
+
+
+class RapportPlaybackIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sectionKey: str = PydanticField(min_length=1, max_length=100)
+    questionIdx: int = PydanticField(ge=0)
+    beat: Literal["ask", "reply"]
+    utteranceId: int | None = PydanticField(default=None, ge=1)
+    wseq: int = PydanticField(ge=1, le=9_007_199_254_740_991)
+    outcome: Literal["played", "failed"]
+
+
+def _rapport_playback_projection(row: RapportPlaybackReceipt | None) -> dict:
+    return {"receipt": None if row is None else {
+        "sectionKey": row.section_key, "questionIdx": row.question_idx,
+        "beat": row.beat, "utteranceId": row.utterance_id,
+        "wseq": row.wseq, "outcome": row.outcome,
+    }}
+
+
+def _rapport_current_playback_position(
+        session_id: str, s: DBSession, live: LiveState | None) -> tuple[dict, int]:
+    sess = s.get(TrainSession, session_id)
+    if sess is None or sess.week_no != 1:
+        raise HTTPException(404, "关系建立场次不存在")
+    _require_started_visit_plan_session(session_id, s, sess=sess)
+    if _session_read_restriction_reason(sess, s) is not None:
+        raise HTTPException(409, "受试者已撤回，播放回执不可用")
+    state = s.get(SessionRuntimeState, session_id)
+    if state is not None and state.status != "active":
+        raise HTTPException(409, "场次已暂停或结束，播放回执不可用")
+    if live is None or _live_session_id(live) != session_id:
+        raise HTTPException(409, "场次不再位于当前床旁")
+    position = _json_load(live.rapport_json)
+    if (not position or _payload_session_id(position) != session_id
+            or not _wseq_from(position)):
+        raise HTTPException(409, "当前没有可核对的关系建立呈现")
+    return position, state.revision if state else 0
+
+
+@app.put("/sessions/{session_id}/rapport/playback")
+def report_rapport_playback(
+        session_id: str, body: RapportPlaybackIn, request: Request,
+        s: DBSession = Depends(get_session)):
+    token_hash = _require_device_capability_token_hash(request, "回报播放结果")
+    _require_capability_bound_session(request, session_id, "回报播放结果")
+    sess = s.get(TrainSession, session_id)
+    if sess is None:
+        raise HTTPException(404, "场次不存在")
+    patient_id = sess.patient_id
+    s.rollback()
+    s.expire_all()
+    # Match device/live mutation lock order. The command wseq is a server-issued
+    # generation and the runtime revision fences pause/resume and device rotation.
+    with (governance_lock.subject_fence(s, patient_id), _LIVE_WRITE_LOCK,
+          device_capability.serialized_mutation()):
+        governance_lock.begin_sqlite_write_fence(s)
+        live = _live_row_for_update(s)
+        _require_capability_current_live(request, s, "回报播放结果", live_row=live)
+        _require_capability_active_for_write(request, s, session_id)
+        current, revision = _rapport_current_playback_position(session_id, s, live)
+        expected = (current.get("sectionKey"), current.get("questionIdx"),
+                    current.get("beat", "ask"), current.get("utteranceId"),
+                    _wseq_from(current))
+        supplied = (body.sectionKey, body.questionIdx, body.beat,
+                    body.utteranceId, body.wseq)
+        if expected != supplied:
+            raise HTTPException(409, "播放回执已过期或不属于当前话拍")
+        existing = s.exec(select(RapportPlaybackReceipt).where(
+            RapportPlaybackReceipt.session_id == session_id,
+            RapportPlaybackReceipt.wseq == body.wseq).with_for_update()).first()
+        if existing is not None:
+            if (existing.runtime_revision != revision
+                    or existing.device_token_hash != token_hash
+                    or existing.outcome != body.outcome):
+                raise HTTPException(409, "同一话拍已有不同播放结果；请重新发起呈现")
+            result = _rapport_playback_projection(existing)
+            s.rollback()
+            return result
+        row = RapportPlaybackReceipt(
+            session_id=session_id, wseq=body.wseq, runtime_revision=revision,
+            section_key=body.sectionKey, question_idx=body.questionIdx,
+            beat=body.beat, utterance_id=body.utteranceId, outcome=body.outcome,
+            device_token_hash=token_hash)
+        s.add(row)
+        try:
+            s.commit()
+        except IntegrityError:
+            s.rollback()
+            raise HTTPException(409, "播放回执并发冲突，请核对当前话拍后重试")
+        s.refresh(row)
+        return _rapport_playback_projection(row)
+
+
+@app.get("/sessions/{session_id}/rapport/playback")
+def get_rapport_playback(
+        session_id: str, request: Request, s: DBSession = Depends(get_session)):
+    patient_id = _preauthorize_session_subject_fence(
+        request, session_id, s, "核对关系建立播放结果")
+    with governance_lock.subject_fence(s, patient_id), _LIVE_WRITE_LOCK:
+        live = _live_row_for_update(s)
+        current, revision = _rapport_current_playback_position(session_id, s, live)
+        row = s.exec(select(RapportPlaybackReceipt).where(
+            RapportPlaybackReceipt.session_id == session_id,
+            RapportPlaybackReceipt.wseq == _wseq_from(current),
+            RapportPlaybackReceipt.runtime_revision == revision)).first()
+        result = _rapport_playback_projection(row)
+        s.rollback()
+        return result
 
 
 def _pause_projection(payload: dict, wseq: int) -> dict:
@@ -6535,6 +6734,8 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                         and reported_identifier != asset.contains_direct_identifier):
                     raise HTTPException(409, "audioSaved 直接标识标记与音频登记不一致")
                 payload["containsDirectIdentifier"] = asset.contains_direct_identifier
+                if asset.recording_wseq is not None:
+                    payload["recordingWseq"] = asset.recording_wseq
                 payload["checksum"] = payload["checksum"].lower()
                 try:
                     capture_receipt, receipt_idempotent = audio_capture.append_receipt(
@@ -7492,6 +7693,7 @@ def _audio_capture_evidence_is_verified(
         and receipt.data_classification == row.data_classification
         and receipt.is_simulation == row.is_simulation
         and receipt.contains_direct_identifier == row.contains_direct_identifier
+        and receipt.recording_wseq == row.recording_wseq
     )
 
 
@@ -9115,7 +9317,7 @@ def rapport_utterance_tts(
         # llm 行是患者派生文本(prompt 要求轻复述老人的词)。云授权可中途撤销,
         # 出网决定必须在合成时刻、于 subject 围栏内重读——撤销端点持同一把锁,
         # 它返回 200 之后这里不可能再放行新的云合成;撤销后落回本地 piper 嗓子。
-        with cloud_processing.serialized_subject_egress(patient_id):
+        with cloud_processing.serialized_subject_egress(patient_id, bind=s.get_bind()):
             s.rollback()
             patient_row = s.get(Patient, patient_id)
             policy_provider = type("_PolicyCloudProvider", (), {
@@ -11336,7 +11538,7 @@ def _serialized_cloud_provider_call(
         bind: object):
     """Hold the subject egress fence across the actual provider invocation.
 
-    The in-process subject lock covers SQLite/single-process deployments.  The
+    Process/file subject locks cover SQLite deployments without a DB writer. The
     locked Session -> Patient rows provide the same total order across workers on
     databases that implement ``FOR UPDATE``.  Consent revocation and research
     withdrawal acquire the identical subject lock before their own governance
@@ -11345,7 +11547,7 @@ def _serialized_cloud_provider_call(
     """
     if cloud_processing.provider_boundary(provider) is not cloud_processing.DataBoundary.CLOUD:
         raise ValueError("serialized cloud provider fence 只能用于 cloud provider")
-    with cloud_processing.serialized_subject_egress(patient_id):
+    with cloud_processing.serialized_subject_egress(patient_id, bind=bind):
         with DBSession(bind) as gate_session:
             current_session = gate_session.exec(select(TrainSession).where(
                 TrainSession.session_id == session_id,
@@ -14592,6 +14794,43 @@ def _questionnaire_record_or_404(s: DBSession, record_id: str) -> QuestionnaireR
     return record
 
 
+@contextmanager
+def _questionnaire_write_scope(
+        s: DBSession, patient_id: str, record_id: str | None = None):
+    """Share the withdrawal fence for every prototype questionnaire mutation.
+
+    A SQLite writer transaction or PostgreSQL advisory/row locks keep
+    the same check-and-commit boundary across workers. A draft
+    checked before waiting is deliberately discarded and read again here.
+    """
+    s.rollback()
+    s.expire_all()
+    with governance_lock.subject_fence(s, patient_id):
+        governance_lock.begin_sqlite_write_fence(s)
+        patient = s.exec(select(Patient).where(
+            Patient.patient_id == patient_id).with_for_update()).first()
+        if patient is None:
+            raise HTTPException(404, "患者不存在,先建档")
+        _questionnaire_patient_or_reject(s, patient_id)
+        record = None
+        if record_id is not None:
+            record = s.exec(select(QuestionnaireRecord).where(
+                QuestionnaireRecord.record_id == record_id,
+                QuestionnaireRecord.patient_id == patient_id,
+            ).with_for_update()).first()
+            if record is None:
+                raise HTTPException(404, "量表记录不存在")
+            if record.status != "draft":
+                raise HTTPException(status_code=409, detail={
+                    "code": "questionnaire_record_locked",
+                    "message": "记录已锁定，不可再改；改错请新建记录",
+                })
+        try:
+            yield patient, record
+        finally:
+            s.rollback()
+
+
 def _questionnaire_values(s: DBSession, record_id: str) -> list[QuestionnaireItemValue]:
     return list(s.exec(_select(
         QuestionnaireItemValue,
@@ -14673,43 +14912,44 @@ def create_questionnaire_record(patient_id: str, body: QuestionnaireRecordCreate
     operator = _require_account_identity(
         request, "建立量表电子记录", roles=_QUESTIONNAIRE_WRITE_ROLES,
         allow_local_m0=True)
-    _questionnaire_patient_or_reject(s, patient_id)
-    registry = _questionnaire_registry_or_503()
-    loaded = registry.get(body.questionnaire_id)
-    if loaded is None:
-        raise HTTPException(status_code=409, detail={
-            "code": "questionnaire_unknown",
-            "message": f"量表 {body.questionnaire_id} 未注册",
-            "registered": sorted(registry),
-        })
-    # 同一位受试者 + 同一份量表 + 同一期别 = 一个槽位。手册规定的改错方式是
-    # 「新建一条正确的，在备注里说明」，所以同槽位再建一条是**正常动作**，不是错误；
-    # 唯一约束要挡的是「两条并列、谁也不知道哪条作数」。于是这里给新记录发下一个
-    # 序号，并把上一条标成被它取代——两条都留着，链条自己说得清。
-    previous = s.exec(
-        select(QuestionnaireRecord)
-        .where(QuestionnaireRecord.patient_id == patient_id,
-               QuestionnaireRecord.questionnaire_id == body.questionnaire_id,
-               QuestionnaireRecord.phase_label == body.phase_label)
-        .order_by(QuestionnaireRecord.phase_ordinal.desc())
-    ).first()
-    ordinal = 1 if previous is None else previous.phase_ordinal + 1
-    record = QuestionnaireRecord(
-        record_id=f"qr_{secrets.token_hex(12)}",
-        patient_id=patient_id,
-        questionnaire_id=body.questionnaire_id,
-        definition_sha256=loaded.content_sha256,
-        phase_label=body.phase_label,
-        phase_ordinal=ordinal,
-        created_by=operator,
-        note=body.note,
-    )
-    s.add(record)
-    if previous is not None and previous.superseded_by_ordinal is None:
-        previous.superseded_by_ordinal = ordinal
-        s.add(previous)
-    s.commit()
-    s.refresh(record)
+    with _questionnaire_write_scope(s, patient_id):
+        _questionnaire_patient_or_reject(s, patient_id)
+        registry = _questionnaire_registry_or_503()
+        loaded = registry.get(body.questionnaire_id)
+        if loaded is None:
+            raise HTTPException(status_code=409, detail={
+                "code": "questionnaire_unknown",
+                "message": f"量表 {body.questionnaire_id} 未注册",
+                "registered": sorted(registry),
+            })
+        # 同一位受试者 + 同一份量表 + 同一期别 = 一个槽位。手册规定的改错方式是
+        # 「新建一条正确的，在备注里说明」，所以同槽位再建一条是**正常动作**，不是错误；
+        # 唯一约束要挡的是「两条并列、谁也不知道哪条作数」。于是这里给新记录发下一个
+        # 序号，并把上一条标成被它取代——两条都留着，链条自己说得清。
+        previous = s.exec(
+            select(QuestionnaireRecord)
+            .where(QuestionnaireRecord.patient_id == patient_id,
+                   QuestionnaireRecord.questionnaire_id == body.questionnaire_id,
+                   QuestionnaireRecord.phase_label == body.phase_label)
+            .order_by(QuestionnaireRecord.phase_ordinal.desc())
+        ).first()
+        ordinal = 1 if previous is None else previous.phase_ordinal + 1
+        record = QuestionnaireRecord(
+            record_id=f"qr_{secrets.token_hex(12)}",
+            patient_id=patient_id,
+            questionnaire_id=body.questionnaire_id,
+            definition_sha256=loaded.content_sha256,
+            phase_label=body.phase_label,
+            phase_ordinal=ordinal,
+            created_by=operator,
+            note=body.note,
+        )
+        s.add(record)
+        if previous is not None and previous.superseded_by_ordinal is None:
+            previous.superseded_by_ordinal = ordinal
+            s.add(previous)
+        s.commit()
+        s.refresh(record)
     detail = f"建立量表记录 {body.questionnaire_id}/{body.phase_label}"
     if ordinal > 1:
         detail += f"（第 {ordinal} 次，取代第 {ordinal - 1} 次）"
@@ -14776,51 +15016,53 @@ def put_questionnaire_values(record_id: str, body: QuestionnaireValuesPutIn,
     _require_account_identity(
         request, "保存量表作答", roles=_QUESTIONNAIRE_WRITE_ROLES,
         allow_local_m0=True)
-    record = _questionnaire_record_or_404(s, record_id)
-    _questionnaire_patient_or_reject(s, record.patient_id)
-    if record.status != "draft":
-        raise HTTPException(status_code=409, detail={
-            "code": "questionnaire_record_locked",
-            "message": "记录已锁定，不可再改；改错请新建记录",
-        })
-    definition = _questionnaire_definition_for_record(record)
-    problems: list[str] = []
-    for entry in body.values:
-        try:
-            questionnaires.validate_value_write(
-                definition, entry.item_key, entry.field_key, entry.value)
-        except questionnaires.QuestionnaireValidationError as exc:
-            problems.append(str(exc))
-    if problems:
-        raise HTTPException(status_code=409, detail={
-            "code": "questionnaire_value_invalid",
-            "message": "作答值未通过定义校验",
-            "problems": problems,
-        })
-    existing = {
-        (value.item_key, value.field_key): value
-        for value in _questionnaire_values(s, record_id)
-    }
-    for entry in body.values:
-        slot = existing.get((entry.item_key, entry.field_key))
-        if slot is None:
-            slot = QuestionnaireItemValue(
-                record_id=record_id, item_key=entry.item_key,
-                field_key=entry.field_key)
-            existing[(entry.item_key, entry.field_key)] = slot
-        slot.final_value = entry.value
-        if entry.value is None:
-            slot.value_source = None
-        elif slot.ai_draft_value is None:
-            slot.value_source = "human_direct"
-        elif entry.value == slot.ai_draft_value:
-            slot.value_source = "ai_accepted"
-        else:
-            slot.value_source = "ai_overridden"
-        slot.updated_at = utc_now_naive()
-        s.add(slot)
-    s.commit()
-    s.refresh(record)
+    patient_id = _questionnaire_record_or_404(s, record_id).patient_id
+    with _questionnaire_write_scope(s, patient_id, record_id):
+        record = _questionnaire_record_or_404(s, record_id)
+        _questionnaire_patient_or_reject(s, record.patient_id)
+        if record.status != "draft":
+            raise HTTPException(status_code=409, detail={
+                "code": "questionnaire_record_locked",
+                "message": "记录已锁定，不可再改；改错请新建记录",
+            })
+        definition = _questionnaire_definition_for_record(record)
+        problems: list[str] = []
+        for entry in body.values:
+            try:
+                questionnaires.validate_value_write(
+                    definition, entry.item_key, entry.field_key, entry.value)
+            except questionnaires.QuestionnaireValidationError as exc:
+                problems.append(str(exc))
+        if problems:
+            raise HTTPException(status_code=409, detail={
+                "code": "questionnaire_value_invalid",
+                "message": "作答值未通过定义校验",
+                "problems": problems,
+            })
+        existing = {
+            (value.item_key, value.field_key): value
+            for value in _questionnaire_values(s, record_id)
+        }
+        for entry in body.values:
+            slot = existing.get((entry.item_key, entry.field_key))
+            if slot is None:
+                slot = QuestionnaireItemValue(
+                    record_id=record_id, item_key=entry.item_key,
+                    field_key=entry.field_key)
+                existing[(entry.item_key, entry.field_key)] = slot
+            slot.final_value = entry.value
+            if entry.value is None:
+                slot.value_source = None
+            elif slot.ai_draft_value is None:
+                slot.value_source = "human_direct"
+            elif entry.value == slot.ai_draft_value:
+                slot.value_source = "ai_accepted"
+            else:
+                slot.value_source = "ai_overridden"
+            slot.updated_at = utc_now_naive()
+            s.add(slot)
+        s.commit()
+        s.refresh(record)
     return _questionnaire_record_out(record, _questionnaire_values(s, record_id))
 
 
@@ -14838,28 +15080,42 @@ def generate_questionnaire_ai_draft(record_id: str, request: Request,
             "message": "记录已锁定，AI 初评只在草稿期可用",
         })
     definition = _questionnaire_definition_for_record(record)
+    patient_id = record.patient_id
+    expected_definition = record.definition_sha256
     outcome = questionnaire_ai_draft.generate_draft(s, patient, definition)
-    record.ai_draft_status = outcome.status
-    record.ai_draft_engine = outcome.engine
-    record.ai_draft_at = utc_now_naive()
-    s.add(record)
-    if outcome.status == "generated":
-        existing = {
-            (value.item_key, value.field_key): value
-            for value in _questionnaire_values(s, record_id)
-        }
-        for item_key, draft in outcome.items.items():
-            slot = existing.get((item_key, questionnaires.FIELD_VALUE))
-            if slot is None:
-                slot = QuestionnaireItemValue(
-                    record_id=record_id, item_key=item_key,
-                    field_key=questionnaires.FIELD_VALUE)
-            slot.ai_draft_value = draft.value
-            slot.ai_draft_rationale = draft.rationale
-            slot.updated_at = utc_now_naive()
-            s.add(slot)
-    s.commit()
-    s.refresh(record)
+    with (cloud_processing.serialized_subject_egress(patient_id, bind=s.get_bind()),
+          _questionnaire_write_scope(s, patient_id, record_id) as current):
+        patient, record = current
+        assert record is not None
+        if record.definition_sha256 != expected_definition:
+            raise HTTPException(409, "量表定义已变化，初评未保存")
+        if (outcome.status == "generated"
+                and (not questionnaire_ai_draft._cloud_authorized(patient)
+                     or outcome.authorization_snapshot is None
+                     or outcome.authorization_snapshot
+                     != questionnaire_ai_draft.authorization_snapshot(patient))):
+            raise HTTPException(409, "云处理授权已变化，初评未保存")
+        record.ai_draft_status = outcome.status
+        record.ai_draft_engine = outcome.engine
+        record.ai_draft_at = utc_now_naive()
+        s.add(record)
+        if outcome.status == "generated":
+            existing = {
+                (value.item_key, value.field_key): value
+                for value in _questionnaire_values(s, record_id)
+            }
+            for item_key, draft in outcome.items.items():
+                slot = existing.get((item_key, questionnaires.FIELD_VALUE))
+                if slot is None:
+                    slot = QuestionnaireItemValue(
+                        record_id=record_id, item_key=item_key,
+                        field_key=questionnaires.FIELD_VALUE)
+                slot.ai_draft_value = draft.value
+                slot.ai_draft_rationale = draft.rationale
+                slot.updated_at = utc_now_naive()
+                s.add(slot)
+        s.commit()
+        s.refresh(record)
     _audit(s, request, "questionnaire_ai_draft",
            f"AI 初评 {record.questionnaire_id} 状态={outcome.status}",
            patient_id=record.patient_id)
@@ -14872,40 +15128,42 @@ def lock_questionnaire_record(record_id: str, request: Request,
     operator = _require_account_identity(
         request, "锁定量表电子记录", roles=_QUESTIONNAIRE_WRITE_ROLES,
         allow_local_m0=True)
-    record = _questionnaire_record_or_404(s, record_id)
-    _questionnaire_patient_or_reject(s, record.patient_id)
-    if record.status != "draft":
-        raise HTTPException(status_code=409, detail={
-            "code": "questionnaire_record_locked",
-            "message": "记录已锁定",
-        })
-    definition = _questionnaire_definition_for_record(record)
-    values = _questionnaire_values(s, record_id)
-    final_map = {
-        (value.item_key, value.field_key): value.final_value
-        for value in values
-        if value.final_value is not None
-    }
-    try:
-        questionnaires.assert_lock_complete(definition, final_map)
-        scoring = questionnaires.compute_scoring(definition, final_map)
-    except questionnaires.QuestionnaireValidationError as exc:
-        raise HTTPException(status_code=409, detail={
-            "code": exc.code,
-            "message": str(exc),
-            "problems": exc.problems,
-        })
-    if scoring is not None:
-        record.computed_total = scoring["computed_total"]
-        record.cutoff_met = scoring["cutoff_met"]
-        record.computed_flag = scoring["computed_flag"]
-        record.scoring_rule_id = scoring["scoring_rule_id"]
-    record.status = "locked"
-    record.locked_by = operator
-    record.locked_at = utc_now_naive()
-    s.add(record)
-    s.commit()
-    s.refresh(record)
+    patient_id = _questionnaire_record_or_404(s, record_id).patient_id
+    with _questionnaire_write_scope(s, patient_id, record_id):
+        record = _questionnaire_record_or_404(s, record_id)
+        _questionnaire_patient_or_reject(s, record.patient_id)
+        if record.status != "draft":
+            raise HTTPException(status_code=409, detail={
+                "code": "questionnaire_record_locked",
+                "message": "记录已锁定",
+            })
+        definition = _questionnaire_definition_for_record(record)
+        values = _questionnaire_values(s, record_id)
+        final_map = {
+            (value.item_key, value.field_key): value.final_value
+            for value in values
+            if value.final_value is not None
+        }
+        try:
+            questionnaires.assert_lock_complete(definition, final_map)
+            scoring = questionnaires.compute_scoring(definition, final_map)
+        except questionnaires.QuestionnaireValidationError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": exc.code,
+                "message": str(exc),
+                "problems": exc.problems,
+            })
+        if scoring is not None:
+            record.computed_total = scoring["computed_total"]
+            record.cutoff_met = scoring["cutoff_met"]
+            record.computed_flag = scoring["computed_flag"]
+            record.scoring_rule_id = scoring["scoring_rule_id"]
+        record.status = "locked"
+        record.locked_by = operator
+        record.locked_at = utc_now_naive()
+        s.add(record)
+        s.commit()
+        s.refresh(record)
     _audit(s, request, "questionnaire_lock",
            f"锁定量表记录 {record.questionnaire_id}/{record.phase_label}"
            + (f" 总分={record.computed_total}" if record.computed_total is not None else ""),

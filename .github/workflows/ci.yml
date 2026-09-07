@@ -105,7 +105,58 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
           image-ref: nmu-platform:ci
+          cache-dir: ${{ runner.temp }}/trivy-cache
           format: table
           exit-code: "1"
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+      - name: 使用固定安全工具链重建同版本 HTTPS 网关
+        run: bash scripts/build_caddy_release.sh --output "$RUNNER_TEMP/nmu-edge-release"
+      - name: 在 Linux 上验证重建网关和仓库代理配置
+        env:
+          SITE_ADDRESS: http://127.0.0.1:8080
+        run: |
+          "$RUNNER_TEMP/nmu-edge-release/caddy" version
+          "$RUNNER_TEMP/nmu-edge-release/caddy" validate --adapter caddyfile --config Caddyfile
+      - name: 验证实际网关的本地 HTTPS 反代与请求边界
+        run: >-
+          python scripts/smoke_caddy_release.py
+          --binary "$RUNNER_TEMP/nmu-edge-release/caddy" --source-root "$GITHUB_WORKSPACE"
+      - name: 扫描实际网关二进制和 Go 标准库
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          # fs mode disables individual Go binary analysis; rootfs scans the
+          # compiled artifact (the coverage check below rejects empty reports).
+          scan-type: rootfs
+          scan-ref: ${{ runner.temp }}/nmu-edge-release
+          cache-dir: ${{ runner.temp }}/trivy-cache
+          scanners: vuln
+          format: json
+          output: ${{ runner.temp }}/nmu-edge-scan.json
+          list-all-pkgs: true
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+      - name: 确认扫描确实识别了网关和实际 Go 版本
+        run: >-
+          python scripts/verify_caddy_release_scan.py "$RUNNER_TEMP/nmu-edge-scan.json"
+          --go-build-info "$RUNNER_TEMP/nmu-edge-release/go-build-info.txt"
+          --revision "$GITHUB_SHA"
+      - name: 提取已扫描镜像的前端发布构件
+        run: |
+          artifact_dir="$RUNNER_TEMP/nmu-release-artifacts"
+          install -d -m 700 "$artifact_dir"
+          docker create --name nmu-ci-dist nmu-platform:ci
+          docker cp nmu-ci-dist:/app/web/dist "$artifact_dir/dist"
+          docker rm nmu-ci-dist
+          python scripts/verify_browser_dist.py --source-root "$GITHUB_WORKSPACE" "$artifact_dir/dist"
+          docker image inspect nmu-platform:ci --format '{{.Id}}' > "$artifact_dir/image-id.txt"
+          printf '%s\n' "$GITHUB_SHA" > "$artifact_dir/source-commit.txt"
+          cp -R "$RUNNER_TEMP/nmu-edge-release" "$artifact_dir/caddy"
+          cp "$RUNNER_TEMP/nmu-edge-scan.json" "$artifact_dir/caddy/trivy.json"
+      - name: 归档同一镜像生成的前端构件与来源
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: nmu-release-artifacts
+          path: ${{ runner.temp }}/nmu-release-artifacts
+          if-no-files-found: error

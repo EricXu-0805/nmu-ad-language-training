@@ -202,7 +202,122 @@ def test_the_only_subprocess_it_runs_is_git():
 
 def test_the_allowed_git_subcommands_are_all_read_only():
     assert set(verifier._ALLOWED_GIT_SUBCOMMANDS) <= {
-        "cat-file", "show", "rev-parse"}
+        "cat-file", "show", "rev-parse", "ls-tree"}
+
+
+def test_one_matching_file_cannot_hide_every_other_deployed_file(repo):
+    report = verifier.compare({"app/main.py": _sha("print(1)\n")}, revision="HEAD", repo_root=repo)
+    assert not report.matches
+    assert report.missing_on_deployment == ["app/other.py"]
+
+
+@pytest.mark.parametrize("name", ["content/week1_reply_bank_v1.json", "alembic/versions/next.py",
+                                 "scripts/entrypoint.sh", "deploy/service", "web/src/main.ts",
+                                 "Caddyfile", "requirements.txt", "requirements-dev.txt"])
+def test_missing_non_python_release_inputs_are_detected(repo, name):
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("release-input\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "release input")
+    report = verifier.compare({"app/main.py": _sha("print(1)\n"), "app/other.py": _sha("print(2)\n")}, revision="HEAD", repo_root=repo)
+    assert name in report.missing_on_deployment
+
+
+def _release(repo):
+    import hashlib
+    import json
+    from scripts import verify_browser_dist
+    from tests.test_browser_dist_verifier import _write_source
+    _write_source(repo)
+    (repo / "app/__init__.py").write_bytes(b"")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "browser inputs")
+    dist = repo / "web/dist"
+    dist.mkdir()
+    fingerprint = verify_browser_dist._current_source_fingerprint(repo)
+    (dist / "index.html").write_text("<p>test release</p>")
+    (dist / "build-fingerprint.sha256").write_text(fingerprint + "\n")
+    (dist / "build-provenance.json").write_text(json.dumps({
+        "schema_version": "nmu.browser-build-provenance.v1",
+        "build_input_fingerprint_sha256": fingerprint,
+    }))
+    rows = []
+    for path in sorted(dist.iterdir()):
+        value = path.read_bytes()
+        rows.append({"path": path.name, "size": len(value), "sha256": hashlib.sha256(value).hexdigest()})
+    raw = json.dumps({"schema_version": verify_browser_dist.SCHEMA, "algorithm": "SHA-256",
+                      "root": "dist/", "excluded_paths": [verify_browser_dist.MANIFEST_NAME], "files": rows})
+    (dist / verify_browser_dist.MANIFEST_NAME).write_text(raw)
+    trusted = repo / "retained-build-manifest.json"
+    trusted.write_text(raw)
+    return trusted
+
+
+def test_complete_release_binds_empty_source_files_and_browser_to_git(repo):
+    import json
+    trusted = _release(repo)
+    document = verifier._release_document(json.dumps(verifier.capture(repo)))
+    report = verifier.compare({name: value for name, value in document["files"].items() if verifier._source(name)}, revision="HEAD", repo_root=repo)
+    assert report.matches
+    assert document["files"]["app/__init__.py"] == verifier.EMPTY_SHA256
+    assert verifier.verify_browser_release(document, expected_dist_manifest=trusted, revision="HEAD", repo_root=repo) == 4
+
+
+def test_rehashed_tampered_browser_cannot_self_attest(repo):
+    import json
+    trusted = _release(repo)
+    dist = repo / "web/dist"
+    (dist / "index.html").write_text("tampered")
+    manifest = json.loads((dist / "browser-dist-sha256.json").read_text())
+    for row in manifest["files"]:
+        if row["path"] == "index.html":
+            row.update(size=8, sha256=_sha("tampered"))
+    (dist / "browser-dist-sha256.json").write_text(json.dumps(manifest))
+    with pytest.raises(verifier.VerifyError, match="browser_release_unverified"):
+        verifier.verify_browser_release(verifier.capture(repo), expected_dist_manifest=trusted, revision="HEAD", repo_root=repo)
+
+
+def test_valid_old_browser_artifact_cannot_claim_new_source_revision(repo):
+    trusted = _release(repo)
+    (repo / "web/src/base.ts").write_text("new source")
+    _git(repo, "add", "web/src/base.ts")
+    _git(repo, "commit", "-q", "-m", "new browser source")
+    with pytest.raises(verifier.VerifyError, match="browser_release_unverified"):
+        verifier.verify_browser_release(verifier.capture(repo), expected_dist_manifest=trusted, revision="HEAD", repo_root=repo)
+
+
+def test_capture_refuses_symlinks_and_never_reads_root_data_or_env(repo):
+    (repo / "data").mkdir()
+    (repo / "data/secret").write_text("must never be hashed")
+    (repo / ".env").write_text("must never be hashed")
+    assert set(verifier.capture(repo)["files"]) == {"app/main.py", "app/other.py"}
+    (repo / "app/link.py").symlink_to(repo / "data/secret")
+    with pytest.raises(verifier.VerifyError, match="tree_non_regular_file"):
+        verifier.capture(repo)
+
+
+def test_remote_command_quotes_the_tree_root():
+    import shlex
+    root = "/opt/release space/$(never-run)"
+    assert shlex.split(verifier._remote_command(root)) == [
+        "python3", "-I", "-B", root + "/scripts/verify_deployed_tree.py", "--capture", "--tree-root", root]
+
+
+def test_empty_release_directory_cannot_disappear_from_the_file_manifest(repo):
+    import json
+    (repo / "app/unexpected-empty").mkdir()
+    with pytest.raises(verifier.VerifyError, match="release_directory_closure"):
+        verifier._release_document(json.dumps(verifier.capture(repo)))
+
+
+def test_changed_caddy_configuration_fails_even_when_application_matches(repo):
+    (repo / "Caddyfile").write_text("reviewed-proxy-config")
+    _git(repo, "add", "Caddyfile")
+    _git(repo, "commit", "-q", "-m", "proxy config")
+    (repo / "Caddyfile").write_text("unreviewed-proxy-config")
+    report = verifier.compare(verifier.capture(repo)["files"], revision="HEAD", repo_root=repo)
+    assert report.differing == ["Caddyfile"]
 
 
 def test_an_uppercase_digest_is_accepted_and_normalised():

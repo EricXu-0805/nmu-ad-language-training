@@ -56,6 +56,7 @@ let neuralFails = 0;           // 连续网络/后端失败计数:偶发抖动�
 const NEURAL_FAIL_LATCH = 3;   // (一次瞬断就把 neural 钉死,会让无本机中文语音的设备整场静音)
 const audioEl = typeof Audio !== "undefined" ? new Audio() : null;
 let queue: Line[] = [];
+let activeLine: Line | null = null;
 let busy = false;   // 取队即置位:fetch/play 在途都算忙,同帧第二句只能排队
 let gen = 0;        // 世代:打断/停止即 +1,旧世代的一切异步续体自弃
 let curUrl: string | null = null; // 正在播的 blobURL:打断路径也要回收,不靠 onended
@@ -81,7 +82,8 @@ function notifySettled(tag: string, outcome: SpeechOutcome): void {
 
 function interrupt(): void {
   const wasBusy = busy;
-  const interruptedTag = pending?.tag ?? "";
+  const interruptedTag = activeLine?.tag ?? "";
+  activeLine = null;
   gen += 1;
   busy = false;
   ttsGesture(false);   // 被打断/换话的句子不再等手势
@@ -96,6 +98,7 @@ function driveQueue(): void {
   const next = queue.shift();
   if (!next) return;
   busy = true;
+  activeLine = next;
   void playItem(next, gen);
 }
 

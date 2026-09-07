@@ -1,6 +1,6 @@
 // 第1周自动带练的纯逻辑:机器人说完这句之后该干什么、进到一问要不要自动开麦、
-// 本节问完自动去哪、大约等多久。不碰 DOM/网络,便于单测;
-// RelationshipConsoleScreen 只做调用与定时器管理。
+// 本节问完自动去哪。不碰 DOM/网络,便于单测;
+// RelationshipConsoleScreen 在设备确认实际播放结束后调用。
 
 export type AfterReplyAction = "rearm" | "advance" | "section_done" | "none";
 
@@ -42,20 +42,6 @@ export function shouldAutoArmOnEntry(input: {
 }): boolean {
   return input.autoMode && input.speaker === "机器人"
     && input.qIdx >= 0 && input.qIdx < input.questionCount;
-}
-
-// 云 TTS 1.0 倍速约 3.5 字/秒;加起播余量(老人端 800ms 轮询 + 呈现投影 + 未缓存
-// 句的云合成),夹在 4~16 秒。只是等机器人把话说完再开麦的估计,不是精确同步——
-// 宁可多等一秒也别掐断小语正在说的话。老人端另有闭环闸(播完才放行麦克风)。
-export function speechDelayMs(text: string): number {
-  const chars = Array.from(text).length;
-  return Math.min(16000, Math.max(4000, 3000 + 300 * chars));
-}
-
-// 换问后开麦要等新问句念完。问句就在冻结脚本里,长度是已知的——用同一套估时,
-// 别拿一个比任何一条问句都短的固定值(机构环境四问 15~22 字,固定 7 秒全都不够)。
-export function nextQuestionArmDelayMs(nextAsk: string | null | undefined): number {
-  return speechDelayMs(nextAsk ?? "");
 }
 
 export function roundLabel(round: number, maxRounds: number): string {
