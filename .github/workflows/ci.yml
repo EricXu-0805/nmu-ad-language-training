@@ -118,10 +118,16 @@ jobs:
         run: |
           "$RUNNER_TEMP/nmu-edge-release/caddy" version
           "$RUNNER_TEMP/nmu-edge-release/caddy" validate --adapter caddyfile --config Caddyfile
+      - name: 验证实际网关的本地 HTTPS 反代与请求边界
+        run: >-
+          python scripts/smoke_caddy_release.py
+          --binary "$RUNNER_TEMP/nmu-edge-release/caddy" --source-root "$GITHUB_WORKSPACE"
       - name: 扫描实际网关二进制和 Go 标准库
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
-          scan-type: fs
+          # fs mode disables individual Go binary analysis; rootfs scans the
+          # compiled artifact (the coverage check below rejects empty reports).
+          scan-type: rootfs
           scan-ref: ${{ runner.temp }}/nmu-edge-release
           cache-dir: ${{ runner.temp }}/trivy-cache
           scanners: vuln

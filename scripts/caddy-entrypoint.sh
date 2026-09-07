@@ -17,11 +17,26 @@ case "$edge_version" in
 esac
 edge_build_info=$(caddy build-info 2>/dev/null) || reject
 printf '%s\n' "$edge_build_info" | awk '
+  BEGIN {
+    expected["golang.org/x/crypto"] = "v0.55.0"
+    expected["golang.org/x/net"] = "v0.57.0"
+    expected["golang.org/x/text"] = "v0.41.0"
+    expected["google.golang.org/grpc"] = "v1.83.1"
+  }
   $1 == "go" {
     count++
     if (NF != 2 || $2 != "go1.26.8") invalid = 1
   }
-  END { exit (count != 1 || invalid) }
+  $1 == "dep" && ($2 in expected) {
+    dependencies[$2]++
+    if (NF != 4 || $3 != expected[$2] || $4 !~ /^h1:[A-Za-z0-9+\/=]+$/) invalid = 1
+  }
+  # A replacement can retain the approved label while running different code.
+  $1 == "=>" { invalid = 1 }
+  END {
+    for (module in expected) if (dependencies[module] != 1) invalid = 1
+    exit (count != 1 || invalid)
+  }
 ' || reject
 
 exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile

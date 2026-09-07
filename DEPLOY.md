@@ -147,11 +147,11 @@ docker compose config --quiet
 docker compose pull app caddy
 ```
 
-发布构件分开固定：Node、Python 构建镜像按 OCI digest 固定；Caddy 按 `deploy/caddy-build.json` 锁定源码与修复版 Go 后独立构建和扫描，若使用 Compose 还必须形成并批准实际 `CADDY_IMAGE` digest。前端使用 `npm ci` 和仓库 lockfile；Python 只从 `requirements-deploy.lock.txt` 以 `--require-hashes` 安装完整传递依赖。不要在服务器上手工补包或改 lock。依赖升级必须在受控分支重新生成 lock、审查版本/哈希差异、完成全量回归后再替换固定构件。
+发布构件分开固定：Node、Python 构建镜像按 OCI digest 固定；Caddy 按 `deploy/caddy-build.json` 锁定源码、修复版 Go 和安全依赖版本，用 `deploy/caddy/` 中受管的标准入口与完整 Go 锁文件独立构建和扫描，若使用 Compose 还必须形成并批准实际 `CADDY_IMAGE` digest。前端使用 `npm ci` 和仓库 lockfile；Python 只从 `requirements-deploy.lock.txt` 以 `--require-hashes` 安装完整传递依赖。不要在服务器上手工补包或改 lock。依赖升级必须在受控分支重新生成 lock、审查版本/哈希差异、完成全量回归后再替换固定构件。
 
 前端构建会同时生成 `build-provenance.json` 与 `browser-dist-sha256.json`。前者分开记录 lock 声明的 Vite/TypeScript/React 插件版本与本次实际解析到的安装版本（任一不一致立即中止构建），并记录实际 Node/V8/平台/架构和 Dockerfile 声明的两层固定镜像；独立 `declared_edge_source` 指向 Caddy 重建合同，`container_image=null`，不为代理构件或容器发布背书。后者按字节排序覆盖最终 `dist/` 的每个普通文件，并明确只排除清单自身以避免递归悖论。`build-fingerprint.sha256` **只标识代码中明确枚举的输入字节**，不等于跨环境可复现证明、基础镜像证明、依赖漏洞扫描、SBOM、签名或供应链证明。正式发布构建必须在固定 Node 22 builder 内重建，确认 provenance 的 `node_major_matches_declared_release_builder=true`，逐文件复核 dist 清单，并另外保存镜像 digest、SBOM/扫描和签名证据。CI image 任务会在扫描通过后归档镜像中提取的 `nmu-release-artifacts`（前端构件、镜像 ID、源码提交）；部署需从对应成功运行独立下载并复验，不能从现役机器反取可信清单。镜像 ID 不等于注册表签名或 OCI 发布证明。本机 Node 不匹配时的绿色构建只能作为开发回归。
 
-同一成功 CI 的发布归档还包含独立网关 `caddy/caddy`、`go-build-info.txt`、`build-receipt.json`、`caddy-build.json` 和 `trivy.json`。从对应提交的成功 push 运行下载后，用 `scripts/verify_caddy_release_scan.py` 复核精确提交、干净构建、配方/脚本/二进制/构建信息的哈希及实际 Go 和 Caddy 模块扫描覆盖；不可用旧候选的绿色记录代替。GitHub artifact 下载不保留执行权限，先验证字节，再以 `install -m 0755` 放入隔离候选路径；不要直接覆盖现役网关。该二进制归档不等于已发布的 `CADDY_IMAGE` 容器镜像。
+同一成功 CI 的发布归档还包含独立网关 `caddy/caddy`、`go-build-info.txt`、`build-receipt.json`、`caddy-build.json`、`trivy.json` 及原始 `LICENSE.caddy`/`LICENSE.go`（回执绑定摘要）。从对应提交的成功 push 运行下载后，用 `scripts/verify_caddy_release_scan.py` 复核精确提交、干净构建、配方/脚本/二进制/构建信息的哈希及实际 Go 和 Caddy 模块扫描覆盖；不可用旧候选的绿色记录代替。GitHub artifact 下载不保留执行权限，先验证字节，再以 `install -m 0755` 放入隔离候选路径；不要直接覆盖现役网关。该二进制归档不等于已发布的 `CADDY_IMAGE` 容器镜像。
 
 默认容器不复制工作区 `data/`，也不安装可选 Piper。若部署本地 Piper 模型，必须把模型与固定版本 `piper-tts` 作为同一个受审查镜像变更安装并完成实际合成验收；不能只挂模型、也不能只装包。未做该变更时系统应明确降级到已配置云 TTS 或浏览器语音，不得把缺包伪装成已具备本地音色。
 

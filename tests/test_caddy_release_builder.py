@@ -6,27 +6,36 @@ import io
 import json
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import subprocess
 import tarfile
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _fixture(tmp_path: Path, go_response: str):
+def _fixture(tmp_path: Path, go_response: str, *, go_license: bytes | None = b"Go license fixture"):
     root = tmp_path / "repo"
     (root / "scripts").mkdir(parents=True)
     (root / "deploy").mkdir()
+    shutil.copytree(ROOT / "deploy/caddy", root / "deploy/caddy")
+    shutil.copyfile(ROOT / "deploy/caddy/main.go", root / "upstream-main.go")
     shutil.copyfile(ROOT / "scripts/build_caddy_release.sh", root / "scripts/build_caddy_release.sh")
     recipe = json.loads((ROOT / "deploy/caddy-build.json").read_text())
     archive = tmp_path / "toolchain.tar.gz"
-    script = ("#!/bin/sh\n" + go_response + "\n").encode()
+    script = ("#!/bin/sh\nfixture_root=" + shlex.quote(str(root)) + "\n" + go_response + "\n").encode()
     with tarfile.open(archive, "w:gz") as tar:
         member = tarfile.TarInfo("go/bin/go")
         member.size = len(script)
         member.mode = 0o755
         tar.addfile(member, io.BytesIO(script))
+        if go_license is not None:
+            member = tarfile.TarInfo("go/LICENSE")
+            member.size = len(go_license)
+            tar.addfile(member, io.BytesIO(go_license))
     host = platform.system().lower() + "-" + {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
     recipe["go"]["archives"][host]["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
     (root / "deploy/caddy-build.json").write_text(json.dumps(recipe))
@@ -106,36 +115,86 @@ def test_recipe_cannot_select_a_go_patch_before_the_security_fix(tmp_path):
     assert "security floor" in result.stderr
 
 
-def test_devel_main_module_cannot_hide_caddy_version_from_binary_scanners(tmp_path):
+def _source_response(*, caddy_version=None, missing_license="", old_crypto=False, replacement=False, mutate_lock=False):
     recipe = json.loads((ROOT / "deploy/caddy-build.json").read_text())
     caddy = recipe["caddy"]
-    response = f'''
+    module_config = {
+        "Module": {"Path": recipe["build_module"]["module"]},
+        "Require": [{"Path": name, "Version": version} for name, version in {
+            caddy["module"]: caddy["version"], **recipe["dependency_pins"],
+        }.items()],
+        "Replace": [{"Old": {"Path": caddy["module"]}, "New": {"Path": "./replacement"}}] if replacement else None,
+    }
+    dependencies = dict(recipe["dependency_pins"])
+    if old_crypto:
+        dependencies["golang.org/x/crypto"] = "v0.52.0"
+    dep_lines = "".join(f"\\tdep\\t{name}\\t{version}\\th1:fixture\\n" for name, version in dependencies.items())
+    return f'''
 case "$1 $2" in
   "env GOVERSION") echo go1.26.8 ;;
   "mod download")
-    mkdir -p "$GOMODCACHE/source"
+    mkdir -p "$GOMODCACHE/source/cmd/caddy"
+    cp "$fixture_root/upstream-main.go" "$GOMODCACHE/source/cmd/caddy/main.go"
     printf 'module fixture\\n' > "$GOMODCACHE/source/go.mod"
     printf 'fixture sum\\n' > "$GOMODCACHE/source/go.sum"
+    if [ '{missing_license}' != caddy ]; then printf 'Caddy license fixture' > "$GOMODCACHE/source/LICENSE"; fi
+    if [ '{mutate_lock}' = True ]; then printf changed >> "$fixture_root/deploy/caddy/go.sum"; fi
     printf '%s' '{{"Origin":{{"Hash":"{caddy['source_commit']}"}}}}' > "$GOMODCACHE/source/info.json"
     printf '{{"Path":"{caddy['module']}","Version":"{caddy['version']}","Sum":"{caddy['source_sum']}","GoModSum":"{caddy['go_mod_sum']}","Info":"%s/source/info.json","Dir":"%s/source"}}' "$GOMODCACHE" "$GOMODCACHE"
     ;;
-  "install -mod=readonly")
-    mkdir -p "$GOPATH/bin/linux_amd64"
-    printf fixture > "$GOPATH/bin/caddy"
-    printf fixture > "$GOPATH/bin/linux_amd64/caddy"
-    ;;
+  "mod edit") printf '%s' {shlex.quote(json.dumps(module_config))} ;;
+  "build -mod=readonly") printf fixture > "$8" ;;
   "mod verify") true ;;
   "version -m")
     printf '%s: go1.26.8\\n' "$3"
-    printf '\\tpath\\t{caddy['module']}/cmd/caddy\\n\\tmod\\t{caddy['module']}\\t(devel)\\t\\n'
-    printf '\\tbuild\\tCGO_ENABLED=0\\n\\tbuild\\tGOOS=linux\\n\\tbuild\\tGOARCH=amd64\\n\\tbuild\\tGOAMD64=v1\\n'
+    printf '\\tpath\\t{recipe['build_module']['module']}\\n\\tdep\\t{caddy['module']}\\t{caddy_version or caddy['version']}\\t{caddy['source_sum']}\\n'
+    printf '{dep_lines}'
+    printf '\\tbuild\\tCGO_ENABLED=0\\n\\tbuild\\tGOOS=linux\\n\\tbuild\\tGOARCH=amd64\\n\\tbuild\\tGOAMD64=v1\\n\\tbuild\\t-tags=nobadger\\n'
     ;;
   *) exit 91 ;;
 esac
 '''
-    root, archive, _ = _fixture(tmp_path, response)
+
+
+def test_devel_caddy_dependency_cannot_hide_caddy_version_from_binary_scanners(tmp_path):
+    root, archive, _ = _fixture(tmp_path, _source_response(caddy_version="(devel)"))
     output = tmp_path / "release"
     result = _build(root, archive, output)
     assert result.returncode != 0
     assert "pinned Caddy module version" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("missing", ["caddy", "go"])
+def test_missing_redistribution_license_cannot_publish_a_release(tmp_path, missing):
+    root, archive, _ = _fixture(tmp_path, _source_response(missing_license=missing),
+                                go_license=None if missing == "go" else b"Go license fixture")
+    output = tmp_path / "release"
+    result = _build(root, archive, output)
+    assert result.returncode != 0
+    assert f"missing or invalid redistribution license: LICENSE.{missing}" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(("kwargs", "error"), [
+    ({"old_crypto": True}, "wrong controlled dependency: golang.org/x/crypto"),
+    ({"replacement": True}, "dependency pins or module configuration mismatch"),
+    ({"mutate_lock": True}, "source changed before compilation"),
+])
+def test_controlled_dependency_contract_refuses_drift(tmp_path, kwargs, error):
+    root, archive, _ = _fixture(tmp_path, _source_response(**kwargs))
+    output = tmp_path / "release"
+    result = _build(root, archive, output)
+    assert result.returncode != 0
+    assert error in result.stderr
+    assert not output.exists()
+
+
+def test_controlled_entrypoint_must_equal_verified_upstream_source(tmp_path):
+    root, archive, _ = _fixture(tmp_path, _source_response())
+    (root / "deploy/caddy/main.go").write_text("package main\nfunc main() {}\n")
+    output = tmp_path / "release"
+    result = _build(root, archive, output)
+    assert result.returncode != 0
+    assert "differs from the verified upstream source" in result.stderr
     assert not output.exists()

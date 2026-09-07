@@ -25,6 +25,13 @@
     }
   },
   "target": {"goos": "linux", "goarch": "amd64", "cgo_enabled": "0"},
+  "build_module": {"path": "deploy/caddy", "module": "nmu.local/caddy-release"},
+  "dependency_pins": {
+    "golang.org/x/crypto": "v0.55.0",
+    "golang.org/x/net": "v0.57.0",
+    "golang.org/x/text": "v0.41.0",
+    "google.golang.org/grpc": "v1.83.1"
+  },
   "security_fix": {
     "id": "CVE-2026-56862",
     "advisory": "https://pkg.go.dev/vuln/GO-2026-6090",

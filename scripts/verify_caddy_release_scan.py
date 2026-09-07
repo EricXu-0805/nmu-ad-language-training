@@ -35,6 +35,14 @@ def verify_build_binding(artifact: Path, revision: str, root: Path) -> str:
     recipe = json.loads(recipe_bytes)
     if not isinstance(recipe, dict) or not isinstance(recipe.get("go"), dict):
         raise ScanError("build_recipe_invalid")
+    sources = receipt.get("controlled_sources_sha256")
+    if not isinstance(sources, dict) or set(sources) != {
+        "deploy/caddy/main.go", "deploy/caddy/go.mod", "deploy/caddy/go.sum",
+    }:
+        raise ScanError("controlled_source_receipt_missing")
+    for name, digest in sources.items():
+        if hashlib.sha256(data(root / name)).hexdigest() != digest:
+            raise ScanError("controlled_source_hash_mismatch")
     inputs = {
         "recipe_sha256": recipe_bytes,
         "builder_sha256": data(root / "scripts/build_caddy_release.sh"),
@@ -43,6 +51,13 @@ def verify_build_binding(artifact: Path, revision: str, root: Path) -> str:
     }
     if any(receipt.get(key) != hashlib.sha256(value).hexdigest() for key, value in inputs.items()):
         raise ScanError("build_artifact_or_source_hash_mismatch")
+    licenses = receipt.get("licenses_sha256")
+    if not isinstance(licenses, dict) or set(licenses) != {"LICENSE.caddy", "LICENSE.go"}:
+        raise ScanError("build_license_receipt_missing")
+    for name, digest in licenses.items():
+        license_bytes = data(artifact / name)
+        if not license_bytes or hashlib.sha256(license_bytes).hexdigest() != digest:
+            raise ScanError("build_license_missing_or_changed")
     if data(artifact / "caddy-build.json") != recipe_bytes:
         raise ScanError("build_recipe_copy_mismatch")
     expected_go = "go" + str(recipe["go"].get("version"))
@@ -50,6 +65,15 @@ def verify_build_binding(artifact: Path, revision: str, root: Path) -> str:
     if (receipt.get("go_version") != expected_go or not build_info.splitlines()
             or not build_info.splitlines()[0].endswith(": " + expected_go)):
         raise ScanError("build_go_version_differs_from_recipe")
+    pins = recipe.get("dependency_pins")
+    if not isinstance(pins, dict) or set(pins) != {
+        "golang.org/x/crypto", "golang.org/x/net", "golang.org/x/text", "google.golang.org/grpc",
+    }:
+        raise ScanError("dependency_security_pins_missing")
+    for name, version in pins.items():
+        versions = re.findall(r"^\tdep\t" + re.escape(name) + r"\t([^\t\n]+)\t", build_info, re.MULTILINE)
+        if versions != [version]:
+            raise ScanError("binary_dependency_differs_from_security_pin")
     return build_info
 
 
@@ -77,12 +101,16 @@ def verify(report: object, build_info: str) -> int:
         raise ScanError("go_standard_library_not_scanned_at_build_version")
     if not any(p.get("Name") == "github.com/caddyserver/certmagic" for p in packages):
         raise ScanError("caddy_dependency_coverage_missing")
-    module = re.search(r"^\tmod\tgithub\.com/caddyserver/caddy/v2\t(v2\.\d+\.\d+)\t", build_info, re.MULTILINE)
+    modules = re.findall(r"^\t(?:mod|dep)\tgithub\.com/caddyserver/caddy/v2\t(v2\.\d+\.\d+)\t", build_info, re.MULTILINE)
     caddy = [p for p in packages if p.get("Name") == "github.com/caddyserver/caddy/v2"]
-    if module is None or len(caddy) != 1 or caddy[0].get("Version") not in {
-        module[1], module[1][1:],
+    if len(modules) != 1 or len(caddy) != 1 or caddy[0].get("Version") not in {
+        modules[0], modules[0][1:],
     }:
         raise ScanError("caddy_main_module_not_scanned_at_build_version")
+    for name, version in re.findall(r"^\tdep\t([^\t\n]+)\t([^\t\n]+)\t", build_info, re.MULTILINE):
+        scanned = [p for p in packages if p.get("Name") == name]
+        if len(scanned) != 1 or str(scanned[0].get("Version")).removeprefix("v") != version.removeprefix("v"):
+            raise ScanError("compiled_dependency_not_scanned_at_build_version")
     for result in report["Results"]:
         if not isinstance(result, dict):
             raise ScanError("scan_result_malformed")
