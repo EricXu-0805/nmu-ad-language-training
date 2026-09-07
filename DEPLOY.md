@@ -96,7 +96,7 @@ Docker 发布端口时会创建宿主 iptables 规则，单纯配置 UFW 不足�
 ## 2. 取代码 + 配 .env
 
 ```bash
-git clone <经批准的源码仓库> nmu && cd nmu/platform   # 密钥和运行数据不得入库
+git clone <经批准的源码仓库> nmu && cd nmu   # 当前仓库根即平台目录；密钥和运行数据不得入库
 cp .env.example .env
 chmod 600 .env
 vi .env
