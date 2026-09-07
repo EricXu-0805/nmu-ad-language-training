@@ -9,6 +9,11 @@ import sys
 
 
 _IMMUTABLE_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+_REJECTED_EDGE_DIGESTS = frozenset({
+    # Caddy 2.11.4 upstream image built with vulnerable Go. Renaming the
+    # registry/tag cannot make the same immutable content safe.
+    "5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648",
+})
 _PRIVATE_PROXY_NETWORKS = (
     ip_network("10.0.0.0/8"),
     ip_network("172.16.0.0/12"),
@@ -71,10 +76,32 @@ def validate_forwarded_allow_ips(value: object) -> str:
     return value
 
 
+def validate_edge_contract(mode: object, image: object) -> None:
+    """Require an explicit edge topology and immutable embedded image.
+
+    Host binary provenance and future OCI publication/scan evidence are separate
+    release gates. This check rejects missing/mutable/known-bad pointers; an
+    arbitrary digest is not an approval or an attestation.
+    """
+    if mode == "host":
+        if image not in (None, ""):
+            raise ReleaseContractError("host_edge_image_must_be_unset")
+        return
+    if mode != "embedded":
+        raise ReleaseContractError("edge_mode_not_explicit")
+    try:
+        reference = validate_image_reference(image)
+    except ReleaseContractError as exc:
+        raise ReleaseContractError("edge_image_not_immutable") from exc
+    if reference.rsplit("@sha256:", 1)[1] in _REJECTED_EDGE_DIGESTS:
+        raise ReleaseContractError("edge_image_known_vulnerable")
+
+
 def main() -> int:
     try:
         validate_image_reference(os.environ.get("NMU_RELEASE_IMAGE"))
         validate_forwarded_allow_ips(os.environ.get("FORWARDED_ALLOW_IPS"))
+        validate_edge_contract(os.environ.get("NMU_EDGE_MODE"), os.environ.get("NMU_EDGE_IMAGE"))
     except ReleaseContractError as exc:
         print(f"REJECTED code={exc.code}", file=sys.stderr, flush=True)
         return 78

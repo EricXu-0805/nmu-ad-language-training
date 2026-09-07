@@ -1,6 +1,6 @@
 # 部署手册 · 现役 VPS 与目标 Docker Compose
 
-> **拓扑状态（2026-09-06）**：最近书面上线记录仍为 systemd 裸机 `nmu` + `nmu-caddy`，应用 `c2fd7fd`、库头 `d0c22a6dae2a`，详见 `docs/RELEASE_STATE.md`；本轮未重新 SSH 核验。本文 Docker Compose 部分是目标交付方案，尚不代表现役服务器已完成容器迁移。现役值班与恢复先查 `docs/handover/运维交接_值班与故障处置.md`。
+> **拓扑状态（2026-09-06）**：现场只读复核仍为 systemd 裸机 `nmu` + `nmu-caddy`、库头 `d0c22a6dae2a`；登记应用版本 `c2fd7fd` 的受管文件字节一致，但实际目录另有历史/生成文件，不能视为完整发布树验证通过。书面记录见 `docs/RELEASE_STATE.md`。本文 Docker Compose 部分是目标交付方案，尚不代表现役服务器已完成容器迁移。现役值班与恢复先查 `docs/handover/运维交接_值班与故障处置.md`。
 >
 > 本文禁止的 dirty-tree、删除式同步和现场依赖变更仍然禁止。容器候选卷预检与读取真实容器卷的自动备份尚未完成时，不得用裸机脚本的绿色结果替代容器验收；也不得在未迁移的现役服务器上套用容器命令。
 
@@ -104,6 +104,7 @@ vi .env
 
 `.env` 至少改这几项：
 - `APP_IMAGE=`：只接受已审查镜像的完整 `registry/name@sha256:<64 位小写 hex>`。只写 `latest` 或版本 tag 会在 Uvicorn 监听前 fail-closed。
+- `CADDY_IMAGE=`：内置反代另需已构建、扫描和批准的不可变镜像。原 Caddy 2.11.4 官方镜像所含 Go 已确认受影响，已移除默认值；当前只提供 `deploy/caddy-build.json` 的固定 Go 重建合同，**没有宣称新容器已发布**。空值、浮动引用或已知受影响 digest 会被启动合同拒绝；代理自身还在监听 TLS 前核对实际 Caddy 2.11.4 / Go 1.26.8。使用宿主 Caddy 覆盖文件时无需此镜像，宿主二进制及其扫描证据另验。
 - `APPDATA_VOLUME=`：已由具名运维员创建并验收的应用数据卷精确名。升级时它指向“从已验证快照恢复的候选卷”，不是原 live 卷。
 - `CADDY_DATA_VOLUME=` + `CADDY_CONFIG_VOLUME=`：已预建的 Caddy 状态卷精确名；特别是使用内部 CA 时不得丢失原 `caddydata`。
 - `APP_ENV_FILE=.env`：应用容器要读取的权限 `0600` 配置文件。候选卷预演时用独立 `.env.candidate`，不覆盖当前运行容器的环境。
@@ -141,13 +142,16 @@ docker volume create nmu-platform-caddyconfig
 
 # 只做语法/插值/外部卷合同校验，不把 env_file 密钥展开到终端或 CI 日志。
 docker compose config --quiet
-# APP_IMAGE 和 Caddy 都是 digest 引用；也可以先用受控 OCI 包 docker load。
+# APP_IMAGE 与显式 CADDY_IMAGE 均须为已批准 digest；尚无 Caddy 镜像时不得继续。
+# 也可以先用受控 OCI 包 docker load。
 docker compose pull app caddy
 ```
 
-发布构件有三层固定边界：Node、Python、Caddy 基础镜像均按 OCI digest 固定；前端使用 `npm ci` 和仓库 lockfile；Python 只从 `requirements-deploy.lock.txt` 以 `--require-hashes` 安装完整传递依赖。不要在服务器上手工补包或改 lock。依赖升级必须在受控分支重新生成 lock、审查版本/哈希差异、完成全量回归后再替换固定构件。
+发布构件分开固定：Node、Python 构建镜像按 OCI digest 固定；Caddy 按 `deploy/caddy-build.json` 锁定源码与修复版 Go 后独立构建和扫描，若使用 Compose 还必须形成并批准实际 `CADDY_IMAGE` digest。前端使用 `npm ci` 和仓库 lockfile；Python 只从 `requirements-deploy.lock.txt` 以 `--require-hashes` 安装完整传递依赖。不要在服务器上手工补包或改 lock。依赖升级必须在受控分支重新生成 lock、审查版本/哈希差异、完成全量回归后再替换固定构件。
 
-前端构建会同时生成 `build-provenance.json` 与 `browser-dist-sha256.json`。前者分开记录 lock 声明的 Vite/TypeScript/React 插件版本与本次实际解析到的安装版本（任一不一致立即中止构建），并记录实际 Node/V8/平台/架构和 Dockerfile/Compose 声明的三层固定镜像；后者按字节排序覆盖最终 `dist/` 的每个普通文件，并明确只排除清单自身以避免递归悖论。`build-fingerprint.sha256` **只标识代码中明确枚举的输入字节**，不等于跨环境可复现证明、基础镜像证明、依赖漏洞扫描、SBOM、签名或供应链证明。正式发布构建必须在固定 Node 22 builder 内重建，确认 provenance 的 `node_major_matches_declared_release_builder=true`，逐文件复核 dist 清单，并另外保存镜像 digest、SBOM/扫描和签名证据。CI image 任务会在扫描通过后归档镜像中提取的 `nmu-release-artifacts`（前端构件、镜像 ID、源码提交）；部署需从对应成功运行独立下载并复验，不能从现役机器反取可信清单。镜像 ID 不等于注册表签名或 OCI 发布证明。本机 Node 不匹配时的绿色构建只能作为开发回归。
+前端构建会同时生成 `build-provenance.json` 与 `browser-dist-sha256.json`。前者分开记录 lock 声明的 Vite/TypeScript/React 插件版本与本次实际解析到的安装版本（任一不一致立即中止构建），并记录实际 Node/V8/平台/架构和 Dockerfile 声明的两层固定镜像；独立 `declared_edge_source` 指向 Caddy 重建合同，`container_image=null`，不为代理构件或容器发布背书。后者按字节排序覆盖最终 `dist/` 的每个普通文件，并明确只排除清单自身以避免递归悖论。`build-fingerprint.sha256` **只标识代码中明确枚举的输入字节**，不等于跨环境可复现证明、基础镜像证明、依赖漏洞扫描、SBOM、签名或供应链证明。正式发布构建必须在固定 Node 22 builder 内重建，确认 provenance 的 `node_major_matches_declared_release_builder=true`，逐文件复核 dist 清单，并另外保存镜像 digest、SBOM/扫描和签名证据。CI image 任务会在扫描通过后归档镜像中提取的 `nmu-release-artifacts`（前端构件、镜像 ID、源码提交）；部署需从对应成功运行独立下载并复验，不能从现役机器反取可信清单。镜像 ID 不等于注册表签名或 OCI 发布证明。本机 Node 不匹配时的绿色构建只能作为开发回归。
+
+同一成功 CI 的发布归档还包含独立网关 `caddy/caddy`、`go-build-info.txt`、`build-receipt.json`、`caddy-build.json` 和 `trivy.json`。从对应提交的成功 push 运行下载后，用 `scripts/verify_caddy_release_scan.py` 复核精确提交、干净构建、配方/脚本/二进制/构建信息的哈希及实际 Go 和 Caddy 模块扫描覆盖；不可用旧候选的绿色记录代替。GitHub artifact 下载不保留执行权限，先验证字节，再以 `install -m 0755` 放入隔离候选路径；不要直接覆盖现役网关。该二进制归档不等于已发布的 `CADDY_IMAGE` 容器镜像。
 
 默认容器不复制工作区 `data/`，也不安装可选 Piper。若部署本地 Piper 模型，必须把模型与固定版本 `piper-tts` 作为同一个受审查镜像变更安装并完成实际合成验收；不能只挂模型、也不能只装包。未做该变更时系统应明确降级到已配置云 TTS 或浏览器语音，不得把缺包伪装成已具备本地音色。
 
@@ -391,6 +395,8 @@ upstream 从旧 `127.0.0.1:8000` 改到候选 `127.0.0.1:18000`。先用现网�
 Caddy 二进制执行 `caddy validate`，再 reload；不 stop、不覆盖证书目录。切换失败
 立即把 upstream reload 回 8000。旧 app、旧数据库和旧卷保持不动，直到新版本
 完成观察期和新 head 的异地可恢复快照；不得删除失败候选或执行 downgrade。
+
+上述 reload 仅适用于 upstream 配置切换，不能激活修复 Go 的新网关二进制。网关升级须单独安排维护，保存旧二进制、配置与回退路径，先用候选二进制验证配置，再受控替换并重启对应网关服务；恢复入口前须核对新进程实际可执行文件的哈希、Caddy/Go 版本及 HTTPS 健康情况。仅磁盘文件变更不算已修复运行进程。
 
 ### 9.1 切换前：旧卷不动，候选卷预演
 

@@ -16,6 +16,8 @@ import { build as viteBuild } from "vite";
 
 import {
   BUILD_PROVENANCE_NAME,
+  DECLARED_EDGE_SOURCE,
+  DECLARED_RELEASE_IMAGES,
   DIST_MANIFEST_NAME,
   assertNoSensitiveContentInDist,
   assertToolchainMatchesLock,
@@ -292,4 +294,9 @@ test("dist SHA-256 manifest is deterministic, covers provenance, and excludes on
     },
   );
   assert.match(provenance.fingerprint_scope.limitation, /Not a cross-environment/u);
+  assert.deepEqual(provenance.declared_release_images, DECLARED_RELEASE_IMAGES);
+  assert.equal("edge_runtime" in provenance.declared_release_images, false);
+  assert.deepEqual(provenance.declared_edge_source, DECLARED_EDGE_SOURCE);
+  assert.equal(provenance.declared_edge_source.container_image, null);
+  assert.match(provenance.declared_edge_source.limitation, /does not attest an edge binary/u);
 });

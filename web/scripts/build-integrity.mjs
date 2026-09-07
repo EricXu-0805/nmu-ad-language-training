@@ -71,11 +71,19 @@ const TOOLCHAIN_PACKAGES = Object.freeze([
 ]);
 
 // These are declarations, not claims that a local build actually ran inside
-// these images.  Regression tests pin them to Dockerfile/docker-compose.yml.
+// these images. Regression tests pin them to Dockerfile. The edge is separately
+// built and verified; no default reviewed Caddy OCI image currently exists.
 export const DECLARED_RELEASE_IMAGES = Object.freeze({
   browser_builder: "node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2",
   application_runtime: "python:3.12-alpine3.24@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df",
-  edge_runtime: "caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648",
+});
+
+export const DECLARED_EDGE_SOURCE = Object.freeze({
+  build_contract: "deploy/caddy-build.json",
+  caddy_version: "v2.11.4",
+  go_version: "1.26.8",
+  container_image: null,
+  limitation: "This browser build does not attest an edge binary or published OCI image. Verify the separate controlled build, binary hash and security scan before deployment.",
 });
 
 function bytewiseCompare(left, right) {
@@ -446,6 +454,7 @@ export function writeBrowserBuildEvidence({
       ...observedVersions,
     },
     declared_release_images: DECLARED_RELEASE_IMAGES,
+    declared_edge_source: DECLARED_EDGE_SOURCE,
     output_evidence: {
       manifest: DIST_MANIFEST_NAME,
       algorithm: "SHA-256",

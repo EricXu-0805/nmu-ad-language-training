@@ -107,6 +107,8 @@ def test_production_compose_uses_immutable_release_and_external_volume_contract(
     assert 'name: "${APPDATA_VOLUME:?set explicit existing APPDATA_VOLUME}"' in volumes_block
     assert 'name: "${CADDY_DATA_VOLUME:?set explicit existing CADDY_DATA_VOLUME}"' in volumes_block
     assert 'name: "${CADDY_CONFIG_VOLUME:?set explicit existing CADDY_CONFIG_VOLUME}"' in volumes_block
+    assert 'NMU_EDGE_MODE: "embedded"' in app_block
+    assert 'NMU_EDGE_IMAGE: "${CADDY_IMAGE:-}"' in app_block
     assert volumes_block.count("external: true") == 3
 
 
@@ -597,10 +599,14 @@ def test_browser_build_evidence_declares_but_does_not_overclaim_release_identity
     for identity, source in (
         ("node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2", dockerfile),
         ("python:3.12-alpine3.24@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df", dockerfile),
-        ("caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648", compose),
     ):
         assert identity in integrity
         assert identity in source
+    assert "edge_runtime:" not in integrity
+    assert "declared_edge_source: DECLARED_EDGE_SOURCE" in integrity
+    assert 'build_contract: "deploy/caddy-build.json"' in integrity
+    assert "container_image: null" in integrity
+    assert '${CADDY_IMAGE:-invalid.invalid/nmu-caddy-release-not-approved:blocked}' in compose
     assert '"scripts/build-integrity.mjs"' in fingerprint
     assert '"scripts/build-integrity.d.mts"' in fingerprint
     assert "Not a cross-environment reproducibility" in integrity

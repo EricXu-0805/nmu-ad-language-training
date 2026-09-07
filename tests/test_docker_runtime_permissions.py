@@ -33,7 +33,7 @@ def test_runtime_user_cannot_rewrite_application_or_training_content():
     assert collapsed.index("chown -R root:root") < collapsed.index("USER appuser")
 
 
-def test_release_images_are_pinned_to_reviewed_multiarch_digests():
+def test_app_images_are_pinned_and_edge_has_no_unsafe_default():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     from_lines = [
@@ -44,14 +44,10 @@ def test_release_images_are_pinned_to_reviewed_multiarch_digests():
     assert len(from_lines) == 2
     assert all(re.search(r"@sha256:[0-9a-f]{64}(?:\s|$)", line)
                for line in from_lines)
-    caddy_image = next(
-        line.strip() for line in compose.splitlines()
-        if line.strip().startswith("image: caddy:")
-    )
-    assert re.fullmatch(
-        r"image: caddy:2\.11\.4-alpine@sha256:[0-9a-f]{64}",
-        caddy_image,
-    )
+    assert 'image: "${CADDY_IMAGE:-invalid.invalid/nmu-caddy-release-not-approved:blocked}"' in compose
+    assert "image: caddy:" not in compose
+    assert 'entrypoint: ["sh", "/usr/local/libexec/nmu-caddy-entrypoint.sh"]' in compose
+    assert './scripts/caddy-entrypoint.sh:/usr/local/libexec/nmu-caddy-entrypoint.sh:ro' in compose
 
 
 def test_container_installs_complete_hash_locked_dependency_graph():

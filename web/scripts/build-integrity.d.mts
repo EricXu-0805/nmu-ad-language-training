@@ -20,6 +20,13 @@ export interface BrowserBuildEvidenceOptions {
 export const DIST_MANIFEST_NAME: string;
 export const BUILD_PROVENANCE_NAME: string;
 export const DECLARED_RELEASE_IMAGES: Readonly<Record<string, string>>;
+export const DECLARED_EDGE_SOURCE: Readonly<{
+  build_contract: string;
+  caddy_version: string;
+  go_version: string;
+  container_image: null;
+  limitation: string;
+}>;
 export function protectedBrowserModuleGraph(options?: BrowserModuleGraphOptions): Plugin;
 export function assertNoSensitiveContentInDist(options?: SensitiveDistOptions): void;
 export function assertToolchainMatchesLock(
