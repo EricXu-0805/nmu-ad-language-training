@@ -5928,6 +5928,17 @@ def _rapport_validate_script_position(
     return questions[question_idx] if questions else {}
 
 
+def _rapport_fence_position(state: SessionRuntimeState | None) -> tuple[str | None, int | None]:
+    """第1周当前问位(节, 问):回应只许落在它被请求时的那一问。"""
+    rapport = _json_load(state.rapport_json) if state is not None else None
+    if not isinstance(rapport, dict):
+        return (None, None)
+    section = rapport.get("sectionKey")
+    idx = rapport.get("questionIdx")
+    return (section if isinstance(section, str) else None,
+            idx if isinstance(idx, int) and not isinstance(idx, bool) else None)
+
+
 @contextmanager
 def _rapport_write_scope(
         request: Request, session_id: str, patient_id: str, s: DBSession,
@@ -5953,8 +5964,12 @@ def _rapport_write_scope(
         if patient is None:
             raise HTTPException(409, "受试者档案不存在")
         policy = cloud_processing.current_policy()
+        # 围栏比的是「暂停/中止/撤回/授权/问位」这些会让迟到回应落错的事实,不是裸
+        # runtime revision:控制台收到录音回执后会先把 recording=idle 写回镜像再请求
+        # 回应,两条并发请求谁先落库不定,拿 revision 比会把自己的这次改写判成
+        # 「场次进度已变化」而随机拒掉回应(合并后走查 3/3 复现)。
         snapshot = (patient_id, sess.trainer_id,
-                    state.revision if state else 0,
+                    _rapport_fence_position(state),
                     patient.governance_revision,
                     patient.cloud_processing_allowed,
                     patient.cloud_processing_provider_id,

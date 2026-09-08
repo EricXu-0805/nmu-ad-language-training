@@ -1019,3 +1019,76 @@ def test_llm_prompt_for_the_zodiac_question_is_built_as_final():
     prompt = rapport_reply.build_reply_prompt("您属什么呀？", "属牛", (), 1, 1)
     assert "最后一轮" in prompt and "不要再提任何问题" in prompt
     assert "开放式追问" not in prompt
+
+
+def _runtime_side_write(client, session_id, mutate):
+    """在回应请求「准入之后、落账之前」模拟另一条并发写:控制台/暂停/换问。"""
+    from app.models import SessionRuntimeState
+    with Session(client.test_engine) as s:
+        state = s.exec(select(SessionRuntimeState).where(
+            SessionRuntimeState.session_id == session_id)).first()
+        assert state is not None
+        mutate(state)
+        state.revision += 1
+        s.add(state)
+        s.commit()
+
+
+def _reply_line_with_side_effect(monkeypatch, client, session_id, mutate):
+    real = patient_presentation.rapport_reply_line
+    fired = {"n": 0}
+    def wrapped(script, section_key, question_idx):
+        if fired["n"] == 0:
+            fired["n"] += 1
+            _runtime_side_write(client, session_id, mutate)
+        return real(script, section_key, question_idx)
+    monkeypatch.setattr(patient_presentation, "rapport_reply_line", wrapped)
+    return fired
+
+
+def test_console_idle_rewrite_racing_the_reply_request_is_not_a_state_change(
+        pipeline_client, monkeypatch):
+    """控制台收到录音回执后先把 recording=idle 写回镜像(runtime revision +1)再请求回应,
+    两条并发请求谁先落库不定。围栏只该比暂停/撤回/授权/问位,不该拿裸 revision 把自己
+    这次改写判成「场次进度已变化」——合并后走查 3/3 随机 409 就是它。"""
+    client = pipeline_client
+    _seed_scene(client)
+    assert _write_reply_step(client, "S-PIPE", section="自我介绍", qidx=0, beat="ask").status_code == 200
+    fired = _reply_line_with_side_effect(monkeypatch, client, "S-PIPE", lambda state: None)
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 0, "mode": "script"})
+    assert fired["n"] == 1, "并发写没有发生在准入与落账之间"
+    assert created.status_code == 200, created.text
+    assert created.json()["source"] == "script"
+
+
+def test_pause_between_admission_and_commit_still_refuses_the_reply(
+        pipeline_client, monkeypatch):
+    client = pipeline_client
+    _seed_scene(client)
+    def pause(state):
+        state.status = "paused"
+    assert _write_reply_step(client, "S-PIPE", section="自我介绍", qidx=0, beat="ask").status_code == 200
+    _reply_line_with_side_effect(monkeypatch, client, "S-PIPE", pause)
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 0, "mode": "script"})
+    assert created.status_code == 409, created.text
+    assert "暂停" in created.json()["detail"]
+
+
+def test_question_change_between_admission_and_commit_refuses_the_late_reply(
+        pipeline_client, monkeypatch):
+    """研究者在回应生成期间换到了下一问:这句迟到回应不能落在新问位上。"""
+    import json as _json
+    client = pipeline_client
+    _seed_scene(client)
+    def advance(state):
+        rapport = _json.loads(state.rapport_json)
+        rapport["questionIdx"] = 1
+        state.rapport_json = _json.dumps(rapport, ensure_ascii=False)
+    assert _write_reply_step(client, "S-PIPE", section="自我介绍", qidx=0, beat="ask").status_code == 200
+    _reply_line_with_side_effect(monkeypatch, client, "S-PIPE", advance)
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "自我介绍", "questionIdx": 0, "mode": "script"})
+    assert created.status_code == 409, created.text
+    assert "进度" in created.json()["detail"] or "变化" in created.json()["detail"]

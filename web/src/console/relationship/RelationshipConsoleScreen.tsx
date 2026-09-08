@@ -328,7 +328,10 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     setBeat("reply");
     replyBeatRef.current = { beat: "reply", utteranceId: u.utteranceId };
     setSpokenReply(u.text);
-    setReplyMeta(replySourceLabel(u.source, u.degradedReason));
+    // 轮次跟着回应句一起留在屏上(直到换问/开麦清掉);单独的提示行设完立刻清,研究者看不见。
+    const roundTag = u.source !== "script" && u.round !== undefined && u.maxRounds !== undefined
+      ? ` · ${roundLabel(u.round, u.maxRounds)}` : "";
+    setReplyMeta(replySourceLabel(u.source, u.degradedReason) + roundTag);
     const accepted = await postRapportWithReceipt({ sectionKey: sk, questionIdx: qi, beat: "reply", utteranceId: u.utteranceId, recording: "idle", recSeq: recSeq.current, ...rapportFlags });
     if (playbackWaitEpoch.current !== epoch) return;
     if (!accepted) {
@@ -363,9 +366,6 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       autoMode: now.autoReply, final: u.final,
       invitesMore: u.invitesMore === true, qIdx: qi, questionCount: now.questionCount,
     });
-    const label = u.source === "script" ? "照脚本回应" : roundLabel(u.round, u.maxRounds);
-    setRoundNote(`${label} · 朗读已完成`);
-    setRoundNote(null);
     if (action === "rearm") latest.current.armNextRound(sk, qi, u.utteranceId);
     else if (action === "advance") latest.current.go(latest.current.sectionIdx, qi + 1);
     else if (action === "section_done") {
