@@ -9,6 +9,13 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+> **2026-09-08 06:11 UTC 已上线 `3ce098b`（零迁移；库头仍 `e2a6d8f0b419`）。** 收据 254：`5684a3a` 的第 1 周回应围栏拿裸
+> runtime revision 比，控制台「录音回执 → 写 idle → 请求回应」两条并发请求谁先落库不定，自动回应随机 409
+> （真 Chrome 走查 3/3 复现）；快照改比问位 `(sectionKey, questionIdx)`，暂停/中止/撤回/授权照旧拦。控制台轮次标签
+> 并进回应句旁说明（原设完即清、看不见）。走 PR #4 + 分支 CI 五项绿后 fast-forward 进 main；前端产物取该提交
+> CI 归档的 dist；树核 `MATCH revision=3ce098b source_files=813 browser_files=16`；preflight 8/8；上线前 10 分钟
+> 生产零非轮询请求；走查 46/46。Claude 执行，Eric 授权。
+>
 > **2026-09-07：综合修复已部署，正常入口于 09:56 UTC 恢复。** 实际应用提交为 `5684a3a329b7189560942d6c2ec6a5f6444474bf`，库头为 `e2a6d8f0b419`。新头异地副本、追加式审计锚点、匿名外网浏览器、调度恢复和现场版本索引均已核对。各项工程验收范围见下表及修复记录，真实使用批准仍单独判断。
 >
 > **旧部署树收据的证明范围已纠正。** 历史 `MATCH files=90` 等只覆盖 `app/`、`scripts/` 的 Python 文件，遗漏 content、迁移、前端构件等，不能证明整包一致。历史数值保留为当时记录；本次使用完整发布清单和独立构建产物核验。现役已实际核对为 systemd 裸机；Compose 仍是尚未采用的目标方案。
@@ -207,6 +214,15 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 ## 本轮发布与运行交接
 
 综合修复已合并、安装，完成新头异地校验与追加式审计锚点记录、正常入口及匿名外网浏览器检查、原调度恢复和现场版本索引登记。逐项工程验收及其剩余边界见 [修复进度与验收](audits/2026-09-06-fix-progress.md)。本次回执不沿用旧提交的 CI、旧头备份或目标设备记录，也不证明认证后业务、真实语音和临床流程已获验收。
+
+## 2026-09-08 上线记录（`3ce098b`：第 1 周回应围栏按问位比 + 轮次标签，零迁移）
+
+**2026-09-08 06:11 UTC 由 Claude 执行收据 254 脚本（Eric 授权），十一步全过；树核 `MATCH revision=3ce098b source_files=813 browser_files=16`（完整清单 + CI dist 清单）；preflight 8/8 退出码 0；上线前 10 分钟生产零非轮询请求。**
+
+- 根因：`5684a3a`（A08）在 `rapport_reply_create` 的处理快照里放了裸 `state.revision`；控制台 `useAudioSaved` 先写 `recording=idle`（推 revision）再请求回应，并发顺序不定，idle 先落就把回应判成「场次进度或授权已变化」→ 自动带练随机停，研究者要手点「让机器人回应」。
+- 改法：快照改比 `_rapport_fence_position(state)` = `(sectionKey, questionIdx)`；暂停/中止（status）、撤回、受试者、trainer、治理版本、云授权照旧拦。测试：准入与落账之间并发写 → 200；同窗口暂停 → 409；同窗口换问 → 409（旧代码上第一条红）。控制台轮次标签并进 `replyMeta`。
+- 上线方式（Codex 之后的口径）：main 分支保护 → 分支 CI 绿后同 SHA fast-forward（PR #4 自动标 merged）；前端产物取 push 事件 run 归档的 `nmu-release-artifacts/dist`（pull_request 事件构建的是合并预演提交）；生产树 nmu:nmu、750/640 在服务端统一落（本机 rsync 是 openrsync）。rsync 带过去 4 个本地空目录（`web/public{,/content,/img}`、`web/src/design`）让完整清单闭包判 INVALID，`rmdir` 后 MATCH；本地同样删掉。
+- 清理：Codex 留下的 worktree `a15-required-check-rejection-20260907` 与本地 codex/* 分支已删；origin 上三条 codex/* 远程分支未删（自动审批拦了 push --delete）。
 
 ## 2026-09-05 上线记录（`c2fd7fd`：属相一问单轮，零迁移）
 
