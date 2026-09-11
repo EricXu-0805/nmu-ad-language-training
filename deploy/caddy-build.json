@@ -28,9 +28,9 @@
   "build_module": {"path": "deploy/caddy", "module": "nmu.local/caddy-release"},
   "dependency_pins": {
     "golang.org/x/crypto": "v0.55.0",
-    "golang.org/x/net": "v0.57.0",
+    "golang.org/x/net": "v0.58.0",
     "golang.org/x/text": "v0.41.0",
-    "google.golang.org/grpc": "v1.83.1"
+    "google.golang.org/grpc": "v1.83.2"
   },
   "security_fix": {
     "id": "CVE-2026-56862",
