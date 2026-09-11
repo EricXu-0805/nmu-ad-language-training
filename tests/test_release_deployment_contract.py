@@ -20,9 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 VALID_IMAGE = "registry.invalid/nmu/app@sha256:" + "a" * 64
 EDGE_DEPENDENCIES = {
     "golang.org/x/crypto": "v0.55.0",
-    "golang.org/x/net": "v0.57.0",
+    "golang.org/x/net": "v0.58.0",
     "golang.org/x/text": "v0.41.0",
-    "google.golang.org/grpc": "v1.83.1",
+    "google.golang.org/grpc": "v1.83.2",
 }
 EDGE_DEPENDENCY_LINES = "".join(
     f"\tdep\t{module}\t{version}\th1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"

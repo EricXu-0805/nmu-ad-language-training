@@ -19,9 +19,9 @@ edge_build_info=$(caddy build-info 2>/dev/null) || reject
 printf '%s\n' "$edge_build_info" | awk '
   BEGIN {
     expected["golang.org/x/crypto"] = "v0.55.0"
-    expected["golang.org/x/net"] = "v0.57.0"
+    expected["golang.org/x/net"] = "v0.58.0"
     expected["golang.org/x/text"] = "v0.41.0"
-    expected["google.golang.org/grpc"] = "v1.83.1"
+    expected["google.golang.org/grpc"] = "v1.83.2"
   }
   $1 == "go" {
     count++

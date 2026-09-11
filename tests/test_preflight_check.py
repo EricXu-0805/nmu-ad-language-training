@@ -7,6 +7,8 @@ from pathlib import Path
 import sqlite3
 import sys
 
+import pytest
+
 _SPEC = importlib.util.spec_from_file_location(
     "preflight_check",
     Path(__file__).resolve().parents[1] / "scripts" / "preflight_check.py")
@@ -47,6 +49,47 @@ def test_missing_database_fails(tmp_path):
 
     assert check.ok is False
     assert "不存在" in check.detail
+
+
+def _backup_app(tmp_path: Path) -> Path:
+    app = tmp_path / "application"
+    (app / "scripts").mkdir(parents=True)
+    for relative in preflight.BACKUP_EXECUTABLES:
+        path = app / relative
+        # 此检查只能观察权限，不得为了验收而真正执行备份。
+        path.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        path.chmod(0o750)
+    return app
+
+
+def test_backup_execution_accepts_owner_and_group_executable_scripts(tmp_path):
+    app = _backup_app(tmp_path)
+
+    assert preflight.check_backup_execution(app).ok is True
+
+
+@pytest.mark.parametrize("relative", preflight.BACKUP_EXECUTABLES)
+def test_backup_execution_rejects_640_for_each_dependency(tmp_path, relative):
+    app = _backup_app(tmp_path)
+    (app / relative).chmod(0o640)
+
+    check = preflight.check_backup_execution(app)
+
+    assert check.ok is False
+    assert f"{relative}: not_executable mode=0640" in check.detail
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "symlink"])
+def test_backup_execution_rejects_missing_or_nonregular_script(tmp_path, kind):
+    app = _backup_app(tmp_path)
+    path = app / "scripts/vps-backup-daily.sh"
+    path.unlink()
+    if kind == "directory":
+        path.mkdir()
+    elif kind == "symlink":
+        path.symlink_to(app / "scripts/backup.sh")
+
+    assert preflight.check_backup_execution(app).ok is False
 
 
 def _fetcher(status_by_path: dict[str, int], headers: dict[str, str] | None = None):
@@ -190,6 +233,9 @@ def _make_all_automatic_groups_pass(monkeypatch) -> None:
         preflight, "check_backup",
         lambda _path: preflight.Check("备份新鲜度", True, "fresh"))
     monkeypatch.setattr(
+        preflight, "check_backup_execution",
+        lambda _path: preflight.Check("备份脚本可执行", True, "executable"))
+    monkeypatch.setattr(
         preflight, "check_supply_chain",
         lambda _path, _python: preflight.Check("依赖与哈希锁一致", True, "locked"))
     monkeypatch.setattr(
@@ -204,6 +250,37 @@ def test_require_all_needs_no_release_evidence_index(tmp_path, monkeypatch):
     _make_all_automatic_groups_pass(monkeypatch)
 
     assert preflight.main([*_all_pass_args(tmp_path), "--require-all"]) == 0
+
+
+@pytest.mark.parametrize("mode, expected", [(0o640, 1), (0o750, 0)])
+def test_require_all_checks_execution_even_with_a_fresh_backup(
+        tmp_path, monkeypatch, capsys, mode, expected):
+    app = _backup_app(tmp_path)
+    for relative in preflight.BACKUP_EXECUTABLES:
+        (app / relative).chmod(mode)
+    execution_check = preflight.check_backup_execution
+    _make_all_automatic_groups_pass(monkeypatch)
+    monkeypatch.setattr(preflight, "check_backup_execution", execution_check)
+
+    code = preflight.main([
+        *_all_pass_args(tmp_path), "--require-all", "--app-root", str(app),
+    ])
+
+    assert code == expected
+    output = capsys.readouterr().out
+    assert "[PASS] 备份新鲜度" in output
+    assert f"[{'FAIL' if expected else 'PASS'}] 备份脚本可执行" in output
+
+
+def test_default_app_root_checks_the_deployed_preflight_tree(tmp_path, monkeypatch):
+    app = _backup_app(tmp_path)
+    (app / "scripts/vps-backup-daily.sh").chmod(0o640)
+    execution_check = preflight.check_backup_execution
+    _make_all_automatic_groups_pass(monkeypatch)
+    monkeypatch.setattr(preflight, "check_backup_execution", execution_check)
+    monkeypatch.setattr(preflight, "__file__", str(app / "scripts/preflight_check.py"))
+
+    assert preflight.main([*_all_pass_args(tmp_path), "--require-all"]) == 1
 
 
 def test_release_fails_without_evidence_even_when_every_automatic_group_passes(

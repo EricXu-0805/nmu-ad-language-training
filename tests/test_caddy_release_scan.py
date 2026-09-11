@@ -8,8 +8,8 @@ import pytest
 from scripts.verify_caddy_release_scan import ScanError, verify, verify_build_binding
 
 
-PINS = {"golang.org/x/crypto": "v0.55.0", "golang.org/x/net": "v0.57.0",
-        "golang.org/x/text": "v0.41.0", "google.golang.org/grpc": "v1.83.1"}
+PINS = {"golang.org/x/crypto": "v0.55.0", "golang.org/x/net": "v0.58.0",
+        "golang.org/x/text": "v0.41.0", "google.golang.org/grpc": "v1.83.2"}
 BUILD_INFO = (
     "/private/build/caddy: go1.26.8\n\tpath\tgithub.com/caddyserver/caddy/v2/cmd/caddy\n"
     "\tmod\tgithub.com/caddyserver/caddy/v2\tv2.11.4\th1:source-checksum\n"
