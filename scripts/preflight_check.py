@@ -7,7 +7,7 @@ D2 走查那天真正只能靠人的，是麦克风、噪声、断网和老人�
 
 五组自动检查各自可跳过，任一硬失败即非零退出：
   数据库   代码的 alembic 头与库里的头是否一致（只读，一条 SELECT）
-  备份     复用 backup_health_check 的判据
+  备份     检查备份脚本可执行，并复用 backup_health_check 的新鲜度判据
   依赖     已安装依赖与带哈希锁是否一致
   操作系统 显式启用时核对安全更新和重启状态
   公网     /health 200、四条红线 404、五个安全头齐、受保护路由 401
@@ -21,9 +21,11 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path
 import sqlite3
 import ssl
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -41,6 +43,7 @@ REQUIRED_HEADERS = (
     "x-content-type-options",
     "permissions-policy",
 )
+BACKUP_EXECUTABLES = ("scripts/vps-backup-daily.sh", "scripts/backup.sh")
 
 
 class Check:
@@ -106,6 +109,26 @@ def check_backup(backup_root: Path) -> Check:
     if problems:
         return Check(name, False, "; ".join(problems))
     return Check(name, True, "最新快照在窗口内，且真的在盘上")
+
+
+def check_backup_execution(app_root: Path) -> Check:
+    """只读检查 systemd 直接启动的脚本及其直接执行的子脚本。"""
+    failures = []
+    for relative in BACKUP_EXECUTABLES:
+        path = app_root / relative
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            failures.append(f"{relative}: missing_or_unreadable")
+            continue
+        if not stat.S_ISREG(mode):
+            failures.append(f"{relative}: not_regular_file")
+        elif not mode & 0o111 or not os.access(path, os.R_OK | os.X_OK):
+            failures.append(f"{relative}: not_executable mode={stat.S_IMODE(mode):04o}")
+    return Check(
+        "备份脚本可执行", not failures,
+        "; ".join(failures) if failures else "入口及子脚本均为当前身份可读、可执行的普通文件",
+    )
 
 
 def check_supply_chain(lock_path: Path, python_executable: str) -> Check:
@@ -257,6 +280,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=None, help="要核对迁移头的 SQLite")
     parser.add_argument("--backup-root", type=Path, default=None)
+    parser.add_argument(
+        "--app-root", type=Path, default=Path(__file__).resolve().parents[1],
+        help="备份脚本所在应用树；默认使用本预检脚本所在的应用树")
     parser.add_argument("--lock", type=Path, default=None,
                         help="哈希锁；给了就把跑这个脚本的解释器和它对一遍账")
     parser.add_argument("--os", action="store_true",
@@ -291,6 +317,8 @@ def main(argv: list[str] | None = None) -> int:
                   else Check("迁移头一致", None, "未给 --db"))
     checks.append(check_backup(args.backup_root) if args.backup_root
                   else Check("备份新鲜度", None, "未给 --backup-root"))
+    if args.backup_root:
+        checks.append(check_backup_execution(args.app_root))
     checks.append(check_supply_chain(args.lock, sys.executable) if args.lock
                   else Check("依赖与哈希锁一致", None, "未给 --lock"))
     checks.append(check_os_security() if args.os
