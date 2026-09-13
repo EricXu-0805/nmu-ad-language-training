@@ -748,7 +748,7 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                 state="visible", timeout=20_000)
             patient.get_by_text("练习已暂停，请稍候", exact=True).wait_for(
                 state="visible", timeout=20_000)
-            caregiver.get_by_text("暂停后不会自动重新开始", exact=True).wait_for(
+            caregiver.get_by_text("暂停后不会自动继续", exact=True).wait_for(
                 state="visible", timeout=20_000)
             for label in ("请求协助", "结束本次"):
                 action = caregiver.get_by_role("button", name=label, exact=True)

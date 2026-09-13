@@ -400,15 +400,26 @@ function ttsGesture(needed: boolean): void {
 
 // 8 kHz 单声道 8 个采样的静音 WAV(60 字节)。只用来在用户手势里「解锁」播放元素:
 // 有些浏览器只认在手势里放过声的那个元素,之后同一元素上的 play() 才不要手势。
-export const SILENT_WAV_DATA_URI =
-  "data:audio/wav;base64,UklGRjQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YRAAAAAAAAAAAAAAAAAAAAAAAAAA";
+// 必须是 blob: URL:页面 CSP 是 media-src 'self' blob:,data: 会被拦,解锁根本没发生
+// (2026-09-13 照护员真 Chrome 验收抓到的控制台报错;9/4 上线那版一直是 data:)。
+const SILENT_WAV_BASE64 =
+  "UklGRjQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YRAAAAAAAAAAAAAAAAAAAAAAAAAA";
+let silentWavUrl: string | null = null;
+export function silentWavObjectUrl(): string {
+  if (silentWavUrl) return silentWavUrl;
+  const binary = atob(SILENT_WAV_BASE64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  silentWavUrl = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+  return silentWavUrl;
+}
 
 /** 必须在用户手势处理器里同步调用;正在出声时不动它。失败静默(解锁只是补强)。 */
 export function unlockTtsPlayback(): void {
   if (!audioEl || busy || !audioEl.paused) return;
   audioEl.onended = null;
   audioEl.onerror = null;
-  audioEl.src = SILENT_WAV_DATA_URI;
+  audioEl.src = silentWavObjectUrl();
   void audioEl.play().catch(() => { /* 没解锁成,pointerdown 补读那条路还在 */ });
 }
 

@@ -2,7 +2,7 @@ import { fetchExactAutopilotTts } from "./autopilotMediaTransport.ts";
 import { browserAutopilotMediaDependencies } from "./autopilotBrowserMediaDependencies.ts";
 import type { AutopilotSpeechBrowserPorts } from "./autopilotSpeechExecutor.ts";
 import {
-  announceGestureNeeded, SILENT_WAV_DATA_URI, stopSpeaking, ttsEnabled,
+  announceGestureNeeded, silentWavObjectUrl, stopSpeaking, ttsEnabled,
 } from "./tts.ts";
 
 // 自动带练每条话术共用**同一个** <audio>,不再每句 new Audio()。
@@ -28,7 +28,7 @@ export function unlockAutopilotPlayback(): void {
   audio.onplaying = null;
   audio.onended = null;
   audio.onerror = null;
-  audio.src = SILENT_WAV_DATA_URI;
+  audio.src = silentWavObjectUrl();
   void audio.play().catch(() => { /* 没解锁成,后面 play() 被拒时还有等手势那条路 */ });
 }
 
