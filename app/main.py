@@ -6477,7 +6477,13 @@ def _apply_audio_disposal_confirmed(
             "code": "audio_disposition_device_capability_required",
             "message": "本地副本删除回执只能由精确绑定本场次的设备能力凭据上报",
         })
-    _require_capability_bound_session(request, session_id, "上报本地副本删除回执")
+    orphan_allowed = _superseded_orphan_receipt_allowed(
+        request, s, session_id, payload["rawAudioId"])
+    if not orphan_allowed:
+        _require_capability_bound_session(request, session_id, "上报本地副本删除回执")
+    # 作废孤儿槽的回执:凭据绑在同一位受试者的新场次,按它自己绑定的场次复验有效性。
+    capability_session = (
+        _device_capability_session_id(request) if orphan_allowed else session_id)
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
@@ -6486,7 +6492,7 @@ def _apply_audio_disposal_confirmed(
         # 已吊销/过期凭据照旧拒绝。
         status, cap_row = device_capability.revalidate_active_for_write(
             s, getattr(request.state, "device_capability_token_hash", None),
-            session_id)
+            capability_session)
         if status not in {device_capability.CapabilityResolution.VALID,
                           device_capability.CapabilityResolution.RECOVERY_ONLY}:
             code = {
@@ -6538,10 +6544,15 @@ def _apply_audio_disposal_confirmed(
                 "message": "录音仍是活跃研究事实，不存在可确认的终态删除",
             })
         checksum = payload["checksum"].lower()
+        # 作废的孤儿录音槽(见 _superseded_capture_disposition)服务端从没见过字节,
+        # 没有可比对的 checksum/字节数,回执里记的是设备自己的本地事实。
+        superseded_orphan = _superseded_orphan_row_shape(asset) and (
+            orphan_allowed or _superseded_orphan_marked(s, payload["rawAudioId"]))
         if (asset.turn_key != canonical_turn_key
                 or payload["reason"] != expected_reason
-                or (asset.checksum or "").lower() != checksum
-                or asset.byte_count != payload["byteCount"]
+                or (not superseded_orphan and (
+                    (asset.checksum or "").lower() != checksum
+                    or asset.byte_count != payload["byteCount"]))
                 or asset.contains_direct_identifier
                 != payload["containsDirectIdentifier"]):
             raise HTTPException(409, detail={
@@ -6575,6 +6586,213 @@ def _apply_audio_disposal_confirmed(
                 "rawAudioId": payload["rawAudioId"], "duplicate": False}
 
 
+def _superseded_orphan_row_shape(asset: AudioAssetRow) -> bool:
+    """作废孤儿槽的行形状:标了 deleted+闸门,但服务端从没见过字节。"""
+    return (asset.status == AudioStatus.deleted and asset.delete_gate_passed
+            and asset.checksum is None and asset.byte_count is None
+            and asset.uploaded_at is None)
+
+
+def _superseded_orphan_marked(s: DBSession, raw_id: str) -> bool:
+    """作废是不是这条规则做的:只认 audio_capture_superseded 审计行,
+    手工修数据修出来的 deleted 无字节行不算。"""
+    return s.exec(select(AuditLog).where(
+        AuditLog.action == "audio_capture_superseded",
+        AuditLog.summary.contains(raw_id))).first() is not None
+
+
+def _device_has_valid_pairing(s: DBSession, *, device_id_hash: str, session_id: str) -> bool:
+    now = device_capability._utc_now_naive()
+    for row in s.exec(select(PatientDeviceCapability).where(
+            PatientDeviceCapability.device_id_hash == device_id_hash,
+            PatientDeviceCapability.session_id == session_id,
+            PatientDeviceCapability.revoked_at.is_(None),
+            PatientDeviceCapability.recovery_only_at.is_(None))).all():
+        if row.expires_at > now:
+            return True
+    return False
+
+
+def _device_newer_pairing_same_patient(
+        s: DBSession, *, device_id_hash: str, old_session: TrainSession) -> bool:
+    """这台设备现在是不是已经配到了同一位受试者的另一场(未吊销、未降级、未过期)。"""
+    now = device_capability._utc_now_naive()
+    rows = s.exec(select(PatientDeviceCapability).where(
+        PatientDeviceCapability.device_id_hash == device_id_hash,
+        PatientDeviceCapability.session_id != old_session.session_id,
+        PatientDeviceCapability.revoked_at.is_(None),
+        PatientDeviceCapability.recovery_only_at.is_(None))).all()
+    for row in rows:
+        if row.expires_at <= now:
+            continue
+        other = s.get(TrainSession, row.session_id)
+        if other is not None and other.patient_id == old_session.patient_id:
+            return True
+    return False
+
+
+def _superseded_orphan_receipt_allowed(
+        request: Request, s: DBSession, session_id: str, raw_id: str) -> bool:
+    """作废孤儿槽的删除回执:设备现在绑在同一位受试者的新场次,回执仍要能落账。"""
+    bound = _device_capability_session_id(request)
+    if bound is None or not session_id or session_id == bound:
+        return False
+    if _capability_recovery_only(request):
+        return False
+    asset = s.get(AudioAssetRow, raw_id)
+    if asset is None or asset.session_id != session_id or not _superseded_orphan_row_shape(asset):
+        return False
+    old_sess = s.get(TrainSession, session_id)
+    new_sess = s.get(TrainSession, bound)
+    if old_sess is None or new_sess is None or old_sess.patient_id != new_sess.patient_id:
+        return False
+    token_hash = getattr(request.state, "device_capability_token_hash", None)
+    cap = s.get(PatientDeviceCapability, token_hash) if isinstance(token_hash, str) else None
+    if cap is None:
+        return False
+    return s.exec(select(PatientDeviceCapability).where(
+        PatientDeviceCapability.session_id == session_id,
+        PatientDeviceCapability.device_id_hash == cap.device_id_hash)).first() is not None
+
+
+def _superseded_capture_disposition(request: Request, s: DBSession, payload: dict) -> None:
+    """同一台平板换到同一位受试者的新场次后,旧场次那段没传完的录音作废。
+
+    老人端 outbox 里只要还有一段没拿到服务端收据的录音,就不会再开新麦(自动带练
+    与第 1 周录音器都是这条 fail-closed 规则)。旧场次 A 没结束时设备配到了同一位
+    受试者的新场次 B,A 那段录音的补传会被拒(绑 B 的凭据 → device_session_mismatch;
+    A 的 recovery-only 凭据 → 不能创建新事实),永远留在本机,平板从此录不了
+    ——2026-09-13 钱凯演示就卡在这里(9/6 那场的「动物园」)。
+
+    只对「服务端对这段录音没有任何字节事实」(没上传过、盘上没原件、没采集收据)的
+    A 场次录音槽给 410 终态处置,把槽标 deleted(delete_gate_passed 记的是这条作废
+    规则,审计 audio_capture_superseded),按既有 410 协议让设备删本地副本。三种凭据:
+      (a) 绑 B 的有效凭据回报 A:A、B 同一位受试者,这台设备配对过 A;
+      (b) A 自己的 recovery-only 凭据回报 A:这台设备现已配到同一位受试者的另一场;
+      (c) 绑 A 的有效凭据回报 A(重配回旧场次):只对已经作废过的槽重放同一个 410。
+    有字节事实的、撤回的、别的受试者的、没配对过 A 的设备、别的场次的 recovery 凭据,
+    一律不碰,照旧走原来的拒绝。A 已中止也作废:没字节的槽不是「保留只读证据」。
+    """
+    bound = _device_capability_session_id(request)
+    if bound is None:
+        return
+    target = _payload_session_id(payload)
+    if not target:
+        return
+    recovery_only = _capability_recovery_only(request)
+    if target != bound and recovery_only:
+        return
+    raw_id = payload.get("rawAudioId")
+    incoming_turn_key = payload.get("turnKey")
+    flag = payload.get("containsDirectIdentifier")
+    checksum = payload.get("checksum")
+    byte_count = payload.get("byteCount")
+    if (not isinstance(raw_id, str) or not raw_id
+            or not isinstance(incoming_turn_key, str) or not incoming_turn_key
+            or not isinstance(flag, bool)
+            or not isinstance(checksum, str) or not isinstance(byte_count, int)):
+        return
+    token_hash = getattr(request.state, "device_capability_token_hash", None)
+    if not isinstance(token_hash, str):
+        return
+    # 先看场次/配对这些与 raw id 无关的条件,再碰录音行(不给跨场 raw id 探测留侧信道)。
+    old_sess = s.get(TrainSession, target)
+    if old_sess is None:
+        return
+    cap = s.get(PatientDeviceCapability, token_hash)
+    if cap is None:
+        return
+    if target != bound:
+        # (a)
+        new_sess = s.get(TrainSession, bound)
+        if new_sess is None or new_sess.patient_id != old_sess.patient_id:
+            return
+        status, _row = device_capability.revalidate_active_for_write(s, token_hash, bound)
+        if status != device_capability.CapabilityResolution.VALID:
+            return
+        if s.exec(select(PatientDeviceCapability).where(
+                PatientDeviceCapability.session_id == target,
+                PatientDeviceCapability.device_id_hash == cap.device_id_hash)).first() is None:
+            return
+        # 这台设备若在 A 上还有一把有效凭据,A 那段录音该用它正常补传,不作废。
+        if _device_has_valid_pairing(
+                s, device_id_hash=cap.device_id_hash, session_id=target):
+            return
+        mode = "new_pairing"
+    elif recovery_only:
+        # (b)
+        if not _device_newer_pairing_same_patient(
+                s, device_id_hash=cap.device_id_hash, old_session=old_sess):
+            return
+        mode = "recovery_token"
+    else:
+        # (c)
+        mode = "replay"
+    # 无锁预读:正常的同场次 audioSaved(录音行仍是 recorded)在这里就退出,
+    # 不多占一遍 audioSaved 正常路径的那组锁;命中的少数情况再进锁重读复核。
+    peek = s.get(AudioAssetRow, raw_id)
+    if peek is None or peek.session_id != target:
+        return
+    if mode == "replay" and not _superseded_orphan_row_shape(peek):
+        return
+    with audio_store.blob_mutation_lock(raw_id), _LIVE_WRITE_LOCK, \
+            device_capability.serialized_mutation():
+        s.rollback()
+        s.expire_all()
+        asset = s.exec(select(AudioAssetRow).where(
+            AudioAssetRow.raw_audio_id == raw_id).with_for_update()).first()
+        if asset is None or asset.session_id != target:
+            return
+        if asset.withdrawn or bool((asset.withdrawal_status or "").strip()):
+            return
+        if asset.checksum is not None or asset.byte_count is not None or asset.uploaded_at is not None:
+            return
+        try:
+            if audio_store.find_blob(raw_id) is not None:
+                return
+        except (ValueError, audio_store.AudioStoreIntegrityError):
+            return
+        if s.exec(select(AudioCaptureReceipt).where(
+                AudioCaptureReceipt.raw_audio_id == raw_id)).first() is not None:
+            return
+        try:
+            canonical_turn_key, _patient_ref = _canonicalize_patient_turn_input(
+                request, old_sess, incoming_turn_key,
+                legacy_exact_turn_key=(
+                    asset.turn_key if asset.patient_turn_ref_version == 1 else None))
+        except HTTPException:
+            return
+        if canonical_turn_key != asset.turn_key or flag != asset.contains_direct_identifier:
+            return
+        if asset.status == AudioStatus.recorded:
+            if mode == "replay":
+                return
+            asset.status = AudioStatus.deleted
+            asset.delete_gate_passed = True
+            s.add(asset)
+            s.commit()
+            _audit(s, request, "audio_capture_superseded",
+                   f"旧场次未上传录音作废 {raw_id}(from={target},to={bound},mode={mode},"
+                   f"device={cap.device_id_hash[:12]})",
+                   session_id=target)
+        elif not _superseded_orphan_row_shape(asset):
+            return
+        elif mode == "replay" and not _superseded_orphan_marked(s, raw_id):
+            return
+    raise HTTPException(410, detail={
+        "code": "audio_terminal_disposition",
+        "schemaVersion": 1,
+        "action": "discard_local_copy",
+        "reason": "deleted",
+        "rawAudioId": raw_id,
+        "sessionId": target,
+        "turnKey": incoming_turn_key,
+        "byteCount": byte_count,
+        "checksum": checksum.lower(),
+        "containsDirectIdentifier": asset.contains_direct_identifier,
+    })
+
+
 @app.put("/live/state")
 def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)):
     """写实时状态；服务端重签 wseq，并把游标同步到当前场次恢复行。"""
@@ -6585,6 +6803,8 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
     if not slot:
         raise HTTPException(422, f"未知 kind {body.kind!r}")
 
+    if body.kind == "audioSaved":
+        _superseded_capture_disposition(request, s, body.payload)
     if body.kind in access_policy.DEVICE_LIVE_WRITE_KINDS:
         _require_capability_bound_session(
             request, _payload_session_id(body.payload), "上报录音状态")

@@ -1,4 +1,5 @@
 import { parsePlaybackReceipt, type RapportPlaybackReceipt } from "./rapportPlayback";
+import { pickDeviceCredential } from "./security/deviceCredentialPolicy";
 // 强类型 API 客户端——逐个后端路由一个函数。相对路径:dev 走 Vite 代理、生产由 FastAPI 同源托管。
 // 浏览器只访问同源后端；后端可按部署配置调用云 TTS/ASR/LLM。任何非 2xx 都明确抛错。
 import type {
@@ -196,24 +197,19 @@ export interface DeviceCredentialSelection {
 export function selectDeviceCredential(
   sessionId?: string,
   allowRecovery = false,
+  activeFallback = false,
 ): DeviceCredentialSelection {
   const active = deviceStore.get();
-  if (active && (!sessionId || active.sessionId === sessionId)) {
-    return {
-      headers: { "X-Device-Capability": active.capability },
-      source: "active",
-      record: active,
-    };
+  const recovery = sessionId ? deviceStore.getRecovery(sessionId) : null;
+  const pick = pickDeviceCredential(
+    { active: active ? { sessionId: active.sessionId, capability: active.capability } : null,
+      recovery: recovery ? { sessionId: recovery.sessionId, capability: recovery.capability } : null },
+    sessionId, { allowRecovery, activeFallback });
+  if (pick.source === "active" || pick.source === "active-foreign") {
+    return { headers: { "X-Device-Capability": pick.capability }, source: "active", record: active };
   }
-  if (allowRecovery && sessionId) {
-    const recovery = deviceStore.getRecovery(sessionId);
-    if (recovery) {
-      return {
-        headers: { "X-Device-Capability": recovery.capability },
-        source: "recovery",
-        record: recovery,
-      };
-    }
+  if (pick.source === "recovery") {
+    return { headers: { "X-Device-Capability": pick.capability }, source: "recovery", record: recovery };
   }
   return { headers: {}, source: null, record: null };
 }
@@ -457,6 +453,9 @@ interface RequestOptions {
   device?: boolean;
   deviceSessionId?: string;
   allowRecovery?: boolean;
+  // 旧场次孤儿录音:没有该场次的 recovery 凭据时,拿现在绑着的那把去探(服务端只在
+  // 同一位受试者、同一台平板、没字节事实时给 410 作废,其余照旧拒)。
+  activeFallback?: boolean;
   noStore?: boolean;
   signal?: AbortSignal;
   // best-effort 治理上报专用:失败不得触发配对/重认证 UI(开放本地模式下
@@ -485,7 +484,7 @@ async function req<T>(method: string, path: string, body?: unknown,
   }, timeoutMs);
   try {
     const credential = opts?.device
-      ? selectDeviceCredential(opts.deviceSessionId, opts.allowRecovery)
+      ? selectDeviceCredential(opts.deviceSessionId, opts.allowRecovery, opts.activeFallback)
       : null;
     // Headerless device requests are intentional in the explicitly open local
     // development mode.  Let the server decide: protected deployments return a
@@ -1251,13 +1250,14 @@ export const api = {
         device: kind === "audioSaved" || kind === "patientRec",
         deviceSessionId: payloadSessionId(payload),
         allowRecovery: kind === "audioSaved",
+        activeFallback: kind === "audioSaved",
         signal,
       }),
   putAudioSaved: (payload: object) => req<{
     seq: number;
     audioReceipt: { serverSeq: number; rawAudioId: string; idempotent: boolean };
   }>("PUT", "/live/state", { kind: "audioSaved", payload }, DEFAULT_REQUEST_TIMEOUT_MS,
-    { device: true, deviceSessionId: payloadSessionId(payload), allowRecovery: true }),
+    { device: true, deviceSessionId: payloadSessionId(payload), allowRecovery: true, activeFallback: true }),
   // 本地副本删除回执(收据 144):payload=410 detail 原样回显。best-effort,
   // 调用方吞错;与 audioSaved 同走 allowRecovery(410 常到达于场次离开 LiveState 后)。
   putAudioDisposalConfirmed: (payload: object) => req<{
@@ -1265,7 +1265,7 @@ export const api = {
   }>("PUT", "/live/state", { kind: "audioDisposalConfirmed", payload },
     3_500,
     { device: true, deviceSessionId: payloadSessionId(payload),
-      allowRecovery: true, silentDeviceAuthFailure: true }),
+      allowRecovery: true, activeFallback: true, silentDeviceAuthFailure: true }),
   // 老人端最小在场上报；服务端校验 session 与 screen，且只用服务器时间判在线。
   patientHeartbeat: (body: PatientHeartbeatRequest) =>
     req<PatientHeartbeatResponse>("POST", "/live/patient-heartbeat", body,
@@ -1303,7 +1303,8 @@ export const api = {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 60_000);
     try {
-      const credential = selectDeviceCredential(sessionId, true);
+      // 旧场次孤儿录音也要能走到 409 → audioSaved 探测那一步,不能在 401 上就断掉。
+      const credential = selectDeviceCredential(sessionId, true, true);
       const res = await fetch(`/audio/${encodeURIComponent(id)}/blob`, {
         method: "PUT", body: blob, signal: controller.signal,
         credentials: "omit",

@@ -34,6 +34,21 @@ import { ConfirmDialog } from "../../components/ConfirmDialog";
 import type { Session } from "../../types";
 import { hasExactWeek2Single20Profile } from "../../autopilot/demoProfile.ts";
 
+// 暂停原因用人话说一遍:研究者对着一串错误码不知道该去平板上看什么。
+// 2026-09-13 演示:平板里留着上一场没传完的录音,自动带练一开麦就 recording_start_failed,
+// 屏上只剩「已安全暂停」,钱凯只能说「进行不了训练」。
+const AUTOPILOT_ERROR_HINTS: Record<string, string> = {
+  recording_start_failed:
+    "老人端麦克风没能启动。常见原因：平板里还留着上一场没传完的录音（重新连上后系统会自动清掉），或浏览器没给麦克风权限。处理后点「继续 AI 自动带练」。",
+  microphone_denied: "老人端浏览器拒绝了麦克风权限，请在平板上允许后再点「继续 AI 自动带练」。",
+  microphone_unavailable: "老人端找不到麦克风设备，请检查平板后再继续。",
+  recording_upload_failed: "老人端录音上传或采集收据没有完成，检查网络后再继续。",
+  device_command_timeout: "老人端没有在限定时间内回应命令，检查平板是否还连着、页面是否还开着。",
+};
+function autopilotErrorHint(code: string): string {
+  return AUTOPILOT_ERROR_HINTS[code] ?? `错误码：${code}`;
+}
+
 export function ServerAutopilotControl({
   session,
   interactionBlocked,
@@ -497,7 +512,14 @@ export function ServerAutopilotControl({
         contentGap ? (
           <>下一题缺少自动训练内容，AI 已停下，不会跳题。请点「转为人工操作」继续。</>
         ) : (
-          <>AI 已安全暂停，题目停在当前位置。点「继续 AI 自动带练」由 AI 从当前未完成的题目重新出题；或点「转为人工操作」由你人工继续本场。</>
+          <>
+            AI 已安全暂停，题目停在当前位置。点「继续 AI 自动带练」由 AI 从当前未完成的题目重新出题；或点「转为人工操作」由你人工继续本场。
+            {state.receipt?.lastErrorCode && (
+              <div style={{ marginTop: "var(--sp-1)" }}>
+                {autopilotErrorHint(state.receipt.lastErrorCode)}
+              </div>
+            )}
+          </>
         )
       ) : completed ? (
         <>{isSimulation ? "本次模拟训练" : "本场训练"}的自动部分已完成；如需继续，请点「转为人工操作」。</>

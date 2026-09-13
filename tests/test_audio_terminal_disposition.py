@@ -37,8 +37,9 @@ def disposition_client(tmp_path, monkeypatch):
     engine.dispose()
 
 
-def _switch_live(client: TestClient, session_id: str) -> None:
-    response = client.put("/live/state", json={
+def _switch_live(client: TestClient, session_id: str,
+                 headers: dict[str, str] | None = None) -> None:
+    response = client.put("/live/state", headers=headers or {}, json={
         "kind": "session",
         "payload": {
             "sessionId": session_id,
@@ -49,7 +50,7 @@ def _switch_live(client: TestClient, session_id: str) -> None:
         },
     })
     assert response.status_code == 200, response.text
-    cursor = client.put("/live/state", json={
+    cursor = client.put("/live/state", headers=headers or {}, json={
         "kind": "cursor",
         "payload": {
             "sessionId": session_id, "screen": "present",
@@ -640,3 +641,434 @@ def test_directory_fsync_failure_is_reported_and_absent_bytes_retry_is_idempoten
         assert retried.json()["bytes_deleted"] is False
     finally:
         admin.close()
+
+
+# ---------------- 同一台平板换到同一位受试者的新场次:旧场次孤儿录音作废 ----------------
+# 2026-09-13 钱凯演示卡住的根因:outbox 里 9/6 那场没传完的录音一直在,新场次一到录音
+# 就被「本机存在待恢复录音」挡住;补传又被 device_session_mismatch 409 拒,永远清不掉。
+
+
+def _seed_second_session_for_patient(client: TestClient, session_id: str, patient_id: str) -> None:
+    session = client.post("/sessions", json={
+        "session_id": session_id,
+        "patient_id": patient_id,
+        "week_no": 2,
+        "phase_type": "正式训练",
+        "event_line": "正式训练",
+        "item_bank_version_id": "wk2-v1-20260707",
+        "is_simulation": True,
+    })
+    assert session.status_code == 200, session.text
+
+
+def _register_only(client: TestClient, raw_id: str, headers: dict[str, str], *,
+                   session_id: str, turn_key: str = "itm-0001#1") -> None:
+    registered = client.post("/audio", headers=headers, json={
+        "raw_audio_id": raw_id, "session_id": session_id, "turn_key": turn_key,
+        "contains_direct_identifier": False,
+    })
+    assert registered.status_code == 200, registered.text
+
+
+def _orphan_saved(raw_id: str, *, session_id: str, turn_key: str = "itm-0001#1") -> dict:
+    return {"kind": "audioSaved", "payload": {
+        "rawAudioId": raw_id, "durationSeconds": 2.5, "byteCount": 4321,
+        "checksum": "AB" * 32, "turnKey": turn_key, "sessionId": session_id,
+        "containsDirectIdentifier": False,
+    }}
+
+
+def _superseded_scene(client: TestClient, monkeypatch, *, device_id: str = "tablet-0000000000000001"):
+    """A 场次登记了录音槽但字节没传上来;同一台平板配到同一受试者的 B 场次。
+    档案/场次先建好再设 PIN(PIN 模式下登记档案要具名账号)。"""
+    _seed_sessions(client)
+    _seed_second_session_for_patient(client, "S-ONE-B", "P-ONE")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    old_headers = _pair(client, device_id=device_id)
+    _register_only(client, "raw-orphan-1", old_headers, session_id="S-ONE")
+    admin = _admin_client(client.test_engine, username=f"orphan-admin-{device_id[-4:]}")
+    try:
+        _switch_live(admin, "S-ONE-B")
+    finally:
+        admin.close()
+    new_headers = _pair(client, device_id=device_id)
+    return old_headers, new_headers
+
+
+def test_orphan_capture_of_previous_session_gets_exact_410_on_same_patient_device(
+        disposition_client, monkeypatch):
+    client = disposition_client
+    _, new_headers = _superseded_scene(client, monkeypatch)
+    saved = _orphan_saved("raw-orphan-1", session_id="S-ONE")
+    response = client.put("/live/state", headers=new_headers, json=saved)
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"] == {
+        "code": "audio_terminal_disposition", "schemaVersion": 1,
+        "action": "discard_local_copy", "reason": "deleted",
+        "rawAudioId": "raw-orphan-1", "sessionId": "S-ONE", "turnKey": "itm-0001#1",
+        "byteCount": 4321, "checksum": "ab" * 32, "containsDirectIdentifier": False,
+    }
+    _assert_device_no_store(response)
+    with Session(client.test_engine) as session:
+        row = session.get(AudioAssetRow, "raw-orphan-1")
+        assert row.status == AudioStatus.deleted and row.delete_gate_passed is True
+        assert row.checksum is None and row.byte_count is None and row.uploaded_at is None
+        audits = session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all()
+        assert len(audits) == 1 and "raw-orphan-1" in audits[0].summary
+    # 重放同一回报:同样的 410,不再记第二条审计。
+    again = client.put("/live/state", headers=new_headers, json=saved)
+    assert again.status_code == 410 and again.json()["detail"]["reason"] == "deleted"
+    with Session(client.test_engine) as session:
+        assert len(session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all()) == 1
+    # 设备删掉本地副本后的回执要能落账:这类槽服务端没有字节事实,记的是设备自己的事实。
+    confirmed = client.put("/live/state", headers=new_headers, json={
+        "kind": "audioDisposalConfirmed", "payload": {
+            "code": "audio_terminal_disposition", "schemaVersion": 1,
+            "action": "discard_local_copy", "reason": "deleted",
+            "rawAudioId": "raw-orphan-1", "sessionId": "S-ONE", "turnKey": "itm-0001#1",
+            "byteCount": 4321, "checksum": "ab" * 32, "containsDirectIdentifier": False,
+        }})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json() == {"code": "audio_disposal_recorded",
+                                "rawAudioId": "raw-orphan-1", "duplicate": False}
+
+
+@pytest.mark.parametrize("variant", [
+    "other_device", "other_patient", "bytes_already_persisted", "same_session_bound",
+])
+def test_orphan_supersede_only_fires_for_the_exact_same_patient_device_case(
+        disposition_client, monkeypatch, variant):
+    """别的平板、别的受试者、已经有字节事实的录音、以及绑在同一场次的正常路径:全都不作废。"""
+    client = disposition_client
+    if variant == "other_device":
+        _, _ = _superseded_scene(client, monkeypatch, device_id="tablet-0000000000000001")
+        stranger = _pair(client, device_id="tablet-0000000000000002")   # 绑到 S-ONE-B,从没配过 S-ONE
+        response = client.put("/live/state", headers=stranger,
+                              json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "device_session_mismatch"
+    elif variant == "other_patient":
+        _seed_sessions(client)
+        monkeypatch.setenv("CONSOLE_PIN", "24681024")
+        headers = _pair(client, device_id="tablet-0000000000000001")
+        _register_only(client, "raw-orphan-2", headers, session_id="S-ONE")
+        admin = _admin_client(client.test_engine, username="orphan-admin-two")
+        try:
+            _switch_live(admin, "S-TWO")                       # 另一位受试者的场次
+        finally:
+            admin.close()
+        moved = _pair(client, device_id="tablet-0000000000000001")
+        response = client.put("/live/state", headers=moved,
+                              json=_orphan_saved("raw-orphan-2", session_id="S-ONE"))
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "device_session_mismatch"
+    elif variant == "bytes_already_persisted":
+        _seed_sessions(client)
+        _seed_second_session_for_patient(client, "S-ONE-B", "P-ONE")
+        monkeypatch.setenv("CONSOLE_PIN", "24681024")
+        headers = _pair(client, device_id="tablet-0000000000000001")
+        _content, upload = _upload(client, "raw-kept-1", headers=headers, session_id="S-ONE",
+                                   turn_key="itm-0001#1")
+        admin = _admin_client(client.test_engine, username="orphan-admin-kept")
+        try:
+            _switch_live(admin, "S-ONE-B")
+        finally:
+            admin.close()
+        moved = _pair(client, device_id="tablet-0000000000000001")
+        response = client.put("/live/state", headers=moved,
+                              json=_audio_saved("raw-kept-1", upload, session_id="S-ONE",
+                                                turn_key="itm-0001#1"))
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "device_session_mismatch"
+    else:
+        _seed_sessions(client)
+        monkeypatch.setenv("CONSOLE_PIN", "24681024")
+        headers = _pair(client, device_id="tablet-0000000000000001")
+        _register_only(client, "raw-orphan-3", headers, session_id="S-ONE")
+        response = client.put("/live/state", headers=headers,
+                              json=_orphan_saved("raw-orphan-3", session_id="S-ONE"))
+        assert response.status_code != 410, response.text
+    with Session(client.test_engine) as session:
+        for raw_id in ("raw-orphan-1", "raw-orphan-2", "raw-kept-1", "raw-orphan-3"):
+            row = session.get(AudioAssetRow, raw_id)
+            if row is not None:
+                assert row.status == AudioStatus.recorded, raw_id
+        assert session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all() == []
+
+
+# ---- 复核补齐:每一道守卫都要有一条能杀掉「删掉它」的测试 ----
+
+
+def _register_orphan_for_stranger(client, monkeypatch):
+    """P-TWO 的场次上登记一个没字节的槽(用配到 S-TWO 的设备)。"""
+    admin = _admin_client(client.test_engine, username="orphan-admin-stranger")
+    try:
+        _switch_live(admin, "S-TWO")
+    finally:
+        admin.close()
+    stranger = _pair(client, device_id="tablet-0000000000000009")
+    _register_only(client, "raw-two-orphan", stranger, session_id="S-TWO")
+    admin = _admin_client(client.test_engine, username="orphan-admin-back")
+    try:
+        _switch_live(admin, "S-ONE")
+    finally:
+        admin.close()
+
+
+def test_orphan_supersede_never_touches_a_row_registered_under_another_session(
+        disposition_client, monkeypatch):
+    """报的是自己旧场次 A 的 sessionId,rawAudioId 却是别人场次登记的槽:照旧 409,那一行不动。"""
+    client = disposition_client
+    _seed_sessions(client)
+    _seed_second_session_for_patient(client, "S-ONE-B", "P-ONE")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    _register_orphan_for_stranger(client, monkeypatch)
+    mine = _pair(client, device_id="tablet-0000000000000001")
+    _register_only(client, "raw-orphan-1", mine, session_id="S-ONE")
+    admin = _admin_client(client.test_engine, username="orphan-admin-b")
+    try:
+        _switch_live(admin, "S-ONE-B")
+    finally:
+        admin.close()
+    moved = _pair(client, device_id="tablet-0000000000000001")
+    response = client.put("/live/state", headers=moved,
+                          json=_orphan_saved("raw-two-orphan", session_id="S-ONE"))
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "device_session_mismatch"
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "raw-two-orphan").status == AudioStatus.recorded
+
+
+@pytest.mark.parametrize("flag", ["withdrawn", "withdrawal_status"])
+def test_orphan_supersede_leaves_withdrawn_rows_on_their_existing_path(
+        disposition_client, monkeypatch, flag):
+    client = disposition_client
+    _, new_headers = _superseded_scene(client, monkeypatch)
+    with Session(client.test_engine) as session:
+        row = session.get(AudioAssetRow, "raw-orphan-1")
+        if flag == "withdrawn":
+            row.withdrawn = True
+        else:
+            row.withdrawal_status = "isolated_by_subject_withdrawal"
+        session.add(row)
+        session.commit()
+    response = client.put("/live/state", headers=new_headers,
+                          json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "device_session_mismatch"
+    with Session(client.test_engine) as session:
+        row = session.get(AudioAssetRow, "raw-orphan-1")
+        assert row.status == AudioStatus.recorded and row.delete_gate_passed is False
+
+
+@pytest.mark.parametrize("evidence", ["db_upload_facts", "blob_on_disk", "capture_receipt"])
+def test_orphan_supersede_refuses_when_the_server_holds_any_byte_evidence(
+        disposition_client, monkeypatch, evidence):
+    """三道「服务端有字节事实」守卫各自独立:库里有上传事实 / 盘上有原件 / 有采集收据。"""
+    client = disposition_client
+    _, new_headers = _superseded_scene(client, monkeypatch)
+    if evidence == "db_upload_facts":
+        with Session(client.test_engine) as session:
+            row = session.get(AudioAssetRow, "raw-orphan-1")
+            row.byte_count = 4321
+            row.checksum = "ab" * 32
+            row.uploaded_at = datetime.now()
+            session.add(row)
+            session.commit()
+    elif evidence == "blob_on_disk":
+        audio_store.AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        (audio_store.AUDIO_DIR / "raw-orphan-1.webm").write_bytes(b"\x1a\x45\xdf\xa3late")
+    else:
+        with Session(client.test_engine) as session:
+            session.add(AudioCaptureReceipt(
+                raw_audio_id="raw-orphan-1", session_id="S-ONE", turn_key="SE_锚#1",
+                duration_seconds=2.5, byte_count=4321, checksum="ab" * 32,
+                data_classification="simulation", is_simulation=True,
+                contains_direct_identifier=False))
+            session.commit()
+    response = client.put("/live/state", headers=new_headers,
+                          json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "device_session_mismatch"
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "raw-orphan-1").status == AudioStatus.recorded
+
+
+def test_orphan_supersede_refuses_a_turn_ref_that_is_not_the_registered_slot(
+        disposition_client, monkeypatch):
+    client = disposition_client
+    _, new_headers = _superseded_scene(client, monkeypatch)
+    response = client.put("/live/state", headers=new_headers,
+                          json=_orphan_saved("raw-orphan-1", session_id="S-ONE", turn_key="itm-0002#1"))
+    assert response.status_code == 409, response.text
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "raw-orphan-1").status == AudioStatus.recorded
+
+
+@pytest.mark.parametrize("flag_value", [True, None])
+def test_orphan_supersede_needs_the_exact_identifier_flag(
+        disposition_client, monkeypatch, flag_value):
+    """标记不一致或干脆没带:不发不可逆的 410。"""
+    client = disposition_client
+    _, new_headers = _superseded_scene(client, monkeypatch)
+    body = _orphan_saved("raw-orphan-1", session_id="S-ONE")
+    if flag_value is None:
+        del body["payload"]["containsDirectIdentifier"]
+    else:
+        body["payload"]["containsDirectIdentifier"] = flag_value
+    response = client.put("/live/state", headers=new_headers, json=body)
+    assert response.status_code == 409, response.text
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "raw-orphan-1").status == AudioStatus.recorded
+
+
+def test_orphan_supersede_via_the_old_session_recovery_token(disposition_client, monkeypatch):
+    """路径 (b):平板拿旧场次 A 自己的 recovery-only 凭据回报——它已配到同一受试者的新场次。"""
+    client = disposition_client
+    old_headers, _new_headers = _superseded_scene(client, monkeypatch)
+    response = client.put("/live/state", headers=old_headers,
+                          json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"]["reason"] == "deleted"
+    with Session(client.test_engine) as session:
+        row = session.get(AudioAssetRow, "raw-orphan-1")
+        assert row.status == AudioStatus.deleted and row.delete_gate_passed is True
+
+
+def test_recovery_token_alone_does_not_supersede_without_a_newer_pairing(
+        disposition_client, monkeypatch):
+    """旧场次的 recovery 凭据但这台平板没配到别的场次:不作废(研究者可能还要回来续这一场)。"""
+    client = disposition_client
+    _seed_sessions(client)
+    _seed_second_session_for_patient(client, "S-ONE-B", "P-ONE")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    headers = _pair(client, device_id="tablet-0000000000000001")
+    _register_only(client, "raw-orphan-1", headers, session_id="S-ONE")
+    admin = _admin_client(client.test_engine, username="orphan-admin-switch")
+    try:
+        _switch_live(admin, "S-ONE-B")      # 床旁槽切走,A 的凭据降为 recovery-only;平板没有再配对
+    finally:
+        admin.close()
+    response = client.put("/live/state", headers=headers,
+                          json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+    assert response.status_code != 410, response.text
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "raw-orphan-1").status == AudioStatus.recorded
+
+
+def test_superseded_slot_replays_the_410_after_re_pairing_to_the_old_session(
+        disposition_client, monkeypatch):
+    """路径 (c):作废之后平板又配回 A,同一段录音再报一次,仍是 410,本地副本能清掉。"""
+    client = disposition_client
+    _, new_headers = _superseded_scene(client, monkeypatch)
+    first = client.put("/live/state", headers=new_headers,
+                       json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+    assert first.status_code == 410, first.text
+    admin = _admin_client(client.test_engine, username="orphan-admin-return")
+    try:
+        _switch_live(admin, "S-ONE")
+    finally:
+        admin.close()
+    back = _pair(client, device_id="tablet-0000000000000001")
+    replay = client.put("/live/state", headers=back,
+                        json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+    assert replay.status_code == 410, replay.text
+    assert replay.json()["detail"]["reason"] == "deleted"
+    with Session(client.test_engine) as session:
+        assert len(session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all()) == 1
+
+
+def test_orphan_supersede_also_clears_slots_of_an_aborted_old_session(
+        disposition_client, monkeypatch):
+    """研究者把出故障的旧场次中止了再开新场:没字节的槽照样作废,平板不能因此卡死。"""
+    client = disposition_client
+    _, new_headers = _superseded_scene(client, monkeypatch)
+    with Session(client.test_engine) as session:
+        state = session.get(SessionRuntimeState, "S-ONE")
+        if state is None:
+            state = SessionRuntimeState(session_id="S-ONE", status="aborted", revision=1)
+        else:
+            state.status = "aborted"
+        session.add(state)
+        session.commit()
+    response = client.put("/live/state", headers=new_headers,
+                          json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+    assert response.status_code == 410, response.text
+
+
+@pytest.mark.parametrize("reporter", ["stranger_device", "deleted_with_bytes"])
+def test_orphan_disposal_receipt_stays_on_the_strict_path_for_everyone_else(
+        disposition_client, monkeypatch, reporter):
+    client = disposition_client
+    if reporter == "stranger_device":
+        _, _ = _superseded_scene(client, monkeypatch)
+        first = client.put("/live/state", headers=_pair(client, device_id="tablet-0000000000000001"),
+                           json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+        assert first.status_code == 410, first.text
+        stranger = _pair(client, device_id="tablet-0000000000000002")
+        response = client.put("/live/state", headers=stranger, json={
+            "kind": "audioDisposalConfirmed", "payload": {
+                "code": "audio_terminal_disposition", "schemaVersion": 1,
+                "action": "discard_local_copy", "reason": "deleted",
+                "rawAudioId": "raw-orphan-1", "sessionId": "S-ONE", "turnKey": "itm-0001#1",
+                "byteCount": 4321, "checksum": "ab" * 32, "containsDirectIdentifier": False,
+            }})
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "device_session_mismatch"
+    else:
+        _seed_sessions(client)
+        _seed_second_session_for_patient(client, "S-ONE-B", "P-ONE")
+        monkeypatch.setenv("CONSOLE_PIN", "24681024")
+        headers = _pair(client, device_id="tablet-0000000000000001")
+        _content, upload = _upload(client, "raw-kept-2", headers=headers, session_id="S-ONE",
+                                   turn_key="itm-0001#1")
+        _mark_terminal(client, "raw-kept-2", reason="deleted")
+        admin = _admin_client(client.test_engine, username="orphan-admin-kept2")
+        try:
+            _switch_live(admin, "S-ONE-B")
+        finally:
+            admin.close()
+        moved = _pair(client, device_id="tablet-0000000000000001")
+        response = client.put("/live/state", headers=moved, json={
+            "kind": "audioDisposalConfirmed", "payload": {
+                "code": "audio_terminal_disposition", "schemaVersion": 1,
+                "action": "discard_local_copy", "reason": "deleted",
+                "rawAudioId": "raw-kept-2", "sessionId": "S-ONE", "turnKey": "itm-0001#1",
+                "byteCount": upload["bytes"], "checksum": upload["checksum"].lower(),
+                "containsDirectIdentifier": False,
+            }})
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "device_session_mismatch"
+
+
+def test_new_pairing_path_yields_to_a_still_valid_pairing_on_the_old_session(
+        disposition_client, monkeypatch):
+    """这台平板在 A 上还有一把有效凭据(重新配回了 A):A 的录音该用它正常补传,
+    拿 B 的凭据来报不作废。"""
+    client = disposition_client
+    _seed_sessions(client)
+    _seed_second_session_for_patient(client, "S-ONE-B", "P-ONE")
+    monkeypatch.setenv("CONSOLE_PIN", "24681024")
+    cap_a = _pair(client, device_id="tablet-0000000000000001")
+    _register_only(client, "raw-orphan-1", cap_a, session_id="S-ONE")
+    admin = _admin_client(client.test_engine, username="orphan-admin-valid-a")
+    try:
+        _switch_live(admin, "S-ONE-B")
+        cap_b = _pair(client, device_id="tablet-0000000000000001")
+        _switch_live(admin, "S-ONE")
+        cap_a2 = _pair(client, device_id="tablet-0000000000000001")   # A 上又有了有效凭据
+    finally:
+        admin.close()
+    response = client.put("/live/state", headers=cap_b,
+                          json=_orphan_saved("raw-orphan-1", session_id="S-ONE"))
+    assert response.status_code != 410, response.text
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "raw-orphan-1").status == AudioStatus.recorded
+    # A 的有效凭据照常能把字节传上来。
+    uploaded = client.put("/audio/raw-orphan-1/blob", headers={**cap_a2, "content-type": "audio/webm"},
+                          content=b"\x1a\x45\xdf\xa3raw-orphan-1")
+    assert uploaded.status_code == 200, uploaded.text

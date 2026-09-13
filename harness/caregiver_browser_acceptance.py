@@ -608,7 +608,8 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
             # diagnostic is ignored here.
             if text.startswith("Failed to load resource: the server responded with a status of"):
                 return
-            violation("页面控制台报错")
+            # 把报错文本带出来:光一句「页面控制台报错」没法判断是哪一行、要不要紧。
+            violation(f"页面控制台报错: {text[:200]}")
 
         page.on("console", observe_console)
         page.on("response", observe_response)
@@ -669,11 +670,13 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                 state="visible", timeout=20_000)
 
             patient.goto(f"{config.origin}/patient", wait_until="domcontentloaded")
+            # 2026-09-04 起老人端配对框标题是「连接这台平板」、输入框叫「配对码」
+            # (components/PinPrompt.tsx),旧名「配对受试者端 / 设备 PIN」已不存在。
             pair_dialog = patient.get_by_role(
-                "dialog", name="配对受试者端", exact=True)
+                "dialog", name="连接这台平板", exact=True)
             pair_dialog.wait_for(
                 state="visible", timeout=20_000)
-            patient.get_by_label("设备 PIN").fill(config.pin)
+            patient.get_by_label("配对码").fill(config.pin)
             patient.get_by_role("button", name="完成配对", exact=True).click()
             pair_dialog.wait_for(
                 state="hidden", timeout=20_000)
@@ -690,7 +693,7 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
             if not start_practice.is_enabled():
                 raise BrowserAcceptanceError("老人画面连接后开始练习仍未开放")
             patient.get_by_role(
-                "button", name="点一下，开始并准备声音播放", exact=True
+                "button", name="点一下，开始", exact=True
             ).click()
             tts_toggle = patient.get_by_role("button", name="关闭语音朗读", exact=True)
             tts_toggle.wait_for(state="visible", timeout=10_000)
