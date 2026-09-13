@@ -9,6 +9,16 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+## 2026-09-13 上线记录（`2dd6d79`：平板旧场次孤儿录音作废 + 暂停原因人话 + 静音解锁改 blob:，零迁移）
+
+**2026-09-13 14:30 UTC 由 Claude 执行收据 256 脚本（Eric 授权），十一步全过；树核完整清单 `MATCH revision=2dd6d79`（见收据 255 §四）；preflight 9/9 退出码 0；上线前 10 分钟生产零非轮询请求。库头仍 `e2a6d8f0b419`。**
+
+- 根因：2026-09-13 11:58 UTC 演示（受试者 Q、第 8 周、Eric 账号）自动带练一开麦即 `recording_start_failed` 安全暂停——平板 outbox 里留着 9/6 那场（同受试者、同账号，仍 paused）「动物园」题登记了槽但没传字节的录音，补传被 `device_session_mismatch`/recovery-only 拒，永远清不掉，`autopilotRecordingExecutor` 的「本机存在待恢复录音，禁止覆盖开新麦克风」每次都拦。
+- 改法：`live_put` audioSaved 在绑定场次检查前先判 `_superseded_capture_disposition`——服务端没有任何字节事实的旧场次录音槽，在 (a) 绑新场次的有效凭据 (b) 旧场次 recovery-only 凭据且设备已配到同一受试者另一场 (c) 重配回旧场次重放 三种情况下给既有 410 `audio_terminal_disposition`，槽标 deleted+闸门，审计 `audio_capture_superseded`；别的受试者/设备、撤回、有字节、旧场次仍有有效配对一律不碰。删除回执对作废孤儿槽放行。老人端 api `activeFallback`：没有该场次 recovery 凭据时拿现在绑着的凭据去探。控制台 AI 暂停区错误码配人话。
+- 顺手：9/4 的静音解锁用 `data:audio/wav` 被 CSP `media-src 'self' blob:` 拦（生产上从没解锁成），改 blob: URL；照护员真 Chrome 验收脚本文案跟上并带出控制台报错原文。
+- 三路对抗复核 20 条 12 坐实全处置；六关全绿；第 1 周走查 46/46；PR #7 分支 CI 两次 run 绿后同 SHA fast-forward。
+- 未验：平板真机上跨场次孤儿录音 → 410 → 新场次能录的完整链只有 HTTP 级与单测证据。
+
 ## 2026-09-11 UTC 备份运维修复（芝加哥 9 月 10 日）
 
 本次为备份权限和运维预检修复；业务应用发布索引仍为 `3ce098b`，数据库头仍为
