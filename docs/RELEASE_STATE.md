@@ -9,6 +9,17 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+## 2026-09-13 上线记录（`ef3b664`：设备故障时场次一起暂停 + 恢复放过过期就绪 + 平板开麦前先清旧场次外来录音，零迁移）
+
+**2026-09-13 21:00 UTC 由 Claude 执行收据 257 脚本（Eric 授权「有问题或者值得优化的部分都弄掉」），十一步全过；树核完整清单 `MATCH revision=ef3b664 source_files=817 browser_files=19`（对照 CI push run 34779785511 的 `browser-dist-sha256.json`）；preflight 9/9 退出码 0；公网 `build-id.txt` 与 CI 产物逐字符一致；上线前 10 分钟生产零非轮询请求。库头仍 `e2a6d8f0b419`。**
+
+- 起因：9/13 演示后的排查（收据 257 §一）——设备故障回执只暂停了自动带练控制面，场次 runtime 没暂停，`session.paused` 不翻真，研究者「继续」到不了停摆的平板；就绪实测 30 分钟 TTL 让 40 分钟的训练在安全暂停后恢复不了；自动带练开麦前那一步看到别的场次的 outbox 条目直接拒开麦、不去清；授权轮询一次抖动就锁界面。
+- 改法（服务端）：`autopilot_command_ack` 对新落账（非重放）的 `record_failed`/`tts_failed` 且 runtime 仍 active 的，同事务 `_pause_runtime_in_transaction`；`require_resume_ready` 放过 `expired` 但仍要 `required_capabilities_ready`；患者场次列表多带 `closeout_saved`；从未登记的旧场次录音在同一受试者、同一台平板换到新场次后也给 410，以 `deleted` 墓碑行落账（受登记配额约束）。
+- 改法（老人端/控制台）：`foreignOutboxDrain` 开麦前按录音器同一条链清别的场次的条目（2xx 需账本收据才删，410 作废，其余保留；8 秒软预算；同一条只清一次）；`createAudio` 加 `activeFallback`；授权轮询宽限 interval+grace；「下一步」认收尾未保存为未收口；场次列表严格契约加 `closeout_saved`，工作台缓存 v3（旧缓存作废一次，刷新回选人台）；自动带练暂停原因逐错误码提示；收尾页缺题给动作；登记页撤回权限说明。
+- 三轮对抗复核：第一轮 4 条坐实（含重放失败回执会把人工场次按回暂停、过期但失败的实测被放过），第二轮 1 条 P0（`closeout_saved` 撞网页端严格契约，整个场次列表会失效——两条走查都不经过该列表，没抓到），第三轮 1 条 P2（墓碑行没受配额）；全部处置进本版。
+- 六关本机全绿两次；第 1 周真 Chrome 走查 FAILURES=0；照护员 start-pause + 求助四态真 Chrome 通过；web 1315/1315；PR #9 两次 CI run 绿后同 SHA fast-forward。
+- 未验：平板真机上「设备故障 → 研究者点继续 → 平板自动重新探测」的完整链只有 HTTP 级证据；控制台工作台缓存 v3 作废后老页签刷新一次回选人台是预期行为。
+
 ## 2026-09-13 上线记录（`2dd6d79`：平板旧场次孤儿录音作废 + 暂停原因人话 + 静音解锁改 blob:，零迁移）
 
 **2026-09-13 14:30 UTC 由 Claude 执行收据 256 脚本（Eric 授权），十一步全过；树核完整清单 `MATCH revision=2dd6d79`（见收据 255 §四）；preflight 9/9 退出码 0；上线前 10 分钟生产零非轮询请求。库头仍 `e2a6d8f0b419`。**
