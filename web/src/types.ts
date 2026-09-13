@@ -280,6 +280,9 @@ export interface Session {
   autopilot_profile_definition_digest?: string | null;
   // 旧后端不携带时按 active 兼容；终态场次只读，不可续做。
   runtime_status?: SessionRuntimeStatus;
+  // 仅患者场次列表携带:床旁已结束的场次,现场收尾保存了没有。没保存的服务端
+  // 拒绝为该受试者开新工作,登记表要把人带回原场补收尾。
+  closeout_saved?: boolean;
   // 仅 journal 撤回墓碑投影携带:受试者/录音已撤回,本场内容读取已关闭。
   content_state?: "withdrawn_tombstone";
 }

@@ -108,6 +108,8 @@ export interface AutopilotCaptureBootstrapPorts {
   clearTimer(handle: number): void;
   acquireLease(signal: AbortSignal): Promise<AudioDeviceLease>;
   recoverySnapshot(): Promise<AutopilotRecoverySnapshot>;
+  /** 开麦前先把**别的场次**留下的录音按录音器同一条链清一遍(2xx 完成 / 410 作废)。 */
+  drainForeignOutbox?(currentSessionId: string, entries: AudioOutboxEntry[]): Promise<void>;
   authorize(
     sessionId: string,
     commandKey: string,
@@ -121,6 +123,24 @@ export const browserAutopilotCaptureBootstrapPorts: AutopilotCaptureBootstrapPor
   clearTimer: (handle) => window.clearTimeout(handle),
   acquireLease: (signal) => acquireAudioDeviceLease(undefined, signal),
   recoverySnapshot: () => blobStore.recoverySnapshot(),
+  drainForeignOutbox: async (currentSessionId, entries) => {
+    const { api } = await import("../api.ts");
+    const { drainForeignOutboxEntries } = await import("../audio/foreignOutboxDrain.ts");
+    await drainForeignOutboxEntries(entries, currentSessionId, {
+      readBlob: (rawAudioId) => blobStore.get(rawAudioId),
+      createAudio: (entry) => api.createAudio({
+        raw_audio_id: entry.rawAudioId, session_id: entry.sessionId, turn_key: entry.turnKey,
+        contains_direct_identifier: entry.containsDirectIdentifier,
+        ...(entry.recordingWseq === undefined ? {} : { recording_wseq: entry.recordingWseq }),
+      }),
+      uploadAudioBlob: (rawAudioId, blob, sessionId) => api.uploadAudioBlob(rawAudioId, blob, sessionId),
+      putOutbox: (entry) => blobStore.putOutbox(entry),
+      putAudioSaved: (saved) => api.putAudioSaved(saved),
+      completeOutbox: (rawAudioId) => blobStore.completeOutbox(rawAudioId),
+      discardTerminalOutbox: async (entry, disposition) => { await blobStore.discardTerminalOutbox(entry, disposition); },
+      reportLocalCopyDisposal: (disposition) => api.putAudioDisposalConfirmed(disposition).then(() => undefined),
+    });
+  },
   authorize: async (sessionId, commandKey, signal) => {
     // 中止后一律不发请求。dynamic import 前后各查一次：权限弹窗期间被判死的
     // 采集，不能因为模块加载晚了一步就补一个请求出去。
@@ -244,6 +264,9 @@ export async function stageAndFinishExactCapture(
  * 但它们迟早会 settle，没人接就会变成 unhandled rejection。挂一条吞掉的续延，
  * 既不掀翻页面，也绝不让那次迟到的结果恢复任何续延。
  */
+/** 开麦前清旧账的软预算;小于 PRE_START_BUDGET_MS,给租约/授权/prepare 留足余量。 */
+export const FOREIGN_DRAIN_SOFT_BUDGET_MS = 8_000;
+
 function isolateLateSettlement(operation: Promise<unknown>): void {
   operation.catch(() => {});
 }
@@ -510,6 +533,17 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
    * 这里不新起定时器、不新建截止时刻：deadline 与 lifecycleDeferred 都是本次
    * 采集已经有的那一个。
    */
+  /** 到点就放行(resolve undefined),不判死;operation 自己的结局由调用方另行隔离。 */
+  private withSoftBudget(operation: Promise<void>, budgetMs: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const handle = this.bootstrap.setTimer(() => resolve(), budgetMs);
+      operation.then(
+        () => { this.bootstrap.clearTimer(handle); resolve(); },
+        () => { this.bootstrap.clearTimer(handle); resolve(); },
+      );
+    });
+  }
+
   private async stage<T>(
     deadline: CaptureDeadline,
     open: () => Promise<T>,
@@ -565,11 +599,33 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
           },
         );
         // 2/6 恢复快照。不交付任何本地设备资源：迟到只需隔离，closed 不必等它。
-        const snapshot = await this.stage(
+        let snapshot = await this.stage(
           deadline,
           () => this.bootstrap.recoverySnapshot(),
           isolateLateSettlement,
         );
+        // 别的场次留下的录音先按录音器那条链清一遍(2xx 完成 / 410 作废),清完再看快照;
+        // 清不掉的照旧拒开麦。2026-09-13 演示:9/6 那场的一段录音把整台平板卡死。
+        const foreign = snapshot.entries.filter((entry) => entry.sessionId !== this.sessionId);
+        if (foreign.length > 0 && this.bootstrap.drainForeignOutbox
+            && snapshot.invalidBlobKeyCount === 0 && snapshot.legacyOrphans.length === 0) {
+          // 清理有自己的软预算,不吃满整段 pre-start 预算:一段大录音在慢网上传超过
+          // 预算时,判死码会是 device_command_timeout(固定码),控制台会把它讲成
+          // 「老人还在等点屏」。到点就不再等,重拍快照——条目还在就按下面那条规则
+          // 拒开麦(recording_start_failed,说的是真话);清理在后台继续,下次开麦接上。
+          const drain = this.bootstrap.drainForeignOutbox!(this.sessionId, foreign);
+          isolateLateSettlement(drain);
+          await this.stage(
+            deadline,
+            () => this.withSoftBudget(drain, FOREIGN_DRAIN_SOFT_BUDGET_MS),
+            isolateLateSettlement,
+          );
+          snapshot = await this.stage(
+            deadline,
+            () => this.bootstrap.recoverySnapshot(),
+            isolateLateSettlement,
+          );
+        }
         if (snapshot.invalidBlobKeyCount > 0 || snapshot.legacyOrphans.length > 0
             || snapshot.entries.length > 0) {
           throw new Error("本机存在待恢复录音，禁止覆盖开新麦克风");

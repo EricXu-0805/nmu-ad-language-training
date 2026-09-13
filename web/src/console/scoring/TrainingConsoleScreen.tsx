@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { pollFailed, pollSucceeded, RUNTIME_ERROR_GRACE_MS } from "../../hooks/runtimePollPolicy";
 import {
   api,
   ApiError,
@@ -78,6 +79,9 @@ function loadAutopilotFailure(sessionId: string): AutopilotFailure | null {
 
 // week≥2 判分主屏:左题目游标列 + 右环节工作卡(转写→确认→AI初评→锁分)。
 // 唯一游标写者,推进老人端;★本文件及本目录禁 import 任何画像源(oxlint 守卫 + vm 运行时断言)。
+// 录音授权背景轮询的间隔;宽限窗按它加 RUNTIME_ERROR_GRACE_MS 取,吸收一次抖动。
+const RECORDING_AUTHORIZATION_POLL_MS = 5_000;
+
 export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWrapup, onExit, onItemEventChange }: {
   session: Session; hasNamedAccount: boolean;
   // 由 ConsoleShell 的既有 usePatientPresence 轮询传入,本屏不新增网络轮询器。
@@ -596,21 +600,31 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     }
     let cancelled = false;
     let inFlight = false;
+    // 与 useSessionRuntime 同一套宽限:背景轮询一次快速失败(连接被拒、status 0)不能立刻
+    // 把 recStatus 翻成 error/denied——那会向老人端写 idle 把正在说话的老人掐断
+    // (2026-09-13 复核坐实)。窗按 interval+grace 取,吸收一次抖动;悬挂到 12 秒超时的
+    // 请求(408)距上次成功早已超窗,照旧立即亮错——那已经是真断网。前台请求照旧立即呈现。
+    let health = pollSucceeded(Date.now());
     const check = (foreground: boolean) => {
       if (inFlight) return;
       inFlight = true;
       if (foreground) setRecStatus("loading");
       api.recordingAuthorization(session.session_id)
         .then((authorization) => {
+          health = pollSucceeded(Date.now());
           if (!cancelled) setRecStatus(authorization.allowed === true && authorization.runtime_status === "active" ? "allowed" : "denied");
         })
         .catch((error) => {
-          if (!cancelled) setRecStatus(error instanceof ApiError && error.status >= 400 && error.status < 500 ? "denied" : "error");
+          if (cancelled || !pollFailed(health, Date.now(), foreground,
+            RECORDING_AUTHORIZATION_POLL_MS + RUNTIME_ERROR_GRACE_MS)) return;
+          // 408/0 是本机超时或断网,不是服务器拒绝;只有 4xx 业务码才算 denied。
+          const denied = error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 408;
+          setRecStatus(denied ? "denied" : "error");
         })
         .finally(() => { inFlight = false; });
     };
     check(true);
-    const timer = window.setInterval(() => check(false), 5_000);
+    const timer = window.setInterval(() => check(false), RECORDING_AUTHORIZATION_POLL_MS);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [manualInteractionBlocked, retryNonce, session.session_id]);
 

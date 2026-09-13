@@ -6052,3 +6052,160 @@ def test_resume_rejects_position_stopped_mid_cue_ladder(
         assert state is not None and state.status == "paused"
         runtime_state = session.get(SessionRuntimeState, SESSION_ID)
         assert runtime_state is not None and runtime_state.status == "paused"
+
+
+def test_device_failure_pauses_the_session_runtime_and_resume_revives_it(
+        api_clients: ApiClients, monkeypatch):
+    """设备故障(record_failed/tts_failed)= 技术暂停:场次 runtime 同事务 paused,live 的
+    session.paused 翻真;研究者「继续」后 runtime active、session.paused 翻假——老人端只认
+    这个下降沿重新探测。此前只暂停控制面,「继续」到不了停摆的平板(2026-09-13 演示)。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    command = _device_next(api_clients)
+    assert command is not None
+    failed = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{command['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(command, ack_type="tts_failed", ack_key="ack-runtime-pause-0001",
+                       device_event_seq=1, error_code="audio_playback_failed"),
+    )
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["status"] == "paused"
+    with Session(api_clients.engine) as session:
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None and runtime_state.status == "paused"
+        live = session.get(LiveState, 1)
+        assert json.loads(live.session_json or "{}").get("paused") is True
+    # 研究者随后点的「暂停」是纯幂等,不再造第二次暂停。
+    revision_before = api_clients.account.get(f"/sessions/{SESSION_ID}/runtime").json()["revision"]
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    assert api_clients.account.get(f"/sessions/{SESSION_ID}/runtime").json()["revision"] == revision_before
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{command['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    resumed = _resume(api_clients, key="resume-after-device-failure-0001",
+                      expected_revision=drained.json()["state_revision"])
+    assert resumed.status_code == 200, resumed.text
+    with Session(api_clients.engine) as session:
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None and runtime_state.status == "active"
+        live = session.get(LiveState, 1)
+        assert json.loads(live.session_json or "{}").get("paused") is not True
+
+
+def test_resume_accepts_an_expired_readiness_probe(
+        api_clients: ApiClients, monkeypatch):
+    """就绪实测过了 30 分钟 TTL:恢复放行——一场训练 40 分钟起步,安全暂停后研究者
+    账号无权重新探测,不能只能干等管理员。启动仍严格,由
+    test_caregiver_operator.test_caregiver_start_provider_gate_is_stable_and_has_zero_writes[expired] 钉住。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    first = _device_next(api_clients)
+    assert first is not None
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{first['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    real_now = provider_readiness._utc_now_naive
+    monkeypatch.setattr(provider_readiness, "_utc_now_naive",
+                        lambda: real_now() + timedelta(hours=2))
+    readiness = api_clients.account.get("/ai/provider-readiness")
+    assert readiness.status_code == 200, readiness.text
+    assert readiness.json()["status"] == "expired"
+    resumed = _resume(api_clients, key="resume-expired-readiness-0001",
+                      expected_revision=drained.json()["state_revision"])
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["status"] == "waiting_tts"
+
+
+def test_resume_still_refuses_when_the_latest_probe_failed_even_after_it_expired(
+        api_clients: ApiClients, monkeypatch):
+    """投影先判过期再判能力:一次失败的实测过了 TTL 会投成 expired。恢复的松口只对
+    「实测过、只是久了」成立,最近一次实测是失败的,过期前后都拒(对抗复核 2026-09-13)。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    first = _device_next(api_clients)
+    assert first is not None
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{first['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    configuration = provider_readiness.capture_configuration()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with Session(api_clients.engine) as session:
+        session.add(ProviderReadinessProbe(
+            probe_id="prb_autopilot_api_failed_after_start",
+            schema_version=provider_readiness.SCHEMA_VERSION,
+            runtime_contract=provider_readiness.RUNTIME_CONTRACT,
+            config_fingerprint=configuration.fingerprint,
+            tts_engine_version=configuration.tts_engine_version,
+            asr_engine_version=configuration.asr_engine_version,
+            llm_engine_version=configuration.llm_engine_version,
+            tts_required=True, tts_success=False,
+            tts_failure_code="tts_synthetic_probe_failed",
+            asr_required=True, asr_success=True,
+            llm_required=False,
+            llm_configured=configuration.llm_configured,
+            llm_success=configuration.llm_configured,
+            llm_failure_code=(None if configuration.llm_configured
+                              else "llm_not_required_not_configured"),
+            required_capabilities_ready=False,
+            all_configured_capabilities_ready=False,
+            probe_failure_code="tts_synthetic_probe_failed",
+            checked_at=now + timedelta(seconds=1),
+            expires_at=now + timedelta(minutes=30),
+            actor_display_id="ACTOR-provider-admin",
+        ))
+        session.commit()
+    fresh = _resume(api_clients, key="resume-failed-probe-fresh-0001",
+                    expected_revision=drained.json()["state_revision"])
+    assert fresh.status_code == 409, fresh.text
+    assert fresh.json()["detail"]["code"] == "provider_readiness_required_capability_failed"
+    real_now = provider_readiness._utc_now_naive
+    monkeypatch.setattr(provider_readiness, "_utc_now_naive",
+                        lambda: real_now() + timedelta(hours=2))
+    assert api_clients.account.get("/ai/provider-readiness").json()["status"] == "expired"
+    stale = _resume(api_clients, key="resume-failed-probe-stale-0001",
+                    expected_revision=drained.json()["state_revision"])
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "provider_readiness_expired"
+
+
+def test_replayed_device_failure_ack_does_not_pause_a_manually_resumed_runtime(
+        api_clients: ApiClients, monkeypatch):
+    """平板丢了响应会原样重发失败回执。重放在「人工接管 + 账号恢复」之后到达时,
+    服务端只能认它是重放(副作用为零),不能把已 active 的人工场次再按回暂停
+    (对抗复核 2026-09-13 实跑坐实)。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    command = _device_next(api_clients)
+    assert command is not None
+    ack_url = f"/sessions/{SESSION_ID}/autopilot/commands/{command['command_key']}/acks"
+    body = _ack_body(command, ack_type="tts_failed", ack_key="ack-replay-after-takeover-0001",
+                     device_event_seq=1, error_code="audio_playback_failed")
+    failed = api_clients.device.post(ack_url, headers=api_clients.device_headers, json=body)
+    assert failed.status_code == 200, failed.text
+    assert (failed.json()["status"], failed.json()["replayed"]) == ("paused", False)
+    with Session(api_clients.engine) as session:
+        assert session.get(SessionRuntimeState, SESSION_ID).status == "paused"
+    taken = api_clients.account.post(
+        f"/sessions/{SESSION_ID}/autopilot/takeover",
+        json={"idempotency_key": "takeover-after-tts-failed-0001",
+              "expected_revision": failed.json()["state_revision"]})
+    assert taken.status_code == 200, taken.text
+    assert taken.json()["mode"] == "manual"
+    resumed = api_clients.account.post(f"/sessions/{SESSION_ID}/resume")
+    assert resumed.status_code == 200, resumed.text
+    with Session(api_clients.engine) as session:
+        assert session.get(SessionRuntimeState, SESSION_ID).status == "active"
+    replayed = api_clients.device.post(ack_url, headers=api_clients.device_headers, json=body)
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["replayed"] is True
+    with Session(api_clients.engine) as session:
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state.status == "active"
+        live = session.get(LiveState, 1)
+        assert json.loads(live.session_json or "{}").get("paused") is not True

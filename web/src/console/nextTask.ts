@@ -29,8 +29,18 @@ export interface NextTaskOptions {
   autoApproveAndCreate: boolean;
 }
 
-// 收口前禁止另开新工作的运行态(与服务端 patient-ready 栅栏同口径)。
-const OPEN_RUNTIME_STATUSES = new Set(["active", "paused", "intervention_completed"]);
+// 只有还在跑/暂停的场次才「回原场」。intervention_completed(床旁已结束、研究复核
+// 待做)本身不算:研究复核按设计是事后做的,服务端在现场收尾已保存时就放行新工作
+// (visit_plan_service assert_patient_ready_for_new_work);从第 3 周起几乎每位受试者
+// 都带着上周的待复核场次,若把它当「未收口」,登记表的「开始下一项任务」永远开不了
+// 今天的训练,只会把研究者带回上周的复核页(2026-09-13 复核坐实)。
+// 例外是收尾**还没保存**的(列表带 closeout_saved=false):服务端只在 start 这一步拒
+// (closeout_required),create/approve 都会先落账——不回原场就会留下一份开不了的安排。
+const OPEN_RUNTIME_STATUSES = new Set(["active", "paused"]);
+
+function awaitingCloseout(session: Session): boolean {
+  return session.runtime_status === "intervention_completed" && session.closeout_saved === false;
+}
 
 function inRunnableVertical(plan: VisitPlanReceipt): boolean {
   return (plan.week_no >= 2 && plan.week_no <= 8
@@ -44,7 +54,7 @@ function inRunnableVertical(plan: VisitPlanReceipt): boolean {
 export function pickOpenSession(sessions: Session[]): Session | null {
   return sessions.find((s) =>
     typeof s.runtime_status === "string"
-    && OPEN_RUNTIME_STATUSES.has(s.runtime_status)) ?? null;
+    && (OPEN_RUNTIME_STATUSES.has(s.runtime_status) || awaitingCloseout(s))) ?? null;
 }
 
 export function nextSittingNo(plans: VisitPlanReceipt[]): number {

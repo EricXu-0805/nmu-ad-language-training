@@ -1942,11 +1942,20 @@ def list_patient_sessions(patient_id: str, request: Request,
                        .where(TrainSession.patient_id == patient_id)
                        .order_by(TrainSession.training_date, TrainSession.session_sitting_no,
                                  TrainSession.session_id)))
+    session_ids = [item.session_id for item in rows]
     runtime_statuses = {
         row.session_id: row.status for row in s.exec(
             select(SessionRuntimeState).where(
-                SessionRuntimeState.session_id.in_([item.session_id for item in rows])))
+                SessionRuntimeState.session_id.in_(session_ids)))
     } if rows else {}
+    # 床旁已结束(intervention_completed)的场次,现场收尾保存没保存决定它算不算
+    # 「未收口」:没保存的,服务端拒绝为该受试者开任何新工作(assert_patient_ready_for_new_work),
+    # 控制台「开始下一项任务」要能把人带回原场补收尾,而不是先建一份开不了的安排。
+    closeout_saved = {
+        row.session_id for row in s.exec(
+            select(SessionCloseoutReport).where(
+                SessionCloseoutReport.session_id.in_(session_ids)))
+    } if rows else set()
     role = getattr(request.state, "actor_role", None)
     actor = _actor(request)
     visible = []
@@ -1957,7 +1966,8 @@ def list_patient_sessions(patient_id: str, request: Request,
         if (role == "researcher"
                 and (row.trainer_id or "").strip() != (actor or "")):
             continue
-        visible.append({**row.model_dump(), "runtime_status": status})
+        visible.append({**row.model_dump(), "runtime_status": status,
+                        "closeout_saved": row.session_id in closeout_saved})
     return visible
 
 
@@ -6731,9 +6741,16 @@ def _superseded_capture_disposition(request: Request, s: DBSession, payload: dic
     # 无锁预读:正常的同场次 audioSaved(录音行仍是 recorded)在这里就退出,
     # 不多占一遍 audioSaved 正常路径的那组锁;命中的少数情况再进锁重读复核。
     peek = s.get(AudioAssetRow, raw_id)
-    if peek is None or peek.session_id != target:
+    if peek is None:
+        # 从未登记的槽:登记请求当时就没到服务端(网络在 POST /audio 前断了),平板
+        # outbox 里停在 captured。服务端对它一个事实都没有,同样的三条凭据路下给 410,
+        # 并以 deleted 墓碑行落下这条作废事实(删除回执、治理面板、重放都靠这一行),
+        # 不走正常登记(不占当前题位、不占配额)。重配回旧场次(c)的重放只认已有的行。
+        if mode == "replay" or not audio_store.SAFE_ID.fullmatch(raw_id):
+            return
+    elif peek.session_id != target:
         return
-    if mode == "replay" and not _superseded_orphan_row_shape(peek):
+    elif mode == "replay" and not _superseded_orphan_row_shape(peek):
         return
     with audio_store.blob_mutation_lock(raw_id), _LIVE_WRITE_LOCK, \
             device_capability.serialized_mutation():
@@ -6741,7 +6758,45 @@ def _superseded_capture_disposition(request: Request, s: DBSession, payload: dic
         s.expire_all()
         asset = s.exec(select(AudioAssetRow).where(
             AudioAssetRow.raw_audio_id == raw_id).with_for_update()).first()
-        if asset is None or asset.session_id != target:
+        if asset is None:
+            if peek is not None:
+                return
+            try:
+                canonical_turn_key, _patient_ref = _canonicalize_patient_turn_input(
+                    request, old_sess, incoming_turn_key, legacy_exact_turn_key=None)
+                _validate_audio_turn_key(target, canonical_turn_key, s)
+                # 墓碑行与正常登记同受每场/每题位的登记配额约束:一台出问题的平板
+                # 不能靠编 raw id 无限造行(对抗复核 2026-09-13)。超配额就不作废,照旧拒。
+                audio_capture.assert_registration_quota(s, target, canonical_turn_key)
+            except (HTTPException, audio_capture.AudioQuotaExceeded,
+                    audio_capture.AudioLimitConfigurationError):
+                return
+            # recovery-only 凭据(路径 b)在这里造的是 deleted 墓碑,不是录音事实——
+            # 「不能创建新事实」挡的是登记/上传,这一行只会让本机副本被删、治理面板可见。
+            asset = AudioAssetRow(
+                raw_audio_id=raw_id, session_id=target, turn_key=canonical_turn_key,
+                contains_direct_identifier=flag, status=AudioStatus.deleted,
+                delete_gate_passed=True, is_simulation=old_sess.is_simulation,
+                data_classification=old_sess.data_classification)
+            s.add(asset)
+            s.commit()
+            _audit(s, request, "audio_capture_superseded",
+                   f"旧场次未登记录音作废 {raw_id}(from={target},to={bound},mode={mode},"
+                   f"device={cap.device_id_hash[:12]},unregistered=1)",
+                   session_id=target)
+            raise HTTPException(410, detail={
+                "code": "audio_terminal_disposition",
+                "schemaVersion": 1,
+                "action": "discard_local_copy",
+                "reason": "deleted",
+                "rawAudioId": raw_id,
+                "sessionId": target,
+                "turnKey": incoming_turn_key,
+                "byteCount": byte_count,
+                "checksum": checksum.lower(),
+                "containsDirectIdentifier": flag,
+            })
+        if asset.session_id != target:
             return
         if asset.withdrawn or bool((asset.withdrawal_status or "").strip()):
             return
@@ -10037,7 +10092,7 @@ def autopilot_resume(
         live = _live_row_for_update(s)
         runtime = _runtime_row_for_update(session_id, s)
         try:
-            provider_readiness.require_start_ready(s)
+            provider_readiness.require_resume_ready(s)
         except provider_readiness.ProviderReadinessConflict as exc:
             s.rollback()
             raise HTTPException(
@@ -10270,6 +10325,18 @@ def autopilot_command_ack(
                 live=live,
                 ack_result=result,
             )
+            if (body.ack_type in ("record_failed", "tts_failed")
+                    and result.status == "paused"
+                    and not result.replayed
+                    and _runtime_row(session_id, s).status == "active"):
+                # 设备故障是服务端权威的技术暂停(与老人端 patientRec 失败同口径):
+                # 场次 runtime 一起暂停,live 的 session.paused 才会翻真;研究者点「继续」
+                # 时 resume 再把它翻回来,老人端只认这个真→假下降沿重新探测。此前只暂停
+                # 控制面,「继续」到不了故障后停摆的平板,只能刷新(2026-09-13 演示实证)。
+                # 只对**新落账**的失败回执做:字节相同的重放(平板丢了响应后重发)在
+                # 人工接管、账号恢复之后到达,不能把已经 active 的人工场次再按回暂停;
+                # 场次已中止/已结束的也不碰(_ensure_runtime_writable 会 409,回执反而落不下)。
+                _pause_runtime_in_transaction(session_id, s)
             s.commit()
         except autopilot_service.AutopilotServiceError as exc:
             _autopilot_write_failure(s, exc)

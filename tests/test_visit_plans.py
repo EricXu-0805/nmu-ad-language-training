@@ -3215,6 +3215,12 @@ def test_different_actor_cannot_restart_patient_before_safe_closeout(
     assert denied.status_code == 409, denied.text
     assert denied.json()["detail"]["code"] == (
         "visit_plan_patient_closeout_required")
+    # 场次列表同口径投影「收尾保存了没有」:控制台「开始下一项任务」据此把人带回
+    # 原场补收尾,而不是先建一份注定开不了的安排(对抗复核 2026-09-13)。
+    listed = {row["session_id"]: row for row in
+              visit_clients.researcher.get("/patients/P-VISIT-04/sessions").json()}
+    assert listed[first_started["session_id"]]["runtime_status"] == "intervention_completed"
+    assert listed[first_started["session_id"]]["closeout_saved"] is False
 
     with Session(visit_clients.engine) as session:
         session.add(SessionCloseoutReport(
@@ -3233,6 +3239,9 @@ def test_different_actor_cannot_restart_patient_before_safe_closeout(
         f"/visit-plans/{second['plan_id']}/start", json=start_body)
     assert allowed.status_code == 200, allowed.text
     assert allowed.json()["status"] == "started"
+    listed = {row["session_id"]: row for row in
+              visit_clients.researcher.get("/patients/P-VISIT-04/sessions").json()}
+    assert listed[first_started["session_id"]]["closeout_saved"] is True
 
 
 def test_concurrent_start_for_same_actor_creates_only_one_active_session(

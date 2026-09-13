@@ -1072,3 +1072,103 @@ def test_new_pairing_path_yields_to_a_still_valid_pairing_on_the_old_session(
     uploaded = client.put("/audio/raw-orphan-1/blob", headers={**cap_a2, "content-type": "audio/webm"},
                           content=b"\x1a\x45\xdf\xa3raw-orphan-1")
     assert uploaded.status_code == 200, uploaded.text
+
+
+def test_never_registered_capture_of_previous_session_gets_410_with_a_deleted_tombstone(
+        disposition_client, monkeypatch):
+    """登记请求当时就没到服务端(outbox 停在 captured):服务端一个事实都没有。同一位
+    受试者、同一台平板换到新场次后回报它,同样 410,并落一条 deleted 墓碑行——删除回执、
+    治理面板、重配回旧场次的重放都靠这一行(对抗复核 2026-09-13)。"""
+    client = disposition_client
+    old_headers, new_headers = _superseded_scene(client, monkeypatch)
+    saved = _orphan_saved("raw-never-registered-1", session_id="S-ONE")
+    response = client.put("/live/state", headers=new_headers, json=saved)
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"] == {
+        "code": "audio_terminal_disposition", "schemaVersion": 1,
+        "action": "discard_local_copy", "reason": "deleted",
+        "rawAudioId": "raw-never-registered-1", "sessionId": "S-ONE", "turnKey": "itm-0001#1",
+        "byteCount": 4321, "checksum": "ab" * 32, "containsDirectIdentifier": False,
+    }
+    _assert_device_no_store(response)
+    with Session(client.test_engine) as session:
+        row = session.get(AudioAssetRow, "raw-never-registered-1")
+        assert row is not None and row.session_id == "S-ONE"
+        assert row.status == AudioStatus.deleted and row.delete_gate_passed is True
+        assert row.checksum is None and row.byte_count is None and row.uploaded_at is None
+        # 墓碑行存的是规范题位键(与正常登记同款),不是设备回报的不透明引用。
+        assert row.turn_key == "SE_胡萝卜#1" and row.contains_direct_identifier is False
+        audits = session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all()
+        assert len(audits) == 1 and "raw-never-registered-1" in audits[0].summary
+        assert "unregistered=1" in audits[0].summary
+    again = client.put("/live/state", headers=new_headers, json=saved)
+    assert again.status_code == 410 and again.json()["detail"]["reason"] == "deleted"
+    with Session(client.test_engine) as session:
+        assert len(session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all()) == 1
+    confirmed = client.put("/live/state", headers=new_headers, json={
+        "kind": "audioDisposalConfirmed", "payload": {
+            "code": "audio_terminal_disposition", "schemaVersion": 1,
+            "action": "discard_local_copy", "reason": "deleted",
+            "rawAudioId": "raw-never-registered-1", "sessionId": "S-ONE", "turnKey": "itm-0001#1",
+            "byteCount": 4321, "checksum": "ab" * 32, "containsDirectIdentifier": False,
+        }})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["duplicate"] is False
+    # 墓碑行不是登记:新场次照常登记同一题位不受它影响。
+    fresh = client.post("/audio", headers=new_headers, json={
+        "raw_audio_id": "raw-b-fresh-1", "session_id": "S-ONE-B", "turn_key": "itm-0001#1",
+        "contains_direct_identifier": False})
+    assert fresh.status_code == 200, fresh.text
+
+
+@pytest.mark.parametrize("variant", ["other_device", "bad_turn_key", "bad_raw_id", "replay_without_row"])
+def test_never_registered_capture_is_not_tombstoned_outside_the_exact_case(
+        disposition_client, monkeypatch, variant):
+    client = disposition_client
+    old_headers, new_headers = _superseded_scene(client, monkeypatch)
+    if variant == "other_device":
+        headers = _pair(client, device_id="tablet-0000000000000002")
+        saved = _orphan_saved("raw-never-registered-2", session_id="S-ONE")
+    elif variant == "bad_turn_key":
+        headers = new_headers
+        saved = _orphan_saved("raw-never-registered-2", session_id="S-ONE", turn_key="itm-9999#1")
+    elif variant == "bad_raw_id":
+        headers = new_headers
+        saved = _orphan_saved("raw never registered", session_id="S-ONE")
+    else:
+        # 重配回旧场次 A:没有已作废的行可重放,不凭空造墓碑。
+        admin = _admin_client(client.test_engine, username="orphan-admin-back")
+        try:
+            _switch_live(admin, "S-ONE")
+        finally:
+            admin.close()
+        headers = _pair(client, device_id="tablet-0000000000000001")
+        saved = _orphan_saved("raw-never-registered-2", session_id="S-ONE")
+    response = client.put("/live/state", headers=headers, json=saved)
+    assert response.status_code != 410, response.text
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "raw-never-registered-2") is None
+        assert session.get(AudioAssetRow, "raw never registered") is None
+        assert session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all() == []
+
+
+def test_never_registered_tombstones_are_bounded_by_the_registration_quota(
+        disposition_client, monkeypatch):
+    """墓碑行与正常登记同受配额:每题位上限到了就不再作废、不再造行(对抗复核 2026-09-13)。"""
+    client = disposition_client
+    monkeypatch.setenv("AUDIO_MAX_REGISTRATIONS_PER_TURN", "2")
+    _, new_headers = _superseded_scene(client, monkeypatch)   # raw-orphan-1 已占 1 条
+    first = client.put("/live/state", headers=new_headers,
+                       json=_orphan_saved("raw-never-registered-q1", session_id="S-ONE"))
+    assert first.status_code == 410, first.text
+    second = client.put("/live/state", headers=new_headers,
+                        json=_orphan_saved("raw-never-registered-q2", session_id="S-ONE"))
+    assert second.status_code != 410, second.text
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "raw-never-registered-q1") is not None
+        assert session.get(AudioAssetRow, "raw-never-registered-q2") is None
+        assert len(session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all()) == 1

@@ -1,4 +1,5 @@
 import { receiptMatchesRapportArm } from "./rapportRecordingAuthority";
+import { pollFailed, pollSucceeded, RUNTIME_ERROR_GRACE_MS } from "../../hooks/runtimePollPolicy";
 import { useEffect, useRef, useState } from "react";
 import { playbackIdentity, waitForRapportPlayback, type RapportPlaybackIdentity } from "../../rapportPlayback";
 import { api, ApiError } from "../../api";
@@ -23,6 +24,9 @@ import { SessionAbortControl } from "../SessionAbortControl";
 // 逐节/逐问广播 rapportStep 推进老人端;录音同训练屏 arm/stop 模式(老人端 VOX 实采字节)。
 // 自我介绍段 containsDirectIdentifier=true 随消息带到老人端登记(导出侧整段红线)。
 // speaker="研究者" 的节是当面话术:老人端不朗读,此处只给研究者看提词。
+// 录音授权背景轮询的间隔;宽限窗按它加 RUNTIME_ERROR_GRACE_MS 取,吸收一次抖动。
+const RECORDING_AUTHORIZATION_POLL_MS = 5_000;
+
 export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   session: Session;
   onWrapup: () => void;
@@ -147,21 +151,31 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   useEffect(() => {
     let cancelled = false;
     let inFlight = false;
+    // 与 useSessionRuntime 同一套宽限:背景轮询一次快速失败(连接被拒、status 0)不能立刻
+    // 把 recStatus 翻成 error/denied——那会向老人端写 idle 把正在说话的老人掐断
+    // (2026-09-13 复核坐实)。窗按 interval+grace 取,吸收一次抖动;悬挂到 12 秒超时的
+    // 请求(408)距上次成功早已超窗,照旧立即亮错——那已经是真断网。前台请求照旧立即呈现。
+    let health = pollSucceeded(Date.now());
     const check = (foreground: boolean) => {
       if (inFlight) return;
       inFlight = true;
       if (foreground) setRecStatus("loading");
       api.recordingAuthorization(session.session_id)
         .then((authorization) => {
+          health = pollSucceeded(Date.now());
           if (!cancelled) setRecStatus(authorization.allowed === true && authorization.runtime_status === "active" ? "allowed" : "denied");
         })
         .catch((error) => {
-          if (!cancelled) setRecStatus(error instanceof ApiError && error.status >= 400 && error.status < 500 ? "denied" : "error");
+          if (cancelled || !pollFailed(health, Date.now(), foreground,
+            RECORDING_AUTHORIZATION_POLL_MS + RUNTIME_ERROR_GRACE_MS)) return;
+          // 408/0 是本机超时或断网,不是服务器拒绝;只有 4xx 业务码才算 denied。
+          const denied = error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 408;
+          setRecStatus(denied ? "denied" : "error");
         })
         .finally(() => { inFlight = false; });
     };
     check(true);
-    const timer = window.setInterval(() => check(false), 5_000);
+    const timer = window.setInterval(() => check(false), RECORDING_AUTHORIZATION_POLL_MS);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [session.session_id, recRetry]);
 

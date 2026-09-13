@@ -60,7 +60,8 @@ export function consoleReducer(s: ConsoleState, a: ConsoleAction): ConsoleState 
 // 工作台状态持久化:误刷新/误关标签页不再丢当前场次(作业日志本就在 localStorage,这里补屏幕位置)。
 const LEGACY_PERSIST_KEY = "nmu:console:state";
 const PERSIST_PREFIX = "nmu:console:state:";
-const CACHE_VERSION = 2;
+// v3(2026-09-13):场次多带 closeout_saved,旧缓存整体作废一次(回选人台),不猜。
+const CACHE_VERSION = 3;
 const AREAS = new Set<ConsoleArea>(["prep", "run", "analyze"]);
 const RUN_SCREENS = new Set<RunScreen>(["picker", "training", "relationship", "unsupported", "wrapup"]);
 const STATE_KEYS = ["area", "screen", "patientId", "session"] as const;
@@ -158,8 +159,14 @@ function envelopeForState(s: ConsoleState, scope: string): PersistedConsoleEnvel
     area: s.area,
     screen: s.screen,
     patientId: s.patientId,
+    // 刚开场的场次(parseStartedVisitSession)不带 runtime_status / closeout_saved,
+    // 严格重载前按「刚开、未收尾」补齐;列表投影来的场次两项俱全,原样保留。
     session: s.session
-      ? { ...s.session, runtime_status: s.session.runtime_status ?? "active" }
+      ? {
+        ...s.session,
+        runtime_status: s.session.runtime_status ?? "active",
+        closeout_saved: s.session.closeout_saved ?? false,
+      }
       : null,
   };
   return {

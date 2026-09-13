@@ -59,3 +59,14 @@ test("SessionControlBar 死胡同文案不得回归:被挡的「继续」必须�
     new URL("../console/scoring/TrainingConsoleScreen.tsx", import.meta.url), "utf8");
   assert.match(training, /resumeBlockedHint=\{observerMode/);
 });
+
+test("a poll slower than the grace passes its interval into the grace so one blip is absorbed", () => {
+  const interval = 5_000;
+  const health = pollSucceeded(100);
+  // 第一次失败在 5.05s:默认 4.5s 窗已超,会亮错;按 interval+grace 取窗则吸收。
+  assert.equal(pollFailed(health, 5_050, false), true);
+  assert.equal(pollFailed(health, 5_050, false, interval + RUNTIME_ERROR_GRACE_MS), false);
+  // 连着第二次失败(10.05s)才亮。
+  assert.equal(pollFailed(health, 10_050, false, interval + RUNTIME_ERROR_GRACE_MS), true);
+  assert.equal(pollFailed(health, 5_050, true, interval + RUNTIME_ERROR_GRACE_MS), true);
+});

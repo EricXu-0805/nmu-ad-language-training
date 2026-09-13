@@ -39,11 +39,19 @@ import { hasExactWeek2Single20Profile } from "../../autopilot/demoProfile.ts";
 // 屏上只剩「已安全暂停」,钱凯只能说「进行不了训练」。
 const AUTOPILOT_ERROR_HINTS: Record<string, string> = {
   recording_start_failed:
-    "老人端麦克风没能启动。常见原因：平板里还留着上一场没传完的录音（重新连上后系统会自动清掉），或浏览器没给麦克风权限。处理后点「继续 AI 自动带练」。",
+    "老人端麦克风没能启动。常见原因：平板里还留着上一场没传完的录音（系统会在下一次开麦前自动清掉），或浏览器没给麦克风权限。点「继续 AI 自动带练」再试一次；还不行就让老人端页面刷新一下。",
   microphone_denied: "老人端浏览器拒绝了麦克风权限，请在平板上允许后再点「继续 AI 自动带练」。",
   microphone_unavailable: "老人端找不到麦克风设备，请检查平板后再继续。",
-  recording_upload_failed: "老人端录音上传或采集收据没有完成，检查网络后再继续。",
-  device_command_timeout: "老人端没有在限定时间内回应命令，检查平板是否还连着、页面是否还开着。",
+  recording_upload_failed: "老人端录音上传或采集收据没有完成，检查网络后再点「继续 AI 自动带练」。",
+  recording_runtime_failed: "老人端录音过程中出错（浏览器录音器异常），让老人端页面刷新一下再点「继续 AI 自动带练」。",
+  device_command_timeout:
+    "老人端没有在限定时间内回应。多半是老人端还在等点屏（屏上显示「点一下，接着听」），让老人点一下屏幕再点「继续 AI 自动带练」；如果屏幕黑了或页面关了，重新打开老人端页面。网络慢时也可能是老人端还在上传上一场没传完的录音，稍等再点「继续 AI 自动带练」。",
+  audio_playback_failed: "老人端放不出这句引导语（拿不到音频、解码失败或浏览器拒绝播放）。检查平板音量和网络，让老人点一下屏幕，再点「继续 AI 自动带练」。",
+  tts_cancelled: "引导语播放被打断（换页、切场或老人端被暂停）。确认老人端还在这一场，再点「继续 AI 自动带练」。",
+  device_runtime_failed: "老人端自动流程内部出错，让老人端页面刷新一下再点「继续 AI 自动带练」。",
+  intervention_completion_evidence_incomplete: "这一题的证据不完整（录音或判定没有落账），AI 不能替它宣布完成。点「转为人工操作」把这一题人工做完。",
+  explicit_repeat_limit: "老人已多次要求重听，达到协议上限，AI 停下等你决定。点「继续 AI 自动带练」会把这一题从头再问一遍；这一题若已经答过一轮，服务器不允许 AI 接着做，请点「转为人工操作」人工完成。",
+  autopilot_device_rotated: "老人端换了设备或重新配对，AI 已停下。换过设备的这一场，AI 不能再继续，也不能转人工接管（旧平板的收麦证明拿不到）；请点「中止本场」，再为该受试者新开一场。",
 };
 function autopilotErrorHint(code: string): string {
   return AUTOPILOT_ERROR_HINTS[code] ?? `错误码：${code}`;

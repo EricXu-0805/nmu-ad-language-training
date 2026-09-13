@@ -216,9 +216,9 @@ test("every paired-null projection keeps both profile keys present and null", ()
   const outputs = [
     parseStartedVisitSession(startedSession(), receipt),
     parsePatientSessionList(
-      [{ ...startedSession(), runtime_status: "paused" }], "P-VISIT-01")[0],
+      [{ ...startedSession(), runtime_status: "paused", closeout_saved: false }], "P-VISIT-01")[0],
     parsePatientSessionList(
-      [{ ...directSession(), runtime_status: "completed" }], "P-VISIT-01")[0],
+      [{ ...directSession(), runtime_status: "completed", closeout_saved: false }], "P-VISIT-01")[0],
   ];
   for (const output of outputs) {
     assert.ok(output);
@@ -262,13 +262,13 @@ test("only the exact frozen demo session pair is accepted by the shared parser",
   for (const session of invalid) {
     assert.throws(() => parseStartedVisitSession(session, receipt));
     assert.throws(() => parsePatientSessionList(
-      [{ ...session, runtime_status: "paused" }], "P-VISIT-01"));
+      [{ ...session, runtime_status: "paused", closeout_saved: false }], "P-VISIT-01"));
   }
 
   assert.deepEqual(parseStartedVisitSession(complete, receipt), complete);
   assert.deepEqual(parsePatientSessionList(
-    [{ ...complete, runtime_status: "paused" }], "P-VISIT-01"),
-  [{ ...complete, runtime_status: "paused" }]);
+    [{ ...complete, runtime_status: "paused", closeout_saved: false }], "P-VISIT-01"),
+  [{ ...complete, runtime_status: "paused", closeout_saved: false }]);
 });
 
 test("started session profile version is compared against the started receipt", () => {
@@ -289,12 +289,13 @@ test("pre-repeat plan-linked history recovers, but a new start must be complete"
     repeat_protocol_version_id: null,
     repeat_protocol_definition_digest: null,
     runtime_status: "paused",
+    closeout_saved: false,
   };
   assert.deepEqual(
     parsePatientSessionList([historical], "P-VISIT-01"), [historical]);
 
   const receipt = parseVisitPlanReceipt(started());
-  const { runtime_status: _live, ...immediate } = historical;
+  const { runtime_status: _live, closeout_saved: _closeout, ...immediate } = historical;
   assert.throws(() => parseStartedVisitSession(immediate, receipt));
 });
 
@@ -465,35 +466,43 @@ test("started session parser binds every available server fact to the started re
 test("repeat protocol binding is absent-or-complete on direct legacy sessions", () => {
   // A pre-protocol session legitimately carries neither half.
   assert.deepEqual(
-    parsePatientSessionList([{ ...directSession(), runtime_status: "completed" }],
+    parsePatientSessionList([{ ...directSession(), runtime_status: "completed", closeout_saved: false }],
       "P-VISIT-01"),
-    [{ ...directSession(), runtime_status: "completed" }]);
+    [{ ...directSession(), runtime_status: "completed", closeout_saved: false }]);
   // A direct session that really was frozen under the protocol is also valid.
   const boundDirect = {
     ...directSession(),
     repeat_protocol_version_id: REPEAT_VERSION,
     repeat_protocol_definition_digest: REPEAT_DIGEST,
     runtime_status: "completed",
+    closeout_saved: false,
   };
   assert.deepEqual(parsePatientSessionList([boundDirect], "P-VISIT-01"), [boundDirect]);
   // Half a pair is refused even where the legacy null shape is allowed.
   for (const session of [
     { ...directSession(), repeat_protocol_version_id: REPEAT_VERSION,
-      runtime_status: "completed" },
+      runtime_status: "completed", closeout_saved: false },
     { ...directSession(), repeat_protocol_definition_digest: REPEAT_DIGEST,
-      runtime_status: "completed" },
+      runtime_status: "completed", closeout_saved: false },
     { ...directSession(), repeat_protocol_version_id: "bad version",
-      repeat_protocol_definition_digest: REPEAT_DIGEST, runtime_status: "completed" },
+      repeat_protocol_definition_digest: REPEAT_DIGEST, runtime_status: "completed", closeout_saved: false },
     { ...directSession(), repeat_protocol_version_id: REPEAT_VERSION,
-      repeat_protocol_definition_digest: "not-hex", runtime_status: "completed" },
+      repeat_protocol_definition_digest: "not-hex", runtime_status: "completed", closeout_saved: false },
   ]) {
     assert.throws(() => parsePatientSessionList([session], "P-VISIT-01"));
   }
 });
 
 test("recovery session list is strict, patient-bound, unique, and runtime-authoritative", () => {
-  const session = { ...startedSession(), runtime_status: "paused" };
+  const session = { ...startedSession(), runtime_status: "paused", closeout_saved: false };
   assert.deepEqual(parsePatientSessionList([session], "P-VISIT-01"), [session]);
+  assert.deepEqual(
+    parsePatientSessionList([{ ...session, runtime_status: "intervention_completed", closeout_saved: true }], "P-VISIT-01"),
+    [{ ...session, runtime_status: "intervention_completed", closeout_saved: true }]);
+  // 收尾标志缺失或不是布尔值:整条列表拒收(服务端与网页同一份契约,不默认)。
+  const { closeout_saved: _flag, ...withoutFlag } = session;
+  assert.throws(() => parsePatientSessionList([withoutFlag], "P-VISIT-01"));
+  assert.throws(() => parsePatientSessionList([{ ...session, closeout_saved: "no" }], "P-VISIT-01"));
   assert.throws(() => parsePatientSessionList([session, session], "P-VISIT-01"));
   assert.throws(() => parsePatientSessionList([
     { ...session, patient_id: "P-VISIT-OTHER" },

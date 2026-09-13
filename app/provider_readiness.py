@@ -552,6 +552,24 @@ def require_start_ready(session: DBSession) -> ReadinessProjection:
     return projection
 
 
+def require_resume_ready(session: DBSession) -> ReadinessProjection:
+    """恢复自动带练的门槛比启动松一档:实测过、只是过了 TTL 的,放行。
+
+    启动前必须有管理员做过的有效实测(计费自检只能管理员发起,门禁书口径)。
+    但一场训练 40 分钟起步,安全暂停后常常已过 30 分钟 TTL;研究者账号又没权限
+    重新探测,只能干等管理员——2026-09-13 复核坐实的死角。过期只是「距上次实测久了」,
+    不是「供应商不可用」;真不可用时下一句 TTS/ASR 会失败,自动带练照样安全暂停。
+    没探测过、配置已变、必需能力失败的,仍然拒。投影先判过期再判能力,所以一次
+    失败的实测过了 TTL 也会投成 expired——这里单独再看 required_capabilities_ready,
+    最近一次实测是失败的就不放(对抗复核 2026-09-13)。
+    """
+    projection = readiness_projection(session)
+    if (projection.status not in {"ready", "expired"}
+            or not projection.required_capabilities_ready):
+        raise ProviderReadinessConflict(projection)
+    return projection
+
+
 def conflict_detail(exc: ProviderReadinessConflict) -> dict[str, Any]:
     return {
         "code": exc.code,

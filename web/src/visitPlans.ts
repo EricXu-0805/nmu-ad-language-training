@@ -38,7 +38,8 @@ const SESSION_KEYS = [
 function knownProfileVersion(value: unknown): value is typeof WEEK2_SINGLE20_DEMO_PROFILE_VERSION {
   return value === WEEK2_SINGLE20_DEMO_PROFILE_VERSION;
 }
-const RECOVERY_SESSION_KEYS = [...SESSION_KEYS, "runtime_status"] as const;
+// 列表投影多两项:runtime 状态,以及床旁已结束场次的现场收尾保存了没有。
+const RECOVERY_SESSION_KEYS = [...SESSION_KEYS, "runtime_status", "closeout_saved"] as const;
 const PLAN_ID = /^vp_[A-Za-z0-9_-]{24}$/;
 const SESSION_ID = /^s_[A-Za-z0-9_-]{24}$/;
 // 受试者编号契约 = 后端 visit_plan_contract._PATIENT_ID_PATTERN(ASCII 编号)。
@@ -387,7 +388,8 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
       || (row.data_classification !== "legacy_unknown"
         && row.data_classification !== (row.is_simulation ? "simulation" : "research"))
       || (includeRuntime && (typeof row.runtime_status !== "string"
-        || !RUNTIME_STATUSES.has(row.runtime_status as SessionRuntimeStatus)))) {
+        || !RUNTIME_STATUSES.has(row.runtime_status as SessionRuntimeStatus)
+        || typeof row.closeout_saved !== "boolean"))) {
     throw new Error("训练场次响应不符合严格契约");
   }
   const weekNo = row.week_no as number;
@@ -418,7 +420,10 @@ function parseSessionRecord(value: unknown, includeRuntime: boolean): Session {
     is_simulation: row.is_simulation,
     data_classification: row.data_classification,
     ...(includeRuntime
-      ? { runtime_status: row.runtime_status as SessionRuntimeStatus }
+      ? {
+        runtime_status: row.runtime_status as SessionRuntimeStatus,
+        closeout_saved: row.closeout_saved as boolean,
+      }
       : {}),
   };
 }

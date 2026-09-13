@@ -88,7 +88,9 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
         return;
       }
       if (outcome.kind === "resumed") {
-        toast("该受试者有未收口的场次，已回到原场继续", "info");
+        toast(outcome.session.runtime_status === "intervention_completed"
+          ? "该受试者上一场的现场收尾还没保存，已回到原场补收尾"
+          : "该受试者有未收口的场次，已回到原场继续", "info");
       }
       onSessionStarted(outcome.session); // 成功即切走本屏,不再回写本组件状态
     } catch (e) {
@@ -217,6 +219,9 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
                 setWithdrawalReceipt(null);
                 setWithdrawalFor(r);
               }}>登记研究撤回</Button>
+            )}
+            {!r.is_simulation_subject && !r.withdrawal_status && !canRegisterWithdrawal && (
+              <span className="muted" style={{ alignSelf: "center" }}>登记研究撤回需系统管理员账号</span>
             )}
             {!archived && (
               <Button disabled={cannotPlan || idInvalid}

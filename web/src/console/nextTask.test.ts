@@ -140,12 +140,31 @@ test("helpers: open-session pick and sitting derivation are deterministic", () =
   assert.equal(pickOpenSession([]), null);
   assert.equal(
     pickOpenSession([{ session_id: "a", runtime_status: "completed" } as Session]), null);
+  // 床旁已结束、待研究复核的场次不再算「未收口」:今天的训练要能开。
   assert.equal(
     pickOpenSession([
       { session_id: "a", runtime_status: "completed" } as Session,
       { session_id: "b", runtime_status: "intervention_completed" } as Session,
+    ]),
+    null);
+  assert.equal(
+    pickOpenSession([
+      { session_id: "b", runtime_status: "intervention_completed" } as Session,
+      { session_id: "c", runtime_status: "paused" } as Session,
+    ])?.session_id,
+    "c");
+  // 收尾没保存的床旁已结束场次仍算未收口:服务端只在 start 才拒,不回原场会先留下
+  // 一份开不了的安排。
+  assert.equal(
+    pickOpenSession([
+      { session_id: "b", runtime_status: "intervention_completed", closeout_saved: false } as Session,
     ])?.session_id,
     "b");
+  assert.equal(
+    pickOpenSession([
+      { session_id: "b", runtime_status: "intervention_completed", closeout_saved: true } as Session,
+    ]),
+    null);
   assert.equal(nextSittingNo([]), 1);
   assert.equal(nextSittingNo([
     receipt({ status: "started", session_sitting_no: 3 }),

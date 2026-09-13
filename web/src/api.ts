@@ -1292,6 +1292,10 @@ export const api = {
       device: true,
       deviceSessionId: body.session_id ?? undefined,
       allowRecovery: true,
+      // 与 blob 上传 / audioSaved 同一条凭据路:旧场次的恢复凭据过期后,只剩本场次的
+      // 有效凭据可用;登记撞 409 device_session_mismatch 后走 audioSaved 探测,服务端
+      // 才有机会按收据 255 给 410 作废。否则 captured 阶段的旧账无凭据可发,永远清不掉。
+      activeFallback: true,
     }),
   audioExport: (id: string) => req<AudioAsset>("POST", `/audio/${encodeURIComponent(id)}/export`),
   audioChecksum: (id: string) => req<AudioAsset>("POST", `/audio/${encodeURIComponent(id)}/checksum`),

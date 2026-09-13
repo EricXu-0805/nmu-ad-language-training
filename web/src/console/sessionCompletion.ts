@@ -182,7 +182,7 @@ export function localInterventionCompletionGate({
     return {
       canRequest: false,
       label: `还差 ${itemsMissingRecords} 题记录，暂不能结束`,
-      detail: "缺少记录的题目会被服务器拒绝；请返回训练补齐，或走中止流程提前结束。",
+      detail: "缺少记录的题目会被服务器拒绝；请点「返回训练」补齐，或在训练页点「中止本场」提前结束。",
     };
   }
   return {

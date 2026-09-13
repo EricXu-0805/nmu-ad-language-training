@@ -340,7 +340,13 @@ _NATIVE_MEDIA_OBSERVER_SCRIPT = r"""
     return id;
   };
   const push = (event, element, extra = {}) => {
-    journal.push({ event, id: idFor(element), ...extra });
+    // 2026-09-04 起所有话术共用一个 <audio>,手势里还会先放一段静音解锁片
+    // (blob:,时长 ~1ms):按 src 区分话术,按时长识别静音片。
+    journal.push({
+      event, id: idFor(element), src: element.currentSrc || element.src || "",
+      duration: Number.isFinite(element.duration) ? element.duration : null,
+      ...extra,
+    });
   };
   Object.defineProperty(window, "__nmuNativeMediaJournal", {
     value: journal,
@@ -791,28 +797,36 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                 raise BrowserAcceptanceError("无法读取原生音频播放与暂停证据") from exc
             if not isinstance(media_journal, list):
                 raise BrowserAcceptanceError("原生音频证据格式无效")
+            # 话术共用同一个 <audio>(2026-09-04 起),手势里还会放一段 ~1ms 的静音解锁片:
+            # 按 src 区分两段话术,把静音片(时长 < 50ms)排除在外。
+            def _is_speech(entry) -> bool:
+                if not isinstance(entry, dict):
+                    return False
+                duration = entry.get("duration")
+                return not (isinstance(duration, (int, float)) and duration < 0.05)
             playing = [entry for entry in media_journal
-                       if isinstance(entry, dict) and entry.get("event") == "playing"]
-            if len(playing) != 2 or playing[0].get("id") == playing[1].get("id"):
-                raise BrowserAcceptanceError("浏览器没有精确播放首次问题和判定后反馈")
-            first_media_id = playing[0].get("id")
-            feedback_media_id = playing[1].get("id")
+                       if _is_speech(entry) and entry.get("event") == "playing"]
+            if len(playing) != 2 or not playing[0].get("src") or playing[0].get("src") == playing[1].get("src"):
+                raise BrowserAcceptanceError(
+                    f"浏览器没有精确播放首次问题和判定后反馈(playing={len(playing)})")
+            first_src = playing[0].get("src")
+            feedback_src = playing[1].get("src")
             first_ended = any(
-                isinstance(entry, dict)
+                _is_speech(entry)
                 and entry.get("event") == "ended"
-                and entry.get("id") == first_media_id
+                and entry.get("src") == first_src
                 for entry in media_journal
             )
             feedback_ended = any(
-                isinstance(entry, dict)
+                _is_speech(entry)
                 and entry.get("event") == "ended"
-                and entry.get("id") == feedback_media_id
+                and entry.get("src") == feedback_src
                 for entry in media_journal
             )
             feedback_paused = any(
-                isinstance(entry, dict)
+                _is_speech(entry)
                 and entry.get("event") == "pause_called"
-                and entry.get("id") == feedback_media_id
+                and entry.get("src") == feedback_src
                 and entry.get("pausedBefore") is False
                 and entry.get("pausedAfter") is True
                 and entry.get("endedAfter") is False
@@ -940,11 +954,11 @@ def _run_help_states(caregiver, observations: dict[str, object]) -> None:
     # 反过来写的话，一旦文案被改成谎称已送达，先炸的是"等不到诚实文案"的超时，
     # 禁词那条断言一次都执行不到——回退验证实测就是这么红的，红得没有意义。
     _assert_no_claimed_delivery(caregiver, "刚登记完的求助面板")
-    caregiver.get_by_text(re.compile("本机构尚未配置自动通知对象")).wait_for(
+    caregiver.get_by_text(re.compile("已记录，但系统不会通知任何人")).wait_for(
         state="visible", timeout=20_000)
 
     # 四态可跳过：没配通道时工作人员当面走过来仍能直接到「已有人到场」。
-    arrival = caregiver.get_by_role("button", name="记：已有人到场", exact=True)
+    arrival = caregiver.get_by_role("button", name="已有人到场", exact=True)
     arrival.wait_for(state="visible", timeout=20_000)
     with caregiver.expect_response(
         lambda response: (
@@ -961,11 +975,11 @@ def _run_help_states(caregiver, observations: dict[str, object]) -> None:
             f"记录到场被拒绝（HTTP {acknowledged.value.status}）")
     caregiver.get_by_text(re.compile("已有工作人员到场并接手")).wait_for(
         state="visible", timeout=20_000)
-    if caregiver.get_by_role("button", name="记：已有人到场", exact=True).count() != 0:
+    if caregiver.get_by_role("button", name="已有人到场", exact=True).count() != 0:
         raise BrowserAcceptanceError("已经到场之后还能再记一次到场")
     _assert_no_claimed_delivery(caregiver, "已接收态的求助面板")
 
-    resolved = caregiver.get_by_role("button", name="记：已处理完", exact=True)
+    resolved = caregiver.get_by_role("button", name="已处理完成", exact=True)
     resolved.wait_for(state="visible", timeout=20_000)
     with caregiver.expect_response(
         lambda response: (
@@ -980,7 +994,7 @@ def _run_help_states(caregiver, observations: dict[str, object]) -> None:
             f"记录处理完毕被拒绝（HTTP {done.value.status}）")
     caregiver.get_by_text(re.compile("本次求助已处理完毕")).wait_for(
         state="visible", timeout=20_000)
-    for label in ("记：已有人到场", "记：已处理完"):
+    for label in ("已有人到场", "已处理完成"):
         if caregiver.get_by_role("button", name=label, exact=True).count() != 0:
             raise BrowserAcceptanceError(f"求助已处理完之后「{label}」仍留在屏上")
     _assert_no_claimed_delivery(caregiver, "已处理态的求助面板")

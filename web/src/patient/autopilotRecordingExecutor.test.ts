@@ -17,10 +17,11 @@ import {
   type AutopilotCaptureBootstrapPorts,
   type ExactCaptureUploadPorts,
 } from "./autopilotRecordingExecutor.ts";
-import { attachAutopilotStopReason, createAudioOutboxEntry } from "../audio/audioOutbox.ts";
+import { attachAutopilotStopReason, createAudioOutboxEntry, type AudioOutboxEntry } from "../audio/audioOutbox.ts";
 import { sha256Blob } from "../audio/audioUploadReceipt.ts";
 import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import { PRE_START_BUDGET_MS } from "./autopilotCaptureWindow.ts";
+import { FOREIGN_DRAIN_SOFT_BUDGET_MS } from "./autopilotRecordingExecutor.ts";
 import type { AudioDeviceLease } from "../audio/audioDeviceLease.ts";
 import type { RecordingAuthorization } from "./recordingAuthorization.ts";
 import type { AutopilotRecoverySnapshot } from "./autopilotRecordingRecovery.ts";
@@ -514,6 +515,7 @@ const AUTHORIZED: RecordingAuthorization = {
 function bootstrapHarness(clock: Clock, overrides: {
   acquireLease?: (signal: AbortSignal) => Promise<AudioDeviceLease>;
   recoverySnapshot?: () => Promise<AutopilotRecoverySnapshot>;
+  drainForeignOutbox?: (currentSessionId: string, entries: AudioOutboxEntry[]) => Promise<void>;
   authorize?: (call: number, signal: AbortSignal) => Promise<RecordingAuthorization>;
   /** 第 N 次 setTimer 同步抛错。作答窗口那次是第 2 次（第 1 次是 pre-start 预算）。 */
   throwOnTimerCall?: number;
@@ -569,6 +571,12 @@ function bootstrapHarness(clock: Clock, overrides: {
       calls.push("recoverySnapshot");
       return overrides.recoverySnapshot?.() ?? Promise.resolve(EMPTY_SNAPSHOT);
     },
+    ...(overrides.drainForeignOutbox ? {
+      drainForeignOutbox: (currentSessionId: string, entries: AudioOutboxEntry[]) => {
+        calls.push(`drainForeignOutbox:${entries.length}`);
+        return overrides.drainForeignOutbox!(currentSessionId, entries);
+      },
+    } : {}),
     authorize: (_sessionId, _commandKey, signal) => {
       authorizeCalls += 1;
       calls.push(`authorize:${authorizeCalls}`);
@@ -1459,4 +1467,78 @@ test("对照：真实开录后的 cancel() 就是一次成功停止——半段�
   assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
   assert.equal(run.events.some((event) => event.phase === "persisting"), false);
   assert.equal(run.events.at(-1)?.phase, "cleared");
+});
+
+function foreignOutboxEntry(): AudioOutboxEntry {
+  return attachAutopilotStopReason(createAudioOutboxEntry({
+    rawAudioId: "raw-old-session-0001",
+    sessionId: "S-OLD-0001",
+    turnKey: "itm-0001#1",
+    containsDirectIdentifier: false,
+    durationSeconds: 3,
+    blob: recordingBlob(),
+  }), "user_done");
+}
+
+test("开麦前清旧账：别的场次的条目先清、再重拍快照，清干净后照常授权开麦", async (context) => {
+  const clock = clockDouble();
+  const devices = installDeviceDoubles(clock);
+  context.after(() => devices.restore());
+  let snapshots = 0;
+  const harness = bootstrapHarness(clock, {
+    recoverySnapshot: async () => {
+      snapshots += 1;
+      return snapshots === 1
+        ? { entries: [foreignOutboxEntry()], legacyOrphans: [], invalidBlobKeyCount: 0 }
+        : EMPTY_SNAPSHOT;
+    },
+    drainForeignOutbox: async (currentSessionId, entries) => {
+      assert.equal(currentSessionId, SESSION);
+      assert.deepEqual(entries.map((entry) => entry.sessionId), ["S-OLD-0001"]);
+    },
+  });
+  const executor = new BrowserAutopilotRecordingExecutor(SESSION, {
+    ownerGeneration: 7, isForeground: () => true, bootstrap: harness.ports,
+  });
+  const capture = executor.start(recordCommand() as never);
+  capture.started.catch(() => {});
+  capture.stopped.catch(() => {});
+  // 推进到开录指令已下达(与 captureAtRealOnstart 同一口径),不必等真实 onstart。
+  for (let turn = 0; turn < 400 && (devices.devices[0]?.starts ?? 0) === 0; turn += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(devices.devices[0]?.starts, 1);
+  assert.deepEqual(harness.calls.slice(0, 4),
+    ["acquireLease", "recoverySnapshot", "drainForeignOutbox:1", "recoverySnapshot"]);
+  assert.ok(harness.calls.includes("authorize:1"));
+  harness.advance(PRE_START_BUDGET_MS);
+  await capture.closed;
+});
+
+test("开麦前清旧账有软预算：清理悬挂到点就重拍快照，条目还在则按「待恢复录音」拒开麦而不是超时码", async (context) => {
+  const clock = clockDouble();
+  const devices = installDeviceDoubles(clock);
+  context.after(() => devices.restore());
+  const harness = bootstrapHarness(clock, {
+    recoverySnapshot: async () => ({
+      entries: [foreignOutboxEntry()], legacyOrphans: [], invalidBlobKeyCount: 0,
+    }),
+    drainForeignOutbox: () => new Promise<never>(() => {}),
+  });
+  const executor = new BrowserAutopilotRecordingExecutor(SESSION, {
+    ownerGeneration: 8, isForeground: () => true, bootstrap: harness.ports,
+  });
+  const capture = executor.start(recordCommand() as never);
+  capture.stopped.catch(() => {});
+  await flushMicrotasks();
+  assert.deepEqual(harness.calls, ["acquireLease", "recoverySnapshot", "drainForeignOutbox:1"]);
+  // 软预算比整段预算短:到点放行,不是判死。
+  assert.ok(FOREIGN_DRAIN_SOFT_BUDGET_MS < PRE_START_BUDGET_MS);
+  harness.advance(FOREIGN_DRAIN_SOFT_BUDGET_MS);
+  const error = await capture.started.then(() => null, (reason: unknown) => reason);
+  assert.equal((error as AutopilotMediaError).errorCode, "recording_start_failed");
+  assert.match(String((error as Error).cause), /待恢复录音/);
+  assert.deepEqual(harness.calls,
+    ["acquireLease", "recoverySnapshot", "drainForeignOutbox:1", "recoverySnapshot"]);
+  assert.equal(devices.userMediaCalls, 0);
 });

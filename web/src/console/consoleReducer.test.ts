@@ -35,6 +35,7 @@ function session(runtime_status: Session["runtime_status"], week_no = 2): Sessio
     autopilot_profile_version_id: null,
     autopilot_profile_definition_digest: null,
     runtime_status,
+    closeout_saved: false,
   };
 }
 
@@ -67,7 +68,7 @@ function withLocalStorage(store: Map<string, string>, run: () => void): void {
 /** The exact v2 envelope shape production writes and requires on read. */
 function envelope(sessionRow: unknown) {
   return JSON.stringify({
-    version: 2,
+    version: 3,
     identityScope: "local:M0",
     state: {
       area: "run", screen: "training", patientId: "P-1", session: sessionRow,
@@ -257,7 +258,7 @@ test("malformed or forged workspace caches fail closed and are removed", () => {
   });
   const identity = { username: "researcher" };
   const envelope = (state: unknown, extra: Record<string, unknown> = {}) => JSON.stringify({
-    version: 2,
+    version: 3,
     identityScope: "account:researcher",
     state,
     ...extra,
@@ -272,7 +273,9 @@ test("malformed or forged workspace caches fail closed and are removed", () => {
     const invalidPayloads = [
       "{not-json",
       envelope(validState, { injected: true }),
-      JSON.stringify({ version: 2, identityScope: "account:someone-else", state: validState }),
+      JSON.stringify({ version: 3, identityScope: "account:someone-else", state: validState }),
+      // 上一版缓存(version 2,场次没有 closeout_saved):整体作废,不补默认值。
+      JSON.stringify({ version: 2, identityScope: "local:M0", state: validState }),
       envelope({ ...validState, injected: true }),
       envelope({ ...validState, session: { ...session("active"), injected: true } }),
       envelope({ ...validState, patientId: "P-OTHER" }),

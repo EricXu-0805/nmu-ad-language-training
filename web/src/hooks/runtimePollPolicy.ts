@@ -12,10 +12,14 @@ export function pollSucceeded(nowMs: number): PollHealth {
   return { lastSuccessMs: nowMs };
 }
 
+// 宽限窗必须比轮询间隔长,否则「距上次成功」在第一次失败时就已超窗,一次抖动
+// 照样亮错(5 秒一轮的授权轮询用 4.5 秒窗就是这样,对抗复核 2026-09-13)。
+// 间隔长于宽限的轮询传 interval + RUNTIME_ERROR_GRACE_MS:吸收一次抖动,连着两次才亮。
 export function pollFailed(
   health: PollHealth,
   nowMs: number,
   foreground: boolean,
+  graceMs: number = RUNTIME_ERROR_GRACE_MS,
 ): boolean {
-  return foreground || nowMs - health.lastSuccessMs >= RUNTIME_ERROR_GRACE_MS;
+  return foreground || nowMs - health.lastSuccessMs >= graceMs;
 }
