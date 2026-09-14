@@ -163,3 +163,72 @@ def test_inventory_is_written_next_to_the_verdict(tmp_path, monkeypatch):
                 extra=["--inventory", str(target)])
     assert code == 0
     assert target.read_text(encoding="utf-8").startswith("bash")
+
+
+# 逐字取自生产机 2026-09-14 的 apt-get -s upgrade 输出:需要装新依赖的内核/netplan
+# 更新被整组"保留",不出 Inst 行——2026-09-11 那次预检 9/9 绿灯下积着 5 个安全内核包。
+KEPT_BACK_OUTPUT = """\
+NOTE: This is only a simulation!
+Reading package lists...
+Building dependency tree...
+Calculating upgrade...
+The following packages have been kept back:
+  libnetplan0 linux-generic linux-headers-generic linux-image-generic netplan.io
+0 upgraded, 0 newly installed, 0 to remove and 5 not upgraded.
+"""
+
+# 同一台机器同一时刻的 apt-get -s full-upgrade:保留的包变成 Inst 行、带来源。
+FULL_UPGRADE_OUTPUT = """\
+NOTE: This is only a simulation!
+Calculating upgrade...
+The following NEW packages will be installed:
+  linux-headers-5.15.0-191 linux-image-5.15.0-191-generic netplan-generator
+The following packages will be upgraded:
+  libnetplan0 linux-generic linux-headers-generic linux-image-generic netplan.io
+5 upgraded, 7 newly installed, 0 to remove and 0 not upgraded.
+Inst netplan.io [0.106.1-7ubuntu0.22.04.4] (0.107.1-3ubuntu0.22.04.4 Ubuntu:22.04/jammy-updates [amd64]) []
+Inst netplan-generator (0.107.1-3ubuntu0.22.04.4 Ubuntu:22.04/jammy-updates [amd64]) []
+Inst libnetplan0 [0.106.1-7ubuntu0.22.04.4] (0.107.1-3ubuntu0.22.04.4 Ubuntu:22.04/jammy-updates [amd64])
+Inst linux-image-5.15.0-191-generic (5.15.0-191.201 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])
+Inst linux-generic [5.15.0.170.159] (5.15.0.191.169 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64]) []
+Inst linux-image-generic [5.15.0.170.159] (5.15.0.191.169 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64]) []
+Inst linux-headers-generic [5.15.0.170.159] (5.15.0.191.169 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])
+Conf netplan.io (0.107.1-3ubuntu0.22.04.4 Ubuntu:22.04/jammy-updates [amd64])
+"""
+
+
+def test_kept_back_block_is_parsed_and_is_a_hard_failure():
+    """upgrade 模拟里被保留的包不出 Inst 行:只看 Inst 会把 5 个安全内核包算成 0。"""
+    assert osc.parse_simulation(KEPT_BACK_OUTPUT) == []
+    assert osc.parse_kept_back(KEPT_BACK_OUTPUT) == [
+        "libnetplan0", "linux-generic", "linux-headers-generic",
+        "linux-image-generic", "netplan.io"]
+    failures, _ = osc.evaluate([], FRESH, MAX_AGE, False,
+                               osc.parse_kept_back(KEPT_BACK_OUTPUT))
+    assert len(failures) == 1 and "5 个包被保留" in failures[0] and "linux-generic" in failures[0]
+
+
+def test_full_upgrade_simulation_counts_the_kernel_as_security_backlog():
+    """full-upgrade 把保留的包变成带来源的 Inst 行:内核三件是 security 积压,netplan 两件是普通更新。"""
+    pending = osc.parse_simulation(FULL_UPGRADE_OUTPUT)
+    assert osc.parse_kept_back(FULL_UPGRADE_OUTPUT) == []
+    assert sorted(p.name for p in pending if p.security) == [
+        "linux-generic", "linux-headers-generic", "linux-image-generic"]
+    assert sorted(p.name for p in pending if not p.security) == ["libnetplan0", "netplan.io"]
+    failures, notes = osc.evaluate(pending, FRESH, MAX_AGE, False, [])
+    assert len(failures) == 1 and "3 个安全更新待安装" in failures[0]
+    assert any("2 个非安全更新" in n for n in notes)
+
+
+def test_run_simulation_asks_apt_for_a_full_upgrade(monkeypatch):
+    seen: list[list[str]] = []
+
+    class _Done:
+        returncode = 0
+        stdout = FULL_UPGRADE_OUTPUT
+        stderr = ""
+
+    monkeypatch.setattr(osc.subprocess, "run",
+                        lambda argv, **_kw: seen.append(argv) or _Done())
+    assert osc.run_simulation() == FULL_UPGRADE_OUTPUT
+    assert seen == [["apt-get", "-s", "full-upgrade"]]

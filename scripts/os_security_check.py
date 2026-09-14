@@ -16,6 +16,11 @@ jammy-security。没有任何东西在看这个数字，它只会越积越多。
   包列表比 --max-age-days 旧   → 退出 1。拿陈旧列表算出的 0 不可信。
   需要重启（内核已换未生效）    → 只报告，不算失败。这台机器还跑着别的服务，
                                  重启由人挑时间，脚本不该替人做这个决定。
+  被保留的包（kept back）      → 退出 1。2026-09-11 查出 `apt-get -s upgrade` 会把
+                                 需要装新依赖的内核/netplan 更新整组"保留"、不出
+                                 Inst 行，5 个安全内核包积着而这里报 0。所以模拟改用
+                                 full-upgrade（把保留的包一起算），万一 full-upgrade
+                                 仍有保留项，按名字报失败，不当作通过。
 
 顺手职责：--inventory 把 dpkg 全量清单落盘（供应链审计里"裸机 OS 包不在任何
 清单里"那条的记录面）。清单跟着系统走、会漂，所以落在机器上按周留档，不进 git。
@@ -43,6 +48,10 @@ REBOOT_REQUIRED = Path("/var/run/reboot-required")
 #   Inst tar [1.34+dfsg-1ubuntu0.1.22.04.2] (1.34+dfsg-1ubuntu0.1.22.04.6
 #        Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])
 _INST = re.compile(r"^Inst\s+(?P<name>\S+)\s+\[(?P<old>[^\]]+)\]\s+\((?P<new>\S+)\s+(?P<origins>[^\[]*)\[")
+# apt-get 把因需要新依赖而不装的包列成一块：
+#   The following packages have been kept back:
+#     libnetplan0 linux-generic linux-headers-generic linux-image-generic netplan.io
+_KEPT_BACK_HEADER = re.compile(r"^The following packages have been kept back:")
 
 
 class PendingUpgrade:
@@ -65,6 +74,22 @@ def parse_simulation(text: str) -> list[PendingUpgrade]:
     return pending
 
 
+def parse_kept_back(text: str) -> list[str]:
+    """被保留的包名。紧跟标题行的缩进行都是包名，遇到不缩进的行即结束。"""
+    names: list[str] = []
+    collecting = False
+    for line in text.splitlines():
+        if _KEPT_BACK_HEADER.match(line):
+            collecting = True
+            continue
+        if collecting:
+            if line.startswith((" ", "\t")):
+                names.extend(line.split())
+            else:
+                collecting = False
+    return names
+
+
 def lists_age(lists_dir: Path, now: datetime) -> timedelta | None:
     """包列表的年龄 = 最新一个索引文件距今多久。目录不存在/为空返回 None。"""
     newest: float | None = None
@@ -81,10 +106,12 @@ def lists_age(lists_dir: Path, now: datetime) -> timedelta | None:
 
 def run_simulation() -> str:
     # -s 是纯模拟：不加锁、不改系统，普通读权限即可。
+    # full-upgrade 而不是 upgrade：后者把需要装新依赖的更新（新内核带 modules/headers、
+    # netplan 拆包）整组"保留"、不出 Inst 行，安全内核积着这里却报 0（2026-09-11 查出）。
     done = subprocess.run(
-        ["apt-get", "-s", "upgrade"], capture_output=True, text=True, timeout=300)
+        ["apt-get", "-s", "full-upgrade"], capture_output=True, text=True, timeout=300)
     if done.returncode != 0:
-        raise RuntimeError(f"apt-get -s upgrade 失败：{done.stderr.strip()[:300]}")
+        raise RuntimeError(f"apt-get -s full-upgrade 失败：{done.stderr.strip()[:300]}")
     return done.stdout
 
 
@@ -100,12 +127,17 @@ def write_inventory(path: Path) -> int:
 
 
 def evaluate(pending: list[PendingUpgrade], age: timedelta | None,
-             max_age: timedelta, reboot_required: bool) -> tuple[list[str], list[str]]:
+             max_age: timedelta, reboot_required: bool,
+             kept_back: list[str] | None = None) -> tuple[list[str], list[str]]:
     """返回 (硬失败, 提示)。"""
     failures: list[str] = []
     notes: list[str] = []
     security = [p for p in pending if p.security]
     other = [p for p in pending if not p.security]
+    if kept_back:
+        failures.append(
+            f"{len(kept_back)} 个包被保留未算进积压（{'、'.join(kept_back[:6])}…）；"
+            "保留的包不出现在模拟安装里，这个 0 不可信")
 
     if age is None:
         failures.append("读不到 apt 包列表，无法判断积压——不当作通过")
@@ -118,7 +150,7 @@ def evaluate(pending: list[PendingUpgrade], age: timedelta | None,
         sample = "、".join(p.name for p in security[:6])
         failures.append(
             f"{len(security)} 个安全更新待安装（{sample}…）；"
-            "修法：apt-get upgrade（内核类更新装完记得挑时间重启）")
+            "修法：apt-get full-upgrade（内核类更新装完记得挑时间重启）")
     if other:
         notes.append(f"另有 {len(other)} 个非安全更新待装（不算失败）")
     if reboot_required:
@@ -149,9 +181,10 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     pending = parse_simulation(text)
+    kept_back = parse_kept_back(text)
     age = lists_age(args.lists_dir, now)
     failures, notes = evaluate(pending, age, timedelta(days=args.max_age_days),
-                               REBOOT_REQUIRED.exists())
+                               REBOOT_REQUIRED.exists(), kept_back)
 
     inventory_count = None
     if args.inventory is not None:
@@ -164,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
             "other_pending": sum(1 for p in pending if not p.security),
             "lists_age_days": None if age is None else age.days,
             "reboot_required": REBOOT_REQUIRED.exists(),
+            "kept_back": kept_back,
             "inventory_packages": inventory_count,
             "failures": failures,
             "notes": notes,
