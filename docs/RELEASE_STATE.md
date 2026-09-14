@@ -9,6 +9,17 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+## 2026-09-14 上线记录（`128f59f`：OS 预检把被保留的包算进积压 + 训练台握手改按 AI 托管守卫 + 真 Chrome 恢复链走查，零迁移）
+
+**2026-09-14 10:22 UTC 由 Claude 执行收据 259 脚本（Eric 授权「有需要的直接处理」），十一步全过；树核完整清单 `MATCH revision=128f59f source_files=817 browser_files=19`（对照 CI push run 34827927542）；公网 `build-id.txt` 与 CI 产物逐字符一致；上线前 10 分钟生产零非轮询请求。库头仍 `e2a6d8f0b419`。**
+
+- **预检现在 8/9，OS 项 `[FAIL] 3 个安全更新待安装（linux-generic、linux-image-generic、linux-headers-generic）`——这是真话，不是回归。** Codex 9/11 记录里明写的统计缺口：`apt-get -s upgrade` 把需要装新依赖的内核/netplan 更新整组"保留"、不出 `Inst` 行，9/11 那次 9/9 绿灯下就积着这 3 个安全内核包。现在模拟改 `full-upgrade`、保留项按名字硬失败、锁 `LC_ALL=C`、`apt-mark hold` 的只记提示（PR #12）。装内核 + 重启的维护窗口脚本 `PM_20260730_自动对话/258-维护窗口_内核与netplan升级重启.sh` 由 Eric 本人挑时段跑；跑完预检回 9/9。`nmu-os-security.timer`（周一 21:50 UTC）在此之前会告警一次。
+- 训练台人工面 session 握手写改按 `manualInteractionBlocked` 守卫：从恢复入口进到 AI 暂停中的场次再点「继续 AI 自动带练」，原来会撞 409 `autopilot_manual_control_locked` 变成研究者屏上的同步错误横幅（真 Chrome 恢复链走查抓到）。
+- 新真 Chrome 走查 `run-caregiver-demo20.sh --browser-check recovery-chains`：收据 257 §五 4 那两条链有了浏览器级证据——设备故障 → 场次暂停 → 管理员控制台「继续」→ 平板不导航自己重探；开麦前清旧场次从未登记的录音 → 409 → 410 墓碑 → 删副本回执 → 照常录。本机三次通过，`--verify-ledger` 核临时库。
+- Codex 9/11 写在本地的运维收尾登记已在生产复核后推送（PR #11，见上一节）。
+- 三方向 7 代理复核：走查脚本 0 真缺陷；OS 检查两条 P3 已并入。六关本机全绿；第 1 周走查 FAILURES=0；start-pause 走查通过；web 1316/1316。
+- 未验：真机平板；5 个保留包与 23 个旧库服务要等维护窗口重启。
+
 ## 2026-09-13 上线记录（`ef3b664`：设备故障时场次一起暂停 + 恢复放过过期就绪 + 平板开麦前先清旧场次外来录音，零迁移）
 
 **2026-09-13 21:00 UTC 由 Claude 执行收据 257 脚本（Eric 授权「有问题或者值得优化的部分都弄掉」），十一步全过；树核完整清单 `MATCH revision=ef3b664 source_files=817 browser_files=19`（对照 CI push run 34779785511 的 `browser-dist-sha256.json`）；preflight 9/9 退出码 0；公网 `build-id.txt` 与 CI 产物逐字符一致；上线前 10 分钟生产零非轮询请求。库头仍 `e2a6d8f0b419`。**
