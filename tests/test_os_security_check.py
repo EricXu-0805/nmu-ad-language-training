@@ -220,8 +220,8 @@ def test_full_upgrade_simulation_counts_the_kernel_as_security_backlog():
     assert any("2 个非安全更新" in n for n in notes)
 
 
-def test_run_simulation_asks_apt_for_a_full_upgrade(monkeypatch):
-    seen: list[list[str]] = []
+def test_run_simulation_asks_apt_for_a_full_upgrade_in_the_c_locale(monkeypatch):
+    seen: list[tuple[list[str], dict]] = []
 
     class _Done:
         returncode = 0
@@ -229,6 +229,25 @@ def test_run_simulation_asks_apt_for_a_full_upgrade(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(osc.subprocess, "run",
-                        lambda argv, **_kw: seen.append(argv) or _Done())
+                        lambda argv, **kw: seen.append((argv, kw)) or _Done())
     assert osc.run_simulation() == FULL_UPGRADE_OUTPUT
-    assert seen == [["apt-get", "-s", "full-upgrade"]]
+    assert [argv for argv, _kw in seen] == [["apt-get", "-s", "full-upgrade"]]
+    # ssh 会把 Mac 的 LANG/LC_* 带到生产机;标题一被翻译,按英文解析的保留项就失明。
+    assert seen[0][1]["env"]["LC_ALL"] == "C"
+
+
+def test_held_packages_are_a_note_and_only_unheld_kept_back_fail():
+    """人为 apt-mark hold 的包也会出现在 kept back 里:那是运维的决定,不是统计缺口。"""
+    kept = ["netplan.io", "linux-image-generic"]
+    failures, notes = osc.evaluate([], FRESH, MAX_AGE, False, kept, held=["netplan.io"])
+    assert len(failures) == 1 and "1 个包被保留" in failures[0] and "linux-image-generic" in failures[0]
+    assert any("被人为 hold" in n and "netplan.io" in n for n in notes)
+    failures, notes = osc.evaluate([], FRESH, MAX_AGE, False, ["netplan.io"], held=["netplan.io"])
+    assert failures == [] and any("被人为 hold" in n for n in notes)
+
+
+def test_read_holds_survives_a_missing_apt_mark(monkeypatch):
+    def boom(*_a, **_kw):
+        raise FileNotFoundError("apt-mark")
+    monkeypatch.setattr(osc.subprocess, "run", boom)
+    assert osc.read_holds() == []

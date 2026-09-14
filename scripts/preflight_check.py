@@ -189,7 +189,8 @@ def check_os_security(max_age_days: int = 3) -> Check:
     # 还积着 5 个安全内核包，就是这里没算它们。
     failures, notes = module.evaluate(
         pending, age, timedelta(days=max_age_days),
-        module.REBOOT_REQUIRED.exists(), module.parse_kept_back(simulation))
+        module.REBOOT_REQUIRED.exists(), module.parse_kept_back(simulation),
+        module.read_holds())
     if failures:
         return Check(name, False, "；".join(failures + notes))
     detail = "安全更新积压为 0"

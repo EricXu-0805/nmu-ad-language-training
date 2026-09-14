@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -108,11 +109,27 @@ def run_simulation() -> str:
     # -s 是纯模拟：不加锁、不改系统，普通读权限即可。
     # full-upgrade 而不是 upgrade：后者把需要装新依赖的更新（新内核带 modules/headers、
     # netplan 拆包）整组"保留"、不出 Inst 行，安全内核积着这里却报 0（2026-09-11 查出）。
+    # 锁定 C locale:ssh 会把 Mac 的 LANG/LC_* 带过去,apt 的"kept back"标题一被翻译,
+    # 下面按英文标题解析的保留项就悄悄变成空(Inst 行不翻译,只有这一层会失明)。
     done = subprocess.run(
-        ["apt-get", "-s", "full-upgrade"], capture_output=True, text=True, timeout=300)
+        ["apt-get", "-s", "full-upgrade"], capture_output=True, text=True, timeout=300,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"})
     if done.returncode != 0:
         raise RuntimeError(f"apt-get -s full-upgrade 失败：{done.stderr.strip()[:300]}")
     return done.stdout
+
+
+def read_holds() -> list[str]:
+    """人为 apt-mark hold 的包。查不动就当没有(hold 是例外,不该让主判据失明)。"""
+    try:
+        done = subprocess.run(
+            ["apt-mark", "showhold"], capture_output=True, text=True, timeout=60,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    return [line.strip() for line in done.stdout.splitlines() if line.strip()]
 
 
 def write_inventory(path: Path) -> int:
@@ -128,16 +145,23 @@ def write_inventory(path: Path) -> int:
 
 def evaluate(pending: list[PendingUpgrade], age: timedelta | None,
              max_age: timedelta, reboot_required: bool,
-             kept_back: list[str] | None = None) -> tuple[list[str], list[str]]:
+             kept_back: list[str] | None = None,
+             held: list[str] | None = None) -> tuple[list[str], list[str]]:
     """返回 (硬失败, 提示)。"""
     failures: list[str] = []
     notes: list[str] = []
     security = [p for p in pending if p.security]
     other = [p for p in pending if not p.security]
-    if kept_back:
+    held_set = set(held or [])
+    unresolved = [name for name in (kept_back or []) if name not in held_set]
+    held_back = [name for name in (kept_back or []) if name in held_set]
+    if unresolved:
         failures.append(
-            f"{len(kept_back)} 个包被保留未算进积压（{'、'.join(kept_back[:6])}…）；"
+            f"{len(unresolved)} 个包被保留未算进积压（{'、'.join(unresolved[:6])}…）；"
             "保留的包不出现在模拟安装里，这个 0 不可信")
+    if held_back:
+        # 人为 apt-mark hold 的是运维的决定,不是统计缺口:只报出来,不算失败。
+        notes.append(f"{len(held_back)} 个包被人为 hold（{'、'.join(held_back[:6])}），不算积压")
 
     if age is None:
         failures.append("读不到 apt 包列表，无法判断积压——不当作通过")
@@ -182,9 +206,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     pending = parse_simulation(text)
     kept_back = parse_kept_back(text)
+    held = [] if args.simulate_file else read_holds()
     age = lists_age(args.lists_dir, now)
     failures, notes = evaluate(pending, age, timedelta(days=args.max_age_days),
-                               REBOOT_REQUIRED.exists(), kept_back)
+                               REBOOT_REQUIRED.exists(), kept_back, held)
 
     inventory_count = None
     if args.inventory is not None:
@@ -198,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
             "lists_age_days": None if age is None else age.days,
             "reboot_required": REBOOT_REQUIRED.exists(),
             "kept_back": kept_back,
+            "held": held,
             "inventory_packages": inventory_count,
             "failures": failures,
             "notes": notes,
