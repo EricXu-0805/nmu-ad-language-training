@@ -9,6 +9,17 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+## 2026-09-14 17:00 UTC 维护窗口（内核 5.15.0-191 + netplan 0.107 + nginx 安全更新，整机重启；应用仍 `128f59f`，库头仍 `e2a6d8f0b419`）
+
+**Eric 授权后由 Claude 执行（收据 258 §六）。上线前 60 分钟生产零非轮询请求。**
+
+- 装了 Codex 9/11 记录里"另行维护"的 5 个被保留的包（内核 5.15.0-191 三件 + netplan 0.107 两件）及其新依赖，顺带装了刚出的 nginx 1.18.0-6ubuntu14.21 安全更新。`netplan generate` 结果与现役逐字节一致后才重启。
+- 17:00:47 UTC 重启，15 秒后回来：内核 **5.15.0-191-generic**；nmu / nmu-caddy / sing-box / nginx / ssh 全 active（sing-box 开机自起，NRestarts=0）；needrestart 无待重启服务；`apt list --upgradable` 0；6 个 nmu 定时器齐；网关二进制仍 `e07a4bb1…`。
+- 完整预检 **9/9**——OS 项现在把被保留的包也算进去了，「积压 0」是真的 0。公网 `/health` 200、红线 404，build-id 与 `128f59f` 上线时一致。
+- 清掉 5.15.0-25 老内核（先模拟确认不碰 170/191），170 留作回退；`/boot` 274M。
+- 已知旧账未动：`networking.service` failed——ifupdown 配置里写了不存在的 eth1，上一次开机就这样；eth0 由 netplan 正常起，与本次无关。
+- 远端 13 个已合并分支已删；`feature/*`、`release/*` 六个历史分支保留。
+
 ## 2026-09-14 上线记录（`128f59f`：OS 预检把被保留的包算进积压 + 训练台握手改按 AI 托管守卫 + 真 Chrome 恢复链走查，零迁移）
 
 **2026-09-14 10:22 UTC 由 Claude 执行收据 259 脚本（Eric 授权「有需要的直接处理」），十一步全过；树核完整清单 `MATCH revision=128f59f source_files=817 browser_files=19`（对照 CI push run 34827927542）；公网 `build-id.txt` 与 CI 产物逐字符一致；上线前 10 分钟生产零非轮询请求。库头仍 `e2a6d8f0b419`。**
