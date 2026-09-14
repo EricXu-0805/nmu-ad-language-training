@@ -217,3 +217,9 @@ test("session switch clears transient observer state and no new poller is introd
   // 恢复继续走既有 runtime 轮询与恢复门，不额外常驻请求。
   assert.match(source, /resumeBlocked=\{observerMode \|\| Boolean\(apFailure\)\}/);
 });
+
+test("the session handshake write is gated by manualInteractionBlocked, so an AI-owned session never gets a manual-plane 409 on entry or resume", () => {
+  const handshake = source.match(/useEffect\(\(\) => \{\n\s*if \(!plan \|\| manualInteractionBlocked \|\| handshakeSent\.current\) return;\n\s*postSession\([^)]*\);\n\s*handshakeSent\.current = true;\n\s*\}, \[manualInteractionBlocked, plan, postSession, session\]\);/);
+  assert.ok(handshake, "session handshake must check manualInteractionBlocked in both guard and deps");
+  assert.doesNotMatch(source, /if \(!plan \|\| interactionBlocked \|\| handshakeSent\.current\)/);
+});

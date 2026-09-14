@@ -575,11 +575,14 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
   }, [journal.cursor.itemIdx, journal.cursor.turnIdx, plan, recoveryError, recoveryLoading, runtimeControl.runtime, runtimeReady]);
 
   // HTTP 写入由 useCursorWriter 串行排队：先完成 session 握手，再落首个 cursor。
+  // 握手是人工面的写:AI 托管(观察模式)期间服务端一律 409 autopilot_manual_control_locked,
+  // 从恢复入口进到 AI 暂停中的场次、再点「继续」时,这一下会被写成同步错误横幅
+  // (2026-09-14 真 Chrome 恢复链走查抓到)。等 AI 真的交回人工面再握手。
   useEffect(() => {
-    if (!plan || interactionBlocked || handshakeSent.current) return;
+    if (!plan || manualInteractionBlocked || handshakeSent.current) return;
     postSession({ sessionId: session.session_id, weekNo: session.week_no, eventLine: session.event_line, mode: "task", itemBankVersionId: plan.item_bank_version_id });
     handshakeSent.current = true;
-  }, [interactionBlocked, plan, postSession, session]);
+  }, [manualInteractionBlocked, plan, postSession, session]);
 
   useEffect(() => {
     if (plan && bundle) {

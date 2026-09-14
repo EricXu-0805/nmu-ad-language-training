@@ -10,6 +10,7 @@ usage() {
 用法：
   scripts/run-caregiver-demo20.sh [--port 端口]
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check start-pause
+  scripts/run-caregiver-demo20.sh [--port 端口] --browser-check recovery-chains
   scripts/run-caregiver-demo20.sh --help
 
 作用：
@@ -64,15 +65,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --browser-check)
       [ "$#" -ge 2 ] || {
-        echo "错误：--browser-check 后需要 start-pause" >&2
+        echo "错误：--browser-check 后需要 start-pause 或 recovery-chains" >&2
         exit 64
       }
       [ -z "$BROWSER_CHECK" ] || {
         echo "错误：--browser-check 不能重复" >&2
         exit 64
       }
-      [ "$2" = "start-pause" ] || {
-        echo "错误：目前只支持 --browser-check start-pause" >&2
+      [ "$2" = "start-pause" ] || [ "$2" = "recovery-chains" ] || {
+        echo "错误：--browser-check 只支持 start-pause 或 recovery-chains" >&2
         exit 64
       }
       BROWSER_CHECK="$2"
@@ -297,7 +298,16 @@ if [ "$READY" -ne 1 ]; then
   exit 1
 fi
 
-if [ -n "$BROWSER_CHECK" ]; then
+if [ "$BROWSER_CHECK" = "recovery-chains" ]; then
+  echo "真实 Chrome 恢复链走查开始（不显示临时凭据）…"
+  env -i "${HARNESS_ENV[@]}" \
+    "$BROWSER_PYTHON" -I "$REPO/harness/caregiver_recovery_chains.py" \
+    --recovery-chains --origin "http://127.0.0.1:$PORT"
+  env -i "${HARNESS_ENV[@]}" \
+    "$PYTHON" -m harness.caregiver_recovery_chains --verify-ledger
+  echo "真实 Chrome 恢复链（设备故障→继续→重探；开麦前清旧账→410→照常录）本机验收已全部通过"
+  exit 0
+elif [ -n "$BROWSER_CHECK" ]; then
   echo "真实 Chrome 验收开始（不显示临时凭据）…"
   env -i "${HARNESS_ENV[@]}" \
     "$BROWSER_PYTHON" -I "$REPO/harness/caregiver_browser_acceptance.py" \
