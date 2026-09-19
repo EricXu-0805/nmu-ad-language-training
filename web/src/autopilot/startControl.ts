@@ -343,7 +343,8 @@ export interface AutopilotAdjudicateRequest {
 }
 
 const ADJUDICATION_NOTE_MAX = 200;
-const ADJUDICATION_IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+// 服务端裁定路由的键上限是 100(它自己还要拼 `-resume` 后缀去走续弹),比 start/resume 的 128 短。
+const ADJUDICATION_IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,99}$/;
 
 /**
  * 研究者裁定(老人已答对 / 跳过本题)与 resume 共用同一条 revision 围栏:同一

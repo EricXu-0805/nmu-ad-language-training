@@ -260,6 +260,16 @@ test("adjudicate 请求构造:与 resume 同一 revision 围栏,幂等键带 kin
     () => buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "skip_item", "other", "字".repeat(201)),
     /200/,
   );
+  // 裁定键上限跟服务端一致是 100(不是 start/resume 的 128):33 字前缀 + 场次号 + "." + 版本号。
+  const longestOk = "S".repeat(100 - "p0a.adjudicate.confirmed_correct.".length - ".7".length);
+  assert.equal(
+    buildAutopilotAdjudicateRequest(longestOk, 7, "confirmed_correct", "asr_misrecognized").idempotency_key.length,
+    100,
+  );
+  assert.throws(
+    () => buildAutopilotAdjudicateRequest(`${longestOk}S`, 7, "confirmed_correct", "asr_misrecognized"),
+    /幂等键/,
+  );
   assert.throws(
     () => buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "skip_item", "other", "第一行\n第二行"),
     /单行/,
