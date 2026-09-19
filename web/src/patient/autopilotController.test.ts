@@ -5,6 +5,7 @@ import type { DeviceCapabilityRecord } from "../security/deviceCapability.ts";
 import {
   AUTOPILOT_CONTROLLER_AUTHORITY_TEST_ONLY,
   AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS,
+  AUTOPILOT_TTS_START_DEADLINE_MS,
   AutopilotAckPersistenceError,
   PatientAutopilotController,
   deviceCapabilityAllowsAutopilot,
@@ -1010,9 +1011,12 @@ test("TTS 启动超时回执 device_command_timeout + failure_stage=media_timeou
     idempotencyKey: fixedAckKey,
   });
   const polled = controller.pollOnce();
-  // 先让 pollOnce 走到 observeMedia 挂上 15s 定时器，再推进假时钟。
+  // 先让 pollOnce 走到 observeMedia 挂上起播期限定时器，再推进假时钟。
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
-  t.mock.timers.tick(15_000);
+  t.mock.timers.tick(AUTOPILOT_TTS_START_DEADLINE_MS - 1);
+  await Promise.resolve();
+  assert.equal(acks.length, 0);   // 期限之前一条 tts_failed 都不发
+  t.mock.timers.tick(1);
   const state = await polled;
   assert.equal(state.pause_reason, "tts_failed");
   const failed = acks[0];

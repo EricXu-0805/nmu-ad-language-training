@@ -22,10 +22,22 @@ export interface AutopilotMediaTransportDependencies {
   nextCommand(sessionId: string): Promise<unknown | null>;
   /** Test-only override; production drain recovery uses a finite 12s deadline. */
   requestTimeoutMs?: number;
+  /** Test-only override; production gives each TTS synthesis attempt 4s. */
+  ttsAttemptTimeoutMs?: number;
+  /** Test-only override; production waits 0.5s then 1s before the two TTS retries. */
+  ttsRetryDelaysMs?: readonly number[];
 }
 
 const COMMAND_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const DRAIN_REQUEST_TIMEOUT_MS = 12_000;
+/**
+ * TTS 合成 POST：每次尝试各自的超时，以及最多两次重试之前的等待。
+ *
+ * 网络复审:这条请求原来既无重试也无自己的超时,只靠控制器 20 s 的起播期限兜底。
+ * 3×4 s + 0.5 s + 1 s = 13.5 s,加上两次 revalidate 与 play(),仍在起播期限之内。
+ */
+const TTS_ATTEMPT_TIMEOUT_MS = 4_000;
+const TTS_RETRY_DELAYS_MS: readonly number[] = [500, 1_000];
 
 interface ExactTtsAuthority {
   sessionId: string;
@@ -53,29 +65,30 @@ function ttsCommandIdentity(command: TtsCommand): string {
   ]);
 }
 
-async function withDrainDeadline<T>(
+async function withRequestDeadline<T>(
   parentSignal: AbortSignal,
-  deps: AutopilotMediaTransportDependencies,
+  timeoutMs: number,
+  timeoutDetail: string,
+  cancelledDetail: string,
   operation: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
   if (parentSignal.aborted) {
-    throw parentSignal.reason ?? new DOMException("收麦请求已取消", "AbortError");
+    throw parentSignal.reason ?? new DOMException(cancelledDetail, "AbortError");
   }
   const controller = new AbortController();
-  const timeoutMs = deps.requestTimeoutMs ?? DRAIN_REQUEST_TIMEOUT_MS;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let removeParentAbort: () => void = () => {};
   const interrupted = new Promise<never>((_resolve, reject) => {
     const onParentAbort = () => {
       const reason = parentSignal.reason
-        ?? new DOMException("收麦请求已取消", "AbortError");
+        ?? new DOMException(cancelledDetail, "AbortError");
       controller.abort(reason);
       reject(reason);
     };
     parentSignal.addEventListener("abort", onParentAbort, { once: true });
     removeParentAbort = () => parentSignal.removeEventListener("abort", onParentAbort);
     timer = setTimeout(() => {
-      const error = new ApiError(408, "收麦状态请求超时，将在安全边界内重试");
+      const error = new ApiError(408, timeoutDetail);
       controller.abort(error);
       reject(error);
     }, timeoutMs);
@@ -85,6 +98,71 @@ async function withDrainDeadline<T>(
   } finally {
     removeParentAbort();
     if (timer !== null) clearTimeout(timer);
+  }
+}
+
+function withDrainDeadline<T>(
+  parentSignal: AbortSignal,
+  deps: AutopilotMediaTransportDependencies,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return withRequestDeadline(
+    parentSignal,
+    deps.requestTimeoutMs ?? DRAIN_REQUEST_TIMEOUT_MS,
+    "收麦状态请求超时，将在安全边界内重试",
+    "收麦请求已取消",
+    operation,
+  );
+}
+
+/** 只有 fetch 层的网络失败、status 0、每次尝试自己的 408 与 5xx 才重试；204 与其余 4xx 一次都不。 */
+function isTransientTtsFetchError(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    return error.status === 0 || error.status === 408 || error.status >= 500;
+  }
+  return error instanceof TypeError;
+}
+
+function waitUnlessAborted(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const cancelled = () => signal.reason ?? new DOMException("语音播放已取消", "AbortError");
+    if (signal.aborted) { reject(cancelled()); return; }
+    const onAbort = () => { clearTimeout(timer); reject(cancelled()); };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * TTS 合成 POST，最多再试两次。每次尝试各自一条 4 s 期限；父 signal 一中止就不再
+ * 等也不再发。重试的是同一条 exact 命令 URL 与同一份设备凭据，服务器按 speech_key
+ * 合成，重复请求没有副作用。
+ */
+async function postExactTtsWithRetry(
+  sessionId: string,
+  commandKey: string,
+  signal: AbortSignal,
+  deps: AutopilotMediaTransportDependencies,
+  credential: DeviceCredentialSelection,
+): Promise<Response> {
+  const delays = deps.ttsRetryDelaysMs ?? TTS_RETRY_DELAYS_MS;
+  const timeoutMs = deps.ttsAttemptTimeoutMs ?? TTS_ATTEMPT_TIMEOUT_MS;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await withRequestDeadline(
+        signal, timeoutMs, "TTS 合成请求超时", "语音播放已取消",
+        (requestSignal) => exactCommandPost(
+          sessionId, commandKey, "tts", requestSignal, deps, credential));
+    } catch (error) {
+      const delayMs = delays[attempt];
+      if (signal.aborted || delayMs === undefined || !isTransientTtsFetchError(error)) {
+        throw error;
+      }
+      await waitUnlessAborted(delayMs, signal);
+    }
   }
 }
 
@@ -216,10 +294,9 @@ export async function fetchExactAutopilotTts(
   };
   let response: Response;
   try {
-    response = await exactCommandPost(
+    response = await postExactTtsWithRetry(
       sessionId,
       parsed.command_key,
-      "tts",
       signal,
       deps,
       credential,

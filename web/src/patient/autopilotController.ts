@@ -277,6 +277,13 @@ export interface AutopilotTransientRetryPorts {
  */
 export const AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS = 30_000;
 
+/**
+ * TTS 从 start() 到真实 playing 事件的绝对期限。合成 POST 现在自带 3×4 s 尝试与
+ * 0.5/1 s 退避(最坏 13.5 s),再加两次 revalidate 与 play(),15 s 会在慢网上把一次
+ * 本可成功的重试判成 media_timeout;与录音 PRE_START_BUDGET_MS 对齐为 20 s。
+ */
+export const AUTOPILOT_TTS_START_DEADLINE_MS = 20_000;
+
 export const browserAutopilotTransientRetryPorts: AutopilotTransientRetryPorts = {
   now: () => performance.now(),
   wait: (delayMs, signal) => new Promise<void>((resolve, reject) => {
@@ -902,7 +909,7 @@ export class PatientAutopilotController {
       return;
     }
     this.activeMedia = playback;
-    const startedOutcome = observeMedia(playback.started, 15_000);
+    const startedOutcome = observeMedia(playback.started, AUTOPILOT_TTS_START_DEADLINE_MS);
     const endedOutcome = observeMedia(playback.ended, 120_000);
     try {
       const observedStart = await startedOutcome;
