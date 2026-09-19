@@ -42,10 +42,12 @@ import {
   type ResearchPage,
 } from "./console/research/researchDataContract";
 import {
+  buildAutopilotAdjudicateRequest,
   buildAutopilotResumeRequest,
   buildAutopilotStartRequest,
   buildAutopilotTakeoverRequest,
   parseAutopilotStatusReceipt,
+  type AutopilotAdjudicationKind,
   type AutopilotStartReceipt,
 } from "./autopilot/startControl";
 import {
@@ -935,6 +937,20 @@ export const api = {
       "POST",
       `/sessions/${encodeURIComponent(sid)}/autopilot/resume`,
       buildAutopilotResumeRequest(sid, stateRevision),
+    )),
+  // 研究者裁定:服务端落一条可归因的追加记录并在同一事务里推进到下一题,
+  // 回执与 resume 同形;AI 的判定原样保留。
+  adjudicateAutopilot: async (
+    sid: string,
+    stateRevision: number,
+    kind: AutopilotAdjudicationKind,
+    reasonCode: string,
+    note?: string,
+  ): Promise<AutopilotStartReceipt> =>
+    parseAutopilotStatusReceipt(await req<unknown>(
+      "POST",
+      `/sessions/${encodeURIComponent(sid)}/autopilot/adjudicate`,
+      buildAutopilotAdjudicateRequest(sid, stateRevision, kind, reasonCode, note),
     )),
   rapportPlayback: async (sid: string) => parsePlaybackReceipt(await req<unknown>(
     "GET", `/sessions/${encodeURIComponent(sid)}/rapport/playback`, undefined,

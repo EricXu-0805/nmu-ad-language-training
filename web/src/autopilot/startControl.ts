@@ -303,6 +303,71 @@ export function buildAutopilotResumeRequest(
   };
 }
 
+export type AutopilotAdjudicationKind = "confirmed_correct" | "skip_item";
+
+// 服务端 adjudicate 路由的原因码闭集,按裁定类型分组;UI 标签在控件里配。
+export const AUTOPILOT_ADJUDICATION_REASONS = {
+  confirmed_correct: ["late_correct_after_window", "asr_misrecognized", "staff_judged_correct"],
+  skip_item: ["participant_declined", "asr_repeatedly_failed", "trained_in_prior_sitting", "other"],
+} as const;
+
+export type AutopilotAdjudicationReason =
+  (typeof AUTOPILOT_ADJUDICATION_REASONS)[AutopilotAdjudicationKind][number];
+
+export interface AutopilotAdjudicateRequest {
+  idempotency_key: string;
+  expected_revision: number;
+  kind: AutopilotAdjudicationKind;
+  reason_code: AutopilotAdjudicationReason;
+  note?: string;
+}
+
+const ADJUDICATION_NOTE_MAX = 200;
+const ADJUDICATION_IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+
+/**
+ * 研究者裁定(老人已答对 / 跳过本题)与 resume 共用同一条 revision 围栏:同一
+ * 版本上只有一条控制事实能落账。幂等键里带 kind,丢响应重试时「跳过」的回执
+ * 不会被当成「答对」返回。服务端把裁定落账与推进下一题合成一个事务,回执与
+ * resume 同形。
+ */
+export function buildAutopilotAdjudicateRequest(
+  sessionId: string,
+  stateRevision: number,
+  kind: AutopilotAdjudicationKind,
+  reasonCode: string,
+  note?: string,
+): AutopilotAdjudicateRequest {
+  if (!SAFE_SESSION_ID.test(sessionId)) {
+    throw new Error("当前场次标识不能安全用于研究者裁定");
+  }
+  if (!Number.isSafeInteger(stateRevision) || stateRevision < 1) {
+    throw new Error("研究者裁定缺少可验证的服务器状态版本");
+  }
+  if (!Object.hasOwn(AUTOPILOT_ADJUDICATION_REASONS, kind)) {
+    throw new Error("研究者裁定类型不在允许范围内");
+  }
+  const reasons: readonly string[] = AUTOPILOT_ADJUDICATION_REASONS[kind];
+  if (!reasons.includes(reasonCode)) {
+    throw new Error("研究者裁定的原因码不属于该裁定类型");
+  }
+  const trimmedNote = note?.trim() ?? "";
+  if (trimmedNote.length > ADJUDICATION_NOTE_MAX || /[\p{Cc}\p{Cf}]/u.test(trimmedNote)) {
+    throw new Error(`裁定备注须为不超过 ${ADJUDICATION_NOTE_MAX} 字的单行文字`);
+  }
+  const idempotencyKey = `p0a.adjudicate.${kind}.${sessionId}.${stateRevision}`;
+  if (!ADJUDICATION_IDEMPOTENCY_KEY.test(idempotencyKey)) {
+    throw new Error("研究者裁定的幂等键超出服务端允许形状");
+  }
+  return {
+    idempotency_key: idempotencyKey,
+    expected_revision: stateRevision,
+    kind,
+    reason_code: reasonCode as AutopilotAdjudicationReason,
+    ...(trimmedNote ? { note: trimmedNote } : {}),
+  };
+}
+
 /**
  * 服务端 _require_gate 在写入任何控制事实之前就拒绝的确定性门禁码(D1)。
  * 这些 409 与「可能已有 owner/幂等冲突」不同:可以安全按写前拒绝呈现拒因,

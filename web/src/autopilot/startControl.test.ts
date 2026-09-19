@@ -14,6 +14,8 @@ import {
   parseAutopilotStatusReceipt,
   p0aConsoleEligibility,
   buildAutopilotResumeRequest,
+  buildAutopilotAdjudicateRequest,
+  AUTOPILOT_ADJUDICATION_REASONS,
   receiptAllowsAutopilotResume,
   receiptAllowsAutopilotTakeover,
 } from "./startControl.ts";
@@ -163,6 +165,69 @@ test("resume 请求构造:revision 围栏与幂等键形状", () => {
   });
   assert.throws(() => buildAutopilotResumeRequest("S-a1b2c3d4", 0), /状态版本/);
   assert.throws(() => buildAutopilotResumeRequest("受试者\n答案", 3), /不能安全/);
+});
+
+test("adjudicate 请求构造:与 resume 同一 revision 围栏,幂等键带 kind,原因码按类型闭集", () => {
+  assert.deepEqual(
+    buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "confirmed_correct", "asr_misrecognized"),
+    {
+      idempotency_key: "p0a.adjudicate.confirmed_correct.S-a1b2c3d4.7",
+      expected_revision: 7,
+      kind: "confirmed_correct",
+      reason_code: "asr_misrecognized",
+    },
+  );
+  // 备注去首尾空白后才带上;空备注不发 note 字段。
+  assert.deepEqual(
+    buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "skip_item", "other", "  老人说累了  "),
+    {
+      idempotency_key: "p0a.adjudicate.skip_item.S-a1b2c3d4.7",
+      expected_revision: 7,
+      kind: "skip_item",
+      reason_code: "other",
+      note: "老人说累了",
+    },
+  );
+  assert.equal(
+    "note" in buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "skip_item", "other", "   "),
+    false,
+  );
+  // 服务端幂等键形状 ^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$:两种 kind 的键都要落在里面。
+  for (const kind of ["confirmed_correct", "skip_item"] as const) {
+    for (const reason of AUTOPILOT_ADJUDICATION_REASONS[kind]) {
+      const request = buildAutopilotAdjudicateRequest("S-a1b2c3d4", 12, kind, reason);
+      assert.match(request.idempotency_key, /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/);
+      assert.equal(request.reason_code, reason);
+    }
+  }
+  // 原因码串组:「跳过」的原因不能拿来「答对」,反之亦然。
+  assert.throws(
+    () => buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "confirmed_correct", "participant_declined"),
+    /原因码不属于该裁定类型/,
+  );
+  assert.throws(
+    () => buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "skip_item", "asr_misrecognized"),
+    /原因码不属于该裁定类型/,
+  );
+  assert.throws(
+    () => buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "undo" as never, "other"),
+    /裁定类型/,
+  );
+  assert.throws(() => buildAutopilotAdjudicateRequest("S-a1b2c3d4", 0, "skip_item", "other"), /状态版本/);
+  assert.throws(() => buildAutopilotAdjudicateRequest("受试者\n答案", 3, "skip_item", "other"), /不能安全/);
+  // 备注上限 200 字、单行。
+  assert.throws(
+    () => buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "skip_item", "other", "字".repeat(201)),
+    /200/,
+  );
+  assert.throws(
+    () => buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "skip_item", "other", "第一行\n第二行"),
+    /单行/,
+  );
+  assert.equal(
+    buildAutopilotAdjudicateRequest("S-a1b2c3d4", 7, "skip_item", "other", "字".repeat(200)).note?.length,
+    200,
+  );
 });
 
 test("status/start share an exact content-free receipt", () => {
