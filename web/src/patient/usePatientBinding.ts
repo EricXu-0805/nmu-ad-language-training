@@ -1,5 +1,6 @@
-// 自动跟场循环:设备存有受试者绑定、且当前没有场次能力时,按 ATTACH_POLL_MS 静默尝试
-// /device/attach。接上后交回既有 live 轮询;绑定死亡即停并清除。
+// 自动跟场循环:设备存有受试者绑定、且当前没有场次能力时,静默尝试 /device/attach。
+// 间隔从 ATTACH_POLL_MS 起,连续「没有场次」翻倍退避到 ATTACH_POLL_MAX_MS;接上(200)、
+// 回到前台、手动配对/能力更新即归零并立刻再试。接上后交回既有 live 轮询;绑定死亡即停并清除。
 // 老人端契约不变:这里永不抛错、永不改画面,只回"已绑定"布尔和一句给工作人员
 // 看的提示(别的设备连着 / 这位受试者没有场次 / 本机另一个页签连着)给问候页。
 import { useEffect, useState } from "react";
@@ -12,7 +13,8 @@ import {
 } from "../api";
 import { bus } from "../sync/bus";
 import {
-  ATTACH_POLL_MS, OTHER_TAB_PROBE_MS, probeOtherTabs, shouldAttemptAttach,
+  ATTACH_POLL_MS, OTHER_TAB_PROBE_MS, attachPollDelayMs, nextAttachNoSessionStreak,
+  probeOtherTabs, shouldAttemptAttach,
   type AttachHint,
 } from "./bindingAttachPolicy";
 
@@ -39,12 +41,25 @@ export function usePatientBinding(): { bound: boolean; hint: AttachHint } {
       if (held) bus.post({ type: "capabilityHeld", nonce: msg.nonce, sessionId: held.sessionId });
     });
 
+    let timer: number | null = null;
+    let noSessionStreak = 0;
+
+    // 单条 setTimeout 链而不是 setInterval:下一次间隔要看上一次结果。
+    const schedule = (delayMs: number) => {
+      if (cancelled) return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(tick, delayMs);
+    };
+
     const tick = () => {
       if (cancelled || inFlight) return;
       if (!shouldAttemptAttach(
         getPatientBinding() !== null,
         getDeviceCapability() !== null,
-      )) return;
+      )) {
+        schedule(ATTACH_POLL_MS);
+        return;
+      }
       inFlight = true;
       void probeOtherTabs(
         (msg) => bus.post(msg), (handler) => bus.subscribe(handler),
@@ -59,23 +74,41 @@ export function usePatientBinding(): { bound: boolean; hint: AttachHint } {
         // 这里只保证同一时刻至多一个在途请求。
         return api.attachPatientDevice();
       }).then((result) => {
-        if (result && !cancelled) setHint(result.hint);
+        if (result && !cancelled) {
+          setHint(result.hint);
+          noSessionStreak = nextAttachNoSessionStreak(noSessionStreak, result);
+        }
       }).finally(() => {
         inFlight = false;
         refreshBound();
+        schedule(attachPollDelayMs(noSessionStreak));
       });
     };
 
+    // 手动配对/能力更新、回到前台:退避归零,立刻再试一次。
+    const wake = () => {
+      noSessionStreak = 0;
+      tick();
+    };
+    const onBindingUpdated = () => {
+      refreshBound();
+      wake();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") wake();
+    };
+
     tick();
-    const timer = window.setInterval(tick, ATTACH_POLL_MS);
-    window.addEventListener(PATIENT_BINDING_UPDATED_EVENT, refreshBound);
-    window.addEventListener(DEVICE_CAPABILITY_UPDATED_EVENT, tick);
+    window.addEventListener(PATIENT_BINDING_UPDATED_EVENT, onBindingUpdated);
+    window.addEventListener(DEVICE_CAPABILITY_UPDATED_EVENT, wake);
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
       unsubscribeResponder();
-      window.removeEventListener(PATIENT_BINDING_UPDATED_EVENT, refreshBound);
-      window.removeEventListener(DEVICE_CAPABILITY_UPDATED_EVENT, tick);
+      window.removeEventListener(PATIENT_BINDING_UPDATED_EVENT, onBindingUpdated);
+      window.removeEventListener(DEVICE_CAPABILITY_UPDATED_EVENT, wake);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, []);
 

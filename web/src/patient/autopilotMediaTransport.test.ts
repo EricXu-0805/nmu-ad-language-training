@@ -263,6 +263,135 @@ test("exact media errors preserve canonical API details and run auth-loss handli
   assert.deepEqual(authFailures, [409]);
 });
 
+// ---------------- TTS 合成 POST 的有界重试：每次尝试各自 4 s，最多再试两次 ----------------
+
+function audioResponse(): Response {
+  return new Response(new Blob(["RIFFvoice"], { type: "audio/wav" }), {
+    status: 200,
+    headers: { "Content-Type": "audio/wav" },
+  });
+}
+
+for (const transient of [
+  { name: "网络 TypeError", fail: () => { throw new TypeError("Failed to fetch"); } },
+  { name: "503", fail: () => new Response("upstream down", { status: 503 }) },
+  { name: "502", fail: () => new Response("", { status: 502 }) },
+]) {
+  test(`TTS 合成 POST 瞬时失败(${transient.name})两次后第三次成功：同一 URL、同一凭据，revalidate 照旧两次`, async () => {
+    const urls: string[] = [];
+    let calls = 0;
+    const { deps } = dependencies(async (input) => {
+      calls += 1;
+      urls.push(String(input));
+      if (calls <= 2) return transient.fail();
+      return audioResponse();
+    });
+    deps.ttsRetryDelaysMs = [0, 0];
+    let authorityReads = 0;
+    deps.nextCommand = async () => { authorityReads += 1; return pendingTts(); };
+
+    const blob = await fetchExactAutopilotTts(
+      "S/ONE", pendingTts(), new AbortController().signal, deps);
+
+    assert.equal(blob?.type, "audio/wav");
+    assert.equal(calls, 3);
+    assert.equal(new Set(urls).size, 1);
+    assert.equal(authorityReads, 2);
+  });
+}
+
+test("TTS 合成 POST 三次都瞬时失败：抛 fetch_failed，cause 是最后那个错误，不再有第四次", async () => {
+  let calls = 0;
+  const { deps } = dependencies(async () => {
+    calls += 1;
+    return new Response("", { status: 500 + calls });
+  });
+  deps.ttsRetryDelaysMs = [0, 0];
+  await assert.rejects(
+    () => fetchExactAutopilotTts("S/ONE", pendingTts(), new AbortController().signal, deps),
+    (error: unknown) => error instanceof AutopilotMediaError
+      && error.failureStage === "fetch_failed"
+      && error.cause instanceof ApiError && error.cause.status === 503,
+  );
+  assert.equal(calls, 3);
+});
+
+for (const permanent of [
+  { name: "401", status: 401 },
+  { name: "409", status: 409 },
+  { name: "422", status: 422 },
+  { name: "404", status: 404 },
+]) {
+  test(`TTS 合成 POST ${permanent.name} 一次都不重试`, async () => {
+    let calls = 0;
+    const { deps } = dependencies(async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ detail: { code: "x", message: "y" } }),
+        { status: permanent.status, headers: { "Content-Type": "application/json" } });
+    });
+    deps.ttsRetryDelaysMs = [0, 0];
+    await assert.rejects(
+      () => fetchExactAutopilotTts("S/ONE", pendingTts(), new AbortController().signal, deps),
+      (error: unknown) => error instanceof AutopilotMediaError
+        && error.cause instanceof ApiError && error.cause.status === permanent.status,
+    );
+    assert.equal(calls, 1);
+  });
+}
+
+test("TTS 204(本轮无音频)不是失败：交回 null，一次都不重试", async () => {
+  let calls = 0;
+  const { deps } = dependencies(async () => {
+    calls += 1;
+    return new Response(null, { status: 204 });
+  });
+  deps.ttsRetryDelaysMs = [0, 0];
+  assert.equal(
+    await fetchExactAutopilotTts("S/ONE", pendingTts(), new AbortController().signal, deps),
+    null);
+  assert.equal(calls, 1);
+});
+
+test("每次尝试各自的期限：悬挂的合成 POST 到点按 408 中止并重试，第二次成功", async () => {
+  const signals: AbortSignal[] = [];
+  let calls = 0;
+  const { deps } = dependencies((_input, init = {}) => {
+    calls += 1;
+    signals.push(init.signal as AbortSignal);
+    if (calls === 1) return new Promise<Response>(() => undefined);
+    return Promise.resolve(audioResponse());
+  });
+  deps.ttsAttemptTimeoutMs = 5;
+  deps.ttsRetryDelaysMs = [0, 0];
+
+  const blob = await fetchExactAutopilotTts(
+    "S/ONE", pendingTts(), new AbortController().signal, deps);
+
+  assert.equal(blob?.type, "audio/wav");
+  assert.equal(calls, 2);
+  // 第一条请求确实被自己的期限物理中止，不是悬着不管。
+  assert.equal(signals[0]?.aborted, true);
+  assert.ok(signals[0]?.reason instanceof ApiError && signals[0].reason.status === 408);
+  assert.equal(signals[1]?.aborted, false);
+});
+
+test("父 signal 在退避等待中中止：不再发第二次，原样抛 AbortError", async () => {
+  let calls = 0;
+  const { deps } = dependencies(async () => {
+    calls += 1;
+    throw new TypeError("Failed to fetch");
+  });
+  deps.ttsRetryDelaysMs = [50, 50];
+  const controller = new AbortController();
+  const pending = fetchExactAutopilotTts("S/ONE", pendingTts(), controller.signal, deps);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort(new DOMException("语音播放已取消", "AbortError"));
+  await assert.rejects(pending, (error: unknown) => error instanceof DOMException
+    && error.name === "AbortError");
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  assert.equal(calls, 1);
+});
+
 test("TTS bytes are discarded when server authority changes during synthesis", async () => {
   const { deps } = dependencies(async () => new Response(
     new Blob(["RIFFvoice"], { type: "audio/wav" }), { status: 200 }));

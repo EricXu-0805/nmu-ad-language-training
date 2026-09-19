@@ -1,6 +1,10 @@
 import { ApiError } from "../apiResponse.ts";
 import type { DeviceCapabilityRecord } from "../security/deviceCapability.ts";
-import { exactAutopilotApiCode } from "./autopilotProbePolicy.ts";
+import { drainRetryDelayMs } from "./autopilotDrainRetryPolicy.ts";
+import {
+  exactAutopilotApiCode,
+  isRetryableAutopilotProbeError,
+} from "./autopilotProbePolicy.ts";
 import {
   buildAutopilotAck,
   type AutopilotAck,
@@ -248,7 +252,50 @@ export interface AutopilotAckDelivery {
     lastDeviceEventSeq: number,
     facts: Parameters<typeof buildAutopilotAck>[3],
   ): Promise<AutopilotAck>;
+  /**
+   * `send` 在 transport 层瞬时失败(0/408/429/5xx/网络)之后，重放**同一条**已经
+   * durable 的 envelope：同一个幂等键、同一个 device event seq，绝不生成新 key。
+   * 返回服务器接受的那条 ACK；服务器已把它永久围栏时返回 null。
+   * 缺省(旧适配器/测试替身)= 控制器对 ACK 一次都不重试。
+   */
+  replayPending?(): Promise<AutopilotAck | null>;
 }
+
+/**
+ * 瞬时网络失败重试的可注入节拍。生产就是 performance.now + setTimeout；测试把
+ * 1.5–15 秒的退避压成 0 并数清楚每一次等待。
+ */
+export interface AutopilotTransientRetryPorts {
+  now(): number;
+  /** delayMs 之后 resolve；signal 中止时立即 reject。 */
+  wait(delayMs: number, signal: AbortSignal): Promise<void>;
+}
+
+/**
+ * 活跃 runner 对 /next 与 /acks 瞬时失败的总重试预算。退避走与 drain/probe 同一把
+ * 梯子(1.5→3→6→12→15 s)：下一次等待会越过这个预算就不再等，落到既有 technical_failure。
+ */
+export const AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS = 30_000;
+
+/**
+ * TTS 从 start() 到真实 playing 事件的绝对期限。合成 POST 现在自带 3×4 s 尝试与
+ * 0.5/1 s 退避(最坏 13.5 s),再加两次 revalidate 与 play(),15 s 会在慢网上把一次
+ * 本可成功的重试判成 media_timeout;与录音 PRE_START_BUDGET_MS 对齐为 20 s。
+ */
+export const AUTOPILOT_TTS_START_DEADLINE_MS = 20_000;
+
+export const browserAutopilotTransientRetryPorts: AutopilotTransientRetryPorts = {
+  now: () => performance.now(),
+  wait: (delayMs, signal) => new Promise<void>((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason); return; }
+    const onAbort = () => { globalThis.clearTimeout(timer); reject(signal.reason); };
+    const timer = globalThis.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  }),
+};
 
 export interface PatientAutopilotControllerOptions {
   sessionId: string;
@@ -278,6 +325,7 @@ export interface PatientAutopilotControllerOptions {
     command: NextCommandProjection,
     signal: AbortSignal,
   ) => Promise<void>;
+  transientRetry?: AutopilotTransientRetryPorts;
 }
 
 type MediaOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown };
@@ -418,6 +466,7 @@ export class PatientAutopilotController {
   private readonly waitForPresentation?: NonNullable<
     PatientAutopilotControllerOptions["waitForPresentation"]
   >;
+  private readonly transientRetry: AutopilotTransientRetryPorts;
   private readonly presentationAbort = new AbortController();
   private inFlight: Promise<AutopilotRuntimeState> | null = null;
   private activeMedia: { cancel(): void; closed: Promise<void> } | null = null;
@@ -432,6 +481,9 @@ export class PatientAutopilotController {
   private discardedCapture: AutopilotRecordingCapture | null = null;
   private stopped = false;
   private patientPauseRequested = false;
+  // 随 tts_ended 收据一起采纳的那条 pending 录音命令。下一拍据此跳过开头的
+  // /next：服务器刚刚在同一条响应里签发了它，再读一次只是多一个往返。一次性。
+  private receiptAdoptedRecordKey: string | null = null;
 
   constructor(options: PatientAutopilotControllerOptions) {
     this.sessionId = options.sessionId;
@@ -443,6 +495,7 @@ export class PatientAutopilotController {
     this.onDeviceEventSeq = options.onDeviceEventSeq;
     this.onState = options.onState;
     this.waitForPresentation = options.waitForPresentation;
+    this.transientRetry = options.transientRetry ?? browserAutopilotTransientRetryPorts;
     const initialSeq = options.ackDelivery?.initialDeviceEventSeq
       ?? options.initialDeviceEventSeq ?? 0;
     if (options.ackDelivery && options.initialDeviceEventSeq !== undefined
@@ -668,7 +721,15 @@ export class PatientAutopilotController {
     if (this.stopped || this.stateValue.phase === "paused"
         || this.stateValue.phase === "scope_completed") return this.stateValue;
     try {
-      await this.refreshCommand();
+      // 上一拍 tts_ended 的收据已经带回了这条 pending 录音命令并经 reducer 采纳：
+      // 这一拍不再先读 /next。开麦前的最后一道服务器闸仍是执行器里紧贴真实
+      // onstart 的那次 recording-authorization，这里省掉的只是一个纯读往返。
+      const adoptedKey = this.receiptAdoptedRecordKey;
+      this.receiptAdoptedRecordKey = null;
+      const holdsReceiptRecord = adoptedKey !== null
+        && this.stateValue.command?.command_key === adoptedKey
+        && canOpenAutopilotMicrophone(this.stateValue);
+      if (!holdsReceiptRecord) await this.refreshCommand();
       // refreshCommand mutates the property through a method; widen the prior
       // control-flow narrowing before examining the newly reduced state.
       if ((this.stateValue as AutopilotRuntimeState).phase === "paused") return this.stateValue;
@@ -709,11 +770,44 @@ export class PatientAutopilotController {
     }
   }
 
+  /**
+   * 活跃 runner 的瞬时网络失败重试。只认 0/408/429/5xx 与浏览器 fetch 的 TypeError
+   * (与 drain/probe 同一分类)；401/403/409/422、协议与持久化错误一次都不重。
+   *
+   * 重试期间什么都不做：不进 reducer、不开麦、不播放、相位不变——调用方拿到的
+   * 要么是最终成功的结果，要么是最后那个瞬时错误(照旧落 technical_failure)。
+   * stop()/患者暂停/生命周期收口会中止那条等待，立刻抛出原错误收口。
+   */
+  private retryTransient<T>(
+    attempt: (retry: number) => Promise<T>,
+    retryable = true,
+  ): Promise<T> {
+    const startedAt = this.transientRetry.now();
+    // 成功路径只比直接 await 多一跳(.catch 透传)，不多包一层 async：几条生命周期
+    // 测试按微任务节拍钉"中断落在开麦之前"，多两跳就会漂。
+    const run = (retry: number): Promise<T> => attempt(retry).catch(async (error: unknown) => {
+      if (!retryable || this.stopped || !isRetryableAutopilotProbeError(error)) throw error;
+      const delayMs = drainRetryDelayMs(retry);
+      if (this.transientRetry.now() - startedAt + delayMs
+          > AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS) {
+        throw error;
+      }
+      try {
+        await this.transientRetry.wait(delayMs, this.presentationAbort.signal);
+      } catch {
+        throw error;
+      }
+      if (this.stopped) throw error;
+      return run(retry + 1);
+    });
+    return run(0);
+  }
+
   private async refreshCommand(): Promise<void> {
     if (this.stopped) return;
     let current: unknown | null;
     try {
-      current = await this.transport.next(this.sessionId);
+      current = await this.retryTransient(() => this.transport.next(this.sessionId));
     } catch (error) {
       // /next 的 autopilot_runtime_inactive(收据 139 §5 + 141 复审):它只证明
       // 「本 runtime 世代不再发命令」,却分不清收尾完成、研究者暂停、中止、
@@ -748,17 +842,31 @@ export class PatientAutopilotController {
 
   private async sendAck(command: NextCommandProjection, facts: Parameters<typeof buildAutopilotAck>[3]): Promise<AutopilotAck> {
     if (this.stopped) throw new Error("自动驾驶已停止");
-    const nextSeq = this.stateValue.last_device_event_seq + 1;
-    const ack = this.ackDelivery
-      ? await this.ackDelivery.send(command, this.stateValue.last_device_event_seq, facts)
-      : buildAutopilotAck(
+    const lastSeq = this.stateValue.last_device_event_seq;
+    let ack: AutopilotAck;
+    if (this.ackDelivery) {
+      const delivery = this.ackDelivery;
+      // 第一次走 send(生成唯一 envelope、durable stage、transport)；瞬时失败之后
+      // 只重放同一条 envelope——同 key、同 seq。没有重放能力的适配器不重试。
+      ack = await this.retryTransient(async (retry) => {
+        if (retry === 0) return delivery.send(command, lastSeq, facts);
+        const replayed = await delivery.replayPending!();
+        if (replayed === null) throw new Error("ACK 重放已被服务器围栏，无法确认");
+        return replayed;
+      }, delivery.replayPending !== undefined);
+    } else {
+      // legacy 直连：ack 只造一次，重发的是同一个对象、同一个幂等键。
+      const built = buildAutopilotAck(
         command,
-        this.stateValue.last_device_event_seq,
-        this.makeIdempotencyKey(command, facts.ack_type, nextSeq),
+        lastSeq,
+        this.makeIdempotencyKey(command, facts.ack_type, lastSeq + 1),
         facts,
       );
-    // Local state advances only after the server has durably accepted the ACK.
-    if (!this.ackDelivery) await this.transport.ack(this.sessionId, command.command_key, ack);
+      // Local state advances only after the server has durably accepted the ACK.
+      await this.retryTransient(
+        () => this.transport.ack(this.sessionId, command.command_key, built));
+      ack = built;
+    }
     this.stateValue = autopilotRuntimeReducer(this.stateValue, {
       type: "device_ack",
       ack,
@@ -801,7 +909,7 @@ export class PatientAutopilotController {
       return;
     }
     this.activeMedia = playback;
-    const startedOutcome = observeMedia(playback.started, 15_000);
+    const startedOutcome = observeMedia(playback.started, AUTOPILOT_TTS_START_DEADLINE_MS);
     const endedOutcome = observeMedia(playback.ended, 120_000);
     try {
       const observedStart = await startedOutcome;
@@ -843,12 +951,16 @@ export class PatientAutopilotController {
         return;
       }
       await playback.closed;
-      await this.sendAck(startedCommand, {
+      const endedAck = await this.sendAck(startedCommand, {
         ack_type: "tts_ended",
         media_ended: true,
         ...observedEnd.value,
       });
-      await this.refreshCommand();
+      // 服务器在接受 tts_ended 的同一条响应里就签发了下一条录音命令(收据权威)。
+      // 直接采纳它，省掉一个 /next 往返；证明不足或 reducer 不认，才照旧读 /next。
+      if (!this.adoptReceiptRecordCommand(startedCommand, endedAck)) {
+        await this.refreshCommand();
+      }
     } finally {
       await playback.closed;
       if (this.activeMedia === playback) this.activeMedia = null;
@@ -1125,6 +1237,45 @@ export class PatientAutopilotController {
     const adopted = this.stateValue.command;
     return this.stateValue.phase !== "paused" && adopted?.kind === "record"
       && adopted.state === "started" ? adopted : null;
+  }
+
+  /**
+   * 把 tts_ended 收据随身带回的那条 **pending 录音命令**当场采纳。
+   *
+   * 2026-09-17 养老院实测：服务器在 tts_ended 到达那一刻(0.00 s)就签发了录音
+   * 命令，平板却要再走一个 /next、等下一拍、再走一个 /next 才开麦，中位 1.61 s，
+   * 老人早就在提问声里开口了。收据权威与 /next 投影是同一份服务器 projection、
+   * 同一个解析器；证明项与 record_started 那条一样逐项核：ACK 类型、命令键、
+   * ACK 幂等键都必须是刚刚真的发出去的这一条，投影必须是 pending 录音。
+   *
+   * 采纳只走既有 server_command reducer，先在副本上试：expectedFollowup(seq+1、
+   * 同代际、同 item/turn/attempt/prompt_level)任一项不成立，或它没落到 record_ready，
+   * 就一步都不改本地状态、返回 false，由调用方照旧读 /next——同一条不一致的投影
+   * 在那条路上会得到同样的 fail-closed 判定，这里不抢先判死。
+   */
+  private adoptReceiptRecordCommand(acked: TtsCommand, ack: AutopilotAck): boolean {
+    const authority = this.ackDelivery?.lastReceiptAuthority ?? null;
+    const projected = authority?.command ?? null;
+    if (authority === null || projected === null
+        || authority.ackType !== "tts_ended"
+        || ack.ack_type !== "tts_ended"
+        || authority.commandKey !== acked.command_key
+        || authority.ackIdempotencyKey !== ack.idempotency_key
+        || projected.kind !== "record"
+        || projected.state !== "pending") {
+      return false;
+    }
+    const next = autopilotRuntimeReducer(this.stateValue, {
+      type: "server_command", command: projected,
+    });
+    if (!canOpenAutopilotMicrophone(next)
+        || next.command?.command_key !== projected.command_key) {
+      return false;
+    }
+    this.stateValue = next;
+    this.receiptAdoptedRecordKey = projected.command_key;
+    this.emitState();
+    return true;
   }
 
   /** 权威不足时的安全暂停：零终态 ACK、零失败 ACK、零本地合成 revision。 */
