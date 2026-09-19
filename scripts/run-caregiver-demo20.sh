@@ -11,6 +11,7 @@ usage() {
   scripts/run-caregiver-demo20.sh [--port 端口]
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check start-pause
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check recovery-chains
+  scripts/run-caregiver-demo20.sh [--port 端口] --browser-check adjudication-chains
   scripts/run-caregiver-demo20.sh --help
 
 作用：
@@ -65,15 +66,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --browser-check)
       [ "$#" -ge 2 ] || {
-        echo "错误：--browser-check 后需要 start-pause 或 recovery-chains" >&2
+        echo "错误：--browser-check 后需要 start-pause、recovery-chains 或 adjudication-chains" >&2
         exit 64
       }
       [ -z "$BROWSER_CHECK" ] || {
         echo "错误：--browser-check 不能重复" >&2
         exit 64
       }
-      [ "$2" = "start-pause" ] || [ "$2" = "recovery-chains" ] || {
-        echo "错误：--browser-check 只支持 start-pause 或 recovery-chains" >&2
+      [ "$2" = "start-pause" ] || [ "$2" = "recovery-chains" ] || [ "$2" = "adjudication-chains" ] || {
+        echo "错误：--browser-check 只支持 start-pause、recovery-chains 或 adjudication-chains" >&2
         exit 64
       }
       BROWSER_CHECK="$2"
@@ -306,6 +307,15 @@ if [ "$BROWSER_CHECK" = "recovery-chains" ]; then
   env -i "${HARNESS_ENV[@]}" \
     "$PYTHON" -m harness.caregiver_recovery_chains --verify-ledger
   echo "真实 Chrome 恢复链（设备故障→继续→重探；开麦前清旧账→410→照常录）本机验收已全部通过"
+  exit 0
+elif [ "$BROWSER_CHECK" = "adjudication-chains" ]; then
+  echo "真实 Chrome 裁定链走查开始（不显示临时凭据）…"
+  env -i "${HARNESS_ENV[@]}" \
+    "$BROWSER_PYTHON" -I "$REPO/harness/caregiver_adjudication_chains.py" \
+    --adjudication-chains --origin "http://127.0.0.1:$PORT"
+  env -i "${HARNESS_ENV[@]}" \
+    "$PYTHON" -m harness.caregiver_adjudication_chains --verify-ledger
+  echo "真实 Chrome 裁定链（题内暂停→续弹；老人已答对；无回答拒答对→跳过本题；AI 听到的；第 N 题）本机验收已全部通过"
   exit 0
 elif [ -n "$BROWSER_CHECK" ]; then
   echo "真实 Chrome 验收开始（不显示临时凭据）…"

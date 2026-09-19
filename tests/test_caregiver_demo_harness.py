@@ -393,6 +393,8 @@ def test_shell_cleanup_and_minimal_environment_are_structurally_pinned():
     assert 'x-nmu-caregiver-harness-instance' in text.lower()
     assert '"NMU_CAREGIVER_HARNESS_INSTANCE=$INSTANCE_MARKER"' in text
     assert '--browser-check start-pause' in text
+    assert '--browser-check adjudication-chains' in text
+    assert 'browser-adjudication-chains-result.json' not in text
     assert 'BROWSER_PYTHON' in text
     assert 'from playwright.sync_api import sync_playwright' in text
     assert '不会自动联网安装' in text
