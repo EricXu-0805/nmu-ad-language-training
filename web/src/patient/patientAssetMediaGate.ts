@@ -23,19 +23,35 @@ function abortError(signal: AbortSignal): Error {
 }
 
 /**
+ * 题图门禁与 ImagePane 共用的本地键：服务器投影里的 item_ref + turn_seq。
+ *
+ * 同一题、同一轮的提问 TTS 与它的录音命令是两个 command_key，但题图是同一张
+ * (服务端 /patient-asset/current 按游标出图，游标就是 item/turn)。按 command_key
+ * 键会让录音命令一到就把门禁重置成 loading、ImagePane 把同一张图再下载解码一遍，
+ * 这一段全落在提问播完→开麦的空档里(2026-09-17 养老院实测的 1.6 s 里有它)。
+ * 键里只用投影自带的位置事实，不跨题复用任何字节：换题或换轮照旧重新取图。
+ */
+export function patientStimulusKey(
+  command: Pick<NextCommandProjection, "item_ref" | "turn_seq">,
+): string {
+  return `${command.item_ref}\u0000${command.turn_seq}`;
+}
+
+/**
  * Bridges the React image presentation with the serialized media controller.
- * Keys are current-command capabilities only; old/future commands can never
- * satisfy the exact waiter that owns the microphone or TTS continuation.
+ * Keys are the current stimulus position only (see patientStimulusKey); old/future
+ * items can never satisfy the exact waiter that owns the microphone or TTS
+ * continuation.
  */
 export class PatientAssetMediaGate {
   private currentKey: string | null = null;
   private state: GateState = "loading";
   private waiters = new Set<PendingWaiter>();
 
-  report(commandKey: string, state: GateState): void {
-    if (this.currentKey !== commandKey) {
+  report(stimulusKey: string, state: GateState): void {
+    if (this.currentKey !== stimulusKey) {
       this.rejectAll(new PatientAssetGateError("题目已切换，旧图片门禁失效"));
-      this.currentKey = commandKey;
+      this.currentKey = stimulusKey;
       this.state = state;
     } else {
       this.state = state;
@@ -45,11 +61,11 @@ export class PatientAssetMediaGate {
   }
 
   waitFor(command: NextCommandProjection, signal: AbortSignal): Promise<void> {
-    const commandKey = command.command_key;
+    const stimulusKey = patientStimulusKey(command);
     if (signal.aborted) return Promise.reject(abortError(signal));
-    if (this.currentKey !== commandKey) {
+    if (this.currentKey !== stimulusKey) {
       this.rejectAll(new PatientAssetGateError("题目已切换，旧图片门禁失效"));
-      this.currentKey = commandKey;
+      this.currentKey = stimulusKey;
       this.state = "loading";
     }
     if (this.state === "ready") return Promise.resolve();

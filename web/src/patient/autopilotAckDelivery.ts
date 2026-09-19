@@ -310,6 +310,16 @@ export class DurableAutopilotAckDelivery implements AutopilotAckDelivery {
   }
 
   /**
+   * 活跃 runner 在 transport 瞬时失败之后的重放：就是 drainPending 那一条路——
+   * 同一条 durable envelope、同一个幂等键、同一个 seq，零新 key(K6 计数不变)。
+   * 服务器已永久围栏它时 drainPending 持久丢弃并返回 null，这里原样交回 null。
+   */
+  async replayPending(): Promise<AutopilotAck | null> {
+    const entry = await this.drainPending();
+    return entry === null ? null : entry.ack;
+  }
+
+  /**
    * 服务器已按代际围栏该命令,回执不可能再被接受:持久移除并消费其事件序号。
    * 序号只需严格递增不需连续,跳过被丢弃的序号对服务端安全;终态失败 latch 照常
    * 落存——它只挡「同代际重发」,新代际命令经 commandSupersedesTerminalLatch 放行。

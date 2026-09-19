@@ -1561,6 +1561,49 @@ test("幂等键生成计数（K6 drainPending 重放）：重放不生成新 key
   assert.deepEqual(harness.keys, [firstKey, firstKey]);
 });
 
+test("幂等键生成计数（K7 replayPending 供活跃 runner 瞬时重试）：就是 drainPending 那一条，同 key、计数不变", async () => {
+  const { ApiError } = await import("../apiResponse.ts");
+  const store = new MemoryAckStore();
+  let ackCalls = 0;
+  const seen: AutopilotAck[] = [];
+  const delivery = await DurableAutopilotAckDelivery.create({
+    capability,
+    store,
+    transport: {
+      next: async () => null,
+      ack: async (_sid, _key, ack) => {
+        ackCalls += 1;
+        seen.push(ack);
+        if (ackCalls === 1) throw new ApiError(503, "瞬时失败");
+        // 非重放的严格收据:waiting_tts 必须投影 started 的那条 TTS 命令。
+        return {
+          ...(receipt(ack, false) as Record<string, unknown>),
+          command: { ...question(), state: "started", command_revision: 1 },
+        };
+      },
+    },
+  });
+  await assert.rejects(
+    () => delivery.send(question(), 0, { ack_type: "tts_started" }),
+    (error: unknown) => error instanceof ApiError && error.status === 503,
+  );
+  assert.equal(delivery.generatedIdempotencyKeyCount, 1);
+  assert.equal(delivery.stagingInFlight, false);
+
+  const replayed = await delivery.replayPending();
+
+  assert.equal(replayed?.idempotency_key, seen[0]?.idempotency_key);
+  assert.equal(replayed?.device_event_seq, 1);
+  assert.deepEqual(seen.map((ack) => ack.idempotency_key), [seen[0]?.idempotency_key, seen[0]?.idempotency_key]);
+  assert.equal(delivery.generatedIdempotencyKeyCount, 1);
+  assert.deepEqual(store.events, ["stage", "complete"]);
+  assert.equal(delivery.initialDeviceEventSeq, 1);
+  assert.equal(delivery.lastReceiptAuthority?.ackIdempotencyKey, seen[0]?.idempotency_key);
+  // 没有 pending 时重放什么都不发、交回 null。
+  assert.equal(await delivery.replayPending(), null);
+  assert.equal(ackCalls, 2);
+});
+
 test("夹具自证：未经扰动的当前 checkpoint 必须被判成当前语义", async () => {
   // 这条不测生产判据，测的是下面那张矩阵有没有资格叫"单变量"。基线本身若判负，
   // 每一行都会因为同一个原因返回 unknown，"只动了 X 才失守"的结论一条都不成立。

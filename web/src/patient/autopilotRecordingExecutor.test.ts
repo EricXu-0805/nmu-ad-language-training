@@ -746,7 +746,7 @@ test("绝对预算在第一项 async bootstrap 之前武装：租约悬挂即判
   harness.advance(PRE_START_BUDGET_MS);
   const error = await capture.started.then(() => null, (reason: unknown) => reason);
   assert.equal((error as AutopilotMediaError).errorCode, "device_command_timeout");
-  // 快照、两次授权、getUserMedia、stage/upload 一次都没发生。
+  // 快照、授权、getUserMedia、stage/upload 一次都没发生。
   assert.deepEqual(harness.calls, ["acquireLease"]);
   assert.equal(devices.userMediaCalls, 0);
   assert.deepEqual(uploadCalls, []);
@@ -856,7 +856,7 @@ test("恢复快照悬挂：释放已经拿到的租约后 closed，迟到的快�
   assert.equal(devices.devices.length, 0);
 });
 
-test("六阶段共用同一条绝对预算：分段耗时累计到 20,000 ms 判死，定时器只武装一次", async (context) => {
+test("五阶段共用同一条绝对预算：分段耗时累计到 20,000 ms 判死，定时器只武装一次", async (context) => {
   const clock = clockDouble();
   const devices = installDeviceDoubles(clock);
   context.after(() => devices.restore());
@@ -892,7 +892,11 @@ test("六阶段共用同一条绝对预算：分段耗时累计到 20,000 ms 判
   assert.equal((error as AutopilotMediaError).errorCode, "device_command_timeout");
   // 每段各起一个预算的写法会让这里等于 3；共用一条只可能是 1。
   assert.deepEqual(harness.armedDelays, [PRE_START_BUDGET_MS]);
-  assert.equal(devices.userMediaCalls, 0);
+  // 流在授权之前就取到手(不产生字节)；判死把它全关掉，开录指令一次都没下过。
+  assert.equal(devices.userMediaCalls, 1);
+  await capture.closed;
+  for (const row of devices.tracks) assert.equal(row.stopped, 1);
+  assert.equal(devices.devices.reduce((total, row) => total + row.starts, 0), 0);
 });
 
 /** 把一条采集推进到"真实 onstart 已触发、续延还没恢复"的那一瞬间。 */
@@ -1030,16 +1034,20 @@ test("被前台闸拒绝的开麦不消耗代际：同一 owner 的前两次合�
 // ---------------- 生命周期闸：六段 pre-start 逐段收口 ----------------
 
 type PreStartStage =
-  | "lease" | "snapshot" | "authorize1" | "prepare" | "authorize2" | "onstart";
+  | "lease" | "snapshot" | "prepare" | "authorize" | "onstart";
 
-/** 每一段被卡住时，harness 已经记下的调用序列（prepare/onstart 不经 harness）。 */
+/**
+ * 每一段被卡住时，harness 已经记下的调用序列（prepare/onstart 不经 harness）。
+ *
+ * 2026-09-17 起 getUserMedia 之前不再有一次授权往返：唯一一次 recording-authorization
+ * 紧贴真实开录，prepare 只取流不产生字节。
+ */
 const STAGE_CALLS: Record<PreStartStage, string[]> = {
   lease: ["acquireLease"],
   snapshot: ["acquireLease", "recoverySnapshot"],
-  authorize1: ["acquireLease", "recoverySnapshot", "authorize:1"],
-  prepare: ["acquireLease", "recoverySnapshot", "authorize:1"],
-  authorize2: ["acquireLease", "recoverySnapshot", "authorize:1", "authorize:2"],
-  onstart: ["acquireLease", "recoverySnapshot", "authorize:1", "authorize:2"],
+  prepare: ["acquireLease", "recoverySnapshot"],
+  authorize: ["acquireLease", "recoverySnapshot", "authorize:1"],
+  onstart: ["acquireLease", "recoverySnapshot", "authorize:1"],
 };
 
 /**
@@ -1061,8 +1069,7 @@ function pendingStageHarness(
   const late = {
     lease: deferred<AudioDeviceLease>(),
     snapshot: deferred<AutopilotRecoverySnapshot>(),
-    authorize1: deferred<RecordingAuthorization>(),
-    authorize2: deferred<RecordingAuthorization>(),
+    authorize: deferred<RecordingAuthorization>(),
   };
   const harness = bootstrapHarness(clock, {
     acquireLease: () =>
@@ -1070,8 +1077,7 @@ function pendingStageHarness(
     recoverySnapshot: () =>
       hangAt === "snapshot" ? late.snapshot.promise : Promise.resolve(EMPTY_SNAPSHOT),
     authorize: (call) => {
-      if (call === 1 && hangAt === "authorize1") return late.authorize1.promise;
-      if (call === 2 && hangAt === "authorize2") return late.authorize2.promise;
+      if (call === 1 && hangAt === "authorize") return late.authorize.promise;
       return Promise.resolve(AUTHORIZED);
     },
     failClearForArm: options.failClearForArm,
@@ -1097,9 +1103,9 @@ function pendingStageHarness(
   };
 }
 
-// 六段全覆盖：第一条 lifecycle 拒绝必须当场挡住下一段。
+// 五段全覆盖：第一条 lifecycle 拒绝必须当场挡住下一段。
 for (const hangAt of [
-  "lease", "snapshot", "authorize1", "prepare", "authorize2", "onstart",
+  "lease", "snapshot", "prepare", "authorize", "onstart",
 ] as const) {
   test(`pre-start 第 ${hangAt} 段悬挂时 pagehide：立即判死并挡住下一段`, async (context) => {
     const run = pendingStageHarness(context, hangAt);
@@ -1108,7 +1114,7 @@ for (const hangAt of [
     const userMediaBefore = run.devices.userMediaCalls;
     assert.deepEqual(callsBefore, STAGE_CALLS[hangAt]);
 
-    // 真实 onstart 还没触发过：六段全部落在 before_start。
+    // 真实 onstart 还没触发过：五段全部落在 before_start。
     assert.equal(run.capture.interrupt(), "before_start");
 
     const startError = await run.capture.started.then(() => null, (e: unknown) => e);
@@ -1121,7 +1127,7 @@ for (const hangAt of [
     assert.deepEqual(run.harness.calls, callsBefore);
     assert.equal(run.devices.userMediaCalls, userMediaBefore);
     assert.deepEqual(run.uploadCalls, []);
-    // 只有第 6 段之前的段落连 MediaRecorder 都没造出来。
+    // 只有第 5 段之前的段落连 MediaRecorder 都没造出来。
     if (hangAt !== "onstart") {
       assert.equal(
         run.devices.devices.reduce((total, row) => total + row.starts, 0), 0);
@@ -1175,26 +1181,8 @@ for (const settle of ["resolve", "reject"] as const) {
 }
 
 for (const settle of ["resolve", "reject"] as const) {
-  test(`第一次授权悬挂 + pagehide：迟到 ${settle} 之后仍然零 prepare`, async (context) => {
-    const run = pendingStageHarness(context, "authorize1", { ownerGeneration: 33 });
-    await run.settleAt();
-    run.capture.interrupt();
-    run.held.settleReleased();
-    await run.capture.closed;            // 无资源授权不得挡住 closed
-
-    if (settle === "resolve") run.late.authorize1.resolve(AUTHORIZED);
-    else run.late.authorize1.reject(new Error("授权最终失败"));
-    await flushMicrotasks();
-
-    assert.equal(run.devices.userMediaCalls, 0);   // 一次 getUserMedia 都没有
-    assert.deepEqual(run.harness.calls, STAGE_CALLS.authorize1);
-    assert.deepEqual(run.uploadCalls, []);
-  });
-}
-
-for (const settle of ["resolve", "reject"] as const) {
-  test(`第二次授权悬挂 + pagehide：已准备的流全关，迟到 ${settle} 零开录`, async (context) => {
-    const run = pendingStageHarness(context, "authorize2", { ownerGeneration: 34 });
+  test(`授权悬挂 + pagehide：已准备的流全关，迟到 ${settle} 零开录`, async (context) => {
+    const run = pendingStageHarness(context, "authorize", { ownerGeneration: 34 });
     await run.settleAt();
     assert.equal(run.devices.userMediaCalls, 1);   // 流已经到手，但还没开录
 
@@ -1203,8 +1191,8 @@ for (const settle of ["resolve", "reject"] as const) {
     await run.capture.closed;
 
     for (const row of run.devices.tracks) assert.equal(row.stopped, 1);
-    if (settle === "resolve") run.late.authorize2.resolve(AUTHORIZED);
-    else run.late.authorize2.reject(new Error("复核最终失败"));
+    if (settle === "resolve") run.late.authorize.resolve(AUTHORIZED);
+    else run.late.authorize.reject(new Error("授权最终失败"));
     await flushMicrotasks();
 
     assert.equal(
@@ -1263,24 +1251,21 @@ test("真实 onstart 之前 pagehide：before_start，迟到的 onstart 不复�
   assert.deepEqual(run.uploadCalls, []);
 });
 
-for (const stage of ["authorize1", "authorize2"] as const) {
-  test(`${stage} 被截止时刻判死：稳定 device_command_timeout，迟到拒绝不改判`, async (context) => {
-    const run = pendingStageHarness(context, stage, { ownerGeneration: 37 });
-    await run.settleAt();
-    run.harness.advance(PRE_START_BUDGET_MS);
+test("授权被截止时刻判死：稳定 device_command_timeout，迟到拒绝不改判", async (context) => {
+  const run = pendingStageHarness(context, "authorize", { ownerGeneration: 37 });
+  await run.settleAt();
+  run.harness.advance(PRE_START_BUDGET_MS);
 
-    const error = await run.capture.started.then(() => null, (e: unknown) => e);
-    assert.equal((error as AutopilotMediaError).errorCode, "device_command_timeout");
+  const error = await run.capture.started.then(() => null, (e: unknown) => e);
+  assert.equal((error as AutopilotMediaError).errorCode, "device_command_timeout");
 
-    // 判死之后底层请求才带着传输层错误回来：不得盖掉稳定的超时判定。
-    const pending = stage === "authorize1" ? run.late.authorize1 : run.late.authorize2;
-    pending.reject(new Error("请求已被中止"));
-    await flushMicrotasks();
-    const stopError = await run.capture.stopped.then(() => null, (e: unknown) => e);
-    assert.equal((stopError as AutopilotMediaError).errorCode, "device_command_timeout");
-    assert.deepEqual(run.uploadCalls, []);
-  });
-}
+  // 判死之后底层请求才带着传输层错误回来：不得盖掉稳定的超时判定。
+  run.late.authorize.reject(new Error("请求已被中止"));
+  await flushMicrotasks();
+  const stopError = await run.capture.stopped.then(() => null, (e: unknown) => e);
+  assert.equal((stopError as AutopilotMediaError).errorCode, "device_command_timeout");
+  assert.deepEqual(run.uploadCalls, []);
+});
 
 // ---------------- 生命周期中断：定时器清除端口失效仍须 fail closed ----------------
 

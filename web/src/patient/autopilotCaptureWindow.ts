@@ -52,7 +52,7 @@ export function answerWindowMs(maxDurationSeconds: number): number {
  * 从真实录音起点起算，还剩多少作答窗口。
  *
  * elapsedSinceStartMs 只计算真实 `MediaRecorder.onstart` 之后、到作答定时器武装
- * 之前已经录进去的时间。权限返回后的第二次授权发生在 `startPrepared()` 之前，
+ * 之前已经录进去的时间。权限返回后的服务端授权发生在 `startPrepared()` 之前，
  * 属于开录前预算，不占老人的作答窗口；这里扣除的是 onstart 后的本地调度耗时，
  * 防止它被额外加到服务器时长上限之外。
  */
@@ -68,7 +68,7 @@ export function remainingAnswerWindowMs(
 
 /**
  * 开麦前整段准备的绝对预算。这是 pre-start 窗口里**唯一**的一个数：prepare、
- * 权限返回后的第二次服务端授权、等待真实 onstart 全部受它约束，也只武装一个
+ * 权限返回后的服务端授权、等待真实 onstart 全部受它约束，也只武装一个
  * 定时器。控制器不得再为 capture.started 另起一个超时——两个 owner 就是两条
  * 互相竞争的截止时刻，谁先烧取决于调度，判定就不可复现了。
  */
