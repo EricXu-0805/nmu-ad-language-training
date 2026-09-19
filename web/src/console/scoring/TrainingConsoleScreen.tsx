@@ -31,6 +31,7 @@ import type { AttemptEvent, AttemptProcessRequest, PlanItem, PlanTurn, Session, 
 import { AuthenticatedAudio } from "../AuthenticatedAudio";
 import { SessionControlBar } from "../SessionControlBar";
 import { SessionAbortControl } from "../SessionAbortControl";
+import { itemSeqLabel, itemSeqText } from "../itemNumbering";
 import { autopilotFailureKindForErrorCode, cueTypeForPrompt, decideAttemptProcessResult } from "./attemptEvidence";
 import { answerTimeoutAction, canReleaseAutopilotFailure, makeAutopilotFailure, type AutopilotFailure, type AutopilotFailureKind } from "./autopilotSafety";
 import { decideAudioSavedAutomation, retireLegacyAudioSavedAutoAdvancePreference } from "./audioSavedProgressSafety";
@@ -1864,6 +1865,15 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
   if (!plan) return <p>加载会话计划…</p>;
   if (plan.items.length === 0) return <p>本场次无评分题(第 1 周应走关系建立控制台)。</p>;
 
+  // 页首题号:观察面取权威回执映射进冻结计划的位置,人工面取当前计划题;
+  // 都是 presentation_order 的投影(类型内号对钱凯的纸质记录单)。
+  const headerSeqTaskType = observerMode ? observerPosition?.taskType : item?.task_type;
+  const headerSeq = observerMode
+    ? observerPosition?.seq ?? null
+    : item ? itemSeqLabel(item.task_type, item.presentation_order) : null;
+  const headerSeqText = headerSeq && headerSeqTaskType
+    ? itemSeqText(headerSeqTaskType, headerSeq) : null;
+
   return (
     <div className="training-layout">
       {!observerMode && (
@@ -1874,7 +1884,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
       <div className="training-main">
         <div className="training-page-header">
           <div>
-            <div className="page-kicker">当前训练任务</div>
+            <div className="page-kicker">当前训练任务{headerSeqText ? ` · ${headerSeqText}` : ""}{headerSeq ? <span className="muted">（总第 {headerSeq.seq} 题）</span> : null}</div>
             <h2 className="page-title">{observerMode
               ? observerPosition?.itemLabel ?? "同步中…"
               : item?.item_id.replace(/^(SE|DE)_/, "") ?? "训练判分"}</h2>
@@ -2212,14 +2222,18 @@ function ItemRail({ plan, itemIdx, lockedCount, onPick, journalTurns, disabled =
           const locked = it.turns.filter((t) => journalTurns[`${it.item_id}#${t.turn_seq}`]?.locked).length;
           const allLocked = locked === total;
           const displayName = it.item_id.replace(/^(SE|DE)_/, "");
+          // 类型内号对纸质记录单(单要素 1–20 / 双要素 1–10 / 多要素 1–2);左侧数字仍是总序号。
+          const seq = itemSeqLabel(it.task_type, it.presentation_order);
+          const typeLabel = seq?.typeSeq !== null && seq?.typeSeq !== undefined
+            ? `${it.task_type}第 ${seq.typeSeq} 题` : it.task_type;
           return (
             <button key={it.item_id} onClick={() => onPick(i)} disabled={disabled}
               aria-current={i === itemIdx ? "step" : undefined}
               className={`item-rail-button${i === itemIdx ? " is-active" : ""}${allLocked ? " is-complete" : ""}`}>
-              <span className="item-rail-index">{i + 1}</span>
+              <span className="item-rail-index">{seq?.seq ?? i + 1}</span>
               <span className="item-rail-copy">
                 <strong>{displayName}</strong>
-                <span>{it.task_type}{total > 1 ? ` · ${locked}/${total} 环节` : allLocked ? " · 已锁定" : " · 待完成"}</span>
+                <span>{typeLabel}{total > 1 ? ` · ${locked}/${total} 环节` : allLocked ? " · 已锁定" : " · 待完成"}</span>
               </span>
             </button>
           );

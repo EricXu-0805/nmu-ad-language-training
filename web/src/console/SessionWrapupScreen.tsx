@@ -28,6 +28,7 @@ import type {
 } from "../types";
 import { ResearchReviewPanel } from "./ResearchReviewPanel";
 import { SessionCloseoutPanel } from "./SessionCloseoutPanel";
+import { itemSeqLabel, itemSeqSummary } from "./itemNumbering";
 import { ensureExportIntent, type ExportIntent } from "./exportIntent";
 import type {
   SessionCloseoutOutcomeSummary,
@@ -577,7 +578,10 @@ export function SessionWrapupScreen({
               缺少记录的题目会阻止结束，明细见下方折叠。
               <details style={{ marginTop: 8 }}>
                 <summary>查看缺失题目</summary>
-                <ul>{untouched.map((item) => <li key={item.item_id}>{item.item_id} · {item.task_type}</li>)}</ul>
+                <ul>{untouched.map((item) => {
+                  const seq = itemSeqLabel(item.task_type, item.presentation_order);
+                  return <li key={item.item_id}>{seq ? `${itemSeqSummary(item.task_type, seq)} · ` : ""}{item.item_id} · {item.task_type}</li>;
+                })}</ul>
               </details>
             </Alert>
           )}

@@ -5,6 +5,7 @@ import { Button } from "../components/Button";
 import { StatusPill } from "../components/StatusPill";
 import type { AuditEntry, AuditVerify, AudioAsset, AttemptEvent, InteractionEvent, ItemEvent, PatientSummary, ScaleResult, Session, TurnEvent } from "../types";
 import { AuthenticatedAudio } from "./AuthenticatedAudio";
+import { itemSeqLabel, itemSeqSummary } from "./itemNumbering";
 import {
   buildEvidenceTimeline,
   processingStatusLabel,
@@ -964,7 +965,11 @@ function EvidenceTurnCard({ row, canPlayAudio, confirmation }: {
     <section className="analysis-turn-card evidence-turn-card">
       <div className="analysis-turn-head">
         <div>
-          <span className="page-kicker">{row.item?.task_type ?? "题目类型未知"}</span>
+          {/* 题号只用 ItemEvent.presentation_order(人工面建的题目目前为 NULL,则只显示类型);不从 item_id 编。 */}
+          <span className="page-kicker">{(() => {
+            const seq = row.item ? itemSeqLabel(row.item.task_type, row.item.presentation_order) : null;
+            return seq && row.item ? itemSeqSummary(row.item.task_type, seq) : row.item?.task_type ?? "题目类型未知";
+          })()}</span>
           <strong>{row.itemId.replace(/^(SE|DE)_/, "")}
             <span className="muted"> · {row.responseRole ?? "环节角色缺失"} #{row.turnSeq}</span>
           </strong>

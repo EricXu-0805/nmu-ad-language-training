@@ -181,7 +181,11 @@ test("observer position comes only from the exact session runtime cursor and fro
     itemLabel: "牙刷_牙膏",
     taskType: "双要素",
     responseRole: "关系识别",
+    // 夹具里双要素排在第 2 位,不落在冻结的 21–30 区间:只给总序号,不硬算类型内号。
+    seq: { seq: 2, typeSeq: null, group: null, groupSeq: null },
   });
+  assert.deepEqual(observerPlanPosition(runtimeAt(0, 0), "S-a", PLAN)?.seq,
+    { seq: 1, typeSeq: 1, group: 1, groupSeq: 1 });
   assert.equal(observerPlanPosition(runtimeAt(0, 0), "S-a", PLAN)?.itemLabel, "胡萝卜");
 });
 

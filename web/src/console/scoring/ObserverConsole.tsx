@@ -1,5 +1,6 @@
 import { Button } from "../../components/Button";
 import { StatusPill } from "../../components/StatusPill";
+import { itemSeqText } from "../itemNumbering.ts";
 import {
   observerPhaseView,
   type ManualResyncStatus,
@@ -36,7 +37,10 @@ export function ObserverConsole({ patientCode, phase, resyncStatus, resyncError,
         {position ? (
           <>
             <StatusPill tone="primary">{position.taskType}</StatusPill>
-            <span>当前任务：{position.itemLabel} · {position.responseRole}</span>
+            <span>
+              当前任务：{position.seq ? `${itemSeqText(position.taskType, position.seq)} · ` : ""}
+              {position.itemLabel} · {position.responseRole}
+            </span>
             <span>计划位置：第 {position.itemOrdinal}/{position.itemTotal} 题 · 环节 {position.turnOrdinal}/{position.turnTotal}</span>
           </>
         ) : (

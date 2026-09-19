@@ -2,6 +2,7 @@
 // 唯一事实源仍是 ServerAutopilotControl 上报的 (owned, phase) 与服务端 runtime/journal。
 import type { AutopilotConsoleState } from "../../autopilot/startControl";
 import type { SessionPlan, SessionRuntimeState } from "../../types";
+import { itemSeqLabel, type ItemSeq } from "../itemNumbering.ts";
 
 export type ObserverOwnershipPhase = AutopilotConsoleState["phase"];
 
@@ -159,6 +160,8 @@ export interface ObserverPlanPosition {
   itemLabel: string;
   taskType: string;
   responseRole: string;
+  /** 冻结计划 presentation_order 的题号投影(类型内号对纸质记录单);不可证明为 null。 */
+  seq: ItemSeq | null;
 }
 
 /** 任何不能通过 exactPlanCursor 的位置显示"待同步"，绝不显示估计进度。 */
@@ -186,6 +189,7 @@ function positionFromPlanCursor(
     itemLabel: item.item_id.replace(/^(SE|DE)_/, ""),
     taskType: item.task_type,
     responseRole: turn.response_role,
+    seq: itemSeqLabel(item.task_type, item.presentation_order),
   };
 }
 
