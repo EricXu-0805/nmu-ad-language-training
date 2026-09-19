@@ -260,11 +260,11 @@ export async function stageAndFinishExactCapture(
 /**
  * 无资源阶段的迟到落地：观察但不消费。
  *
- * snapshot 与两次授权都不交付本地设备资源，所以判死之后 `closed` 不必等它们；
+ * snapshot 与授权都不交付本地设备资源，所以判死之后 `closed` 不必等它们；
  * 但它们迟早会 settle，没人接就会变成 unhandled rejection。挂一条吞掉的续延，
  * 既不掀翻页面，也绝不让那次迟到的结果恢复任何续延。
  */
-/** 开麦前清旧账的软预算;小于 PRE_START_BUDGET_MS,给租约/授权/prepare 留足余量。 */
+/** 开麦前清旧账的软预算;小于 PRE_START_BUDGET_MS,给租约/prepare/授权留足余量。 */
 export const FOREIGN_DRAIN_SOFT_BUDGET_MS = 8_000;
 
 function isolateLateSettlement(operation: Promise<unknown>): void {
@@ -518,7 +518,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   }
 
   /**
-   * 六段 pre-start 的统一闸。
+   * 五段 pre-start 的统一闸。
    *
    * `deadline.race` 只认截止时刻，不认生命周期——而 `interrupt()` 恰恰会把那个
    * 定时器 clear 掉。于是 pagehide 之后，一条不合作的 snapshot 或授权既等不到
@@ -569,7 +569,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
     let leaseDelivery: Promise<void> = Promise.resolve();
     try {
       // 绝对截止时刻在第一项异步 bootstrap（含 acquireLease）之前同步武装，整段
-      // pre-start 只有这一个定时器：租约、恢复快照、两次授权、prepare、等待真实
+      // pre-start 只有这一个定时器：租约、恢复快照、prepare、授权、等待真实
       // onstart 全部共用它，任何一段都不重置预算。controller 不再为
       // capture.started 另起 20 秒超时，只消费这条 Promise 已经 settle 的结果。
       const deadline = armCaptureDeadline({
@@ -585,7 +585,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
       });
       this.preStartDeadline = deadline;
       try {
-        // 1/6 设备租约。它**可能迟到交付**一把真锁，所以观察者就是 late-lease
+        // 1/5 设备租约。它**可能迟到交付**一把真锁，所以观察者就是 late-lease
         // tracker：acquisition 有结论之前 closed 不许 settle，否则那把将来才出现
         // 的锁永远没人释放，下一个页面再也开不了麦。
         this.lease = await this.stage(
@@ -598,7 +598,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
             );
           },
         );
-        // 2/6 恢复快照。不交付任何本地设备资源：迟到只需隔离，closed 不必等它。
+        // 2/5 恢复快照。不交付任何本地设备资源：迟到只需隔离，closed 不必等它。
         let snapshot = await this.stage(
           deadline,
           () => this.bootstrap.recoverySnapshot(),
@@ -630,23 +630,15 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
             || snapshot.entries.length > 0) {
           throw new Error("本机存在待恢复录音，禁止覆盖开新麦克风");
         }
-        // 3/6 第一次授权。同样是无资源阶段。
-        const authorization = await this.stage(
-          deadline,
-          () => this.bootstrap.authorize(
-            this.sessionId,
-            this.command.command_key,
-            this.abortController.signal,
-          ),
-          isolateLateSettlement,
-        );
-        if (!authorizesMicrophoneStart(authorization)) {
-          throw new Error("当前场次未授权开启麦克风");
-        }
         this.assertForeground();
-        // 4/6 只取流、只造 recorder。到这里为止一个录音字节都没有产生。
+        // 3/5 只取流、只造 recorder。到这里为止一个录音字节都没有产生。
         // 底层 getUserMedia 可能迟到交付 MediaStream：留住这条 Promise，cleanup
         // 里 dispose() 之后等它，晚到的 tracks 才算真的被关干净。
+        //
+        // 2026-09-17 之前这里还有一次 recording-authorization 往返。它证明不了
+        // 比下面 4/5 更多的东西(授权与开录之间隔着 getUserMedia，闸只能是最后
+        // 那一次)，却把提问→开麦的空档多拉长一个网络往返。取流本身不产生字节、
+        // 不需要服务器授权:prepare() 绝不调 MediaRecorder.start()。
         const prepared = await this.stage(
           deadline,
           () => this.recorder.prepare(),
@@ -659,11 +651,12 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
           throw new Error("麦克风未能完成准备");
         }
         this.assertForeground();
-        // 5/6 Permission prompts can outlive the command that authorized opening.
-        // Revalidate after the stream really exists; a pause/takeover during the
-        // prompt closes tracks before any byte is recorded.
+        // 4/5 唯一一次服务端授权，紧贴真实开录。Permission prompts can outlive the
+        // command that would authorize opening: authorize only after the stream
+        // really exists, so a pause/takeover during the prompt closes tracks
+        // before any byte is recorded.
         //
-        // 这次复核是一整个网络往返，但麦克风**还没开录**：它耗掉的是开麦前预算，
+        // 这次授权是一整个网络往返，但麦克风**还没开录**：它耗掉的是开麦前预算，
         // 不再从老人的 14 秒作答窗口里扣，也不会留下一段没人知道的隐性录音。
         const postPermissionAuthorization = await this.stage(
           deadline,
@@ -684,7 +677,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         const expired = deadline.check();
         if (expired) throw expired;
         this.assertForeground();
-        // 6/6 startPrepared() 在返回 Promise 之前同步下达开录指令；这里 await 的
+        // 5/5 startPrepared() 在返回 Promise 之前同步下达开录指令；这里 await 的
         // 只是真实 onstart 事件。
         const startedReal = await this.stage(
           deadline,
