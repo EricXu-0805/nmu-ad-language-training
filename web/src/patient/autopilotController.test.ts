@@ -4,6 +4,7 @@ import { ApiError } from "../apiResponse.ts";
 import type { DeviceCapabilityRecord } from "../security/deviceCapability.ts";
 import {
   AUTOPILOT_CONTROLLER_AUTHORITY_TEST_ONLY,
+  AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS,
   AutopilotAckPersistenceError,
   PatientAutopilotController,
   deviceCapabilityAllowsAutopilot,
@@ -11,6 +12,7 @@ import {
   type AutopilotAckPersistenceIdentity,
   type AutopilotRecordingExecutor,
   type AutopilotSpeechExecutor,
+  type AutopilotTransientRetryPorts,
   type AutopilotTransport,
 } from "./autopilotController.ts";
 import {
@@ -1557,14 +1559,17 @@ test("before_start 生命周期：零 cancel、零 ACK，服务器命令仍留�
       ack: async () => { throw new Error("不应直连 transport.ack"); },
     },
     speech: { start: () => { throw new Error("不应播放"); } },
-    recording: { start: () => capture },
+    recording: { start: () => { events.push("record:start"); return capture; } },
     ackDelivery: authority.delivery,
     idempotencyKey: fixedAckKey,
   });
 
   const polling = controller.pollOnce();
-  await Promise.resolve();
-  await Promise.resolve();
+  // 推进到采集已经造出来、但真实 onstart 还没发生(started 只会被 interrupt 拒绝)。
+  for (let turn = 0; turn < 40 && !events.includes("record:start"); turn += 1) {
+    await Promise.resolve();
+  }
+  assert.ok(events.includes("record:start"));
   const shutdown = controller.interruptRecordingForLifecycleAndWait();
   await polling;
   await shutdown;
@@ -3740,3 +3745,333 @@ for (const success of [
     assert.equal(state.phase, "waiting_server_after_record");
   });
 }
+
+// ---------------- 活跃 runner 的瞬时网络失败：有界退避重试，零新 key ----------------
+
+/** 可控退避：每次等待只记账、拨快时钟，不真的睡；signal 中止时照生产一样立即拒绝。 */
+function retryHarness() {
+  let nowMs = 0;
+  const waits: number[] = [];
+  const observed: Array<() => void> = [];
+  return {
+    waits,
+    get nowMs() { return nowMs; },
+    /** 每次进入等待时先跑一遍这些观察(用来钉"重试期间相位不变、零媒体")。 */
+    onWait(observer: () => void) { observed.push(observer); },
+    ports: {
+      now: () => nowMs,
+      wait: (delayMs: number, signal: AbortSignal) => {
+        for (const observer of observed) observer();
+        waits.push(delayMs);
+        nowMs += delayMs;
+        return signal.aborted ? Promise.reject(signal.reason) : Promise.resolve();
+      },
+    } satisfies AutopilotTransientRetryPorts,
+  };
+}
+
+function transientError(kind: "0" | "408" | "429" | "503" | "TypeError"): Error {
+  if (kind === "TypeError") return new TypeError("Failed to fetch");
+  return new ApiError(Number(kind), "瞬时失败");
+}
+
+for (const kind of ["0", "408", "429", "503", "TypeError"] as const) {
+  test(`/next 瞬时失败(${kind})按 1.5/3 s 退避重试，期间不播不开麦、相位不变，成功后照常执行`, async () => {
+    const events: string[] = [];
+    const acks: AutopilotAck[] = [];
+    const retry = retryHarness();
+    let nextCalls = 0;
+    const controller = new PatientAutopilotController({
+      sessionId: "S-RETRY-NEXT",
+      transport: {
+        next: async () => {
+          nextCalls += 1;
+          events.push(`next:${nextCalls}`);
+          if (nextCalls <= 2) throw transientError(kind);
+          // legacy 路径:开麦命令 → started 投影 → 终态后再读一次(null)。
+          return nextCalls === 3 ? recordCommand()
+            : nextCalls === 4 ? recordCommand("started") : null;
+        },
+        ack: async (_sessionId, _commandKey, ack) => { acks.push(ack); return {}; },
+      },
+      speech: { start: () => { throw new Error("不应播放"); } },
+      recording: {
+        start: () => {
+          events.push("record:getUserMedia");
+          return settledCapture(events);
+        },
+      },
+      idempotencyKey: fixedAckKey,
+      transientRetry: retry.ports,
+    });
+    retry.onWait(() => {
+      assert.equal(controller.state.phase, "waiting_command");
+      assert.equal(events.includes("record:getUserMedia"), false);
+    });
+
+    const state = await controller.pollOnce();
+
+    assert.deepEqual(retry.waits, [1_500, 3_000]);
+    assert.deepEqual(events.slice(0, 4), ["next:1", "next:2", "next:3", "record:getUserMedia"]);
+    assert.equal(state.pause_reason, null);
+    assert.deepEqual(acks.map((ack) => ack.ack_type), ["record_started", "record_stopped"]);
+  });
+}
+
+for (const permanent of [
+  { name: "401", error: new ApiError(401, "凭据失效") },
+  { name: "403", error: new ApiError(403, "禁止") },
+  { name: "409 其他码", error: new ApiError(409, "冲突", { code: "autopilot_state_invalid", message: "x" }, "nested-detail") },
+  { name: "422", error: new ApiError(422, "契约") },
+  { name: "普通 Error", error: new Error("解析失败") },
+]) {
+  test(`/next 非瞬时失败(${permanent.name})零重试，照旧 technical_failure`, async () => {
+    const retry = retryHarness();
+    let nextCalls = 0;
+    const controller = new PatientAutopilotController({
+      sessionId: "S-RETRY-PERMANENT",
+      transport: {
+        next: async () => { nextCalls += 1; throw permanent.error; },
+        ack: async () => ({}),
+      },
+      speech: { start: () => { throw new Error("不应播放"); } },
+      recording: { start: () => { throw new Error("不应开麦"); } },
+      idempotencyKey: fixedAckKey,
+      transientRetry: retry.ports,
+    });
+    const state = await controller.pollOnce();
+    assert.deepEqual(retry.waits, []);
+    assert.equal(nextCalls, 1);
+    assert.equal(state.phase, "paused");
+    assert.equal(state.pause_reason, "technical_failure");
+  });
+}
+
+test("/next 一直瞬时失败：退避 1.5/3/6/12 s 后下一步会越过 30 s 预算，落到 technical_failure", async () => {
+  const retry = retryHarness();
+  let nextCalls = 0;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-RETRY-BUDGET",
+    transport: {
+      next: async () => { nextCalls += 1; throw transientError("0"); },
+      ack: async () => ({}),
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+    transientRetry: retry.ports,
+  });
+  const state = await controller.pollOnce();
+  assert.deepEqual(retry.waits, [1_500, 3_000, 6_000, 12_000]);
+  assert.ok(retry.nowMs <= AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS);
+  assert.equal(nextCalls, 5);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "technical_failure");
+});
+
+test("退避等待中 stop()：立即收口，不再发下一次请求", async () => {
+  let nextCalls = 0;
+  let abortWait: (() => void) | null = null;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-RETRY-STOP",
+    transport: {
+      next: async () => { nextCalls += 1; throw transientError("503"); },
+      ack: async () => ({}),
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+    transientRetry: {
+      now: () => 0,
+      wait: (_delayMs, signal) => new Promise<void>((_resolve, reject) => {
+        abortWait = () => reject(signal.reason);
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+    },
+  });
+  const polled = controller.pollOnce();
+  for (let turn = 0; turn < 20 && abortWait === null; turn += 1) await Promise.resolve();
+  assert.ok(abortWait);
+  controller.stop();
+  const state = await polled;
+  assert.equal(nextCalls, 1);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "technical_failure");
+});
+
+/** 严格 TTS 收据：与生产 parseAutopilotAckReceipt 的封闭契约逐项对齐。 */
+function ttsReceipt(ack: AutopilotAck): unknown {
+  return ack.ack_type === "tts_started"
+    ? {
+      scope_key: "p0a_sim_first_single_v1",
+      ack_idempotency_key: ack.idempotency_key,
+      ack_type: "tts_started",
+      replayed: false,
+      command_state: "started",
+      command_revision: 1,
+      status: "waiting_tts",
+      state_revision: 2,
+      command: questionCommand("started"),
+    }
+    : {
+      scope_key: "p0a_sim_first_single_v1",
+      ack_idempotency_key: ack.idempotency_key,
+      ack_type: "tts_ended",
+      replayed: false,
+      command_state: "succeeded",
+      command_revision: 2,
+      status: "waiting_recording",
+      state_revision: 3,
+      command: recordCommand(),
+    };
+}
+
+test("ACK 瞬时失败(持久 delivery)：重放同一条 durable envelope、同一个幂等键，零新 key、零重 stage", async () => {
+  const store = new ReplacementStore();
+  store.failStageFor = [];
+  const acked: AutopilotAck[] = [];
+  let ackCalls = 0;
+  const delivery = await DurableAutopilotAckDelivery.create({
+    capability: REPLACEMENT_CAPABILITY,
+    store,
+    transport: {
+      next: async () => null,
+      ack: async (_sid, _key, ack) => {
+        ackCalls += 1;
+        acked.push(ack);
+        if (ackCalls === 1) throw transientError("503");
+        return ttsReceipt(ack);
+      },
+    },
+  });
+  const retry = retryHarness();
+  const events: string[] = [];
+  const nextQueue: Array<NextCommandProjection | null> = [
+    questionCommand(), questionCommand("started"),
+  ];
+  const controller = new PatientAutopilotController({
+    sessionId: REPLACEMENT_SESSION,
+    transport: {
+      next: async () => {
+        events.push("next");
+        if (nextQueue.length === 0) throw new Error("多读了一次 /next");
+        return nextQueue.shift() ?? null;
+      },
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: {
+      start: () => {
+        events.push("speech:start");
+        return {
+          started: Promise.resolve({ media_duration_ms: 900 }),
+          ended: Promise.resolve({ media_duration_ms: 900 }),
+          closed: Promise.resolve(),
+          cancel: () => { events.push("speech:cancel"); },
+        };
+      },
+    },
+    recording: { start: () => { throw new Error("本轮不应开麦"); } },
+    ackDelivery: delivery,
+    idempotencyKey: fixedAckKey,
+    transientRetry: retry.ports,
+  });
+  retry.onWait(() => {
+    // 重试期间：tts_started 还没被确认，相位仍是 tts_ready；delivery 握着同一条 pending。
+    assert.equal(controller.state.phase, "tts_ready");
+    assert.equal(store.pending?.ack.ack_type, "tts_started");
+  });
+
+  const state = await controller.pollOnce();
+
+  assert.deepEqual(retry.waits, [1_500]);
+  // 网络上两次都是同一条 tts_started：同 key、同 seq；随后 tts_ended 是第二个 key。
+  assert.deepEqual(acked.map((ack) => `${ack.ack_type}:s${ack.device_event_seq}`),
+    ["tts_started:s1", "tts_started:s1", "tts_ended:s2"]);
+  assert.equal(acked[0]?.idempotency_key, acked[1]?.idempotency_key);
+  assert.notEqual(acked[1]?.idempotency_key, acked[2]?.idempotency_key);
+  assert.equal(delivery.generatedIdempotencyKeyCount, 2);
+  // create() 读一次 snapshot；之后 tts_started 只 stage 一次，重放零 restage。
+  assert.deepEqual(store.events,
+    ["snapshot", "stage:tts_started", "complete", "stage:tts_ended", "complete"]);
+  assert.equal(events.filter((row) => row === "speech:start").length, 1);
+  assert.equal(events.includes("speech:cancel"), false);
+  // 收据权威直接带回录音命令：tts_ended 之后零 /next。
+  assert.deepEqual(events.filter((row) => row === "next").length, 2);
+  assert.equal(state.phase, "record_ready");
+  assert.equal(state.last_device_event_seq, 2);
+});
+
+test("ACK 瞬时失败(legacy 直连)：重发的是同一个 ack 对象、同一个幂等键", async () => {
+  const retry = retryHarness();
+  const acked: AutopilotAck[] = [];
+  let ackCalls = 0;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-RETRY-ACK-LEGACY",
+    transport: {
+      next: async () => questionCommand(),
+      ack: async (_sessionId, _commandKey, ack) => {
+        ackCalls += 1;
+        acked.push(ack);
+        if (ackCalls === 1) throw transientError("TypeError");
+        return {};
+      },
+    },
+    speech: {
+      start: () => ({
+        started: Promise.resolve({ media_duration_ms: 900 }),
+        ended: new Promise(() => {}),
+        closed: Promise.resolve(),
+        cancel: () => {},
+      }),
+    },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+    transientRetry: retry.ports,
+  });
+  const polled = controller.pollOnce();
+  for (let turn = 0; turn < 40 && controller.state.phase !== "tts_playing"; turn += 1) {
+    await Promise.resolve();
+  }
+  assert.deepEqual(retry.waits, [1_500]);
+  assert.equal(acked.length, 2);
+  assert.equal(acked[0], acked[1]);
+  assert.equal(acked[0]?.idempotency_key, acked[1]?.idempotency_key);
+  // 重发成功之后本地状态才推进：tts_started 落地一次，seq 恰好 +1。
+  assert.equal(controller.state.phase, "tts_playing");
+  assert.equal(controller.state.last_device_event_seq, 1);
+  controller.stop();
+  await polled;
+});
+
+test("delivery 没有重放能力：ACK 瞬时失败零重试，照旧 technical_failure", async () => {
+  const retry = retryHarness();
+  let sends = 0;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-RETRY-NO-REPLAY",
+    transport: {
+      next: async () => questionCommand(),
+      ack: async () => { throw new Error("不应直连 transport.ack"); },
+    },
+    speech: {
+      start: () => ({
+        started: Promise.resolve({ media_duration_ms: 900 }),
+        ended: new Promise(() => {}),
+        closed: Promise.resolve(),
+        cancel: () => {},
+      }),
+    },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    ackDelivery: {
+      initialDeviceEventSeq: 0,
+      lastReceiptAuthority: null,
+      send: async () => { sends += 1; throw transientError("503"); },
+    },
+    idempotencyKey: fixedAckKey,
+    transientRetry: retry.ports,
+  });
+  const state = await controller.pollOnce();
+  assert.deepEqual(retry.waits, []);
+  assert.equal(sends, 1);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "technical_failure");
+});
