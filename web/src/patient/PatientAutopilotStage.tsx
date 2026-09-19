@@ -118,10 +118,11 @@ export function PatientAutopilotStage({
     : null;
   const listening = localPhase?.phase === "listening";
   const persisting = localPhase?.phase === "persisting";
+  const imageReady = autopilot.assetReadiness?.requestKey === stimulusKey
+    && autopilot.assetReadiness.readiness === "ready";
   const status = !activated
     ? "点一下屏幕后开始"
-    : autopilot.assetReadiness?.requestKey !== stimulusKey
-        || autopilot.assetReadiness.readiness === "loading"
+    : !imageReady
       ? "正在准备题目图片"
     : persisting
       ? "录好了，正在保存"
@@ -130,6 +131,17 @@ export function PatientAutopilotStage({
     : runtime?.phase === "tts_playing"
       ? "正在为您朗读"
       : command.kind === "record" ? "正在准备麦克风" : "正在准备朗读";
+  // 提问/线索在播、以及播完到真实开麦之间那一小段，老人常常已经开口，那句话录不
+  // 进去(2026-09-17 养老院实测)。屏上给一句平静的提示；真实 onstart 一到，
+  // listening 接管，换成"正在听您说"。反馈/报答案句不是在等回答，不提示。
+  const purpose = command.kind === "tts"
+    ? command.payload.purpose : command.payload.presentation_purpose;
+  const listenFirstCue = activated && imageReady && !listening && !persisting
+    && (purpose === "question" || purpose === "cue")
+    && (command.kind === "record"
+      ? runtime?.phase === "record_ready"
+      : runtime?.phase === "tts_ready" || runtime?.phase === "tts_playing"
+        || runtime?.phase === "waiting_server_after_tts");
 
   // V2:线索级(prompt_level>0)话术比首问长得多——题图收紧一档(与 legacy
   // PatientStage 的 cueText 规则同义),长文本与贴底收音区互不遮挡。
@@ -148,7 +160,14 @@ export function PatientAutopilotStage({
           />
         </div>
         <p className="question" aria-live="polite" aria-atomic="true">{speechText}</p>
-        <div className="cue-slot" />
+        {/* 提示槽恒占位：提示出现/消失不把问句和麦克风上下顶。不出声，只是屏上一句。 */}
+        <div className="cue-slot">
+          {listenFirstCue && (
+            <p className="patient-optional-hint" data-cue="listen-first" style={{ margin: 0 }}>
+              请听完再回答
+            </p>
+          )}
+        </div>
       </div>
       <div className="stage-mic" aria-live="polite">
         <p className="patient-status" role="status">{status}</p>

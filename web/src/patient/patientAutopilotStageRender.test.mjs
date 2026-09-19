@@ -296,3 +296,106 @@ test("V2:线索级(prompt_level>0)题图收紧一档给长文本让位;首问不
   }));
   assert.match(questionMarkup, /data-compact="false"/);
 });
+
+// ---------------- 「请听完再回答」：提问在播到真实开麦之前的屏上提示 ----------------
+
+/** 提问 TTS 正在播：服务器 runtime 是 tts_playing，本地还没有任何采集相位。 */
+function questionPlayingView(purpose = "question") {
+  const view = recordingView();
+  const question = {
+    schema_version: 1,
+    command_key: "cmd-question-stage-0001",
+    command_seq: 1,
+    kind: "tts",
+    state: "started",
+    command_revision: 1,
+    control_generation: 3,
+    runner_generation: 7,
+    item_ref: "itm-0001",
+    turn_seq: 1,
+    attempt_seq: 1,
+    prompt_level: purpose === "cue" ? 1 : 0,
+    payload: {
+      speech_key: `wk2.01.${purpose}`,
+      speech_text: purpose === "feedback" ? "说得很好。" : "请看这张图片，您能告诉我这是什么吗？",
+      purpose,
+    },
+  };
+  view.current = question;
+  view.runtime = { ...view.runtime, phase: "tts_playing", command: question };
+  view.localCapturePhase = null;
+  return view;
+}
+
+async function renderView(context, view, props = {}) {
+  const vite = await createServer({
+    root: process.cwd(),
+    appType: "custom",
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  context.after(() => vite.close());
+  const { PatientAutopilotStage } = await vite.ssrLoadModule(
+    "/src/patient/PatientAutopilotStage.tsx",
+  );
+  return renderToStaticMarkup(React.createElement(PatientAutopilotStage, {
+    autopilot: view,
+    sessionId: "S-ONE",
+    activated: true,
+    ttsOn: true,
+    externallyPaused: false,
+    ...props,
+  }));
+}
+
+test("提问在播：屏上多一句「请听完再回答」，状态仍是正在为您朗读，不出现正在听您说", async (context) => {
+  // 2026-09-17 养老院实测：老人在提问声里就开口，那句话没录进去，之后工作人员搭话，
+  // 麦克风录到的是工作人员。提示不出声，只是屏上一句。
+  const markup = await renderView(context, questionPlayingView());
+  assert.match(markup, /请听完再回答/);
+  assert.match(markup, /data-cue="listen-first"/);
+  assert.match(markup, /正在为您朗读/);
+  assert.doesNotMatch(markup, /正在听您说/);
+  assert.doesNotMatch(markup, /说完了可以点这里/);
+});
+
+test("线索句在播同样提示；反馈句/报答案句不是在等回答，不提示", async (context) => {
+  assert.match(await renderView(context, questionPlayingView("cue")), /请听完再回答/);
+  assert.doesNotMatch(await renderView(context, questionPlayingView("feedback")), /请听完再回答/);
+  assert.doesNotMatch(await renderView(context, questionPlayingView("tell_answer")), /请听完再回答/);
+});
+
+test("提问播完到真实开麦之前(record_ready，正在准备麦克风)提示不闪掉", async (context) => {
+  const markup = await stageMarkup(context, (view) => {
+    view.current = { ...view.current, state: "pending", command_revision: 0 };
+    view.runtime = { ...view.runtime, phase: "record_ready", command: view.current };
+    view.localCapturePhase = null;
+  });
+  assert.match(markup, /正在准备麦克风/);
+  assert.match(markup, /请听完再回答/);
+});
+
+test("真实 onstart 一到就换成正在听您说：提示消失；收麦保存中也不提示", async (context) => {
+  const listeningMarkup = await stageMarkup(context, () => {});
+  assert.match(listeningMarkup, /正在听您说/);
+  assert.doesNotMatch(listeningMarkup, /请听完再回答/);
+
+  const persistingMarkup = await stageMarkup(context, (view) => {
+    view.localCapturePhase = PERSISTING;
+  });
+  assert.match(persistingMarkup, /录好了，正在保存/);
+  assert.doesNotMatch(persistingMarkup, /请听完再回答/);
+});
+
+test("还没点屏激活、题图还没就绪、麦克风相位已被生命周期清掉：都不提示", async (context) => {
+  assert.doesNotMatch(
+    await renderView(context, questionPlayingView(), { activated: false }), /请听完再回答/);
+
+  const loading = questionPlayingView();
+  loading.assetReadiness = { requestKey: STIMULUS_KEY, readiness: "loading" };
+  assert.doesNotMatch(await renderView(context, loading), /请听完再回答/);
+
+  // capture 被丢弃、本地相位清空，服务器还停在 recording：麦克风已经关了，不能再请老人等着说。
+  const cleared = await stageMarkup(context, (view) => { view.localCapturePhase = null; });
+  assert.doesNotMatch(cleared, /请听完再回答/);
+});
