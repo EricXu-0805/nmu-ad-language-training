@@ -48,7 +48,7 @@ def _insert_utterance(connection, *, event_seq: int = 1,
 
 def test_migration_reaches_exactly_one_repo_head(tmp_path):
     config = _config(tmp_path / "app.db")
-    assert ScriptDirectory.from_config(config).get_heads() == ["e2a6d8f0b419"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["f4b2d8c1a635"]
 
 
 def test_upgrade_creates_ledger_with_exact_constraints(tmp_path):

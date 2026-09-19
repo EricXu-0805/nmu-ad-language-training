@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 from app.runtime import PlanItem, PlanTurn, SessionPlan
 from app.session_completion import (
+    plan_without_skipped,
     assess_completion_with_audio,
     assess_intervention_completion,
     assess_locked_research_truth,
@@ -264,3 +265,25 @@ def test_intervention_completion_keeps_plan_attempt_and_audio_gates_closed():
     assert result.ready is False
     assert result.completed_attempt_turns == 2
     assert result.audio_evidenced_turns == 1
+
+
+def test_skipped_positions_shrink_the_plan_without_touching_other_turns():
+    """研究者现场跳过的题位(具名收据、无录音证据)从冻结计划里拿掉:整题跳过连题目
+    事件都不要求,其余题位一字不放宽。"""
+    plan = _plan()
+    assert plan.total_turns() == 3
+    partial = plan_without_skipped(plan, frozenset({("B", 2)}))
+    assert [(item.item_id, tuple(t.turn_seq for t in item.turns)) for item in partial.items] == [
+        ("A", (1,)), ("B", (1,))]
+    whole = plan_without_skipped(plan, frozenset({("B", 1), ("B", 2)}))
+    assert [item.item_id for item in whole.items] == ["A"]
+    assert whole.total_turns() == 1
+    assert plan_without_skipped(plan, frozenset()) is plan
+    # 没有跳过的题位照旧算「缺环节」。
+    assessment = assess_locked_research_truth(whole, [], [])
+    assert assessment.expected_turns == 1
+    assert [issue.code for issue in assessment.issues] == ["missing_turn"]
+    assessed_full = assess_locked_research_truth(
+        plan, [], [], skipped_positions=frozenset({("B", 1), ("B", 2)}))
+    assert assessed_full.expected_turns == 1
+    assert [issue.item_id for issue in assessed_full.issues] == ["A"]

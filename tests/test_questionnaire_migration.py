@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 # 直接 upgrade 到 "head" 会把后面的迁移也带上，于是「被拒绝的降级」
 # 变得不原子：后一条先降完了，才轮到这一条拒绝。
 HEAD = "b6d4f8a2c917"
-REPO_HEAD = "e2a6d8f0b419"
+REPO_HEAD = "f4b2d8c1a635"
 PARENT = "6f2a9c4d8e17"
 
 

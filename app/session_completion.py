@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Callable, Iterable, Protocol
 
 from .runtime import SessionPlan
@@ -326,10 +326,33 @@ def assess_rapport_completion(
     )
 
 
+SkippedPositions = frozenset[tuple[str, int]]
+
+
+def plan_without_skipped(plan: SessionPlan, skipped: SkippedPositions) -> SessionPlan:
+    """研究者现场跳过的题位(AutopilotPositionAdjudication kind=skipped)不算「缺环节」。
+
+    跳过是具名、带原因、只追加的收据,不伪造录音证据;完成口径把这些题位从
+    冻结计划里拿掉再核对,整题都跳过的题连题目事件都不要求。其余题位一字不放宽。
+    """
+    if not skipped:
+        return plan
+    items = []
+    for item in plan.items:
+        turns = tuple(turn for turn in item.turns
+                      if (item.item_id, turn.turn_seq) not in skipped)
+        if not turns:
+            continue
+        items.append(replace(item, turns=turns))
+    return replace(plan, items=tuple(items))
+
+
 def assess_locked_research_truth(
     plan: SessionPlan,
     item_rows: Iterable[ItemRow],
     turn_rows: Iterable[TurnRow],
+    *,
+    skipped_positions: SkippedPositions = frozenset(),
 ) -> CompletionAssessment:
     """核对计划内每个环节是否有且仅有一条已锁定研究真值。
 
@@ -337,6 +360,7 @@ def assess_locked_research_truth(
     都会阻止 ``completed``。第 1 周空评分计划也不会被当作天然完成；关系建立需要
     独立的脚本/录音完成口径后才能接入终态 API。
     """
+    plan = plan_without_skipped(plan, skipped_positions)
     items = list(item_rows)
     turns = list(turn_rows)
     expected_turns = plan.total_turns()
@@ -476,12 +500,14 @@ def assess_completion_with_audio(
     is_simulation: bool,
     data_classification: str,
     blob_exists: Callable[[str], bool],
+    skipped_positions: SkippedPositions = frozenset(),
 ) -> CompletionAssessment:
     """在锁定研究真值之上，核对每个计划环节的原始录音证据。
 
     录音豁免将来必须是独立结构化字段；当前 schema 没有它，所以缺音频一律
     fail-closed。AI 技术失败的 attempt 不能冒充有效录音证据。
     """
+    plan = plan_without_skipped(plan, skipped_positions)
     items = list(item_rows)
     turns = list(turn_rows)
     audios = {row.raw_audio_id: row for row in audio_rows}
@@ -617,6 +643,7 @@ def assess_intervention_completion(
     is_simulation: bool,
     data_classification: str,
     blob_exists: Callable[[str], bool],
+    skipped_positions: SkippedPositions = frozenset(),
 ) -> InterventionCompletionAssessment:
     """核对床旁自动化流程是否真的走完，但不要求人工确认或锁分。
 
@@ -624,6 +651,7 @@ def assess_intervention_completion(
     严格要求人工确认文本与锁分。本门禁只证明冻结计划的每个环节都有唯一 Turn、
     已完成的权威 Attempt 与仍可用的原始录音，因此可以结束老人端交互并转入异步复核。
     """
+    plan = plan_without_skipped(plan, skipped_positions)
     items = list(item_rows)
     turns = list(turn_rows)
     audios = {row.raw_audio_id: row for row in audio_rows}

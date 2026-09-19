@@ -1422,7 +1422,7 @@ def test_publish_parent_fsync_failure_rolls_back_to_staging(monkeypatch, tmp_pat
 
 
 LEGACY_HEAD = "d0c22a6dae2a"
-CURRENT_HEAD = "e2a6d8f0b419"
+CURRENT_HEAD = "f4b2d8c1a635"
 COVARIATES_HEAD = "c8e5a1f3b209"
 QUALITY_RELEASE_HEAD = "141bc30e4580"
 DISPOSAL_HEAD = "f7c2e8a4d105"

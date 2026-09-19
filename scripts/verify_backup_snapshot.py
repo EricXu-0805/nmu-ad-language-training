@@ -85,13 +85,14 @@ VPS_CONFIG_FILES = frozenset({
     "nmu-backup.service",
     "nmu-backup.timer",
 })
-SUPPORTED_ALEMBIC_HEADS = frozenset({"e2a6d8f0b419"})
+SUPPORTED_ALEMBIC_HEADS = frozenset({"f4b2d8c1a635"})
 LEGACY_RECOVERY_SCHEMA_SHA256 = "847c2b8db25dd910e5b0e03ad0e24c0c0803a93db7b04e4de4d084e4702c0e00"
 CURRENT_RECOVERY_SCHEMA_SHA256 = (
-    "dcf7fe26be6f38d62d528f44cc1a46446527f06ce0c9d4171c0aaf94f6b663f2"
+    "de75dd18b123a1e3e0f6c716c7430b37eb07b28d4a96d38a54131adca24d0222"
 )
 REQUIRED_APPLICATION_TABLES = frozenset({
     "abnormalevent",
+    "autopilotpositionadjudication",
     "assessmentcommand",
     "assessmentdeferralapproval",
     "assessmentevent",
@@ -149,7 +150,8 @@ REQUIRED_APPLICATION_TABLES = frozenset({
     "week1profile",
 })
 RECOVERY_SCHEMA_TABLES = REQUIRED_APPLICATION_TABLES | {"alembic_version"}
-LEGACY_RECOVERY_SCHEMA_TABLES = RECOVERY_SCHEMA_TABLES - {"rapportplaybackreceipt"}
+LEGACY_RECOVERY_SCHEMA_TABLES = RECOVERY_SCHEMA_TABLES - {
+    "rapportplaybackreceipt", "autopilotpositionadjudication"}
 
 
 class SnapshotError(RuntimeError):

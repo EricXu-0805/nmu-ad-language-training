@@ -102,6 +102,10 @@ _TURNS = Dataset(
         Column("session_code", "pseudonym", "string", "场次假名"),
         Column("subject_code", "pseudonym", "string", "受试者假名"),
         Column("item_id", "clear", "string", "冻结题目标识"),
+        Column("presentation_order", "clear", "integer",
+               "冻结计划位置(1 起):第 2–8 周固定为 单要素 1–20、双要素 21–30、多要素 31–32；"
+               "题型内序号 = 单要素原值 / 双要素减 20 / 多要素减 30，与变量记录表的题号一致。"
+               "item_id 跨周复用，核对方案必须同时看 sessions.week_no 与本列"),
         Column("task_type", "clear", "string", "题型：单要素 / 双要素 / 多要素"),
         Column("turn_seq", "clear", "integer", "环节序号（自然键，替代数据库主键）"),
         Column("response_role", "clear", "string", "作答角色"),
@@ -121,6 +125,14 @@ _TURNS = Dataset(
         Column("ai_human_diff", "clear", "float", "人工分减 AI 分，两者皆有时才有值"),
         Column("judge_portrait_used", "clear", "boolean",
                "判分是否用过画像：恒为 false，这一列是★画像不进判分的审计证据"),
+        Column("adjudication_kind", "clear", "string",
+               "研究者现场裁定：confirmed_correct（老人其实答对）/ terminated_no_verdict"
+               "（本题到此为止）/ 空=AI 自行收口。裁定不改 ai_* 列，也不是研究真值；"
+               "真值仍看 reviewed_score / score_locked"),
+        Column("adjudication_reason", "clear", "string",
+               "裁定原因闭集：late_correct_after_window / asr_misrecognized / "
+               "staff_judged_correct / participant_declined / asr_repeatedly_failed / "
+               "trained_in_prior_sitting / other"),
         Column("withdrawn", "clear", "boolean",
                "该环节的受试者是否已登记研究撤回。撤回者的行是墓碑：自然键"
                "（item_id / turn_seq）与本列保留，其余全为空。**统计时必须先按"

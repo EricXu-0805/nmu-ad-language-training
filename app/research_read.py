@@ -39,6 +39,7 @@ from sqlmodel import Session as DBSession, select
 from . import export_security, research_dataset, session_admission
 from .models import (
     AttemptEvent,
+    AutopilotPositionAdjudication,
     ItemEvent,
     Patient,
     QualityReleaseEpochRowSnapshot,
@@ -486,6 +487,15 @@ def list_turns(db: DBSession, *, config, data_classification: str,
                 AttemptEvent.id.in_(attempt_ids)))
         }
 
+    adjudications: dict[tuple[str, str, int], AutopilotPositionAdjudication] = {}
+    page_session_ids = {sess.session_id for _, _, sess in page}
+    if page_session_ids:
+        adjudications = {
+            (row.session_id, row.item_id, row.turn_seq): row
+            for row in db.exec(select(AutopilotPositionAdjudication).where(
+                AutopilotPositionAdjudication.session_id.in_(page_session_ids)))
+        }
+
     rows: list[dict[str, Any]] = []
     last_key: list[Any] | None = None
     for turn, item, sess in page:
@@ -507,7 +517,8 @@ def list_turns(db: DBSession, *, config, data_classification: str,
         else:
             rows.append(_turn_row(
                 session_code, subject_code, item, turn,
-                attempt_seq.get(turn.source_attempt_id)))
+                attempt_seq.get(turn.source_attempt_id),
+                adjudications.get((sess.session_id, item.item_id, turn.turn_seq))))
         last_key = [sess.session_id, item.item_id, turn.turn_seq]
 
     next_cursor = (encode_cursor(last_key, config, "turns")
@@ -674,13 +685,15 @@ def list_questionnaire_item_values(db: DBSession, *, config,
 
 def _turn_row(session_code: str, subject_code: str,
               item: ItemEvent, turn: TurnEvent,
-              source_attempt_seq: int | None) -> dict[str, Any]:
+              source_attempt_seq: int | None,
+              adjudication: AutopilotPositionAdjudication | None = None) -> dict[str, Any]:
     diff = (None if turn.reviewed_score is None or turn.ai_score is None
             else round(turn.reviewed_score - turn.ai_score, 4))
     return {
         "session_code": session_code,
         "subject_code": subject_code,
         "item_id": item.item_id,
+        "presentation_order": item.presentation_order,
         "task_type": getattr(item.task_type, "value", item.task_type),
         "turn_seq": turn.turn_seq,
         "response_role": getattr(turn.response_role, "value", turn.response_role),
@@ -697,6 +710,8 @@ def _turn_row(session_code: str, subject_code: str,
         "element_value": getattr(turn.element_value, "value", turn.element_value),
         "ai_human_diff": diff,
         "judge_portrait_used": turn.judge_portrait_used,
+        "adjudication_kind": adjudication.kind if adjudication else None,
+        "adjudication_reason": adjudication.reason_code if adjudication else None,
         # 在训的人必须是 False 而不是 null：SPSS 里 null 是缺失值，
         # `filter withdrawn = 0` 会把在训的人一起滤掉。
         "withdrawn": False,

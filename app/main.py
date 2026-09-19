@@ -63,6 +63,7 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      AttemptCaptureProcessing,
                      AttemptEvent, AuditLog, AudioAssetRow,
                      AudioCaptureReceipt, AudioLocalCopyDisposalReceipt,
+                     AutopilotPositionAdjudication,
                      CaregiverHelpRequest,
                      ExportBatch, InteractionEvent,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
@@ -8066,7 +8067,17 @@ def _assess_session_completion(sess: TrainSession, s: DBSession) -> tuple[
         is_simulation=sess.is_simulation,
         data_classification=sess.data_classification,
         blob_exists=lambda raw_audio_id: raw_audio_id in verified_audio_ids,
+        skipped_positions=_skipped_autopilot_positions(sess.session_id, s),
     )
+
+
+def _skipped_autopilot_positions(session_id: str, s: DBSession) -> frozenset[tuple[str, int]]:
+    """研究者现场跳过的题位(具名、带原因、只追加,收据 260);完成口径按此收窄冻结计划。"""
+    return frozenset(
+        (row.item_id, row.turn_seq) for row in s.exec(
+            select(AutopilotPositionAdjudication).where(
+                AutopilotPositionAdjudication.session_id == session_id,
+                AutopilotPositionAdjudication.kind == "skipped")))
 
 
 def _assess_intervention_completion(
@@ -8093,6 +8104,7 @@ def _assess_intervention_completion(
         is_simulation=sess.is_simulation,
         data_classification=sess.data_classification,
         blob_exists=lambda raw_audio_id: raw_audio_id in verified_audio_ids,
+        skipped_positions=_skipped_autopilot_positions(sess.session_id, s),
     )
 
 
@@ -9768,6 +9780,25 @@ class AutopilotTakeoverIn(BaseModel):
     expected_revision: int = PydanticField(ge=0)
 
 
+class AutopilotAdjudicateIn(BaseModel):
+    """研究者对当前题位的现场裁定(收据 260):具名、闭集原因、只追加;裁定后 AI 进下一题。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = PydanticField(
+        min_length=8, max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,99}$",
+    )
+    expected_revision: int = PydanticField(ge=0)
+    kind: Literal["confirmed_correct", "skip_item"]
+    reason_code: Literal[
+        "late_correct_after_window", "asr_misrecognized", "staff_judged_correct",
+        "participant_declined", "asr_repeatedly_failed", "trained_in_prior_sitting",
+        "other",
+    ]
+    note: str | None = PydanticField(default=None, max_length=200)
+
+
 class AutopilotResumeIn(BaseModel):
     """Account CAS command; resume reason/source are derived server-side."""
 
@@ -10130,6 +10161,91 @@ def autopilot_resume(
             _autopilot_write_failure(s, exc)
         except IntegrityError as exc:
             _autopilot_integrity_conflict(s, exc)
+    return result
+
+
+@app.post(
+    "/sessions/{session_id}/autopilot/adjudicate",
+    response_model=autopilot_service.AutopilotStatusReceipt,
+)
+def autopilot_adjudicate(
+        session_id: str, body: AutopilotAdjudicateIn, request: Request,
+        s: DBSession = Depends(get_session)):
+    """研究者现场裁定当前题位(老人已答对 / 跳过本题),同事务让 AI 从下一位继续。
+
+    与 resume 同一安全闸与同一 runtime 复活路径:控制面裁定 + resume 与 runtime
+    active 一次 commit。AI 判类一字不改;研究真值仍走事后复核锁分。
+    """
+    actor_id = _require_account_identity(
+        request, "裁定自动带练题位",
+        roles={"researcher", "admin"},
+        allow_local_m0=True)
+    patient_id = _preauthorize_session_subject_fence(
+        request, session_id, s, "裁定自动带练题位")
+    with (governance_lock.subject_fence(s, patient_id),
+          _LIVE_WRITE_LOCK,
+          device_capability.serialized_mutation()):
+        sess = s.exec(select(TrainSession).where(
+            TrainSession.session_id == session_id,
+        ).with_for_update()).first()
+        if sess is None:
+            raise HTTPException(404, "场次不存在")
+        _require_session_operator(
+            request, sess, s, "裁定自动带练题位", mutation=True)
+        _require_started_visit_plan_session(session_id, s, sess=sess)
+        live = _live_row_for_update(s)
+        runtime = _runtime_row_for_update(session_id, s)
+        try:
+            provider_readiness.require_resume_ready(s)
+        except provider_readiness.ProviderReadinessConflict as exc:
+            s.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=provider_readiness.conflict_detail(exc)) from exc
+        _ensure_patient_capture_idle_for_autopilot(live)
+        _ensure_runtime_writable(session_id, s, "裁定")
+        revived = False
+        if runtime.status == "paused":
+            # 与 resume 端点同款先复活 runtime(服务层的门要求场次 active);
+            # 裁定的是最后一题、没有下一位可续时,下面再按回暂停,由研究者直接收尾。
+            live_is_current = bool(live and _live_session_id(live) == session_id)
+            if live_is_current and live:
+                _set_live_session_paused(live, False)
+                live.patient_rec_json = None
+                live.seq += 1
+                live.updated_at = datetime.now()
+                s.add(live)
+            runtime.status = "active"
+            runtime.resumed_at = datetime.now()
+            runtime.revision += 1
+            runtime.updated_at = runtime.resumed_at
+            s.add(runtime)
+            s.flush()
+            revived = True
+        try:
+            outcome = autopilot_service.adjudicate_p0a_position(
+                s,
+                session_id=session_id,
+                idempotency_key=body.idempotency_key,
+                expected_revision=body.expected_revision,
+                actor_id=actor_id,
+                kind=body.kind,
+                reason_code=body.reason_code,
+                note=body.note,
+            )
+            if outcome.command is None and revived:
+                _pause_runtime_in_transaction(session_id, s)
+            result = autopilot_service.get_autopilot_status(
+                s, session_id=session_id)
+            s.commit()
+        except autopilot_service.AutopilotServiceError as exc:
+            _autopilot_write_failure(s, exc)
+        except IntegrityError as exc:
+            _autopilot_integrity_conflict(s, exc)
+        # 审计走独立会话,必须等本事务 commit 释放 SQLite 写锁后再追加(与中止端点同序)。
+        _audit(s, request, "autopilot_position_adjudicated",
+               f"kind={body.kind} reason={body.reason_code} actor={actor_id}",
+               session_id=session_id)
     return result
 
 

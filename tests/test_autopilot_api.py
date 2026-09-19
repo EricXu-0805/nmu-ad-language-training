@@ -55,7 +55,7 @@ from app.models import (
     TtsServeEvidence,
     TurnEvent,
     VisitPlan,
-)
+    AutopilotPositionAdjudication,)
 
 
 SESSION_ID = "S-P0A-HTTP"
@@ -6017,9 +6017,13 @@ def test_resume_is_blocked_for_withdrawn_subject(
         assert (state.mode, state.status) == ("manual", "paused")
 
 
-def test_resume_rejects_position_stopped_mid_cue_ladder(
+def test_resume_continues_mid_cue_ladder_with_the_pending_cue(
         api_clients: ApiClients, monkeypatch):
-    """提示阶梯中段被暂停的题位不可原地续弹:如实拒绝并保持暂停原样。"""
+    """提示阶梯中段被暂停的题位,恢复时按最后一次 attempt 重算下一步并续弹同一条线索。
+
+    2026-09-17 养老院三场就死在这里:老人一按「暂停练习」,只要这题答过一轮,AI 就再也
+    续不上(旧行为 autopilot_resume_position_unresumable)。现在恢复命令就是判分后本该
+    下发的那条 cue(prompt_level 1 / attempt_seq 2),线索播完照常开第二次麦。"""
     _enable_p0a(monkeypatch)
     _drive_to_processing_attempt(api_clients)
     monkeypatch.setattr(asr, "get_engine", lambda: _EmptyTranscriptAsr())
@@ -6027,10 +6031,8 @@ def test_resume_rejects_position_stopped_mid_cue_ladder(
 
     cue = _device_next(api_clients)
     assert cue is not None and cue["kind"] == "tts"
-    assert json.loads(
-        Session(api_clients.engine).exec(select(RuntimeCommand).where(
-            RuntimeCommand.command_seq == cue["command_seq"],
-        )).first().payload_json)["purpose"] == "cue"
+    assert cue["payload"]["purpose"] == "cue"
+    assert (cue["prompt_level"], cue["attempt_seq"]) == (1, 2)
 
     paused = api_clients.account.post(f"/sessions/{SESSION_ID}/pause")
     assert paused.status_code == 200, paused.text
@@ -6041,17 +6043,273 @@ def test_resume_rejects_position_stopped_mid_cue_ladder(
     )
     assert drained.status_code == 200, drained.text
 
-    rejected = _resume(
+    resumed = _resume(
         api_clients, key="resume-mid-ladder-0001",
         expected_revision=drained.json()["state_revision"])
-    assert rejected.status_code == 409, rejected.text
-    assert rejected.json()["detail"]["code"] == (
-        "autopilot_resume_position_unresumable")
+    assert resumed.status_code == 200, resumed.text
+    receipt = resumed.json()
+    assert (receipt["mode"], receipt["status"]) == ("autonomous", "waiting_tts")
+    assert receipt["position_item_id"] == FIRST_ONLY_BANK.single_element[0]["item_id"]
+
+    reissued = _device_next(api_clients)
+    assert reissued is not None and reissued["kind"] == "tts"
+    assert reissued["payload"]["purpose"] == "cue"
+    assert reissued["payload"]["speech_text"] == cue["payload"]["speech_text"]
+    assert (reissued["prompt_level"], reissued["attempt_seq"]) == (1, 2)
+    assert reissued["command_key"] != cue["command_key"]
+    assert reissued["control_generation"] == cue["control_generation"] + 1
+
+    ended = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{reissued['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(reissued, ack_type="tts_ended", ack_key="ack-mid-ladder-cue-ended-0001",
+                       device_event_seq=3, media_ended=True, media_duration_ms=900),
+    )
+    assert ended.status_code == 200, ended.text
+    record = ended.json()["command"]
+    assert record["kind"] == "record"
+    assert (record["prompt_level"], record["attempt_seq"]) == (1, 2)
     with Session(api_clients.engine) as session:
         state = session.get(SessionAutopilotState, SESSION_ID)
-        assert state is not None and state.status == "paused"
+        assert state is not None and state.status == "waiting_recording"
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None and runtime_state.status == "active"
+
+
+def test_resume_after_pause_during_terminal_feedback_concludes_the_turn_and_advances(
+        api_clients: ApiClients, monkeypatch):
+    """反馈话术播到一半被暂停:这一题在判分时就已收口(TurnEvent 落账),恢复时直接从
+    下一题的问句继续,不重问、不跳题、不重复收口。"""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(api_clients)
+    monkeypatch.setattr(asr, "get_engine", lambda: _WorkerAsr())
+    _run_p0a_attempt_worker(SESSION_ID)
+
+    feedback = _device_next(api_clients)
+    assert feedback is not None and feedback["payload"]["purpose"] == "feedback"
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{feedback['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(TurnEvent)))) == 1
+
+    resumed = _resume(api_clients, key="resume-after-feedback-0001",
+                      expected_revision=drained.json()["state_revision"])
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["position_item_id"] == TWO_ONLY_BANK.single_element[1]["item_id"]
+    with Session(api_clients.engine) as session:
+        turns = list(session.exec(select(TurnEvent)))
+        assert len(turns) == 1
+        assert turns[0].turn_seq == 1 and turns[0].ai_answer_type == "正确"
+        item = session.get(ItemEvent, turns[0].item_event_id)
+        assert item.item_id == TWO_ONLY_BANK.single_element[0]["item_id"]
+        assert item.presentation_order == 1
+    question = _device_next(api_clients)
+    assert question is not None and question["payload"]["purpose"] == "question"
+    assert (question["prompt_level"], question["attempt_seq"]) == (0, 1)
+
+
+def test_resume_after_device_rotation_continues_with_the_new_device(
+        api_clients: ApiClients, monkeypatch):
+    """换设备暂停(旧凭据已吊销)= 媒体终止证明:恢复与接管都不再被拒。
+    2026-09-17 C1 第 3 周练了 45 分钟,平板重新连接就整场报废——这是那条出口。"""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(api_clients)
+    blocked_asr = _BlockingWorkerAsr()
+    monkeypatch.setattr(asr, "get_engine", lambda: blocked_asr)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        worker = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert blocked_asr.entered.wait(timeout=10)
+        new_device = TestClient(app)
+        try:
+            paired = new_device.post(
+                "/device/pair", headers={"X-Console-Pin": "24681024"},
+                json={"deviceId": "p0a-http-device-rotated-000003"})
+            assert paired.status_code == 200, paired.text
+            new_headers = {"X-Device-Capability": paired.json()["capability"]}
+        finally:
+            blocked_asr.release.set()
+        worker.result(timeout=10)
+    with Session(api_clients.engine) as session:
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.last_error_code == "autopilot_device_rotated"
+        revision = state.revision
+
+    resumed = _resume(api_clients, key="resume-after-rotation-0001",
+                      expected_revision=revision)
+    assert resumed.status_code == 200, resumed.text
+    assert (resumed.json()["mode"], resumed.json()["status"]) == ("autonomous", "waiting_tts")
+    # 新平板拿到的是重出的问句(旧那段采集没有 attempt,题位从 0 级重来)。
+    command = new_device.get(
+        f"/sessions/{SESSION_ID}/autopilot/next", headers=new_headers)
+    assert command.status_code == 200, command.text
+    assert command.json()["kind"] == "tts"
+    assert command.json()["payload"]["purpose"] == "question"
+    with Session(api_clients.engine) as session:
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None and runtime_state.status == "active"
+    new_device.close()
+
+
+def _adjudicate(clients: ApiClients, *, key: str, expected_revision: int,
+                kind: str, reason_code: str, note: str | None = None):
+    body = {"idempotency_key": key, "expected_revision": expected_revision,
+            "kind": kind, "reason_code": reason_code}
+    if note is not None:
+        body["note"] = note
+    return clients.account.post(
+        f"/sessions/{SESSION_ID}/autopilot/adjudicate", json=body)
+
+
+def test_adjudicate_confirmed_correct_concludes_the_turn_and_advances(
+        api_clients: ApiClients, monkeypatch):
+    """ASR 把答对听成别的(2026-09-17:螺母→刘世茂):研究者暂停后点「老人已答对」——
+    这一题按最后一次 attempt 收口,AI 判类原样保留,裁定具名带原因,AI 进下一题。"""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(api_clients)
+    monkeypatch.setattr(asr, "get_engine", lambda: _EmptyTranscriptAsr())
+    _run_p0a_attempt_worker(SESSION_ID)
+    cue = _device_next(api_clients)
+    assert cue is not None and cue["payload"]["purpose"] == "cue"
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{cue['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    revision = drained.json()["state_revision"]
+
+    adjudicated = _adjudicate(
+        api_clients, key="adjudicate-correct-0001", expected_revision=revision,
+        kind="confirmed_correct", reason_code="asr_misrecognized", note="老人说的就是胡萝卜")
+    assert adjudicated.status_code == 200, adjudicated.text
+    receipt = adjudicated.json()
+    assert (receipt["mode"], receipt["status"]) == ("autonomous", "waiting_tts")
+    assert receipt["position_item_id"] == TWO_ONLY_BANK.single_element[1]["item_id"]
+    with Session(api_clients.engine) as session:
+        turns = list(session.exec(select(TurnEvent)))
+        assert len(turns) == 1
+        turn = turns[0]
+        assert (turn.ai_answer_type, turn.ai_score, turn.reviewed_score, turn.score_locked) == (
+            "沉默", 0.0, None, False)
+        rows = list(session.exec(select(AutopilotPositionAdjudication)))
+        assert len(rows) == 1
+        row = rows[0]
+        assert (row.kind, row.reason_code, row.note, row.turn_seq) == (
+            "confirmed_correct", "asr_misrecognized", "老人说的就是胡萝卜", 1)
+        assert row.item_id == TWO_ONLY_BANK.single_element[0]["item_id"]
+        assert row.turn_event_id == turn.id and row.source_attempt_id == turn.source_attempt_id
+        assert row.actor_id and row.is_simulation is True
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None and runtime_state.status == "active"
+        audits = list(session.exec(select(AuditLog).where(
+            AuditLog.action == "autopilot_position_adjudicated")))
+        assert len(audits) == 1 and "confirmed_correct" in audits[0].summary
+    # 同键重放:不再落第二条裁定,走恢复的重放路径。
+    replay = _adjudicate(
+        api_clients, key="adjudicate-correct-0001", expected_revision=revision,
+        kind="confirmed_correct", reason_code="asr_misrecognized", note="老人说的就是胡萝卜")
+    assert replay.status_code == 200, replay.text
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(AutopilotPositionAdjudication)))) == 1
+        assert len(list(session.exec(select(TurnEvent)))) == 1
+    # 裁定行只追加:更新/删除在 ORM 层就被拒。
+    with Session(api_clients.engine) as session:
+        row = session.exec(select(AutopilotPositionAdjudication)).first()
+        row.note = "改口"
+        session.add(row)
+        with pytest.raises(RuntimeError, match="禁止更新或删除"):
+            session.commit()
+
+
+def test_adjudicate_skip_item_without_an_answer_writes_a_skip_receipt_and_advances(
+        api_clients: ApiClients, monkeypatch):
+    """老人不愿答这题:题位没有任何录音,跳过只落具名收据,不造 TurnEvent;AI 进下一题。"""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    assert _start(api_clients).status_code == 200
+    question = _device_next(api_clients)
+    assert question is not None
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{question['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+
+    skipped = _adjudicate(
+        api_clients, key="adjudicate-skip-0001",
+        expected_revision=drained.json()["state_revision"],
+        kind="skip_item", reason_code="participant_declined")
+    assert skipped.status_code == 200, skipped.text
+    assert skipped.json()["position_item_id"] == TWO_ONLY_BANK.single_element[1]["item_id"]
+    with Session(api_clients.engine) as session:
+        assert list(session.exec(select(TurnEvent))) == []
+        rows = list(session.exec(select(AutopilotPositionAdjudication)))
+        assert [(r.kind, r.item_id, r.turn_seq, r.source_attempt_id, r.turn_event_id) for r in rows] == [
+            ("skipped", TWO_ONLY_BANK.single_element[0]["item_id"], 1, None, None)]
+    nxt = _device_next(api_clients)
+    assert nxt is not None and nxt["payload"]["purpose"] == "question"
+    assert nxt["payload"]["speech_text"] == TWO_ONLY_BANK.single_element[1]["initial_prompt"]
+
+
+def test_adjudicate_skip_of_the_last_item_leaves_the_scope_paused_for_wrapup(
+        api_clients: ApiClients, monkeypatch):
+    """跳过的是最后一题:没有下一位可续,状态留在安全暂停(不伪造完成事实),由研究者收尾。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    question = _device_next(api_clients)
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{question['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    skipped = _adjudicate(
+        api_clients, key="adjudicate-skip-last-0001",
+        expected_revision=drained.json()["state_revision"],
+        kind="skip_item", reason_code="other", note="演示只练一题")
+    assert skipped.status_code == 200, skipped.text
+    assert skipped.json()["status"] == "paused"
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(AutopilotPositionAdjudication)))) == 1
         runtime_state = session.get(SessionRuntimeState, SESSION_ID)
         assert runtime_state is not None and runtime_state.status == "paused"
+
+
+def test_adjudicate_requires_a_safe_pause_and_a_recorded_answer_for_confirmed_correct(
+        api_clients: ApiClients, monkeypatch):
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    question = _device_next(api_clients)
+    with Session(api_clients.engine) as session:
+        revision = session.get(SessionAutopilotState, SESSION_ID).revision
+    running = _adjudicate(api_clients, key="adjudicate-running-0001", expected_revision=revision,
+                          kind="confirmed_correct", reason_code="staff_judged_correct")
+    assert running.status_code == 409, running.text
+    assert running.json()["detail"]["code"] == "autopilot_adjudication_requires_pause"
+
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{question['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    no_answer = _adjudicate(api_clients, key="adjudicate-noanswer-0001",
+                            expected_revision=drained.json()["state_revision"],
+                            kind="confirmed_correct", reason_code="staff_judged_correct")
+    assert no_answer.status_code == 409, no_answer.text
+    assert no_answer.json()["detail"]["code"] == "autopilot_adjudication_attempt_required"
+    wrong_reason = api_clients.account.post(
+        f"/sessions/{SESSION_ID}/autopilot/adjudicate",
+        json={"idempotency_key": "adjudicate-badreason-0001",
+              "expected_revision": drained.json()["state_revision"],
+              "kind": "skip_item", "reason_code": "asr_misrecognized"})
+    assert wrong_reason.status_code == 422, wrong_reason.text
+    assert wrong_reason.json()["detail"]["code"] == "autopilot_input_invalid"
+    with Session(api_clients.engine) as session:
+        assert list(session.exec(select(AutopilotPositionAdjudication))) == []
 
 
 def test_device_failure_pauses_the_session_runtime_and_resume_revives_it(

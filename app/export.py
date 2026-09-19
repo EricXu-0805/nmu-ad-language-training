@@ -36,7 +36,7 @@ from .enums import AudioStatus
 from .models import (
     AbnormalEvent, AttemptCaptureProcessing, AttemptEvent, AudioAssetRow,
     AudioCaptureReceipt, AutopilotRepeatRequest, InteractionEvent, ItemEvent,
-    AutopilotControlEvent, Patient, PatientDeviceCapability,
+    AutopilotControlEvent, AutopilotPositionAdjudication, Patient, PatientDeviceCapability,
     PatientWithdrawalEvent, QuestionnaireItemValue, QuestionnaireRecord,
     RuntimeCommand, RuntimeCommandAck,
     ExportArtifact, ExportBatch, ScaleResult, Session as TrainSession, SessionCloseoutReport,
@@ -1232,7 +1232,14 @@ def export_session_bundle(
     session_code = export_security.pseudonymize_session(
         session_id, deidentification_config)
 
-    items = list(db.exec(select(ItemEvent).where(ItemEvent.session_id == session_id)))
+    # 按冻结计划位置出行,不按 item_id 字典序:核对方案时靠的就是这个序号(收据 260)。
+    items = list(db.exec(select(ItemEvent).where(ItemEvent.session_id == session_id)
+                         .order_by(ItemEvent.presentation_order, ItemEvent.id)))
+    adjudications = list(db.exec(select(AutopilotPositionAdjudication).where(
+        AutopilotPositionAdjudication.session_id == session_id
+    ).order_by(AutopilotPositionAdjudication.id)))
+    adjudication_by_position = {
+        (row.item_id, row.turn_seq): row for row in adjudications}
     turns_by_item: dict[int, list[TurnEvent]] = {}
     for it in items:
         rows = list(db.exec(select(TurnEvent).where(TurnEvent.item_event_id == it.id)
@@ -1298,9 +1305,15 @@ def export_session_bundle(
                         or source_attempt.turn_seq != t.turn_seq):
                     raise ValueError("环节关联的原始 attempt 不属于本场次/本环节，拒绝导出")
                 source_attempt_seq = source_attempt.attempt_seq
+            adjudicated = adjudication_by_position.get((it.item_id, t.turn_seq))
             turn_sheet.append({
                 **session_cols(), "item_id": it.item_id,
+                "presentation_order": it.presentation_order,
                 "task_type": _v(it.task_type), "turn_seq": t.turn_seq,
+                # 研究者现场裁定(答对/到此为止),与 AI 判类并列;研究真值仍看 reviewed_score。
+                "adjudication_kind": adjudicated.kind if adjudicated else None,
+                "adjudication_reason": adjudicated.reason_code if adjudicated else None,
+                "adjudicated_by": adjudicated.actor_id if adjudicated else None,
                 "response_role": t.response_role,
                 "source_attempt_seq": source_attempt_seq,
                 "asr_text": asr, "confirmed_response_text": conf,
@@ -1317,6 +1330,15 @@ def export_session_bundle(
                 "ai_human_diff": (None if t.reviewed_score is None or t.ai_score is None
                                   else round(t.reviewed_score - t.ai_score, 4)),
                 "judge_portrait_used": t.judge_portrait_used})
+
+    # --- 研究者现场裁定(含没有录音证据的「跳过」题位)---
+    adjudication_sheet = [{
+        **session_cols(), "item_id": row.item_id, "turn_seq": row.turn_seq,
+        "kind": row.kind, "reason_code": row.reason_code,
+        "note": export_security.redact_free_text(row.note),
+        "adjudicated_by": row.actor_id,
+        "adjudication_seq": index + 1,
+    } for index, row in enumerate(adjudications)]
 
     # --- 重建评分汇总 ---
     scores = _reconstruct_scores(items, turns_by_item)
@@ -1521,6 +1543,7 @@ def export_session_bundle(
     # 表名闭集：漏声明一张表 → _write_csvs 会拒收；声明了却从来不产 → 分析者
     # 拿到的包永远少一张而没人报错。两个方向都在这里当场炸。
     sheets = {"session": session_sheet, "turns": turn_sheet, "attempts": attempt_sheet,
+              "adjudications": adjudication_sheet,
               "interactions": interaction_sheet, "item_scores": score_sheet,
               "scales": scale_sheet,
               "legacy_unverified_scales": legacy_unverified_scale_sheet,
@@ -2088,12 +2111,17 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         "pseudonym_key_id", "pseudonym_version",
     ),
     "turns": _SESSION_COLS + (
-        "item_id", "task_type", "turn_seq", "response_role",
+        "item_id", "presentation_order", "task_type", "turn_seq", "response_role",
         "source_attempt_seq", "asr_text", "confirmed_response_text",
         "asr_confidence", "prompt_level", "ai_answer_type", "ai_score",
         "ai_needs_review", "ai_judge_mode", "reviewed_score", "score_locked",
         "element_value", "ai_human_diff", "judge_portrait_used",
         "duration_seconds",
+        "adjudication_kind", "adjudication_reason", "adjudicated_by",
+    ),
+    "adjudications": _SESSION_COLS + (
+        "item_id", "turn_seq", "kind", "reason_code", "note", "adjudicated_by",
+        "adjudication_seq",
     ),
     "attempts": _SESSION_COLS + (
         "item_id", "turn_seq", "response_role", "attempt_seq", "audio_code",

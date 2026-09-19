@@ -10,21 +10,22 @@ from test_rapport_utterance_migration import (
     _config, _insert_utterance, _recovery_guard, _schema_rows,
 )
 
-HEAD = "e2a6d8f0b419"
+REPO_HEAD = "f4b2d8c1a635"     # 全仓头(裁定收据表);本层历史头由 HEAD 钉住
+HEAD = "e2a6d8f0b419"          # 本层迁移头:回放/采集代际
 PARENT = "d0c22a6dae2a"
 
 
 def test_generation_upgrade_roundtrip_matches_current_recovery_contract(tmp_path):
     db = tmp_path / "app.db"
     config = _config(db)
-    command.upgrade(config, HEAD)
+    command.upgrade(config, REPO_HEAD)
     guard = _recovery_guard()
     for _ in range(2):
         with sqlite3.connect(db) as conn:
             assert guard._schema_contract_fingerprint(conn) == guard.CURRENT_RECOVERY_SCHEMA_SHA256
         command.downgrade(config, PARENT)
         assert "rapportplaybackreceipt" not in inspect(create_engine(f"sqlite:///{db}")).get_table_names()
-        command.upgrade(config, HEAD)
+        command.upgrade(config, REPO_HEAD)
 
 
 def test_duplicate_history_blocks_upgrade_before_any_schema_change(tmp_path):

@@ -861,6 +861,86 @@ def _reject_autopilot_repeat_request_mutation(*_args) -> None:
     raise RuntimeError("AutopilotRepeatRequest 是只追加账本，禁止更新或删除")
 
 
+ADJUDICATION_KINDS = ("confirmed_correct", "terminated_no_verdict", "skipped")
+ADJUDICATION_REASON_CODES = (
+    "late_correct_after_window", "asr_misrecognized", "staff_judged_correct",
+    "participant_declined", "asr_repeatedly_failed", "trained_in_prior_sitting",
+    "other",
+)
+
+
+class AutopilotPositionAdjudication(SQLModel, table=True):
+    """研究者对自动带练某个题位的现场裁定,只追加、具名、带原因(收据 260)。
+
+    养老院实测(2026-09-17):ASR 把「螺母」听成「刘世茂」、老人在题目念完前就答、
+    超时后才答对——研究者只能对着麦克风喊,被录进去又判错。这里给三种裁定:
+      confirmed_correct     老人其实答对了:按最后一次已完成的 attempt 收口本题位
+                            (TurnEvent 的 ai_* 原样抄 attempt,AI 原判不动),AI 进下一题。
+      terminated_no_verdict 这一题位不再追问,按最后一次 attempt 收口(跳过本题时
+                            当前题位若已有回答走这条)。
+      skipped               题位没有任何回答就跳过:不造 TurnEvent,恢复/完成门/
+                            导出按「研究者跳过」识别,绝不伪造录音证据。
+    研究真值(reviewed_score / score_locked)仍只走事后复核锁分;本表只是运行流程的
+    可归责收据,导出里与 AI 判类并列。
+    """
+    __table_args__ = (
+        UniqueConstraint("session_id", "item_id", "turn_seq",
+                         name="uq_position_adjudication_position"),
+        UniqueConstraint("idempotency_key",
+                         name="uq_position_adjudication_idempotency"),
+        UniqueConstraint("turn_event_id",
+                         name="uq_position_adjudication_turn_event"),
+        Index("ix_position_adjudication_session_created",
+              "session_id", "created_at"),
+        CheckConstraint("turn_seq >= 1", name="ck_position_adjudication_turn_positive"),
+        CheckConstraint("state_revision >= 0",
+                        name="ck_position_adjudication_revision_nonnegative"),
+        CheckConstraint(
+            "kind IN ('confirmed_correct','terminated_no_verdict','skipped')",
+            name="ck_position_adjudication_kind"),
+        CheckConstraint(
+            "reason_code IN ('late_correct_after_window','asr_misrecognized',"
+            "'staff_judged_correct','participant_declined','asr_repeatedly_failed',"
+            "'trained_in_prior_sitting','other')",
+            name="ck_position_adjudication_reason"),
+        CheckConstraint(
+            "(kind = 'skipped' AND source_attempt_id IS NULL AND turn_event_id IS NULL)"
+            " OR (kind <> 'skipped' AND source_attempt_id IS NOT NULL"
+            " AND turn_event_id IS NOT NULL)",
+            name="ck_position_adjudication_evidence_matches_kind"),
+        CheckConstraint("length(trim(actor_id)) > 0",
+                        name="ck_position_adjudication_actor_nonempty"),
+        CheckConstraint("length(idempotency_key) BETWEEN 8 AND 128",
+                        name="ck_position_adjudication_idempotency_length"),
+        CheckConstraint("note IS NULL OR length(note) <= 200",
+                        name="ck_position_adjudication_note_length"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: str = Field(foreign_key="session.session_id", index=True)
+    item_id: str = Field(index=True)
+    turn_seq: int
+    kind: str                                # confirmed_correct / terminated_no_verdict / skipped
+    reason_code: str
+    note: Optional[str] = None
+    actor_id: str = Field(index=True)
+    source_attempt_id: Optional[int] = Field(
+        default=None, foreign_key="attemptevent.id")
+    turn_event_id: Optional[int] = Field(default=None, foreign_key="turnevent.id")
+    control_generation: int
+    state_revision: int
+    idempotency_key: str
+    created_at: datetime = Field(default_factory=_utc_now_naive)
+    is_simulation: bool = False
+
+
+@sa_event.listens_for(AutopilotPositionAdjudication, "before_update")
+@sa_event.listens_for(AutopilotPositionAdjudication, "before_delete")
+def _reject_position_adjudication_mutation(*_args) -> None:
+    """研究者裁定是只追加收据;改错只能再追加一条相反裁定,不得更新或删除。"""
+    raise RuntimeError("AutopilotPositionAdjudication 是只追加证据，禁止更新或删除")
+
+
 class InteractionEvent(SQLModel, table=True):
     """运行交互只追加账本。
 
