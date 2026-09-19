@@ -282,6 +282,26 @@ export function receiptAllowsAutopilotResume(
     || (receipt.serverOwned && receipt.takeoverReady);
 }
 
+// 研究者裁定(老人已答对/跳过本题)的呈现资格:与「继续 AI 自动带练」同一份收麦
+// 证明,但只在 AI 自己暂停的来态出现——人工接管态下研究者自己判分,不需要裁定。
+export function receiptAllowsAutopilotAdjudication(
+  receipt: AutopilotStatusReceipt | null,
+): boolean {
+  return receiptAllowsAutopilotResume(receipt) && receipt?.mode === "autonomous";
+}
+
+/** 服务端 409 的规范 code(nested-detail 信封);其他形状一律 null。 */
+export function autopilotConflictCode(error: unknown): string | null {
+  if (!(error instanceof ApiError)
+      || error.status !== 409
+      || error.detailEnvelope !== "nested-detail"
+      || error.detailData === null
+      || typeof error.detailData !== "object"
+      || Array.isArray(error.detailData)) return null;
+  const code = (error.detailData as { code?: unknown }).code;
+  return typeof code === "string" && SAFE_ERROR_CODE.test(code) ? code : null;
+}
+
 export interface AutopilotResumeRequest {
   idempotency_key: string;
   expected_revision: number;

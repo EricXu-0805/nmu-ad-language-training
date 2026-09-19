@@ -16,6 +16,8 @@ import {
   buildAutopilotResumeRequest,
   buildAutopilotAdjudicateRequest,
   AUTOPILOT_ADJUDICATION_REASONS,
+  autopilotConflictCode,
+  receiptAllowsAutopilotAdjudication,
   receiptAllowsAutopilotResume,
   receiptAllowsAutopilotTakeover,
 } from "./startControl.ts";
@@ -165,6 +167,44 @@ test("resume 请求构造:revision 围栏与幂等键形状", () => {
   });
   assert.throws(() => buildAutopilotResumeRequest("S-a1b2c3d4", 0), /状态版本/);
   assert.throws(() => buildAutopilotResumeRequest("受试者\n答案", 3), /不能安全/);
+});
+
+test("adjudicate 呈现资格:只在 AI 自己暂停且有收麦证明时出现,人工接管态不出", () => {
+  assert.equal(receiptAllowsAutopilotAdjudication(null), false);
+  const pausedNoProof = parseAutopilotStatusReceipt({
+    ...safeStatus(), status: "paused", current_command_kind: null,
+  });
+  assert.equal(receiptAllowsAutopilotAdjudication(pausedNoProof), false);
+  const drained = parseAutopilotStatusReceipt({
+    ...safeStatus(), status: "paused", current_command_kind: null,
+    takeover_ready: true,
+  });
+  assert.equal(receiptAllowsAutopilotAdjudication(drained), true);
+  // resume 允许人工接管态切回;裁定不允许——人工面自己判分。
+  const manual = parseAutopilotStatusReceipt({
+    ...safeStatus(), mode: "manual", status: "paused",
+    current_command_kind: null, server_owned: false,
+  });
+  assert.equal(receiptAllowsAutopilotResume(manual), true);
+  assert.equal(receiptAllowsAutopilotAdjudication(manual), false);
+  assert.equal(receiptAllowsAutopilotAdjudication({ ...drained, status: "failed" }), false);
+});
+
+test("409 规范 code 只从 nested-detail 信封里取,别的形状一律 null", () => {
+  assert.equal(autopilotConflictCode(new ApiError(
+    409, "先暂停", { code: "autopilot_adjudication_requires_pause" }, "nested-detail",
+  )), "autopilot_adjudication_requires_pause");
+  assert.equal(autopilotConflictCode(new ApiError(
+    409, "conflict", { code: "autopilot_revision_conflict" }, "nested-detail",
+  )), "autopilot_revision_conflict");
+  assert.equal(autopilotConflictCode(new ApiError(409, "conflict", "conflict", "direct")), null);
+  assert.equal(autopilotConflictCode(new ApiError(
+    422, "bad", { code: "autopilot_attempt_processing" }, "nested-detail",
+  )), null);
+  assert.equal(autopilotConflictCode(new ApiError(
+    409, "bad", { code: "Not A Code" }, "nested-detail",
+  )), null);
+  assert.equal(autopilotConflictCode(new Error("network")), null);
 });
 
 test("adjudicate 请求构造:与 resume 同一 revision 围栏,幂等键带 kind,原因码按类型闭集", () => {
