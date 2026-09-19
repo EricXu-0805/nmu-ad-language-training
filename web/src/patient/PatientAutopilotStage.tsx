@@ -6,6 +6,7 @@ import {
   resolveExactAutopilotDisplayText,
   type ExactAutopilotDisplayText,
 } from "./autopilotDisplayText.ts";
+import { patientStimulusKey } from "./patientAssetMediaGate.ts";
 import type { PatientAutopilotView } from "./usePatientAutopilot.ts";
 
 export function PatientAutopilotStage({
@@ -103,6 +104,9 @@ export function PatientAutopilotStage({
 
   const speechText = displayRef.current?.text
     ?? "请稍等一下";
+  // 题图按 item/turn 取、按 item/turn 判就绪：提问→录音换的是 command_key，
+  // 不是题，同一张图不再下载第二遍。
+  const stimulusKey = patientStimulusKey(command);
   // 两端都以浏览器自己的事实为准，不等服务器 runtime。
   // 开录那一端：真实 onstart 之后 record_started 还要走一整个网络往返，服务器
   // 此刻仍是 waiting_recording；等它才显示"正在听您说"，就是白白吃掉老人的
@@ -116,7 +120,7 @@ export function PatientAutopilotStage({
   const persisting = localPhase?.phase === "persisting";
   const status = !activated
     ? "点一下屏幕后开始"
-    : autopilot.assetReadiness?.requestKey !== command.command_key
+    : autopilot.assetReadiness?.requestKey !== stimulusKey
         || autopilot.assetReadiness.readiness === "loading"
       ? "正在准备题目图片"
     : persisting
@@ -136,7 +140,7 @@ export function PatientAutopilotStage({
         <div className="stage-image" data-compact={compactImage ? "true" : "false"}>
           <ImagePane
             sessionId={sessionId}
-            requestKey={command.command_key}
+            requestKey={stimulusKey}
             spotlight="none"
             compact={compactImage}
             alt="题目图片"

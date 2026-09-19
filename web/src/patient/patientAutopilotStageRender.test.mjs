@@ -5,6 +5,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 const COMMAND_KEY = "cmd-record-stage-0001";
+// = patientStimulusKey({ item_ref: "itm-0001", turn_seq: 1 })
+const STIMULUS_KEY = "itm-0001\u00001";
 
 const IDENTITY = {
   sessionId: "S-ONE",
@@ -49,7 +51,8 @@ function recordingView() {
     },
     current: command,
     reason: null,
-    assetReadiness: { requestKey: COMMAND_KEY, readiness: "ready" },
+    // 题图就绪按 item/turn 判(patientStimulusKey),不按 command_key:提问→录音不重下图。
+    assetReadiness: { requestKey: STIMULUS_KEY, readiness: "ready" },
     // 屏显与按钮由浏览器自己的 listening 驱动，不由服务器 runtime 驱动。
     localCapturePhase: LISTENING,
     reportAssetReadiness: () => {},

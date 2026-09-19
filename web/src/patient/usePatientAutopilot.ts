@@ -72,7 +72,7 @@ import {
   planAutopilotProbeFailure,
 } from "./autopilotProbePolicy.ts";
 import type { PatientAssetReadinessEvent } from "./currentPatientAsset.ts";
-import { PatientAssetMediaGate } from "./patientAssetMediaGate.ts";
+import { PatientAssetMediaGate, patientStimulusKey } from "./patientAssetMediaGate.ts";
 import {
   PATIENT_AUTOPILOT_WAKE_EVENT,
   PatientProbeWakeCoordinator,
@@ -210,8 +210,11 @@ export function usePatientAutopilot(input: {
 
   const reportAssetReadiness = useCallback((event: PatientAssetReadinessEvent) => {
     // A stale image callback can arrive after React has projected a newer
-    // command. It must neither satisfy nor fail that newer command's gate.
-    if (serverContextRef.current?.current?.command_key !== event.requestKey) return;
+    // item. It must neither satisfy nor fail that newer item's gate. The key is
+    // the stimulus position (item/turn), so the record command that follows a
+    // question keeps the image the question already loaded.
+    const current = serverContextRef.current?.current ?? null;
+    if (current === null || patientStimulusKey(current) !== event.requestKey) return;
     assetGateRef.current?.report(event.requestKey, event.readiness);
     setAssetReadiness(event);
     if (event.readiness !== "failed") return;
