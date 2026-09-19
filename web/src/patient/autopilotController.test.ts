@@ -351,6 +351,187 @@ test("提问播完、tts_ended 已签名之后，收麦不再多等一个空闲�
     ["tts_started", "tts_ended", "record_started", "record_stopped"]);
 });
 
+/**
+ * 持久 delivery 替身：与生产 DurableAutopilotAckDelivery 一样，每条被服务器确认的
+ * ACK 都把收据里的 command 锁成权威。tts_ended 的收据带回服务器**同一瞬间**签发
+ * 的 pending 录音命令(status waiting_recording)；record_started 带回 started 投影。
+ */
+function receiptFollowupDelivery(events: string[], acks: AutopilotAck[], drift: {
+  /** tts_ended 收据随身的投影；undefined = 正常的 pending 录音命令。 */
+  endedFollowup?: NextCommandProjection | null;
+  endedAckType?: AutopilotAck["ack_type"];
+  endedIdempotencyKey?: string;
+  endedCommandKey?: string;
+} = {}) {
+  let authority: ReceiptAuthority | null = null;
+  return {
+    initialDeviceEventSeq: 0,
+    get lastReceiptAuthority() { return authority; },
+    send: async (
+      command: NextCommandProjection,
+      seq: number,
+      facts: Parameters<typeof buildAutopilotAck>[3],
+    ) => {
+      events.push(`delivery:${facts.ack_type}:r${command.command_revision}`);
+      const ack = buildAutopilotAck(command, seq, `k:${facts.ack_type}:${seq}`, facts);
+      acks.push(ack);
+      if (facts.ack_type === "tts_ended") {
+        authority = {
+          commandKey: drift.endedCommandKey ?? command.command_key,
+          ackType: drift.endedAckType ?? "tts_ended",
+          ackIdempotencyKey: drift.endedIdempotencyKey ?? ack.idempotency_key,
+          commandRevision: command.command_revision + 1,
+          command: drift.endedFollowup === undefined ? recordCommand() : drift.endedFollowup,
+        };
+      } else if (facts.ack_type === "record_started") {
+        authority = {
+          commandKey: command.command_key,
+          ackType: "record_started",
+          ackIdempotencyKey: ack.idempotency_key,
+          commandRevision: 1,
+          command: recordCommand("started"),
+        };
+      } else {
+        authority = {
+          commandKey: command.command_key,
+          ackType: facts.ack_type,
+          ackIdempotencyKey: ack.idempotency_key,
+          commandRevision: command.command_revision + 1,
+          command: null,
+        };
+      }
+      return ack;
+    },
+  };
+}
+
+function receiptFollowupRunner(events: string[], acks: AutopilotAck[], input: {
+  /** /next 的应答队列；读空即抛，钉住「多读了一次」。 */
+  nextQueue: Array<NextCommandProjection | null>;
+  drift?: Parameters<typeof receiptFollowupDelivery>[2];
+}) {
+  return new PatientAutopilotController({
+    sessionId: "S-RECEIPT",
+    transport: {
+      next: async () => {
+        events.push("next");
+        if (input.nextQueue.length === 0) throw new Error("多读了一次 /next");
+        return input.nextQueue.shift() ?? null;
+      },
+      ack: async () => { throw new Error("持久 delivery 路径不应直连 transport.ack"); },
+    },
+    speech: {
+      start: () => ({
+        started: Promise.resolve({ media_duration_ms: 900 }),
+        ended: Promise.resolve({ media_duration_ms: 900 }),
+        closed: Promise.resolve(),
+        cancel: () => { events.push("speech:cancel"); },
+      }),
+    },
+    recording: {
+      start: (command) => {
+        events.push("record:getUserMedia");
+        return {
+          started: Promise.resolve({ mime_type: "audio/webm" as const }),
+          stopped: Promise.resolve({
+            stop_reason: "max_duration" as const,
+            raw_audio_id: command.payload.raw_audio_id,
+            receipt_server_seq: 44,
+            checksum: CHECKSUM,
+            byte_count: 4_096,
+            duration_seconds: 11.5,
+          }),
+          closed: Promise.resolve(),
+          cancel: () => { events.push("record:cancel"); },
+        };
+      },
+    },
+    ackDelivery: receiptFollowupDelivery(events, acks, input.drift),
+    idempotencyKey: fixedAckKey,
+  });
+}
+
+test("tts_ended 收据随身带回录音命令：当场采纳，下一拍不再读 /next 就开麦", async () => {
+  // 2026-09-17 养老院实测：服务器 0.00 s 签发录音命令，平板中位 1.61 s 才 record_started，
+  // 老人在提问声里就开口，那句话没录进去。收据里已经有这条命令，不该再去 /next 读两遍。
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const controller = receiptFollowupRunner(events, acks, {
+    nextQueue: [questionCommand(), questionCommand("started"), null],
+  });
+
+  const afterQuestion = await controller.pollOnce();
+  assert.equal(afterQuestion.phase, "record_ready");
+  assert.equal(afterQuestion.command?.command_key, recordCommand().command_key);
+  assert.equal(autopilotNextTickDelayMs(afterQuestion), 0);
+  // tts_ended 持久化之后一次 /next 都没读：录音命令来自收据权威。
+  assert.deepEqual(events, [
+    "next",
+    "delivery:tts_started:r0",
+    "next",
+    "delivery:tts_ended:r1",
+  ]);
+
+  const afterRecord = await controller.pollOnce();
+  assert.equal(afterRecord.phase, "waiting_server_after_record");
+  // 这一拍开头也不读 /next：开麦前的服务器闸是执行器里紧贴 onstart 的那次授权。
+  assert.deepEqual(events.slice(4), [
+    "record:getUserMedia",
+    "delivery:record_started:r0",
+    "delivery:record_stopped:r1",
+  ]);
+  assert.deepEqual(acks.map((ack) => ack.ack_type),
+    ["tts_started", "tts_ended", "record_started", "record_stopped"]);
+
+  // 跳过只对紧接着的那一拍生效：之后的节拍照旧先读 /next。
+  await controller.pollOnce();
+  assert.equal(events.at(-1), "next");
+  assert.equal(events.filter((row) => row === "next").length, 3);
+});
+
+for (const negative of [
+  { name: "收据没投影命令（exact 重放 / 非媒体等待态）", drift: { endedFollowup: null } },
+  { name: "收据投影的是下一条 TTS 而不是录音", drift: { endedFollowup: questionCommand() } },
+  { name: "收据投影的录音不是 pending", drift: { endedFollowup: recordCommand("started") } },
+  {
+    name: "收据投影的录音不是这条提问的后继（command_seq 跳号）",
+    drift: { endedFollowup: { ...recordCommand(), command_seq: 3 } },
+  },
+  {
+    name: "收据投影的录音换了 runner 代际",
+    drift: { endedFollowup: { ...recordCommand(), runner_generation: 8 } },
+  },
+  { name: "收据 ACK 类型不是 tts_ended", drift: { endedAckType: "tts_started" as const } },
+  { name: "收据 ACK 幂等键对不上", drift: { endedIdempotencyKey: "k:forged:2" } },
+  { name: "收据命令键对不上", drift: { endedCommandKey: "cmd-question-controller-9999" } },
+]) {
+  test(`收据权威不足（${negative.name}）：不采纳、不判死，照旧读 /next`, async () => {
+    const events: string[] = [];
+    const acks: AutopilotAck[] = [];
+    const controller = receiptFollowupRunner(events, acks, {
+      nextQueue: [questionCommand(), questionCommand("started"), recordCommand(), recordCommand()],
+      drift: negative.drift,
+    });
+
+    const afterQuestion = await controller.pollOnce();
+    // 采纳失败一步都不改本地状态：/next 交回的 pending 录音命令照常进入 record_ready。
+    assert.equal(afterQuestion.phase, "record_ready");
+    assert.equal(afterQuestion.pause_reason, null);
+    assert.deepEqual(events, [
+      "next",
+      "delivery:tts_started:r0",
+      "next",
+      "delivery:tts_ended:r1",
+      "next",
+    ]);
+
+    const afterRecord = await controller.pollOnce();
+    assert.equal(afterRecord.phase, "waiting_server_after_record");
+    // 没有采纳就没有跳过：下一拍照旧先读 /next 再开麦。
+    assert.deepEqual(events.slice(5, 7), ["next", "record:getUserMedia"]);
+  });
+}
+
 test("the recorder is requested only after an exact record command and returns the server receipt tuple", async () => {
   const events: string[] = [];
   const acks: AutopilotAck[] = [];

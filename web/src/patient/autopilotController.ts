@@ -432,6 +432,9 @@ export class PatientAutopilotController {
   private discardedCapture: AutopilotRecordingCapture | null = null;
   private stopped = false;
   private patientPauseRequested = false;
+  // 随 tts_ended 收据一起采纳的那条 pending 录音命令。下一拍据此跳过开头的
+  // /next：服务器刚刚在同一条响应里签发了它，再读一次只是多一个往返。一次性。
+  private receiptAdoptedRecordKey: string | null = null;
 
   constructor(options: PatientAutopilotControllerOptions) {
     this.sessionId = options.sessionId;
@@ -668,7 +671,15 @@ export class PatientAutopilotController {
     if (this.stopped || this.stateValue.phase === "paused"
         || this.stateValue.phase === "scope_completed") return this.stateValue;
     try {
-      await this.refreshCommand();
+      // 上一拍 tts_ended 的收据已经带回了这条 pending 录音命令并经 reducer 采纳：
+      // 这一拍不再先读 /next。开麦前的最后一道服务器闸仍是执行器里紧贴真实
+      // onstart 的那次 recording-authorization，这里省掉的只是一个纯读往返。
+      const adoptedKey = this.receiptAdoptedRecordKey;
+      this.receiptAdoptedRecordKey = null;
+      const holdsReceiptRecord = adoptedKey !== null
+        && this.stateValue.command?.command_key === adoptedKey
+        && canOpenAutopilotMicrophone(this.stateValue);
+      if (!holdsReceiptRecord) await this.refreshCommand();
       // refreshCommand mutates the property through a method; widen the prior
       // control-flow narrowing before examining the newly reduced state.
       if ((this.stateValue as AutopilotRuntimeState).phase === "paused") return this.stateValue;
@@ -843,12 +854,16 @@ export class PatientAutopilotController {
         return;
       }
       await playback.closed;
-      await this.sendAck(startedCommand, {
+      const endedAck = await this.sendAck(startedCommand, {
         ack_type: "tts_ended",
         media_ended: true,
         ...observedEnd.value,
       });
-      await this.refreshCommand();
+      // 服务器在接受 tts_ended 的同一条响应里就签发了下一条录音命令(收据权威)。
+      // 直接采纳它，省掉一个 /next 往返；证明不足或 reducer 不认，才照旧读 /next。
+      if (!this.adoptReceiptRecordCommand(startedCommand, endedAck)) {
+        await this.refreshCommand();
+      }
     } finally {
       await playback.closed;
       if (this.activeMedia === playback) this.activeMedia = null;
@@ -1125,6 +1140,45 @@ export class PatientAutopilotController {
     const adopted = this.stateValue.command;
     return this.stateValue.phase !== "paused" && adopted?.kind === "record"
       && adopted.state === "started" ? adopted : null;
+  }
+
+  /**
+   * 把 tts_ended 收据随身带回的那条 **pending 录音命令**当场采纳。
+   *
+   * 2026-09-17 养老院实测：服务器在 tts_ended 到达那一刻(0.00 s)就签发了录音
+   * 命令，平板却要再走一个 /next、等下一拍、再走一个 /next 才开麦，中位 1.61 s，
+   * 老人早就在提问声里开口了。收据权威与 /next 投影是同一份服务器 projection、
+   * 同一个解析器；证明项与 record_started 那条一样逐项核：ACK 类型、命令键、
+   * ACK 幂等键都必须是刚刚真的发出去的这一条，投影必须是 pending 录音。
+   *
+   * 采纳只走既有 server_command reducer，先在副本上试：expectedFollowup(seq+1、
+   * 同代际、同 item/turn/attempt/prompt_level)任一项不成立，或它没落到 record_ready，
+   * 就一步都不改本地状态、返回 false，由调用方照旧读 /next——同一条不一致的投影
+   * 在那条路上会得到同样的 fail-closed 判定，这里不抢先判死。
+   */
+  private adoptReceiptRecordCommand(acked: TtsCommand, ack: AutopilotAck): boolean {
+    const authority = this.ackDelivery?.lastReceiptAuthority ?? null;
+    const projected = authority?.command ?? null;
+    if (authority === null || projected === null
+        || authority.ackType !== "tts_ended"
+        || ack.ack_type !== "tts_ended"
+        || authority.commandKey !== acked.command_key
+        || authority.ackIdempotencyKey !== ack.idempotency_key
+        || projected.kind !== "record"
+        || projected.state !== "pending") {
+      return false;
+    }
+    const next = autopilotRuntimeReducer(this.stateValue, {
+      type: "server_command", command: projected,
+    });
+    if (!canOpenAutopilotMicrophone(next)
+        || next.command?.command_key !== projected.command_key) {
+      return false;
+    }
+    this.stateValue = next;
+    this.receiptAdoptedRecordKey = projected.command_key;
+    this.emitState();
+    return true;
   }
 
   /** 权威不足时的安全暂停：零终态 ACK、零失败 ACK、零本地合成 revision。 */
