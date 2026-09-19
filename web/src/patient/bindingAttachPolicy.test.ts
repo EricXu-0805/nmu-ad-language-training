@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ATTACH_POLL_MAX_MS,
+  ATTACH_POLL_MS,
   attachHintFor,
+  attachPollDelayMs,
   classifyAttachOutcome,
+  nextAttachNoSessionStreak,
   shouldAttemptAttach,
 } from "./bindingAttachPolicy.ts";
 
@@ -43,4 +47,40 @@ test("只有『有绑定且无能力』的设备才轮询 attach", () => {
   assert.equal(shouldAttemptAttach(true, true), false);
   assert.equal(shouldAttemptAttach(false, false), false);
   assert.equal(shouldAttemptAttach(false, true), false);
+});
+
+test("连续「没有场次」的轮询间隔从 2 s 翻倍到 10 s 封顶;没有连续记录就是 2 s", () => {
+  // 2026-09 网络复审:场次之间平板整天挂在问候页,每 2 s 一个 409 攒出几百条。
+  assert.equal(ATTACH_POLL_MS, 2_000);
+  assert.equal(ATTACH_POLL_MAX_MS, 10_000);
+  assert.deepEqual([0, 1, 2, 3, 4, 10, 100].map(attachPollDelayMs),
+    [2_000, 4_000, 8_000, 10_000, 10_000, 10_000, 10_000]);
+  assert.equal(attachPollDelayMs(-1), 2_000);
+  assert.equal(attachPollDelayMs(Number.NaN), 2_000);
+  assert.equal(attachPollDelayMs(1.5), 2_000);
+});
+
+test("计数只对 409 no_session 往上加;200 归零;别的设备占着/限速/网络抖动/绑定死亡都不动", () => {
+  assert.equal(nextAttachNoSessionStreak(0, { disposition: "quiet_retry", hint: "no_session" }), 1);
+  assert.equal(nextAttachNoSessionStreak(3, { disposition: "quiet_retry", hint: "no_session" }), 4);
+  assert.equal(nextAttachNoSessionStreak(3, { disposition: "attached", hint: null }), 0);
+  assert.equal(nextAttachNoSessionStreak(3, { disposition: "quiet_retry", hint: "busy" }), 3);
+  assert.equal(nextAttachNoSessionStreak(3, { disposition: "quiet_retry", hint: null }), 3);
+  assert.equal(nextAttachNoSessionStreak(3, { disposition: "drop_binding", hint: null }), 3);
+});
+
+test("一串结果对应的间隔:409,409,409 → 4/8/10 s;中间一次网络抖动不打断;200 之后回到 2 s", () => {
+  const results: Array<Parameters<typeof nextAttachNoSessionStreak>[1]> = [
+    { disposition: "quiet_retry", hint: "no_session" },
+    { disposition: "quiet_retry", hint: "no_session" },
+    { disposition: "quiet_retry", hint: null },
+    { disposition: "quiet_retry", hint: "no_session" },
+    { disposition: "attached", hint: null },
+  ];
+  let streak = 0;
+  const delays = results.map((result) => {
+    streak = nextAttachNoSessionStreak(streak, result);
+    return attachPollDelayMs(streak);
+  });
+  assert.deepEqual(delays, [4_000, 8_000, 8_000, 10_000, 2_000]);
 });

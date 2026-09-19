@@ -3,6 +3,30 @@
 import type { SyncMsg } from "../sync/messages";
 
 export const ATTACH_POLL_MS = 2000;
+// 场次之间平板整天挂在问候页,每 2 s 一个 409 no_session 攒出几百条(2026-09 网络复审)。
+// 连续「没有场次」就翻倍退避到 10 s;一接上(200)、回到前台、手动配对/能力更新就归零。
+export const ATTACH_POLL_MAX_MS = 10_000;
+
+/** 连续 n 次「这位受试者没有场次」之后的下一次轮询间隔:2 s 起翻倍,封顶 10 s。 */
+export function attachPollDelayMs(consecutiveNoSession: number): number {
+  if (!Number.isSafeInteger(consecutiveNoSession) || consecutiveNoSession <= 0) {
+    return ATTACH_POLL_MS;
+  }
+  return Math.min(ATTACH_POLL_MS * (2 ** Math.min(consecutiveNoSession, 8)), ATTACH_POLL_MAX_MS);
+}
+
+/**
+ * 一次 attach 结果之后的连续「没有场次」计数。只有 409 no_session 往上加;200 归零;
+ * 别的设备占着、限速、网络抖动、绑定死亡都不动它——退避只针对"安静等场次"这一种常态。
+ */
+export function nextAttachNoSessionStreak(
+  streak: number,
+  result: { disposition: AttachDisposition; hint: AttachHint },
+): number {
+  if (result.disposition === "attached") return 0;
+  if (result.hint === "no_session") return streak + 1;
+  return streak;
+}
 
 // 同一浏览器再开一个老人端页签:两页共用同一份绑定与 deviceId,新页一去 attach 就把
 // 旧页的能力轮换掉并让自动带练安全暂停(2026-09-04 生产 autopilot_device_rotated)。
