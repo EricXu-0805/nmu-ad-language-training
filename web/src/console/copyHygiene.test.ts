@@ -65,6 +65,22 @@ test("编辑抽屉:同意状态单选项有解释;编号禁改时不再显示自
   assert.match(editDrawer, /已有训练数据，编号不能再改/);
 });
 
+test("研究者裁定按钮的文案说真话:AI 判定保留、决定连账号名和原因记录,引用真实按钮名", () => {
+  // 2026-09-17 养老院实测:ASR 把螺母听成刘世茂、老人过了答窗才答对,研究者只能
+  // 转人工。裁定是可归因的追加记录,不改写 AI 判定,科研真值仍走事后复核。
+  assert.match(autopilotControl, /AI 自己的判定原样保留/);
+  assert.match(autopilotControl, /连同账号名和原因一起记录/);
+  assert.match(autopilotControl, /研究评分仍以事后复核为准/);
+  assert.doesNotMatch(autopilotControl, /改写 AI 判定|覆盖 AI 判定|修正 AI 判定/);
+  // 提示里让人去点的按钮必须真实存在。
+  assert.match(autopilotControl, /可以点「跳过本题」，或点「继续 AI 自动带练」让 AI 重问这一题/);
+  assert.doesNotMatch(autopilotControl, /或「继续」让 AI 重问/);
+  for (const label of ["超时后才答对", "识别错了，其实答对了", "研究者在场判定答对",
+    "老人不愿意答这题", "识别反复出错", "上一场已经练过这题", "其他"]) {
+    assert.match(autopilotControl, new RegExp(label));
+  }
+});
+
 test("自动带练启动拒因逐分支说真话,不再一律折成「麦克风还未确认关闭」", () => {
   // 旧 catch-all:任何 prepareOwnership 失败都硬写成同一句麦克风文案(Eric
   // 2026-08-25 实测被误导一整晚)。麦克风文案只允许出现在 TrainingConsoleScreen

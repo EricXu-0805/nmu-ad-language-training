@@ -282,6 +282,26 @@ export function receiptAllowsAutopilotResume(
     || (receipt.serverOwned && receipt.takeoverReady);
 }
 
+// 研究者裁定(老人已答对/跳过本题)的呈现资格:与「继续 AI 自动带练」同一份收麦
+// 证明,但只在 AI 自己暂停的来态出现——人工接管态下研究者自己判分,不需要裁定。
+export function receiptAllowsAutopilotAdjudication(
+  receipt: AutopilotStatusReceipt | null,
+): boolean {
+  return receiptAllowsAutopilotResume(receipt) && receipt?.mode === "autonomous";
+}
+
+/** 服务端 409 的规范 code(nested-detail 信封);其他形状一律 null。 */
+export function autopilotConflictCode(error: unknown): string | null {
+  if (!(error instanceof ApiError)
+      || error.status !== 409
+      || error.detailEnvelope !== "nested-detail"
+      || error.detailData === null
+      || typeof error.detailData !== "object"
+      || Array.isArray(error.detailData)) return null;
+  const code = (error.detailData as { code?: unknown }).code;
+  return typeof code === "string" && SAFE_ERROR_CODE.test(code) ? code : null;
+}
+
 export interface AutopilotResumeRequest {
   idempotency_key: string;
   expected_revision: number;
@@ -300,6 +320,71 @@ export function buildAutopilotResumeRequest(
   return {
     idempotency_key: `p0a.resume.${sessionId}.${stateRevision}`,
     expected_revision: stateRevision,
+  };
+}
+
+export type AutopilotAdjudicationKind = "confirmed_correct" | "skip_item";
+
+// 服务端 adjudicate 路由的原因码闭集,按裁定类型分组;UI 标签在控件里配。
+export const AUTOPILOT_ADJUDICATION_REASONS = {
+  confirmed_correct: ["late_correct_after_window", "asr_misrecognized", "staff_judged_correct"],
+  skip_item: ["participant_declined", "asr_repeatedly_failed", "trained_in_prior_sitting", "other"],
+} as const;
+
+export type AutopilotAdjudicationReason =
+  (typeof AUTOPILOT_ADJUDICATION_REASONS)[AutopilotAdjudicationKind][number];
+
+export interface AutopilotAdjudicateRequest {
+  idempotency_key: string;
+  expected_revision: number;
+  kind: AutopilotAdjudicationKind;
+  reason_code: AutopilotAdjudicationReason;
+  note?: string;
+}
+
+const ADJUDICATION_NOTE_MAX = 200;
+const ADJUDICATION_IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+
+/**
+ * 研究者裁定(老人已答对 / 跳过本题)与 resume 共用同一条 revision 围栏:同一
+ * 版本上只有一条控制事实能落账。幂等键里带 kind,丢响应重试时「跳过」的回执
+ * 不会被当成「答对」返回。服务端把裁定落账与推进下一题合成一个事务,回执与
+ * resume 同形。
+ */
+export function buildAutopilotAdjudicateRequest(
+  sessionId: string,
+  stateRevision: number,
+  kind: AutopilotAdjudicationKind,
+  reasonCode: string,
+  note?: string,
+): AutopilotAdjudicateRequest {
+  if (!SAFE_SESSION_ID.test(sessionId)) {
+    throw new Error("当前场次标识不能安全用于研究者裁定");
+  }
+  if (!Number.isSafeInteger(stateRevision) || stateRevision < 1) {
+    throw new Error("研究者裁定缺少可验证的服务器状态版本");
+  }
+  if (!Object.hasOwn(AUTOPILOT_ADJUDICATION_REASONS, kind)) {
+    throw new Error("研究者裁定类型不在允许范围内");
+  }
+  const reasons: readonly string[] = AUTOPILOT_ADJUDICATION_REASONS[kind];
+  if (!reasons.includes(reasonCode)) {
+    throw new Error("研究者裁定的原因码不属于该裁定类型");
+  }
+  const trimmedNote = note?.trim() ?? "";
+  if (trimmedNote.length > ADJUDICATION_NOTE_MAX || /[\p{Cc}\p{Cf}]/u.test(trimmedNote)) {
+    throw new Error(`裁定备注须为不超过 ${ADJUDICATION_NOTE_MAX} 字的单行文字`);
+  }
+  const idempotencyKey = `p0a.adjudicate.${kind}.${sessionId}.${stateRevision}`;
+  if (!ADJUDICATION_IDEMPOTENCY_KEY.test(idempotencyKey)) {
+    throw new Error("研究者裁定的幂等键超出服务端允许形状");
+  }
+  return {
+    idempotency_key: idempotencyKey,
+    expected_revision: stateRevision,
+    kind,
+    reason_code: reasonCode as AutopilotAdjudicationReason,
+    ...(trimmedNote ? { note: trimmedNote } : {}),
   };
 }
 

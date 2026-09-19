@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AudioAsset, ItemEvent, Session, TurnEvent } from "../types";
+import type { AttemptEvent, AudioAsset, ItemEvent, Session, TurnEvent } from "../types";
 import {
   emptySessionJournal,
   journalStorageKey,
   loadSessionJournal,
   mergeServerJournal,
+  parseJournalAttempts,
   parseStoredSessionJournal,
   type ServerSessionJournal,
   type SessionJournal,
@@ -291,4 +292,64 @@ test("附带小修:无 turn 的服务端音频从采集回执取真实时长—�
   // 什么都没有:保持 undefined(上层不许再显示成 0.0 秒)。
   const bare = mergeServerJournal(persistedJournal(), remote({ audios: [serverAudio] }));
   assert.equal(bare.audios["aud-ap"].durationSeconds, undefined);
+});
+
+test("attempts 投影只保留面板字段,回答原文不落 SessionJournal;畸形行整体拒收", () => {
+  const row: AttemptEvent = {
+    id: 501,
+    session_id: "S-A",
+    item_id: "SE_螺母",
+    turn_seq: 1,
+    response_role: "命名",
+    attempt_seq: 2,
+    raw_audio_id: "aud-501",
+    prompt_level: 1,
+    cue_type: "prompt_level_1",
+    duration_seconds: 2.4,
+    asr_text: "刘世茂",
+    asr_confidence: 0.61,
+    operational_answer_type: "错误",
+    operational_score: 0,
+    operational_needs_review: true,
+    judge_mode: "rule",
+    judge_portrait_used: false,
+    processing_status: "completed",
+    error_code: null,
+    created_at: "2026-09-17T02:00:00Z",
+    processed_at: "2026-09-17T02:00:03Z",
+    is_simulation: false,
+  };
+  assert.deepEqual(parseJournalAttempts([row], "S-A"), [{
+    attemptId: 501,
+    itemId: "SE_螺母",
+    turnSeq: 1,
+    attemptSeq: 2,
+    promptLevel: 1,
+    asrText: "刘世茂",
+    answerType: "错误",
+    score: 0,
+    needsReview: true,
+    processingStatus: "completed",
+    errorCode: null,
+    createdAt: "2026-09-17T02:00:00Z",
+  }]);
+  assert.deepEqual(parseJournalAttempts(undefined, "S-A"), []);
+  // 未转写的行:可空字段落 null,不编值。
+  assert.deepEqual(parseJournalAttempts([{
+    ...row, id: 502, attempt_seq: 3, processing_status: "received",
+    asr_text: undefined, operational_answer_type: undefined, operational_score: undefined,
+    operational_needs_review: undefined, error_code: undefined,
+  }], "S-A")[0], {
+    attemptId: 502, itemId: "SE_螺母", turnSeq: 1, attemptSeq: 3, promptLevel: 1,
+    asrText: null, answerType: null, score: null, needsReview: null,
+    processingStatus: "received", errorCode: null, createdAt: "2026-09-17T02:00:00Z",
+  });
+  assert.throws(() => parseJournalAttempts([{ ...row, session_id: "S-B" }], "S-A"), /attempt/);
+  assert.throws(() => parseJournalAttempts([row, row], "S-A"), /attempt/);
+  assert.throws(() => parseJournalAttempts([{ ...row, processing_status: "done" as never }], "S-A"), /attempt/);
+  assert.throws(() => parseJournalAttempts([{ ...row, attempt_seq: 0 }], "S-A"), /attempt/);
+  assert.throws(() => parseJournalAttempts([{ ...row, operational_score: Number.NaN }], "S-A"), /attempt/);
+  // mergeServerJournal 的持久化结构里没有 attempts 字段(回答原文不进 localStorage)。
+  const merged = mergeServerJournal(persistedJournal(), remote({ attempts: [row] }));
+  assert.equal("attempts" in merged, false);
 });

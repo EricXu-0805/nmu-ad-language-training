@@ -5,6 +5,7 @@ import { turnKey } from "../lib/ids.ts";
 import { journalForLocalStorage } from "../security/localSensitiveState.ts";
 import type {
   AttemptEvent,
+  AttemptProcessingStatus,
   AudioAsset,
   AudioCaptureReceipt,
   InteractionEvent,
@@ -103,6 +104,30 @@ export interface ServerSessionJournal {
   attempts?: AttemptEvent[];
   audio_receipts?: AudioCaptureReceipt[];
 }
+
+/**
+ * 服务端 attempt 行的只读投影,只留训练台「AI 听到了什么」面板要用的字段。
+ * 不进 SessionJournal:那份会落 localStorage,而 asr_text 是回答原文(与 turns 的
+ * asrText 同一条「Web Storage 不保留原文」纪律),所以只作 React 状态。
+ */
+export interface JournalAttempt {
+  attemptId: number;
+  itemId: string;
+  turnSeq: number;
+  attemptSeq: number;
+  promptLevel: number;
+  asrText: string | null;
+  answerType: string | null;
+  score: number | null;
+  needsReview: boolean | null;
+  processingStatus: AttemptProcessingStatus;
+  errorCode: string | null;
+  createdAt: string;
+}
+
+const ATTEMPT_PROCESSING_STATUSES = new Set<string>([
+  "received", "asr_completed", "completed", "technical_failure",
+]);
 
 // 旧后端既无 AudioAsset.turn_key、又可能缺关联 TurnEvent。不能因此把服务端音频丢掉；
 // 用内部占位键保留，但绝不把它当成训练环节回放映射。
@@ -426,6 +451,48 @@ function assertServerJournalScope(remote: ServerSessionJournal, expectedSessionI
   }
 }
 
+/** 畸形 attempt 行按本 hook 一贯做法整体拒收,不静默丢行、不当空数组。 */
+export function parseJournalAttempts(
+  rows: readonly AttemptEvent[] | undefined,
+  expectedSessionId: string,
+): JournalAttempt[] {
+  const seen = new Set<number>();
+  return (rows ?? []).map((row) => {
+    if (!isRecord(row)
+        || row.session_id !== expectedSessionId
+        || !isPositiveInteger(row.id) || seen.has(row.id)
+        || !isSafeRecordKey(row.item_id)
+        || !isPositiveInteger(row.turn_seq)
+        || !isPositiveInteger(row.attempt_seq)
+        || !isNonNegativeInteger(row.prompt_level)
+        || !(row.asr_text == null || typeof row.asr_text === "string")
+        || !(row.operational_answer_type == null || typeof row.operational_answer_type === "string")
+        || !(row.operational_score == null
+          || (typeof row.operational_score === "number" && Number.isFinite(row.operational_score)))
+        || !(row.operational_needs_review == null || typeof row.operational_needs_review === "boolean")
+        || !ATTEMPT_PROCESSING_STATUSES.has(row.processing_status)
+        || !(row.error_code == null || typeof row.error_code === "string")
+        || typeof row.created_at !== "string") {
+      throw new Error("服务端 attempt 行不符合训练台契约");
+    }
+    seen.add(row.id);
+    return {
+      attemptId: row.id,
+      itemId: row.item_id,
+      turnSeq: row.turn_seq,
+      attemptSeq: row.attempt_seq,
+      promptLevel: row.prompt_level,
+      asrText: row.asr_text ?? null,
+      answerType: row.operational_answer_type ?? null,
+      score: row.operational_score ?? null,
+      needsReview: row.operational_needs_review ?? null,
+      processingStatus: row.processing_status,
+      errorCode: row.error_code ?? null,
+      createdAt: row.created_at,
+    };
+  });
+}
+
 function cueLevelFromInteraction(interaction: InteractionEvent): number | null {
   if (interaction.event_type !== "cue_selected" || !interaction.item_id || !isPositiveInteger(interaction.turn_seq)) return null;
   let payload: unknown;
@@ -588,8 +655,12 @@ function currentJournal(journal: SessionJournal, sessionId: string): SessionJour
 
 export function useSessionJournal(sessionId: string) {
   const [journal, setJournal] = useState<SessionJournal>(() => loadSessionJournal(sessionId));
+  const [attempts, setAttempts] = useState<JournalAttempt[]>([]);
 
-  useEffect(() => { setJournal(loadSessionJournal(sessionId)); }, [sessionId]);
+  useEffect(() => {
+    setJournal(loadSessionJournal(sessionId));
+    setAttempts([]);
+  }, [sessionId]);
 
   const persist = useCallback((next: SessionJournal) => {
     if (next.sessionId !== sessionId) {
@@ -694,13 +765,15 @@ export function useSessionJournal(sessionId: string) {
 
   const hydrateFromServer = useCallback((remote: ServerSessionJournal) => {
     assertServerJournalScope(remote, sessionId);
+    const nextAttempts = parseJournalAttempts(remote.attempts, sessionId);
     setJournal((previous) => {
       const j = currentJournal(previous, sessionId);
       const n = mergeServerJournal(j, remote);
       store(n, sessionId);
       return n;
     });
+    setAttempts(nextAttempts);
   }, [sessionId]);
 
-  return { journal, persist, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer };
+  return { journal, attempts, persist, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer };
 }

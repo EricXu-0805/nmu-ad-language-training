@@ -31,6 +31,7 @@ import type { AttemptEvent, AttemptProcessRequest, PlanItem, PlanTurn, Session, 
 import { AuthenticatedAudio } from "../AuthenticatedAudio";
 import { SessionControlBar } from "../SessionControlBar";
 import { SessionAbortControl } from "../SessionAbortControl";
+import { itemSeqLabel, itemSeqText } from "../itemNumbering";
 import { autopilotFailureKindForErrorCode, cueTypeForPrompt, decideAttemptProcessResult } from "./attemptEvidence";
 import { answerTimeoutAction, canReleaseAutopilotFailure, makeAutopilotFailure, type AutopilotFailure, type AutopilotFailureKind } from "./autopilotSafety";
 import { decideAudioSavedAutomation, retireLegacyAudioSavedAutoAdvancePreference } from "./audioSavedProgressSafety";
@@ -91,7 +92,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
   const toast = useToast();
   const exactDemoProfile = hasExactWeek2Single20Profile(session);
   const { bundle } = useItemBankBundle(session.week_no);
-  const { journal, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer } = useSessionJournal(session.session_id);
+  const { journal, attempts, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer } = useSessionJournal(session.session_id);
   const {
     postSession,
     postCursor,
@@ -508,6 +509,24 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
       });
     return () => { cancelled = true; };
   }, [hydrateFromServer, retryNonce, session.session_id]);
+
+  // 自动带练期间「AI 听到了什么」面板要跟着服务端 attempts 走:服务端自动推进不经
+  // 本页任何写路径,journal 只在挂载/重同步时取一次。这里不加定时器(本屏的网络
+  // 轮询器数量被集成测试钉死),而是跟着权威回执的相位/题位变化补取一次——每次
+  // 回答判完服务端都会换相位(processing_attempt→waiting_tts/paused),状态轮询本身
+  // 就是节拍。取失败只保留上一份快照等下一次变化;这面板是观察提示,不锁页。
+  const attemptsRefreshActive = serverOwnership.owned && serverOwnership.phase !== "checking";
+  useEffect(() => {
+    if (!attemptsRefreshActive) return undefined;
+    let cancelled = false;
+    api.sessionJournal(session.session_id).then((remote) => {
+      if (!cancelled && remote.session.session_id === session.session_id) hydrateFromServer(remote);
+    }).catch(() => {
+      // 下一次相位/题位变化再取;首帧/重同步的取法与错误展示在上面那条 effect 里。
+    });
+    return () => { cancelled = true; };
+  }, [apReceiptPosition, attemptsRefreshActive, hydrateFromServer, serverOwnership.phase,
+    session.session_id]);
 
   const recoveryLoading = runtimeControl.loading || journalLoading;
   const recoveryError = runtimeControl.error ?? journalRecoveryError ?? syncError;
@@ -1846,6 +1865,15 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
   if (!plan) return <p>加载会话计划…</p>;
   if (plan.items.length === 0) return <p>本场次无评分题(第 1 周应走关系建立控制台)。</p>;
 
+  // 页首题号:观察面取权威回执映射进冻结计划的位置,人工面取当前计划题;
+  // 都是 presentation_order 的投影(类型内号对钱凯的纸质记录单)。
+  const headerSeqTaskType = observerMode ? observerPosition?.taskType : item?.task_type;
+  const headerSeq = observerMode
+    ? observerPosition?.seq ?? null
+    : item ? itemSeqLabel(item.task_type, item.presentation_order) : null;
+  const headerSeqText = headerSeq && headerSeqTaskType
+    ? itemSeqText(headerSeqTaskType, headerSeq) : null;
+
   return (
     <div className="training-layout">
       {!observerMode && (
@@ -1856,7 +1884,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
       <div className="training-main">
         <div className="training-page-header">
           <div>
-            <div className="page-kicker">当前训练任务</div>
+            <div className="page-kicker">当前训练任务{headerSeqText ? ` · ${headerSeqText}` : ""}{headerSeq ? <span className="muted">（总第 {headerSeq.seq} 题）</span> : null}</div>
             <h2 className="page-title">{observerMode
               ? observerPosition?.itemLabel ?? "同步中…"
               : item?.item_id.replace(/^(SE|DE)_/, "") ?? "训练判分"}</h2>
@@ -1953,6 +1981,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
           onOwnershipChange={onServerOwnershipChange}
           onReceiptPosition={onAutopilotReceiptPosition}
           prepareOwnership={prepareServerOwnership}
+          attempts={attempts}
         />
 
         {observerMode ? (
@@ -2193,14 +2222,18 @@ function ItemRail({ plan, itemIdx, lockedCount, onPick, journalTurns, disabled =
           const locked = it.turns.filter((t) => journalTurns[`${it.item_id}#${t.turn_seq}`]?.locked).length;
           const allLocked = locked === total;
           const displayName = it.item_id.replace(/^(SE|DE)_/, "");
+          // 类型内号对纸质记录单(单要素 1–20 / 双要素 1–10 / 多要素 1–2);左侧数字仍是总序号。
+          const seq = itemSeqLabel(it.task_type, it.presentation_order);
+          const typeLabel = seq?.typeSeq !== null && seq?.typeSeq !== undefined
+            ? `${it.task_type}第 ${seq.typeSeq} 题` : it.task_type;
           return (
             <button key={it.item_id} onClick={() => onPick(i)} disabled={disabled}
               aria-current={i === itemIdx ? "step" : undefined}
               className={`item-rail-button${i === itemIdx ? " is-active" : ""}${allLocked ? " is-complete" : ""}`}>
-              <span className="item-rail-index">{i + 1}</span>
+              <span className="item-rail-index">{seq?.seq ?? i + 1}</span>
               <span className="item-rail-copy">
                 <strong>{displayName}</strong>
-                <span>{it.task_type}{total > 1 ? ` · ${locked}/${total} 环节` : allLocked ? " · 已锁定" : " · 待完成"}</span>
+                <span>{typeLabel}{total > 1 ? ` · ${locked}/${total} 环节` : allLocked ? " · 已锁定" : " · 待完成"}</span>
               </span>
             </button>
           );

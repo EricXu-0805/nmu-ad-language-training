@@ -8,6 +8,7 @@ import { useToast } from "../components/ToastContext";
 import type { JournalTurn } from "../hooks/useSessionJournal";
 import { turnKey } from "../lib/ids";
 import type { SessionPlan } from "../types";
+import { itemSeqLabel, itemSeqSummary } from "./itemNumbering";
 import {
   evaluateResearchReviewGate,
   planDisplayFacts,
@@ -57,10 +58,12 @@ export function ResearchReviewPanel({
             row: turns[turnKey(item.item_id, planned.turn_seq)],
           }));
           const locked = itemTurns.filter(({ row }) => row?.locked).length;
+          // 题号从冻结计划的 presentation_order 来(与研究数据集同一序号),不从 item_id 编。
+          const seq = itemSeqLabel(item.task_type, item.presentation_order);
           return (
             <details key={item.item_id} className="card">
               <summary style={{ cursor: "pointer", fontWeight: 700, padding: "var(--sp-3) 0" }}>
-                {item.item_id} · {item.task_type} · {locked}/{itemTurns.length} 已锁定
+                {seq ? `${itemSeqSummary(item.task_type, seq)} · ` : ""}{item.item_id} · {item.task_type} · {locked}/{itemTurns.length} 已锁定
               </summary>
               <div className="col" style={{ gap: "var(--sp-3)", marginTop: "var(--sp-3)" }}>
                 {itemTurns.map(({ planned, row }) => (
