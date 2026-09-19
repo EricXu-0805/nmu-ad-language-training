@@ -12,7 +12,7 @@ from alembic.config import Config
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import (audio_store, autopilot_service, export, export_security,
                  repeat_intent)
@@ -21,7 +21,7 @@ from app.export import DIRECT_IDENTIFIER_COLUMNS, mask_text, pseudonymize
 from app.models import (
     AbnormalEvent, AttemptCaptureProcessing, AttemptEvent, AudioAssetRow,
     AudioCaptureReceipt,
-    AutopilotRepeatRequest, ExportArtifact, ExportBatch, ItemEvent, Patient,
+    AutopilotPositionAdjudication, AutopilotRepeatRequest, ExportArtifact, ExportBatch, ItemEvent, Patient,
     PatientDeviceCapability, RuntimeCommand, RuntimeCommandAck, ScaleResult,
     Session as TrainSession, SessionCloseoutReport,
     SessionOutcomeSummary, SessionRuntimeState, TurnEvent,
@@ -1964,3 +1964,51 @@ def test_withdrawn_subject_questionnaire_records_never_export(db, tmp_path):
     with pytest.raises(ValueError, match="受试者已撤回"):
         _export_bundle(db, "S9", deidentify=True, write_dir=tmp_path)
     assert not list(tmp_path.rglob("*.csv"))
+
+
+def test_adjudications_export_beside_ai_verdict_without_staff_identity(db, tmp_path):
+    """研究者现场裁定与 AI 判类并列进 turns 行、单独一张 adjudications 表页;
+    署名留在库表,去标识导出包不带工作人员账号;备注走同一套红线。"""
+    _seed(db)
+    se = db.exec(select(ItemEvent).where(ItemEvent.item_id == "SE_锚")).one()
+    turn = db.exec(select(TurnEvent).where(TurnEvent.item_event_id == se.id)).one()
+    db.add(AttemptEvent(
+        session_id="S9", item_id="SE_锚", turn_seq=1, response_role="命名",
+        attempt_seq=1, raw_audio_id="a_plain", prompt_level=0,
+        asr_text="刘世茂", operational_answer_type="unrecognized", operational_score=0,
+        processing_status="completed"))
+    db.commit()
+    attempt = db.exec(select(AttemptEvent)).one()
+    db.add(AutopilotPositionAdjudication(
+        session_id="S9", item_id="SE_锚", turn_seq=1, kind="confirmed_correct",
+        reason_code="asr_misrecognized", note="老人说的是锚,身份证号 320102199001011234",
+        actor_id="researcher-qk", source_attempt_id=attempt.id, turn_event_id=turn.id,
+        control_generation=1, state_revision=3, idempotency_key="adjudicate-export-0001"))
+    db.add(AutopilotPositionAdjudication(
+        session_id="S9", item_id="SE_锚", turn_seq=2, kind="skipped",
+        reason_code="participant_declined", note=None, actor_id="researcher-qk",
+        control_generation=1, state_revision=4, idempotency_key="adjudicate-export-0002"))
+    db.commit()
+
+    result = _export_bundle(db, "S9", deidentify=True, write_dir=tmp_path)
+    turns = {(row["item_id"], row["turn_seq"]): row for row in result["sheets"]["turns"]}
+    adjudicated = turns[("SE_锚", 1)]
+    assert adjudicated["adjudication_kind"] == "confirmed_correct"
+    assert adjudicated["adjudication_reason"] == "asr_misrecognized"
+    assert adjudicated["reviewed_score"] == 1 and adjudicated["score_locked"] is True
+    untouched = turns[("DE_斧子+树", 1)]
+    assert untouched["adjudication_kind"] is None and untouched["adjudication_reason"] is None
+    sheet = result["sheets"]["adjudications"]
+    assert [(row["item_id"], row["turn_seq"], row["kind"], row["reason_code"], row["adjudication_seq"])
+            for row in sheet] == [
+        ("SE_锚", 1, "confirmed_correct", "asr_misrecognized", 1),
+        ("SE_锚", 2, "skipped", "participant_declined", 2)]
+    # 自由文本整条红线,不做部分遮盖:备注可能夹着老人原话或证件号。
+    assert sheet[0]["note"] == export_security.redact_free_text("任意文本")
+    assert "320102199001011234" not in str(result["sheets"])
+    assert sheet[1]["note"] == export_security.redact_free_text(None)
+    for name, rows in result["sheets"].items():
+        for row in rows:
+            assert "researcher-qk" not in row.values(), f"{name} 泄露工作人员账号"
+            assert "adjudicated_by" not in row
+    assert set(export.SHEET_FIELDS["adjudications"]) == set(sheet[0])

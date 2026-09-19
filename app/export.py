@@ -1313,7 +1313,6 @@ def export_session_bundle(
                 # 研究者现场裁定(答对/到此为止),与 AI 判类并列;研究真值仍看 reviewed_score。
                 "adjudication_kind": adjudicated.kind if adjudicated else None,
                 "adjudication_reason": adjudicated.reason_code if adjudicated else None,
-                "adjudicated_by": adjudicated.actor_id if adjudicated else None,
                 "response_role": t.response_role,
                 "source_attempt_seq": source_attempt_seq,
                 "asr_text": asr, "confirmed_response_text": conf,
@@ -1336,7 +1335,7 @@ def export_session_bundle(
         **session_cols(), "item_id": row.item_id, "turn_seq": row.turn_seq,
         "kind": row.kind, "reason_code": row.reason_code,
         "note": export_security.redact_free_text(row.note),
-        "adjudicated_by": row.actor_id,
+        # 署名留在库表与审计里;去标识导出包不带任何工作人员账号(与其它表页同口径)。
         "adjudication_seq": index + 1,
     } for index, row in enumerate(adjudications)]
 
@@ -2117,11 +2116,10 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         "ai_needs_review", "ai_judge_mode", "reviewed_score", "score_locked",
         "element_value", "ai_human_diff", "judge_portrait_used",
         "duration_seconds",
-        "adjudication_kind", "adjudication_reason", "adjudicated_by",
+        "adjudication_kind", "adjudication_reason",
     ),
     "adjudications": _SESSION_COLS + (
-        "item_id", "turn_seq", "kind", "reason_code", "note", "adjudicated_by",
-        "adjudication_seq",
+        "item_id", "turn_seq", "kind", "reason_code", "note", "adjudication_seq",
     ),
     "attempts": _SESSION_COLS + (
         "item_id", "turn_seq", "response_role", "attempt_seq", "audio_code",

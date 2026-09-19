@@ -40,7 +40,7 @@ _EXPORT_ARTIFACT_KINDS = frozenset({
 })
 _EXPORT_SHEET_NAMES = frozenset({
     "session", "turns", "attempts", "interactions", "item_scores", "scales",
-    "legacy_unverified_scales", "abnormal", "audio_manifest",
+    "legacy_unverified_scales", "abnormal", "audio_manifest", "adjudications",
 })
 _POST_EXPORT_AUDIO_STATUSES = frozenset({
     "exported", "checksum_verified", "reliability_review_done", "deletable",
@@ -726,7 +726,7 @@ def _verify_staging_export_intent(
         else:
             raise SnapshotError("export_artifact_contract_invalid")
     if (csv_names != _EXPORT_SHEET_NAMES or len(receipt_rows) != 1
-            or len(descriptors) != 10 + len(controlled_codes)
+            or len(descriptors) != len(_EXPORT_SHEET_NAMES) + 1 + len(controlled_codes)
             or len(set(controlled_codes)) != len(controlled_codes)
             or sorted(controlled_codes) != metadata["audio_touched"]):
         raise SnapshotError("export_artifact_contract_invalid")
@@ -1168,7 +1168,7 @@ def _verify_export_semantics(
 
             if (len(manifest_rows) != 1 or len(receipt_rows) != 1
                     or csv_names != _EXPORT_SHEET_NAMES
-                    or len(descriptors) != 11 + len(controlled_receipts)):
+                    or len(descriptors) != len(_EXPORT_SHEET_NAMES) + 2 + len(controlled_receipts)):
                 raise SnapshotError("export_artifact_contract_invalid")
             receipt_descriptor, receipt_path = receipt_rows[0]
             if receipt_descriptor["byte_count"] > 4096:

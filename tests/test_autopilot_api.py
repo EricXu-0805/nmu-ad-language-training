@@ -3759,6 +3759,12 @@ def test_api_worker_technical_failure_after_cue_pauses_without_next_prompt(
         ) == before_counts
     assert failed_asr.calls == failure_level
     assert failing_asr.calls == 1
+    # 判分技术失败的题位不能靠「继续」续弹:码要与「还在判分」分开,控制台才能指路转人工。
+    with Session(api_clients.engine) as session:
+        revision = session.get(SessionAutopilotState, SESSION_ID).revision
+    blocked = _resume(api_clients, key="resume-after-judge-failure-0001", expected_revision=revision)
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "autopilot_attempt_failed"
 
 
 def _live_snapshot(session: Session) -> tuple:
@@ -6251,9 +6257,27 @@ def test_adjudicate_skip_item_without_an_answer_writes_a_skip_receipt_and_advanc
         rows = list(session.exec(select(AutopilotPositionAdjudication)))
         assert [(r.kind, r.item_id, r.turn_seq, r.source_attempt_id, r.turn_event_id) for r in rows] == [
             ("skipped", TWO_ONLY_BANK.single_element[0]["item_id"], 1, None, None)]
+        # 目标题位那一行带裸键,丢了响应再发同一条请求能按重放找回来。
+        assert rows[0].idempotency_key == "adjudicate-skip-0001"
     nxt = _device_next(api_clients)
     assert nxt is not None and nxt["payload"]["purpose"] == "question"
     assert nxt["payload"]["speech_text"] == TWO_ONLY_BANK.single_element[1]["initial_prompt"]
+
+    replayed = _adjudicate(
+        api_clients, key="adjudicate-skip-0001",
+        expected_revision=drained.json()["state_revision"],
+        kind="skip_item", reason_code="participant_declined")
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["position_item_id"] == skipped.json()["position_item_id"]
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(AutopilotPositionAdjudication)))) == 1
+    # 换个原因码冒用同一个键 → 幂等冲突,不会把下一题也跳掉。
+    conflict = _adjudicate(
+        api_clients, key="adjudicate-skip-0001",
+        expected_revision=drained.json()["state_revision"],
+        kind="skip_item", reason_code="other")
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["detail"]["code"] == "autopilot_idempotency_conflict"
 
 
 def test_adjudicate_skip_of_the_last_item_leaves_the_scope_paused_for_wrapup(
@@ -6273,10 +6297,23 @@ def test_adjudicate_skip_of_the_last_item_leaves_the_scope_paused_for_wrapup(
         kind="skip_item", reason_code="other", note="演示只练一题")
     assert skipped.status_code == 200, skipped.text
     assert skipped.json()["status"] == "paused"
+    # 回执得让控制台看出「变了」:revision 前进、错误码写明已全部训毕。
+    assert skipped.json()["state_revision"] == drained.json()["state_revision"] + 1
+    assert skipped.json()["last_error_code"] == "autopilot_scope_completed"
     with Session(api_clients.engine) as session:
         assert len(list(session.exec(select(AutopilotPositionAdjudication)))) == 1
         runtime_state = session.get(SessionRuntimeState, SESSION_ID)
         assert runtime_state is not None and runtime_state.status == "paused"
+    again = _adjudicate(
+        api_clients, key="adjudicate-skip-last-0002",
+        expected_revision=skipped.json()["state_revision"],
+        kind="skip_item", reason_code="other")
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"]["code"] == "autopilot_scope_completed"
+    resumed = _resume(api_clients, key="resume-after-last-0001",
+                      expected_revision=skipped.json()["state_revision"])
+    assert resumed.status_code == 409, resumed.text
+    assert resumed.json()["detail"]["code"] == "autopilot_scope_completed"
 
 
 def test_adjudicate_requires_a_safe_pause_and_a_recorded_answer_for_confirmed_correct(
@@ -6467,3 +6504,25 @@ def test_replayed_device_failure_ack_does_not_pause_a_manually_resumed_runtime(
         assert runtime_state.status == "active"
         live = session.get(LiveState, 1)
         assert json.loads(live.session_json or "{}").get("paused") is not True
+
+
+def test_adjudicate_note_rejects_control_and_format_characters(
+        api_clients: ApiClients, monkeypatch):
+    """备注是单行文字:控制符/零宽字符进不了只追加收据(与 LLM 守卫同口径)。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    question = _device_next(api_clients)
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{question['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    for bad in ("第一行\n第二行", "零宽\u200b字符", "制表\t符"):
+        rejected = _adjudicate(
+            api_clients, key="adjudicate-note-ctrl-0001",
+            expected_revision=drained.json()["state_revision"],
+            kind="skip_item", reason_code="other", note=bad)
+        assert rejected.status_code == 422, rejected.text
+        assert rejected.json()["detail"]["code"] == "autopilot_input_invalid"
+    with Session(api_clients.engine) as session:
+        assert list(session.exec(select(AutopilotPositionAdjudication))) == []

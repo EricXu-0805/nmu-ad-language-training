@@ -57,6 +57,7 @@ def _published_export_fixture(
     sheet_names = (
         "session", "turns", "attempts", "interactions", "item_scores",
         "scales", "legacy_unverified_scales", "abnormal", "audio_manifest",
+        "adjudications",
     )
     audio_code = "AUDIO-v1-test-key-0123456789abcdef0123"
     raw_audio_id = "raw-synthetic-export"
