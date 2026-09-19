@@ -91,7 +91,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
   const toast = useToast();
   const exactDemoProfile = hasExactWeek2Single20Profile(session);
   const { bundle } = useItemBankBundle(session.week_no);
-  const { journal, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer } = useSessionJournal(session.session_id);
+  const { journal, attempts, upsertItem, upsertTurn, upsertAudio, recordCueLevel, setCursor, hydrateFromServer } = useSessionJournal(session.session_id);
   const {
     postSession,
     postCursor,
@@ -508,6 +508,24 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
       });
     return () => { cancelled = true; };
   }, [hydrateFromServer, retryNonce, session.session_id]);
+
+  // 自动带练期间「AI 听到了什么」面板要跟着服务端 attempts 走:服务端自动推进不经
+  // 本页任何写路径,journal 只在挂载/重同步时取一次。这里不加定时器(本屏的网络
+  // 轮询器数量被集成测试钉死),而是跟着权威回执的相位/题位变化补取一次——每次
+  // 回答判完服务端都会换相位(processing_attempt→waiting_tts/paused),状态轮询本身
+  // 就是节拍。取失败只保留上一份快照等下一次变化;这面板是观察提示,不锁页。
+  const attemptsRefreshActive = serverOwnership.owned && serverOwnership.phase !== "checking";
+  useEffect(() => {
+    if (!attemptsRefreshActive) return undefined;
+    let cancelled = false;
+    api.sessionJournal(session.session_id).then((remote) => {
+      if (!cancelled && remote.session.session_id === session.session_id) hydrateFromServer(remote);
+    }).catch(() => {
+      // 下一次相位/题位变化再取;首帧/重同步的取法与错误展示在上面那条 effect 里。
+    });
+    return () => { cancelled = true; };
+  }, [apReceiptPosition, attemptsRefreshActive, hydrateFromServer, serverOwnership.phase,
+    session.session_id]);
 
   const recoveryLoading = runtimeControl.loading || journalLoading;
   const recoveryError = runtimeControl.error ?? journalRecoveryError ?? syncError;
@@ -1953,6 +1971,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
           onOwnershipChange={onServerOwnershipChange}
           onReceiptPosition={onAutopilotReceiptPosition}
           prepareOwnership={prepareServerOwnership}
+          attempts={attempts}
         />
 
         {observerMode ? (

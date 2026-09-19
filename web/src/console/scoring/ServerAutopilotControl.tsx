@@ -37,8 +37,10 @@ import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Field, TextInput } from "../../components/Field";
+import type { JournalAttempt } from "../../hooks/useSessionJournal";
 import type { Session } from "../../types";
 import { hasExactWeek2Single20Profile } from "../../autopilot/demoProfile.ts";
+import { autopilotAttemptView, type AutopilotAttemptView } from "./autopilotAttemptView.ts";
 
 // 暂停原因用人话说一遍:研究者对着一串错误码不知道该去平板上看什么。
 // 2026-09-13 演示:平板里留着上一场没传完的录音,自动带练一开麦就 recording_start_failed,
@@ -104,6 +106,7 @@ export function ServerAutopilotControl({
   onOwnershipChange,
   onReceiptPosition,
   prepareOwnership,
+  attempts,
 }: {
   session: Session;
   interactionBlocked: boolean;
@@ -116,6 +119,8 @@ export function ServerAutopilotControl({
   /** 权威回执里的只读位置投影(观察面/接管恢复展示用),无位置时回报 null。 */
   onReceiptPosition?: (position: { itemId: string; turnSeq: number } | null) => void;
   prepareOwnership: () => Promise<true | string>;
+  /** journal 的 attempts 投影(服务器持有期间由训练台定时补取),只给「AI 听到了什么」面板。 */
+  attempts: readonly JournalAttempt[];
 }) {
   const [state, dispatch] = useReducer(
     autopilotConsoleReducer,
@@ -541,6 +546,14 @@ export function ServerAutopilotControl({
   // 裁定按钮与「继续 AI 自动带练」同一份收麦证明;内容缺口的暂停不许跳题。
   const canAdjudicate = receiptAllowsAutopilotAdjudication(state.receipt) && !contentGap;
   const controlBusy = resumeBusy || takeoverBusy || adjudicateBusy;
+  // 「AI 听到了什么」:只在服务器持有且在题位上(带练中/处理中/AI 自己暂停)时展示,
+  // 位置来自权威回执,回答来自 journal attempts 投影;人工接管态由人工面自己判分。
+  const heardPosition = state.receipt?.serverOwned
+    && state.receipt.positionItemId !== null && state.receipt.positionTurnSeq !== null
+    ? { itemId: state.receipt.positionItemId, turnSeq: state.receipt.positionTurnSeq }
+    : null;
+  const heardVisible = heardPosition !== null && (active || processing || paused);
+  const heard = heardVisible ? autopilotAttemptView(attempts, heardPosition) : null;
   const title = manual ? "AI 自动带练已转为人工接管"
     : active ? "AI 正在控制当前环节"
     : processing ? "AI 正在处理当前回答"
@@ -690,6 +703,7 @@ export function ServerAutopilotControl({
           </details>
         </>
       )}
+      {heardVisible && <HeardPanel view={heard} />}
       {isRealResearch && (
         <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.85 }}>
           训练引导语为研究初版，尚未经临床定稿；请按研究方案核对后使用。
@@ -773,5 +787,31 @@ export function ServerAutopilotControl({
       onConfirm={() => { void adjudicate(); }}
     />
     </>
+  );
+}
+
+// 2026-09-17 养老院实测:研究者看不到 ASR 听成了什么(螺母→刘世茂、茶杯→查呗),
+// 只能猜 AI 为什么判错。这里只展示,不参与控制判定;判类是运营决策,不是研究评分。
+function HeardPanel({ view }: { view: AutopilotAttemptView | null }) {
+  if (!view) {
+    return (
+      <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.85 }}>
+        AI 听到的：这一题还没有录到老人的回答。
+      </div>
+    );
+  }
+  const heard = view.heard.kind === "pending" ? "转写中…"
+    : view.heard.kind === "silence" ? "没有识别到语音"
+      : `「${view.heard.text}」`;
+  const verdict = view.verdict.kind === "pending" ? "判分中…"
+    : view.verdict.kind === "failed"
+      ? `处理失败（技术原因${view.verdict.errorCode ? `：${view.verdict.errorCode}` : ""}）`
+      : `${view.verdict.answerType}${view.verdict.score !== null ? ` · ${view.verdict.score} 分` : ""}${view.verdict.needsReview ? " · 建议复核" : ""}`;
+  return (
+    <div style={{ marginTop: 6, fontSize: "0.9em" }} aria-live="polite">
+      <div><strong>AI 听到的</strong>（本题第 {view.attemptSeq} 次回答 · {view.promptLabel}）</div>
+      <div>识别：{heard}</div>
+      <div>AI 判类：{verdict}<span style={{ opacity: 0.7 }}>（仅供参考，研究评分以事后复核为准）</span></div>
+    </div>
   );
 }
