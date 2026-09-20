@@ -1980,12 +1980,12 @@ def test_adjudications_export_beside_ai_verdict_without_staff_identity(db, tmp_p
     db.commit()
     attempt = db.exec(select(AttemptEvent)).one()
     db.add(AutopilotPositionAdjudication(
-        session_id="S9", item_id="SE_锚", turn_seq=1, kind="confirmed_correct",
+        session_id="S9", item_id="SE_锚", turn_seq=1, presentation_order=1, kind="confirmed_correct",
         reason_code="asr_misrecognized", note="老人说的是锚,身份证号 320102199001011234",
         actor_id="researcher-qk", source_attempt_id=attempt.id, turn_event_id=turn.id,
         control_generation=1, state_revision=3, idempotency_key="adjudicate-export-0001"))
     db.add(AutopilotPositionAdjudication(
-        session_id="S9", item_id="SE_锚", turn_seq=2, kind="skipped",
+        session_id="S9", item_id="SE_锚", turn_seq=2, presentation_order=1, kind="skipped",
         reason_code="participant_declined", note=None, actor_id="researcher-qk",
         control_generation=1, state_revision=4, idempotency_key="adjudicate-export-0002"))
     db.commit()
@@ -1999,10 +1999,10 @@ def test_adjudications_export_beside_ai_verdict_without_staff_identity(db, tmp_p
     untouched = turns[("DE_斧子+树", 1)]
     assert untouched["adjudication_kind"] is None and untouched["adjudication_reason"] is None
     sheet = result["sheets"]["adjudications"]
-    assert [(row["item_id"], row["turn_seq"], row["kind"], row["reason_code"], row["adjudication_seq"])
-            for row in sheet] == [
-        ("SE_锚", 1, "confirmed_correct", "asr_misrecognized", 1),
-        ("SE_锚", 2, "skipped", "participant_declined", 2)]
+    assert [(row["item_id"], row["presentation_order"], row["turn_seq"], row["kind"],
+             row["reason_code"], row["adjudication_seq"]) for row in sheet] == [
+        ("SE_锚", 1, 1, "confirmed_correct", "asr_misrecognized", 1),
+        ("SE_锚", 1, 2, "skipped", "participant_declined", 2)]
     # 自由文本整条红线,不做部分遮盖:备注可能夹着老人原话或证件号。
     assert sheet[0]["note"] == export_security.redact_free_text("任意文本")
     assert "320102199001011234" not in str(result["sheets"])

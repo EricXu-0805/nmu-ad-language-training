@@ -1332,8 +1332,8 @@ def export_session_bundle(
 
     # --- 研究者现场裁定(含没有录音证据的「跳过」题位)---
     adjudication_sheet = [{
-        **session_cols(), "item_id": row.item_id, "turn_seq": row.turn_seq,
-        "kind": row.kind, "reason_code": row.reason_code,
+        **session_cols(), "item_id": row.item_id, "presentation_order": row.presentation_order,
+        "turn_seq": row.turn_seq, "kind": row.kind, "reason_code": row.reason_code,
         "note": export_security.redact_free_text(row.note),
         # 署名留在库表与审计里;去标识导出包不带任何工作人员账号(与其它表页同口径)。
         "adjudication_seq": index + 1,
@@ -2119,7 +2119,8 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         "adjudication_kind", "adjudication_reason",
     ),
     "adjudications": _SESSION_COLS + (
-        "item_id", "turn_seq", "kind", "reason_code", "note", "adjudication_seq",
+        "item_id", "presentation_order", "turn_seq", "kind", "reason_code", "note",
+        "adjudication_seq",
     ),
     "attempts": _SESSION_COLS + (
         "item_id", "turn_seq", "response_role", "attempt_seq", "audio_code",

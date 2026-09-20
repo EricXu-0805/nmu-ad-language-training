@@ -335,6 +335,13 @@ def _drive_to_processing_attempt(
     """Use only public device APIs to persist a proof-complete P0a capture."""
     started = _start(clients)
     assert started.status_code == 200, started.text
+    return _drive_issued_question_to_processing_attempt(clients, stop_reason=stop_reason)
+
+
+def _drive_issued_question_to_processing_attempt(
+        clients: ApiClients, *, stop_reason: str = "silence",
+        ack_prefix: str = "ack-worker", first_device_event_seq: int = 1) -> dict:
+    """已签发的提问 → 念完 → 录一段 → 上传 → 收麦回执;停在 processing_attempt。"""
     tts = _device_next(clients)
     assert tts is not None
     ended = clients.device.post(
@@ -344,8 +351,8 @@ def _drive_to_processing_attempt(
         json=_ack_body(
             tts,
             ack_type="tts_ended",
-            ack_key="ack-worker-tts-ended-0001",
-            device_event_seq=1,
+            ack_key=f"{ack_prefix}-tts-ended-0001",
+            device_event_seq=first_device_event_seq,
             media_ended=True,
             media_duration_ms=800,
         ),
@@ -386,8 +393,8 @@ def _drive_to_processing_attempt(
         json=_ack_body(
             record,
             ack_type="record_stopped",
-            ack_key="ack-worker-record-stopped-0001",
-            device_event_seq=2,
+            ack_key=f"{ack_prefix}-record-stopped-0001",
+            device_event_seq=first_device_event_seq + 1,
             stop_reason=stop_reason,
             raw_audio_id=raw_audio_id,
             receipt_server_seq=receipt["serverSeq"],
@@ -6304,6 +6311,16 @@ def test_adjudicate_skip_of_the_last_item_leaves_the_scope_paused_for_wrapup(
         assert len(list(session.exec(select(AutopilotPositionAdjudication)))) == 1
         runtime_state = session.get(SessionRuntimeState, SESSION_ID)
         assert runtime_state is not None and runtime_state.status == "paused"
+    # 同键重放:回同一份「已全部训毕」的暂停回执,不再动 revision、不落第二条裁定。
+    replay = _adjudicate(
+        api_clients, key="adjudicate-skip-last-0001",
+        expected_revision=drained.json()["state_revision"],
+        kind="skip_item", reason_code="other", note="演示只练一题")
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["state_revision"] == skipped.json()["state_revision"]
+    assert replay.json()["last_error_code"] == "autopilot_scope_completed"
+    with Session(api_clients.engine) as session:
+        assert len(list(session.exec(select(AutopilotPositionAdjudication)))) == 1
     again = _adjudicate(
         api_clients, key="adjudicate-skip-last-0002",
         expected_revision=skipped.json()["state_revision"],
@@ -6526,3 +6543,144 @@ def test_adjudicate_note_rejects_control_and_format_characters(
         assert rejected.json()["detail"]["code"] == "autopilot_input_invalid"
     with Session(api_clients.engine) as session:
         assert list(session.exec(select(AutopilotPositionAdjudication))) == []
+
+
+def test_adjudicate_accepts_an_answer_recorded_before_an_earlier_resume_bumped_the_generation(
+        api_clients: ApiClients, monkeypatch):
+    """第一次回答在代际 1 录完判完 → 线索 → 暂停 → 继续(代际 2,续弹线索)→ 老人没答又暂停 →
+    「老人已答对」。证据是旧代际里录的,裁定照样按它收口;不能因为代际变了就报证据无效
+    (复核 2026-09-19 抓出的 P1:养老院每暂停一次再裁定就 409)。"""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(api_clients)
+    monkeypatch.setattr(asr, "get_engine", lambda: _EmptyTranscriptAsr())
+    _run_p0a_attempt_worker(SESSION_ID)
+    cue = _device_next(api_clients)
+    assert cue is not None and cue["payload"]["purpose"] == "cue"
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{cue['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    resumed = _resume(api_clients, key="resume-before-adjudicate-0001",
+                      expected_revision=drained.json()["state_revision"])
+    assert resumed.status_code == 200, resumed.text
+    reissued = _device_next(api_clients)
+    assert reissued is not None and reissued["control_generation"] == cue["control_generation"] + 1
+
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained_again = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{reissued['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained_again.status_code == 200, drained_again.text
+    adjudicated = _adjudicate(
+        api_clients, key="adjudicate-after-resume-0001",
+        expected_revision=drained_again.json()["state_revision"],
+        kind="confirmed_correct", reason_code="late_correct_after_window")
+    assert adjudicated.status_code == 200, adjudicated.text
+    assert adjudicated.json()["position_item_id"] == TWO_ONLY_BANK.single_element[1]["item_id"]
+    with Session(api_clients.engine) as session:
+        turns = list(session.exec(select(TurnEvent)))
+        assert len(turns) == 1 and turns[0].turn_seq == 1
+        rows = list(session.exec(select(AutopilotPositionAdjudication)))
+        assert [(r.kind, r.reason_code, r.turn_event_id == turns[0].id) for r in rows] == [
+            ("confirmed_correct", "late_correct_after_window", True)]
+        commands = list(session.exec(select(RuntimeCommand).where(
+            RuntimeCommand.kind == "record").order_by(RuntimeCommand.command_seq)))
+        # 收口用的就是代际 1 的那段录音。
+        assert commands[0].control_generation == cue["control_generation"]
+        assert turns[0].source_attempt_id == rows[0].source_attempt_id
+
+
+def test_skipping_an_item_still_lets_the_session_finish_and_export(
+        api_clients: ApiClients, monkeypatch):
+    """跳过一题后其余题目照常练完:最后一条反馈 ACK 能落、场次能结束、汇总能落库(复核
+    2026-09-19 抓出的 P1:汇总按未扣减的计划算 expected/matched,与门禁计数对不上 → 409,
+    场次永远结束不了、也导不出)。"""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    assert _start(api_clients).status_code == 200
+    question = _device_next(api_clients)
+    assert question is not None
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{question['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    skipped = _adjudicate(
+        api_clients, key="adjudicate-skip-then-finish-0001",
+        expected_revision=drained.json()["state_revision"],
+        kind="skip_item", reason_code="participant_declined")
+    assert skipped.status_code == 200, skipped.text
+    second_item = TWO_ONLY_BANK.single_element[1]
+    assert skipped.json()["position_item_id"] == second_item["item_id"]
+
+    _drive_issued_question_to_processing_attempt(api_clients, ack_prefix="ack-skip-finish")
+    monkeypatch.setattr(asr, "get_engine", lambda: _WorkerAsr(text=second_item["target_word"]))
+    _run_p0a_attempt_worker(SESSION_ID)
+    feedback = _device_next(api_clients)
+    assert feedback is not None and feedback["payload"]["purpose"] == "feedback"
+    ended = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{feedback['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(feedback, ack_type="tts_ended", ack_key="ack-skip-finish-ended-0001",
+                       device_event_seq=3, media_ended=True, media_duration_ms=900))
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["status"] == "scope_completed"
+    with Session(api_clients.engine) as session:
+        runtime_state = session.get(SessionRuntimeState, SESSION_ID)
+        assert runtime_state is not None and runtime_state.status == "intervention_completed"
+        summary = session.get(SessionOutcomeSummary, SESSION_ID)
+        assert summary is not None
+        assert (summary.expected_turns, summary.matched_turns,
+                summary.completed_attempt_turns, summary.audio_evidenced_turns) == (1, 1, 1, 1)
+        assert [r.kind for r in session.exec(select(AutopilotPositionAdjudication))] == ["skipped"]
+
+
+def test_pause_during_judgement_leaves_an_abandoned_attempt_that_resume_and_adjudicate_name_honestly(
+        api_clients: ApiClients, monkeypatch):
+    """判分(LLM)进行中被研究者暂停:暂停作废了 worker 的租约,这段回答停在 asr_completed、
+    再也没人接着判。恢复/裁定不能一直说「几秒后再试」——要说清不会自动完成、请转人工;
+    转人工这条出口必须通。"""
+    _enable_p0a(monkeypatch)
+    _drive_to_processing_attempt(api_clients)
+    monkeypatch.setattr(asr, "get_engine", lambda: _WorkerAsr(text="大胡萝卜"))
+    judge = _BlockingWorkerJudge()
+    monkeypatch.setattr(llm_judge, "get_engine", lambda: judge)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker = pool.submit(_run_p0a_attempt_worker, SESSION_ID)
+        assert judge.entered.wait(timeout=10), "worker never entered judgement"
+        paused = api_clients.account.post(f"/sessions/{SESSION_ID}/pause")
+        assert paused.status_code == 200, paused.text
+        judge.release.set()
+        worker.result(timeout=10)
+    with Session(api_clients.engine) as session:
+        attempts = list(session.exec(select(AttemptEvent)))
+        assert [(a.processing_status, a.processing_owner) for a in attempts] == [("asr_completed", None)]
+        record = session.exec(select(RuntimeCommand).where(
+            RuntimeCommand.kind == "record")).one()
+        record_key = record.idempotency_key
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.status == "paused"
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{record_key}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    revision = drained.json()["state_revision"]
+
+    resumed = _resume(api_clients, key="resume-abandoned-0001", expected_revision=revision)
+    assert resumed.status_code == 409, resumed.text
+    assert resumed.json()["detail"]["code"] == "autopilot_attempt_abandoned"
+    for kind, reason in (("confirmed_correct", "staff_judged_correct"), ("skip_item", "other")):
+        rejected = _adjudicate(api_clients, key=f"adjudicate-abandoned-{kind}", expected_revision=revision,
+                               kind=kind, reason_code=reason)
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["detail"]["code"] == "autopilot_attempt_abandoned"
+    with Session(api_clients.engine) as session:
+        assert list(session.exec(select(AutopilotPositionAdjudication))) == []
+        assert list(session.exec(select(TurnEvent))) == []
+    takeover = api_clients.account.post(
+        f"/sessions/{SESSION_ID}/autopilot/takeover",
+        json={"idempotency_key": "takeover-abandoned-0001", "expected_revision": revision})
+    assert takeover.status_code == 200, takeover.text
+    assert takeover.json()["mode"] == "manual"

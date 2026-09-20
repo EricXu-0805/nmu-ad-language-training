@@ -65,7 +65,8 @@ const AUTOPILOT_ERROR_HINTS: Record<string, string> = {
   autopilot_adjudication_requires_pause: "先暂停，等平板收麦后再点。",
   autopilot_adjudication_attempt_required: "这一题还没有录到老人的回答，AI 判不了「答对」；可以点「跳过本题」，或点「继续 AI 自动带练」让 AI 重问这一题。",
   autopilot_attempt_processing: "上一段录音还在判分，几秒后再点。",
-  autopilot_attempt_failed: "上一段录音判分失败，AI 不能接着弹这一题；点「转为人工操作」把这一题人工完成，或「跳过本题」。",
+  autopilot_attempt_failed: "上一段录音判分失败，AI 不能接着弹这一题；点「转为人工操作」把这一题人工完成。",
+  autopilot_attempt_abandoned: "上一段录音的判分被暂停打断，不会再自动完成；点「转为人工操作」把这一题人工完成。",
   autopilot_resume_position_unresumable: "人工接管期间答过的这一题，AI 不能接着弹；请人工完成这一题后再切回。",
   autopilot_scope_completed: "本场可自动带练的题目已全部练完或裁定完毕；请直接进入场次收尾。",
   autopilot_revision_conflict: "服务器状态刚更新过，已按最新状态重试一次仍冲突；请核对当前题位后再点一次。",
@@ -80,6 +81,7 @@ const ADJUDICATION_PREWRITE_CODES = new Set([
   "autopilot_adjudication_attempt_required",
   "autopilot_attempt_processing",
   "autopilot_attempt_failed",
+  "autopilot_attempt_abandoned",
   "autopilot_scope_completed",
   "autopilot_revision_conflict",
 ]);
@@ -88,6 +90,7 @@ const ADJUDICATION_PREWRITE_CODES = new Set([
 const RESUME_PREWRITE_CODES = new Set([
   "autopilot_attempt_processing",
   "autopilot_attempt_failed",
+  "autopilot_attempt_abandoned",
   "autopilot_resume_position_unresumable",
   "autopilot_scope_completed",
   "autopilot_revision_conflict",
@@ -133,8 +136,8 @@ export function ServerAutopilotControl({
   /** 权威回执里的只读位置投影(观察面/接管恢复展示用),无位置时回报 null。 */
   onReceiptPosition?: (position: { itemId: string; turnSeq: number } | null) => void;
   prepareOwnership: () => Promise<true | string>;
-  /** journal 的 attempts 投影(服务器持有期间由训练台定时补取),只给「AI 听到了什么」面板。 */
-  attempts: readonly JournalAttempt[];
+  /** journal 的 attempts 投影(服务器持有期间由训练台定时补取),只给「AI 听到了什么」面板;null = 还没取到过。 */
+  attempts: readonly JournalAttempt[] | null;
 }) {
   const [state, dispatch] = useReducer(
     autopilotConsoleReducer,
@@ -577,7 +580,7 @@ export function ServerAutopilotControl({
     ? { itemId: state.receipt.positionItemId, turnSeq: state.receipt.positionTurnSeq }
     : null;
   const heardVisible = heardPosition !== null && (active || processing || paused);
-  const heard = heardVisible ? autopilotAttemptView(attempts, heardPosition) : null;
+  const heard = heardVisible && attempts !== null ? autopilotAttemptView(attempts, heardPosition) : null;
   const title = manual ? "AI 自动带练已转为人工接管"
     : active ? "AI 正在控制当前环节"
     : processing ? "AI 正在处理当前回答"
@@ -729,7 +732,7 @@ export function ServerAutopilotControl({
           </details>
         </>
       )}
-      {heardVisible && <HeardPanel view={heard} />}
+      {heardVisible && <HeardPanel view={heard} loaded={attempts !== null} />}
       {isRealResearch && (
         <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.85 }}>
           训练引导语为研究初版，尚未经临床定稿；请按研究方案核对后使用。
@@ -818,7 +821,14 @@ export function ServerAutopilotControl({
 
 // 2026-09-17 养老院实测:研究者看不到 ASR 听成了什么(螺母→刘世茂、茶杯→查呗),
 // 只能猜 AI 为什么判错。这里只展示,不参与控制判定;判类是运营决策,不是研究评分。
-function HeardPanel({ view }: { view: AutopilotAttemptView | null }) {
+function HeardPanel({ view, loaded }: { view: AutopilotAttemptView | null; loaded: boolean }) {
+  if (!loaded) {
+    return (
+      <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.85 }}>
+        AI 听到的：还没取到本场的回答记录，稍等。
+      </div>
+    );
+  }
   if (!view) {
     return (
       <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.85 }}>

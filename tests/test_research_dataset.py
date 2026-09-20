@@ -7,7 +7,7 @@ from app import export_security, research_dataset as rd
 def test_registry_is_self_consistent():
     assert rd.registry_self_check() == []
     assert rd.dataset_keys() == (
-        "subjects", "sessions", "turns",
+        "subjects", "sessions", "turns", "adjudications",
         "questionnaire_records", "questionnaire_item_values")
 
 

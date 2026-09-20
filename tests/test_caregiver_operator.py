@@ -1082,6 +1082,13 @@ def test_caregiver_finish_insufficient_evidence_has_no_research_diagnostics(
     ("GET", "/audit", None),
     ("GET", "/exports/EXP-UNKNOWN", None),
     ("POST", f"/sessions/{OWNER_SESSION}/resume", None),
+    ("POST", f"/sessions/{OWNER_SESSION}/autopilot/resume", {
+        "idempotency_key": "caregiver-must-not-resume", "expected_revision": 0,
+    }),
+    ("POST", f"/sessions/{OWNER_SESSION}/autopilot/adjudicate", {
+        "idempotency_key": "caregiver-must-not-adjudicate", "expected_revision": 0,
+        "kind": "skip_item", "reason_code": "other",
+    }),
     ("POST", f"/sessions/{OWNER_SESSION}/complete", None),
     ("PUT", f"/sessions/{OWNER_SESSION}/closeout", {}),
     ("PUT", f"/sessions/{OWNER_SESSION}/runtime/cursor", {}),

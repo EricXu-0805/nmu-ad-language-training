@@ -893,6 +893,8 @@ class AutopilotPositionAdjudication(SQLModel, table=True):
         Index("ix_position_adjudication_session_created",
               "session_id", "created_at"),
         CheckConstraint("turn_seq >= 1", name="ck_position_adjudication_turn_positive"),
+        CheckConstraint("presentation_order >= 1",
+                        name="ck_position_adjudication_order_positive"),
         CheckConstraint("state_revision >= 0",
                         name="ck_position_adjudication_revision_nonnegative"),
         CheckConstraint(
@@ -920,6 +922,7 @@ class AutopilotPositionAdjudication(SQLModel, table=True):
     session_id: str = Field(foreign_key="session.session_id", index=True)
     item_id: str = Field(index=True)
     turn_seq: int
+    presentation_order: int                  # 冻结计划里的第 N 题(1 起),整题跳过时没有 ItemEvent 可查,所以自带
     kind: str                                # confirmed_correct / terminated_no_verdict / skipped
     reason_code: str
     note: Optional[str] = None
@@ -1454,7 +1457,7 @@ class QualityReleaseEpochRowSnapshot(SQLModel, table=True):
         CheckConstraint(
             # 闭集随注册表一起前进。2026-08-27 加入两张量表表：加数据集必须同时
             # 改这里和一个迁移，否则冻结纪元写不进去——这道闸就是干这个用的。
-            "dataset_key IN ('subjects','sessions','turns',"
+            "dataset_key IN ('subjects','sessions','turns','adjudications',"
             "'questionnaire_records','questionnaire_item_values')",
             name="ck_quality_release_epoch_row_snapshot_dataset_closed"),
         CheckConstraint(
