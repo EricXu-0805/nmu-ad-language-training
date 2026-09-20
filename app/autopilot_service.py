@@ -22,6 +22,7 @@ import math
 import os
 import re
 import secrets
+import unicodedata
 from typing import Literal
 
 from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
@@ -3698,9 +3699,16 @@ def _completed_attempts_at(
         AttemptEvent.turn_seq == turn_seq,
     ).order_by(AttemptEvent.attempt_seq)))
     if any(a.processing_status == "technical_failure" for a in attempts):
-        _fail("autopilot_attempt_processing",
+        _fail("autopilot_attempt_failed",
               "这一题上一段录音判分失败,AI 不能接着弹;请「转为人工操作」处理这一题")
-    if any(a.processing_status != "completed" for a in attempts):
+    unfinished = [a for a in attempts if a.processing_status != "completed"]
+    if unfinished:
+        # 安全暂停会作废所有在途 worker 的处理租约(evidence_ledger.invalidate_processing_claims):
+        # 一段 asr_completed 的回答若已没有持有者,判分永远不会自己完成——别再说「几秒后再试」。
+        if all(a.processing_owner is None for a in unfinished):
+            _fail("autopilot_attempt_abandoned",
+                  "这一题上一段录音的判分被暂停打断,不会再自动完成;"
+                  "请「转为人工操作」人工完成这一题")
         _fail("autopilot_attempt_processing",
               "上一段录音还在判分,几秒后再试")
     return attempts
@@ -4237,6 +4245,8 @@ def adjudicate_p0a_position(
         note = note.strip() or None
         if note is not None and len(note) > 200:
             _fail("autopilot_input_invalid", "note 最多 200 字")
+        if note is not None and any(unicodedata.category(ch) in ("Cc", "Cf") for ch in note):
+            _fail("autopilot_input_invalid", "note 只能是单行文字,不能含控制字符")
     observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
     resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
     resolved_protocol = protocol or _default_protocol()
@@ -4261,10 +4271,12 @@ def adjudicate_p0a_position(
                 or (kind == "confirmed_correct" and prior.kind != expected_kind)
                 or (kind == "skip_item" and prior.kind == "confirmed_correct")):
             _fail("autopilot_idempotency_conflict", "裁定幂等键已被其他事实使用")
-        return resume_p0a(
-            db, session_id=session_id, idempotency_key=resume_key,
+        if state is None:
+            _fail("autopilot_not_active", "当前场次没有可裁定的 P0a 状态")
+        return _resume_after_adjudication(
+            db, state=state, session_id=session_id, resume_key=resume_key,
             expected_revision=expected_revision, actor_id=actor_id,
-            bank=resolved_bank, protocol=resolved_protocol, now=observed_at)
+            bank=resolved_bank, protocol=resolved_protocol, observed_at=observed_at)
 
     if state is None or state.scope_key != P0A_SCOPE_KEY:
         _fail("autopilot_not_active", "当前场次没有可裁定的 P0a 状态")
@@ -4292,13 +4304,16 @@ def adjudicate_p0a_position(
         _fail("autopilot_scope_completed", "本场可自动范围已全部训毕,请直接进入场次收尾")
     attempts = _completed_attempts_at(db, session_id, target.item_id, target.turn_seq)
 
+    plan_items = resolved.session_plan.items
+
     def row(*, item_id: str, turn_seq: int, row_kind: str,
             attempt_id: int | None, turn_event_id: int | None,
-            key_suffix: str) -> AutopilotPositionAdjudication:
+            key_suffix: str, item_index: int) -> AutopilotPositionAdjudication:
         return AutopilotPositionAdjudication(
             session_id=session_id,
             item_id=item_id,
             turn_seq=turn_seq,
+            presentation_order=plan_items[item_index].presentation_order,
             kind=row_kind,
             reason_code=reason_code,
             note=note,
@@ -4312,6 +4327,8 @@ def adjudicate_p0a_position(
             is_simulation=locked_session.is_simulation,
         )
 
+    # 目标题位那一行永远用裸键(重放靠它找回来);本题其余题位的派生行用 "#t<turn>" 后缀——
+    # "#" 不在幂等键的合法字符集里,客户端拼不出这种键,派生行不会被当成一次裁定重放。
     rows: list[AutopilotPositionAdjudication] = []
     if kind == "confirmed_correct":
         if not attempts:
@@ -4325,7 +4342,8 @@ def adjudicate_p0a_position(
             observed_at=observed_at)
         rows.append(row(item_id=target.item_id, turn_seq=target.turn_seq,
                         row_kind="confirmed_correct", attempt_id=attempt_id,
-                        turn_event_id=turn_event_id, key_suffix=""))
+                        turn_event_id=turn_event_id, key_suffix="",
+                        item_index=target.item_index))
     else:
         if attempts:
             attempt_id, turn_event_id = _adjudication_terminal_turn_id(
@@ -4334,33 +4352,66 @@ def adjudicate_p0a_position(
                 observed_at=observed_at)
             rows.append(row(item_id=target.item_id, turn_seq=target.turn_seq,
                             row_kind="terminated_no_verdict", attempt_id=attempt_id,
-                            turn_event_id=turn_event_id, key_suffix=""))
+                            turn_event_id=turn_event_id, key_suffix="",
+                            item_index=target.item_index))
             concluded.add((target.item_id, target.turn_seq))
         for position in resolved.positions:
             if (position.item_id != target.item_id
                     or (position.item_id, position.turn_seq) in concluded):
                 continue
+            is_target = position.turn_seq == target.turn_seq
             rows.append(row(item_id=position.item_id, turn_seq=position.turn_seq,
                             row_kind="skipped", attempt_id=None, turn_event_id=None,
-                            key_suffix=f"-t{position.turn_seq}"))
+                            key_suffix="" if is_target else f"#t{position.turn_seq}",
+                            item_index=position.item_index))
     if not rows:
         _fail("autopilot_state_invalid", "裁定没有落下任何题位")
     for entry in rows:
         db.add(entry)
     db.flush()
+    return _resume_after_adjudication(
+        db, state=state, session_id=session_id, resume_key=resume_key,
+        expected_revision=expected_revision, actor_id=actor_id,
+        bank=resolved_bank, protocol=resolved_protocol, observed_at=observed_at)
 
+
+def _resume_after_adjudication(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+    session_id: str,
+    resume_key: str,
+    expected_revision: int,
+    actor_id: str,
+    bank: content.ItemBank,
+    protocol: dict,
+    observed_at: datetime,
+) -> StartP0aResult:
+    """裁定落账后让 AI 从下一位继续;裁定的是最后一题时留在安全暂停(首次与重放同一口径)。"""
+    if state.last_error_code == "autopilot_scope_completed":
+        # 只有重放会走到这里(首次裁定在没有可裁题位时早已 409):回同一份回执,不动状态。
+        return StartP0aResult(
+            status=state.status, state_revision=state.revision,
+            replayed=True, command=None)
     try:
         return resume_p0a(
             db, session_id=session_id, idempotency_key=resume_key,
             expected_revision=expected_revision, actor_id=actor_id,
-            bank=resolved_bank, protocol=resolved_protocol, now=observed_at)
+            bank=bank, protocol=protocol, now=observed_at)
     except AutopilotServiceError as exc:
         if exc.code != "autopilot_scope_completed":
             raise
-        # 裁定的是最后一题:没有下一位可续,状态留在安全暂停,让研究者直接去收尾。
-        return StartP0aResult(
-            status=state.status, state_revision=state.revision,
-            replayed=False, command=None)
+    # 没有下一位可续。状态留在安全暂停(正常路径的 scope_complete 事件绑着最后一条命令
+    # 的媒体终止证明,这里没有那条命令,不硬造),把「已全部训毕」写进 last_error_code
+    # 并推进 revision,控制台据此收起裁定/继续按钮、提示直接去场次收尾。
+    state.last_error_code = "autopilot_scope_completed"
+    state.revision += 1
+    state.updated_at = observed_at
+    db.add(state)
+    db.flush()
+    return StartP0aResult(
+        status=state.status, state_revision=state.revision,
+        replayed=False, command=None)
 
 
 # Mirrors the write-side contract in autopilot_ledger.fenced_autopilot_update:
@@ -5492,8 +5543,10 @@ def _materialize_terminal_attempt_evidence(
     try:
         if paused_proof:
             # 安全暂停中的收口(恢复续弹 / 研究者裁定):录音命令早已不是当前处理目标,
-            # 但采集证据本身不可变——只验不可变证明与本代际权威,不要求 processing_attempt。
-            proof = autopilot_ledger.verify_terminal_record_capture(db, record.id)
+            # 但采集证据本身不可变——只验不可变证明与本场自治范围,不要求 processing_attempt,
+            # 也不要求同代际:之前每一次「继续」都会把代际 +1,这段录音是在旧代际里录完
+            # 并判过分的,证据不会因此失效。
+            proof = autopilot_ledger.verify_settled_record_capture(db, record.id)
         else:
             proof = autopilot_ledger.verify_record_capture_for_attempt(db, record.id)
     except autopilot_ledger.AutopilotProofError as exc:

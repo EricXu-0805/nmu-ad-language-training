@@ -655,11 +655,13 @@ function currentJournal(journal: SessionJournal, sessionId: string): SessionJour
 
 export function useSessionJournal(sessionId: string) {
   const [journal, setJournal] = useState<SessionJournal>(() => loadSessionJournal(sessionId));
-  const [attempts, setAttempts] = useState<JournalAttempt[]>([]);
+  // null = 本场的回答记录还没从服务端取到过(与「取到了、就是没有回答」区分开,
+  // 免得「AI 听到的」面板把没取到说成老人没答、把研究者引向「跳过本题」)。
+  const [attempts, setAttempts] = useState<JournalAttempt[] | null>(null);
 
   useEffect(() => {
     setJournal(loadSessionJournal(sessionId));
-    setAttempts([]);
+    setAttempts(null);
   }, [sessionId]);
 
   const persist = useCallback((next: SessionJournal) => {

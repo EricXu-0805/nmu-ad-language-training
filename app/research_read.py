@@ -526,6 +526,93 @@ def list_turns(db: DBSession, *, config, data_classification: str,
     return _envelope("turns", rows, next_cursor, has_more, config, binding)
 
 
+def list_adjudications(db: DBSession, *, config, data_classification: str,
+                       cursor: str | None, limit: int,
+                       binding: Any = None) -> dict[str, Any]:
+    """研究者现场裁定,按 (场次, 题目, 环节序号) 的 keyset 翻页;跳过的题位只在这里可见。"""
+    if _has_frozen_snapshot(binding):
+        return _list_frozen_snapshot(
+            db,
+            dataset_key="adjudications",
+            config=config,
+            data_classification=data_classification,
+            cursor=cursor,
+            limit=limit,
+            binding=binding,
+        )
+    after = decode_cursor(cursor, config, "adjudications") if cursor else None
+    statement = (
+        select(AutopilotPositionAdjudication, Session)
+        .join(Session, AutopilotPositionAdjudication.session_id == Session.session_id)
+        .where(Session.data_classification == data_classification)
+        .order_by(AutopilotPositionAdjudication.session_id,
+                  AutopilotPositionAdjudication.item_id,
+                  AutopilotPositionAdjudication.turn_seq)
+    )
+    if binding is not None:
+        statement = statement.where(
+            AutopilotPositionAdjudication.session_id.in_(binding.session_ids))
+    if after is not None:
+        session_after, item_after, seq_after = after
+        statement = statement.where(or_(
+            AutopilotPositionAdjudication.session_id > session_after,
+            and_(AutopilotPositionAdjudication.session_id == session_after,
+                 AutopilotPositionAdjudication.item_id > item_after),
+            and_(AutopilotPositionAdjudication.session_id == session_after,
+                 AutopilotPositionAdjudication.item_id == item_after,
+                 AutopilotPositionAdjudication.turn_seq > seq_after),
+        ))
+    picked = list(db.exec(statement.limit(limit + 1)))
+    page, has_more = _page(picked, limit)
+    withdrawn = _withdrawn_patient_ids(db)
+
+    # 本场内先后序号按落库顺序(id)算,只算这一页涉及的场次。
+    page_session_ids = {sess.session_id for _, sess in page}
+    seq_by_id: dict[int, int] = {}
+    if page_session_ids:
+        counters: dict[str, int] = {}
+        for row in db.exec(select(AutopilotPositionAdjudication).where(
+                AutopilotPositionAdjudication.session_id.in_(page_session_ids),
+        ).order_by(AutopilotPositionAdjudication.session_id,
+                   AutopilotPositionAdjudication.id)):
+            counters[row.session_id] = counters.get(row.session_id, 0) + 1
+            if row.id is not None:
+                seq_by_id[row.id] = counters[row.session_id]
+
+    rows: list[dict[str, Any]] = []
+    last_key: list[Any] | None = None
+    for row, sess in page:
+        subject_code = export_security.pseudonymize_subject(
+            sess.patient_id, config)
+        session_code = export_security.pseudonymize_session(
+            sess.session_id, config)
+        if sess.patient_id in withdrawn:
+            rows.append(_tombstone("adjudications", {
+                "session_code": session_code,
+                "subject_code": subject_code,
+                "item_id": row.item_id,
+                "turn_seq": row.turn_seq,
+                "withdrawn": True,
+            }))
+        else:
+            rows.append({
+                "session_code": session_code,
+                "subject_code": subject_code,
+                "item_id": row.item_id,
+                "presentation_order": row.presentation_order,
+                "turn_seq": row.turn_seq,
+                "kind": row.kind,
+                "reason_code": row.reason_code,
+                "adjudication_seq": seq_by_id.get(row.id) if row.id is not None else None,
+                "withdrawn": False,
+            })
+        last_key = [sess.session_id, row.item_id, row.turn_seq]
+
+    next_cursor = (encode_cursor(last_key, config, "adjudications")
+                   if has_more and last_key is not None else None)
+    return _envelope("adjudications", rows, next_cursor, has_more, config, binding)
+
+
 def _questionnaire_patient_ids(db: DBSession, binding: Any) -> set[str] | None:
     """冻结纪元下，量表面覆盖哪些受试者。
 
@@ -894,6 +981,7 @@ READERS: dict[str, str] = {
     "subjects": "list_subjects",
     "sessions": "list_sessions",
     "turns": "list_turns",
+    "adjudications": "list_adjudications",
     "questionnaire_records": "list_questionnaire_records",
     "questionnaire_item_values": "list_questionnaire_item_values",
 }

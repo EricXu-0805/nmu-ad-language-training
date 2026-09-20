@@ -40,7 +40,7 @@ _EXPORT_ARTIFACT_KINDS = frozenset({
 })
 _EXPORT_SHEET_NAMES = frozenset({
     "session", "turns", "attempts", "interactions", "item_scores", "scales",
-    "legacy_unverified_scales", "abnormal", "audio_manifest",
+    "legacy_unverified_scales", "abnormal", "audio_manifest", "adjudications",
 })
 _POST_EXPORT_AUDIO_STATUSES = frozenset({
     "exported", "checksum_verified", "reliability_review_done", "deletable",
@@ -88,7 +88,7 @@ VPS_CONFIG_FILES = frozenset({
 SUPPORTED_ALEMBIC_HEADS = frozenset({"f4b2d8c1a635"})
 LEGACY_RECOVERY_SCHEMA_SHA256 = "847c2b8db25dd910e5b0e03ad0e24c0c0803a93db7b04e4de4d084e4702c0e00"
 CURRENT_RECOVERY_SCHEMA_SHA256 = (
-    "de75dd18b123a1e3e0f6c716c7430b37eb07b28d4a96d38a54131adca24d0222"
+    "8a8cf674d62d0a0ab34798866d2acea8138ca5e0eccdbc9d642edb85ffa405ee"
 )
 REQUIRED_APPLICATION_TABLES = frozenset({
     "abnormalevent",
@@ -726,7 +726,7 @@ def _verify_staging_export_intent(
         else:
             raise SnapshotError("export_artifact_contract_invalid")
     if (csv_names != _EXPORT_SHEET_NAMES or len(receipt_rows) != 1
-            or len(descriptors) != 10 + len(controlled_codes)
+            or len(descriptors) != len(_EXPORT_SHEET_NAMES) + 1 + len(controlled_codes)
             or len(set(controlled_codes)) != len(controlled_codes)
             or sorted(controlled_codes) != metadata["audio_touched"]):
         raise SnapshotError("export_artifact_contract_invalid")
@@ -1168,7 +1168,7 @@ def _verify_export_semantics(
 
             if (len(manifest_rows) != 1 or len(receipt_rows) != 1
                     or csv_names != _EXPORT_SHEET_NAMES
-                    or len(descriptors) != 11 + len(controlled_receipts)):
+                    or len(descriptors) != len(_EXPORT_SHEET_NAMES) + 2 + len(controlled_receipts)):
                 raise SnapshotError("export_artifact_contract_invalid")
             receipt_descriptor, receipt_path = receipt_rows[0]
             if receipt_descriptor["byte_count"] > 4096:

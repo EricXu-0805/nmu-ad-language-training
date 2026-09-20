@@ -21,12 +21,13 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import (auth, content, db, export_security, quality_release,
                  repeat_intent, main, research_dataset, research_read,
-                 session_admission)
+                 resource_limits, session_admission)
 from app.db import get_session
 from app.main import app
 from app.models import (
     AttemptEvent,
     AuditLog,
+    AutopilotPositionAdjudication,
     ItemEvent,
     Patient,
     QualityDisclosureRecord,
@@ -240,6 +241,15 @@ def research_env(monkeypatch):
             asr_confidence=0.9, prompt_level=0, ai_score=1.0,
             reviewed_score=1.0, score_locked=True, judge_portrait_used=False))
         session.commit()
+        # 两位受试者各一条现场裁定(整题跳过,没有环节行):撤回者那条必须变成墓碑。
+        for session_id, key in (("S-REAL-1", "adjudicate-real-0001"),
+                                ("S-GONE-1", "adjudicate-gone-0001")):
+            session.add(AutopilotPositionAdjudication(
+                session_id=session_id, item_id="SE_熨斗", turn_seq=1,
+                presentation_order=2, kind="skipped", reason_code="participant_declined",
+                note=SECRET_TEXT, actor_id="RESEARCHER", control_generation=1,
+                state_revision=3, idempotency_key=key))
+        session.commit()
         # 两位受试者各一份已锁定的量表记录：撤回者那份必须变成墓碑，
         # 而没有真行的话「每个数据集都有 withdrawn 布尔列」那条断言会空转。
         for patient_id, record_id in (("P-REAL-1", "qr_real_1"),
@@ -420,6 +430,8 @@ def test_csv_carries_a_bom_and_the_same_columns_as_json(research_env, monkeypatc
     _with_key(monkeypatch)
     client = _client("steward")
     for dataset in research_dataset.dataset_keys():
+        # 六个数据集各两次读超过研究取数的突发配额(10 页);这里测的是 CSV 形状,不是限速。
+        resource_limits.reset_for_tests()
         json_body = client.get(
             f"/research/v1/{dataset}?data_classification=research").json()
         csv_response = client.get(
@@ -991,6 +1003,7 @@ def test_the_schema_surface_stays_readable_without_a_key_but_carries_no_data(
 
     # 而一切带数据行的端点必须 503
     for dataset in research_dataset.dataset_keys():
+        resource_limits.reset_for_tests()
         for suffix in ("", ".csv"):
             response = client.get(
                 f"/research/v1/{dataset}{suffix}?data_classification=research")
@@ -1422,3 +1435,29 @@ def test_the_csv_filename_carries_the_epoch(research_env, monkeypatch):
     assert response.status_code == 200
     assert 'filename="nmu-turns-research-epoch001.csv"' in \
         response.headers["content-disposition"]
+
+
+def test_adjudications_dataset_shows_skipped_positions_pseudonymously_with_tombstones(
+        research_env, monkeypatch):
+    """跳过的题位没有环节行,只能在 adjudications 数据集里看到;备注/裁定人/时间永不出现,
+    撤回者那条留墓碑保住分母。"""
+    _with_key(monkeypatch)
+    client = _client("steward")
+    payload = client.get("/research/v1/adjudications?data_classification=research").json()
+    assert payload["columns"] == list(research_dataset.published_columns(
+        research_dataset.dataset_for("adjudications")))
+    rows = payload["rows"]
+    assert len(rows) == 2
+    live = [row for row in rows if row["withdrawn"] is False]
+    gone = [row for row in rows if row["withdrawn"] is True]
+    assert len(live) == len(gone) == 1
+    assert (live[0]["item_id"], live[0]["presentation_order"], live[0]["turn_seq"],
+            live[0]["kind"], live[0]["reason_code"], live[0]["adjudication_seq"]) == (
+        "SE_熨斗", 2, 1, "skipped", "participant_declined", 1)
+    assert gone[0]["kind"] is None and gone[0]["item_id"] == "SE_熨斗"
+    raw = client.get("/research/v1/adjudications.csv?data_classification=research").text
+    for secret in (SECRET_TEXT, "RESEARCHER", "S-REAL-1", "P-REAL-1", "adjudicate-real-0001"):
+        assert secret not in raw
+    # 环节表里没有这个题位:跳过不伪造环节行。
+    turns = client.get("/research/v1/turns?data_classification=research").json()["rows"]
+    assert all(row["item_id"] != "SE_熨斗" for row in turns)

@@ -161,6 +161,11 @@ def _logged_in_client(eng, username: str) -> TestClient:
      access_policy.CAREGIVER_SESSION_CONTROL_ROLES),
     ("POST", "/sessions/S/autopilot/takeover", access_policy.AccessKind.ACCOUNT,
      access_policy.CAREGIVER_SESSION_CONTROL_ROLES),
+    # 恢复/裁定重新开启老人端出题与录音或替 AI 结论一题:只允许具名研究者/管理员。
+    ("POST", "/sessions/S/autopilot/resume", access_policy.AccessKind.ACCOUNT,
+     access_policy.TRAINING_OPERATION_ROLES),
+    ("POST", "/sessions/S/autopilot/adjudicate", access_policy.AccessKind.ACCOUNT,
+     access_policy.TRAINING_OPERATION_ROLES),
     ("GET", "/caregiver/today", access_policy.AccessKind.ACCOUNT,
      access_policy.CAREGIVER_ROLES),
     ("POST", "/caregiver/visit-plans/VP/start", access_policy.AccessKind.ACCOUNT,
@@ -643,6 +648,14 @@ def test_named_account_and_role_allowlist_matrix(policy_client):
             ("POST", "/sessions/S-POLICY/autopilot/start", {"json": {
                 "idempotency_key": "steward-must-not-start",
                 "expected_revision": 0,
+            }}),
+            ("POST", "/sessions/S-POLICY/autopilot/resume", {"json": {
+                "idempotency_key": "steward-must-not-resume",
+                "expected_revision": 0,
+            }}),
+            ("POST", "/sessions/S-POLICY/autopilot/adjudicate", {"json": {
+                "idempotency_key": "steward-must-not-adjudicate",
+                "expected_revision": 0, "kind": "skip_item", "reason_code": "other",
             }}),
         )
         for method, path, kwargs in clinical_writes:

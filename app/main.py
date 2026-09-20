@@ -8051,7 +8051,12 @@ def _assess_session_completion(sess: TrainSession, s: DBSession) -> tuple[
         | session_completion.RapportCompletionAssessment]:
     if sess.week_no == 1:
         return _assess_rapport_completion(sess, s)
-    plan = _session_plan_for_runtime(sess)
+    # 研究者现场跳过的题位(具名、只追加的收据,收据 260)从冻结计划里拿掉后再核对;
+    # 返回给调用方的也是这份扣减后的计划——场次汇总必须按同一份计划算 expected/matched,
+    # 否则汇总会替跳过的题位声称「已匹配、有录音」,或与门禁计数对不上而 409。
+    skipped = _skipped_autopilot_positions(sess.session_id, s)
+    plan = session_completion.plan_without_skipped(
+        _session_plan_for_runtime(sess), skipped)
     items = list(s.exec(select(ItemEvent).where(ItemEvent.session_id == sess.session_id)))
     item_ids = [item.id for item in items if item.id is not None]
     turns = (list(s.exec(select(TurnEvent).where(TurnEvent.item_event_id.in_(item_ids))))
@@ -8067,7 +8072,7 @@ def _assess_session_completion(sess: TrainSession, s: DBSession) -> tuple[
         is_simulation=sess.is_simulation,
         data_classification=sess.data_classification,
         blob_exists=lambda raw_audio_id: raw_audio_id in verified_audio_ids,
-        skipped_positions=_skipped_autopilot_positions(sess.session_id, s),
+        skipped_positions=skipped,
     )
 
 
@@ -8088,7 +8093,12 @@ def _assess_intervention_completion(
         | session_completion.RapportCompletionAssessment]:
     if sess.week_no == 1:
         return _assess_rapport_completion(sess, s)
-    plan = _session_plan_for_runtime(sess)
+    # 研究者现场跳过的题位(具名、只追加的收据,收据 260)从冻结计划里拿掉后再核对;
+    # 返回给调用方的也是这份扣减后的计划——场次汇总必须按同一份计划算 expected/matched,
+    # 否则汇总会替跳过的题位声称「已匹配、有录音」,或与门禁计数对不上而 409。
+    skipped = _skipped_autopilot_positions(sess.session_id, s)
+    plan = session_completion.plan_without_skipped(
+        _session_plan_for_runtime(sess), skipped)
     items = list(s.exec(select(ItemEvent).where(ItemEvent.session_id == sess.session_id)))
     item_ids = [item.id for item in items if item.id is not None]
     turns = (list(s.exec(select(TurnEvent).where(TurnEvent.item_event_id.in_(item_ids))))
@@ -8104,7 +8114,7 @@ def _assess_intervention_completion(
         is_simulation=sess.is_simulation,
         data_classification=sess.data_classification,
         blob_exists=lambda raw_audio_id: raw_audio_id in verified_audio_ids,
-        skipped_positions=_skipped_autopilot_positions(sess.session_id, s),
+        skipped_positions=skipped,
     )
 
 

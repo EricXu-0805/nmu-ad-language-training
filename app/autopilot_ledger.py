@@ -1103,6 +1103,34 @@ def verify_terminal_record_capture(
     return proof
 
 
+def verify_settled_record_capture(
+    session: Session,
+    command_id: int,
+) -> AttemptCaptureProof:
+    """Immutable capture proof for a capture that already concluded and was judged.
+
+    Used only from a proven safe pause (resume continuing a half-finished position,
+    researcher adjudication).  Every fact about the capture is generation-bound at
+    write time and re-proved by :func:`verify_immutable_record_capture`; a later
+    resume legitimately bumps the control generation, so this must not require the
+    command to belong to the *current* generation — only to this session's live
+    autonomous scope, and never to a generation the scope has not reached.
+    """
+    command = session.get(RuntimeCommand, command_id)
+    if command is None or command.kind != "record":
+        raise AutopilotProofError("record command does not exist")
+    proof = verify_immutable_record_capture(session, command)
+    state = session.get(SessionAutopilotState, command.session_id)
+    if state is None:
+        raise AutopilotProofError("session has no autopilot control state")
+    if state.scope_key != command.scope_key or state.mode != "autonomous":
+        raise AutopilotProofError("command scope is no longer autonomous and current")
+    if (command.control_generation > state.control_generation
+            or command.runner_generation > state.runner_generation):
+        raise AutopilotProofError("command generation is ahead of the live scope")
+    return proof
+
+
 def verify_record_capture_for_attempt(
     session: Session,
     command_id: int,

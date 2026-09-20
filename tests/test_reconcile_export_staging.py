@@ -60,6 +60,7 @@ SHEETS = {
     "legacy_unverified_scales",
     "abnormal",
     "audio_manifest",
+    "adjudications",
 }
 
 

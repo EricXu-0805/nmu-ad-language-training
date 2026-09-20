@@ -544,6 +544,20 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                     ack_types = observations["ack_types"]
                     assert isinstance(ack_types, dict)
                     ack_types.setdefault(key, []).append(ack_type)
+                # 收据 260 起 tts_ended 的回执里带回的录音命令被平板当场采纳,不再经 /next;
+                # 命令序列要把它也登记上,否则 record 在走查眼里从此消失。
+                receipt = response.json()
+                carried = receipt.get("command") if isinstance(receipt, dict) else None
+                if isinstance(carried, dict):
+                    carried_key = carried.get("command_key")
+                    carried_seq = carried.get("command_seq")
+                    carried_kind = carried.get("kind")
+                    if isinstance(carried_key, str) and isinstance(carried_seq, int) \
+                            and isinstance(carried_kind, str):
+                        entries = observations["next"]
+                        assert isinstance(entries, list)
+                        if (carried_key, carried_seq, carried_kind) not in entries:
+                            entries.append((carried_key, carried_seq, carried_kind))
             except Exception:
                 violation("设备命令 ACK 无法校验")
         if response.status == 200 and request.method == "POST" \
@@ -732,7 +746,8 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                     and ack_types.get(first_tts[0]) == ["tts_started", "tts_ended"]
                     and ack_types.get(record[0]) == ["record_started", "record_stopped"]
                     and ack_types.get(next_command[0]) == ["tts_started"]
-                    and authorizations.get(record[0]) == 2
+                    # 收据 260:开麦前置只剩一次录音授权(取流之后、真 onstart 之前那道门)。
+                    and authorizations.get(record[0]) == 1
                     and tts.get(first_tts[0]) == 1 and tts.get(next_command[0]) == 1
                     and int(observations["audio_posts"]) == 1
                     and int(observations["audio_uploads"]) == 1

@@ -4,7 +4,7 @@
 收据 257 上线后只有 HTTP 级与单测证据的两条链,这里在真 Chrome 里点一遍:
 
   链 A  设备故障 → 研究者点「继续 AI 自动带练」→ 平板不刷新自己重新探测
-        做法:第二段话术的 TTS 请求被浏览器层拦掉(route.abort)→ 老人端回 tts_failed
+        做法:第二段话术的 TTS 请求被浏览器层持续拦掉(route.abort,含平板的两次自动重试)→ 老人端回 tts_failed
         (audio_playback_failed)→ 服务端把场次 runtime 一起暂停(收据 257 §二 1)→ 管理员在
         真实控制台的「AI 自动带练」卡片看到暂停原因、点「继续」→ 老人端页面没有导航,
         自己 GET /autopilot/next 拿到新命令并放出下一段话术。
@@ -260,12 +260,14 @@ def run_recovery_chains(config: BrowserAcceptanceConfig) -> RecoveryChainsResult
             route.abort("blockedbyclient")
 
     def abort_next_tts(route) -> None:
-        # 链 A 的故障注入:第一次命中的话术请求整条掐掉(浏览器层 net::ERR_BLOCKED_BY_CLIENT),
-        # 老人端会按 fetch_failed 回 tts_failed;之后的话术照常放行。
+        # 链 A 的故障注入:第一次命中的话术命令,它的每一次请求都整条掐掉(浏览器层
+        # net::ERR_BLOCKED_BY_CLIENT)——收据 260 起平板对话术拉取会自动再试两次,只掐一次
+        # 就被它自己救回来了;持续掐断才是「设备放不出这句」的故障。别的命令键照常放行。
         matched = _TTS_PATH.match(urlsplit(route.request.url).path)
-        if obs["aborted_tts_key"] is None and matched and obs["device_failure_induced"] is False:
+        if matched and obs["aborted_tts_key"] is None and obs["device_failure_induced"] is False:
             obs["aborted_tts_key"] = matched.group(1)
             obs["device_failure_induced"] = True
+        if matched and matched.group(1) == obs["aborted_tts_key"]:
             route.abort("blockedbyclient")
             return
         route.fallback()
@@ -422,6 +424,16 @@ def run_recovery_chains(config: BrowserAcceptanceConfig) -> RecoveryChainsResult
                     ack_types = obs["ack_types"]
                     assert isinstance(ack_types, dict)
                     ack_types.setdefault(key, []).append(ack_type)
+                # 收据 260 起 tts_ended 的回执里带回的录音命令被平板当场采纳,不再经 /next;
+                # 命令序列要把它也登记上,否则 record 在走查眼里从此消失。
+                receipt = response.json()
+                carried = receipt.get("command") if isinstance(receipt, dict) else None
+                if isinstance(carried, dict) and isinstance(carried.get("command_key"), str):
+                    entries = obs["next"]
+                    assert isinstance(entries, list)
+                    row = (carried["command_key"], carried.get("command_seq"), carried.get("kind"))
+                    if row not in entries:
+                        entries.append(row)
             except Exception:
                 violation("设备命令 ACK 无法校验")
         if (request.method == "POST" and parsed.path.endswith("/recording-authorization")

@@ -53,6 +53,7 @@ _SHEETS = frozenset({
     "legacy_unverified_scales",
     "abnormal",
     "audio_manifest",
+    "adjudications",
 })
 _ANALYSIS_NAMES = frozenset(
     {f"{name}.csv" for name in _SHEETS} | {".staging-receipt.json"}
