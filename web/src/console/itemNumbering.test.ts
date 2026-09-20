@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { SessionPlan } from "../types.ts";
-import { itemSeqLabel, itemSeqSummary, itemSeqText, planItemSeq } from "./itemNumbering.ts";
+import { itemSeqLabel, itemSeqSummary, itemSeqText } from "./itemNumbering.ts";
 
 test("冻结计划 32 题的结构:单要素 1–20 分 4 组每组 5 题,双要素 21–30,多要素 31–32", () => {
   for (let order = 1; order <= 20; order += 1) {
@@ -45,17 +44,4 @@ test("文案:主显示是类型内号(对纸质记录单),单要素带组号;摘
   const unmapped = itemSeqLabel("双要素", 3)!;
   assert.equal(itemSeqText("双要素", unmapped), "第 3 题");
   assert.equal(itemSeqSummary("双要素", unmapped), "第 3 题");
-});
-
-test("planItemSeq 按 item_id 在冻结计划里查,计划缺失或题不在计划里都为 null", () => {
-  const plan = {
-    items: [
-      { item_id: "SE_胡萝卜", task_type: "单要素", presentation_order: 12 },
-      { item_id: "DE_牙刷_牙膏", task_type: "双要素", presentation_order: 24 },
-    ],
-  } as unknown as SessionPlan;
-  assert.deepEqual(planItemSeq(plan, "SE_胡萝卜"), { seq: 12, typeSeq: 12, group: 3, groupSeq: 2 });
-  assert.deepEqual(planItemSeq(plan, "DE_牙刷_牙膏"), { seq: 24, typeSeq: 4, group: null, groupSeq: null });
-  assert.equal(planItemSeq(plan, "SE_书"), null);
-  assert.equal(planItemSeq(null, "SE_胡萝卜"), null);
 });

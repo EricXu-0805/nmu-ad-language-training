@@ -2110,13 +2110,13 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         "pseudonym_key_id", "pseudonym_version",
     ),
     "turns": _SESSION_COLS + (
-        "item_id", "presentation_order", "task_type", "turn_seq", "response_role",
+        "item_id", "task_type", "turn_seq", "response_role",
         "source_attempt_seq", "asr_text", "confirmed_response_text",
         "asr_confidence", "prompt_level", "ai_answer_type", "ai_score",
         "ai_needs_review", "ai_judge_mode", "reviewed_score", "score_locked",
         "element_value", "ai_human_diff", "judge_portrait_used",
         "duration_seconds",
-        "adjudication_kind", "adjudication_reason",
+        "presentation_order", "adjudication_kind", "adjudication_reason",
     ),
     "adjudications": _SESSION_COLS + (
         "item_id", "presentation_order", "turn_seq", "kind", "reason_code", "note",

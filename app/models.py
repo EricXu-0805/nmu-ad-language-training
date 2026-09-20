@@ -940,7 +940,11 @@ class AutopilotPositionAdjudication(SQLModel, table=True):
 @sa_event.listens_for(AutopilotPositionAdjudication, "before_update")
 @sa_event.listens_for(AutopilotPositionAdjudication, "before_delete")
 def _reject_position_adjudication_mutation(*_args) -> None:
-    """研究者裁定是只追加收据;改错只能再追加一条相反裁定,不得更新或删除。"""
+    """研究者裁定是只追加收据,不得更新或删除。
+
+    裁定只落在当前题位、裁完 AI 就进下一题,同一题位不会被裁第二次(uq 约束);裁错了
+    不改这张表——研究真值本来就只走事后复核锁分,操作记录留原样。
+    """
     raise RuntimeError("AutopilotPositionAdjudication 是只追加证据，禁止更新或删除")
 
 
