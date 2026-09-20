@@ -220,6 +220,31 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
             return True
         return False
 
+    def register_command(payload) -> None:
+        # 平板拿命令有两条路:GET /autopilot/next(话术、以及旧口径的录音),以及
+        # tts_ended ACK 回执体里直接带下来的录音命令(合入平板分支后 tts→record 不再
+        # 走 /next)。两处形状同为 NextCommandProjection,这里统一登记一次。
+        if not isinstance(payload, dict) or not isinstance(payload.get("command_key"), str):
+            return
+        commands = obs["commands"]
+        order = obs["command_order"]
+        assert isinstance(commands, dict) and isinstance(order, list)
+        key = payload["command_key"]
+        if key in commands:
+            return
+        inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        commands[key] = {
+            "command_key": key,
+            "command_seq": payload.get("command_seq"),
+            "kind": payload.get("kind"),
+            "item_ref": payload.get("item_ref"),
+            "turn_seq": payload.get("turn_seq"),
+            "attempt_seq": payload.get("attempt_seq"),
+            "prompt_level": payload.get("prompt_level"),
+            "purpose": inner.get("purpose"),
+        }
+        order.append(key)
+
     def observe_response(tag: str, response) -> None:
         request = response.request
         parsed = urlsplit(response.url)
@@ -265,23 +290,7 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
             try:
                 payload = response.json()
                 if isinstance(payload, dict) and isinstance(payload.get("command_key"), str):
-                    commands = obs["commands"]
-                    order = obs["command_order"]
-                    assert isinstance(commands, dict) and isinstance(order, list)
-                    key = payload["command_key"]
-                    if key not in commands:
-                        inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
-                        commands[key] = {
-                            "command_key": key,
-                            "command_seq": payload.get("command_seq"),
-                            "kind": payload.get("kind"),
-                            "item_ref": payload.get("item_ref"),
-                            "turn_seq": payload.get("turn_seq"),
-                            "attempt_seq": payload.get("attempt_seq"),
-                            "prompt_level": payload.get("prompt_level"),
-                            "purpose": inner.get("purpose"),
-                        }
-                        order.append(key)
+                    register_command(payload)
                     if obs["runtime_paused"] == "resuming":
                         obs["runtime_paused"] = False
             except Exception:
@@ -307,6 +316,12 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
                 ack_types.setdefault(key, []).append(ack_type)
             else:
                 violation("设备命令 ACK 无法校验")
+            # 合入平板分支后 tts_ended 的回执体直接带下来后续录音命令,平板不再为它
+            # 调 /autopilot/next;这里同样登记,否则等录音命令会一直等不到。
+            try:
+                register_command(response.json().get("command"))
+            except Exception:
+                violation("命令 ACK 回执体里的后续命令无法校验")
         session_id = obs["session_id"]
         if request.method == "POST" and isinstance(session_id, str) and response.status == 200:
             if parsed.path == f"/sessions/{session_id}/autopilot/start":
@@ -351,10 +366,28 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
         page.on("response", lambda response: observe_response(tag, response))
         page.on("requestfailed", observe_request_failure)
 
+    debug_on = bool(os.environ.get("NMU_ADJ_DEBUG"))
+
     def acks(key: str) -> list[str]:
         ack_types = obs["ack_types"]
         assert isinstance(ack_types, dict)
         return list(ack_types.get(key, []))
+
+    def dump_debug() -> None:
+        if not debug_on:
+            return
+        table = obs["commands"]
+        order = obs["command_order"]
+        assert isinstance(table, dict) and isinstance(order, list)
+        print("--- 命令序列(调试)---", file=sys.stderr)
+        for key in order:
+            command = table[key]
+            print(f"  seq={command['command_seq']} {command['kind']}/{command['purpose']}"
+                  f" {command['item_ref']}#{command['turn_seq']} L{command['prompt_level']}"
+                  f" A{command['attempt_seq']} acks={acks(key)}", file=sys.stderr)
+        print(f"--- resumes={len(obs['resumes'])} adjudications="  # type: ignore[arg-type]
+              f"{[(r.get('status'), r.get('code')) for r in obs['adjudications']]} ---",  # type: ignore[union-attr]
+              file=sys.stderr)
 
     def commands() -> list[dict]:
         table = obs["commands"]
@@ -775,6 +808,9 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
             )
             _write_receipt(config, result)
             return result
+    except BaseException:
+        dump_debug()
+        raise
     finally:
         if admin_api is not None:
             admin_api.close()
