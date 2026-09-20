@@ -3,7 +3,6 @@
 // item_id 跨周复用(143 个里 73 个),字符串本身不带序。
 // 钱凯的纸质记录单按任务类型内编号(单要素 1–20、双要素 1–10、多要素 1–2),训练
 // 手册把单要素分 4 组每组 5 题;研究者对表看的是类型内号,总序号只作弱化后缀。
-import type { SessionPlan } from "../types";
 
 export interface ItemSeq {
   /** 冻结计划 1 基总序号(= presentation_order)。 */
@@ -54,9 +53,4 @@ export function itemSeqSummary(taskType: string, seq: ItemSeq): string {
   return seq.typeSeq === null
     ? `第 ${seq.seq} 题`
     : `第 ${seq.seq} 题 · ${itemSeqText(taskType, seq)}`;
-}
-
-export function planItemSeq(plan: SessionPlan | null, itemId: string): ItemSeq | null {
-  const item = plan?.items.find((row) => row.item_id === itemId);
-  return item ? itemSeqLabel(item.task_type, item.presentation_order) : null;
 }
