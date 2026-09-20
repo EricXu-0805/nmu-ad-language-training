@@ -4,6 +4,7 @@ import { ApiError } from "../apiResponse.ts";
 import type { DeviceCapabilityRecord } from "../security/deviceCapability.ts";
 import {
   AUTOPILOT_CONTROLLER_AUTHORITY_TEST_ONLY,
+  AUTOPILOT_DEVICE_REQUEST_TIMEOUT_MS,
   AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS,
   AUTOPILOT_TTS_START_DEADLINE_MS,
   AutopilotAckPersistenceError,
@@ -3760,6 +3761,7 @@ function retryHarness() {
   return {
     waits,
     get nowMs() { return nowMs; },
+    set nowMs(value: number) { nowMs = value; },
     /** 每次进入等待时先跑一遍这些观察(用来钉"重试期间相位不变、零媒体")。 */
     onWait(observer: () => void) { observed.push(observer); },
     ports: {
@@ -3851,7 +3853,7 @@ for (const permanent of [
   });
 }
 
-test("/next 一直瞬时失败：退避 1.5/3/6/12 s 后下一步会越过 30 s 预算，落到 technical_failure", async () => {
+test("/next 一直瞬时失败：退避 1.5/3/6 s 后再等 12 s 加一次最长 12 s 的请求会越过 30 s 预算，落到 technical_failure", async () => {
   const retry = retryHarness();
   let nextCalls = 0;
   const controller = new PatientAutopilotController({
@@ -3866,10 +3868,37 @@ test("/next 一直瞬时失败：退避 1.5/3/6/12 s 后下一步会越过 30 s 
     transientRetry: retry.ports,
   });
   const state = await controller.pollOnce();
-  assert.deepEqual(retry.waits, [1_500, 3_000, 6_000, 12_000]);
-  assert.ok(retry.nowMs <= AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS);
-  assert.equal(nextCalls, 5);
+  // 预算是总时长上限:已等 10.5 s,再等 12 s 加一次最长 12 s 的请求 = 34.5 s > 30 s,不再试。
+  assert.deepEqual(retry.waits, [1_500, 3_000, 6_000]);
+  assert.ok(retry.nowMs + AUTOPILOT_DEVICE_REQUEST_TIMEOUT_MS <= AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS);
+  assert.equal(nextCalls, 4);
   assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "technical_failure");
+});
+
+test("/next 每次都超时(408,各占满 12 s):预算把在途请求也算进去,两次就停,总时长不过 30 s", async () => {
+  const retry = retryHarness();
+  let nextCalls = 0;
+  const controller = new PatientAutopilotController({
+    sessionId: "S-RETRY-BUDGET-408",
+    transport: {
+      next: async () => {
+        nextCalls += 1;
+        retry.nowMs += AUTOPILOT_DEVICE_REQUEST_TIMEOUT_MS;
+        throw transientError("408");
+      },
+      ack: async () => ({}),
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => { throw new Error("不应开麦"); } },
+    idempotencyKey: fixedAckKey,
+    transientRetry: retry.ports,
+  });
+  const state = await controller.pollOnce();
+  // 12 s 失败 → 等 1.5 s → 12 s 失败:再等 3 s 加一次 12 s 会到 40.5 s,停。
+  assert.deepEqual(retry.waits, [1_500]);
+  assert.equal(nextCalls, 2);
+  assert.ok(retry.nowMs <= AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS);
   assert.equal(state.pause_reason, "technical_failure");
 });
 
@@ -3899,6 +3928,51 @@ test("退避等待中 stop()：立即收口，不再发下一次请求", async (
   controller.stop();
   const state = await polled;
   assert.equal(nextCalls, 1);
+  assert.equal(state.phase, "paused");
+  assert.equal(state.pause_reason, "technical_failure");
+});
+
+test("热麦时 record_started ACK 瞬时失败进入退避:stopAndWait 一关麦就中止等待,收口不等阶梯跑完", async () => {
+  // 复核 2026-09-19:原来 safeShutdownAndWait 先 await inFlight 再 abort,退避等待只认
+  // presentationAbort,麦克风早关了却要等 1.5/3/6/12 s 阶梯(最坏 30 s)才能放行页签所有权与收麦证明。
+  const events: string[] = [];
+  const ackAttempts: string[] = [];
+  const media = halfRecordingCapture(events);
+  let waitEntered: (() => void) | null = null;
+  const waitEnteredOnce = new Promise<void>((resolve) => { waitEntered = resolve; });
+  const controller = new PatientAutopilotController({
+    sessionId: "S-RETRY-SHUTDOWN",
+    transport: {
+      next: async () => recordCommand(),
+      ack: async (_sessionId, _key, ack) => {
+        ackAttempts.push(ack.ack_type);
+        throw transientError("503");
+      },
+    },
+    speech: { start: () => { throw new Error("不应播放"); } },
+    recording: { start: () => media.capture },
+    idempotencyKey: fixedAckKey,
+    transientRetry: {
+      now: () => 0,
+      wait: (_delayMs, signal) => new Promise<void>((_resolve, reject) => {
+        waitEntered?.();
+        if (signal.aborted) { reject(signal.reason); return; }
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+    },
+  });
+  const polling = controller.pollOnce();
+  await waitEnteredOnce;
+  assert.deepEqual(ackAttempts, ["record_started"]);
+  assert.equal(media.counters.interrupts, 0);
+
+  const shutdown = controller.stopAndWait();
+  assert.equal(media.counters.interrupts, 1, "麦克风在同一同步调用栈内关掉");
+  await shutdown;
+  const state = await settleOrWedge(polling);
+  // 等待被立即中止:没有第二次 record_started。服务器从没收到 started,所以也没有
+  // record_failed 可发(命令仍是服务器手里的 pending,留给重新激活的页面),本地安全暂停。
+  assert.deepEqual(ackAttempts, ["record_started"]);
   assert.equal(state.phase, "paused");
   assert.equal(state.pause_reason, "technical_failure");
 });

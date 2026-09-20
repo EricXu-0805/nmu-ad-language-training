@@ -22,8 +22,10 @@ export interface AutopilotMediaTransportDependencies {
   nextCommand(sessionId: string): Promise<unknown | null>;
   /** Test-only override; production drain recovery uses a finite 12s deadline. */
   requestTimeoutMs?: number;
-  /** Test-only override; production gives each TTS synthesis attempt 4s. */
+  /** Test-only override applied to every attempt; production uses TTS_ATTEMPT_TIMEOUTS_MS. */
   ttsAttemptTimeoutMs?: number;
+  /** Test-only override, per attempt (last value repeats); production 10 s then 3.5 s. */
+  ttsAttemptTimeoutsMs?: readonly number[];
   /** Test-only override; production waits 0.5s then 1s before the two TTS retries. */
   ttsRetryDelaysMs?: readonly number[];
 }
@@ -34,10 +36,13 @@ const DRAIN_REQUEST_TIMEOUT_MS = 12_000;
  * TTS 合成 POST：每次尝试各自的超时，以及最多两次重试之前的等待。
  *
  * 网络复审:这条请求原来既无重试也无自己的超时,只靠控制器 20 s 的起播期限兜底。
- * 3×4 s + 0.5 s + 1 s = 13.5 s,加上两次 revalidate 与 play(),仍在起播期限之内。
+ * 第一次给 10 s——冷缓存合成要真去云端(服务端自己的供应商超时是 15 s),4 s 会把一次
+ * 慢但会成功的合成掐成 tts_failed,而且每掐一次服务端又起一次合成(没有 in-flight 去重);
+ * 之后的重试只为连接级失败(TypeError/0/5xx/408)准备,3.5 s 一次。
+ * 10 + 0.5 + 3.5 + 0.75 + 3.5 = 18.25 s,加两次 revalidate 与 play(),在 20 s 起播期限内。
  */
-const TTS_ATTEMPT_TIMEOUT_MS = 4_000;
-const TTS_RETRY_DELAYS_MS: readonly number[] = [500, 1_000];
+const TTS_ATTEMPT_TIMEOUTS_MS: readonly number[] = [10_000, 3_500];
+const TTS_RETRY_DELAYS_MS: readonly number[] = [500, 750];
 
 interface ExactTtsAuthority {
   sessionId: string;
@@ -137,8 +142,8 @@ function waitUnlessAborted(delayMs: number, signal: AbortSignal): Promise<void> 
 }
 
 /**
- * TTS 合成 POST，最多再试两次。每次尝试各自一条 4 s 期限；父 signal 一中止就不再
- * 等也不再发。重试的是同一条 exact 命令 URL 与同一份设备凭据，服务器按 speech_key
+ * TTS 合成 POST，最多再试两次。每次尝试各自一条期限(首次 10 s,之后 3.5 s)；父 signal
+ * 一中止就不再等也不再发。重试的是同一条 exact 命令 URL 与同一份设备凭据，服务器按 speech_key
  * 合成，重复请求没有副作用。
  */
 async function postExactTtsWithRetry(
@@ -149,8 +154,11 @@ async function postExactTtsWithRetry(
   credential: DeviceCredentialSelection,
 ): Promise<Response> {
   const delays = deps.ttsRetryDelaysMs ?? TTS_RETRY_DELAYS_MS;
-  const timeoutMs = deps.ttsAttemptTimeoutMs ?? TTS_ATTEMPT_TIMEOUT_MS;
+  const timeouts = deps.ttsAttemptTimeoutMs !== undefined
+    ? [deps.ttsAttemptTimeoutMs]
+    : deps.ttsAttemptTimeoutsMs ?? TTS_ATTEMPT_TIMEOUTS_MS;
   for (let attempt = 0; ; attempt += 1) {
+    const timeoutMs = timeouts[Math.min(attempt, timeouts.length - 1)] ?? TTS_ATTEMPT_TIMEOUTS_MS[0];
     try {
       return await withRequestDeadline(
         signal, timeoutMs, "TTS 合成请求超时", "语音播放已取消",

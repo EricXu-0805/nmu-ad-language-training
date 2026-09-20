@@ -17,6 +17,7 @@ import {
   type AutopilotCaptureBootstrapPorts,
   type ExactCaptureUploadPorts,
 } from "./autopilotRecordingExecutor.ts";
+import { ApiError } from "../apiResponse.ts";
 import { attachAutopilotStopReason, createAudioOutboxEntry, type AudioOutboxEntry } from "../audio/audioOutbox.ts";
 import { sha256Blob } from "../audio/audioUploadReceipt.ts";
 import { AutopilotMediaError } from "./autopilotMediaError.ts";
@@ -937,6 +938,48 @@ async function captureAtRealOnstart(
   assert.equal(device?.starts, 1, "startPrepared 必须已经同步下达开录指令");
   clock.set(clock.now() + 20);
   return { capture, device, devices, harness, clock, uploadCalls, events, held };
+}
+
+for (const denial of [
+  { name: "allowed:false", authorize: async (): Promise<RecordingAuthorization> => (
+    { allowed: false, runtime_status: "active", is_simulation: true }) },
+  { name: "runtime 已暂停", authorize: async (): Promise<RecordingAuthorization> => (
+    { allowed: true, runtime_status: "paused", is_simulation: true }) },
+  { name: "409 命令已失效", authorize: async (): Promise<RecordingAuthorization> => {
+    throw new ApiError(409, "autopilot_command_not_current");
+  } },
+] as const) {
+  test(`唯一一次授权在取流之后被拒(${denial.name})：流已到手也不开录,轨道全部关掉,零 stage/上传`, async (context) => {
+    // 复核 2026-09-19:去掉取流前那次授权后,这道门是服务端管开麦的唯一一道;它拒绝时
+    // getUserMedia 已经交出了流——必须证明字节零、轨道停、MediaRecorder 一次 start 都没有。
+    const clock = clockDouble();
+    const devices = installDeviceDoubles(clock);
+    context.after(() => devices.restore());
+    const held = leaseDouble();
+    const uploadCalls: UploadStage[] = [];
+    const harness = bootstrapHarness(clock, {
+      acquireLease: async () => held.lease,
+      authorize: () => denial.authorize(),
+    });
+    const executor = new BrowserAutopilotRecordingExecutor(SESSION, {
+      ownerGeneration: 11,
+      isForeground: () => true,
+      observe: () => {},
+      ports: uploadPorts(uploadCalls, null),
+      bootstrap: harness.ports,
+    });
+    const capture = executor.start(recordCommand() as never) as TestCapture;
+    capture.stopped.catch(() => {});
+    const error = await capture.started.then(() => null, (e: unknown) => e);
+    assert.equal((error as AutopilotMediaError).errorCode, "recording_start_failed");
+    await capture.closed;
+    assert.equal(devices.userMediaCalls, 1);
+    assert.deepEqual(harness.calls, ["acquireLease", "recoverySnapshot", "authorize:1"]);
+    assert.deepEqual(devices.tracks.map((row) => row.stopped), [1, 1]);
+    assert.equal(devices.devices.reduce((sum, row) => sum + row.starts, 0), 0);
+    assert.deepEqual(uploadCalls, []);
+    assert.equal(held.releases, 1);
+  });
 }
 
 test("真实 onstart 之后、续延恢复之前中断：after_start + exact started，零 listening、零上传", async (context) => {

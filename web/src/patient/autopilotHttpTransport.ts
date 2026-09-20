@@ -5,9 +5,9 @@ import {
 import { ApiError, apiNetworkError, decodeJsonApiResponse } from "../apiResponse.ts";
 import { csrfHeader } from "../security/csrf.ts";
 import type { AutopilotAck } from "./autopilotProtocol.ts";
-import type { AutopilotTransport } from "./autopilotController.ts";
+import { AUTOPILOT_DEVICE_REQUEST_TIMEOUT_MS, type AutopilotTransport } from "./autopilotController.ts";
 
-const REQUEST_TIMEOUT_MS = 12_000;
+const REQUEST_TIMEOUT_MS = AUTOPILOT_DEVICE_REQUEST_TIMEOUT_MS;
 
 async function deviceRequest(
   method: "GET" | "POST",

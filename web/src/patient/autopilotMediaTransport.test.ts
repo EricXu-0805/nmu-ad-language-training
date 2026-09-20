@@ -375,6 +375,31 @@ test("每次尝试各自的期限：悬挂的合成 POST 到点按 408 中止并
   assert.equal(signals[1]?.aborted, false);
 });
 
+test("冷缓存合成慢但会成功：第一次期限足够长,一次 POST 就拿到音频,不掐、不重发第二次合成", async () => {
+  // 复核 2026-09-19:每次一律 4 s 会把 >4 s 的云合成掐成 tts_failed,且每掐一次服务端又起
+  // 一次合成(没有 in-flight 去重)。第一次给长期限,短期限只留给之后的连接级重试。
+  let calls = 0;
+  const { deps } = dependencies(async () => {
+    calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    return audioResponse();
+  });
+  deps.ttsAttemptTimeoutsMs = [200, 5];
+  deps.ttsRetryDelaysMs = [0, 0];
+
+  const blob = await fetchExactAutopilotTts(
+    "S/ONE", pendingTts(), new AbortController().signal, deps);
+  assert.equal(blob?.type, "audio/wav");
+  assert.equal(calls, 1);
+});
+
+test("生产期限:首次 10 s、之后 3.5 s,两次退避 0.5/0.75 s,最坏 18.25 s 在 20 s 起播期限内", async () => {
+  const source = await import("node:fs").then((fs) => fs.readFileSync(
+    new URL("./autopilotMediaTransport.ts", import.meta.url), "utf8"));
+  assert.match(source, /TTS_ATTEMPT_TIMEOUTS_MS: readonly number\[\] = \[10_000, 3_500\];/);
+  assert.match(source, /TTS_RETRY_DELAYS_MS: readonly number\[\] = \[500, 750\];/);
+});
+
 test("父 signal 在退避等待中中止：不再发第二次，原样抛 AbortError", async () => {
   let calls = 0;
   const { deps } = dependencies(async () => {

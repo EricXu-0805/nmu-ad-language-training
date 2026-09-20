@@ -278,11 +278,28 @@ export interface AutopilotTransientRetryPorts {
 export const AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS = 30_000;
 
 /**
- * TTS 从 start() 到真实 playing 事件的绝对期限。合成 POST 现在自带 3×4 s 尝试与
- * 0.5/1 s 退避(最坏 13.5 s),再加两次 revalidate 与 play(),15 s 会在慢网上把一次
- * 本可成功的重试判成 media_timeout;与录音 PRE_START_BUDGET_MS 对齐为 20 s。
+ * TTS 从 start() 到真实 playing 事件的绝对期限。合成 POST 现在自带 10/3.5/3.5 s 三次
+ * 尝试与 0.5/0.75 s 退避(最坏 18.25 s),再加两次 revalidate 与 play(),15 s 会在慢网上
+ * 把一次本可成功的重试判成 media_timeout;与录音 PRE_START_BUDGET_MS 对齐为 20 s。
  */
 export const AUTOPILOT_TTS_START_DEADLINE_MS = 20_000;
+
+/**
+ * 设备直连请求(/next、/acks 等)每一次的硬超时。瞬时重试的预算按「等待 + 下一次尝试
+ * 最长可能耗时」算,所以这个数也是重试预算的一部分,不能只在传输层里知道。
+ */
+export const AUTOPILOT_DEVICE_REQUEST_TIMEOUT_MS = 12_000;
+
+/** 两个 AbortSignal 任一中止即中止;已中止的直接返回它自己(reason 原样)。 */
+function anySignal(first: AbortSignal, second: AbortSignal): AbortSignal {
+  if (first.aborted) return first;
+  if (second.aborted) return second;
+  const controller = new AbortController();
+  const forward = (signal: AbortSignal) => () => controller.abort(signal.reason);
+  first.addEventListener("abort", forward(first), { once: true });
+  second.addEventListener("abort", forward(second), { once: true });
+  return controller.signal;
+}
 
 export const browserAutopilotTransientRetryPorts: AutopilotTransientRetryPorts = {
   now: () => performance.now(),
@@ -468,6 +485,8 @@ export class PatientAutopilotController {
   >;
   private readonly transientRetry: AutopilotTransientRetryPorts;
   private readonly presentationAbort = new AbortController();
+  // 只给瞬时重试的等待用:生命周期收口一关麦就中止它,不等 inFlight 自己跑完退避阶梯。
+  private readonly retryAbort = new AbortController();
   private inFlight: Promise<AutopilotRuntimeState> | null = null;
   private activeMedia: { cancel(): void; closed: Promise<void> } | null = null;
   private activeRecording: AutopilotRecordingCapture | null = null;
@@ -678,6 +697,10 @@ export class PatientAutopilotController {
     if (this.lifecycleShutdown) return this.lifecycleShutdown;
     const capture = this.activeRecording ?? (this.activeMedia as AutopilotRecordingCapture | null);
     this.handleRecordingLifecycleInterruption();
+    // 麦克风到这里已经同步关掉;还在退避阶梯里等的 ACK 重试没有意义了——立刻让它抛出
+    // 原错误走失败分支(durable outbox 会在下一次进入时重放同一条 envelope),否则
+    // stopAndWait / 页签所有权释放 / 收麦证明要等整条阶梯(最坏 30 s)跑完。
+    this.retryAbort.abort(new DOMException("自动驾驶正在收口", "AbortError"));
     const disposition = this.lifecycleDispositionFor(capture);
     this.lifecycleShutdown = (async () => {
       // before_start owes nothing: no bytes, no record_started, so the server
@@ -776,7 +799,11 @@ export class PatientAutopilotController {
    *
    * 重试期间什么都不做：不进 reducer、不开麦、不播放、相位不变——调用方拿到的
    * 要么是最终成功的结果，要么是最后那个瞬时错误(照旧落 technical_failure)。
-   * stop()/患者暂停/生命周期收口会中止那条等待，立刻抛出原错误收口。
+   * stop()/患者暂停/生命周期收口(safeShutdownAndWait,含有活跃录音时)会中止那条
+   * 等待，立刻抛出原错误收口。
+   *
+   * 预算是总时长的上限:决定再试一次时,把「等待 + 下一次请求最长 12 s」都算进去,
+   * 请求超时(408)连着来也不会拖过 30 s。
    */
   private retryTransient<T>(
     attempt: (retry: number) => Promise<T>,
@@ -786,18 +813,19 @@ export class PatientAutopilotController {
     // 成功路径只比直接 await 多一跳(.catch 透传)，不多包一层 async：几条生命周期
     // 测试按微任务节拍钉"中断落在开麦之前"，多两跳就会漂。
     const run = (retry: number): Promise<T> => attempt(retry).catch(async (error: unknown) => {
-      if (!retryable || this.stopped || !isRetryableAutopilotProbeError(error)) throw error;
+      if (!retryable || this.stopped || this.retryAbort.signal.aborted
+          || !isRetryableAutopilotProbeError(error)) throw error;
       const delayMs = drainRetryDelayMs(retry);
-      if (this.transientRetry.now() - startedAt + delayMs
+      if (this.transientRetry.now() - startedAt + delayMs + AUTOPILOT_DEVICE_REQUEST_TIMEOUT_MS
           > AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS) {
         throw error;
       }
       try {
-        await this.transientRetry.wait(delayMs, this.presentationAbort.signal);
+        await this.transientRetry.wait(delayMs, anySignal(this.presentationAbort.signal, this.retryAbort.signal));
       } catch {
         throw error;
       }
-      if (this.stopped) throw error;
+      if (this.stopped || this.retryAbort.signal.aborted) throw error;
       return run(retry + 1);
     });
     return run(0);

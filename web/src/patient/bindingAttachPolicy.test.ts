@@ -49,12 +49,13 @@ test("只有『有绑定且无能力』的设备才轮询 attach", () => {
   assert.equal(shouldAttemptAttach(false, true), false);
 });
 
-test("连续「没有场次」的轮询间隔从 2 s 翻倍到 10 s 封顶;没有连续记录就是 2 s", () => {
+test("连续「没有场次」的轮询间隔从 2 s 翻倍到 5 s 封顶;没有连续记录就是 2 s", () => {
   // 2026-09 网络复审:场次之间平板整天挂在问候页,每 2 s 一个 409 攒出几百条。
+  // 封顶 5 s 不是 10 s:工作人员新开一场后最坏等一个间隔,床边等得住(复核 2026-09-19)。
   assert.equal(ATTACH_POLL_MS, 2_000);
-  assert.equal(ATTACH_POLL_MAX_MS, 10_000);
+  assert.equal(ATTACH_POLL_MAX_MS, 5_000);
   assert.deepEqual([0, 1, 2, 3, 4, 10, 100].map(attachPollDelayMs),
-    [2_000, 4_000, 8_000, 10_000, 10_000, 10_000, 10_000]);
+    [2_000, 4_000, 5_000, 5_000, 5_000, 5_000, 5_000]);
   assert.equal(attachPollDelayMs(-1), 2_000);
   assert.equal(attachPollDelayMs(Number.NaN), 2_000);
   assert.equal(attachPollDelayMs(1.5), 2_000);
@@ -82,5 +83,5 @@ test("一串结果对应的间隔:409,409,409 → 4/8/10 s;中间一次网络抖
     streak = nextAttachNoSessionStreak(streak, result);
     return attachPollDelayMs(streak);
   });
-  assert.deepEqual(delays, [4_000, 8_000, 8_000, 10_000, 2_000]);
+  assert.deepEqual(delays, [4_000, 5_000, 5_000, 5_000, 2_000]);
 });

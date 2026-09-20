@@ -4,10 +4,12 @@ import type { SyncMsg } from "../sync/messages";
 
 export const ATTACH_POLL_MS = 2000;
 // 场次之间平板整天挂在问候页,每 2 s 一个 409 no_session 攒出几百条(2026-09 网络复审)。
-// 连续「没有场次」就翻倍退避到 10 s;一接上(200)、回到前台、手动配对/能力更新就归零。
-export const ATTACH_POLL_MAX_MS = 10_000;
+// 连续「没有场次」就翻倍退避,封顶 5 s;一接上(200)、回到前台、手动配对/能力更新就归零。
+// 封顶不取 10 s:工作人员新开一场后等平板自己接上,最坏要等一个完整间隔——5 s 是
+// 「站在床边等得住」与「409 少 60%」的折中(复核 2026-09-19)。
+export const ATTACH_POLL_MAX_MS = 5_000;
 
-/** 连续 n 次「这位受试者没有场次」之后的下一次轮询间隔:2 s 起翻倍,封顶 10 s。 */
+/** 连续 n 次「这位受试者没有场次」之后的下一次轮询间隔:2 s 起翻倍,封顶 5 s。 */
 export function attachPollDelayMs(consecutiveNoSession: number): number {
   if (!Number.isSafeInteger(consecutiveNoSession) || consecutiveNoSession <= 0) {
     return ATTACH_POLL_MS;
