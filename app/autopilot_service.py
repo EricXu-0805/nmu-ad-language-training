@@ -5268,7 +5268,9 @@ def _initial_response_path_for_cued_attempt(
     _require_completed_operational_attempt(
         db, attempt=first, record=first_record, selected=selected)
     try:
-        proof = autopilot_ledger.verify_terminal_record_capture(db, first_record.id)
+        # 首次作答是历史采集:题内暂停→「继续」会把代际 +1,再要求它与当前代际相同,
+        # 老人在续弹线索后的第二次回答就永远判不了分(养老院 9/17 的主场景)。
+        proof = autopilot_ledger.verify_settled_record_capture(db, first_record.id)
     except autopilot_ledger.AutopilotProofError as exc:
         raise AutopilotServiceError(
             "autopilot_attempt_sequence_invalid", "首次作答录音证据无法复核") from exc
@@ -5305,8 +5307,20 @@ def _initial_response_path_for_cued_attempt(
         _validate_command_identity(cue, selected)
     expected_route_key = _derived_key(
         "cmd-attempt", attempt.session_id, first_record.id, first.id)
+    # 线索命令要么是判分后按首次作答派生的那条,要么是研究者「继续」时按同一条路由
+    # 重算后签发的续弹(resume 控制事实指向它、具名研究者);两者载荷里的 response_path
+    # 都要与首次作答证据一致——下面照旧核。
+    if cue is not None and cue.id is not None and cue.idempotency_key != expected_route_key:
+        resumed = db.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == attempt.session_id,
+            AutopilotControlEvent.scope_key == P0A_SCOPE_KEY,
+            AutopilotControlEvent.event_type == "resume",
+            AutopilotControlEvent.actor_type == "researcher",
+            AutopilotControlEvent.command_id == cue.id,
+        )).first()
+        if resumed is None:
+            _fail("autopilot_attempt_sequence_invalid", "一级提示与首次作答链路不一致")
     if (cue is None or cue.kind != "tts" or cue.state != "succeeded"
-            or cue.idempotency_key != expected_route_key
             or cue.item_id != attempt.item_id
             or cue.turn_seq != attempt.turn_seq
             or cue.attempt_seq != 2 or cue.prompt_level != 1

@@ -6085,6 +6085,47 @@ def test_resume_continues_mid_cue_ladder_with_the_pending_cue(
     with Session(api_clients.engine) as session:
         state = session.get(SessionAutopilotState, SESSION_ID)
         assert state is not None and state.status == "waiting_recording"
+
+    # 续弹线索后老人的第二次回答必须能判分、能进反馈(真 Chrome 走查 2026-09-19 抓到:
+    # 代际 +1 后第二次录音的路由复核首次录音命令要求同代际 → worker 崩、attempt 卡死)。
+    raw_audio_id = record["payload"]["raw_audio_id"]
+    uploaded = api_clients.device.put(
+        f"/audio/{raw_audio_id}/blob",
+        headers={**api_clients.device_headers, "content-type": "audio/webm"},
+        content=b"\x1a\x45\xdf\xa3p0a-resumed-cue-answer")
+    assert uploaded.status_code == 200, uploaded.text
+    upload_fact = uploaded.json()
+    saved = api_clients.device.put(
+        "/live/state", headers=api_clients.device_headers,
+        json={"kind": "audioSaved", "payload": {
+            "rawAudioId": raw_audio_id, "durationSeconds": 1.5,
+            "byteCount": upload_fact["bytes"], "checksum": upload_fact["checksum"],
+            "turnKey": record["payload"]["turn_ref"], "sessionId": SESSION_ID,
+            "containsDirectIdentifier": False}})
+    assert saved.status_code == 200, saved.text
+    stopped = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{record['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(record, ack_type="record_stopped", ack_key="ack-mid-ladder-record-stopped-0001",
+                       device_event_seq=4, stop_reason="silence", raw_audio_id=raw_audio_id,
+                       receipt_server_seq=saved.json()["audioReceipt"]["serverSeq"],
+                       checksum=upload_fact["checksum"], byte_count=upload_fact["bytes"],
+                       duration_seconds=1.5))
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json()["status"] == "processing_attempt"
+    monkeypatch.setattr(asr, "get_engine", lambda: _WorkerAsr())
+    _run_p0a_attempt_worker(SESSION_ID)
+    with Session(api_clients.engine) as session:
+        attempts = list(session.exec(select(AttemptEvent).order_by(AttemptEvent.attempt_seq)))
+        assert [(a.attempt_seq, a.prompt_level, a.processing_status, a.contains_target)
+                for a in attempts] == [(1, 0, "completed", False), (2, 1, "completed", True)]
+        state = session.get(SessionAutopilotState, SESSION_ID)
+        assert state is not None and state.last_error_code is None
+        assert state.status == "waiting_tts"
+    feedback = _device_next(api_clients)
+    assert feedback is not None and feedback["payload"]["purpose"] == "feedback"
+    assert (feedback["prompt_level"], feedback["attempt_seq"]) == (1, 2)
+    with Session(api_clients.engine) as session:
         runtime_state = session.get(SessionRuntimeState, SESSION_ID)
         assert runtime_state is not None and runtime_state.status == "active"
 
