@@ -368,7 +368,12 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
         if bool(obs["teardown_started"]):
             return
         parsed = urlsplit(request.url)
-        violation(f"浏览器网络请求未完成 {request.method} {parsed.path}")
+        failure = str(request.failure or "")
+        if request.method == "GET" and parsed.path == "/live/state" and "ERR_ABORTED" in failure:
+            # 平板的实时状态长轮询由页面自己撤销(sync/useLiveCursor:到客户端期限、能力
+            # 更新重探、离线),不是网络故障;真断连会是 ERR_CONNECTION_REFUSED 或 5xx。
+            return
+        violation(f"浏览器网络请求未完成 {request.method} {parsed.path} ({failure or '-'})")
 
     def attach_page(tag: str, page) -> None:
         page.on("pageerror", lambda _error: violation(f"[{tag}] 页面运行出错"))
