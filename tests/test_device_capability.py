@@ -232,9 +232,13 @@ def test_stalled_staging_does_not_block_delete_or_resurrect_voice(
     try:
         deleted = admin.delete("/audio/delete-race-audio?source=manual&session_id=S-ONE")
         assert deleted.status_code == 200, deleted.text
-        # A leaked SQLite read transaction would hit the configured one-second DB
-        # timeout instead of committing promptly while the request body is paused.
-        assert time.monotonic() - started < 1.0
+        # A leaked SQLite read transaction would be held for the whole 5 s the request
+        # body is paused: the delete would then either hit the fixture's one-second
+        # busy timeout (500, caught above) or block until the release. Anything well
+        # under that hold proves the commit did not wait on the paused upload; the
+        # bound is not 1.0 s because a loaded CI runner alone took 1.12 s twice
+        # (2026-09-21), which says nothing about transactions.
+        assert time.monotonic() - started < 4.0
     finally:
         release.set()
         worker.join(5)
