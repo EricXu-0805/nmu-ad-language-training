@@ -286,3 +286,35 @@ def test_prompt_defines_every_answer_type_and_pins_repeat_meaning():
     # JSON 形状与只产初评的口径不变
     assert '"answer_type": "正确|部分正确|上位词或相关词|偏题|重复|未识别"' in p
     assert "拿不准一律 needs_review=true" in p
+
+
+def test_judge_call_caps_output_tokens_and_asks_for_a_one_line_reason(monkeypatch):
+    """延迟专项(收据 262):判分输出是一个小 JSON,reason 限一句话并用 max_tokens 兜底;
+    截断的输出走既有解析失败→规则判路径,不伪造判定。"""
+    import sys
+    import types
+
+    from app import llm_judge
+    captured = {}
+
+    class _Generation:
+        @staticmethod
+        def call(**kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(output=types.SimpleNamespace(choices=[
+                types.SimpleNamespace(message=types.SimpleNamespace(
+                    content='{"answer_type": "正确", "score": 1, "needs_review": false, "reason": "就是目标词"}'))]))
+
+    monkeypatch.setitem(sys.modules, "dashscope", types.SimpleNamespace(Generation=_Generation))
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key-not-real")
+    engine = llm_judge.QwenJudge("qwen-plus")
+    ji = build_judge_input(item_id="x", task_type="单要素", target_word="锚", asr_text="锚")
+    verdict = engine.judge(ji)
+    assert verdict is not None and verdict.ai_score == 1
+    assert captured["max_tokens"] == llm_judge.JUDGE_MAX_OUTPUT_TOKENS == 200
+    assert captured["request_timeout"] == 15
+    assert "不超过 40 字" in captured["messages"][0]["content"]
+    # 截断成非法 JSON:不伪造判定,交回 None 让调用方退回规则判。
+    _Generation.call = staticmethod(lambda **kwargs: types.SimpleNamespace(output=types.SimpleNamespace(choices=[
+        types.SimpleNamespace(message=types.SimpleNamespace(content='{"answer_type": "正确", "score": 1, "needs_rev'))])))
+    assert engine.judge(ji) is None

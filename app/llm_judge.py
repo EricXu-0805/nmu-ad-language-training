@@ -62,7 +62,7 @@ def build_judge_prompt(ji: JudgeInput) -> str:
         "另一个要素,没有回答本题;把目标词本身说两遍不算重复。\n"
         "- 未识别(0分):听不出在说什么。\n"
         "本轮只判「目标词」这一个词:双要素、多要素题也只看这一轮的目标词,不要求回答里出现两个要素。\n"
-        "注意:你只产初评,不产最终分;拿不准一律 needs_review=true。"
+        "注意:你只产初评,不产最终分;拿不准一律 needs_review=true。reason 用一句话、不超过 40 字。"
     )
 
 
@@ -102,6 +102,12 @@ _JUDGEMENT_KEYS = frozenset({
 })
 
 
+# 判分 JSON 六个键加一句 40 字以内的 reason,中文按 1–2 token/字算也不到 160;
+# 留到 200 是给 JSON 标点和模型偶尔的英文 key 引号。截断的输出解析失败会走
+# 既有的「解析失败退回规则判」路径,不会伪造判定。
+JUDGE_MAX_OUTPUT_TOKENS = 200
+
+
 class QwenJudge:
     """阿里百炼 qwen 判分:产 AI 初评,永不锁分。任何异常/格式可疑 → None 回退规则。"""
 
@@ -127,11 +133,14 @@ class QwenJudge:
 
     def _call(self, prompt: str) -> str | None:
         from dashscope import Generation
+        # 老人说完到机器人开口的 8 s 里判分占 3.4 s(2026-09-17 生产中位);输出只有一个
+        # 小 JSON,reason 限一句话,再用 max_tokens 兜底,免得模型把理由写成小作文。
         resp = Generation.call(model=self._model,
                                messages=[{"role": "user", "content": prompt}],
                                result_format="message",
                                response_format={"type": "json_object"},
                                temperature=0.1,
+                               max_tokens=JUDGE_MAX_OUTPUT_TOKENS,
                                request_timeout=15)  # SDK 默认 300s,判分等不起
         out = getattr(resp, "output", None)
         choices = getattr(out, "choices", None) if out is not None else None
