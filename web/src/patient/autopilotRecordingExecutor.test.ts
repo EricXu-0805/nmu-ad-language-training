@@ -44,13 +44,13 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function phase(stopReason: "user_done" | "max_duration"): LocalAutopilotCapturePhase {
+function phase(stopReason: "user_done" | "max_duration" | "silence"): LocalAutopilotCapturePhase {
   return { ...IDENTITY, stopReason, phase: "persisting" };
 }
 
 const OK = () => {};
 
-for (const stopReason of ["max_duration", "user_done"] as const) {
+for (const stopReason of ["max_duration", "user_done", "silence"] as const) {
   test(`${stopReason} 收麦：stop 真正 resolve 之前不得报告"已收音"`, async () => {
     const gate = deferred<{ blob: { size: number } }>();
     const seen: LocalAutopilotCapturePhase[] = [];
@@ -527,6 +527,11 @@ function bootstrapHarness(clock: Clock, overrides: {
    * 才能表达"同一个 handle 被清了两次都没清掉"，只失败一次是另一回事。
    */
   failClearForArm?: number;
+  /**
+   * 「说完没」旁听端口。省略 = 没有 VAD(2026-09-20 之前的行为);"throws" = 挂旁听
+   * 时同步抛错;函数 = 自定义(返回拆除函数)。
+   */
+  observeVoiceActivity?: "throws" | ((stream: MediaStream, onTrailingSilence: () => void) => () => void);
 } = {}) {
   const calls: string[] = [];
   const timers = new Map<number, { dueAt: number; callback: () => void }>();
@@ -583,6 +588,13 @@ function bootstrapHarness(clock: Clock, overrides: {
       calls.push(`authorize:${authorizeCalls}`);
       return overrides.authorize?.(authorizeCalls, signal) ?? Promise.resolve(AUTHORIZED);
     },
+    ...(overrides.observeVoiceActivity ? {
+      observeVoiceActivity: (stream: MediaStream, onTrailingSilence: () => void) => {
+        calls.push("observeVoiceActivity");
+        if (overrides.observeVoiceActivity === "throws") throw new Error("AudioContext 不可用");
+        return overrides.observeVoiceActivity!(stream, onTrailingSilence);
+      },
+    } : {}),
   };
 
   const fireDue = () => {
@@ -908,6 +920,7 @@ async function captureAtRealOnstart(
     uploadFailAt?: UploadStage | null;
     throwOnTimerCall?: number;
     failClearForArm?: number;
+    observeVoiceActivity?: Parameters<typeof bootstrapHarness>[1]["observeVoiceActivity"];
   } = {},
 ) {
   const clock = clockDouble();
@@ -915,11 +928,12 @@ async function captureAtRealOnstart(
   context.after(() => devices.restore());
   const held = leaseDouble();
   const uploadCalls: UploadStage[] = [];
-  const events: Array<{ phase: string }> = [];
+  const events: Array<{ phase: string; stopReason?: string }> = [];
   const harness = bootstrapHarness(clock, {
     acquireLease: async () => held.lease,
     throwOnTimerCall: options.throwOnTimerCall,
     failClearForArm: options.failClearForArm,
+    observeVoiceActivity: options.observeVoiceActivity,
   });
   const executor = new BrowserAutopilotRecordingExecutor(SESSION, {
     ownerGeneration: options.ownerGeneration ?? 7,
@@ -1495,6 +1509,193 @@ test("对照：真实开录后的 cancel() 就是一次成功停止——半段�
   assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
   assert.equal(run.events.some((event) => event.phase === "persisting"), false);
   assert.equal(run.events.at(-1)?.phase, "cleared");
+});
+
+// ---------------- 「说完没」旁听:silence 与按钮同一条停止路 ----------------
+//
+// 旁听端口只在真实 onstart 之后、作答窗口武装之后挂上,拿的是 Recorder 自己那条流
+// (零第二次 getUserMedia);每条退出路径都把它拆一次。判到「说完」= 与「说完了」
+// 按钮同一条内部停止路,理由记成 silence,持久化链一步不少。
+
+/** 记下旁听回调与拆除次数的替身端口;测试自己决定什么时候「说完」。 */
+function voiceActivityDouble() {
+  const row = {
+    streams: [] as MediaStream[],
+    releases: 0,
+    decide: null as (() => void) | null,
+    observe(stream: MediaStream, onTrailingSilence: () => void): () => void {
+      row.streams.push(stream);
+      row.decide = onTrailingSilence;
+      return () => { row.releases += 1; };
+    },
+  };
+  return row;
+}
+
+test("旁听判「说完」:与按钮同一条物理停止路,stop_reason=silence,persisting 与整条上传链照跑", async (context) => {
+  const vad = voiceActivityDouble();
+  const run = await captureAtRealOnstart(context, {
+    ownerGeneration: 50, observeVoiceActivity: vad.observe,
+  });
+  // 真实 onstart 之前不旁听:开录指令已下达、onstart 还没回来,端口一次都没被调。
+  assert.equal(vad.streams.length, 0);
+  run.device.fireStart();
+  assert.deepEqual(await run.capture.started, { mime_type: "audio/webm" });
+  assert.equal(run.events.at(-1)?.phase, "listening");
+  // 旁听挂在 Recorder 自己那条流上;麦克风只取过一次。
+  assert.equal(vad.streams.length, 1);
+  assert.equal(run.devices.userMediaCalls, 1);
+  assert.deepEqual(vad.streams[0].getTracks(), run.devices.tracks);
+  // 旁听排在作答窗口之后:两个定时器都已武装,VAD 不判时 max_duration 仍兜底。
+  assert.equal(run.harness.armedHandles.length, 2);
+  assert.equal(run.harness.calls.at(-1), "observeVoiceActivity");
+
+  run.device.pushData(4);
+  run.clock.set(run.clock.now() + 5_000);
+  (vad.decide as () => void)();
+  await flushMicrotasks();
+  // 判定一到就拆旁听,再物理停麦;作答窗口定时器撤掉。
+  assert.equal(vad.releases, 1);
+  assert.equal(run.device.stops, 1);
+  assert.equal(run.harness.pendingTimers, 0);
+  run.device.fireStop();
+
+  const facts = await run.capture.stopped;
+  await run.capture.closed;
+  assert.equal(facts.stop_reason, "silence");
+  assert.equal(facts.receipt_server_seq, 77);
+  assert.equal(facts.byte_count, 4);
+  assert.equal(facts.duration_seconds, 5);
+  assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
+  assert.deepEqual(
+    run.events.filter((event) => event.phase === "persisting").map((event) => event.stopReason),
+    ["silence"]);
+  // 拆除只发生一次:后面 finally 里那次是幂等空转。
+  assert.equal(vad.releases, 1);
+  assert.equal(run.device.stops, 1);
+  for (const row of run.devices.tracks) assert.equal(row.stopped, 1);
+  assert.equal(run.held.releases, 1);
+});
+
+test("旁听判定晚于按钮:闩门先到先得,理由仍是 user_done,物理停麦只有一次", async (context) => {
+  const vad = voiceActivityDouble();
+  const run = await captureAtRealOnstart(context, {
+    ownerGeneration: 51, observeVoiceActivity: vad.observe,
+  });
+  run.device.fireStart();
+  await run.capture.started;
+  run.device.pushData(4);
+  run.clock.set(run.clock.now() + 3_000);
+  run.capture.requestStop("user_done");
+  (vad.decide as () => void)();          // 迟到的判定
+  await flushMicrotasks();
+  run.device.fireStop();
+
+  const facts = await run.capture.stopped;
+  await run.capture.closed;
+  assert.equal(facts.stop_reason, "user_done");
+  assert.equal(run.device.stops, 1);
+  assert.equal(vad.releases, 1);
+  assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
+});
+
+test("旁听永远不判:作答窗口到点照旧 max_duration 收麦,旁听在停麦前被拆", async (context) => {
+  const vad = voiceActivityDouble();
+  const run = await captureAtRealOnstart(context, {
+    ownerGeneration: 52, observeVoiceActivity: vad.observe,
+  });
+  run.device.fireStart();
+  await run.capture.started;
+  run.device.pushData(4);
+  run.harness.advance(14_000);           // 15 s 上限 − 1 s 抖动容差
+  await flushMicrotasks();
+  assert.equal(vad.releases, 1);
+  assert.equal(run.device.stops, 1);
+  run.device.fireStop();
+
+  const facts = await run.capture.stopped;
+  await run.capture.closed;
+  assert.equal(facts.stop_reason, "max_duration");
+  assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
+  assert.equal(vad.releases, 1);
+});
+
+test("旁听端口同步抛错:与没有 VAD 时完全一样——listening 照常、按钮照常收麦、上传照常", async (context) => {
+  const run = await captureAtRealOnstart(context, {
+    ownerGeneration: 53, observeVoiceActivity: "throws",
+  });
+  run.device.fireStart();
+  assert.deepEqual(await run.capture.started, { mime_type: "audio/webm" });
+  assert.equal(run.events.at(-1)?.phase, "listening");
+  assert.equal(run.harness.calls.at(-1), "observeVoiceActivity");
+
+  run.device.pushData(4);
+  run.clock.set(run.clock.now() + 3_000);
+  run.capture.requestStop("user_done");
+  await flushMicrotasks();
+  run.device.fireStop();
+
+  const facts = await run.capture.stopped;
+  await run.capture.closed;
+  assert.equal(facts.stop_reason, "user_done");
+  assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
+  assert.equal(run.device.stops, 1);
+  for (const row of run.devices.tracks) assert.equal(row.stopped, 1);
+  assert.equal(run.held.releases, 1);
+});
+
+test("旁听中安全中断:采样器当场拆掉,迟到的「说完」判定不触发第二次停麦、零上传", async (context) => {
+  const vad = voiceActivityDouble();
+  const run = await captureAtRealOnstart(context, {
+    ownerGeneration: 54, observeVoiceActivity: vad.observe,
+  });
+  run.device.fireStart();
+  await run.capture.started;
+  run.device.pushData(4);
+  run.clock.set(run.clock.now() + 2_000);
+
+  assert.equal(run.capture.interrupt(), "after_start");
+  assert.equal(vad.releases, 1);           // interrupt() 同步拆掉
+  const stopError = await run.capture.stopped.then(() => null, (e: unknown) => e);
+  assert.equal((stopError as AutopilotMediaError).errorCode, "device_runtime_failed");
+  await run.capture.closed;
+  assert.equal(vad.releases, 1);           // finally 里不重复拆
+  const stopsAfterInterrupt = run.device.stops;
+
+  // 采样器已经不存在,但就算它的回调还是迟到了:不复活这条捕获。
+  (vad.decide as () => void)();
+  await flushMicrotasks();
+  assert.equal(run.device.stops, stopsAfterInterrupt);
+  assert.deepEqual(run.uploadCalls, []);
+  assert.equal(run.events.some((event) => event.phase === "persisting"), false);
+  assert.equal(
+    ((await run.capture.stopped.then(() => null, (e: unknown) => e)) as AutopilotMediaError)
+      .errorCode, "device_runtime_failed");
+});
+
+test("attachAutopilotStopReason 收 silence,与 user_done/max_duration 同等持久化", () => {
+  const entry = attachAutopilotStopReason(createAudioOutboxEntry({
+    rawAudioId: "raw-capture-persist-0001",
+    sessionId: SESSION,
+    turnKey: "itm-0001#1",
+    containsDirectIdentifier: false,
+    durationSeconds: 3,
+    blob: recordingBlob(),
+  }), "silence");
+  assert.equal(entry.autopilotStopReason, "silence");
+  // 已定的理由不许改写。
+  assert.throws(() => attachAutopilotStopReason(entry, "user_done"));
+});
+
+test("辅助断言:生产旁听端口就是 observeTrailingSilence,挂在作答窗口之后、拆在每条退出路上", () => {
+  const source = readFileSync(
+    new URL("./autopilotRecordingExecutor.ts", import.meta.url), "utf8");
+  assert.match(source, /observeVoiceActivity: \(stream, onTrailingSilence\) => observeTrailingSilence\(/);
+  const armAt = source.indexOf("this.armVoiceActivity()");
+  const answerWindowAt = source.indexOf('this.signalStop("max_duration")');
+  assert.ok(answerWindowAt >= 0 && armAt > answerWindowAt, "旁听必须排在作答窗口武装之后");
+  // interrupt()、停止信号之后、finally 三处各拆一次。
+  assert.equal(source.split("this.releaseVoiceActivity()").length - 1, 3);
 });
 
 function foreignOutboxEntry(): AudioOutboxEntry {

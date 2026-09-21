@@ -49,6 +49,7 @@ import {
   type RecordingAuthorization,
 } from "./recordingAuthorization.ts";
 import { authorizeExactAutopilotRecording } from "./autopilotMediaTransport.ts";
+import { observeTrailingSilence } from "./autopilotBrowserVoiceActivity.ts";
 
 type RecordCommand = Extract<NextCommandProjection, { kind: "record" }>;
 type RecordStoppedFacts = Awaited<AutopilotRecordingCapture["stopped"]>;
@@ -115,12 +116,21 @@ export interface AutopilotCaptureBootstrapPorts {
     commandKey: string,
     signal: AbortSignal,
   ): Promise<RecordingAuthorization>;
+  /**
+   * 真实开录之后,在录音器已经拿到的那条 MediaStream 上旁听「说完了没」;判到
+   * 尾静默就调一次 onTrailingSilence。返回拆除函数,拆掉之后绝不再回调。
+   *
+   * 可选端口:没有它,或它抛错、或它永远不判,收麦就只剩「说完了」按钮与作答
+   * 窗口到点这两条路——与 2026-09-20 之前完全一样。
+   */
+  observeVoiceActivity?(stream: MediaStream, onTrailingSilence: () => void): () => void;
 }
 
 export const browserAutopilotCaptureBootstrapPorts: AutopilotCaptureBootstrapPorts = {
   now: () => performance.now(),
   setTimer: (callback, delayMs) => window.setTimeout(callback, delayMs),
   clearTimer: (handle) => window.clearTimeout(handle),
+  observeVoiceActivity: (stream, onTrailingSilence) => observeTrailingSilence(stream, onTrailingSilence),
   acquireLease: (signal) => acquireAudioDeviceLease(undefined, signal),
   recoverySnapshot: () => blobStore.recoverySnapshot(),
   drainForeignOutbox: async (currentSessionId, entries) => {
@@ -311,6 +321,9 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   private acquiredLease: AudioDeviceLease | null = null;
   private lateLease: AudioDeviceLease | null = null;
   private maxTimer: number | null = null;
+  // 「说完没」旁听采样器的拆除函数。真实 onstart 之后才有;每条退出路径都拆一次,
+  // 拆过就置空,所以底层采样器只会被拆一次。
+  private voiceActivityRelease: (() => void) | null = null;
   private preStartDeadline: CaptureDeadline | null = null;
   // prepare() 底下的 getUserMedia 可能在判死之后才交出 MediaStream。留住这条
   // Promise，cleanup 才能在 dispose() 之后等它落地——不等就等于在那条流还在
@@ -434,6 +447,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
     this.releaseTimerBestEffort(() => {
       if (answerTimer !== null) this.bootstrap.clearTimer(answerTimer);
     });
+    this.releaseVoiceActivity();
     this.recorder.cancelPendingStart();
     this.recorder.discardActive();
     if (started) {
@@ -460,6 +474,33 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
     try {
       release();
     } catch { /* 定时器端口失效不改变生命周期判定 */ }
+  }
+
+  /**
+   * 真实 onstart 之后才挂旁听。端口没有、抛错、永远不判,都只是「听不见」:
+   * 按钮与作答窗口到点照旧收麦。判到「说完」走的是与按钮**同一条**内部停止路,
+   * 只是理由记成 silence;闩门先到先得,晚到的判定与晚到的定时器一样作废。
+   */
+  private armVoiceActivity(): void {
+    const observe = this.bootstrap.observeVoiceActivity;
+    const stream = this.recorder.mediaStream;
+    if (!observe || !stream) return;
+    try {
+      this.voiceActivityRelease = observe(stream, () => {
+        if (this.outcome !== null) return;
+        this.signalStop("silence");
+      });
+    } catch { /* 旁听挂不上,与没有 VAD 时完全一样 */ }
+  }
+
+  /** 拆旁听采样器。幂等、best-effort:它抛错不改变任何判定,也不挡后面的拆设备。 */
+  private releaseVoiceActivity(): void {
+    const release = this.voiceActivityRelease;
+    this.voiceActivityRelease = null;
+    if (release === null) return;
+    try {
+      release();
+    } catch { /* 采样器拆不掉不改变生命周期判定 */ }
   }
 
   cancel(): void {
@@ -714,10 +755,14 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
           this.command.payload.max_duration_seconds,
           this.bootstrap.now() - started.startedAtMs,
         ));
+      // 作答窗口武装之后才旁听:VAD 永远不判时,max_duration 照旧是那条兜底。
+      this.armVoiceActivity();
 
       const stopReason = await Promise.race([
         this.stopLatch.wait(), this.lifecycleDeferred.promise,
       ]);
+      // 有人要求停了:先拆旁听,再撤作答窗口。此后不会再有第二个停止信号进来。
+      this.releaseVoiceActivity();
       if (this.maxTimer !== null) this.bootstrap.clearTimer(this.maxTimer);
       this.maxTimer = null;
       // signal 只是"有人要求停"，还不等于成功。先 claim 成功，claim 到手才在
@@ -727,9 +772,10 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         throw this.lifecycleError ?? new Error("录音过程未正常结束");
       }
       this.outcome = "successful_stop";
-      // 物理收麦、判活、"已收音"屏显在同一处汇流：max_duration 与 user_done 都
-      // 走这里；两项校验先过，屏幕才可以说已收音——空字节或超限的采集马上就会
-      // 被判死，先显示保存态就是在骗老人。事件仍然早于 IndexedDB 与任何网络。
+      // 物理收麦、判活、"已收音"屏显在同一处汇流：max_duration、user_done 与
+      // 平板自己判的 silence 都走这里；两项校验先过，屏幕才可以说已收音——空字节
+      // 或超限的采集马上就会被判死，先显示保存态就是在骗老人。事件仍然早于
+      // IndexedDB 与任何网络。
       const recording = await finalizeCaptureThenNotify(
         () => {
           this.physicalStopCalled = true;
@@ -742,7 +788,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
           assertCaptureDurationWithinCommandLimit(
             captured.durationSeconds, this.command.payload.max_duration_seconds);
         },
-        stopReason === "user_done" || stopReason === "max_duration"
+        stopReason === "user_done" || stopReason === "max_duration" || stopReason === "silence"
           ? { ...this.identity, phase: "persisting", stopReason }
           : { ...this.identity, phase: "cleared" },
         this.observe,
@@ -802,6 +848,8 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
       const lease = this.lease;
       this.lease = null;
       await settleCaptureCleanup([
+        // 旁听采样器先拆:麦克风 track 关掉之后不许还有一个挂着输入节点的音频图。
+        () => this.releaseVoiceActivity(),
         () => {
           if (this.maxTimer !== null) this.bootstrap.clearTimer(this.maxTimer);
           this.maxTimer = null;

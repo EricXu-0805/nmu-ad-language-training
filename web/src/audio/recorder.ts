@@ -78,6 +78,14 @@ export class Recorder {
   }
 
   /**
+   * 正在准备/录音的那条 MediaStream,给「说完没」的旁听采样器用。旁听绝不
+   * 第二次 getUserMedia:同一条流上挂 AnalyserNode 就够了,track 仍归本类关。
+   */
+  get mediaStream(): MediaStream | null {
+    return this.stream;
+  }
+
+  /**
    * 只取流、只造 recorder。绝不调用 `MediaRecorder.start()`：调用方要在这之后
    * 再做一次服务端授权，那次授权没过就不该产生任何录音字节。
    */

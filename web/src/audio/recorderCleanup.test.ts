@@ -364,3 +364,29 @@ test("legacy start() 期间 dispose 抢在流之前：迟到的流被物理关�
   assert.equal(recorder.startedAtMs, null);
   assert.equal(recorder.mimeType, null);
 });
+
+test("mediaStream 只在 prepared/recording 期间交出同一条流：给旁听采样器用，收尾后为 null", async (context) => {
+  const tracks = [track()];
+  const doubles = installBrowserDoubles({ tracks, nowMs: 1_000, manualEvents: true });
+  context.after(() => doubles.restore());
+
+  const recorder = new Recorder();
+  assert.equal(recorder.mediaStream, null);
+  assert.equal(await recorder.prepare(), true);
+  const stream = recorder.mediaStream;
+  assert.notEqual(stream, null);
+  assert.deepEqual((stream as MediaStream).getTracks(), tracks);   // 就是 getUserMedia 那一条
+  assert.equal(doubles.userMediaCalls, 1);
+
+  const device = doubles.recorders[0] as FakeRecorder;
+  const started = recorder.startPrepared();
+  device.fireStart();
+  assert.equal(await started, true);
+  assert.equal(recorder.mediaStream, stream);                       // 开录后还是同一条
+
+  const stopping = recorder.stop();
+  device.fireStop();
+  await stopping;
+  assert.equal(recorder.mediaStream, null);                         // track 已关,引用断掉
+  assert.equal(tracks[0].stopped, 1);
+});

@@ -26,8 +26,9 @@ export type LocalAutopilotCapturePhase =
   | (LocalAutopilotCaptureIdentity & {
     readonly phase: "persisting";
     // Only a real successful stop carries a reason; "listening" must never
-    // manufacture one for a stop that has not happened.
-    readonly stopReason: "user_done" | "max_duration";
+    // manufacture one for a stop that has not happened.  "silence" is the
+    // tablet's own trailing-silence decision; it persists exactly like a tap.
+    readonly stopReason: "user_done" | "max_duration" | "silence";
   });
 
 export type LocalAutopilotCaptureClear =
