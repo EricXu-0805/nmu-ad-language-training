@@ -9,6 +9,18 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+## 2026-09-21 03:55 UTC 上线记录（`3baa257`：题内续弹 + 研究者现场裁定 + 平板题末即录与重试 + 题号；**含迁移 `e2a6d8f0b419` → `f4b2d8c1a635`**）
+
+**Eric 跑收据 261 脚本（窗口 `20260920-225426`，America/Chicago 22:54），第 0–20 步全过；第 21 步记账因脚本里一个 `→` 字符在 bash 中被读成变量名而失败，`last-deploy.state` 由 Claude 手工按同一模板补写。** 上线前 10 分钟生产零非轮询请求。
+
+- 应用提交 `3baa257e8db501bb6b578fda84b25020b0d43f3b`（[PR #16](https://github.com/EricXu-0805/nmu-ad-language-training/pull/16)，push run 35487722895 / pull_request run 35487724253 均 success；产物取自 main 上同 SHA 的 push run 35489170549，`source-commit` 一致，`verify_browser_dist` 18 个受管文件通过）。依赖锁相对 `128f59f` 零变化，venv 未动。
+- 迁移：锚点停写快照 `20260921-035511`（旧头）→ 回滚存档 `/opt/nmu/app-before-deploy-20260920-225426.tar.gz`（15.4 MB）→ `check_database_head` 退 78 → `su nmu` 执行 `alembic upgrade head`（e2a6d8f0b419 → f4b2d8c1a635）退 0 → 库头闸退 0；升库后 `autopilotpositionadjudication` 16 列 0 行，`qualityreleaseepochrowsnapshot` 的 dataset_key CHECK 已含 adjudications（该表 0 行），integrity ok，外键违例 0。**未做 downgrade。**
+- 起服后本机/公网 `/health` 200，`/docs` `/openapi.json` 404；新头快照 `20260921-035555` ok；备份定时器恢复；完整预检上线时 8/9（唯一 FAIL = OS 安全补丁 8 项，与上线无关）。
+- 收尾三件套：树核 `verify_deployed_tree` **MATCH source_files=822 browser_files=19**（对 `3baa257` + CI dist 清单）；Mac 异地校验器重装（指纹 `56a00a07…`，与仓库、VPS 三处一致）并立即拉取一次：新头快照 `20260921-035555` 异地字节一致（sha256 `42f1ef93…`），审计锚点追加为第 77 条，conflicts 0；**13 份旧头快照按合同进 `legacy-unvalidated/` 留存（held，不删）**，与 2026-09-07 那次一样。
+- 同窗口顺带（Eric「你直接弄一下」）：`apt-get full-upgrade` 装了 16 个包（安全项：libsqlite3 3.37.2-2ubuntu0.8、polkit 0.105-33ubuntu0.2 四件、wireless-regdb；其余 krb5 四件、netplan 0.107.1-…5 四件），无内核、无 reboot-required；needrestart 只列 nmu/ssh/vnstat/packagekit/user@0，前四个已重启（nmu 在 5 分钟零非轮询下重启，8 秒回来），sing-box 未动。之后完整预检 **9/9 退 0**，六个 nmu 定时器齐。
+- `last-deploy.state`：`commit = 3baa257…`，`migrated_to = f4b2d8c1a635`，`archive = /opt/nmu/app-before-deploy-20260920-225426.tar.gz`，`receipt = PM_20260730_自动对话/260-养老院实测反馈六条-20260919.md`。
+- 已知旧账未动：`networking.service` failed（ifupdown 里不存在的 eth1，与本次无关）。
+
 ## 2026-09-14 17:00 UTC 维护窗口（内核 5.15.0-191 + netplan 0.107 + nginx 安全更新，整机重启；应用仍 `128f59f`，库头仍 `e2a6d8f0b419`）
 
 **Eric 授权后由 Claude 执行（收据 258 §六）。上线前 60 分钟生产零非轮询请求。**
