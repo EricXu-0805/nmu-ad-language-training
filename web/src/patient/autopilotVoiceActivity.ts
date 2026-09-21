@@ -13,13 +13,37 @@
  * 阈值是自适应的:噪声底取头 400 ms 的低分位,之后由非语音帧慢慢跟踪;开口阈值
  * 与收口阈值分开(迟滞),吵一点的房间阈值自然抬高。纯静音永远不会判「说完」——
  * 没开过口就没有「说完」,那两条路(按钮、作答窗口到点)仍是唯一的收麦方式。
+ *
+ * 复核 2026-09-21 抓出的截断路径:一声咳嗽、一个「嗯」、工作人员一句「你说说看」
+ * 都够 250 ms,3 s 后就把麦收了,老人的回答根本不在录音里。所以「说完」还要求开口后
+ * 累计有声时长够一个词;有声不足一句话的,尾静默窗口拉长——宁可多等,不可少录。
  */
 
-/** 连续高于开口阈值这么久才算「开口」;短于此的敲击、咳嗽不算话。 */
+/** 连续高于开口阈值这么久才算「开口」(累计,每帧最多记 VAD_ONSET_FRAME_CAP_MS)。 */
 export const VAD_SPEECH_ONSET_MS = 250;
 
-/** 开口之后连续低于收口阈值这么久判「说完」。 */
+/**
+ * 开口累计每帧最多记这么多毫秒:主线程卡顿 ≥250 ms 之后补来的一帧,读数只代表
+ * analyser 窗口那 43 ms,不能让一声敲击靠「帧长」就凑够开口。64 ms 采样下 4 帧才够。
+ */
+export const VAD_ONSET_FRAME_CAP_MS = 130;
+
+/** 开口之后连续低于收口阈值这么久判「说完」(有声时长达到 VAD_FULL_UTTERANCE_MS 时)。 */
 export const VAD_TRAILING_SILENCE_MS = 3_000;
+
+/**
+ * 开口后累计有声时长(高于收口阈值的帧)不足这个数,不判「说完」:咳嗽(300–500 ms)、
+ * 填充词「嗯」、桌上放杯子都不够。单音节目标词(「锚」「书」)也可能不够——那就照旧
+ * 等按钮或作答窗口,与今天一样,不会更差。
+ */
+export const VAD_MIN_VOICED_MS = 450;
+
+/**
+ * 有声时长达到这个数才用 3 s 的尾静默;不足的(一个短词、半句话)用更长的窗口,
+ * 给老人找词的停顿留余地。
+ */
+export const VAD_FULL_UTTERANCE_MS = 900;
+export const VAD_SHORT_UTTERANCE_TRAILING_SILENCE_MS = 4_500;
 
 /** 头这段时间只标定噪声底,不判语音。 */
 export const VAD_CALIBRATION_MS = 400;
@@ -39,6 +63,16 @@ export const VAD_RELEASE_MIN_RATIO = 0.7;
 
 /** 标定期取这一分位当噪声底:头 400 ms 里混进半句话也不会把底抬到语音级。 */
 export const VAD_CALIBRATION_QUANTILE = 0.25;
+
+/**
+ * 标定出的噪声底封顶:标定期混进语音时分位数也可能是语音级,不封顶的话开口阈值跟着
+ * 上天,这一次回答 VAD 全程听不见。0.04 ≈ −28 dBFS:比正常语音(AGC 下 0.05–0.3)低,
+ * 比一般房间的底(0.002–0.03)高;比这更吵的房间开口阈值封在 0.12,照样能判大声说话。
+ */
+export const VAD_NOISE_FLOOR_CAP_RMS = 0.04;
+
+/** 标定完成前先用这个底判开口,老人第一帧就在说话也能记进有声时长。 */
+export const VAD_PROVISIONAL_FLOOR_RMS = VAD_ABSOLUTE_MIN_RMS / 3;
 
 /**
  * 标定之后噪声底按非语音帧做非对称 EMA:往下跟得快(老人一开录就在说话时,
@@ -61,6 +95,8 @@ export interface VoiceActivityDetector {
   readonly noiseFloor: number | null;
   readonly onsetThreshold: number | null;
   readonly releaseThreshold: number | null;
+  /** 开口之后累计的有声毫秒(高于收口阈值的帧)。 */
+  readonly voicedMs: number;
   /**
    * 喂一帧。`atMs` 是这帧采样时刻的单调毫秒读数;帧代表上一帧到这一帧之间那段
    * 时间。返回这帧之后的状态;`stopped` 一旦出现就定型,再喂什么都不变。
@@ -79,14 +115,20 @@ export function createVoiceActivityDetector(): VoiceActivityDetector {
   let firstAtMs: number | null = null;
   let lastAtMs: number | null = null;
   const calibration: number[] = [];
+  let calibrationMaxRms = 0;
   let floor: number | null = null;
   let loudMs = 0;
   let quietMs = 0;
+  let voicedMs = 0;
 
-  const onsetThreshold = (): number | null => floor === null
-    ? null : Math.max(floor * VAD_ONSET_FLOOR_RATIO, VAD_ABSOLUTE_MIN_RMS);
-  const releaseThreshold = (): number | null => floor === null
-    ? null : Math.max(floor * VAD_RELEASE_FLOOR_RATIO, VAD_ABSOLUTE_MIN_RMS * VAD_RELEASE_MIN_RATIO);
+  const effectiveFloor = (): number => floor ?? VAD_PROVISIONAL_FLOOR_RMS;
+  const onsetOf = (base: number): number => Math.max(base * VAD_ONSET_FLOOR_RATIO, VAD_ABSOLUTE_MIN_RMS);
+  const releaseOf = (base: number): number =>
+    Math.max(base * VAD_RELEASE_FLOOR_RATIO, VAD_ABSOLUTE_MIN_RMS * VAD_RELEASE_MIN_RATIO);
+  const onsetThreshold = (): number | null => floor === null ? null : onsetOf(floor);
+  const releaseThreshold = (): number | null => floor === null ? null : releaseOf(floor);
+  const trailingWindowMs = (): number => voicedMs >= VAD_FULL_UTTERANCE_MS
+    ? VAD_TRAILING_SILENCE_MS : VAD_SHORT_UTTERANCE_TRAILING_SILENCE_MS;
 
   const trackFloor = (rms: number, deltaMs: number): void => {
     if (floor === null || deltaMs <= 0) return;
@@ -100,6 +142,7 @@ export function createVoiceActivityDetector(): VoiceActivityDetector {
     get noiseFloor() { return floor; },
     get onsetThreshold() { return onsetThreshold(); },
     get releaseThreshold() { return releaseThreshold(); },
+    get voicedMs() { return voicedMs; },
     push(rms: number, atMs: number): VoiceActivityState {
       if (state === "stopped") return state;
       // 坏读数(NaN/负数)整帧丢掉:既不当静默也不当语音,时间也不推进。
@@ -110,36 +153,50 @@ export function createVoiceActivityDetector(): VoiceActivityDetector {
       if (firstAtMs === null) firstAtMs = atMs;
 
       if (floor === null) {
+        // 标定期每一帧都进噪声样本;同时按临时底照常累计开口/有声——老人在提问声里
+        // 就开口时,第一帧就是话。标定一完成就用真底复核:临时判出的「开口」若其实
+        // 低于真开口阈值(吵的房间的稳态噪声),撤回成 idle。
         calibration.push(rms);
+        calibrationMaxRms = Math.max(calibrationMaxRms, rms);
         if (atMs - firstAtMs >= VAD_CALIBRATION_MS) {
-          floor = lowQuantile(calibration, VAD_CALIBRATION_QUANTILE);
+          floor = Math.min(lowQuantile(calibration, VAD_CALIBRATION_QUANTILE), VAD_NOISE_FLOOR_CAP_RMS);
+          if (state !== "idle" && calibrationMaxRms < onsetOf(floor)) {
+            state = "idle";
+            loudMs = 0;
+            voicedMs = 0;
+            quietMs = 0;
+          }
         }
-        return state;
       }
 
-      const onset = onsetThreshold() as number;
-      const release = releaseThreshold() as number;
+      const base = effectiveFloor();
+      const onset = onsetOf(base);
+      const release = releaseOf(base);
       if (state === "idle") {
         if (rms >= onset) {
-          loudMs += deltaMs;
+          loudMs += Math.min(deltaMs, VAD_ONSET_FRAME_CAP_MS);
+          voicedMs += deltaMs;
           if (loudMs >= VAD_SPEECH_ONSET_MS) {
             state = "speaking";
             quietMs = 0;
           }
         } else {
           loudMs = 0;
-          trackFloor(rms, deltaMs);
+          voicedMs = 0;
+          if (floor !== null) trackFloor(rms, deltaMs);
         }
         return state;
       }
 
-      // speaking / trailing_silence:低于收口阈值累计静默,高于就回到 speaking。
+      // speaking / trailing_silence:低于收口阈值累计静默,高于就回到 speaking 并累计有声。
       if (rms < release) {
         quietMs += deltaMs;
-        trackFloor(rms, deltaMs);
-        state = quietMs >= VAD_TRAILING_SILENCE_MS ? "stopped" : "trailing_silence";
+        if (floor !== null) trackFloor(rms, deltaMs);
+        state = voicedMs >= VAD_MIN_VOICED_MS && quietMs >= trailingWindowMs()
+          ? "stopped" : "trailing_silence";
       } else {
         quietMs = 0;
+        voicedMs += deltaMs;
         state = "speaking";
       }
       return state;
