@@ -419,13 +419,26 @@ export function canOpenAutopilotMicrophone(state: AutopilotRuntimeState): boolea
 export const AUTOPILOT_IDLE_TICK_MS = 900;
 
 /**
+ * 刚交回服务器、等它签发下一条命令时的节拍。录音 ACK 之后服务器要 ASR + 判分 +
+ * 取话术(养老院 2026-09-17 实测约 8 s 机器人才再开口);900 ms 一拍最坏白等一拍,
+ * 300 ms 把这段平均少等 0.3 s。仍是有界间隔,不是 busy loop。
+ */
+export const AUTOPILOT_AWAITING_SERVER_TICK_MS = 300;
+
+/**
  * 下一次 runner tick 的间隔。
  *
  * 服务器已经签发本轮录音命令(record_ready)时必须是 0：提问音频真的播完了、
  * tts_ended 也已持久化，这时再压一个空闲节拍，老人那头就是"问完了没反应"。
- * 其余状态保留有界间隔。真正的开麦仍然发生在 runRecording 里，仍然排在
- * 音频 ended 与持久化 tts_ended 之后——这里只去掉人为的等待。
+ * 刚把 tts_ended / record_stopped 交回服务器、等它下一条命令的两个状态用短节拍;
+ * 其余状态(waiting_command、paused、scope_completed、tts 各态)保留空闲节拍。
+ * 真正的开麦仍然发生在 runRecording 里，仍然排在音频 ended 与持久化 tts_ended
+ * 之后——这里只去掉人为的等待。
  */
 export function autopilotNextTickDelayMs(state: AutopilotRuntimeState): number {
-  return canOpenAutopilotMicrophone(state) ? 0 : AUTOPILOT_IDLE_TICK_MS;
+  if (canOpenAutopilotMicrophone(state)) return 0;
+  if (state.phase === "waiting_server_after_record" || state.phase === "waiting_server_after_tts") {
+    return AUTOPILOT_AWAITING_SERVER_TICK_MS;
+  }
+  return AUTOPILOT_IDLE_TICK_MS;
 }

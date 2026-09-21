@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { commandSupersedesTerminalLatch } from "./autopilotRuntime.ts";
+import {
+  AUTOPILOT_AWAITING_SERVER_TICK_MS,
+  AUTOPILOT_IDLE_TICK_MS,
+  autopilotNextTickDelayMs,
+  commandSupersedesTerminalLatch,
+  type AutopilotRuntimePhase,
+  type AutopilotRuntimeState,
+} from "./autopilotRuntime.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
 
 function command(overrides: Partial<NextCommandProjection & {
@@ -115,4 +122,45 @@ test("交互静默推进:收麦后服务器直接下发下一题问句,跨题 re
   assert.equal(reduced.phase, "tts_ready");
   assert.equal(reduced.command?.command_key, "cmd-runtime-next-q-0001");
   assert.equal(reduced.pause_reason, null);
+});
+
+test("runner 节拍按状态分三档:record_ready 0、等服务器判分/签发的两个状态 300、其余 900", () => {
+  const record = command({
+    kind: "record",
+    command_key: "cmd-runtime-rec-0002",
+    command_seq: 4,
+    payload: {
+      raw_audio_id: "raw-runtime-0002",
+      turn_ref: "itm-0001#1",
+      max_duration_seconds: 15,
+      contains_direct_identifier: false,
+      presentation_speech_key: "wk2.01.question",
+      presentation_speech_text: "问题",
+      presentation_purpose: "question",
+    },
+  } as Partial<NextCommandProjection>);
+  const state = (phase: AutopilotRuntimePhase, current: NextCommandProjection | null): AutopilotRuntimeState => ({
+    phase, command: current, last_device_event_seq: 3, last_ack: null, pause_reason: null,
+  });
+  assert.equal(AUTOPILOT_AWAITING_SERVER_TICK_MS, 300);
+  assert.equal(AUTOPILOT_IDLE_TICK_MS, 900);
+  assert.ok(AUTOPILOT_AWAITING_SERVER_TICK_MS < AUTOPILOT_IDLE_TICK_MS);
+
+  // 录音命令已签发:一拍都不等。
+  assert.equal(autopilotNextTickDelayMs(state("record_ready", record)), 0);
+  // 刚交回服务器等它下一条(录音 ACK 后 ASR/判分/取话术;tts_ended 后签发录音或下一句):短节拍。
+  assert.equal(autopilotNextTickDelayMs(state("waiting_server_after_record", record)),
+    AUTOPILOT_AWAITING_SERVER_TICK_MS);
+  assert.equal(autopilotNextTickDelayMs(state("waiting_server_after_tts", command())),
+    AUTOPILOT_AWAITING_SERVER_TICK_MS);
+  // 其余状态照旧空闲节拍。
+  for (const phase of [
+    "waiting_command", "paused", "scope_completed", "tts_ready", "tts_playing", "recording",
+  ] as const) {
+    assert.equal(autopilotNextTickDelayMs(state(phase, phase === "waiting_command" ? null : command())),
+      AUTOPILOT_IDLE_TICK_MS, phase);
+  }
+  // record_ready 但命令不是 pending 的录音(刷新恢复/错配):不许 0 拍开麦,也不是等服务器。
+  assert.equal(autopilotNextTickDelayMs(state("record_ready", command({ state: "started" }))),
+    AUTOPILOT_IDLE_TICK_MS);
 });

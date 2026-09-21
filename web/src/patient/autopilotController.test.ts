@@ -40,6 +40,7 @@ import {
   assertCaptureDurationWithinCommandLimit,
 } from "./autopilotCaptureWindow.ts";
 import {
+  AUTOPILOT_AWAITING_SERVER_TICK_MS,
   AUTOPILOT_IDLE_TICK_MS,
   autopilotNextTickDelayMs,
   canOpenAutopilotMicrophone,
@@ -326,16 +327,21 @@ test("提问播完、tts_ended 已签名之后，收麦不再多等一个空闲�
   // 复刻 usePatientAutopilot 的 runner tick：每轮 pollOnce 之后按运行时状态
   // 决定下一轮的间隔。
   const scheduledDelays: number[] = [];
+  const phases: string[] = [];
   for (let round = 0; round < 2; round += 1) {
     const runtime = await controller.pollOnce();
     if (runtime.phase === "paused" || runtime.phase === "scope_completed") break;
+    phases.push(runtime.phase);
     scheduledDelays.push(autopilotNextTickDelayMs(runtime));
   }
 
   // 第一轮结束时服务器已经签发本轮录音命令 → 立即进入下一轮，0ms。
-  // 第二轮已交回服务器等待下一条命令 → 回到有界空闲节拍。
-  assert.deepEqual(scheduledDelays, [0, AUTOPILOT_IDLE_TICK_MS]);
+  // 第二轮 record_stopped 已交回服务器、等它 ASR/判分后签发下一条 → 等服务器的短节拍
+  // (2026-09-20 起 300 ms;此前是 900 ms 的空闲节拍)。
+  assert.deepEqual(phases, ["record_ready", "waiting_server_after_record"]);
+  assert.deepEqual(scheduledDelays, [0, AUTOPILOT_AWAITING_SERVER_TICK_MS]);
   assert.equal(AUTOPILOT_IDLE_TICK_MS, 900);
+  assert.equal(AUTOPILOT_AWAITING_SERVER_TICK_MS, 300);
   // 开麦仍然排在真实 ended 与持久化 tts_ended 之后，一步都没提前。
   assert.deepEqual(events, [
     "next",
