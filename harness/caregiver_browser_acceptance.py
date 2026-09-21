@@ -412,6 +412,11 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
         "tts": {},
         "next": [],
         "ack_types": {},
+        # record_stopped 回执里的 stop_reason,按命令键。伪麦克风是循环播放的 330 Hz 连续音
+        # (_write_fake_microphone_wav),没有「说完之后的静默」,而且走查在「正在听您说」一出现
+        # 就点「说完了可以点这里」——平板 2026-09-20 起的尾静默自动收麦(silence)在这里
+        # 不可能先到,收麦理由必须还是按钮那条 user_done。
+        "record_stop_reasons": {},
         "record_authorizations": {},
         "audio_posts": 0,
         "audio_uploads": 0,
@@ -544,6 +549,10 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                     ack_types = observations["ack_types"]
                     assert isinstance(ack_types, dict)
                     ack_types.setdefault(key, []).append(ack_type)
+                if ack_type == "record_stopped" and isinstance(posted, dict):
+                    stop_reasons = observations["record_stop_reasons"]
+                    assert isinstance(stop_reasons, dict)
+                    stop_reasons[key] = posted.get("stop_reason")
                 # 收据 260 起 tts_ended 的回执里带回的录音命令被平板当场采纳,不再经 /next;
                 # 命令序列要把它也登记上,否则 record 在走查眼里从此消失。
                 receipt = response.json()
@@ -733,9 +742,11 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                     return False
                 first_tts, record, next_command = entries[0], entries[1], entries[2]
                 ack_types = observations["ack_types"]
+                stop_reasons = observations["record_stop_reasons"]
                 authorizations = observations["record_authorizations"]
                 tts = observations["tts"]
                 assert isinstance(ack_types, dict)
+                assert isinstance(stop_reasons, dict)
                 assert isinstance(authorizations, dict)
                 assert isinstance(tts, dict)
                 return (
@@ -745,6 +756,8 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                     and first_tts[1] < record[1] < next_command[1]
                     and ack_types.get(first_tts[0]) == ["tts_started", "tts_ended"]
                     and ack_types.get(record[0]) == ["record_started", "record_stopped"]
+                    # 收麦是按钮那条(user_done):伪麦克风连续音 + 立刻点按钮,VAD 不会先判。
+                    and stop_reasons.get(record[0]) == "user_done"
                     and ack_types.get(next_command[0]) == ["tts_started"]
                     # 收据 260:开麦前置只剩一次录音授权(取流之后、真 onstart 之前那道门)。
                     and authorizations.get(record[0]) == 1
