@@ -9,6 +9,16 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+## 2026-09-21 16:00 UTC 上线记录（`3f49f32`：延迟专项——平板说完 3 s 静音自动收麦 + 判分中轮询 300 ms + LLM 判分输出限长；零迁移，库头仍 `f4b2d8c1a635`）
+
+**Eric 跑收据 263 脚本（窗口 `20260921-110033`，America/Chicago 11:00），第 0–11 步全过。** 上线前 10 分钟生产零非轮询请求。
+
+- 应用提交 `3f49f32b3128e6ff08ab8c61e6d3b1789a30d177`（[PR #18](https://github.com/EricXu-0805/nmu-ad-language-training/pull/18)，push/pull_request 两个 CI run 均 success；产物取自 main 上同 SHA 的 push run 35567179563，`verify_browser_dist` 18 个受管文件通过）。依赖锁、迁移图、备份校验器相对 `3baa257` 零变化；venv、库、异地校验器均未动。
+- 起服后本机/公网 `/health` 200，`/docs` 404；完整预检 **9/9 退 0**（迁移头 f4b2d8c1a635、备份新鲜、依赖锁 53 包对上、OS 安全积压 0）。
+- 树核 `verify_deployed_tree` **MATCH source_files=826 browser_files=19**（对 `3f49f32` + CI dist 清单）。
+- `last-deploy.state`：`commit = 3f49f32…`，`receipt = PM_20260730_自动对话/262-延迟专项_静音收麦与判分提速-20260920.md`。
+- 行为变化（收据 262）：老人端录音在检测到说话且累计有声 ≥450 ms 后静满 3 s（短话 4.5 s）以 `stop_reason=silence` 自动收麦，没检测到说话不自动收，「说完了」按钮与 14 s 上限照旧；判分口径不变。上线后要按 `stop_reason` 分布重算收据 260 §八 的延迟表，并按 `silence` 收麦的录音抽样听、统计截断率。
+
 ## 2026-09-21 03:55 UTC 上线记录（`3baa257`：题内续弹 + 研究者现场裁定 + 平板题末即录与重试 + 题号；**含迁移 `e2a6d8f0b419` → `f4b2d8c1a635`**）
 
 **Eric 跑收据 261 脚本（窗口 `20260920-225426`，America/Chicago 22:54），第 0–20 步全过；第 21 步记账因脚本里一个 `→` 字符在 bash 中被读成变量名而失败，`last-deploy.state` 由 Claude 手工按同一模板补写。** 上线前 10 分钟生产零非轮询请求。
