@@ -570,7 +570,7 @@ async function req<T>(method: string, path: string, body?: unknown,
 
 // CSV 走裸 fetch 而不是 <a download>：顶层导航会把控制台带走，而且失败时浏览器
 // 会把错误响应当文件存下来。这样非 2xx 仍走与 JSON 读同一条错误解码路径。
-async function fetchResearchCsv(path: string): Promise<Blob> {
+async function fetchResearchCsv(path: string, timeoutMessage = "导出超时，请把每页行数调小后重试"): Promise<Blob> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), RESEARCH_READ_TIMEOUT_MS);
   try {
@@ -588,7 +588,7 @@ async function fetchResearchCsv(path: string): Promise<Blob> {
     }
     return await res.blob();
   } catch (error) {
-    if (controller.signal.aborted) throw new ApiError(408, "导出超时，请把每页行数调小后重试");
+    if (controller.signal.aborted) throw new ApiError(408, timeoutMessage);
     throw apiNetworkError(error);
   } finally {
     window.clearTimeout(timeout);
@@ -1026,6 +1026,9 @@ export const api = {
       "GET", "/questionnaires/definitions", undefined,
       DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
     )),
+  questionnaireReviewCsv: (patientId: string, dataset: "records" | "items"): Promise<Blob> =>
+    fetchResearchCsv(`/patients/${encodeURIComponent(patientId)}/questionnaire-review.csv?dataset=${dataset}`,
+      "量表核对表下载超时，请稍后重试"),
   listQuestionnaireRecords: async (patientId: string): Promise<QuestionnaireRecord[]> =>
     parseQuestionnaireRecordList(await req<unknown>(
       "GET", `/patients/${encodeURIComponent(patientId)}/questionnaire-records`,

@@ -131,6 +131,7 @@ export interface PatientSummary {
   patient_id: string;
   is_simulation_subject: boolean;
   dementia_severity?: string | null;
+  study_arm?: string | null;
   mandarin_eligible?: boolean | null;
   consent_status?: string | null;
   consent_type?: ConsentType | null;

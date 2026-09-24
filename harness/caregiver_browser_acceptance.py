@@ -306,11 +306,14 @@ def _read_result_receipt(root: Path) -> BrowserResult:
     )
 
 
-def _write_fake_microphone_wav(path: Path) -> None:
+def _write_fake_microphone_wav(path: Path, *, voice_band: bool = False) -> None:
     rate = 16_000
     frames = bytearray()
     for index in range(rate * 3):
-        sample = int(6_000 * math.sin(2 * math.pi * 330 * index / rate))
+        # Baseline tests use out-of-band sound; automatic interruption explicitly
+        # opts into the voice band. Both remain voiced for recording RMS/VAD.
+        frequency = 330 if voice_band else 80
+        sample = int(6_000 * math.sin(2 * math.pi * frequency * index / rate))
         frames += sample.to_bytes(2, "little", signed=True)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -390,7 +393,9 @@ def _wait_for(predicate, pages: tuple[object, ...], *, timeout_seconds: float, l
     raise BrowserAcceptanceError(f"等待{label}超时")
 
 
-def run_start_pause(config: BrowserAcceptanceConfig, *, answer_now: bool = False) -> BrowserResult:
+def run_start_pause(config: BrowserAcceptanceConfig, *, answer_now: bool = False,
+                    voice_barge_in: bool = False) -> BrowserResult:
+    answer_now = answer_now or voice_barge_in
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -399,7 +404,7 @@ def run_start_pause(config: BrowserAcceptanceConfig, *, answer_now: bool = False
 
     fake_audio = config.harness_root / "tmp" / "browser-fake-microphone.wav"
     fake_audio.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _write_fake_microphone_wav(fake_audio)
+    _write_fake_microphone_wav(fake_audio, voice_band=voice_barge_in)
     violations: list[str] = []
     observations: dict[str, object] = {
         "pause_requested": False,
@@ -412,12 +417,13 @@ def run_start_pause(config: BrowserAcceptanceConfig, *, answer_now: bool = False
         "tts": {},
         "next": [],
         "ack_types": {},
-        # record_stopped 回执里的 stop_reason,按命令键。伪麦克风是循环播放的 330 Hz 连续音
+        # record_stopped 回执里的 stop_reason,按命令键。伪麦克风是循环播放的连续音
         # (_write_fake_microphone_wav),没有「说完之后的静默」,而且走查在「正在听您说」一出现
         # 就点「说完了可以点这里」——平板 2026-09-20 起的尾静默自动收麦(silence)在这里
         # 不可能先到,收麦理由必须还是按钮那条 user_done。
         "record_stop_reasons": {},
         "record_authorizations": {},
+        "barge_in_authorizations": {},
         "audio_posts": 0,
         "audio_uploads": 0,
         "audio_saved": 0,
@@ -569,6 +575,14 @@ def run_start_pause(config: BrowserAcceptanceConfig, *, answer_now: bool = False
                             entries.append((carried_key, carried_seq, carried_kind))
             except Exception:
                 violation("设备命令 ACK 无法校验")
+        if response.status == 200 and request.method == "POST" \
+                and parsed.path.endswith("/barge-in-authorization"):
+            authorizations = observations["barge_in_authorizations"]
+            assert isinstance(authorizations, dict)
+            key = parsed.path.split("/")[-2]
+            authorizations[key] = int(authorizations.get(key, 0)) + 1
+            if observations["record_authorizations"] or observations["audio_posts"]:
+                violation("声音检测期间提前创建了录音或回答")
         if response.status == 200 and request.method == "POST" \
                 and parsed.path.endswith("/recording-authorization"):
             key = parsed.path.split("/")[-2]
@@ -732,15 +746,21 @@ def run_start_pause(config: BrowserAcceptanceConfig, *, answer_now: bool = False
             caregiver.get_by_text("练习进行中", exact=True).wait_for(
                 state="visible", timeout=20_000)
 
-            if answer_now:
+            if answer_now and not voice_barge_in:
                 early_answer = patient.get_by_role("button", name="现在回答", exact=True)
                 early_answer.wait_for(state="visible", timeout=20_000)
                 if observations["record_authorizations"]:
                     raise BrowserAcceptanceError("点击提前回答前已经签发录音授权")
                 early_answer.click()
                 early_answer.wait_for(state="hidden", timeout=5_000)
-            patient.get_by_text("正在听您说", exact=True).wait_for(
+            patient.get_by_text(
+                "正在听您说，请从头完整说一次" if voice_barge_in else "正在听您说",
+                exact=True).wait_for(
                 state="visible", timeout=30_000)
+            if voice_barge_in:
+                authorizations = observations["barge_in_authorizations"]
+                if not isinstance(authorizations, dict) or list(authorizations.values()) != [2]:
+                    raise BrowserAcceptanceError("自动停播缺少同一命令的开麦前后授权")
             patient.get_by_role("button", name="说完了可以点这里", exact=True).click()
 
             def next_command_is_visible() -> bool:
@@ -1119,7 +1139,9 @@ def _interrupted_browser_judgement_is_legal(session, attempt) -> bool:
     )
 
 
-def _validate_start_pause_database(config, result: BrowserResult, *, answer_now: bool = False) -> None:
+def _validate_start_pause_database(config, result: BrowserResult, *, answer_now: bool = False,
+                                   voice_barge_in: bool = False) -> None:
+    answer_now = answer_now or voice_barge_in
     from sqlmodel import Session, select
 
     from app import (
@@ -1414,7 +1436,7 @@ def _validate_start_pause_database(config, result: BrowserResult, *, answer_now:
                 session, first_tts, ack_idempotency_key=first_tts_acks[1].idempotency_key,
                 require_current_command=False, require_live_scope=False)
             payload = json.loads(interrupted.payload_json)
-            if payload["media_duration_ms"] < 0 or payload["interrupt_reason"] != "answer_now":
+            if payload["media_duration_ms"] < 0 or payload["interrupt_reason"] != ("voice_activity" if voice_barge_in else "answer_now"):
                 raise BrowserAcceptanceError("提前回答缺少已停播和已播时长证据")
         record_acks = exact_ack_types(
             record, ["record_started", "record_stopped"], "录音")
@@ -1709,10 +1731,11 @@ def _validate_help_states_database(session, result: BrowserResult) -> None:
         raise BrowserAcceptanceError("有一条状态转移没有具名")
 
 
-def validate_start_pause_ledger(snapshot: BrowserResult | None = None, *, answer_now: bool = False) -> None:
+def validate_start_pause_ledger(snapshot: BrowserResult | None = None, *, answer_now: bool = False,
+                               voice_barge_in: bool = False) -> None:
     config = _ledger_harness_config()
     result = snapshot or _read_result_receipt(config.base.root)
-    _validate_start_pause_database(config, result, answer_now=answer_now)
+    _validate_start_pause_database(config, result, answer_now=answer_now, voice_barge_in=voice_barge_in)
 
 
 def _redacted_error(error: BaseException, secrets: tuple[str, ...]) -> str:
@@ -1728,8 +1751,10 @@ def _parser() -> argparse.ArgumentParser:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--start-pause", action="store_true")
     group.add_argument("--answer-now", action="store_true")
+    group.add_argument("--voice-barge-in", action="store_true")
     group.add_argument("--verify-ledger", action="store_true")
     group.add_argument("--verify-answer-now-ledger", action="store_true")
+    group.add_argument("--verify-voice-barge-in-ledger", action="store_true")
     parser.add_argument("--origin")
     return parser
 
@@ -1741,16 +1766,17 @@ def main(argv: list[str] | None = None) -> int:
         for name in (CAREGIVER_PASSWORD_ENV, CONSOLE_PIN_ENV, INSTANCE_MARKER_ENV)
     )
     try:
-        if args.start_pause or args.answer_now:
+        if args.start_pause or args.answer_now or args.voice_barge_in:
             if not args.origin:
                 raise BrowserAcceptanceError("真实 Chrome 验收缺少本机地址")
             config = resolve_browser_config(args.origin)
-            run_start_pause(config, answer_now=args.answer_now)
+            run_start_pause(config, answer_now=args.answer_now, voice_barge_in=args.voice_barge_in)
             print("真实 Chrome 流程已完成：开始、配对、朗读、录音、上传、ASR/判定、下一命令、安全暂停")
         else:
             if args.origin:
                 raise BrowserAcceptanceError("账本核验不接受网页地址")
-            validate_start_pause_ledger(read_ledger_snapshot(), answer_now=args.verify_answer_now_ledger)
+            validate_start_pause_ledger(read_ledger_snapshot(), answer_now=args.verify_answer_now_ledger,
+                                       voice_barge_in=args.verify_voice_barge_in_ledger)
             print("同一临时库账本核验已通过")
         return 0
     except BrowserAcceptanceError as exc:

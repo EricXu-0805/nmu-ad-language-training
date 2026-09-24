@@ -145,7 +145,7 @@ class AutopilotAckIn(BaseModel):
     # arbitrary strings from becoming research-control evidence.
     media_ended: bool | None = None
     media_stopped: bool | None = None
-    interrupt_reason: Literal["answer_now"] | None = None
+    interrupt_reason: Literal["answer_now", "voice_activity"] | None = None
     media_duration_ms: int | None = Field(
         default=None, ge=0, le=21_600_000)
     mime_type: Literal[
@@ -181,7 +181,7 @@ class AutopilotAckIn(BaseModel):
     @model_validator(mode="after")
     def _shape_matches_ack(self) -> "AutopilotAckIn":
         if self.ack_type == "tts_interrupted":
-            if (self.media_stopped is not True or self.interrupt_reason != "answer_now"
+            if (self.media_stopped is not True or self.interrupt_reason not in {"answer_now", "voice_activity"}
                     or self.media_duration_ms is None or self.media_ended is not None):
                 raise ValueError("tts_interrupted 必须证明已停播及真实已播时长，不得冒充播完")
         elif self.media_stopped is not None or self.interrupt_reason is not None:
@@ -260,7 +260,7 @@ class AutopilotAckIn(BaseModel):
                 payload["media_duration_ms"] = self.media_duration_ms
             return payload
         if self.ack_type == "tts_interrupted":
-            return {"media_stopped": True, "interrupt_reason": "answer_now",
+            return {"media_stopped": True, "interrupt_reason": self.interrupt_reason,
                     "media_duration_ms": self.media_duration_ms}
         if self.ack_type in {"tts_failed", "record_failed"}:
             assert self.error_code is not None

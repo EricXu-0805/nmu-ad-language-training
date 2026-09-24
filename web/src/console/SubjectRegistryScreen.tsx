@@ -171,6 +171,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
         <span className="col" style={{ gap: 4 }} role="cell">
           <span className="registry-cell-label">研究编号</span>
           <strong className="mono">{r.patient_id}</strong>
+          <span>研究分组：{r.study_arm?.trim() || "未填写"}</span>
           <DataBoundaryBadge classification={classification} entity="patient" />
           {r.pairing_code && (
             <span className="muted">
@@ -383,7 +384,7 @@ export function SubjectRegistryScreen({ canManagePlans = true, actorRole = null,
 
       {!rows && !err && <StatusPill tone="muted">正在加载登记表…</StatusPill>}
 
-      {scaleFor && <ScaleDrawer patientId={scaleFor} open onClose={() => setScaleFor(null)} />}
+      {scaleFor && <ScaleDrawer patientId={scaleFor} open canExportQuestionnaires={actorRole === "admin" || actorRole === "data_steward"} onClose={() => setScaleFor(null)} />}
       {editFor && (
         <PatientEditDrawer patientId={editFor.patient_id}
           sessionCount={editFor.session_count}

@@ -5,6 +5,8 @@ import type {
 import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
 
+import type { BargeInHandle, BargeInObservation } from "./autopilotBrowserBargeIn.ts";
+
 type TtsCommand = Extract<NextCommandProjection, { kind: "tts" }>;
 
 export interface AutopilotSpeechBrowserPorts {
@@ -15,6 +17,12 @@ export interface AutopilotSpeechBrowserPorts {
   createObjectUrl(blob: Blob): string;
   revokeObjectUrl(url: string): void;
   now(): number;
+  startBargeIn?(input: {
+    sessionId: string; command: TtsCommand; audio: HTMLAudioElement;
+    onConfirmed(): boolean; onPlaybackFailed(error: unknown): void;
+    observe?(observation: BargeInObservation): void;
+  }): BargeInHandle;
+  observeBargeIn?(observation: BargeInObservation): void;
   /**
    * play() 被浏览器以「无用户手势」拒绝时的第二条路:等下一次点屏,在那个手势
    * 处理器里**同步**再 play() 一次并把它的 promise 交回来。signal 中止即拒绝。
@@ -47,13 +55,15 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
   readonly ended: AutopilotSpeechPlayback["ended"];
   readonly closed: Promise<void>;
   private readonly startedDeferred = deferred<{ media_duration_ms?: number }>();
-  private readonly endedDeferred = deferred<{ media_duration_ms?: number; interrupted?: true }>();
+  private readonly endedDeferred = deferred<Awaited<AutopilotSpeechPlayback["ended"]>>();
   private readonly closedDeferred = deferred<void>();
   private readonly abortController = new AbortController();
   private readonly audio: HTMLAudioElement;
   private objectUrl: string | null = null;
   private startAtMs: number | null = null;
   private terminal = false;
+  private bargeIn: BargeInHandle | null = null;
+  private bargeInArmed = false;
   private readonly sessionId: string;
   private readonly command: TtsCommand;
   private readonly ports: AutopilotSpeechBrowserPorts;
@@ -82,10 +92,41 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
     const error = new DOMException("语音播放已取消", "AbortError");
     this.startedDeferred.reject(error);
     this.endedDeferred.reject(error);
-    this.closedDeferred.resolve(undefined);
+    this.finishClose();
   }
 
-  answerNow(): boolean {
+  armBargeIn(command: TtsCommand): void {
+    if (this.terminal || this.bargeInArmed || !this.ports.startBargeIn
+        || this.startAtMs === null || command.state !== "started"
+        || command.command_key !== this.command.command_key
+        || command.control_generation !== this.command.control_generation
+        || command.runner_generation !== this.command.runner_generation
+        || (command.payload.purpose !== "question" && command.payload.purpose !== "cue")) return;
+    this.bargeInArmed = true;
+    try {
+      this.bargeIn = this.ports.startBargeIn({
+        sessionId: this.sessionId, command, audio: this.audio,
+        onConfirmed: () => this.interruptForAnswer("voice_activity"),
+        onPlaybackFailed: (error) => this.fail(new AutopilotMediaError(
+          "audio_playback_failed", "提前回答检测后无法继续朗读",
+          { cause: error, failureStage: "play_rejected" })),
+        observe: this.ports.observeBargeIn,
+      });
+    } catch { /* Optional enhancement: the explicit answer button still works. */ }
+  }
+
+  private finishClose(): void {
+    const monitor = this.bargeIn;
+    this.bargeIn = null;
+    if (monitor) {
+      monitor.close();
+      void monitor.closed.then(() => this.closedDeferred.resolve(undefined));
+    } else this.closedDeferred.resolve(undefined);
+  }
+
+  answerNow(): boolean { return this.interruptForAnswer("answer_now"); }
+
+  private interruptForAnswer(reason: "answer_now" | "voice_activity"): boolean {
     if (this.terminal || this.audio.ended === true || this.startAtMs === null
         || !Number.isFinite(this.audio.currentTime) || this.audio.currentTime < 0
         || (this.command.payload.purpose !== "question" && this.command.payload.purpose !== "cue")) return false;
@@ -96,8 +137,9 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
     this.terminal = true;
     const elapsed = Math.round(this.audio.currentTime * 1_000);
     this.cleanupUrl();
-    this.endedDeferred.resolve({ interrupted: true, media_duration_ms: elapsed });
-    this.closedDeferred.resolve(undefined);
+    this.endedDeferred.resolve({ interrupted: true, media_duration_ms: elapsed,
+      ...(reason === "voice_activity" ? { interrupt_reason: reason } : {}) });
+    this.finishClose();
     return true;
   }
 
@@ -114,7 +156,7 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
     this.cleanupUrl();
     this.startedDeferred.reject(error);
     this.endedDeferred.reject(error);
-    this.closedDeferred.resolve(undefined);
+    this.finishClose();
   }
 
   private async run(): Promise<void> {
@@ -148,7 +190,7 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
         this.terminal = true;
         this.cleanupUrl();
         this.endedDeferred.resolve({ media_duration_ms: elapsed });
-        this.closedDeferred.resolve(undefined);
+        this.finishClose();
       };
       this.audio.onerror = () => this.fail(new AutopilotMediaError(
         "audio_playback_failed", "TTS 音频解码或播放失败",

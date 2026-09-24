@@ -459,3 +459,42 @@ export async function authorizeExactAutopilotRecording(
   });
   return parseExactRecordingAuthorization(decoded);
 }
+
+/** Local listening is a separate, exact started-TTS capability, never recording admission. */
+export async function authorizeExactAutopilotBargeIn(
+  sessionId: string,
+  command: TtsCommand,
+  signal: AbortSignal,
+  deps: AutopilotMediaTransportDependencies,
+): Promise<void> {
+  const parsed = parseNextCommandProjection(command);
+  if (parsed.kind !== "tts" || parsed.state !== "started"
+      || (parsed.payload.purpose !== "question" && parsed.payload.purpose !== "cue")) {
+    throw new Error("提前回答检测需要正在播放的提问或线索");
+  }
+  await withRequestDeadline(signal, deps.requestTimeoutMs ?? 3_000,
+    "提前回答检测授权超时", "提前回答检测已取消", async (requestSignal) => {
+      const credential = exactActiveCredential(sessionId, deps);
+      const response = await deps.fetchImpl(commandPath(sessionId, command.command_key, "barge-in-authorization"), {
+        method: "POST", signal: requestSignal, credentials: "omit", cache: "no-store",
+        headers: { ...credential.headers, ...deps.csrf("POST"), "Content-Type": "application/json" },
+        body: JSON.stringify({ command_revision: command.command_revision,
+          control_generation: command.control_generation, runner_generation: command.runner_generation }),
+      });
+      const text = await response.text();
+      if (requestSignal.aborted) throw requestSignal.reason;
+      if (exactActiveCredential(sessionId, deps).record?.capability !== credential.record?.capability) {
+        throw new Error("提前回答检测期间设备凭据已变化");
+      }
+      if (!response.ok) deps.handleAuthorizationFailure(response.status, text, credential);
+      const value = decodeJsonApiResponse({ status: response.status, ok: response.ok,
+        statusText: response.statusText, text });
+      if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("提前回答检测授权无效");
+      const row = value as Record<string, unknown>;
+      if (Object.keys(row).sort().join(",") !== "allowed,barge_in_authorized,is_simulation,runtime_status"
+          || row.allowed !== true || row.barge_in_authorized !== true
+          || row.runtime_status !== "active" || typeof row.is_simulation !== "boolean") {
+        throw new Error("提前回答检测未获明确授权");
+      }
+    });
+}

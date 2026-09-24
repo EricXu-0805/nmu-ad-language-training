@@ -1197,6 +1197,7 @@ def list_patients(request: Request, s: DBSession = Depends(get_session)):
             "patient_id": p.patient_id,
             "is_simulation_subject": p.is_simulation_subject,
             "dementia_severity": p.dementia_severity,
+            "study_arm": p.study_arm,
             "mandarin_eligible": p.mandarin_eligible,
             "consent_status": p.consent_status,
             "consent_type": p.consent_type.value if hasattr(p.consent_type, "value") else p.consent_type,
@@ -4045,6 +4046,39 @@ def autopilot_recording_authorization(
         "runtime_status": "active",
         "is_simulation": effective_simulation,
     }
+
+
+class BargeInAuthorizationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command_revision: int = PydanticField(strict=True, ge=1)
+    control_generation: int = PydanticField(strict=True, ge=1)
+    runner_generation: int = PydanticField(strict=True, ge=1)
+
+
+@app.post("/sessions/{session_id}/autopilot/commands/{command_key}/barge-in-authorization")
+def autopilot_barge_in_authorization(
+        session_id: str, command_key: str, body: BargeInAuthorizationIn,
+        request: Request, s: DBSession = Depends(get_session)):
+    """Authorize local-only voice detection; this is not a recording permit."""
+    token_hash = _require_device_capability_token_hash(request, "申请本机声音检测授权")
+    _require_capability_bound_session(request, session_id, "申请本机声音检测授权")
+    with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
+        s.rollback()
+        s.expire_all()
+        live = _live_row_for_update(s)
+        _require_capability_bound_session(request, session_id, "申请本机声音检测授权")
+        _require_capability_current_live(request, s, "申请本机声音检测授权", live_row=live)
+        _require_capability_active_for_write(request, s, session_id)
+        try:
+            simulation = autopilot_service.authorize_barge_in_monitor(
+                s, session_id=session_id, command_key=command_key,
+                capability_token_hash=token_hash, **body.model_dump())
+        except autopilot_service.AutopilotServiceError as exc:
+            s.rollback()
+            _raise_autopilot_http_error(exc)
+    return {"allowed": True, "barge_in_authorized": True,
+            "runtime_status": "active", "is_simulation": simulation}
 
 
 @app.post("/audio", response_model=AudioAssetRow | DeviceAudioRegistrationOut)
@@ -15654,6 +15688,45 @@ def list_questionnaire_records(patient_id: str, request: Request,
             for record in sorted(records, key=lambda r: r.created_at)
         ],
     }
+
+
+@app.get("/patients/{patient_id}/questionnaire-review.csv")
+def export_questionnaire_review(
+        patient_id: str, request: Request,
+        dataset: Literal["records", "items"] = "items",
+        s: DBSession = Depends(get_session)):
+    from . import questionnaire_review_export
+
+    actor = _require_account_identity(
+        request, "导出量表核对表", roles={"admin", "data_steward"})
+    try:
+        config = export_security.load_deidentification_config()
+    except export_security.DeidentificationConfigurationError as exc:
+        raise HTTPException(503, detail={"code": "deidentification_unavailable", "message": str(exc)}) from exc
+    s.rollback()
+    s.expire_all()
+    with governance_lock.subject_fence(s, patient_id):
+        # An attempt log, not a claim that a download completed. The independent
+        # audit connection must finish before SQLite's writer fence is acquired.
+        try:
+            audit.record(s, actor=actor, action="questionnaire_review_export_requested",
+                         patient_id=patient_id, summary=f"dataset={dataset} non_frozen=true")
+        except Exception as exc:
+            raise HTTPException(503, "量表核对导出暂时无法记账，请稍后重试") from exc
+        governance_lock.begin_sqlite_write_fence(s)
+        try:
+            patient = _questionnaire_patient_or_reject(s, patient_id)
+            payload = questionnaire_review_export.build_csv(
+                s, patient=patient, dataset=dataset, config=config)
+        except questionnaire_review_export.ReviewExportUnavailable as exc:
+            raise HTTPException(409, detail={"code": exc.code, "message": str(exc)}) from exc
+        finally:
+            s.rollback()
+    return PlainResponse(payload, media_type="text/csv; charset=utf-8", headers={
+        "Cache-Control": "private, no-store", "Pragma": "no-cache",
+        "Content-Disposition": f'attachment; filename="questionnaire-review-{dataset}.csv"',
+        "X-Content-Type-Options": "nosniff",
+    })
 
 
 class QuestionnaireValueIn(BaseModel):

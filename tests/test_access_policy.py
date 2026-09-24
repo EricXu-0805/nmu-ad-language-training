@@ -129,6 +129,8 @@ def _logged_in_client(eng, username: str) -> TestClient:
      access_policy.AccessKind.ACCOUNT, access_policy.TRAINING_OPERATION_ROLES),
     ("POST", "/sessions/S/autopilot/commands/C/recording-authorization",
      access_policy.AccessKind.DEVICE, access_policy.TRAINING_OPERATION_ROLES),
+    ("POST", "/sessions/S/autopilot/commands/C/barge-in-authorization",
+     access_policy.AccessKind.DEVICE, None),
     ("POST", "/sessions/S/autopilot/commands/C/acks",
      access_policy.AccessKind.DEVICE, access_policy.TRAINING_OPERATION_ROLES),
     ("POST", "/sessions/S/autopilot/commands/C/drain-ack",

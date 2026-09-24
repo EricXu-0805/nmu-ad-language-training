@@ -400,3 +400,17 @@ test("还没点屏激活、题图还没就绪、麦克风相位已被生命周�
   const cleared = await stageMarkup(context, (view) => { view.localCapturePhase = null; });
   assert.doesNotMatch(cleared, /请听完再回答/);
 });
+
+test("自动停播只在同一回答和同一控制世代提醒重说", async (context) => {
+  const observation = {
+    sessionId: "S-ONE", commandKey: "prior-prompt", itemRef: "itm-0001",
+    turnSeq: 1, attemptSeq: 1, controlGeneration: 3, runnerGeneration: 7,
+    phase: "interrupted",
+  };
+  const current = await stageMarkup(context, (view) => { view.bargeIn = observation; });
+  assert.match(current, /正在听您说，请从头完整说一次/);
+  for (const delta of [{ runnerGeneration: 8 }, { controlGeneration: 4 }, { attemptSeq: 2 }]) {
+    const stale = await stageMarkup(context, (view) => { view.bargeIn = { ...observation, ...delta }; });
+    assert.doesNotMatch(stale, /请从头完整说一次/);
+  }
+});

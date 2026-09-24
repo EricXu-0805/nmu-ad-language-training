@@ -14,6 +14,7 @@ usage() {
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check adjudication-chains
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check start-position
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check answer-now
+  scripts/run-caregiver-demo20.sh [--port 端口] --browser-check voice-barge-in
   scripts/run-caregiver-demo20.sh --help
 
 作用：
@@ -68,15 +69,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --browser-check)
       [ "$#" -ge 2 ] || {
-        echo "错误：--browser-check 后需要 start-pause、recovery-chains、adjudication-chains、start-position 或 answer-now" >&2
+        echo "错误：--browser-check 后需要 start-pause、recovery-chains、adjudication-chains、start-position、answer-now 或 voice-barge-in" >&2
         exit 64
       }
       [ -z "$BROWSER_CHECK" ] || {
         echo "错误：--browser-check 不能重复" >&2
         exit 64
       }
-      [ "$2" = "start-pause" ] || [ "$2" = "recovery-chains" ] || [ "$2" = "adjudication-chains" ] || [ "$2" = "start-position" ] || [ "$2" = "answer-now" ] || {
-        echo "错误：--browser-check 只支持 start-pause、recovery-chains、adjudication-chains、start-position 或 answer-now" >&2
+      [ "$2" = "start-pause" ] || [ "$2" = "recovery-chains" ] || [ "$2" = "adjudication-chains" ] || [ "$2" = "start-position" ] || [ "$2" = "answer-now" ] || [ "$2" = "voice-barge-in" ] || {
+        echo "错误：--browser-check 只支持 start-pause、recovery-chains、adjudication-chains、start-position、answer-now 或 voice-barge-in" >&2
         exit 64
       }
       BROWSER_CHECK="$2"
@@ -327,6 +328,15 @@ elif [ "$BROWSER_CHECK" = "start-position" ]; then
   env -i "${HARNESS_ENV[@]}" \
     "$PYTHON" -m harness.caregiver_start_position --verify-ledger
   echo "真实 Chrome 指定起点及无伪回答账本核验已全部通过"
+  exit 0
+elif [ "$BROWSER_CHECK" = "voice-barge-in" ]; then
+  echo "真实 Chrome 声音触发停播走查开始（不显示临时凭据）…"
+  env -i "${HARNESS_ENV[@]}" \
+    "$BROWSER_PYTHON" -I "$REPO/harness/caregiver_browser_acceptance.py" \
+    --voice-barge-in --origin "http://127.0.0.1:$PORT"
+  env -i "${HARNESS_ENV[@]}" \
+    "$PYTHON" -m harness.caregiver_browser_acceptance --verify-voice-barge-in-ledger
+  echo "真实 Chrome 自动停播、重复回答提示、录音判分与账本核验已全部通过"
   exit 0
 elif [ "$BROWSER_CHECK" = "answer-now" ]; then
   echo "真实 Chrome 提前回答走查开始（不显示临时凭据）…"

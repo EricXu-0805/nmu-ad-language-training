@@ -121,6 +121,8 @@ _ROUTE_RULES = (
         roles=TRAINING_OPERATION_ROLES,
         label="申请当前自动驾驶录音授权",
     ),
+    _route({"POST"}, r"/sessions/[^/]+/autopilot/commands/[^/]+/barge-in-authorization",
+           AccessKind.DEVICE, label="授权当前提问的本机声音检测"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/commands/[^/]+/acks",
            AccessKind.DEVICE, roles=TRAINING_OPERATION_ROLES,
            label="回执当前自动驾驶命令"),
@@ -263,6 +265,9 @@ _ROUTE_RULES = (
     # 量表电子记录（原型道）：定义含逐题词，读也必须具名；写只属于施测角色。
     _route({"GET", "HEAD"}, r"/questionnaires/definitions", AccessKind.ACCOUNT,
            roles=KNOWN_ACCOUNT_ROLES, label="读取量表定义（原型）"),
+    _route({"GET"}, r"/patients/[^/]+/questionnaire-review\.csv",
+           AccessKind.ACCOUNT, roles=frozenset({"admin", "data_steward"}),
+           label="导出当前量表核对表"),
     _route({"GET", "HEAD"}, r"/patients/[^/]+/questionnaire-records",
            AccessKind.ACCOUNT, roles=KNOWN_ACCOUNT_ROLES,
            label="读取受试者量表电子记录"),

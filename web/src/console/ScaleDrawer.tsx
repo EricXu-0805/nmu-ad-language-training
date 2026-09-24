@@ -85,10 +85,11 @@ function scaleReadinessSummary(readiness: ScaleProtocolReadiness): string {
 
 // PI 尚未冻结具体工具时只展示可核查的就绪状态与历史未验证记录。
 // 自由填写的量表名/分数不能伪装成正式研究结局。
-export function ScaleDrawer({ patientId, open, onClose }: {
+export function ScaleDrawer({ patientId, open, onClose, canExportQuestionnaires = false }: {
   patientId: string;
   open: boolean;
   onClose: () => void;
+  canExportQuestionnaires?: boolean;
 }) {
   const panelRef = useDialogFocusTrap<HTMLElement>({
     open,
@@ -222,7 +223,7 @@ export function ScaleDrawer({ patientId, open, onClose }: {
           </div>
         )}
 
-        <QuestionnairePanel patientId={patientId} />
+        <QuestionnairePanel key={patientId} patientId={patientId} canExport={canExportQuestionnaires} />
 
         {assessmentEvents && (
           <div className="card col">

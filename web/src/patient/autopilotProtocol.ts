@@ -108,7 +108,7 @@ export type AutopilotAck =
   | (AckBase & {
     ack_type: "tts_interrupted";
     media_stopped: true;
-    interrupt_reason: "answer_now";
+    interrupt_reason: "answer_now" | "voice_activity";
     media_duration_ms: number;
   })
   | (AckBase & {
@@ -336,7 +336,7 @@ export function parseAutopilotAck(value: unknown): AutopilotAck {
       break;
     case "tts_interrupted":
       if (exact(["media_stopped", "interrupt_reason", "media_duration_ms"])
-          && row.media_stopped === true && row.interrupt_reason === "answer_now"
+          && row.media_stopped === true && oneOf(row.interrupt_reason, ["answer_now", "voice_activity"] as const)
           && safeInteger(row.media_duration_ms, 0, 21_600_000)) {
         return row as unknown as AutopilotAck;
       }

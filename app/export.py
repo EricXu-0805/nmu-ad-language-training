@@ -1825,7 +1825,9 @@ def _prompt_playback_evidence(db, attempt: AttemptEvent) -> dict:
         return {"prompt_playback_outcome": "unverified", "prompt_played_ms": None,
                 "prompt_exposure_needs_review": True}
     interrupted = ack.ack_type == "tts_interrupted"
-    return {"prompt_playback_outcome": "interrupted_answer_now" if interrupted else "ended",
+    reason = json.loads(ack.payload_json).get("interrupt_reason") if interrupted else None
+    outcome = f"interrupted_{reason}" if interrupted else "ended"
+    return {"prompt_playback_outcome": outcome,
             # Historical ended ACKs used wall-clock elapsed time. Only this new
             # interrupted ACK reports HTMLAudioElement.currentTime.
             "prompt_played_ms": json.loads(ack.payload_json).get("media_duration_ms") if interrupted else None,

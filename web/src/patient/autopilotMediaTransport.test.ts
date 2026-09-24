@@ -6,6 +6,7 @@ import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import {
   acknowledgeExactAutopilotDrain,
   authorizeExactAutopilotRecording,
+  authorizeExactAutopilotBargeIn,
   fetchExactAutopilotDrainTarget,
   fetchExactAutopilotTts,
   type AutopilotMediaTransportDependencies,
@@ -65,6 +66,42 @@ function dependencies(fetchImpl: AutopilotMediaTransportDependencies["fetchImpl"
     },
   };
 }
+
+test("voice monitor authorization binds the started prompt and refuses malformed or stale authority", async () => {
+  const command = { ...pendingTts(), state: "started" as const, command_revision: 1 };
+  const receipt = { allowed: true, barge_in_authorized: true, runtime_status: "active", is_simulation: false };
+  let calls = 0;
+  const { deps } = dependencies(async (input, init) => {
+    calls += 1;
+    assert.equal(String(input), "/sessions/S%2FONE/autopilot/commands/cmd-question%3A0001/barge-in-authorization");
+    assert.deepEqual(JSON.parse(String(init?.body)), {
+      command_revision: 1, control_generation: 1, runner_generation: 1,
+    });
+    assert.equal(init?.credentials, "omit");
+    return Response.json(receipt);
+  });
+  await authorizeExactAutopilotBargeIn("S/ONE", command, new AbortController().signal, deps);
+  await assert.rejects(authorizeExactAutopilotBargeIn("S/ONE", pendingTts(), new AbortController().signal, deps));
+  assert.equal(calls, 1);
+  for (const response of [ { ...receipt, barge_in_authorized: false },
+    { ...receipt, allowed: "true" }, { ...receipt, recording_authorized: true },
+    { ...receipt, runtime_status: "paused" }, { ...receipt, is_simulation: null } ]) {
+    await assert.rejects(authorizeExactAutopilotBargeIn("S/ONE", command,
+      new AbortController().signal, dependencies(async () => Response.json(response)).deps));
+  }
+  let active = credential;
+  const switched = dependencies(async () => {
+    active = { ...credential, record: { ...credential.record!, capability: "y".repeat(43) } };
+    return Response.json(receipt);
+  }).deps;
+  switched.selectCredential = () => active;
+  await assert.rejects(authorizeExactAutopilotBargeIn("S/ONE", command,
+    new AbortController().signal, switched), /凭据已变化/);
+  const timed = dependencies(() => new Promise<Response>(() => {})).deps;
+  timed.requestTimeoutMs = 5;
+  await assert.rejects(authorizeExactAutopilotBargeIn("S/ONE", command,
+    new AbortController().signal, timed), /超时/);
+});
 
 test("exact TTS sends only the encoded command URL and device proofs", async () => {
   let observed: { url: string; init: RequestInit } | null = null;

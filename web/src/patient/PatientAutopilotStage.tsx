@@ -118,6 +118,16 @@ export function PatientAutopilotStage({
     ? autopilot.localCapturePhase
     : null;
   const listening = localPhase?.phase === "listening";
+  const bargeIn = autopilot.bargeIn?.sessionId === sessionId
+    && autopilot.bargeIn.itemRef === command.item_ref
+    && autopilot.bargeIn.turnSeq === command.turn_seq
+    && autopilot.bargeIn.attemptSeq === command.attempt_seq
+    && autopilot.bargeIn.controlGeneration === command.control_generation
+    && autopilot.bargeIn.runnerGeneration === command.runner_generation
+    ? autopilot.bargeIn : null;
+  const voiceInterrupted = bargeIn?.phase === "interrupted";
+  const voiceMonitoring = bargeIn?.phase === "monitoring"
+    && bargeIn.commandKey === command.command_key;
   const persisting = localPhase?.phase === "persisting";
   const imageReady = autopilot.assetReadiness?.requestKey === stimulusKey
     && autopilot.assetReadiness.readiness === "ready";
@@ -128,7 +138,9 @@ export function PatientAutopilotStage({
     : persisting
       ? "录好了，正在保存"
     : listening
-      ? "正在听您说"
+      ? voiceInterrupted ? "正在听您说，请从头完整说一次" : "正在听您说"
+    : voiceInterrupted
+      ? "朗读已停止，看到「正在听您说」后从头回答"
     : answerNowKey === command.command_key
       ? "朗读已停止，正在准备麦克风"
     : runtime?.phase === "tts_playing"
@@ -167,7 +179,8 @@ export function PatientAutopilotStage({
         <div className="cue-slot">
           {listenFirstCue && (
             <p className="patient-optional-hint" data-cue="listen-first" style={{ margin: 0 }}>
-              请听完再回答
+              {voiceInterrupted ? "刚才的开头还没有录下，请稍候再完整说一次"
+                : voiceMonitoring ? "想回答时可以开口，或点「现在回答」" : "请听完再回答"}
             </p>
           )}
         </div>
@@ -175,7 +188,7 @@ export function PatientAutopilotStage({
       <div className="stage-mic" aria-live="polite">
         <p className="patient-status" role="status">{status}</p>
         {activated && imageReady && command.kind === "tts" && command.state === "started"
-          && answerNowKey !== command.command_key
+          && answerNowKey !== command.command_key && !voiceInterrupted
           && runtime?.phase === "tts_playing"
           && (purpose === "question" || purpose === "cue") && (
           <>
