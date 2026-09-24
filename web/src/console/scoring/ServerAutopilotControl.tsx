@@ -82,6 +82,13 @@ const AUTOPILOT_ERROR_HINTS: Record<string, string> = {
   autopilot_resume_position_unresumable: "人工接管期间答过的这一题，AI 不能接着弹；请人工完成这一题后再切回。",
   autopilot_scope_completed: "本场可自动带练的题目已全部练完或裁定完毕；请直接进入场次收尾。",
   autopilot_revision_conflict: "服务器状态已更新，请核对当前题目与环节后重新操作。",
+  autopilot_activation_requires_pause: "请先暂停本场，等待老人端收麦后再继续。",
+  autopilot_activation_processing: "本场上一段回答尚未完成安全暂停，请等待后台处理停止后再继续。",
+  autopilot_activation_bedside_busy: "另一场训练还未安全停止。请先暂停当前床旁场次，等待收麦和回答处理结束，再回到这里继续。",
+  autopilot_takeover_drain_required: "还没有收到老人端停止播放、关闭麦克风的回执，请保持平板在线，收麦完成后再继续。",
+  autopilot_patient_microphone_active: "当前床旁麦克风仍可能在录音，请先完成收麦再继续。",
+  autopilot_device_not_paired: "本场已切回并保持暂停。请在老人端重新连接这场训练，确认配对后再点「继续 AI 自动带练」。",
+  autopilot_device_not_active: "老人端的连接已失效，请重新连接这场训练，确认配对后再继续。",
 };
 function autopilotErrorHint(code: string): string {
   return AUTOPILOT_ERROR_HINTS[code] ?? `错误码：${code}`;
@@ -107,6 +114,13 @@ const RESUME_PREWRITE_CODES = new Set([
   "autopilot_resume_position_unresumable",
   "autopilot_scope_completed",
   "autopilot_revision_conflict",
+  "autopilot_activation_requires_pause",
+  "autopilot_activation_processing",
+  "autopilot_activation_bedside_busy",
+  "autopilot_takeover_drain_required",
+  "autopilot_patient_microphone_active",
+  "autopilot_device_not_paired",
+  "autopilot_device_not_active",
 ]);
 
 const ADJUDICATION_REASON_LABELS: Record<AutopilotAdjudicationReason, string> = {
@@ -525,6 +539,15 @@ export function ServerAutopilotControl({
       acceptReceipt(latest);
       if (!receiptAllowsAutopilotResume(latest)) return;
       try {
+        // A paused automatic session can have yielded the shared bedside slot.
+        // This explicit action restores only its paused server-owned identity;
+        // it cannot displace a running session or manufacture device pairing.
+        if (latest.mode === "autonomous") {
+          const activated = await api.activateAutopilotSession(
+            session.session_id, latest.stateRevision,
+          );
+          acceptReceipt(activated);
+        }
         const next = await api.resumeAutopilot(
           session.session_id,
           latest.stateRevision,

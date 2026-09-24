@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import (audio_store, autopilot_service, export, export_security,
+from app import (audio_store, autopilot_service, content, export, export_security,
                  repeat_intent)
 from app.enums import AudioStatus
 from app.export import DIRECT_IDENTIFIER_COLUMNS, mask_text, pseudonymize
@@ -183,6 +183,27 @@ def test_pseudonym_is_stable_and_not_raw_id():
     assert "P77" not in pseudonym
     assert re.fullmatch(r"SUBJ-v1-test-2026-[0-9a-f]{20}", pseudonym)
     assert pseudonym != pseudonymize("P78")
+
+
+@pytest.mark.parametrize("binding_valid", [True, False])
+def test_export_projects_legacy_manual_numbers_only_from_verified_frozen_bank(
+        db, tmp_path, binding_valid):
+    _seed(db)
+    sess = db.get(TrainSession, "S9")
+    bank = content.load_item_bank_for_week(2)
+    sess.item_bank_definition_digest = (
+        content.item_bank_definition_digest(bank) if binding_valid else "0" * 64)
+    db.add(sess)
+    db.commit()
+    result = _export_bundle(db, "S9", write_dir=tmp_path)
+    single = next(row for row in result["sheets"]["turns"] if row["item_id"] == "SE_锚")
+    assert single["presentation_order"] == (3 if binding_valid else None)
+    if binding_valid:
+        orders = [row["presentation_order"] for row in result["sheets"]["turns"]]
+        assert orders == sorted(orders)
+    # Projection is not a migration: historic evidence and existing exports stay immutable.
+    db.expire_all()
+    assert all(row.presentation_order is None for row in db.exec(select(ItemEvent)))
 
 
 def test_export_ledger_migration_roundtrip_includes_staging_lease(tmp_path):

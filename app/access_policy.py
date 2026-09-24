@@ -185,6 +185,8 @@ _ROUTE_RULES = (
     # 恢复=重新开启老人端出题与录音,只允许具名研究者/管理员;照护员不在内。
     _route({"POST"}, r"/sessions/[^/]+/autopilot/resume", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="恢复自动驾驶"),
+    _route({"POST"}, r"/sessions/[^/]+/autopilot/activate", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="切回已安全暂停的自动训练"),
     # 现场裁定=替 AI 结论一题并继续,与恢复同一角色集(具名研究者/管理员)。
     _route({"POST"}, r"/sessions/[^/]+/autopilot/adjudicate", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="裁定自动带练题位"),

@@ -31,7 +31,7 @@ from sqlmodel import select
 from . import (audio_gate, audio_store, autopilot_plan_profiles, autopilot_ledger,
                evidence_ledger, export_security,
                repeat_evidence,
-               governance_lock, scoring)
+               governance_lock, item_numbering, scoring)
 from .enums import AudioStatus
 from .models import (
     AbnormalEvent, AttemptCaptureProcessing, AttemptEvent, AudioAssetRow,
@@ -1242,6 +1242,12 @@ def export_session_bundle(
     # 按冻结计划位置出行,不按 item_id 字典序:核对方案时靠的就是这个序号(收据 260)。
     items = list(db.exec(select(ItemEvent).where(ItemEvent.session_id == session_id)
                          .order_by(ItemEvent.presentation_order, ItemEvent.id)))
+    historical_plan = (item_numbering.historical_items(sess)
+                       if any(item.presentation_order is None for item in items) else {})
+    item_orders = {
+        item.id: item_numbering.presentation_order(item, historical_plan) for item in items}
+    items.sort(key=lambda item: (
+        item_orders[item.id] is None, item_orders[item.id] or 0, item.id or 0))
     adjudications = list(db.exec(select(AutopilotPositionAdjudication).where(
         AutopilotPositionAdjudication.session_id == session_id
     ).order_by(AutopilotPositionAdjudication.id)))
@@ -1315,7 +1321,7 @@ def export_session_bundle(
             adjudicated = adjudication_by_position.get((it.item_id, t.turn_seq))
             turn_sheet.append({
                 **session_cols(), "item_id": it.item_id,
-                "presentation_order": it.presentation_order,
+                "presentation_order": item_orders[it.id],
                 "task_type": _v(it.task_type), "turn_seq": t.turn_seq,
                 # 研究者现场裁定(答对/到此为止),与 AI 判类并列;研究真值仍看 reviewed_score。
                 "adjudication_kind": adjudicated.kind if adjudicated else None,

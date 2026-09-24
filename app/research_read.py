@@ -36,7 +36,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import and_, or_
 from sqlmodel import Session as DBSession, select
 
-from . import export_security, research_dataset, session_admission
+from . import export_security, item_numbering, research_dataset, session_admission
 from .models import (
     AttemptEvent,
     AutopilotPositionAdjudication,
@@ -498,6 +498,7 @@ def list_turns(db: DBSession, *, config, data_classification: str,
 
     rows: list[dict[str, Any]] = []
     last_key: list[Any] | None = None
+    historical_plans: dict[str, dict] = {}
     for turn, item, sess in page:
         subject_code = export_security.pseudonymize_subject(
             sess.patient_id, config)
@@ -515,10 +516,14 @@ def list_turns(db: DBSession, *, config, data_classification: str,
                 "withdrawn": True,
             }))
         else:
+            if item.presentation_order is None and sess.session_id not in historical_plans:
+                historical_plans[sess.session_id] = item_numbering.historical_items(sess)
             rows.append(_turn_row(
                 session_code, subject_code, item, turn,
                 attempt_seq.get(turn.source_attempt_id),
-                adjudications.get((sess.session_id, item.item_id, turn.turn_seq))))
+                adjudications.get((sess.session_id, item.item_id, turn.turn_seq)),
+                presentation_order=item_numbering.presentation_order(
+                    item, historical_plans.get(sess.session_id, {}))))
         last_key = [sess.session_id, item.item_id, turn.turn_seq]
 
     next_cursor = (encode_cursor(last_key, config, "turns")
@@ -773,14 +778,15 @@ def list_questionnaire_item_values(db: DBSession, *, config,
 def _turn_row(session_code: str, subject_code: str,
               item: ItemEvent, turn: TurnEvent,
               source_attempt_seq: int | None,
-              adjudication: AutopilotPositionAdjudication | None = None) -> dict[str, Any]:
+              adjudication: AutopilotPositionAdjudication | None = None,
+              *, presentation_order: int | None = None) -> dict[str, Any]:
     diff = (None if turn.reviewed_score is None or turn.ai_score is None
             else round(turn.reviewed_score - turn.ai_score, 4))
     return {
         "session_code": session_code,
         "subject_code": subject_code,
         "item_id": item.item_id,
-        "presentation_order": item.presentation_order,
+        "presentation_order": presentation_order,
         "task_type": getattr(item.task_type, "value", item.task_type),
         "turn_seq": turn.turn_seq,
         "response_role": getattr(turn.response_role, "value", turn.response_role),

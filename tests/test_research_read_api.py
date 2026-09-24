@@ -1485,3 +1485,50 @@ def test_adjudications_dataset_shows_skipped_positions_pseudonymously_with_tombs
     # 环节表里没有这个题位:跳过不伪造环节行。
     turns = client.get("/research/v1/turns?data_classification=research").json()["rows"]
     assert all(row["item_id"] != "SE_熨斗" for row in turns)
+
+
+@pytest.mark.parametrize("binding_valid", [True, False])
+def test_live_research_projection_recovers_legacy_manual_number_without_mutation(
+        research_env, binding_valid):
+    with Session(research_env) as session:
+        item = session.exec(select(ItemEvent).where(ItemEvent.session_id == "S-REAL-1")).one()
+        item.presentation_order = None
+        session.add(item)
+        if not binding_valid:
+            sess = session.get(TrainSession, "S-REAL-1")
+            sess.item_bank_definition_digest = "0" * 64
+            session.add(sess)
+        session.commit()
+        result = research_read.list_turns(
+            session, config=CONFIG, data_classification="research", cursor=None, limit=100,
+            binding=_LiveSnapshotBinding(("S-REAL-1",)))
+        assert result["rows"][0]["presentation_order"] == (1 if binding_valid else None)
+        session.expire_all()
+        assert session.get(ItemEvent, item.id).presentation_order is None
+
+
+def test_frozen_missing_numbers_are_not_rewritten_after_content_becomes_available(
+        research_env, monkeypatch):
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        item = session.exec(select(ItemEvent).where(ItemEvent.session_id == "S-REAL-1")).one()
+        item.presentation_order = None
+        session.add(item)
+        sess = session.get(TrainSession, "S-REAL-1")
+        sess.item_bank_definition_digest = "0" * 64
+        session.add(sess)
+        session.commit()
+    _freeze_epoch(research_env, "S-REAL-1")
+    client = _client("steward")
+    path = "/research/v1/turns?data_classification=research"
+    before = client.get(path)
+    assert before.status_code == 200
+    assert before.json()["rows"][0]["presentation_order"] is None
+    with Session(research_env) as session:
+        sess = session.get(TrainSession, "S-REAL-1")
+        sess.item_bank_definition_digest = BANK_DIGEST
+        session.add(sess)
+        session.commit()
+    assert client.get(path).content == before.content
+    _freeze_epoch(research_env, "S-REAL-1")
+    assert client.get(path).json()["rows"][0]["presentation_order"] == 1

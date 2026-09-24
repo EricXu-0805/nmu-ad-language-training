@@ -18,10 +18,12 @@ import { parseAccountSessionPlan } from "./sessionPlan.ts";
 import { ApiError, apiNetworkError, decodeJsonApiResponse } from "./apiResponse";
 import {
   createDeviceCapabilityStore,
+  parseDevicePairResponse,
   type DeviceCapabilityRecord,
 } from "./security/deviceCapability";
 import {
   createPatientBindingStore,
+  parsePatientBindingRecord,
   type PatientBindingRecord,
 } from "./security/patientBinding";
 import {
@@ -172,9 +174,15 @@ export const PATIENT_BINDING_UPDATED_EVENT = "nmu:patient-binding-updated";
 // 受试者绑定长期存 localStorage(它只能换本人场次能力,不是路由凭据);
 // 短时场次能力仍只在 sessionStorage,老规则不变。
 const patientBindingStore = createPatientBindingStore(localStorage);
+// Manual pairing supersedes automatic attach, including responses already in
+// flight. Keep the fence synchronous so repeated submits cannot rotate tokens
+// twice before React renders its disabled button.
+let pairingGeneration = 0;
+let pairingPending = false;
 export const getPatientBinding = (): PatientBindingRecord | null =>
   patientBindingStore.get();
 export const clearPatientBinding = (): void => {
+  pairingGeneration += 1;
   patientBindingStore.clear();
   queueMicrotask(() => window.dispatchEvent(new Event(PATIENT_BINDING_UPDATED_EVENT)));
 };
@@ -187,6 +195,7 @@ export const removeRecoveryDeviceCapabilityIfMatches = (record: DeviceCapability
   // blank, stop, or re-pair the currently active patient UI.
   deviceStore.removeRecoveryIfMatches(record);
 export const clearDeviceCapability = (): void => {
+  pairingGeneration += 1;
   deviceStore.clear();
   queueMicrotask(() => window.dispatchEvent(new Event(DEVICE_CAPABILITY_UPDATED_EVENT)));
 };
@@ -298,38 +307,9 @@ export function handleDeviceAuthorizationFailure(
 }
 
 async function pairDevice(pin: string): Promise<DeviceCapabilityRecord> {
-  const suppliedPin = pin.trim();
-  if (!suppliedPin) throw new ApiError(422, "请输入设备 PIN");
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS);
-  try {
-    const res = await fetch("/device/pair", {
-      method: "POST",
-      signal: controller.signal,
-      credentials: "omit",
-      cache: "no-store",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Console-Pin": suppliedPin,
-      },
-      body: JSON.stringify({ deviceId: deviceStore.getOrCreateDeviceId() }),
-    });
-    const text = await res.text();
-    const parsed = decodeJsonApiResponse({
-      status: res.status,
-      ok: res.ok,
-      statusText: res.statusText,
-      text,
-    });
-    const record = deviceStore.save(parsed);
-    queueMicrotask(() => window.dispatchEvent(new Event(DEVICE_CAPABILITY_UPDATED_EVENT)));
-    return record;
-  } catch (error) {
-    if (controller.signal.aborted) throw new ApiError(408, "设备配对超时，请检查连接后重试");
-    throw apiNetworkError(error);
-  } finally {
-    window.clearTimeout(timeout);
-  }
+  const result = await requestDevicePair(pin, false);
+  if (result.kind !== "session") throw new ApiError(502, "服务器配对响应缺少场次凭据");
+  return result.record;
 }
 
 // 配对响应的宽形状:全局 PIN 只回场次能力三元组;受试者配对码额外带 binding,
@@ -339,8 +319,71 @@ export type PairWithCodeResult =
   | { kind: "binding" };
 
 async function pairDeviceWithCode(pin: string): Promise<PairWithCodeResult> {
+  return requestDevicePair(pin, true);
+}
+
+function samePatientBinding(left: PatientBindingRecord | null, right: PatientBindingRecord | null): boolean {
+  return left?.binding === right?.binding && left?.deviceId === right?.deviceId;
+}
+
+function sameDeviceCapability(left: DeviceCapabilityRecord | null, right: DeviceCapabilityRecord | null): boolean {
+  return left?.capability === right?.capability && left?.sessionId === right?.sessionId
+    && left?.expiresAt === right?.expiresAt;
+}
+
+function savePairingResponse(value: unknown, deviceId: string, allowBinding: boolean): PairWithCodeResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(502, "服务器配对响应格式错误");
+  }
+  const parsed = value as Record<string, unknown>;
+  // Validate the complete response before changing either credential store.
+  const binding = parsed.binding === undefined ? null
+    : parsePatientBindingRecord({ binding: parsed.binding, deviceId });
+  const record = parsed.capability === undefined ? null : parseDevicePairResponse({
+    capability: parsed.capability, sessionId: parsed.sessionId, expiresAt: parsed.expiresAt,
+  });
+  if ((!record && !binding) || (!allowBinding && !record)) {
+    throw new ApiError(502, "服务器配对响应缺少凭据");
+  }
+  const previousBinding = patientBindingStore.get();
+  const previousActive = deviceStore.get();
+  // Old exact audio receipts still need their original session credential.
+  // Switching people must not delete that recovery path or their persisted audio.
+  if (previousActive && record && previousActive.sessionId !== record.sessionId) {
+    deviceStore.retainForRecovery(previousActive);
+  }
+  try {
+    if (binding) patientBindingStore.save(binding);
+    else {
+      // A one-session code replaces the old person's automatic-follow binding.
+      patientBindingStore.clear();
+      if (patientBindingStore.get()) throw new Error("本机无法更新受试者绑定");
+    }
+    if (record) deviceStore.save(record);
+    else if (previousActive) deviceStore.demoteIfMatches(previousActive);
+  } catch (error) {
+    // Capability writes/demotion are themselves transactional. Restore the
+    // companion binding as well if storage is unavailable midway through pairing.
+    try {
+      if (previousBinding) patientBindingStore.save(previousBinding);
+      else patientBindingStore.clear();
+    } catch { /* original storage failure remains visible to the caller */ }
+    throw error;
+  }
+  queueMicrotask(() => {
+    window.dispatchEvent(new Event(DEVICE_CAPABILITY_UPDATED_EVENT));
+    window.dispatchEvent(new Event(PATIENT_BINDING_UPDATED_EVENT));
+  });
+  return record ? { kind: "session", record } : { kind: "binding" };
+}
+
+async function requestDevicePair(pin: string, allowBinding: boolean): Promise<PairWithCodeResult> {
   const suppliedPin = pin.trim();
   if (!suppliedPin) throw new ApiError(422, "请输入配对码");
+  if (pairingPending) throw new ApiError(409, "正在配对，请稍候");
+  pairingPending = true;
+  const generation = ++pairingGeneration;
+  const bindingAtStart = patientBindingStore.get();
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS);
   try {
@@ -362,31 +405,17 @@ async function pairDeviceWithCode(pin: string): Promise<PairWithCodeResult> {
       ok: res.ok,
       statusText: res.statusText,
       text,
-    }) as Record<string, unknown>;
-    const binding = parsed.binding;
-    const bindingSaved = typeof binding === "string";
-    if (bindingSaved) {
-      patientBindingStore.save({ binding, deviceId });
+    });
+    if (controller.signal.aborted) throw new ApiError(408, "设备配对超时，请检查连接后重试");
+    if (generation !== pairingGeneration || !samePatientBinding(bindingAtStart, patientBindingStore.get())) {
+      throw new ApiError(409, "配对状态已改变，请重新输入配对码");
     }
-    if (parsed.capability !== undefined) {
-      const record = deviceStore.save({
-        capability: parsed.capability,
-        sessionId: parsed.sessionId,
-        expiresAt: parsed.expiresAt,
-      });
-      queueMicrotask(() => {
-        window.dispatchEvent(new Event(DEVICE_CAPABILITY_UPDATED_EVENT));
-        if (bindingSaved) window.dispatchEvent(new Event(PATIENT_BINDING_UPDATED_EVENT));
-      });
-      return { kind: "session", record };
-    }
-    if (!bindingSaved) throw new ApiError(502, "服务器配对响应缺少凭据");
-    queueMicrotask(() => window.dispatchEvent(new Event(PATIENT_BINDING_UPDATED_EVENT)));
-    return { kind: "binding" };
+    return savePairingResponse(parsed, deviceId, allowBinding);
   } catch (error) {
     if (controller.signal.aborted) throw new ApiError(408, "设备配对超时，请检查连接后重试");
     throw apiNetworkError(error);
   } finally {
+    pairingPending = false;
     window.clearTimeout(timeout);
   }
 }
@@ -401,8 +430,11 @@ export interface AttachResult {
 }
 
 async function attachPatientDevice(): Promise<AttachResult> {
+  if (pairingPending) return { disposition: "quiet_retry", hint: null };
   const bindingRecord = patientBindingStore.get();
   if (!bindingRecord) return { disposition: "drop_binding", hint: null };
+  const generation = pairingGeneration;
+  const activeAtStart = deviceStore.get();
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), ATTACH_REQUEST_TIMEOUT_MS);
   try {
@@ -418,6 +450,11 @@ async function attachPatientDevice(): Promise<AttachResult> {
       }),
     });
     const text = await res.text();
+    if (controller.signal.aborted || pairingPending || generation !== pairingGeneration
+      || !samePatientBinding(bindingRecord, patientBindingStore.get())
+      || !sameDeviceCapability(activeAtStart, deviceStore.get())) {
+      return { disposition: "quiet_retry", hint: null };
+    }
     const code = errorCodeFromText(text);
     const disposition = classifyAttachOutcome(res.status, code);
     const hint = attachHintFor(res.status, code);
@@ -939,6 +976,15 @@ export const api = {
       "POST",
       `/sessions/${encodeURIComponent(sid)}/autopilot/resume`,
       buildAutopilotResumeRequest(sid, stateRevision),
+    )),
+  activateAutopilotSession: async (
+    sid: string,
+    stateRevision: number,
+  ): Promise<AutopilotStartReceipt> =>
+    parseAutopilotStatusReceipt(await req<unknown>(
+      "POST",
+      `/sessions/${encodeURIComponent(sid)}/autopilot/activate`,
+      { expected_revision: stateRevision },
     )),
   // 研究者裁定:服务端落一条可归因的追加记录并在同一事务里推进到下一题,
   // 回执与 resume 同形;AI 的判定原样保留。

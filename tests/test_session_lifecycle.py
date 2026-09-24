@@ -81,7 +81,7 @@ def _one_turn_plan() -> SessionPlan:
             item_id="SE_锚",
             task_type="单要素",
             image_id=None,
-            presentation_order=1,
+            presentation_order=3,
             turns=(PlanTurn(1, "命名"),),
         ),),
     )
@@ -90,7 +90,7 @@ def _one_turn_plan() -> SessionPlan:
 def _unlocked_authoritative_turn(
         client: TestClient, raw_audio_id: str = "life-operational-audio") -> tuple[int, int]:
     item = client.post("/sessions/S-LIFE/items", json={
-        "item_id": "SE_锚", "task_type": "单要素", "presentation_order": 1,
+        "item_id": "SE_锚", "task_type": "单要素", "presentation_order": 3,
     })
     assert item.status_code == 200, item.text
     with Session(client.test_engine) as db_session:
@@ -209,7 +209,7 @@ def test_locked_truth_without_bound_audio_cannot_complete(monkeypatch):
         monkeypatch.setattr("app.main._session_plan_for_runtime",
                             lambda _session: _one_turn_plan())
         item = client.post("/sessions/S-LIFE/items", json={
-            "item_id": "SE_锚", "task_type": "单要素", "presentation_order": 1,
+            "item_id": "SE_锚", "task_type": "单要素", "presentation_order": 3,
         }).json()
         # 模拟迁移前遗留/篡改行；正常 API 已不允许建立这种无 source attempt 的 Turn。
         with Session(_engine) as db_session:
@@ -285,7 +285,7 @@ def test_research_truth_cannot_be_locked_without_server_audio_bytes(monkeypatch)
         monkeypatch.setattr("app.main._session_plan_for_runtime",
                             lambda _session: _one_turn_plan())
         item = client.post("/sessions/S-LIFE/items", json={
-            "item_id": "SE_锚", "task_type": "单要素", "presentation_order": 1,
+            "item_id": "SE_锚", "task_type": "单要素", "presentation_order": 3,
         }).json()
         raw_audio_id = "missing-review-audio-bytes"
         assert client.post("/audio", json={

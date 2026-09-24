@@ -44,7 +44,7 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                cloud_processing, content, db, export_security, governance_lock,
                device_capability, evidence_ledger, export, http_security, judging,
                ai_quality_service, llm_judge, rapport_reply, rule_judge,
-               runtime, scoring,
+               runtime, scoring, item_numbering,
                session_completion,
                resource_limits, patient_asset, patient_pairing,
                patient_presentation,
@@ -9835,6 +9835,14 @@ class AutopilotResumeIn(BaseModel):
     expected_revision: int = PydanticField(ge=0)
 
 
+class AutopilotActivateIn(BaseModel):
+    """Explicitly restore a paused server-owned session to the bedside slot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = PydanticField(ge=0, strict=True)
+
+
 def _autopilot_write_failure(
         s: DBSession, exc: autopilot_service.AutopilotServiceError) -> NoReturn:
     """领域错误永远先回滚，再暴露稳定机器码，不泄露库内细节。"""
@@ -10121,6 +10129,143 @@ def autopilot_takeover(
             _autopilot_write_failure(s, exc)
         except IntegrityError as exc:
             _autopilot_integrity_conflict(s, exc)
+    return result
+
+
+@app.post(
+    "/sessions/{session_id}/autopilot/activate",
+    response_model=autopilot_service.AutopilotStatusReceipt,
+)
+def autopilot_activate(
+        session_id: str, body: AutopilotActivateIn, request: Request,
+        s: DBSession = Depends(get_session)):
+    """Restore only a proven stopped automatic session, without resuming it.
+
+    A stale manual handshake must remain forbidden. This named action restores
+    the frozen server-side identity and paused projection only. Device pairing
+    and the existing resume gates still authorize any later media or provider IO.
+    """
+    _require_account_identity(
+        request, "切回已暂停的自动训练", roles={"researcher", "admin"},
+        allow_local_m0=True)
+    patient_id = _preauthorize_session_subject_fence(
+        request, session_id, s, "切回已暂停的自动训练")
+    with (governance_lock.subject_fence(s, patient_id),
+          _LIVE_WRITE_LOCK, device_capability.serialized_mutation()):
+        # Preauthorization reset the read transaction. SQLite ignores FOR UPDATE;
+        # acquire its writer fence before reading either session's authority.
+        governance_lock.begin_sqlite_write_fence(s)
+        sess = s.exec(select(TrainSession).where(
+            TrainSession.session_id == session_id,
+        ).with_for_update()).first()
+        if sess is None:
+            raise HTTPException(404, "场次不存在")
+        _require_session_operator(
+            request, sess, s, "切回已暂停的自动训练", mutation=True)
+        _require_started_visit_plan_session(session_id, s, sess=sess)
+        live = _live_row_for_update(s)
+        state = s.exec(select(SessionAutopilotState).where(
+            SessionAutopilotState.session_id == session_id,
+        ).with_for_update()).first()
+        runtime = _runtime_row_for_update(session_id, s)
+        try:
+            if (state is None or state.scope_key != autopilot_service.P0A_SCOPE_KEY
+                    or state.mode != "autonomous" or state.status != "paused"
+                    or runtime.status != "paused"
+                    or state.current_command_id is not None
+                    or state.lease_owner is not None
+                    or any((runtime.intervention_completed_at,
+                            runtime.completed_at, runtime.aborted_at))):
+                raise autopilot_service.AutopilotServiceError(
+                    "autopilot_activation_requires_pause",
+                    "只能切回已安全暂停的自动训练；请先暂停并等待老人端收麦")
+            if state.revision != body.expected_revision:
+                raise autopilot_service.AutopilotServiceError(
+                    "autopilot_revision_conflict", "自动驾驶状态 revision 已变化")
+            autopilot_service._safe_takeover_proof(s, state=state)
+            for model in (AttemptCaptureProcessing, AttemptEvent):
+                if s.exec(select(model).where(
+                        model.session_id == session_id,
+                        model.processing_owner.is_not(None),
+                )).first() is not None:
+                    raise autopilot_service.AutopilotServiceError(
+                        "autopilot_activation_processing",
+                        "本场仍有回答持有处理租约，请先完成安全暂停")
+            _ensure_recording_allowed_for_session(
+                session_id, s, is_simulation=sess.is_simulation)
+            previous_session_id = _live_session_id(live)
+            if previous_session_id == session_id:
+                result = autopilot_service.get_autopilot_status(s, session_id=session_id)
+                s.commit()
+                return result
+            if previous_session_id:
+                previous = s.get(TrainSession, previous_session_id)
+                if previous is None:
+                    raise autopilot_service.AutopilotServiceError(
+                        "autopilot_activation_bedside_busy", "当前床旁场次无法核验，请先处理当前场次")
+                previous_control = s.exec(select(SessionAutopilotState).where(
+                    SessionAutopilotState.session_id == previous_session_id,
+                ).with_for_update()).first()
+                previous_runtime = _runtime_row_for_update(previous_session_id, s)
+                if previous_runtime.status not in _TERMINAL_RUNTIME_STATUSES:
+                    _require_session_operator(
+                        request, previous, s, "切换当前床旁场次", mutation=True,
+                        allow_withdrawn_safety_exit=True)
+                if previous_runtime.status not in {
+                        "paused", "intervention_completed", *_TERMINAL_RUNTIME_STATUSES}:
+                    raise autopilot_service.AutopilotServiceError(
+                        "autopilot_activation_bedside_busy",
+                        "另一场训练仍在进行，请先暂停当前场次并等待老人端收麦，再切回本场")
+                _ensure_patient_capture_idle_for_autopilot(live)
+                if previous_control is not None and previous_control.mode == "autonomous":
+                    try:
+                        if (previous_control.current_command_id is not None
+                                or previous_control.lease_owner is not None):
+                            raise autopilot_service.AutopilotServiceError(
+                                "autopilot_activation_bedside_busy", "当前场次仍持有执行租约")
+                        autopilot_service._safe_takeover_proof(s, state=previous_control)
+                    except autopilot_service.AutopilotServiceError as exc:
+                        raise autopilot_service.AutopilotServiceError(
+                            "autopilot_activation_bedside_busy",
+                            "当前床旁场次尚未完成安全收口，请先等待老人端收麦") from exc
+                for model in (AttemptCaptureProcessing, AttemptEvent):
+                    if s.exec(select(model).where(
+                            model.session_id == previous_session_id,
+                            model.processing_owner.is_not(None),
+                    )).first() is not None:
+                        raise autopilot_service.AutopilotServiceError(
+                            "autopilot_activation_bedside_busy",
+                            "当前床旁场次仍有回答正在处理，请先完成安全暂停")
+            if live is None:
+                live = LiveState(id=1)
+            _prime_live_wseq_from_runtime(live, runtime)
+            live.session_json = _json.dumps({
+                "sessionId": session_id, "weekNo": sess.week_no,
+                "eventLine": sess.event_line, "mode": "task",
+                "itemBankVersionId": sess.item_bank_version_id, "paused": True,
+                "wseq": _allocate_live_wseq(live),
+            }, ensure_ascii=False)
+            live.audio_json = None
+            live.patient_rec_json = None
+            live.patient_ack_session_id = None
+            live.patient_current_screen = None
+            live.patient_last_seen_at = None
+            live.patient_ack_seq = None
+            _restore_runtime_to_live(live, runtime)
+            device_capability.mark_session_recovery_only(s, previous_session_id)
+            live.seq += 1
+            live.updated_at = datetime.now()
+            s.add(live)
+            s.add(runtime)
+            result = autopilot_service.get_autopilot_status(s, session_id=session_id)
+            s.commit()
+        except autopilot_service.AutopilotServiceError as exc:
+            _autopilot_write_failure(s, exc)
+        except IntegrityError as exc:
+            _autopilot_integrity_conflict(s, exc)
+    _audit(s, request, "autopilot_paused_session_activate",
+           f"from={previous_session_id or 'none'};to={session_id};paused=true",
+           session_id=session_id)
     return result
 
 
@@ -10994,7 +11139,19 @@ def create_item(session_id: str, body: ItemIn, request: Request,
             request, sess, s, "新建题目事件", mutation=True)
         _ensure_manual_plane_writable(session_id, s, "从旧操作端新建题目事件")
         _ensure_runtime_writable(session_id, s, "新建题目事件")
-        ie = ItemEvent(session_id=session_id, **body.model_dump())
+        values = body.model_dump()
+        if sess.week_no >= 2:
+            try:
+                planned = item_numbering.frozen_items(sess).get(body.item_id)
+            except item_numbering.FrozenNumberingUnavailable as exc:
+                raise HTTPException(409, "场次冻结计划无法核验，不能新建题目事件") from exc
+            if planned is None or body.task_type != planned.task_type:
+                raise HTTPException(409, "题目事件与场次冻结计划不一致")
+            if (body.presentation_order is not None
+                    and body.presentation_order != planned.presentation_order):
+                raise HTTPException(409, "题号与场次冻结计划不一致")
+            values["presentation_order"] = planned.presentation_order
+        ie = ItemEvent(session_id=session_id, **values)
         s.add(ie)
         try:
             s.commit()
