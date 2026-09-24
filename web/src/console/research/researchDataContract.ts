@@ -8,7 +8,10 @@
 // 行按列顺序投影成数组而不是保留对象：视图只能渲染 columns 里有的东西，
 // "屏幕上看到的" 与 "导出的 CSV" 在结构上不可能不一致。
 
-export const RESEARCH_DATASET_KEYS = ["subjects", "sessions", "turns", "adjudications"] as const;
+export const RESEARCH_DATASET_KEYS = [
+  "subjects", "sessions", "turns", "adjudications",
+  "questionnaire_records", "questionnaire_item_values",
+] as const;
 export type ResearchDatasetKey = typeof RESEARCH_DATASET_KEYS[number];
 export type ResearchDataClassification = "research" | "simulation";
 

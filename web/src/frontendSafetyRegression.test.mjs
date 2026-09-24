@@ -378,12 +378,18 @@ function presentationGapHarness() {
       section_key: '认识机器人', question_idx: 0, beat: 'ask', speaker: '机器人', text: '我们一起聊聊天', wseq: 10 },
   };
 }
-async function runActualRecorderStart(options) {
-  let starts = 0, authorizations = 0;
+async function runActualRecorderStart(options, hiddenAt = null) {
+  let starts = 0, prepares = 0, authorizations = 0, discards = 0;
   const ref = current => ({ current }), noop = () => {};
+  const document = { visibilityState: hiddenAt === 'initial' ? 'hidden' : 'visible' };
+  const pageForeground = ref(hiddenAt !== 'initial');
+  const hide = () => { document.visibilityState = 'hidden'; pageForeground.current = false; };
   const globals = {
+    document, pageForeground,
     latest: ref({ ...options, selfStartAllowed: false }), mountedRef: ref(true), deviceLease: ref(true), outboxReady: ref(true),
-    recRef: ref({ active: false, cancelPendingStart: noop, start: async () => { starts++; return true; }, discardActive: noop }),
+    recRef: ref({ active: false, cancelPendingStart: noop,
+      prepare: async () => { prepares++; if (hiddenAt === 'prepare') hide(); return true; },
+      startPrepared: async () => { starts++; return true; }, discardActive: () => { discards++; } }),
     savingRef: ref(false), pendingSave: ref(null), startingRef: ref(false), patientPauseDiscardRequested: ref(false),
     startGeneration: ref(0), activePermit: ref(null), startTimeout: ref(null), armedMeta: ref(null),
     activeKind: ref(null), consumedRemote: ref(null), recordingLimit: ref(null),
@@ -391,13 +397,14 @@ async function runActualRecorderStart(options) {
     reportStartFailure: () => assert.fail('unexpected recording failure'), classifyRecordingStartFailure: () => 'authorization',
     MIC_START_TIMEOUT_MS: 12000, MAX_RECORDING_MS: 300000,
     window: { setTimeout: () => 1 }, clearTimeout: noop, clearRecordingLimit: noop,
-    api: { recordingAuthorization: async () => { authorizations++; return { allowed: true, runtime_status: 'active', recording_wseq: options.commandSeq }; } },
+    api: { recordingAuthorization: async () => { authorizations++; if (hiddenAt === 'authorization') hide(); return { allowed: true, runtime_status: 'active', recording_wseq: options.commandSeq }; } },
     authorizesMicrophoneStart: value => value.allowed && value.runtime_status === 'active',
     persistRec: async () => ({}), postInactive: noop, bus: { post: noop }, stopAndSave: noop,
   };
+  globals.isForeground = executable(hookFunction('./patient/useVoxRecorder.ts', 'isForeground'), globals);
   globals.permitIsCurrent = executable(hookFunction('./patient/useVoxRecorder.ts', 'permitIsCurrent'), globals);
   await executable(hookFunction('./patient/useVoxRecorder.ts', 'launchStart'), globals)('remote');
-  return { starts, authorizations };
+  return { starts, prepares, authorizations, discards };
 }
 for (const speechFinished of [false, true]) test(`real presentation hook masks old wseq while ${speechFinished ? 'completed speech allows' : 'unfinished speech blocks'} a fast microphone authorization`, async () => {
   const h = presentationGapHarness();
@@ -413,6 +420,20 @@ for (const speechFinished of [false, true]) test(`real presentation hook masks o
   const result = await runActualRecorderStart(h.options());
   assert.equal(result.authorizations, speechFinished ? 1 : 0);
   assert.equal(result.starts, speechFinished ? 1 : 0, 'actual recorder launch may not beat unfinished TTS');
+  assert.equal(result.prepares, speechFinished ? 1 : 0);
+});
+
+for (const hiddenAt of ['initial', 'authorization', 'prepare']) test(`actual recorder callback refuses background start at ${hiddenAt}`, async () => {
+  const result = await runActualRecorderStart({
+    sessionId: 'SIM-REGRESSION', turnKey: 'rapport:认识机器人:0', recording: 'armed',
+    recSeq: 2, commandSeq: 11, connectionReady: true, suspended: false,
+    requireRecordingWseq: true,
+  }, hiddenAt);
+  assert.equal(result.starts, 0);
+  assert.equal(result.authorizations, hiddenAt === 'initial' ? 0 : 1);
+  assert.equal(result.prepares, hiddenAt === 'prepare' ? 1 : 0);
+  assert.equal(result.discards, hiddenAt === 'prepare' ? 1 : 0,
+    'a stream already prepared in the background must be physically discarded');
 });
 
 

@@ -128,6 +128,21 @@ export function closeoutFailureNeedsReconciliation(error: unknown): boolean {
   return status === 0 || status === 408 || status === 409 || status >= 500;
 }
 
+export function reconcileSessionCloseoutRequest(
+  request: SessionCloseoutSaveRequest,
+  record: SessionCloseoutRecord | null,
+): "confirmed" | "retry" | "conflict" {
+  if (record && record.revision > request.expected_revision
+    && sessionCloseoutDraftMatchesRecord({ ...request, note: request.note ?? "" }, record)) {
+    return "confirmed";
+  }
+  if ((!record && request.expected_revision === 0)
+    || (record && !record.locked && record.revision === request.expected_revision)) {
+    return "retry";
+  }
+  return "conflict";
+}
+
 export function hasStructuredCloseoutObservation(
   value: SessionCloseoutObservationFlags,
 ): boolean {

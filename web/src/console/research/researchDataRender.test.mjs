@@ -8,12 +8,14 @@ import { createServer } from "vite";
 // HTML 里到底有几个格子、格子里到底是什么。
 
 const COLUMNS = ["subject_code", "session_code", "item_id", "turn_seq", "ai_score"];
+const RELEASE = { epochSeq: 3, cohortRuleVersion: "cohort.v1", aggregatePayloadSha256: "a".repeat(64) };
 
 function page(overrides = {}) {
   return {
     schemaVersion: "research-read.v1",
     dataset: "turns",
     grain: "一行一次作答",
+    release: RELEASE,
     pseudonymVersion: "v1",
     pseudonymKeyId: "nmu-2026-01",
     columns: COLUMNS,
@@ -28,7 +30,7 @@ function page(overrides = {}) {
   };
 }
 
-async function render(props) {
+async function renderModule(modulePath, exportName, props) {
   const vite = await createServer({
     root: process.cwd(),
     appType: "custom",
@@ -36,18 +38,36 @@ async function render(props) {
     server: { middlewareMode: true },
   });
   try {
-    const { ResearchTable } = await vite.ssrLoadModule(
-      "/src/console/research/ResearchDataTable.tsx",
-    );
-    return renderToStaticMarkup(React.createElement(ResearchTable, {
-      page: page(), downloading: false,
-      onExportPage() {}, onExportDictionary() {},
-      canGoBack: false, onBack() {}, onNext() {}, pageNo: 1,
-      ...props,
-    }));
+    const module = await vite.ssrLoadModule(modulePath);
+    return renderToStaticMarkup(React.createElement(module[exportName], props));
   } finally {
     await vite.close();
   }
+}
+
+function render(props) {
+  return renderModule("/src/console/research/ResearchDataTable.tsx", "ResearchTable", {
+    page: page(), downloading: false,
+    onExportPage() {}, onExportDictionary() {},
+    canGoBack: false, onBack() {}, onNext() {}, pageNo: 1,
+    ...props,
+  });
+}
+
+function meta(overrides = {}) {
+  return {
+    configured: true, schemaVersion: "research-read.v1",
+    pseudonymVersion: "v1", pseudonymKeyId: "nmu-2026-01",
+    release: { ...RELEASE, bound: true, asOf: "2026-08-01T00:00:00Z",
+      frozenAt: "2026-08-02T00:00:00Z", frozenSessionCount: 12 },
+    note: "请核对当前页的假名密钥编号。", ...overrides,
+  };
+}
+
+function renderProvenance(props = {}) {
+  return renderModule("/src/console/research/ResearchDataProvenance.tsx", "ResearchDataProvenance", {
+    meta: meta(), page: page(), ...props,
+  });
 }
 
 test("渲染出来的表头逐字等于响应声明的列，一列不多一列不少", async () => {
@@ -112,4 +132,58 @@ test("正在导出时两个导出按钮都锁住，避免重复打服务端", as
   const buttons = [...markup.matchAll(/<button[^>]*>(?:正在导出…|导出数据字典 CSV)<\/button>/g)];
   assert.equal(buttons.length, 2);
   for (const button of buttons) assert.match(button[0], /disabled/);
+});
+
+test("当前页与概况版本一致时，才同时显示该版截止日和场次数", async () => {
+  const markup = await renderProvenance();
+  assert.match(markup, /当前页数据版本：第 3 版/);
+  assert.match(markup, /本版本包含 12 个场次，截止 2026-08-01T00:00:00Z/);
+  assert.match(markup, /aaaaaaaaaaaa/);
+});
+
+test("发布新版后，显示实际页版本和假名键，不沿用旧概况的截止日与场次数", async () => {
+  const markup = await renderProvenance({ page: page({
+    release: { ...RELEASE, epochSeq: 4, aggregatePayloadSha256: "b".repeat(64) },
+    schemaVersion: "research-read.v2", pseudonymVersion: "v2", pseudonymKeyId: "new-key",
+  }) });
+  assert.match(markup, /当前页数据版本：第 4 版/);
+  assert.match(markup, /bbbbbbbbbbbb/);
+  assert.match(markup, /research-read.v2/);
+  assert.match(markup, /new-key/);
+  for (const stale of ["第 3 版", "aaaaaaaaaaaa", "2026-08-01", "12 个场次", "nmu-2026-01"]) {
+    assert.ok(!markup.includes(stale), `不得沿用旧概况：${stale}`);
+  }
+  assert.match(markup, /截止日期与场次数尚未核对，暂不显示/);
+});
+
+test("纪元号相同但指纹或纳入规则不同时，也不能借用概况", async () => {
+  for (const changed of [
+    { aggregatePayloadSha256: "b".repeat(64) },
+    { cohortRuleVersion: "cohort.v2" },
+  ]) {
+    const markup = await renderProvenance({ page: page({ release: { ...RELEASE, ...changed } }) });
+    assert.match(markup, /截止日期与场次数尚未核对，暂不显示/);
+    assert.doesNotMatch(markup, /2026-08-01|12 个场次/);
+  }
+});
+
+test("概况还没有冻结版时，已成功读取的页面仍按自身版本显示", async () => {
+  const markup = await renderProvenance({ meta: meta({
+    release: { bound: false, code: "research_release_not_frozen", reason: "尚未发布" },
+  }) });
+  assert.match(markup, /当前页数据版本：第 3 版/);
+  assert.doesNotMatch(markup, /2026-08-01|12 个场次/);
+});
+
+test("模拟页明确未冻结，不能挂上真实研究概况中的版本、场次数或截止日", async () => {
+  const markup = await renderProvenance({ page: page({ release: null }) });
+  assert.match(markup, /当前页为模拟演练数据，没有冻结版本/);
+  assert.match(markup, /导出以下载时的数据为准/);
+  assert.doesNotMatch(markup, /第 3 版|数据指纹|2026-08-01|12 个场次/);
+});
+
+test("取数未成功时，不用接口概况冒充当前页版本", async () => {
+  const markup = await renderProvenance({ page: null });
+  assert.match(markup, /数据版本将在当前页读取成功后显示/);
+  assert.doesNotMatch(markup, /第 3 版|数据指纹|2026-08-01|12 个场次/);
 });

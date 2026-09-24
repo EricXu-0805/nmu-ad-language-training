@@ -6,6 +6,7 @@ import {
   buildSessionCloseoutRequest,
   closeoutFailureNeedsReconciliation,
   EMPTY_SESSION_CLOSEOUT_FLAGS,
+  reconcileSessionCloseoutRequest,
   SESSION_CLOSEOUT_NOTE_MAX_LENGTH,
   sessionCloseoutDraftFromRecord,
   sessionCloseoutDraftMatchesRecord,
@@ -56,10 +57,14 @@ export function SessionCloseoutPanel({
   const [draft, setDraft] = useState<SessionCloseoutDraft>(() => sessionCloseoutDraftFromRecord(closeout));
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
   const [saveFailure, setSaveFailure] = useState<string | null>(null);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [pendingRequest, setPendingRequest] = useState<SessionCloseoutSaveRequest | null>(null);
-  const [reconciliationState, setReconciliationState] = useState<"required" | "confirmed_missing" | null>(null);
+  const [reconciliationState, setReconciliationState] = useState<"required" | "confirmed_missing" | "conflict" | null>(null);
+  // A reconciliation read can update the parent's record before this promise
+  // settles. Never let that revision change silently erase the pending draft.
+  const preservePendingDraft = useRef(false);
   const saveIntentKey = useRef(newCloseoutIdempotencyKey());
   const locked = closeout?.locked === true;
   const effectiveBusy = busy || submitting || reconciling;
@@ -67,6 +72,7 @@ export function SessionCloseoutPanel({
   const dirty = !sessionCloseoutDraftMatchesRecord(draft, closeout);
 
   useEffect(() => {
+    if (preservePendingDraft.current) return;
     setDraft(sessionCloseoutDraftFromRecord(closeout));
     setValidationErrors([]);
     setSaveFailure(null);
@@ -92,6 +98,7 @@ export function SessionCloseoutPanel({
   function chooseObservation(status: SessionCloseoutReportStatus) {
     setValidationErrors([]);
     setSaveFailure(null);
+    setSaveNotice(null);
     setDraft((current) => status === "no_additional_observation"
       ? { ...current, report_status: status, note: "", ...EMPTY_SESSION_CLOSEOUT_FLAGS }
       : { ...current, report_status: status });
@@ -100,6 +107,7 @@ export function SessionCloseoutPanel({
   function setObservationFlag(key: keyof SessionCloseoutObservationFlags, checked: boolean) {
     setValidationErrors([]);
     setSaveFailure(null);
+    setSaveNotice(null);
     setDraft((current) => ({ ...current, [key]: checked }));
   }
 
@@ -114,6 +122,7 @@ export function SessionCloseoutPanel({
     }
     setValidationErrors([]);
     setSaveFailure(null);
+    setSaveNotice(null);
     setSubmitting(true);
     try {
       await onSave(result.value);
@@ -124,6 +133,7 @@ export function SessionCloseoutPanel({
         ? cause.message
         : "现场收尾尚未保存。";
       if (closeoutFailureNeedsReconciliation(cause)) {
+        preservePendingDraft.current = true;
         setPendingRequest(result.value);
         setReconciliationState("required");
         await reconcileAfterFailure(result.value, message);
@@ -140,15 +150,25 @@ export function SessionCloseoutPanel({
     setReconciling(true);
     try {
       const authoritative = await onReconcile();
-      if (authoritative) {
+      const resolution = reconcileSessionCloseoutRequest(request, authoritative);
+      if (resolution === "confirmed" && authoritative) {
+        preservePendingDraft.current = false;
+        setDraft(sessionCloseoutDraftFromRecord(authoritative));
         setPendingRequest(null);
         setReconciliationState(null);
-        setSaveFailure("服务器已找回保存结果，页面已按权威版本恢复。");
+        setSaveFailure(null);
+        setSaveNotice("已核对服务器记录，本次填写的内容已保存。");
+        saveIntentKey.current = newCloseoutIdempotencyKey();
         return;
       }
       setPendingRequest(request);
+      if (resolution === "conflict") {
+        setReconciliationState("conflict");
+        setSaveFailure("服务器记录已发生变化，不能确认本次内容已保存。草稿已保留，请先核对下方服务器记录，再选择如何继续。");
+        return;
+      }
       setReconciliationState("confirmed_missing");
-      setSaveFailure(`${reason}。服务器上还没有这份记录，请点「用原内容安全重试」。`);
+      setSaveFailure(`${reason}。服务器尚未确认本次修改，请点「用原内容安全重试」。`);
     } catch (cause) {
       setPendingRequest(request);
       setReconciliationState("required");
@@ -168,7 +188,9 @@ export function SessionCloseoutPanel({
     setSubmitting(true);
     setSaveFailure(null);
     try {
-      await onSave(pendingRequest);
+      const saved = await onSave(pendingRequest);
+      preservePendingDraft.current = false;
+      setDraft(sessionCloseoutDraftFromRecord(saved));
       setPendingRequest(null);
       setReconciliationState(null);
       saveIntentKey.current = newCloseoutIdempotencyKey();
@@ -178,6 +200,18 @@ export function SessionCloseoutPanel({
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function resolveConflict(keepDraft: boolean) {
+    if (effectiveBusy || reconciliationState !== "conflict") return;
+    if (keepDraft && (!closeout || locked)) return;
+    preservePendingDraft.current = false;
+    if (!keepDraft) setDraft(sessionCloseoutDraftFromRecord(closeout));
+    setPendingRequest(null);
+    setReconciliationState(null);
+    setSaveFailure(null);
+    setSaveNotice(keepDraft ? "草稿已保留，请核对后重新保存。" : "已采用服务器记录。");
+    saveIntentKey.current = newCloseoutIdempotencyKey();
   }
 
   return (
@@ -201,9 +235,25 @@ export function SessionCloseoutPanel({
             ? <Button disabled={effectiveBusy} onClick={() => { void reconcileNow(); }}>核对服务器记录</Button>
             : reconciliationState === "confirmed_missing"
               ? <Button disabled={effectiveBusy} onClick={() => { void retryExactRequest(); }}>用原内容安全重试</Button>
+              : reconciliationState === "conflict"
+                ? <>
+                  <Button disabled={effectiveBusy} onClick={() => resolveConflict(false)}>采用服务器记录</Button>
+                  {closeout && !locked && <Button disabled={effectiveBusy} onClick={() => resolveConflict(true)}>保留草稿继续编辑</Button>}
+                </>
               : undefined}>
           {error ?? saveFailure}
         </Alert>
+      )}
+      {saveNotice && <Alert tone="info" title="现场收尾核对结果">{saveNotice}</Alert>}
+      {reconciliationState === "conflict" && (
+        <div className="card col">
+          <strong>本次尚未确认保存的草稿</strong>
+          <p>{draft.report_status === "no_additional_observation" ? "无额外观察" : "已记录观察"}</p>
+          <ul>{OBSERVATION_OPTIONS.filter((option) => draft[option.key]).map((option) => <li key={option.key}>{option.label}</li>)}</ul>
+          {draft.note && <p style={{ whiteSpace: "pre-wrap" }}>{draft.note}</p>}
+          <strong>服务器当前记录{closeout ? `（版本 ${closeout.revision}）` : "：未找到"}</strong>
+          {closeout && <ReadOnlyCloseout closeout={closeout} />}
+        </div>
       )}
       {validationErrors.length > 0 && (
         <Alert tone="warn" title="请完成现场观察确认">
@@ -254,6 +304,7 @@ export function SessionCloseoutPanel({
                   onChange={(event) => {
                     setValidationErrors([]);
                     setSaveFailure(null);
+                    setSaveNotice(null);
                     setDraft((current) => ({ ...current, note: event.target.value }));
                   }} />
                 <span className="field__hint" id={noteHintId}>
