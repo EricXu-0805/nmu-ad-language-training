@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { ImagePane } from "../components/ImagePane.tsx";
 import { Centered } from "./Centered.tsx";
 import { capturePhaseMatches } from "./autopilotCapturePresentation.ts";
@@ -23,6 +23,7 @@ export function PatientAutopilotStage({
   externallyPaused: boolean;
 }) {
   const displayRef = useRef<ExactAutopilotDisplayText | null>(null);
+  const [answerNowKey, setAnswerNowKey] = useState<string | null>(null);
   displayRef.current = autopilot.mode === "server"
     ? resolveExactAutopilotDisplayText(displayRef.current, autopilot.current)
     : null;
@@ -128,6 +129,8 @@ export function PatientAutopilotStage({
       ? "录好了，正在保存"
     : listening
       ? "正在听您说"
+    : answerNowKey === command.command_key
+      ? "朗读已停止，正在准备麦克风"
     : runtime?.phase === "tts_playing"
       ? "正在为您朗读"
       : command.kind === "record" ? "正在准备麦克风" : "正在准备朗读";
@@ -171,6 +174,22 @@ export function PatientAutopilotStage({
       </div>
       <div className="stage-mic" aria-live="polite">
         <p className="patient-status" role="status">{status}</p>
+        {activated && imageReady && command.kind === "tts" && command.state === "started"
+          && answerNowKey !== command.command_key
+          && runtime?.phase === "tts_playing"
+          && (purpose === "question" || purpose === "cue") && (
+          <>
+            <button type="button" className="patient-primary-action patient-primary-action--secondary"
+              onClick={() => {
+                if (autopilot.answerNow?.()) setAnswerNowKey(command.command_key);
+              }} aria-describedby="autopilot-answer-now-hint">
+              现在回答
+            </button>
+            <p className="patient-optional-hint" id="autopilot-answer-now-hint">
+              点这里停止朗读，看到「正在听您说」后回答
+            </p>
+          </>
+        )}
         {listening && (
           <>
             {/* 服务器托管的自动流程里这个按钮只是提前结束，不是完成链路的必要条件：

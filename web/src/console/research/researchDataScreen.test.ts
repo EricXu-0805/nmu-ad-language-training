@@ -41,8 +41,9 @@ test("403 讲清楚是角色问题而不是故障，并且不教人共用账号"
 test("导出与屏上那一页共用同一个 query 构造器", () => {
   // 两条路径都走 researchDatasetPath，CSV 与 JSON 结构上不可能拉到不同范围。
   assert.match(api, /researchDataset: async[\s\S]{0,400}researchDatasetPath\(request\)/);
-  assert.match(api, /researchCsv:[\s\S]{0,200}researchDatasetPath\(\{ \.\.\.request, csv: true \}\)/);
-  assert.match(screen, /api\.researchCsv\(\{ dataset, classification, cursor \}\)/);
+  assert.match(api, /researchCsv:[\s\S]{0,300}researchDatasetPath\(\{ \.\.\.request, csv: true \}\)/);
+  assert.match(screen, /api\.researchCsv\(\{\s*dataset, classification, cursor,/);
+  assert.match(screen, /expectedEpochSeq: pageState\.status === "ready" \? pageState\.page\.release\?\.epochSeq : null/);
   assert.match(screen, /api\.researchDataset\(\{ dataset, classification, cursor/);
 });
 

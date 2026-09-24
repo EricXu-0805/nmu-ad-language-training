@@ -3,6 +3,11 @@ import { api, ApiError } from "../../api";
 import {
   AUTOPILOT_ADJUDICATION_REASONS,
   autopilotConflictCode,
+  buildAutopilotAdjudicateRequest,
+  buildAutopilotStartRequest,
+  allowsAutopilotStartSelection,
+  allowsBedsideDefaultStart,
+  autopilotStartPreview,
   autopilotServerOwnsConsole,
   autopilotConsoleReducer,
   AutopilotControlOperationEpoch,
@@ -17,6 +22,9 @@ import {
   type AutopilotAdjudicationKind,
   type AutopilotAdjudicationReason,
   type AutopilotConsoleState,
+  type AutopilotStatusReceipt,
+  type AutopilotStartOptions,
+  type AutopilotStartSkipReason,
 } from "../../autopilot/startControl";
 import {
   canAutoStartServerAutopilot,
@@ -38,9 +46,11 @@ import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Field, TextInput } from "../../components/Field";
 import type { JournalAttempt } from "../../hooks/useSessionJournal";
-import type { Session } from "../../types";
+import type { Session, SessionPlan } from "../../types";
+import { submitReviewedAdjudication } from "./autopilotAdjudication.ts";
 import { hasExactWeek2Single20Profile } from "../../autopilot/demoProfile.ts";
 import { autopilotAttemptView, type AutopilotAttemptView } from "./autopilotAttemptView.ts";
+import { itemSeqLabel, itemSeqSummary } from "../itemNumbering.ts";
 
 // 暂停原因用人话说一遍:研究者对着一串错误码不知道该去平板上看什么。
 // 2026-09-13 演示:平板里留着上一场没传完的录音,自动带练一开麦就 recording_start_failed,
@@ -63,13 +73,15 @@ const AUTOPILOT_ERROR_HINTS: Record<string, string> = {
   // 研究者裁定(老人已答对/跳过本题)的写前 409:服务端在任何写入之前拒绝,
   // 提示常驻在卡片里,不折成会被下一次轮询抹掉的 uncertain。
   autopilot_adjudication_requires_pause: "先暂停，等平板收麦后再点。",
+  autopilot_adjudication_saved: "现场决定已保存。AI 服务暂不可用，训练保持暂停；恢复后可继续 AI，或转为人工操作。",
+  autopilot_adjudication_already_recorded: "这个环节的现场决定已经保存，不能重复裁定。请继续 AI 自动带练，或转为人工操作。",
   autopilot_adjudication_attempt_required: "这一题还没有录到老人的回答，AI 判不了「答对」；可以点「跳过本题」，或点「继续 AI 自动带练」让 AI 重问这一题。",
   autopilot_attempt_processing: "上一段录音还在判分，几秒后再点。",
   autopilot_attempt_failed: "上一段录音判分失败，AI 不能接着弹这一题；点「转为人工操作」把这一题人工完成。",
-  autopilot_attempt_abandoned: "上一段录音的判分被暂停打断，不会再自动完成；点「转为人工操作」把这一题人工完成。",
+  autopilot_attempt_abandoned: "上一段录音的判分被暂停打断；可点「继续 AI 自动带练」，用已保存录音接着处理，或转为人工操作。",
   autopilot_resume_position_unresumable: "人工接管期间答过的这一题，AI 不能接着弹；请人工完成这一题后再切回。",
   autopilot_scope_completed: "本场可自动带练的题目已全部练完或裁定完毕；请直接进入场次收尾。",
-  autopilot_revision_conflict: "服务器状态刚更新过，已按最新状态重试一次仍冲突；请核对当前题位后再点一次。",
+  autopilot_revision_conflict: "服务器状态已更新，请核对当前题目与环节后重新操作。",
 };
 function autopilotErrorHint(code: string): string {
   return AUTOPILOT_ERROR_HINTS[code] ?? `错误码：${code}`;
@@ -79,6 +91,7 @@ function autopilotErrorHint(code: string): string {
 const ADJUDICATION_PREWRITE_CODES = new Set([
   "autopilot_adjudication_requires_pause",
   "autopilot_adjudication_attempt_required",
+  "autopilot_adjudication_already_recorded",
   "autopilot_attempt_processing",
   "autopilot_attempt_failed",
   "autopilot_attempt_abandoned",
@@ -107,6 +120,8 @@ const ADJUDICATION_REASON_LABELS: Record<AutopilotAdjudicationReason, string> = 
 };
 
 interface AdjudicationDraft {
+  reviewed: AutopilotStatusReceipt;
+  positionLabel: string;
   kind: AutopilotAdjudicationKind;
   reason: AutopilotAdjudicationReason | null;
   note: string;
@@ -124,8 +139,11 @@ export function ServerAutopilotControl({
   onReceiptPosition,
   prepareOwnership,
   attempts,
+  hasExistingEvidence,
+  plan,
 }: {
   session: Session;
+  plan: SessionPlan | null;
   interactionBlocked: boolean;
   hasNamedAccount: boolean;
   operationalAutopilotReady: boolean | null;
@@ -138,6 +156,8 @@ export function ServerAutopilotControl({
   prepareOwnership: () => Promise<true | string>;
   /** journal 的 attempts 投影(服务器持有期间由训练台定时补取),只给「AI 听到了什么」面板;null = 还没取到过。 */
   attempts: readonly JournalAttempt[] | null;
+  /** 已恢复的题目/环节/录音/提示账本中是否存在人工或自动证据；服务端仍最终复核。 */
+  hasExistingEvidence: boolean;
 }) {
   const [state, dispatch] = useReducer(
     autopilotConsoleReducer,
@@ -175,12 +195,24 @@ export function ServerAutopilotControl({
   const [resumeBusy, setResumeBusy] = useState(false);
   const [adjudication, setAdjudication] = useState<AdjudicationDraft | null>(null);
   const [adjudicateBusy, setAdjudicateBusy] = useState(false);
+  const [adjudicationError, setAdjudicationError] = useState<string | null>(null);
   // 裁定写前被拒的提示,常驻到下一次裁定或服务器版本前进为止(D1 同一纪律)。
   const [controlNotice, setControlNotice] = useState<{ label: string; text: string } | null>(null);
   const [providerReadiness, setProviderReadiness] = useState<ProviderReadiness | null>(null);
   const [providerReadinessError, setProviderReadinessError] = useState<string | null>(null);
   const [canProbeProvider, setCanProbeProvider] = useState(false);
   const [providerProbeBusy, setProviderProbeBusy] = useState(false);
+  const [startOrder, setStartOrder] = useState(1);
+  const [startSkipReason, setStartSkipReason] = useState<AutopilotStartSkipReason | null>(null);
+  const [startSkipNote, setStartSkipNote] = useState("");
+  const [startSelectionError, setStartSelectionError] = useState<string | null>(null);
+  const [startSelectionEdited, setStartSelectionEdited] = useState(false);
+  const startSelectionEditedRef = useRef(false);
+  const [confirmStartPosition, setConfirmStartPosition] = useState<AutopilotStartOptions | null>(null);
+  const startPreview = autopilotStartPreview(plan, startOrder);
+  const canSelectStart = allowsAutopilotStartSelection(
+    state.receipt, attempts === null ? null : attempts.length, hasExistingEvidence,
+  ) && autopilotStartPreview(plan, 1) !== null;
   const acceptReceipt = useCallback((receipt: Awaited<ReturnType<typeof api.autopilotStatus>>) => {
     if (receipt.stateRevision < latestRevision.current) return;
     if (receipt.stateRevision === latestRevision.current && latestReceipt.current
@@ -234,7 +266,15 @@ export function ServerAutopilotControl({
     setResumeBusy(false);
     setAdjudication(null);
     setAdjudicateBusy(false);
+    setAdjudicationError(null);
     setControlNotice(null);
+    setStartOrder(1);
+    setStartSkipReason(null);
+    setStartSkipNote("");
+    setStartSelectionError(null);
+    setStartSelectionEdited(false);
+    startSelectionEditedRef.current = false;
+    setConfirmStartPosition(null);
     if (!classificationProven) {
       onOwnershipChange(false, "idle");
       return undefined;
@@ -327,10 +367,23 @@ export function ServerAutopilotControl({
     }
   };
 
-  const start = async () => {
+  const start = async (options?: AutopilotStartOptions) => {
     if (completePlanBlocked || providerReadiness?.startAllowed !== true
         || !eligibility.allowed
         || autopilotServerOwnsConsole(state) || startInFlight.current) return;
+    if ((options?.startPresentationOrder ?? 1) !== startOrder
+        || (startOrder > 1 && (!canSelectStart || !startPreview))) {
+      setStartSelectionError("起始题目或本场记录已变化，请核对后重新选择；已开始的场次请使用继续训练。");
+      return;
+    }
+    try {
+      buildAutopilotStartRequest(session.session_id, options);
+    } catch (error) {
+      setStartSelectionError(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    setConfirmStartPosition(null);
+    setStartSelectionError(null);
     startInFlight.current = true;
     controlWriteInFlight.current = true;
     operationEpoch.current.beginWrite();
@@ -345,7 +398,7 @@ export function ServerAutopilotControl({
         onOwnershipChange(false, "rejected");
         return;
       }
-      const receipt = await api.startAutopilotP0a(session.session_id);
+      const receipt = await api.startAutopilotP0a(session.session_id, options);
       acceptReceipt(receipt);
     } catch (error) {
       const message = error instanceof ApiError ? error.detail : error instanceof Error ? error.message : String(error);
@@ -399,6 +452,9 @@ export function ServerAutopilotControl({
   // 不新建第二条。信号先到、门禁未明时只等待;checking/starting/uncertain/
   // 服务器已持有/写前被拒 一律不自动发起,写请求每个激活周期最多一次。
   useEffect(() => {
+    // 选择起点属于研究者操作：即使后来选回1，也要明确重置才恢复床旁自动启动。
+    // ref 在原生选框获得焦点时即锁住，防激活信号早于 React 的状态更新。
+    if (!allowsBedsideDefaultStart(startOrder, startSelectionEditedRef.current, confirmStartPosition !== null)) return;
     if (!canAutoStartServerAutopilot({
       sessionId: session.session_id,
       latchedActivationSessionId: bedsideActivation,
@@ -417,13 +473,13 @@ export function ServerAutopilotControl({
     void startRef.current();
   }, [bedsideActivation, completePlanBlocked, eligibility.allowed, interactionBlocked,
     patientMicOn, planPositionReady, providerReadiness, session.session_id,
-    state.phase, state.receipt]);
+    state.phase, state.receipt, startOrder, startSelectionEdited, confirmStartPosition]);
 
   if (!classificationProven) return null;
 
   const takeover = async () => {
     const receipt = state.receipt;
-    if (!receiptAllowsAutopilotTakeover(receipt) || takeoverBusy) return;
+    if (!receiptAllowsAutopilotTakeover(receipt) || takeoverBusy || controlWriteInFlight.current) return;
     setConfirmTakeover(false);
     setTakeoverBusy(true);
     controlWriteInFlight.current = true;
@@ -458,7 +514,7 @@ export function ServerAutopilotControl({
   // 与 takeover 同一收口范式:写前重取权威状态,写后收权威回执;失败折 uncertain
   // fail-closed。恢复成功后 serverOwned 仍为 true,不触发人工面重挂。
   const resume = async () => {
-    if (!receiptAllowsAutopilotResume(state.receipt) || resumeBusy) return;
+    if (!receiptAllowsAutopilotResume(state.receipt) || resumeBusy || controlWriteInFlight.current) return;
     setConfirmResume(false);
     setResumeBusy(true);
     controlWriteInFlight.current = true;
@@ -495,13 +551,35 @@ export function ServerAutopilotControl({
     }
   };
 
-  // 研究者裁定(老人已答对/跳过本题):与 resume 同一收口范式——写前重取权威状态,
-  // 写后收权威回执(服务端在同一事务里落裁定并推进到下一题)。写前确定性 409
-  // (未暂停/没录到回答/判分中)服务端明确未写入:回退到刚重取的回执并把提示常驻
-  // 在卡片里;revision 冲突刷新一次再试一次;其余错误一律折 uncertain fail-closed。
+  // Drafts retain the exact paused state the researcher saw. A status refresh or
+  // revision conflict must never move that decision to another question/answer.
+  const openAdjudication = (kind: AutopilotAdjudicationKind) => {
+    const receipt = state.receipt;
+    if (controlWriteInFlight.current || !receipt || !receiptAllowsAutopilotAdjudication(receipt)) return;
+    const targetItem = plan?.items.find(row => row.item_id === receipt.positionItemId);
+    const targetTurn = targetItem?.turns.find(row => row.turn_seq === receipt.positionTurnSeq);
+    if (!targetItem || !targetTurn) return;
+    setAdjudicationError(null);
+    setAdjudication({
+      kind, reason: null, note: "", reviewed: { ...receipt },
+      positionLabel: `第 ${targetItem.presentation_order} 题 · ${targetItem.task_type} · 第 ${targetTurn.turn_seq} 环节（${targetTurn.response_role}）`,
+    });
+  };
   const adjudicate = async () => {
     const draft = adjudication;
-    if (!draft?.reason || !receiptAllowsAutopilotAdjudication(state.receipt) || adjudicateBusy) return;
+    if (!draft?.reason || adjudicateBusy || controlWriteInFlight.current) return;
+    const reason = draft.reason;
+    // Local validation has no uncertain server outcome. Keep the editable draft
+    // visible if copied notes contain control characters or exceed the contract.
+    try {
+      buildAutopilotAdjudicateRequest(
+        session.session_id, draft.reviewed.stateRevision, draft.kind, reason, draft.note,
+      );
+    } catch (error) {
+      setAdjudicationError(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    setAdjudicationError(null);
     setAdjudication(null);
     setAdjudicateBusy(true);
     setControlNotice(null);
@@ -509,29 +587,23 @@ export function ServerAutopilotControl({
     operationEpoch.current.beginWrite();
     onOwnershipChange(true, "uncertain");
     try {
-      let latest = await api.autopilotStatus(session.session_id);
-      acceptReceipt(latest);
-      if (!receiptAllowsAutopilotAdjudication(latest)) return;
-      for (let retried = false; ; retried = true) {
-        try {
-          const next = await api.adjudicateAutopilot(
-            session.session_id, latest.stateRevision, draft.kind, draft.reason, draft.note,
-          );
-          acceptReceipt(next);
-          return;
-        } catch (error) {
-          const code = autopilotConflictCode(error);
-          if (code === null || !ADJUDICATION_PREWRITE_CODES.has(code)) throw error;
-          if (code === "autopilot_revision_conflict") {
-            latest = await api.autopilotStatus(session.session_id);
-            acceptReceipt(latest);
-            if (!receiptAllowsAutopilotAdjudication(latest)) return;
-            if (!retried) continue;
-          }
-          acceptReceipt(latest);
-          setControlNotice({ label: "裁定未记录", text: autopilotErrorHint(code) });
-          return;
-        }
+      try {
+        const result = await submitReviewedAdjudication({
+          reviewed: draft.reviewed,
+          readStatus: () => api.autopilotStatus(session.session_id),
+          write: revision => api.adjudicateAutopilot(
+            session.session_id, revision, draft.kind, reason, draft.note,
+          ),
+          acceptReceipt,
+        });
+        if (result === "changed") setControlNotice({
+          label: "裁定未记录",
+          text: "打开确认框后训练状态已改变。请核对当前题目、环节和回答，再重新选择；刚才的决定没有提交到新位置。",
+        });
+      } catch (error) {
+        const code = autopilotConflictCode(error);
+        if (code === null || !ADJUDICATION_PREWRITE_CODES.has(code)) throw error;
+        setControlNotice({ label: "裁定未记录", text: autopilotErrorHint(code) });
       }
     } catch (error) {
       const message = error instanceof ApiError ? error.detail
@@ -560,6 +632,7 @@ export function ServerAutopilotControl({
   // 最后一题被裁定后没有下一位可续:服务端留在安全暂停并把它写进 lastErrorCode,
   // 这里收起「继续/裁定」,只留人工接管与去收尾的提示。
   const scopeExhausted = paused && state.receipt?.lastErrorCode === "autopilot_scope_completed";
+  const adjudicationSaved = paused && state.receipt?.lastErrorCode === "autopilot_adjudication_saved";
   const completed = state.phase === "scope_completed";
   const uncertain = state.phase === "uncertain";
   const checking = state.phase === "checking";
@@ -571,8 +644,32 @@ export function ServerAutopilotControl({
   const canTakeover = receiptAllowsAutopilotTakeover(state.receipt)
     && (paused || completed || serverFailed);
   // 裁定按钮与「继续 AI 自动带练」同一份收麦证明;内容缺口的暂停不许跳题。
-  const canAdjudicate = receiptAllowsAutopilotAdjudication(state.receipt) && !contentGap && !scopeExhausted;
+  const adjudicationPositionKnown = plan?.items.some(row => row.item_id === state.receipt?.positionItemId
+    && row.turns.some(turn => turn.turn_seq === state.receipt?.positionTurnSeq)) === true;
+  const canAdjudicate = receiptAllowsAutopilotAdjudication(state.receipt)
+    && adjudicationPositionKnown && !contentGap && !scopeExhausted;
   const controlBusy = resumeBusy || takeoverBusy || adjudicateBusy;
+  const startSelectionBlocked = startOrder > 1
+    && (!canSelectStart || !startPreview || startSkipReason === null);
+  const markStartSelectionEdited = () => {
+    startSelectionEditedRef.current = true;
+    setStartSelectionEdited(true);
+    setStartSelectionError(null);
+  };
+  const requestStart = () => {
+    if (startOrder === 1) { void start(); return; }
+    const options: AutopilotStartOptions = {
+      startPresentationOrder: startOrder, skipReasonCode: startSkipReason, skipNote: startSkipNote,
+    };
+    try {
+      buildAutopilotStartRequest(session.session_id, options);
+      if (!canSelectStart || !startPreview) throw new Error("本场已有记录，不能重新指定训练起点");
+      setStartSelectionError(null);
+      setConfirmStartPosition(options);
+    } catch (error) {
+      setStartSelectionError(error instanceof Error ? error.message : String(error));
+    }
+  };
   // 「AI 听到了什么」:只在服务器持有且在题位上(带练中/处理中/AI 自己暂停)时展示,
   // 位置来自权威回执,回答来自 journal attempts 投影;人工接管态由人工面自己判分。
   const heardPosition = state.receipt?.serverOwned
@@ -604,8 +701,9 @@ export function ServerAutopilotControl({
             variant={autopilotServerOwnsConsole(state) ? "secondary" : "primary"}
             disabled={manual || completePlanBlocked || !eligibility.allowed
               || providerBlocked
+              || startSelectionBlocked
               || autopilotServerOwnsConsole(state)}
-            onClick={() => { void start(); }}
+            onClick={requestStart}
           >
             {manual ? "已转为人工操作"
               : state.phase === "starting" ? "正在核对启动条件…"
@@ -626,6 +724,7 @@ export function ServerAutopilotControl({
                   : accountBlocked ? "需要具名研究账号"
                   : runtimeBlocked ? "场次未处于可启动状态"
                     : rejected ? "重新核对并启动"
+                      : startOrder > 1 ? `确认从第 ${startOrder} 题开始`
                       : isSimulation ? "启动 AI 自动带练（演练）"
                         : "启动 AI 自动带练"}
           </Button>
@@ -639,11 +738,11 @@ export function ServerAutopilotControl({
           {canAdjudicate && (
             <>
               <Button type="button" variant="secondary" disabled={controlBusy}
-                onClick={() => setAdjudication({ kind: "confirmed_correct", reason: null, note: "" })}>
+                onClick={() => openAdjudication("confirmed_correct")}>
                 {adjudicateBusy ? "正在记录裁定…" : "老人已答对"}
               </Button>
               <Button type="button" variant="secondary" disabled={controlBusy}
-                onClick={() => setAdjudication({ kind: "skip_item", reason: null, note: "" })}>
+                onClick={() => openAdjudication("skip_item")}>
                 跳过本题
               </Button>
             </>
@@ -674,17 +773,14 @@ export function ServerAutopilotControl({
           <>下一题缺少自动训练内容，AI 已停下，不会跳题。请点「转为人工操作」继续。</>
         ) : scopeExhausted ? (
           <>{autopilotErrorHint("autopilot_scope_completed")}如需补做，请点「转为人工操作」。</>
+        ) : adjudicationSaved ? (
+          <>{autopilotErrorHint("autopilot_adjudication_saved")}</>
         ) : (
           <>
             AI 已安全暂停，题目停在当前位置。点「继续 AI 自动带练」由 AI 接着当前题目（已经答过的，按最后一次回答给下一级提示或反馈）；或点「转为人工操作」由你人工继续本场。
             {canAdjudicate && (
               <div style={{ marginTop: "var(--sp-1)" }}>
-                老人其实答对了、或这题不该再问，可点「老人已答对」或「跳过本题」让 AI 直接出下一题。AI 自己的判定原样保留，你的决定连同账号名和原因一起记录；研究评分仍以事后复核为准。
-              </div>
-            )}
-            {controlNotice && (
-              <div role="alert" style={{ marginTop: "var(--sp-1)" }}>
-                {controlNotice.label}：{controlNotice.text}
+                老人其实答对了、或这题不该再问，可点「老人已答对」结束当前环节，或「跳过本题」结束本题剩余环节。保存决定后会尝试继续；AI 服务不可用时保持暂停。AI 自己的判定原样保留，你的决定连同账号名和原因一起记录；研究评分仍以事后复核为准。
               </div>
             )}
             {state.receipt?.lastErrorCode && (
@@ -732,6 +828,74 @@ export function ServerAutopilotControl({
           </details>
         </>
       )}
+      {controlNotice && (
+        <div role="alert" style={{ marginTop: "var(--sp-1)" }}>
+          {controlNotice.label}：{controlNotice.text}
+        </div>
+      )}
+      {(canSelectStart || (startOrder > 1 && !autopilotServerOwnsConsole(state))) && (
+        <div className="col" style={{ gap: "var(--sp-2)", marginTop: "var(--sp-2)" }}>
+          <Field label="本场从哪一题开始" hint="仅新场次可选。题号来自本场冻结计划；之前的题会留下跳过记录，不算本场已完成的回答。">
+            <select className="form-control" value={startOrder}
+              disabled={!canSelectStart || startInFlight.current}
+              onFocus={markStartSelectionEdited}
+              onChange={(event) => {
+                markStartSelectionEdited();
+                setStartOrder(Number(event.target.value));
+                setStartSkipReason(null);
+                setStartSkipNote("");
+              }}>
+              {plan?.items.map((item) => {
+                const seq = itemSeqLabel(item.task_type, item.presentation_order);
+                return <option key={item.item_id} value={item.presentation_order}>
+                  {seq ? itemSeqSummary(item.task_type, seq) : `第 ${item.presentation_order} 题`} · {item.item_id}
+                </option>;
+              })}
+            </select>
+          </Field>
+          {startOrder > 1 && startPreview && (
+            <>
+              <div>从第 {startOrder} 题开始；前面的 {startPreview.skippedItems.length} 题、{startPreview.skippedTurns} 个环节将记录为跳过。</div>
+              <details>
+                <summary>核对将跳过的题目</summary>
+                <ul>{startPreview.skippedItems.map((item) => <li key={item.item_id}>
+                  第 {item.presentation_order} 题 · {item.task_type} · {item.item_id}（{item.turns.length} 个环节）
+                </li>)}</ul>
+              </details>
+              <Field label="跳过前面题目的原因" required>
+                <select className="form-control" value={startSkipReason ?? ""} disabled={!canSelectStart}
+                  onChange={(event) => {
+                    markStartSelectionEdited();
+                    setStartSkipReason(event.target.value === "" ? null : event.target.value as AutopilotStartSkipReason);
+                  }}>
+                  <option value="">请选择原因</option>
+                  <option value="trained_in_prior_sitting">上一场已经练过</option>
+                  <option value="other">其他</option>
+                </select>
+              </Field>
+              <Field label="跳过备注（可不填，200 字以内）">
+                <TextInput value={startSkipNote} maxLength={200} disabled={!canSelectStart}
+                  onChange={(event) => { markStartSelectionEdited(); setStartSkipNote(event.target.value); }} />
+              </Field>
+            </>
+          )}
+          {startSelectionEdited && (
+            <div className="row wrap">
+              <span>正在核对训练起点，请由研究者确认启动；老人端点击不会自动开始。</span>
+              <Button variant="ghost" disabled={!canSelectStart} onClick={() => {
+                setStartOrder(1); setStartSkipReason(null); setStartSkipNote("");
+                setStartSelectionError(null); setConfirmStartPosition(null);
+                startSelectionEditedRef.current = false; setStartSelectionEdited(false);
+              }}>{autoStartAttempted.current ? "重置为第 1 题" : "重置为第 1 题并恢复床旁自动启动"}</Button>
+            </div>
+          )}
+          {autoStartAttempted.current && (
+            <div>本场已尝试过自动启动，重置起点后仍需由研究者手动点击启动；老人端点击不会自动重试。</div>
+          )}
+          {startSelectionError && <div role="alert">未启动：{startSelectionError}</div>}
+          {!canSelectStart && <div role="alert">本场记录已变化，指定起点已关闭；请核对现有进度。</div>}
+        </div>
+      )}
       {heardVisible && <HeardPanel view={heard} loaded={attempts !== null} />}
       {isRealResearch && (
         <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.85 }}>
@@ -765,6 +929,24 @@ export function ServerAutopilotControl({
       )}
     </Alert>
     <ConfirmDialog
+      open={confirmStartPosition !== null}
+      title={`确认从第 ${confirmStartPosition?.startPresentationOrder ?? startOrder} 题开始训练？`}
+      body={confirmStartPosition && startPreview && (
+        <div className="col" style={{ gap: "var(--sp-2)" }}>
+          <strong>起始题：第 {startPreview.startItem.presentation_order} 题 · {startPreview.startItem.task_type} · {startPreview.startItem.item_id}</strong>
+          <div>前面的 {startPreview.skippedItems.length} 题、{startPreview.skippedTurns} 个环节将留下署名跳过记录；不会补造回答、录音或正确分数。启动后不能更改这次选择。</div>
+          <div>原因：{confirmStartPosition.skipReasonCode === "trained_in_prior_sitting" ? "上一场已经练过" : "其他"}</div>
+          {confirmStartPosition.skipNote?.trim() && <div>备注：{confirmStartPosition.skipNote.trim()}</div>}
+          <div>请确认老人已准备好，启动后 AI 会从上面这道题开始提问。</div>
+        </div>
+      )}
+      confirmLabel="确认跳过前面题目并开始"
+      confirmVariant="primary"
+      confirmDisabled={startSelectionBlocked || !eligibility.allowed || providerBlocked || completePlanBlocked}
+      onCancel={() => setConfirmStartPosition(null)}
+      onConfirm={() => { if (confirmStartPosition) void start(confirmStartPosition); }}
+    />
+    <ConfirmDialog
       open={confirmTakeover}
       title="确认结束 AI 控制并转为人工操作？"
       body="服务器确认老人端麦克风已关闭后才会放行；接管会留下记录，技术故障不会算作老人答错。"
@@ -775,7 +957,7 @@ export function ServerAutopilotControl({
     <ConfirmDialog
       open={confirmResume}
       title={manual ? "确认切回 AI 自动带练？" : "确认继续 AI 自动带练？"}
-      body="AI 会接着当前题目并开启老人端麦克风（已经答过的，按最后一次回答给下一级提示或反馈）；请先确认老人已准备好继续。恢复会留下记录。"
+      body="AI 会接着当前题目；处理未完的录音会用已保存的录音继续判分，不会重新开麦。已经判完的回答会给下一级提示或反馈，需要新回答时再开启麦克风。请先确认老人已准备好继续，恢复会留下记录。"
       confirmLabel={manual ? "确认切回 AI" : "确认继续 AI"}
       onCancel={() => setConfirmResume(false)}
       onConfirm={() => { void resume(); }}
@@ -785,10 +967,12 @@ export function ServerAutopilotControl({
       title={adjudication?.kind === "skip_item" ? "确认跳过本题？" : "确认老人已答对？"}
       body={adjudication && (
         <div className="col" style={{ gap: "var(--sp-2)" }}>
+          <strong>{adjudication.positionLabel}</strong>
+          {adjudicationError && <div role="alert">裁定未记录：{adjudicationError}</div>}
           <div>
             {adjudication.kind === "skip_item"
-              ? "AI 会把这一题记为跳过，然后直接出下一题。"
-              : "AI 会把这一题记为老人已答对，然后直接出下一题。"}
+              ? "系统会结束本题剩余环节并记录跳过；已经完成的环节保留。保存后尝试继续下一题，AI 服务不可用时保持暂停。"
+              : "系统会记录你确认当前环节答对。保存后尝试继续下一环节，AI 服务不可用时保持暂停；同一题的其他环节仍需训练。"}
             AI 自己的判定原样保留；你的决定连同账号名和下面选的原因一起记录，研究评分仍以事后复核为准。
           </div>
           <fieldset className="col" style={{ gap: "var(--sp-1)", border: 0, padding: 0, margin: 0 }}>

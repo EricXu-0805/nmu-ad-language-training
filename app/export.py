@@ -28,7 +28,7 @@ from sqlalchemy import or_
 from sqlmodel import Session as DBSession
 from sqlmodel import select
 
-from . import (audio_gate, audio_store, autopilot_plan_profiles,
+from . import (audio_gate, audio_store, autopilot_plan_profiles, autopilot_ledger,
                evidence_ledger, export_security,
                repeat_evidence,
                governance_lock, scoring)
@@ -598,7 +598,9 @@ def _locked(turn: TurnEvent) -> bool:
             and turn.confirmed_response_text is not None)
 
 
-def _reconstruct_scores(items: list[ItemEvent], turns_by_item: dict[int, list[TurnEvent]]) -> dict:
+def _reconstruct_scores(
+        items: list[ItemEvent], turns_by_item: dict[int, list[TurnEvent]], *,
+        skipped_item_ids: frozenset[str] = frozenset()) -> dict:
     """按 task_type 分桶，用【全部环节已锁定】的题重建综合指标。返回聚合 + 排除清单。"""
     singles: list[scoring.SingleElementItem] = []
     doubles: list[scoring.DoubleElementItem] = []
@@ -606,6 +608,11 @@ def _reconstruct_scores(items: list[ItemEvent], turns_by_item: dict[int, list[Tu
     excluded: list[str] = []
 
     for it in items:
+        if it.item_id in skipped_item_ids:
+            excluded.append(
+                f"{it.item_id}（{it.task_type}）：含研究者跳过的环节，保留逐环节数据，不计入题级综合分"
+            )
+            continue
         turns = turns_by_item.get(it.id, [])
         if not turns or not all(_locked(t) for t in turns):
             excluded.append(
@@ -1340,7 +1347,10 @@ def export_session_bundle(
     } for index, row in enumerate(adjudications)]
 
     # --- 重建评分汇总 ---
-    scores = _reconstruct_scores(items, turns_by_item)
+    scores = _reconstruct_scores(
+        items, turns_by_item,
+        skipped_item_ids=frozenset(row.item_id for row in adjudications
+                                   if row.kind == "skipped"))
     score_sheet = [_score_row(session_cols(), tt, scores[key])
                    for tt, key in (("单要素", "single"), ("双要素", "double"), ("多要素", "multi"))
                    if scores[key]]
@@ -1449,6 +1459,7 @@ def export_session_bundle(
             "error_code": attempt.error_code,
             "is_simulation": attempt.is_simulation,
             "truth_scope": "operational_only",
+            **_prompt_playback_evidence(db, attempt),
         })
 
     interaction_sheet = []
@@ -1783,6 +1794,36 @@ def _resolve_recoverable_batch(
     if existing.status not in {"published", "artifacts_ready"}:
         return None
     return existing
+
+
+def _prompt_playback_evidence(db, attempt: AttemptEvent) -> dict:
+    """Report media exposure separately from correctness and locked research scores.
+
+    A stopped prompt is not a fully played prompt. No elapsed time is used to
+    infer which words were heard or lower the issued prompt level.
+    """
+    record = db.exec(select(RuntimeCommand).where(
+        RuntimeCommand.session_id == attempt.session_id,
+        RuntimeCommand.expected_raw_audio_id == attempt.raw_audio_id,
+        RuntimeCommand.kind == "record",
+    )).first()
+    empty = {"prompt_playback_outcome": None, "prompt_played_ms": None,
+             "prompt_exposure_needs_review": False}
+    if record is None:
+        return empty
+    try:
+        # This column describes the prompt, not successful recording/judging.
+        # A later capture failure must not introduce a new whole-export gate.
+        ack = autopilot_ledger.verify_tts_ended_prerequisite(db, record, require_live_scope=False)
+    except autopilot_ledger.AutopilotProofError:
+        return {"prompt_playback_outcome": "unverified", "prompt_played_ms": None,
+                "prompt_exposure_needs_review": True}
+    interrupted = ack.ack_type == "tts_interrupted"
+    return {"prompt_playback_outcome": "interrupted_answer_now" if interrupted else "ended",
+            # Historical ended ACKs used wall-clock elapsed time. Only this new
+            # interrupted ACK reports HTMLAudioElement.currentTime.
+            "prompt_played_ms": json.loads(ack.payload_json).get("media_duration_ms") if interrupted else None,
+            "prompt_exposure_needs_review": interrupted}
 
 
 def _row_fingerprint(row, *, identity) -> tuple:
@@ -2132,6 +2173,7 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         # 这两列只在带重复请求/画像证据的场次里出现，第一版按实测列集推契约时
         # 没走到那条路径。列契约必须覆盖**所有**分支，不是抽样到的那些。
         "judge_portrait_used", "processing_status",
+        "prompt_playback_outcome", "prompt_played_ms", "prompt_exposure_needs_review",
     ),
     "interactions": _SESSION_COLS + (
         "event_seq", "item_id", "turn_seq", "attempt_seq", "audio_code",
@@ -2233,5 +2275,3 @@ def _flat(d: Optional[dict]) -> Optional[str]:
         raise ValueError(
             f"结局指标含嵌套值 {nested}，不得压成字符串静默丢弃；请展开成列")
     return "; ".join(f"{k}={v}" for k, v in d.items())
-
-

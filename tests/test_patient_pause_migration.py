@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 
 
-HEAD = "f4b2d8c1a635"
+HEAD = "a7c3e9d2b641"
 PATIENT_PAUSE_HEAD = "a9d2e6f4c108"
 PARENT = "b8e5f2a91c07"
 

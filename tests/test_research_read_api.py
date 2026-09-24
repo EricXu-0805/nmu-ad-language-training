@@ -1437,6 +1437,30 @@ def test_the_csv_filename_carries_the_epoch(research_env, monkeypatch):
         response.headers["content-disposition"]
 
 
+def test_csv_refuses_to_relabel_a_new_release_as_the_displayed_epoch(research_env, monkeypatch):
+    _with_key(monkeypatch)
+    client = _client("steward")
+    path = "/research/v1/turns.csv?data_classification=research&expected_epoch_seq="
+    matching = client.get(path + "1")
+    assert matching.status_code == 200
+    assert 'epoch001.csv' in matching.headers["content-disposition"]
+    changed = client.get(path + "2")
+    assert changed.status_code == 409
+    assert changed.json()["detail"]["code"] == "research_release_changed"
+    assert "content-disposition" not in changed.headers
+
+
+@pytest.mark.parametrize("query", [
+    "data_classification=research&expected_epoch_seq=0",
+    "data_classification=simulation&expected_epoch_seq=1",
+])
+def test_expected_research_epoch_rejects_invalid_scope(research_env, monkeypatch, query):
+    _with_key(monkeypatch)
+    response = _client("steward").get("/research/v1/turns.csv?" + query)
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "research_query_invalid"
+
+
 def test_adjudications_dataset_shows_skipped_positions_pseudonymously_with_tombstones(
         research_env, monkeypatch):
     """跳过的题位没有环节行,只能在 adjudications 数据集里看到;备注/裁定人/时间永不出现,

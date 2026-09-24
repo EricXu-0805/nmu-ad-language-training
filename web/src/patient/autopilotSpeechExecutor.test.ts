@@ -34,6 +34,7 @@ function question(): TtsCommand {
 class AudioDouble {
   src = "";
   duration = 1.25;
+  currentTime = 0;
   paused = true;
   onplaying: (() => void) | null = null;
   onended: (() => void) | null = null;
@@ -146,6 +147,32 @@ test("production playback settles only on playing then ended, and ended is exact
   assert.deepEqual(run.created, ["blob:test-1"]);
   assert.deepEqual(run.revoked, ["blob:test-1"]);
   assert.equal(run.stopped(), 1);
+});
+
+test("现在回答先物理停播,只给 interrupted 事实;自然结束先赢时不能再打断", async () => {
+  const run = harness();
+  const playback = run.start();
+  await flush();
+  assert.equal(playback.answerNow?.(), false, "还未真实开播不能打断");
+  run.audio.playing();
+  await playback.started;
+  run.setNow(800);
+  run.audio.currentTime = 0.7;
+  assert.equal(playback.answerNow?.(), true);
+  assert.equal(run.audio.paused, true);
+  await playback.closed;
+  assert.deepEqual(await playback.ended, { interrupted: true, media_duration_ms: 700 });
+  run.audio.ended();
+  assert.equal(playback.answerNow?.(), false);
+  assert.equal(run.audio.pauseCalls, 1);
+
+  const natural = harness();
+  const completed = natural.start();
+  await flush();
+  natural.audio.playing();
+  natural.audio.ended();
+  assert.equal(completed.answerNow?.(), false);
+  assert.equal((await completed.ended).interrupted, undefined);
 });
 
 test("ended before playing is ignored and cannot fabricate successful playback", async () => {

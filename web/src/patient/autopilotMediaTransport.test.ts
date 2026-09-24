@@ -447,6 +447,111 @@ test("TTS authority is re-proved after blob materialization and before bytes rea
   assert.equal(authorityReads, 2);
 });
 
+test("TTS 响应头已到但音频下载断流时重取同一命令,完整字节仍须两次授权复核", async () => {
+  let requests = 0;
+  let authorityReads = 0;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    const response = new Response(new Blob(["RIFFvoice"], { type: "audio/wav" }));
+    if (requests === 1) response.blob = async () => { throw new TypeError("terminated"); };
+    return response;
+  });
+  deps.ttsRetryDelaysMs = [0, 0];
+  deps.nextCommand = async () => { authorityReads += 1; return pendingTts(); };
+  const blob = await fetchExactAutopilotTts(
+    "S/ONE", pendingTts(), new AbortController().signal, deps);
+  assert.equal(await blob?.text(), "RIFFvoice");
+  assert.equal(requests, 2);
+  assert.equal(authorityReads, 3);
+});
+
+test("音频响应体下载也受单次期限约束,迟到的第一份字节不会继续复核或交给播放", async () => {
+  let requests = 0;
+  let authorityReads = 0;
+  let firstSignal: AbortSignal | undefined;
+  let resolveLateBody!: (blob: Blob) => void;
+  const { deps } = dependencies(async (_input, init = {}) => {
+    requests += 1;
+    const response = new Response(new Blob(["RIFFretry"], { type: "audio/wav" }));
+    if (requests === 1) {
+      firstSignal = init.signal as AbortSignal;
+      response.blob = () => new Promise<Blob>((resolve) => { resolveLateBody = resolve; });
+    }
+    return response;
+  });
+  deps.ttsAttemptTimeoutMs = 10;
+  deps.ttsRetryDelaysMs = [0, 0];
+  deps.nextCommand = async () => { authorityReads += 1; return pendingTts(); };
+  // 此计时器只让旧实现可确定地退出,修正实现应在它之前重试成功。
+  const late = setTimeout(() => resolveLateBody(new Blob(["RIFFlate"], { type: "audio/wav" })), 80);
+  try {
+    const blob = await fetchExactAutopilotTts(
+      "S/ONE", pendingTts(), new AbortController().signal, deps);
+    assert.equal(await blob?.text(), "RIFFretry");
+    assert.equal(requests, 2);
+    assert.equal(firstSignal?.aborted, true);
+    resolveLateBody(new Blob(["RIFFlate"], { type: "audio/wav" }));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    assert.equal(authorityReads, 3);
+  } finally {
+    clearTimeout(late);
+  }
+});
+
+test("TTS 播放前授权复核遇到一次 503 可恢复,新一轮仍须复核同一条命令", async () => {
+  let requests = 0;
+  let authorityReads = 0;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    return new Response(new Blob(["RIFFvoice"], { type: "audio/wav" }));
+  });
+  deps.ttsRetryDelaysMs = [0, 0];
+  deps.nextCommand = async () => {
+    authorityReads += 1;
+    if (authorityReads === 1) throw new ApiError(503, "暂时不可用");
+    return pendingTts();
+  };
+  const blob = await fetchExactAutopilotTts(
+    "S/ONE", pendingTts(), new AbortController().signal, deps);
+  assert.equal(blob?.type, "audio/wav");
+  assert.equal(requests, 2);
+  assert.equal(authorityReads, 3);
+});
+
+test("断流重试期间命令代际变化时立即拒绝,不使用先前授权或再发第三次请求", async () => {
+  let requests = 0;
+  let authorityReads = 0;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    const response = new Response(new Blob(["RIFFvoice"], { type: "audio/wav" }));
+    if (requests === 1) response.blob = async () => { throw new TypeError("terminated"); };
+    return response;
+  });
+  deps.ttsRetryDelaysMs = [0, 0];
+  deps.nextCommand = async () => {
+    authorityReads += 1;
+    return authorityReads === 1 ? pendingTts() : { ...pendingTts(), runner_generation: 2 };
+  };
+  await assert.rejects(() => fetchExactAutopilotTts(
+    "S/ONE", pendingTts(), new AbortController().signal, deps),
+  (error: unknown) => error instanceof AutopilotMediaError && error.failureStage === "authority_changed");
+  assert.equal(requests, 2);
+  assert.equal(authorityReads, 2);
+});
+
+test("TTS 内容无效仍是 blob_invalid,不会因纳入获取重试范围而重试", async () => {
+  let requests = 0;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    return new Response(new Blob(["error page"], { type: "text/html" }));
+  });
+  deps.ttsRetryDelaysMs = [0, 0];
+  await assert.rejects(() => fetchExactAutopilotTts(
+    "S/ONE", pendingTts(), new AbortController().signal, deps),
+  (error: unknown) => error instanceof AutopilotMediaError && error.failureStage === "blob_invalid");
+  assert.equal(requests, 1);
+});
+
 test("capability rotation during final authority read discards synthesized bytes", async () => {
   const { deps } = dependencies(async () => new Response(
     new Blob(["RIFFvoice"], { type: "audio/wav" }), { status: 200 }));

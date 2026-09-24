@@ -90,3 +90,13 @@ test("自动带练启动拒因逐分支说真话,不再一律折成「麦克风�
   assert.match(trainingConsole, /故障锁还没解除/);
   assert.match(trainingConsole, /场次暂停中——请先点「继续本场」恢复/);
 });
+
+test("已尝试过自动启动时重置起点只承诺重置,说明需手动启动并保留重试锁", () => {
+  const resetSection = autopilotControl.slice(
+    autopilotControl.indexOf("{startSelectionEdited && ("),
+    autopilotControl.indexOf("{startSelectionError &&"),
+  );
+  assert.match(resetSection, /autoStartAttempted\.current \? "重置为第 1 题" : "重置为第 1 题并恢复床旁自动启动"/);
+  assert.match(resetSection, /本场已尝试过自动启动，重置起点后仍需由研究者手动点击启动；老人端点击不会自动重试。/);
+  assert.doesNotMatch(resetSection, /autoStartAttempted\.current\s*=/);
+});

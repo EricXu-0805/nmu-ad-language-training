@@ -268,6 +268,11 @@ function reduceDeviceAck(
         && (state.phase === "tts_ready" || state.phase === "tts_playing")) {
       return { ...advanced, phase: "waiting_server_after_tts" };
     }
+    if (ack.ack_type === "tts_interrupted" && state.phase === "tts_playing"
+        && state.command.state === "started"
+        && (state.command.payload.purpose === "question" || state.command.payload.purpose === "cue")) {
+      return { ...advanced, phase: "waiting_server_after_tts" };
+    }
     if (ack.ack_type === "tts_failed"
         && (state.phase === "tts_ready" || state.phase === "tts_playing")) {
       return pause(advanced, "tts_failed");

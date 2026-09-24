@@ -75,6 +75,8 @@ function ackMatchesCommand(ack: AutopilotAck, command: NextCommandProjection): b
   if (command.kind === "tts") {
     return ack.ack_type === "tts_started"
       || ack.ack_type === "tts_ended"
+      || (ack.ack_type === "tts_interrupted" && command.state === "started"
+        && (command.payload.purpose === "question" || command.payload.purpose === "cue"))
       || ack.ack_type === "tts_failed";
   }
   return (ack.ack_type === "record_started"

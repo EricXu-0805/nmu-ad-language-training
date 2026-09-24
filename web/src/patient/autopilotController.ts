@@ -38,9 +38,11 @@ export interface AutopilotSpeechPlayback {
   /** Resolves only after the browser/media element has really begun playback. */
   started: Promise<{ media_duration_ms?: number }>;
   /** Resolves only after the same playback reaches its real ended event. */
-  ended: Promise<{ media_duration_ms?: number }>;
+  ended: Promise<{ media_duration_ms?: number; interrupted?: true }>;
   /** Resolves only after playback/fetch teardown can no longer emit audio. */
   closed: Promise<void>;
+  /** Stops only a started question/cue; natural ended wins if already observed. */
+  answerNow?(): boolean;
   cancel(): void;
 }
 
@@ -641,6 +643,14 @@ export class PatientAutopilotController {
     capture.requestStop?.("user_done");
   }
 
+  answerNow(): boolean {
+    const command = this.stateValue.command;
+    if (this.stopped || this.patientPauseRequested || this.stateValue.phase !== "tts_playing"
+        || command?.kind !== "tts" || command.state !== "started"
+        || (command.payload.purpose !== "question" && command.payload.purpose !== "cue")) return false;
+    return (this.activeMedia as AutopilotSpeechPlayback | null)?.answerNow?.() ?? false;
+  }
+
   /**
    * 页面生命周期或普通安全收尾判定：麦克风现在就得关。
    *
@@ -979,11 +989,16 @@ export class PatientAutopilotController {
         return;
       }
       await playback.closed;
-      const endedAck = await this.sendAck(startedCommand, {
-        ack_type: "tts_ended",
-        media_ended: true,
-        ...observedEnd.value,
-      });
+      // A pause/withdrawal that wins after the click must never open a recorder.
+      if (this.stopped || this.patientPauseRequested) return;
+      const endedAck = await this.sendAck(startedCommand, observedEnd.value.interrupted
+        ? {
+            ack_type: "tts_interrupted", media_stopped: true, interrupt_reason: "answer_now",
+            media_duration_ms: observedEnd.value.media_duration_ms ?? 0,
+          }
+        : { ack_type: "tts_ended", media_ended: true,
+            ...(observedEnd.value.media_duration_ms === undefined
+              ? {} : { media_duration_ms: observedEnd.value.media_duration_ms }) });
       // 服务器在接受 tts_ended 的同一条响应里就签发了下一条录音命令(收据权威)。
       // 直接采纳它，省掉一个 /next 往返；证明不足或 reducer 不认，才照旧读 /next。
       if (!this.adoptReceiptRecordCommand(startedCommand, endedAck)) {
@@ -1285,8 +1300,8 @@ export class PatientAutopilotController {
     const authority = this.ackDelivery?.lastReceiptAuthority ?? null;
     const projected = authority?.command ?? null;
     if (authority === null || projected === null
-        || authority.ackType !== "tts_ended"
-        || ack.ack_type !== "tts_ended"
+        || (ack.ack_type !== "tts_ended" && ack.ack_type !== "tts_interrupted")
+        || authority.ackType !== ack.ack_type
         || authority.commandKey !== acked.command_key
         || authority.ackIdempotencyKey !== ack.idempotency_key
         || projected.kind !== "record"

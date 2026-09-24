@@ -223,6 +223,16 @@ test("主线程卡顿 300 ms 之后补来的一帧瞬态不算开口:开口累�
   assert.ok(VAD_ONSET_FRAME_CAP_MS < VAD_SPEECH_ONSET_MS);
 });
 
+test("稀疏的两帧响声不能靠卡顿凑满 900 ms 有声时长并自动收麦", () => {
+  const detector = createVoiceActivityDetector();
+  feed(detector, [[1_000, QUIET]], 100);
+  detector.push(SPEECH, 1_500);
+  detector.push(SPEECH, 2_000);
+  assert.ok(detector.voicedMs < VAD_MIN_VOICED_MS);
+  const trace = feed(detector, [[6_000, QUIET]], 100, 2_000);
+  assert.equal(trace.stoppedAt, null);
+});
+
 test("stopped 是终态:之后再喂大声也不回到 speaking", () => {
   const detector = createVoiceActivityDetector();
   feed(detector, [[1_000, QUIET], [2_000, SPEECH], [3_000, QUIET]], 100);

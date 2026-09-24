@@ -44,7 +44,7 @@ function timeDomainRms(samples: Float32Array): number {
 /**
  * 开始旁听;返回拆除函数。拆除幂等,拆掉之后绝不再回调。
  *
- * `onTrailingSilence` 至多被调一次,而且一定在拆除之前——调用方拿到回调时
+ * `onTrailingSilence` 至多被调一次,而且一定在拆除之后——调用方拿到回调时
  * 采样器已经不存在了。
  */
 export function observeTrailingSilence(
@@ -84,16 +84,23 @@ export function observeTrailingSilence(
     const analyser = context.createAnalyser();
     analyser.fftSize = VAD_ANALYSER_FFT_SIZE;
     source.connect(analyser);
-    // 自动播放策略可能把新建的上下文挂在 suspended:试着唤醒,唤不醒就一直读到 0,
-    // 判定永远停在 idle——正是「静默无为」。
+    // 自动播放策略可能把新建的上下文挂在 suspended:试着唤醒。未运行期间
+    // 不读取 analyser,零值或停留在上一帧的值都不是新鲜的语音/静默证据。
     if (context.state === "suspended") {
       void context.resume().catch(() => {});
     }
-    const detector = createVoiceActivityDetector();
+    let detector = createVoiceActivityDetector();
     const frame = new Float32Array(analyser.fftSize);
     timer = ports.setInterval(() => {
       if (released) return;
       try {
+        if (context?.state !== "running") {
+          // 系统中断也可能发生在老人已开口之后。丢弃先前的倒计时,恢复后
+          // 重新观察开口,不能把音频图暂停误认为老人说完。录音器的按钮和
+          // 原始作答上限继续生效,这里只降级 VAD。
+          detector = createVoiceActivityDetector();
+          return;
+        }
         analyser.getFloatTimeDomainData(frame);
         if (detector.push(timeDomainRms(frame), ports.now()) !== "stopped") return;
       } catch {

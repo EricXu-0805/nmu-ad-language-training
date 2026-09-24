@@ -26,7 +26,7 @@ export interface AutopilotMediaTransportDependencies {
   ttsAttemptTimeoutMs?: number;
   /** Test-only override, per attempt (last value repeats); production 10 s then 3.5 s. */
   ttsAttemptTimeoutsMs?: readonly number[];
-  /** Test-only override; production waits 0.5s then 1s before the two TTS retries. */
+  /** Test-only override; production waits 0.5s then 0.75s before the two TTS retries. */
   ttsRetryDelaysMs?: readonly number[];
 }
 
@@ -39,7 +39,8 @@ const DRAIN_REQUEST_TIMEOUT_MS = 12_000;
  * 第一次给 10 s——冷缓存合成要真去云端(服务端自己的供应商超时是 15 s),4 s 会把一次
  * 慢但会成功的合成掐成 tts_failed,而且每掐一次服务端又起一次合成(没有 in-flight 去重);
  * 之后的重试只为连接级失败(TypeError/0/5xx/408)准备,3.5 s 一次。
- * 10 + 0.5 + 3.5 + 0.75 + 3.5 = 18.25 s,加两次 revalidate 与 play(),在 20 s 起播期限内。
+ * 10 + 0.5 + 3.5 + 0.75 + 3.5 = 18.25 s;每次期限包含下载与两次 revalidate,
+ * 为 20 s 起播期限内的 play() 留出余量。
  */
 const TTS_ATTEMPT_TIMEOUTS_MS: readonly number[] = [10_000, 3_500];
 const TTS_RETRY_DELAYS_MS: readonly number[] = [500, 750];
@@ -142,17 +143,17 @@ function waitUnlessAborted(delayMs: number, signal: AbortSignal): Promise<void> 
 }
 
 /**
- * TTS 合成 POST，最多再试两次。每次尝试各自一条期限(首次 10 s,之后 3.5 s)；父 signal
- * 一中止就不再等也不再发。重试的是同一条 exact 命令 URL 与同一份设备凭据，服务器按 speech_key
- * 合成，重复请求没有副作用。
+ * TTS 获取完整字节并复核授权，最多再试两次。响应头返回并不表示音频下载成功:
+ * 下载断流、正文悬挂及 /next 暂时不可用都必须落在同一次期限和有限重试内。
+ * 父 signal 一中止就不再等也不再发。重试的是同一条 exact 命令 URL 与同一份
+ * 设备凭据;每次都重新完成两道授权证明,不会沿用失败尝试的证明。
  */
-async function postExactTtsWithRetry(
-  sessionId: string,
-  commandKey: string,
+async function fetchExactTtsBytesWithRetry(
+  authority: ExactTtsAuthority,
   signal: AbortSignal,
   deps: AutopilotMediaTransportDependencies,
   credential: DeviceCredentialSelection,
-): Promise<Response> {
+): Promise<Blob | null> {
   const delays = deps.ttsRetryDelaysMs ?? TTS_RETRY_DELAYS_MS;
   const timeouts = deps.ttsAttemptTimeoutMs !== undefined
     ? [deps.ttsAttemptTimeoutMs]
@@ -162,8 +163,22 @@ async function postExactTtsWithRetry(
     try {
       return await withRequestDeadline(
         signal, timeoutMs, "TTS 合成请求超时", "语音播放已取消",
-        (requestSignal) => exactCommandPost(
-          sessionId, commandKey, "tts", requestSignal, deps, credential));
+        async (requestSignal) => {
+          const response = await exactCommandPost(
+            authority.sessionId, authority.commandKey, "tts", requestSignal, deps, credential);
+          if (response.status === 204) return null;
+          await revalidateExactTtsAuthority(authority, requestSignal, deps);
+          const blob = await response.blob();
+          // 超时或取消后到达的字节不能继续参与授权判定,也不能交给播放。
+          if (requestSignal.aborted) throw requestSignal.reason;
+          if (blob.size <= 0 || !blob.type.startsWith("audio/")) {
+            throw new AutopilotMediaError(
+              "audio_playback_failed", "TTS 服务返回的音频无效",
+              { failureStage: "blob_invalid" });
+          }
+          await revalidateExactTtsAuthority(authority, requestSignal, deps);
+          return blob;
+        });
     } catch (error) {
       const delayMs = delays[attempt];
       if (signal.aborted || delayMs === undefined || !isTransientTtsFetchError(error)) {
@@ -300,37 +315,21 @@ export async function fetchExactAutopilotTts(
     commandIdentity: ttsCommandIdentity(parsed),
     capability: credential.record!.capability,
   };
-  let response: Response;
   try {
-    response = await postExactTtsWithRetry(
-      sessionId,
-      parsed.command_key,
+    return await fetchExactTtsBytesWithRetry(
+      authority,
       signal,
       deps,
       credential,
     );
   } catch (error) {
     // 取消不是网络失败；ApiError 语义保留在 cause 里，不在这里吞掉。
-    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    if (error instanceof AutopilotMediaError
+        || (error instanceof DOMException && error.name === "AbortError")) throw error;
     throw new AutopilotMediaError(
       "audio_playback_failed", "TTS 合成请求失败",
       { cause: error, failureStage: "fetch_failed" });
   }
-  if (response.status === 204) return null;
-
-  // Synthesis runs outside the server command lock and may take seconds.
-  await revalidateExactTtsAuthority(authority, signal, deps);
-  const blob = await response.blob();
-  if (blob.size <= 0 || !blob.type.startsWith("audio/")) {
-    throw new AutopilotMediaError(
-      "audio_playback_failed", "TTS 服务返回的音频无效",
-      { failureStage: "blob_invalid" });
-  }
-  // Blob materialization can itself be asynchronous.  Re-prove exact authority
-  // at the last await boundary before URL creation/play; stale bytes are dropped
-  // here and never reach either Audio.play() or a browser-speech fallback.
-  await revalidateExactTtsAuthority(authority, signal, deps);
-  return blob;
 }
 
 /**

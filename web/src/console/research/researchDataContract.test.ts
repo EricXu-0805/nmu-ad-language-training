@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  RESEARCH_DATASET_KEYS,
   parseResearchDictionary,
   parseResearchMeta,
   parseResearchPage,
@@ -90,6 +91,22 @@ test("parseResearchPage：行按列顺序投影成数组", () => {
   assert.equal(page.hasMore, false);
 });
 
+test("无录音的跳过题可从研究数据入口读取，保留题号与原因", () => {
+  assert.ok(RESEARCH_DATASET_KEYS.includes("adjudications"));
+  assert.equal(researchDatasetPath({
+    dataset: "adjudications", classification: "research",
+  }), "/research/v1/adjudications?data_classification=research");
+  const page = parseResearchPage(pagePayload({
+    dataset: "adjudications",
+    columns: ["item_id", "presentation_order", "turn_seq", "kind", "reason_code"],
+    rows: [{
+      item_id: "SE_熨斗", presentation_order: 2, turn_seq: 1,
+      kind: "skipped", reason_code: "participant_declined",
+    }],
+  }), "adjudications", "research");
+  assert.deepEqual(page.rows, [["SE_熨斗", 2, 1, "skipped", "participant_declined"]]);
+});
+
 test("parseResearchPage：多出一个未声明的列就拒绝渲染整页", () => {
   const rows = [{ ...(pagePayload().rows as Record<string, unknown>[])[0], patient_id: "P-001" }];
   assert.throws(
@@ -149,6 +166,12 @@ test("researchDatasetPath：没有游标和 limit 时不发空参数", () => {
     researchDatasetPath({ dataset: "subjects", classification: "simulation" }),
     "/research/v1/subjects?data_classification=simulation",
   );
+});
+
+test("研究页下载带屏幕上的版本，服务端可拒绝中途发布的新版本", () => {
+  assert.equal(researchDatasetPath({
+    dataset: "adjudications", classification: "research", csv: true, expectedEpochSeq: 3,
+  }), "/research/v1/adjudications.csv?data_classification=research&expected_epoch_seq=3");
 });
 
 test("researchCsvFilename：文件名带分区与纪元号，避免两份存混也避免两版存混", () => {

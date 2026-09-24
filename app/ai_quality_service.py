@@ -1549,7 +1549,8 @@ def _valid_pause_events(
         for row in grouped["interactions"]
     )
     worker_candidates: list[AutopilotControlEvent] = []
-    worker_boundary_counts: dict[tuple[int, int, int], int] = defaultdict(int)
+    events_by_seq = {row.event_seq: row for row in grouped["control_events"]}
+    worker_boundary_counts: dict[tuple[int, int, int, int | None], int] = defaultdict(int)
     for row in grouped["control_events"]:
         if row.event_type != "failure":
             continue
@@ -1565,7 +1566,8 @@ def _valid_pause_events(
             and not isinstance(row.command_id, bool)
         ):
             worker_boundary_counts[
-                (row.command_id, row.control_generation, row.runner_generation)
+                (row.command_id, row.control_generation, row.runner_generation,
+                 _attempt_failure_episode(row, events_by_seq))
             ] += 1
     valid_worker_pauses = 0
     for row in worker_candidates:
@@ -1573,9 +1575,10 @@ def _valid_pause_events(
             row.command_id,
             row.control_generation,
             row.runner_generation,
+            _attempt_failure_episode(row, events_by_seq),
         )
         if (
-            _worker_exception_control_pause_valid(row)
+            _worker_exception_control_pause_valid(row, events_by_seq)
             and worker_boundary_counts.get(boundary) == 1
         ):
             valid_worker_pauses += 1
@@ -1599,8 +1602,52 @@ def _canonical_control_payload(
     return payload if canonical == row.payload_json else None
 
 
+def _attempt_failure_episode(
+    row: AutopilotControlEvent,
+    events_by_seq: dict[int, AutopilotControlEvent],
+) -> int | None:
+    """Resolve a failure key only through the exact saved-recording resume proof."""
+    if (not isinstance(row.command_id, int) or isinstance(row.command_id, bool)
+            or not isinstance(row.reason_code, str)):
+        return None
+    base = autopilot_ledger.attempt_failure_event_key(
+        row.session_id, row.command_id, row.reason_code)
+    original_key = row.idempotency_key == base
+    resume = events_by_seq.get(row.event_seq - 1)
+    if resume is None or (not original_key
+                          and row.idempotency_key != f"{base}-r{resume.event_seq}"):
+        return 0 if original_key else None
+    if not (
+        resume.event_type == "resume"
+        and resume.session_id == row.session_id
+        and resume.scope_key == row.scope_key
+        and resume.control_generation == row.control_generation
+        and resume.runner_generation == row.runner_generation
+        and resume.command_id == row.command_id
+        and resume.actor_type == "researcher"
+        and bool((resume.actor_id or "").strip())
+        and resume.from_mode == resume.to_mode == "autonomous"
+        and resume.from_status == "paused"
+        and resume.to_status == "processing_attempt"
+        and resume.reason_code == "researcher_explicit_resume"
+        and _canonical_control_payload(resume) == {
+            "reason_code": "researcher_explicit_resume",
+            "source": "account_resume_endpoint",
+        }
+        and (original_key or any(previous.idempotency_key == base
+                and previous.event_type == "failure"
+                and previous.event_seq < resume.event_seq
+                and previous.command_id == row.command_id
+                and previous.session_id == row.session_id
+                for previous in events_by_seq.values()))
+    ):
+        return 0 if original_key else None
+    return resume.event_seq
+
+
 def _worker_exception_control_pause_valid(
     row: AutopilotControlEvent,
+    events_by_seq: dict[int, AutopilotControlEvent],
 ) -> bool:
     payload = _canonical_control_payload(row)
     return bool(
@@ -1613,8 +1660,7 @@ def _worker_exception_control_pause_valid(
         and isinstance(row.idempotency_key, str)
         and isinstance(row.command_id, int)
         and not isinstance(row.command_id, bool)
-        and row.idempotency_key == autopilot_ledger.attempt_failure_event_key(
-            row.session_id, row.command_id, row.reason_code)
+        and _attempt_failure_episode(row, events_by_seq) is not None
         and row.session_id
         and row.event_seq >= 1
         and row.scope_key == "p0a_sim_first_single_v1"
@@ -1633,6 +1679,7 @@ def _worker_exception_control_pause_valid(
 def _takeover_predecessor_valid(
     takeover: AutopilotControlEvent,
     predecessor: AutopilotControlEvent | None,
+    events_by_seq: dict[int, AutopilotControlEvent],
 ) -> bool:
     """Verify the exact latest media-stop fact used by safe takeover.
 
@@ -1692,12 +1739,7 @@ def _takeover_predecessor_valid(
             and isinstance(predecessor.command_id, int)
             and not isinstance(predecessor.command_id, bool)
             and isinstance(predecessor.reason_code, str)
-            and predecessor.idempotency_key
-            == autopilot_ledger.attempt_failure_event_key(
-                predecessor.session_id,
-                predecessor.command_id,
-                predecessor.reason_code,
-            )
+            and _attempt_failure_episode(predecessor, events_by_seq) is not None
             and source in {"attempt_processing", "worker_exception"}
             and predecessor.actor_type == "system"
             and predecessor.from_status == "processing_attempt"
@@ -1757,7 +1799,7 @@ def _valid_takeover_count(grouped: dict[str, list]) -> tuple[int, int]:
             and row.from_status == row.to_status
             and row.from_status in {"paused", "scope_completed", "failed"}
             and _takeover_predecessor_valid(
-                row, events_by_seq.get(row.event_seq - 1))
+                row, events_by_seq.get(row.event_seq - 1), events_by_seq)
         ):
             valid += 1
         else:

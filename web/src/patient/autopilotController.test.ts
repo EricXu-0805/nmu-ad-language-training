@@ -4103,7 +4103,8 @@ test("ACK 瞬时失败(legacy 直连)：重发的是同一个 ack 对象、同�
     speech: {
       start: () => ({
         started: Promise.resolve({ media_duration_ms: 900 }),
-        ended: new Promise(() => {}),
+        // 夹具已经 closed,必须同时结清 ended;否则只留下无关的 120 s 媒体期限。
+        ended: Promise.resolve({ media_duration_ms: 900 }),
         closed: Promise.resolve(),
         cancel: () => {},
       }),
@@ -4139,7 +4140,7 @@ test("delivery 没有重放能力：ACK 瞬时失败零重试，照旧 technical
     speech: {
       start: () => ({
         started: Promise.resolve({ media_duration_ms: 900 }),
-        ended: new Promise(() => {}),
+        ended: Promise.resolve({ media_duration_ms: 900 }),
         closed: Promise.resolve(),
         cancel: () => {},
       }),
@@ -4159,3 +4160,62 @@ test("delivery 没有重放能力：ACK 瞬时失败零重试，照旧 technical
   assert.equal(state.phase, "paused");
   assert.equal(state.pause_reason, "technical_failure");
 });
+
+for (const pauseAfterClick of [false, true]) {
+  test(`现在回答真实停止朗读后才回执,单次签发录音；点击后暂停=${pauseAfterClick}`, async () => {
+    const events: string[] = [];
+    const acks: AutopilotAck[] = [];
+    let stopped = false;
+    let finish!: (value: { interrupted: true; media_duration_ms: number }) => void;
+    let close!: () => void;
+    let ready!: () => void;
+    const canInterrupt = new Promise<void>((resolve) => { ready = resolve; });
+    const ended = new Promise<{ interrupted: true; media_duration_ms: number }>((resolve) => { finish = resolve; });
+    const closed = new Promise<void>((resolve) => { close = resolve; });
+    const queue = [questionCommand(), questionCommand("started"), recordCommand()];
+    const controller = new PatientAutopilotController({
+      sessionId: "S-ANSWER-NOW-CONTROLLER",
+      transport: {
+        next: async () => queue.shift() ?? null,
+        ack: async (_sessionId, _key, ack) => {
+          events.push(ack.ack_type);
+          if (ack.ack_type === "tts_interrupted") assert.equal(stopped, true);
+          acks.push(ack);
+          return {};
+        },
+      },
+      speech: { start: () => ({
+        started: Promise.resolve({ media_duration_ms: 3_000 }), ended, closed,
+        answerNow: () => {
+          if (stopped) return false;
+          stopped = true;
+          events.push("physical:stopped");
+          close();
+          finish({ interrupted: true, media_duration_ms: 600 });
+          return true;
+        },
+        cancel: () => { close(); },
+      }) },
+      recording: { start: () => { throw new Error("没有录音命令就不能开麦"); } },
+      idempotencyKey: fixedAckKey,
+      onState: (state) => {
+        if (state.phase === "tts_playing" && state.command?.state === "started") ready();
+      },
+    });
+    const polled = controller.pollOnce();
+    await canInterrupt;
+    assert.equal(controller.answerNow(), true);
+    assert.equal(controller.answerNow(), false);
+    if (pauseAfterClick) controller.stop();
+    const state = await polled;
+    assert.equal(acks.some((ack) => ack.ack_type === "tts_ended"), false);
+    if (pauseAfterClick) {
+      assert.deepEqual(events, ["tts_started", "physical:stopped"]);
+    } else {
+      assert.deepEqual(events, ["tts_started", "physical:stopped", "tts_interrupted"]);
+      assert.equal(state.phase, "record_ready");
+      assert.equal(state.command?.kind, "record");
+      assert.equal(state.command?.prompt_level, 0);
+    }
+  });
+}

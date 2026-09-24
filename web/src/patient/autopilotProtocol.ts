@@ -106,6 +106,12 @@ export type AutopilotAck =
     media_duration_ms?: number;
   })
   | (AckBase & {
+    ack_type: "tts_interrupted";
+    media_stopped: true;
+    interrupt_reason: "answer_now";
+    media_duration_ms: number;
+  })
+  | (AckBase & {
     ack_type: "tts_failed";
     error_code: AutopilotErrorCode;
     failure_stage?: AutopilotFailureStage;
@@ -134,6 +140,7 @@ export type AutopilotAck =
 export type AutopilotAckFacts =
   | Omit<Extract<AutopilotAck, { ack_type: "tts_started" }>, keyof AckBase>
   | Omit<Extract<AutopilotAck, { ack_type: "tts_ended" }>, keyof AckBase>
+  | Omit<Extract<AutopilotAck, { ack_type: "tts_interrupted" }>, keyof AckBase>
   | Omit<Extract<AutopilotAck, { ack_type: "tts_failed" }>, keyof AckBase>
   | Omit<Extract<AutopilotAck, { ack_type: "record_started" }>, keyof AckBase>
   | Omit<Extract<AutopilotAck, { ack_type: "record_stopped" }>, keyof AckBase>
@@ -324,6 +331,13 @@ export function parseAutopilotAck(value: unknown): AutopilotAck {
           && row.media_ended === true
           && (!Object.hasOwn(row, "media_duration_ms")
             || safeInteger(row.media_duration_ms, 0, 21_600_000))) {
+        return row as unknown as AutopilotAck;
+      }
+      break;
+    case "tts_interrupted":
+      if (exact(["media_stopped", "interrupt_reason", "media_duration_ms"])
+          && row.media_stopped === true && row.interrupt_reason === "answer_now"
+          && safeInteger(row.media_duration_ms, 0, 21_600_000)) {
         return row as unknown as AutopilotAck;
       }
       break;

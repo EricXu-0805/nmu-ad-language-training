@@ -850,7 +850,7 @@ def test_withdrawal_migration_fresh_check_and_parent_roundtrip(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version")).scalar_one() == (
-                "f4b2d8c1a635")
+                "a7c3e9d2b641")
 
     command.downgrade(config, "f2b7d4e9a106")
     inspector = inspect(engine)

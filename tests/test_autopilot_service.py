@@ -3452,6 +3452,38 @@ def test_attempt_submission_is_nonblocking_and_deduplicates_in_process(
     assert finished.wait(timeout=2)
 
 
+def test_explicit_resume_schedules_without_waiting_for_fenced_provider(monkeypatch):
+    _enable_p0a(monkeypatch)
+    old_entered, old_release, old_finished = threading.Event(), threading.Event(), threading.Event()
+    new_entered, new_release, new_finished = threading.Event(), threading.Event(), threading.Event()
+
+    def old_worker(_session_id):
+        old_entered.set()
+        old_release.wait(timeout=5)
+        old_finished.set()
+
+    def new_worker(_session_id):
+        new_entered.set()
+        new_release.wait(timeout=5)
+        new_finished.set()
+
+    sid = "S-P0A-SCHEDULER-RESUMED"
+    try:
+        assert autopilot_orchestration.submit(sid, old_worker) is True
+        assert old_entered.wait(timeout=2)
+        assert autopilot_orchestration.submit_after_resume(sid, new_worker) is True
+        assert new_entered.wait(timeout=2)
+        assert old_finished.is_set() is False
+        old_release.set()
+        assert old_finished.wait(timeout=2)
+        assert autopilot_orchestration.inflight_for_tests(sid) is True
+        assert autopilot_orchestration.submit(sid, new_worker) is False
+    finally:
+        old_release.set()
+        new_release.set()
+    assert new_finished.wait(timeout=2)
+
+
 def test_account_status_disabled_is_canonical_and_active_state_is_consistent(
         service_engine, monkeypatch):
     _enable_p0a(monkeypatch)

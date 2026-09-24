@@ -1273,6 +1273,27 @@ def test_session_plan_expands_turns(client):
     assert d["total_items"] == 32 and d["total_turns"] == 20 + 10 * 5 + 2 * 4
 
 
+def test_session_scores_excludes_partially_skipped_multi_item(client):
+    _mk_session(client)
+    with Session(client.test_engine) as session:
+        item = models.ItemEvent(session_id="SM0", item_id="ME_partial", task_type="多要素",
+                                item_set_type="训练集", presentation_order=31)
+        session.add(item)
+        session.flush()
+        session.add(models.TurnEvent(
+            item_event_id=item.id, turn_seq=1, response_role="要素一", score_locked=True,
+            confirmed_response_text="已确认", prompt_level=0, element_value=1, reviewed_score=1))
+        session.add(models.AutopilotPositionAdjudication(
+            session_id="SM0", item_id="ME_partial", turn_seq=2, presentation_order=31,
+            kind="skipped", reason_code="participant_declined", actor_id="TEST-RESEARCHER",
+            control_generation=1, state_revision=1, idempotency_key="partial-score-skip"))
+        session.commit()
+    response = client.get("/sessions/SM0/scores")
+    assert response.status_code == 200, response.text
+    assert response.json()["multi"] is None
+    assert any("ME_partial" in reason for reason in response.json()["excluded_items"])
+
+
 def test_session_plan_uses_persisted_context_and_fails_closed(client):
     _mk_session(client, sid="SP2", pid="PP2")
     assert client.get("/sessions/SP2/plan").status_code == 200

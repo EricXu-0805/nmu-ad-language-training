@@ -348,14 +348,15 @@ async function renderView(context, view, props = {}) {
   }));
 }
 
-test("提问在播：屏上多一句「请听完再回答」，状态仍是正在为您朗读，不出现正在听您说", async (context) => {
+test("提问在播：提示与提前回答入口可见，实际状态仍是朗读而非收音", async (context) => {
   // 2026-09-17 养老院实测：老人在提问声里就开口，那句话没录进去，之后工作人员搭话，
   // 麦克风录到的是工作人员。提示不出声，只是屏上一句。
   const markup = await renderView(context, questionPlayingView());
   assert.match(markup, /请听完再回答/);
   assert.match(markup, /data-cue="listen-first"/);
   assert.match(markup, /正在为您朗读/);
-  assert.doesNotMatch(markup, /正在听您说/);
+  assert.doesNotMatch(markup, /role="status">正在听您说/);
+  assert.match(markup, />现在回答<\/button>/);
   assert.doesNotMatch(markup, /说完了可以点这里/);
 });
 

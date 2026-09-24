@@ -307,7 +307,7 @@ def _snapshot_with_audio(tmp_path, *, archived):
         # Synthetic archived verifier with the explicitly pinned historical
         # head/table/schema contract. All manifest/audio/export logic is real.
         source = (drill.ROOT / "scripts/verify_backup_snapshot.py").read_text()
-        source = source.replace('frozenset({"f4b2d8c1a635"})', 'frozenset({"d0c22a6dae2a"})')
+        source = source.replace('frozenset({"a7c3e9d2b641"})', 'frozenset({"d0c22a6dae2a"})')
         source = source.replace('    "rapportplaybackreceipt",\n', '')
         source = source.replace('    "autopilotpositionadjudication",\n', '')
         source = source.replace(_GUARD_MODULE.CURRENT_RECOVERY_SCHEMA_SHA256,

@@ -18,7 +18,7 @@ CommandStatus = Literal[
     "pending", "started", "succeeded", "failed", "cancelled",
 ]
 AckType = Literal[
-    "tts_started", "tts_ended", "tts_failed",
+    "tts_started", "tts_ended", "tts_interrupted", "tts_failed",
     "record_started", "record_stopped", "record_failed",
 ]
 
@@ -144,6 +144,8 @@ class AutopilotAckIn(BaseModel):
     # Closed, event-specific device facts.  Keeping these fields typed prevents
     # arbitrary strings from becoming research-control evidence.
     media_ended: bool | None = None
+    media_stopped: bool | None = None
+    interrupt_reason: Literal["answer_now"] | None = None
     media_duration_ms: int | None = Field(
         default=None, ge=0, le=21_600_000)
     mime_type: Literal[
@@ -178,6 +180,12 @@ class AutopilotAckIn(BaseModel):
 
     @model_validator(mode="after")
     def _shape_matches_ack(self) -> "AutopilotAckIn":
+        if self.ack_type == "tts_interrupted":
+            if (self.media_stopped is not True or self.interrupt_reason != "answer_now"
+                    or self.media_duration_ms is None or self.media_ended is not None):
+                raise ValueError("tts_interrupted 必须证明已停播及真实已播时长，不得冒充播完")
+        elif self.media_stopped is not None or self.interrupt_reason is not None:
+            raise ValueError("只有 tts_interrupted 可以携带打断事实")
         receipt_fields = (
             self.raw_audio_id,
             self.receipt_server_seq,
@@ -221,6 +229,9 @@ class AutopilotAckIn(BaseModel):
             if any(value is not None for value in tts_fields + record_start_fields) \
                     or self.stop_reason is not None:
                 raise ValueError("tts_failed 回执携带了非法事件事实")
+        elif self.ack_type == "tts_interrupted":
+            if any(value is not None for value in record_start_fields) or self.stop_reason is not None:
+                raise ValueError("tts_interrupted 回执携带了非法事件事实")
         elif self.ack_type == "record_started":
             if self.mime_type is None:
                 raise ValueError("record_started 必须携带受限 mime_type")
@@ -248,6 +259,9 @@ class AutopilotAckIn(BaseModel):
             if self.media_duration_ms is not None:
                 payload["media_duration_ms"] = self.media_duration_ms
             return payload
+        if self.ack_type == "tts_interrupted":
+            return {"media_stopped": True, "interrupt_reason": "answer_now",
+                    "media_duration_ms": self.media_duration_ms}
         if self.ack_type in {"tts_failed", "record_failed"}:
             assert self.error_code is not None
             failure_payload: dict[str, bool | int | str] = {
@@ -279,6 +293,9 @@ _TRANSITIONS: dict[tuple[CommandKind, CommandStatus, AckType], AckTransition] = 
     # 收敛，但绝不允许 started 触发录音。
     ("tts", "pending", "tts_ended"): AckTransition("succeeded", "route_after_tts"),
     ("tts", "started", "tts_ended"): AckTransition("succeeded", "route_after_tts"),
+    # Explicit early-answer requests stop a started question/cue. They are not
+    # successful playback and cannot advance feedback/tell-answer positions.
+    ("tts", "started", "tts_interrupted"): AckTransition("cancelled", "route_after_tts"),
     ("tts", "pending", "tts_failed"): AckTransition("failed", "pause"),
     ("tts", "started", "tts_failed"): AckTransition("failed", "pause"),
     ("record", "pending", "record_started"): AckTransition("started", "none"),

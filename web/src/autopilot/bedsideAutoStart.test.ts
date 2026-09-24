@@ -45,6 +45,10 @@ function greenGates(overrides: Partial<BedsideAutoStartGates> = {}): BedsideAuto
   };
 }
 
+test("resetting the start position cannot retry a previously attempted bedside start", () => {
+  assert.equal(canAutoStartServerAutopilot(greenGates({ alreadyAttempted: true })), false);
+});
+
 // 复现操作端的组合行为:锁存 + 同步 attempted 闸 + 每次渲染重评策略。
 // 返回真实会发出的自动启动写请求次数。
 function renderCycles(

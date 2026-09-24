@@ -47,7 +47,7 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
   readonly ended: AutopilotSpeechPlayback["ended"];
   readonly closed: Promise<void>;
   private readonly startedDeferred = deferred<{ media_duration_ms?: number }>();
-  private readonly endedDeferred = deferred<{ media_duration_ms?: number }>();
+  private readonly endedDeferred = deferred<{ media_duration_ms?: number; interrupted?: true }>();
   private readonly closedDeferred = deferred<void>();
   private readonly abortController = new AbortController();
   private readonly audio: HTMLAudioElement;
@@ -83,6 +83,22 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
     this.startedDeferred.reject(error);
     this.endedDeferred.reject(error);
     this.closedDeferred.resolve(undefined);
+  }
+
+  answerNow(): boolean {
+    if (this.terminal || this.audio.ended === true || this.startAtMs === null
+        || !Number.isFinite(this.audio.currentTime) || this.audio.currentTime < 0
+        || (this.command.payload.purpose !== "question" && this.command.payload.purpose !== "cue")) return false;
+    // Settle only after the actual element is paused. This is an interruption,
+    // never a fabricated ended event, and it does not open any microphone.
+    try { this.audio.pause(); } catch { return false; }
+    if (!this.audio.paused) return false;
+    this.terminal = true;
+    const elapsed = Math.round(this.audio.currentTime * 1_000);
+    this.cleanupUrl();
+    this.endedDeferred.resolve({ interrupted: true, media_duration_ms: elapsed });
+    this.closedDeferred.resolve(undefined);
+    return true;
   }
 
   private cleanupUrl(): void {

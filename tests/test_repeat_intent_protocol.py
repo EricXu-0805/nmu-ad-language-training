@@ -24,7 +24,7 @@ from app.autopilot_contract import RecordCommandPayload, TtsCommandPayload
 
 
 REPEAT_REVISION = "d3f8b5c1a704"
-CURRENT_HEAD = "f4b2d8c1a635"
+CURRENT_HEAD = "a7c3e9d2b641"
 # Compatibility export consumed by the zero-modification legacy recovery test.
 HEAD = CURRENT_HEAD
 PARENT = "c7d4f9a1e603"

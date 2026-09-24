@@ -111,6 +111,7 @@ export interface PatientAutopilotView {
   stopMediaNow(): void;
   stopForPatientPauseNow(): void;
   stopRecordingNow(): void;
+  answerNow?(): boolean;
 }
 
 function blockedReason(error: unknown): string {
@@ -767,5 +768,6 @@ export function usePatientAutopilot(input: {
     stopMediaNow: () => controllerRef.current?.stop(),
     stopForPatientPauseNow: () => controllerRef.current?.stopForPatientPause(),
     stopRecordingNow: () => controllerRef.current?.stopRecordingNow(),
+    answerNow: () => controllerRef.current?.answerNow() ?? false,
   };
 }
