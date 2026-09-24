@@ -579,14 +579,28 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
                 return expected
 
             def adjudicate(kind_label: str, dialog_title: str, reason_label: str,
-                           note: str | None, confirm_label: str) -> None:
+                           note: str | None, confirm_label: str, order: int) -> None:
                 button = admin_page.get_by_role("button", name=kind_label, exact=True)
                 button.wait_for(state="visible", timeout=20_000)
                 wait_for(button.is_enabled, (admin_page,), timeout_seconds=20, label=f"「{kind_label}」可点")
                 button.click()
                 dialog = admin_page.get_by_role("dialog", name=dialog_title, exact=True)
                 dialog.wait_for(state="visible", timeout=10_000)
+                expected_position = f"第 {order} 题 · 单要素 · 第 1 环节（命名）"
+                if expected_position not in dialog.inner_text():
+                    raise RuntimeError("裁定确认框没有明确标出本次要处理的题号和环节")
                 dialog.get_by_label(reason_label, exact=True).check()
+                if order == 1 and kind_label == "老人已答对":
+                    # Invalid pasted notes must stay editable; zero POSTs, no false
+                    # uncertain outcome that disappears on the next status poll.
+                    before = len(obs["adjudications"])
+                    dialog.get_by_label(NOTE_FIELD_LABEL, exact=True).fill("备注\u200b")
+                    dialog.get_by_role("button", name=confirm_label, exact=True).click()
+                    dialog.get_by_role("alert").filter(has_text="裁定未记录").wait_for(
+                        state="visible", timeout=10_000)
+                    if len(obs["adjudications"]) != before:
+                        raise RuntimeError("非法备注不应发出裁定请求")
+                    dialog.get_by_label(NOTE_FIELD_LABEL, exact=True).fill("")
                 if note is not None:
                     dialog.get_by_label(NOTE_FIELD_LABEL, exact=True).fill(note)
                 dialog.get_by_role("button", name=confirm_label, exact=True).click()
@@ -678,7 +692,7 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
 
             # ---- 链 F:没录音时「老人已答对」409 常驻提示、不折 uncertain;「跳过本题」200 ----
             obs["expect_attempt_required"] = True
-            adjudicate("老人已答对", "确认老人已答对？", NO_ANSWER_REASON_LABEL, None, "确认老人已答对")
+            adjudicate("老人已答对", "确认老人已答对？", NO_ANSWER_REASON_LABEL, None, "确认老人已答对", 1)
             wait_for(lambda: len(adjudication_rows()) == 1 and adjudication_rows()[0]["status"] == 409,
                       (admin_page,), timeout_seconds=20, label="没录音时「老人已答对」被 409 拒绝")
             rejected = adjudication_rows()[0]
@@ -693,7 +707,7 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
             if status_receipt().get("state_revision") != receipt_f.get("state_revision"):
                 raise BrowserAcceptanceError("被拒的裁定改动了服务端状态")
 
-            adjudicate("跳过本题", "确认跳过本题？", NO_ANSWER_SKIP_REASON_LABEL, None, "确认跳过本题")
+            adjudicate("跳过本题", "确认跳过本题？", NO_ANSWER_SKIP_REASON_LABEL, None, "确认跳过本题", 1)
             wait_for(lambda: len(adjudication_rows()) == 2 and adjudication_rows()[1]["status"] == 200,
                       (admin_page,), timeout_seconds=20, label="没录音时「跳过本题」写入 200")
             skipped_f = adjudication_rows()[1]
@@ -793,7 +807,7 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
             if not ai_verdict_second:
                 raise BrowserAcceptanceError("裁定前最后一次回答没有 AI 判类")
 
-            adjudicate("老人已答对", "确认老人已答对？", CONFIRMED_REASON_LABEL, ADJUDICATION_NOTE, "确认老人已答对")
+            adjudicate("老人已答对", "确认老人已答对？", CONFIRMED_REASON_LABEL, ADJUDICATION_NOTE, "确认老人已答对", 2)
             wait_for(lambda: len(adjudication_rows()) == 3 and adjudication_rows()[2]["status"] == 200,
                       (admin_page,), timeout_seconds=20, label="「老人已答对」写入 200")
             confirmed = adjudication_rows()[2]
@@ -832,7 +846,7 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
                 raise BrowserAcceptanceError("链 C 暂停后的题位不是第 3 题")
             wait_admin_card_paused("链 C 暂停")
             header_label_third = wait_header_label(3, "链 E 第 3 题")
-            adjudicate("跳过本题", "确认跳过本题？", SKIP_REASON_LABEL, None, "确认跳过本题")
+            adjudicate("跳过本题", "确认跳过本题？", SKIP_REASON_LABEL, None, "确认跳过本题", 3)
             wait_for(lambda: len(adjudication_rows()) == 4 and adjudication_rows()[3]["status"] == 200,
                       (admin_page,), timeout_seconds=20, label="「跳过本题」写入 200")
             skipped_c = adjudication_rows()[3]

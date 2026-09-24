@@ -33,7 +33,7 @@ const RECEIPT_KEYS = new Set([
   "command_revision", "status", "state_revision", "command",
 ]);
 const ACK_TYPES = new Set([
-  "tts_started", "tts_ended", "tts_failed",
+  "tts_started", "tts_ended", "tts_interrupted", "tts_failed",
   "record_started", "record_stopped", "record_failed",
 ]);
 const COMMAND_STATES = new Set(["pending", "started", "succeeded", "failed", "cancelled"]);
@@ -81,6 +81,7 @@ export function parseAutopilotAckReceipt(
   const command = row.command === null ? null : parseNextCommandProjection(row.command);
   const expectedState = expected.ack.ack_type.endsWith("_started")
     ? "started"
+    : expected.ack.ack_type === "tts_interrupted" ? "cancelled"
     : expected.ack.ack_type.endsWith("_failed") ? "failed" : "succeeded";
   // A replay must prove the same immutable lifecycle edge, not merely echo an
   // idempotency key after the command has moved somewhere else.

@@ -1,5 +1,5 @@
 import { ApiError } from "../apiResponse.ts";
-import type { Session } from "../types";
+import type { PlanItem, Session, SessionPlan } from "../types";
 
 export const P0A_SCOPE_KEY = "p0a_sim_first_single_v1" as const;
 
@@ -19,6 +19,56 @@ const SAFE_ERROR_CODE = /^[a-z][a-z0-9_]{0,95}$/;
 export interface AutopilotStartRequest {
   idempotency_key: string;
   expected_revision: 0;
+  start_presentation_order?: number;
+  skip_reason_code?: AutopilotStartSkipReason;
+  skip_note?: string;
+}
+
+export type AutopilotStartSkipReason = "trained_in_prior_sitting" | "other";
+
+export interface AutopilotStartOptions {
+  startPresentationOrder: number;
+  skipReasonCode?: AutopilotStartSkipReason | null;
+  skipNote?: string;
+}
+
+/** 起点只来自冻结计划题号，不从数组下标或题目标识推算。 */
+export function autopilotStartPreview(
+  plan: SessionPlan | null, presentationOrder: number,
+): { startItem: PlanItem; skippedItems: PlanItem[]; skippedTurns: number } | null {
+  if (!plan || !Number.isSafeInteger(presentationOrder) || presentationOrder < 1
+      || plan.items.length === 0) return null;
+  let previous = 0;
+  for (const item of plan.items) {
+    if (!Number.isSafeInteger(item.presentation_order) || item.presentation_order <= previous
+        || item.turns.length === 0) return null;
+    previous = item.presentation_order;
+  }
+  const startItem = plan.items.find((item) => item.presentation_order === presentationOrder);
+  if (!startItem) return null;
+  const skippedItems = plan.items.filter((item) => item.presentation_order < presentationOrder);
+  return {
+    startItem,
+    skippedItems,
+    skippedTurns: skippedItems.reduce((count, item) => count + item.turns.length, 0),
+  };
+}
+
+export function allowsAutopilotStartSelection(
+  receipt: AutopilotStatusReceipt | null,
+  attemptCount: number | null,
+  hasExistingEvidence: boolean,
+): boolean {
+  return receipt?.scopeKey === "disabled" && receipt.stateRevision === 0
+    && receipt.mode === "disabled" && receipt.status === "idle"
+    && !receipt.serverOwned && attemptCount === 0 && !hasExistingEvidence;
+}
+
+/** 床旁激活仅能使用未编辑的默认起点；改回1不会自行清掉编辑锁。 */
+export function allowsBedsideDefaultStart(
+  presentationOrder: number, selectionEdited: boolean, confirmationOpen: boolean,
+): boolean {
+  return presentationOrder === 1 && !selectionEdited && !confirmationOpen;
 }
 
 export interface AutopilotTakeoverRequest {
@@ -120,13 +170,36 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
  * therefore be retried without minting a second control fact. The current UI
  * creates short opaque ASCII session ids; legacy/untrusted ids stay fail-closed.
  */
-export function buildAutopilotStartRequest(sessionId: string): AutopilotStartRequest {
+export function buildAutopilotStartRequest(
+  sessionId: string, options?: AutopilotStartOptions,
+): AutopilotStartRequest {
   if (!SAFE_SESSION_ID.test(sessionId)) {
     throw new Error("当前场次标识不能安全用于自动驾驶启动");
   }
-  return {
+  const request: AutopilotStartRequest = {
     idempotency_key: `p0a.start.${sessionId}`,
     expected_revision: 0,
+  };
+  const order = options?.startPresentationOrder ?? 1;
+  if (!Number.isSafeInteger(order) || order < 1) {
+    throw new Error("请选择冻结计划中的起始题号");
+  }
+  const note = options?.skipNote?.trim() ?? "";
+  if ([...note].length > 200 || /[\p{Cc}\p{Cf}]/u.test(note)) {
+    throw new Error("跳过备注限200字，不能包含控制字符");
+  }
+  if (order === 1) {
+    if (options?.skipReasonCode || note) throw new Error("从第1题开始时不能附带跳过原因或备注");
+    return request;
+  }
+  if (options?.skipReasonCode !== "trained_in_prior_sitting" && options?.skipReasonCode !== "other") {
+    throw new Error("请选择跳过前面题目的原因");
+  }
+  return {
+    ...request,
+    start_presentation_order: order,
+    skip_reason_code: options.skipReasonCode,
+    ...(note ? { skip_note: note } : {}),
   };
 }
 
@@ -287,7 +360,8 @@ export function receiptAllowsAutopilotResume(
 export function receiptAllowsAutopilotAdjudication(
   receipt: AutopilotStatusReceipt | null,
 ): boolean {
-  return receiptAllowsAutopilotResume(receipt) && receipt?.mode === "autonomous";
+  return receiptAllowsAutopilotResume(receipt) && receipt?.mode === "autonomous"
+    && receipt.lastErrorCode !== "autopilot_adjudication_saved";
 }
 
 /** 服务端 409 的规范 code(nested-detail 信封);其他形状一律 null。 */
@@ -416,6 +490,8 @@ const PREWRITE_START_REJECTION_CODES = new Set([
   // 都是写前确定性 409,折成 uncertain 会让研究者对着可点的按钮反复空击。
   "autopilot_content_incomplete",
   "autopilot_device_not_paired",
+  // 起点不在冻结计划或没有可训练环节，服务端尚未写入启动/跳过事实。
+  "autopilot_start_position_invalid",
 ]);
 
 export function isPrewriteStartRejection(error: unknown): boolean {

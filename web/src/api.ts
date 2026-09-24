@@ -49,6 +49,7 @@ import {
   parseAutopilotStatusReceipt,
   type AutopilotAdjudicationKind,
   type AutopilotStartReceipt,
+  type AutopilotStartOptions,
 } from "./autopilot/startControl";
 import {
   parseProviderReadiness,
@@ -685,6 +686,7 @@ export const api = {
     classification: ResearchDataClassification;
     cursor?: string | null;
     limit?: number | null;
+    expectedEpochSeq?: number | null;
   }): Promise<Blob> =>
     fetchResearchCsv(researchDatasetPath({ ...request, csv: true })),
   researchDictionaryCsv: (): Promise<Blob> =>
@@ -910,11 +912,11 @@ export const api = {
     ), sid),
   // 具名研究者显式启动模拟 P0a。响应在进入控制台状态前缩成不含题目、答案、
   // 设备凭据的最小收据；患者设备命令只能走独立 capability 路由获取。
-  startAutopilotP0a: async (sid: string): Promise<AutopilotStartReceipt> =>
+  startAutopilotP0a: async (sid: string, options?: AutopilotStartOptions): Promise<AutopilotStartReceipt> =>
     parseAutopilotStatusReceipt(await req<unknown>(
       "POST",
       `/sessions/${encodeURIComponent(sid)}/autopilot/start`,
-      buildAutopilotStartRequest(sid),
+      buildAutopilotStartRequest(sid, options),
     )),
   autopilotStatus: async (sid: string): Promise<AutopilotStartReceipt> =>
     parseAutopilotStatusReceipt(await req<unknown>(

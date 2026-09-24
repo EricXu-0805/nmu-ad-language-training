@@ -2102,8 +2102,8 @@ class RuntimeCommand(SQLModel, table=True):
     A command is an execution instruction, not a browser-local timer.  The
     control/runner generations fence stale controllers and workers; ``revision``
     fences stale writes within the same generation.  A record command must point
-    to both its preceding TTS command and the exact ``tts_ended`` ACK idempotency
-    key.  The service layer still verifies those cross-row facts before issuance.
+    to both its preceding TTS command and the exact terminal playback ACK
+    idempotency key (natural end or explicit stopped-to-answer).  The service layer still verifies those cross-row facts before issuance.
     """
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_runtime_command_idempotency_key"),
@@ -2301,7 +2301,7 @@ class RuntimeCommandAck(SQLModel, table=True):
         CheckConstraint("runner_generation >= 1",
                         name="ck_runtime_command_ack_runner_generation"),
         CheckConstraint(
-            "ack_type IN ('tts_started','tts_ended','tts_failed',"
+            "ack_type IN ('tts_started','tts_ended','tts_interrupted','tts_failed',"
             "'record_started','record_stopped','record_failed')",
             name="ck_runtime_command_ack_type"),
         CheckConstraint(

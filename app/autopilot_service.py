@@ -357,7 +357,7 @@ class ApplyDeviceAckResult(BaseModel):
     scope_key: Literal["p0a_sim_first_single_v1"] = P0A_SCOPE_KEY
     ack_idempotency_key: str
     ack_type: Literal[
-        "tts_started", "tts_ended", "tts_failed",
+        "tts_started", "tts_ended", "tts_interrupted", "tts_failed",
         "record_started", "record_stopped", "record_failed",
     ]
     replayed: bool
@@ -1845,7 +1845,7 @@ def _project_command(
         predecessor = db.get(RuntimeCommand, command.predecessor_command_id)
         if (predecessor is None
                 or predecessor.kind != "tts"
-                or predecessor.state != "succeeded"
+                or predecessor.state not in {"succeeded", "cancelled"}
                 or predecessor.session_id != command.session_id
                 or predecessor.item_id != command.item_id
                 or predecessor.turn_seq != command.turn_seq
@@ -1961,6 +1961,9 @@ def start_p0a(
     idempotency_key: str,
     expected_revision: int,
     actor_id: str,
+    start_presentation_order: int = 1,
+    skip_reason_code: str | None = None,
+    skip_note: str | None = None,
     bank: content.ItemBank | None = None,
     protocol: dict | None = None,
     now: datetime | None = None,
@@ -1977,6 +1980,22 @@ def start_p0a(
     actor_id = _required_text(actor_id, "actor_id")
     if len(actor_id) > 128:
         _fail("autopilot_input_invalid", "actor_id 过长")
+    if (not isinstance(start_presentation_order, int)
+            or isinstance(start_presentation_order, bool)
+            or start_presentation_order < 1):
+        _fail("autopilot_input_invalid", "起始题号必须是冻结计划中的正整数题号")
+    if skip_note is not None:
+        if not isinstance(skip_note, str):
+            _fail("autopilot_input_invalid", "跳过备注必须是文字")
+        skip_note = skip_note.strip() or None
+        if skip_note and (len(skip_note) > 200 or any(
+                unicodedata.category(ch) in ("Cc", "Cf") for ch in skip_note)):
+            _fail("autopilot_input_invalid", "跳过备注须为不超过200字的单行文字")
+    if start_presentation_order == 1:
+        if skip_reason_code is not None or skip_note is not None:
+            _fail("autopilot_input_invalid", "从第一题开始时不能提交跳过原因或备注")
+    elif skip_reason_code not in {"trained_in_prior_sitting", "other"}:
+        _fail("autopilot_input_invalid", "指定起始题须说明前面题目的跳过原因")
     observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
     resolved_bank = bank if bank is not None else _session_week_bank(db, session_id)
     resolved_protocol = protocol or _default_protocol()
@@ -1996,6 +2015,23 @@ def start_p0a(
     if locked_session is None:
         _fail("autopilot_session_unavailable", "场次不存在或不可用于 P0a")
 
+    resolved = _resolved_profile_plan(locked_session, resolved_bank, resolved_protocol)
+    target_item = next((item for item in resolved.session_plan.items
+                        if item.presentation_order == start_presentation_order), None)
+    if target_item is None or not target_item.turns:
+        _fail("autopilot_start_position_invalid", "起始题号不在本场冻结训练计划内")
+    target_turn = target_item.turns[0]
+    prefix_items = [item for item in resolved.session_plan.items
+                    if item.presentation_order < start_presentation_order]
+    # Keep skip receipts in their existing append-only ledger. Derived keys are
+    # bounded even when the external start key has the full 128 characters.
+    skip_key_prefix = "startskip." + hashlib.sha256(idempotency_key.encode()).hexdigest()
+    expected_skips = {
+        f"{skip_key_prefix}#{item.presentation_order}.{turn.turn_seq}": (
+            item.item_id, turn.turn_seq, item.presentation_order)
+        for item in prefix_items for turn in item.turns
+    }
+
     prior_event = db.exec(select(AutopilotControlEvent).where(
         AutopilotControlEvent.idempotency_key == idempotency_key,
     )).first()
@@ -2007,6 +2043,21 @@ def start_p0a(
                 or prior_event.payload_json != autopilot_ledger.encode_control_event_payload(
                     "start", {"source": P0A_SOURCE})):
             _fail("autopilot_idempotency_conflict", "启动幂等键已被其他事实使用")
+        original_command = db.get(RuntimeCommand, prior_event.command_id)
+        original_skips = list(db.exec(select(AutopilotPositionAdjudication).where(
+            AutopilotPositionAdjudication.session_id == session_id,
+            AutopilotPositionAdjudication.idempotency_key.startswith(skip_key_prefix + "#"),
+        )))
+        if (original_command is None
+                or (original_command.item_id, original_command.turn_seq)
+                != (target_item.item_id, target_turn.turn_seq)
+                or {row.idempotency_key for row in original_skips} != set(expected_skips)
+                or any((row.item_id, row.turn_seq, row.presentation_order)
+                       != expected_skips[row.idempotency_key]
+                       or row.kind != "skipped" or row.actor_id != actor_id
+                       or row.reason_code != skip_reason_code or row.note != skip_note
+                       for row in original_skips)):
+            _fail("autopilot_idempotency_conflict", "启动重试的起始题或跳过说明与已保存记录不一致")
         state = db.get(SessionAutopilotState, session_id)
         if state is None or state.scope_key != P0A_SCOPE_KEY:
             _fail("autopilot_state_invalid", "启动事件缺少对应自动驾驶状态")
@@ -2043,7 +2094,15 @@ def start_p0a(
     existing_interaction = db.exec(select(InteractionEvent).where(
         InteractionEvent.session_id == session_id,
     )).first()
-    if existing_attempt is not None or existing_interaction is not None:
+    existing_item = db.exec(select(ItemEvent).where(
+        ItemEvent.session_id == session_id,
+    )).first()
+    existing_adjudication = db.exec(select(AutopilotPositionAdjudication).where(
+        AutopilotPositionAdjudication.session_id == session_id,
+    )).first()
+    if (existing_attempt is not None or existing_interaction is not None
+            or (start_presentation_order != 1
+                and (existing_item is not None or existing_adjudication is not None))):
         # 证据表没有来源列,人工操作和 AI 带练自己写的行在这里无法区分——
         # 文案不得声称证据来自「人工操作」(AI 暂停后重启也会走到这里)。
         _fail(
@@ -2071,6 +2130,14 @@ def start_p0a(
     )).first()
     if existing_command is not None:
         _fail("autopilot_state_invalid", "禁用状态下存在孤立自动驾驶命令")
+
+    # All original admission and full-plan gates remain in force, including for
+    # skipped items. Only the initial command position changes.
+    if start_presentation_order != 1:
+        gate = _require_gate(
+            db, session_id, bank=resolved_bank, protocol=resolved_protocol,
+            now=observed_at, position_item_id=target_item.item_id,
+            position_turn_seq=target_turn.turn_seq, require_entire_plan_supported=True)
 
     control_generation = max((state.control_generation if state else 0) + 1, 1)
     runner_generation = max((state.runner_generation if state else 0) + 1, 1)
@@ -2132,6 +2199,13 @@ def start_p0a(
     state.lease_expires_at = None
     state.updated_at = observed_at
     db.add(state)
+    for skip_key, (item_id, turn_seq, order) in expected_skips.items():
+        db.add(AutopilotPositionAdjudication(
+            session_id=session_id, item_id=item_id, turn_seq=turn_seq,
+            presentation_order=order, kind="skipped", reason_code=skip_reason_code,
+            note=skip_note, actor_id=actor_id, control_generation=control_generation,
+            state_revision=state.revision, idempotency_key=skip_key,
+            created_at=observed_at, is_simulation=locked_session.is_simulation))
     db.add(AutopilotControlEvent(
         idempotency_key=idempotency_key,
         session_id=session_id,
@@ -3708,7 +3782,7 @@ def _completed_attempts_at(
         if all(a.processing_owner is None for a in unfinished):
             _fail("autopilot_attempt_abandoned",
                   "这一题上一段录音的判分被暂停打断,不会再自动完成;"
-                  "请「转为人工操作」人工完成这一题")
+                  "可点「继续 AI 自动带练」用已保存录音接着处理,或「转为人工操作」")
         _fail("autopilot_attempt_processing",
               "上一段录音还在判分,几秒后再试")
     return attempts
@@ -3939,6 +4013,108 @@ def takeover_autopilot_to_manual(
     return get_autopilot_status(db, session_id=session_id)
 
 
+def _resume_saved_capture_processing(
+    db: Session,
+    *,
+    state: SessionAutopilotState,
+    record: RuntimeCommand,
+    resolved,
+    bank: content.ItemBank,
+    protocol: dict,
+    idempotency_key: str,
+    actor_id: str,
+    payload_json: str,
+    observed_at: datetime,
+) -> StartP0aResult | None:
+    """Resume an interrupted provider stage on its original saved capture.
+
+    No media command is issued or changed. The recording has already stopped;
+    its original generation remains the immutable capture authority. The new
+    researcher resume event fences the processing episode independently, while
+    the ordinary attempt/capture lease generations fence provider result writes.
+    Terminal failures, human conclusions and legacy repeat admissions are never
+    reinterpreted here.
+    """
+    if record.kind != "record" or record.state != "succeeded":
+        return None
+    concluded = _concluded_positions(db, state.session_id) | _skipped_positions(db, state.session_id)
+    target = next((position for position in resolved.positions
+                   if (position.item_id, position.turn_seq) not in concluded), None)
+    if target is None or (target.item_id, target.turn_seq) != (record.item_id, record.turn_seq):
+        return None
+    if db.exec(select(AutopilotPositionAdjudication).where(
+            AutopilotPositionAdjudication.session_id == state.session_id,
+            AutopilotPositionAdjudication.item_id == record.item_id,
+            AutopilotPositionAdjudication.turn_seq == record.turn_seq)).first() is not None:
+        return None
+    capture = db.exec(select(AttemptCaptureProcessing).where(
+        AttemptCaptureProcessing.record_command_id == record.id,
+        AttemptCaptureProcessing.session_id == state.session_id,
+    ).with_for_update()).first()
+    if capture is None or capture.repeat_admission_semantics != evidence_ledger.REPEAT_BOUND_ADMISSION:
+        return None
+    attempts = list(db.exec(select(AttemptEvent).where(
+        AttemptEvent.session_id == state.session_id,
+        AttemptEvent.item_id == record.item_id,
+        AttemptEvent.turn_seq == record.turn_seq,
+    ).order_by(AttemptEvent.attempt_seq)))
+    attempt = next((a for a in attempts if a.raw_audio_id == record.expected_raw_audio_id), None)
+    if attempt is None:
+        if (capture.processing_status != "received" or capture.final_attempt_id is not None
+                or capture.processing_owner is not None):
+            return None
+        if any(a.processing_status != "completed" for a in attempts):
+            return None
+    elif (attempt is not attempts[-1] or attempt.processing_status != "asr_completed"
+          or attempt.processing_owner is not None or attempt.error_code is not None
+          or attempt.asr_text is None or attempt.operational_answer_type is not None
+          or attempt.operational_score is not None or attempt.judge_mode is not None
+          or capture.processing_status != "asr_completed"
+          or capture.final_attempt_id != attempt.id
+          or capture.disposition != "answer_candidate"
+          or any(a.processing_status != "completed" for a in attempts[:-1])):
+        return None
+
+    gate = _require_gate(
+        db, state.session_id, bank=bank, protocol=protocol, now=observed_at,
+        position_item_id=record.item_id, position_turn_seq=record.turn_seq,
+        require_entire_plan_supported=True)
+    _validate_command_identity(record, gate.selected)
+    _require_command_repeat_binding(record, gate.train_session)
+    # Pause already invalidated old claims; fence again atomically with the new
+    # processing episode, including a late claim racing another process.
+    evidence_ledger.invalidate_processing_claims(
+        db, session_id=state.session_id, raw_audio_id=record.expected_raw_audio_id)
+    evidence_ledger.invalidate_capture_processing_claims(
+        db, session_id=state.session_id, raw_audio_id=record.expected_raw_audio_id)
+    state.status = "processing_attempt"
+    state.current_command_id = record.id
+    state.revision += 1
+    state.last_error_code = None
+    state.updated_at = observed_at
+    db.add(state)
+    db.add(AutopilotControlEvent(
+        idempotency_key=idempotency_key, session_id=state.session_id,
+        event_seq=_next_control_event_seq(db, state.session_id), event_type="resume",
+        scope_key=state.scope_key, control_generation=state.control_generation,
+        runner_generation=state.runner_generation, command_id=record.id,
+        actor_type="researcher", actor_id=actor_id,
+        reason_code="researcher_explicit_resume", from_mode="autonomous", to_mode="autonomous",
+        from_status="paused", to_status="processing_attempt", payload_json=payload_json,
+        created_at=observed_at))
+    db.flush()
+    # Reuse the same full admission proof as the worker: mutable governance,
+    # receipt identity, frozen context and original attempt sequence all still
+    # apply. Any refusal rolls back this entire resume transaction.
+    from . import autopilot_orchestration
+    try:
+        autopilot_orchestration.derive_authoritative_attempt_input(db, session_id=state.session_id)
+    except autopilot_orchestration.AutopilotOrchestrationError as exc:
+        raise AutopilotServiceError(exc.code, exc.message) from exc
+    return StartP0aResult(status=state.status, state_revision=state.revision,
+                         replayed=False, command=None)
+
+
 def resume_p0a(
     db: Session,
     *,
@@ -3954,11 +4130,13 @@ def resume_p0a(
 
     与 start 的 fresh-scope 语义互补:start 只接受全新场次,resume 只接受已有
     P0a 状态且 status=='paused' 的场次(mode 允许 autonomous——暂停后原地继续,
-    或 manual——人工接管后切回 AI)。control/runner generation 双双 +1,暂停前的
-    一切设备 ACK、租约与收麦目标全部按代际作废;新命令一律从提示等级 0 重新
-    出题,绝不复活半截录音。位置规则:取最后一条自动命令,若其 purpose 已宣告
-    本题终结则从冻结计划下一位继续,否则原题位重出;人工接管期间产生的人工
-    证据只影响 attempt_seq 续号(避开唯一约束),不改变位置选择。终态
+    或 manual——人工接管后切回 AI)。若仅恢复已停止录音的未完成处理,不重签媒体命令,
+    以新 resume 事件和处理租约隔离旧 worker;其他恢复的 control/runner generation
+    双双 +1,暂停前的
+    一切设备 ACK、租约与收麦目标全部按代际作废,绝不复活半截录音。位置取冻结
+    计划中第一个未结论、未跳过的题位:无回答从 0 级重问,自治模式已有完整回答
+    则按最后一次判定续弹线索或完成收口。人工接管期间的 TurnEvent 也计入已完成
+    位置,尚未完成的人工尝试则须先人工收口。终态
     (failed/scope_completed)不可复活;撤回/云授权撤销由 gate 原样拒绝。
     """
     idempotency_key = _validate_idempotency_key(idempotency_key, "idempotency_key")
@@ -4036,23 +4214,30 @@ def resume_p0a(
         _fail("autopilot_revision_conflict", "自动驾驶状态 revision 已变化")
     if state.current_command_id is not None or state.lease_owner is not None:
         _fail("autopilot_state_invalid", "暂停状态不应持有在途命令或租约")
+    paused_command = None
     if state.mode == "autonomous":
         # 与显式接管同一安全闸:必须已有本代际的收麦/媒体终止证明,
         # 否则可能存在无人认领的热麦克风。
-        _safe_takeover_proof(db, state=state)
+        _, paused_command = _safe_takeover_proof(db, state=state)
     else:
         latest = _latest_control_event(db, session_id)
         if latest is None or not _control_event_matches_state(latest, state):
             _fail("autopilot_state_invalid", "人工接管状态缺少当前 generation 证据")
 
-    # 恢复位置 = 冻结计划里第一个没有 TurnEvent(环节结论)的题位。AI 与人工
-    # 的结论都以 TurnEvent 落账,天然统一两种模式的进度;题位若已有半截 attempt
-    # (提示阶梯中段被打断),账本合同把每个阶梯格子的 attempt_seq 钉成绝对表,
-    # 无法安全地从中段续弹——如实拒绝并指路,绝不静默跳题或伪造阶梯位。
+    # 结论、跳过回执和已完成尝试共同决定恢复位置;提示阶梯续弹沿用原路由判定,
+    # 不重置 attempt_seq、不复用暂停前的采集命令。
     resolved = _resolved_profile_plan(
         locked_session, resolved_bank, resolved_protocol)
     if not resolved.positions:
         _fail("autopilot_content_incomplete", "自动驾驶冻结计划没有可执行位置")
+    if paused_command is not None:
+        processing = _resume_saved_capture_processing(
+            db, state=state, record=paused_command, resolved=resolved,
+            bank=resolved_bank, protocol=resolved_protocol,
+            idempotency_key=idempotency_key, actor_id=actor_id,
+            payload_json=expected_payload, observed_at=observed_at)
+        if processing is not None:
+            return processing
     target, route = _resume_target_and_route(
         db, session_id=session_id, state=state, resolved=resolved,
         bank=resolved_bank, protocol=resolved_protocol, observed_at=observed_at)
@@ -4213,6 +4398,7 @@ def adjudicate_p0a_position(
     kind: str,
     reason_code: str,
     note: str | None = None,
+    auto_resume: bool = True,
     bank: content.ItemBank | None = None,
     protocol: dict | None = None,
     now: datetime | None = None,
@@ -4225,7 +4411,8 @@ def adjudicate_p0a_position(
       skip_item          跳过本题:当前题位若有回答按 terminated_no_verdict 收口,
                          本题其余没答过的题位落 skipped 收据(不造录音证据)。
     与 resume 同一安全闸:必须是安全暂停 + 本代际收麦/媒体终止证明。裁定行只追加、
-    具名、带闭集原因;研究真值仍只走事后复核锁分。同键重放走 resume 的重放路径。
+    具名、带闭集原因;研究真值仍只走事后复核锁分。同键重放只读当前状态。供应商
+    暂不可用时 auto_resume=False 仍记录现场决定,保持安全暂停等研究者明确继续。
     """
     idempotency_key = _validate_idempotency_key(idempotency_key, "idempotency_key")
     if len(idempotency_key) > 100:
@@ -4268,15 +4455,14 @@ def adjudicate_p0a_position(
         expected_kind = "skipped" if kind == "skip_item" else "confirmed_correct"
         if (prior.session_id != session_id or prior.actor_id != actor_id
                 or prior.reason_code != reason_code
+                or prior.note != note
                 or (kind == "confirmed_correct" and prior.kind != expected_kind)
                 or (kind == "skip_item" and prior.kind == "confirmed_correct")):
             _fail("autopilot_idempotency_conflict", "裁定幂等键已被其他事实使用")
         if state is None:
             _fail("autopilot_not_active", "当前场次没有可裁定的 P0a 状态")
-        return _resume_after_adjudication(
-            db, state=state, session_id=session_id, resume_key=resume_key,
-            expected_revision=expected_revision, actor_id=actor_id,
-            bank=resolved_bank, protocol=resolved_protocol, observed_at=observed_at)
+        return StartP0aResult(status=state.status, state_revision=state.revision,
+                             replayed=True, command=None)
 
     if state is None or state.scope_key != P0A_SCOPE_KEY:
         _fail("autopilot_not_active", "当前场次没有可裁定的 P0a 状态")
@@ -4289,19 +4475,38 @@ def adjudicate_p0a_position(
         _fail("autopilot_revision_conflict", "自动驾驶状态 revision 已变化")
     if state.current_command_id is not None or state.lease_owner is not None:
         _fail("autopilot_state_invalid", "暂停状态不应持有在途命令或租约")
-    _safe_takeover_proof(db, state=state)
+    if state.last_error_code == "autopilot_scope_completed":
+        _fail("autopilot_scope_completed", "本场可自动范围已全部训毕,请直接进入场次收尾")
+    _, paused_command = _safe_takeover_proof(db, state=state)
 
     resolved = _resolved_profile_plan(
         locked_session, resolved_bank, resolved_protocol)
     if not resolved.positions:
         _fail("autopilot_content_incomplete", "自动驾驶冻结计划没有可执行位置")
     concluded = _concluded_positions(db, session_id) | _skipped_positions(db, session_id)
+    # 裁定的是研究者屏幕上正在暂停的题位,不是恢复时的首个未完成题位。终结反馈/
+    # 告知答案签发时 TurnEvent 已经落账;此时老人迟答或研究者按跳过,若沿用 resume
+    # 的搜索规则就会误裁下一道尚未展示的题。安全暂停命令是这个位置的权威证明。
     target = next(
         (position for position in resolved.positions
-         if (position.item_id, position.turn_seq) not in concluded),
+         if (position.item_id, position.turn_seq)
+         == (paused_command.item_id, paused_command.turn_seq)),
         None)
     if target is None:
-        _fail("autopilot_scope_completed", "本场可自动范围已全部训毕,请直接进入场次收尾")
+        _fail("autopilot_state_invalid", "暂停命令不在本场冻结计划中")
+    if db.exec(select(AutopilotPositionAdjudication).where(
+            AutopilotPositionAdjudication.session_id == session_id,
+            AutopilotPositionAdjudication.item_id == target.item_id,
+            AutopilotPositionAdjudication.turn_seq == target.turn_seq)).first() is not None:
+        _fail("autopilot_adjudication_already_recorded",
+              "当前环节的现场裁定已记录;请在服务恢复后点继续,或转为人工操作")
+    # Even an unanswered skip must retain every ordinary governance/content
+    # gate when no automatic continuation is requested. Provider availability
+    # alone is separate from permission to save a human bedside decision.
+    _require_gate(
+        db, session_id, bank=resolved_bank, protocol=resolved_protocol, now=observed_at,
+        position_item_id=target.item_id, position_turn_seq=target.turn_seq,
+        require_entire_plan_supported=True)
     attempts = _completed_attempts_at(db, session_id, target.item_id, target.turn_seq)
 
     plan_items = resolved.session_plan.items
@@ -4369,6 +4574,18 @@ def adjudicate_p0a_position(
     for entry in rows:
         db.add(entry)
     db.flush()
+    if not auto_resume:
+        finished = _concluded_positions(db, session_id) | _skipped_positions(db, session_id)
+        complete = all((position.item_id, position.turn_seq) in finished
+                       for position in resolved.positions)
+        state.last_error_code = ("autopilot_scope_completed" if complete
+                                 else "autopilot_adjudication_saved")
+        state.revision += 1
+        state.updated_at = observed_at
+        db.add(state)
+        db.flush()
+        return StartP0aResult(status=state.status, state_revision=state.revision,
+                             replayed=False, command=None)
     return _resume_after_adjudication(
         db, state=state, session_id=session_id, resume_key=resume_key,
         expected_revision=expected_revision, actor_id=actor_id,
@@ -4387,12 +4604,7 @@ def _resume_after_adjudication(
     protocol: dict,
     observed_at: datetime,
 ) -> StartP0aResult:
-    """裁定落账后让 AI 从下一位继续;裁定的是最后一题时留在安全暂停(首次与重放同一口径)。"""
-    if state.last_error_code == "autopilot_scope_completed":
-        # 只有重放会走到这里(首次裁定在没有可裁题位时早已 409):回同一份回执,不动状态。
-        return StartP0aResult(
-            status=state.status, state_revision=state.revision,
-            replayed=True, command=None)
+    """首次裁定落账后继续;最后一题留在安全暂停。幂等重放不进入此路径。"""
     try:
         return resume_p0a(
             db, session_id=session_id, idempotency_key=resume_key,
@@ -4520,6 +4732,14 @@ def _require_terminal_tts_ack(
     command: RuntimeCommand,
     ack_key: str,
 ) -> RuntimeCommandAck:
+    if command.state == "cancelled":
+        try:
+            return autopilot_ledger.verify_interrupted_tts_ack(
+                db, command, ack_idempotency_key=ack_key,
+                require_current_command=False)
+        except autopilot_ledger.AutopilotProofError as exc:
+            raise AutopilotServiceError(
+                "autopilot_tts_ack_invalid", "缺少已开始提问/提示的可信停播事实") from exc
     if (command.id is None or command.kind != "tts" or command.state != "succeeded"
             or command.succeeded_at is None):
         _fail("autopilot_tts_not_ended", "TTS 命令尚无终态成功事实")
@@ -4872,7 +5092,8 @@ def route_tts_ended(
             runner_generation=tts.runner_generation,
             issued_capability_token_hash=gate.active_capability.token_hash,
             issued_device_id_hash=gate.active_capability.device_id_hash,
-            issued_at=max(observed_at, terminal_ack.received_at, tts.succeeded_at),
+            issued_at=max(observed_at, terminal_ack.received_at,
+                          tts.succeeded_at or tts.cancelled_at),
             kind="record",
             state="pending",
             predecessor_command_id=tts.id,
@@ -5320,7 +5541,7 @@ def _initial_response_path_for_cued_attempt(
         )).first()
         if resumed is None:
             _fail("autopilot_attempt_sequence_invalid", "一级提示与首次作答链路不一致")
-    if (cue is None or cue.kind != "tts" or cue.state != "succeeded"
+    if (cue is None or cue.kind != "tts" or cue.state not in {"succeeded", "cancelled"}
             or cue.item_id != attempt.item_id
             or cue.turn_seq != attempt.turn_seq
             or cue.attempt_seq != 2 or cue.prompt_level != 1
@@ -6563,7 +6784,7 @@ def _require_repeat_source_tts(
         RuntimeCommand.id == record.predecessor_command_id,
         RuntimeCommand.session_id == record.session_id,
     ).with_for_update()).first()
-    if source is None or source.kind != "tts" or source.state != "succeeded":
+    if source is None or source.kind != "tts" or source.state not in {"succeeded", "cancelled"}:
         _fail("autopilot_repeat_source_invalid", "前置 TTS 命令不存在或未成功结束")
     if (source.item_id != record.item_id
             or source.turn_seq != record.turn_seq
@@ -7460,6 +7681,18 @@ def apply_device_ack(
     except ValueError as exc:
         raise AutopilotServiceError(
             "autopilot_ack_transition_invalid", "设备回执不符合当前命令生命周期") from exc
+
+    if ack.ack_type == "tts_interrupted":
+        speech = TtsCommandPayload.model_validate_json(command.payload_json)
+        started_ack = db.exec(select(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == command.id,
+            RuntimeCommandAck.ack_type == "tts_started",
+        )).first()
+        if (speech.purpose not in {"question", "cue"}
+                or command.state != "started" or command.started_at is None
+                or started_ack is None
+                or started_ack.command_revision + 1 != command.revision):
+            _fail("autopilot_ack_transition_invalid", "只有已经开始的提问或提示可以提前回答")
 
     if ack.ack_type == "record_stopped":
         _preflight_record_capture(

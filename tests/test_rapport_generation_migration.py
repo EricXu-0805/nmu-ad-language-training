@@ -10,7 +10,7 @@ from test_rapport_utterance_migration import (
     _config, _insert_utterance, _recovery_guard, _schema_rows,
 )
 
-REPO_HEAD = "f4b2d8c1a635"     # 全仓头(裁定收据表);本层历史头由 HEAD 钉住
+REPO_HEAD = "a7c3e9d2b641"     # 全仓头(裁定收据表);本层历史头由 HEAD 钉住
 HEAD = "e2a6d8f0b419"          # 本层迁移头:回放/采集代际
 PARENT = "d0c22a6dae2a"
 

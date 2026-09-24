@@ -390,7 +390,7 @@ def _wait_for(predicate, pages: tuple[object, ...], *, timeout_seconds: float, l
     raise BrowserAcceptanceError(f"等待{label}超时")
 
 
-def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
+def run_start_pause(config: BrowserAcceptanceConfig, *, answer_now: bool = False) -> BrowserResult:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -732,6 +732,13 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
             caregiver.get_by_text("练习进行中", exact=True).wait_for(
                 state="visible", timeout=20_000)
 
+            if answer_now:
+                early_answer = patient.get_by_role("button", name="现在回答", exact=True)
+                early_answer.wait_for(state="visible", timeout=20_000)
+                if observations["record_authorizations"]:
+                    raise BrowserAcceptanceError("点击提前回答前已经签发录音授权")
+                early_answer.click()
+                early_answer.wait_for(state="hidden", timeout=5_000)
             patient.get_by_text("正在听您说", exact=True).wait_for(
                 state="visible", timeout=30_000)
             patient.get_by_role("button", name="说完了可以点这里", exact=True).click()
@@ -754,7 +761,8 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                     and next_command[2] == "tts"
                     and len({first_tts[0], record[0], next_command[0]}) == 3
                     and first_tts[1] < record[1] < next_command[1]
-                    and ack_types.get(first_tts[0]) == ["tts_started", "tts_ended"]
+                    and ack_types.get(first_tts[0]) == [
+                        "tts_started", "tts_interrupted" if answer_now else "tts_ended"]
                     and ack_types.get(record[0]) == ["record_started", "record_stopped"]
                     # 收麦是按钮那条(user_done):伪麦克风连续音 + 立刻点按钮,VAD 不会先判。
                     and stop_reasons.get(record[0]) == "user_done"
@@ -860,9 +868,16 @@ def run_start_pause(config: BrowserAcceptanceConfig) -> BrowserResult:
                 and entry.get("endedAfter") is False
                 for entry in media_journal
             )
-            if not first_ended or feedback_ended or not feedback_paused:
+            first_paused = any(
+                _is_speech(entry) and entry.get("event") == "pause_called"
+                and entry.get("src") == first_src
+                and entry.get("pausedBefore") is False and entry.get("pausedAfter") is True
+                and entry.get("endedAfter") is False for entry in media_journal)
+            first_finished_as_requested = (
+                first_paused and not first_ended if answer_now else first_ended)
+            if not first_finished_as_requested or feedback_ended or not feedback_paused:
                 raise BrowserAcceptanceError(
-                    "浏览器没有证明第二段原生音频在结束前被安全暂停")
+                    "浏览器没有证明第一段正确结束／打断以及第二段被安全暂停")
             if violations:
                 raise BrowserAcceptanceError(violations[0])
             if not isinstance(observations["pause_runtime_revision"], int):
@@ -1062,7 +1077,7 @@ def read_ledger_snapshot() -> BrowserResult:
     return _read_result_receipt(config.base.root)
 
 
-def _validate_start_pause_database(config, result: BrowserResult) -> None:
+def _validate_start_pause_database(config, result: BrowserResult, *, answer_now: bool = False) -> None:
     from sqlmodel import Session, select
 
     from app import (
@@ -1244,8 +1259,8 @@ def _validate_start_pause_database(config, result: BrowserResult) -> None:
         if (
             first_tts.kind != "tts"
             or first_tts.command_seq != 1
-            or first_tts.state != "succeeded"
-            or first_tts.succeeded_at is None
+            or first_tts.state != ("cancelled" if answer_now else "succeeded")
+            or (first_tts.cancelled_at if answer_now else first_tts.succeeded_at) is None
             or first_payload.purpose != "question"
             or record.kind != "record"
             or record.command_seq != 2
@@ -1349,7 +1364,16 @@ def _validate_start_pause_database(config, result: BrowserResult) -> None:
             return rows
 
         first_tts_acks = exact_ack_types(
-            first_tts, ["tts_started", "tts_ended"], "首次朗读")
+            first_tts, ["tts_started", "tts_interrupted" if answer_now else "tts_ended"], "首次朗读")
+        if answer_now:
+            if first_tts.succeeded_at is not None:
+                raise BrowserAcceptanceError("提前回答把打断错误记成播放完成")
+            interrupted = autopilot_ledger.verify_interrupted_tts_ack(
+                session, first_tts, ack_idempotency_key=first_tts_acks[1].idempotency_key,
+                require_current_command=False, require_live_scope=False)
+            payload = json.loads(interrupted.payload_json)
+            if payload["media_duration_ms"] < 0 or payload["interrupt_reason"] != "answer_now":
+                raise BrowserAcceptanceError("提前回答缺少已停播和已播时长证据")
         record_acks = exact_ack_types(
             record, ["record_started", "record_stopped"], "录音")
         feedback_acks = exact_ack_types(
@@ -1631,10 +1655,10 @@ def _validate_help_states_database(session, result: BrowserResult) -> None:
         raise BrowserAcceptanceError("有一条状态转移没有具名")
 
 
-def validate_start_pause_ledger(snapshot: BrowserResult | None = None) -> None:
+def validate_start_pause_ledger(snapshot: BrowserResult | None = None, *, answer_now: bool = False) -> None:
     config = _ledger_harness_config()
     result = snapshot or _read_result_receipt(config.base.root)
-    _validate_start_pause_database(config, result)
+    _validate_start_pause_database(config, result, answer_now=answer_now)
 
 
 def _redacted_error(error: BaseException, secrets: tuple[str, ...]) -> str:
@@ -1649,7 +1673,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="照护员真实 Chrome 本机验收")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--start-pause", action="store_true")
+    group.add_argument("--answer-now", action="store_true")
     group.add_argument("--verify-ledger", action="store_true")
+    group.add_argument("--verify-answer-now-ledger", action="store_true")
     parser.add_argument("--origin")
     return parser
 
@@ -1661,16 +1687,16 @@ def main(argv: list[str] | None = None) -> int:
         for name in (CAREGIVER_PASSWORD_ENV, CONSOLE_PIN_ENV, INSTANCE_MARKER_ENV)
     )
     try:
-        if args.start_pause:
+        if args.start_pause or args.answer_now:
             if not args.origin:
                 raise BrowserAcceptanceError("真实 Chrome 验收缺少本机地址")
             config = resolve_browser_config(args.origin)
-            run_start_pause(config)
+            run_start_pause(config, answer_now=args.answer_now)
             print("真实 Chrome 流程已完成：开始、配对、朗读、录音、上传、ASR/判定、下一命令、安全暂停")
         else:
             if args.origin:
                 raise BrowserAcceptanceError("账本核验不接受网页地址")
-            validate_start_pause_ledger(read_ledger_snapshot())
+            validate_start_pause_ledger(read_ledger_snapshot(), answer_now=args.verify_answer_now_ledger)
             print("同一临时库账本核验已通过")
         return 0
     except BrowserAcceptanceError as exc:

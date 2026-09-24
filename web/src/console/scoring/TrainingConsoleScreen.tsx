@@ -1971,6 +1971,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
         )}
 
         <ServerAutopilotControl
+          plan={plan}
           session={session}
           interactionBlocked={interactionBlocked}
           hasNamedAccount={hasNamedAccount}
@@ -1982,6 +1983,9 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
           onReceiptPosition={onAutopilotReceiptPosition}
           prepareOwnership={prepareServerOwnership}
           attempts={attempts}
+          hasExistingEvidence={Object.keys(journal.itemEvents).length > 0
+            || Object.keys(journal.turns).length > 0 || Object.keys(journal.audios).length > 0
+            || Object.keys(journal.cueLevels).length > 0}
         />
 
         {observerMode ? (

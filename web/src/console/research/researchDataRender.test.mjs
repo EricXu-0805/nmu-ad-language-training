@@ -67,6 +67,17 @@ test("每行的格子数恰好等于列数，空值渲染成占位符而不是�
   assert.deepEqual(bodyRows[1].slice(2), ["—", "—", "—"]);
 });
 
+test("无录音的跳过题仍渲染题号、环节与裁定原因", async () => {
+  const markup = await render({ page: page({
+    dataset: "adjudications",
+    columns: ["item_id", "presentation_order", "turn_seq", "kind", "reason_code"],
+    rows: [["SE_熨斗", 2, 1, "skipped", "participant_declined"]],
+    rowCount: 1, hasMore: false, nextCursor: null,
+  }) });
+  const cells = [...markup.matchAll(/<td[^>]*>([^<]*)<\/td>/g)].map((match) => match[1]);
+  assert.deepEqual(cells, ["SE_熨斗", "2", "1", "skipped", "participant_declined"]);
+});
+
 test("渲染结果里不含任何明文标识符、绝对时间或作答文本", async () => {
   const markup = await render({});
   for (const leak of ["patient_id", "asr_text", "我叫", "P-REAL"]) {

@@ -562,6 +562,7 @@ def fenced_command_transition(
 ACK_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "tts_started": frozenset({"media_duration_ms"}),
     "tts_ended": frozenset({"media_ended", "media_duration_ms"}),
+    "tts_interrupted": frozenset({"media_stopped", "interrupt_reason", "media_duration_ms"}),
     "tts_failed": frozenset({"error_code", "failure_stage"}),
     "record_started": frozenset({"mime_type", "sample_rate_hz", "channels"}),
     "record_stopped": frozenset({"stop_reason"}),
@@ -942,13 +943,76 @@ def verify_terminal_tts_ack(
     return ack
 
 
+def verify_interrupted_tts_ack(
+    session: Session,
+    tts_command: RuntimeCommand,
+    *,
+    ack_idempotency_key: str,
+    require_current_command: bool,
+    require_live_scope: bool = True,
+) -> RuntimeCommandAck:
+    """Only an explicit stopped question/cue can unlock an early answer.
+
+    A generic cancelled command or pause is never a recording prerequisite.
+    Prompt level remains the issued level even when only part of a cue played.
+    """
+    if (tts_command.kind != "tts" or tts_command.state != "cancelled"
+            or tts_command.cancelled_at is None or tts_command.started_at is None):
+        raise AutopilotProofError("interrupted TTS must have started and been cancelled")
+    try:
+        speech = TtsCommandPayload.model_validate_json(tts_command.payload_json)
+        if speech.purpose not in {"question", "cue"}:
+            raise ValueError("not a question/cue")
+    except (TypeError, ValueError) as exc:
+        raise AutopilotProofError("only question/cue permits early answer") from exc
+    ack = session.exec(select(RuntimeCommandAck).where(
+        RuntimeCommandAck.command_id == tts_command.id,
+        RuntimeCommandAck.idempotency_key == ack_idempotency_key,
+        RuntimeCommandAck.ack_type == "tts_interrupted",
+    )).first()
+    started = session.exec(select(RuntimeCommandAck).where(
+        RuntimeCommandAck.command_id == tts_command.id,
+        RuntimeCommandAck.ack_type == "tts_started",
+    )).first()
+    if ack is None or started is None:
+        raise AutopilotProofError("interruption requires persisted start and stopped ACKs")
+    _verify_ack_binding(
+        session, tts_command, ack, ack_type="tts_interrupted",
+        require_terminal_revision=True, require_current_command=require_current_command,
+        require_live_scope=require_live_scope)
+    _verify_ack_static_identity(
+        session, tts_command, started, ack_type="tts_started",
+        require_terminal_revision=False)
+    if (started.command_revision + 1 != ack.command_revision
+            or started.device_event_seq >= ack.device_event_seq
+            or started.received_at > ack.received_at
+            or tts_command.cancelled_at < ack.received_at):
+        raise AutopilotProofError("interruption ordering is inconsistent")
+    try:
+        payload = json.loads(ack.payload_json)
+        duration = payload.get("media_duration_ms")
+        if (set(payload) != ACK_PAYLOAD_KEYS["tts_interrupted"]
+                or payload.get("media_stopped") is not True
+                or payload.get("interrupt_reason") != "answer_now"
+                or type(duration) is not int or not 0 <= duration <= 21_600_000
+                or encode_ack_payload("tts_interrupted", payload) != ack.payload_json):
+            raise ValueError("invalid stopped media fact")
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AutopilotProofError("interruption payload is not canonical evidence") from exc
+    return ack
+
+
 def verify_tts_ended_prerequisite(
     session: Session,
     record_command: RuntimeCommand,
     *,
     require_live_scope: bool = True,
 ) -> RuntimeCommandAck:
-    """Prove that a record command was issued after a real, current ``tts_ended`` ACK."""
+    """Prove the exact predecessor ended or was explicitly stopped to answer.
+
+    The historical function name remains stable for all capture-proof callers;
+    generic cancellation never qualifies as an interrupted-playback proof.
+    """
     if record_command.kind != "record":
         raise AutopilotProofError("only a record command has a TTS prerequisite")
     if record_command.predecessor_command_id is None:
@@ -981,14 +1045,17 @@ def verify_tts_ended_prerequisite(
             or tts_payload.cue_level != tts_command.prompt_level):
         raise AutopilotProofError(
             "only a turn-bound question/cue TTS may unlock recording")
-    ack = verify_terminal_tts_ack(
+    verifier = (verify_interrupted_tts_ack
+                if tts_command.state == "cancelled" else verify_terminal_tts_ack)
+    ack = verifier(
         session,
         tts_command,
         ack_idempotency_key=record_command.trigger_ack_idempotency_key,
         require_current_command=False,
         require_live_scope=require_live_scope,
     )
-    if record_command.issued_at < max(tts_command.succeeded_at, ack.received_at):
+    terminal_at = tts_command.cancelled_at if tts_command.state == "cancelled" else tts_command.succeeded_at
+    if terminal_at is None or record_command.issued_at < max(terminal_at, ack.received_at):
         raise AutopilotProofError("record command predates terminal TTS evidence")
     return ack
 
@@ -1001,7 +1068,7 @@ def verify_immutable_record_capture(
 
     Succeeded record command, canonical ``record_stopped`` ACK with its exact
     device/generation/revision binding, the capture receipt tuple, the record
-    command payload contract, and the canonical ``tts_ended`` trigger for its
+    command payload contract, and the canonical terminal playback trigger for its
     predecessor.  Every reader that must re-prove a *historical* capture calls
     this — the repeat terminal readback and the controlled export both do.
 

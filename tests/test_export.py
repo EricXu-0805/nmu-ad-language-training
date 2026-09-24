@@ -217,7 +217,7 @@ def test_export_ledger_migration_roundtrip_includes_staging_lease(tmp_path):
     with engine.connect() as connection:
         assert connection.execute(text(
             "SELECT version_num FROM alembic_version"
-            )).scalar_one() == "f4b2d8c1a635"
+            )).scalar_one() == "a7c3e9d2b641"
 
 
 def test_mask_redacts_all_free_text_without_trusting_client_flag():
@@ -602,6 +602,35 @@ def test_unlocked_turns_excluded_from_scoring(db, tmp_path):
     assert any("SE_花" in x for x in scores["excluded_items"])
     # 已锁定的单要素仍只算 1 题（未锁定的被排除）
     assert scores["single"]["n"] == 1
+
+
+def test_partially_skipped_multi_item_is_not_a_full_score_but_keeps_turns(db, tmp_path):
+    _seed(db)
+    for item_id, count in (("ME_partial", 1), ("ME_complete", 3)):
+        item = ItemEvent(session_id="S9", item_id=item_id, task_type="多要素",
+                         item_set_type="训练集", presentation_order=31 if count == 1 else 32)
+        db.add(item)
+        db.flush()
+        for seq in range(1, count + 1):
+            db.add(TurnEvent(
+                item_event_id=item.id, turn_seq=seq, response_role=f"要素{seq}",
+                score_locked=True, confirmed_response_text="已确认", prompt_level=0,
+                element_value=1, reviewed_score=1))
+    for seq in (2, 3):
+        db.add(AutopilotPositionAdjudication(
+            session_id="S9", item_id="ME_partial", turn_seq=seq, presentation_order=31,
+            kind="skipped", reason_code="participant_declined", actor_id="TEST-RESEARCHER",
+            control_generation=1, state_revision=1, idempotency_key=f"partial-skip-{seq}"))
+    db.commit()
+    result = _export_bundle(db, "S9", write_dir=tmp_path)
+    multi = next(row for row in result["sheets"]["item_scores"] if row["task_type"] == "多要素")
+    assert multi["n"] == 1
+    per_item = json.loads(multi["per_item_json"])
+    assert [(row["item_id"], row["total_key_elements"]) for row in per_item] == [
+        ("ME_complete", 3)]
+    assert any(row["item_id"] == "ME_partial" for row in result["sheets"]["turns"])
+    assert len(result["sheets"]["adjudications"]) == 2
+    assert any("ME_partial" in reason for reason in result["excluded_items"])
 
 
 def test_zero_new_audio_still_publishes_csv_manifest_and_ledger(db, tmp_path):

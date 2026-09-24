@@ -8,7 +8,7 @@
 // 行按列顺序投影成数组而不是保留对象：视图只能渲染 columns 里有的东西，
 // "屏幕上看到的" 与 "导出的 CSV" 在结构上不可能不一致。
 
-export const RESEARCH_DATASET_KEYS = ["subjects", "sessions", "turns"] as const;
+export const RESEARCH_DATASET_KEYS = ["subjects", "sessions", "turns", "adjudications"] as const;
 export type ResearchDatasetKey = typeof RESEARCH_DATASET_KEYS[number];
 export type ResearchDataClassification = "research" | "simulation";
 
@@ -324,11 +324,15 @@ export function researchDatasetPath(request: {
   cursor?: string | null;
   limit?: number | null;
   csv?: boolean;
+  expectedEpochSeq?: number | null;
 }): string {
   const params = new URLSearchParams();
   params.set("data_classification", request.classification);
   if (request.cursor) params.set("cursor", request.cursor);
   if (request.limit != null) params.set("limit", String(request.limit));
+  if (request.expectedEpochSeq != null) {
+    params.set("expected_epoch_seq", String(request.expectedEpochSeq));
+  }
   const suffix = request.csv ? ".csv" : "";
   return `/research/v1/${encodeURIComponent(request.dataset)}${suffix}?${params.toString()}`;
 }

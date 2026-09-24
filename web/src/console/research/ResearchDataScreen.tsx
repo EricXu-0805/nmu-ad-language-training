@@ -99,7 +99,10 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
     try {
       const blob = kind === "dictionary"
         ? await api.researchDictionaryCsv()
-        : await api.researchCsv({ dataset, classification, cursor });
+        : await api.researchCsv({
+            dataset, classification, cursor,
+            expectedEpochSeq: pageState.status === "ready" ? pageState.page.release?.epochSeq : null,
+          });
       saveBlob(blob, kind === "dictionary"
         ? "nmu-research-dictionary.csv"
         : researchCsvFilename(
@@ -120,7 +123,7 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
           <h2 className="page-title">去标识研究数据总览</h2>
           <p className="page-description">
             所有数据已去标识：受试者与场次只用编号代替，不含姓名、绝对时间、转写原文和录音。
-            导出的 CSV 与屏上显示完全一致。
+            CSV 导出当前页的范围；真实研究数据按屏上版本核对后导出，模拟演练数据以导出时为准。
           </p>
         </div>
         <Button variant="ghost" onClick={onBack}>返回受试者列表</Button>
@@ -165,7 +168,8 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
               <div>
                 <h3>选数据集与分区</h3>
                 <p className="muted">
-                  三张表可按受试者编号相互对照；真实与模拟数据分开查看，不会混在一起。
+                  各表可按受试者与场次编号相互对照；真实与模拟数据分开查看，不会混在一起。
+                  没有录音就跳过的题，请在「研究者现场裁定」中按题号核对。
                 </p>
               </div>
             </div>

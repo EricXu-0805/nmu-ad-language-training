@@ -45,7 +45,7 @@ export const VAD_MIN_VOICED_MS = 450;
 export const VAD_FULL_UTTERANCE_MS = 900;
 export const VAD_SHORT_UTTERANCE_TRAILING_SILENCE_MS = 4_500;
 
-/** 头这段时间只标定噪声底,不判语音。 */
+/** 头这段时间标定噪声底,同时按临时底判语音。 */
 export const VAD_CALIBRATION_MS = 400;
 
 /**
@@ -149,6 +149,9 @@ export function createVoiceActivityDetector(): VoiceActivityDetector {
       if (!Number.isFinite(rms) || rms < 0 || !Number.isFinite(atMs)) return state;
       const deltaMs = lastAtMs === null
         ? 0 : Math.min(Math.max(0, atMs - lastAtMs), VAD_MAX_FRAME_GAP_MS);
+      // 有声资格和开口资格使用同一个采样上限。只限制 loudMs 会让两帧迟到的
+      // 瞬态凭空攒出 1000 ms 有声,越过短话保护后提前收麦。
+      const voicedDeltaMs = Math.min(deltaMs, VAD_ONSET_FRAME_CAP_MS);
       lastAtMs = atMs;
       if (firstAtMs === null) firstAtMs = atMs;
 
@@ -174,8 +177,8 @@ export function createVoiceActivityDetector(): VoiceActivityDetector {
       const release = releaseOf(base);
       if (state === "idle") {
         if (rms >= onset) {
-          loudMs += Math.min(deltaMs, VAD_ONSET_FRAME_CAP_MS);
-          voicedMs += deltaMs;
+          loudMs += voicedDeltaMs;
+          voicedMs += voicedDeltaMs;
           if (loudMs >= VAD_SPEECH_ONSET_MS) {
             state = "speaking";
             quietMs = 0;
@@ -196,7 +199,7 @@ export function createVoiceActivityDetector(): VoiceActivityDetector {
           ? "stopped" : "trailing_silence";
       } else {
         quietMs = 0;
-        voicedMs += deltaMs;
+        voicedMs += voicedDeltaMs;
         state = "speaking";
       }
       return state;

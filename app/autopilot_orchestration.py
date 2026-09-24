@@ -183,6 +183,9 @@ class FrozenWorkerTarget(BaseModel):
     raw_audio_id: str = Field(min_length=1)
     control_generation: int = Field(ge=1)
     runner_generation: int = Field(ge=1)
+    # An explicit retry may reuse the same immutable stopped capture. Control
+    # events fence that processing episode without rewriting its media generation.
+    control_event_seq: int = Field(default=0, ge=0)
 
 
 def _lock_pending_command(
@@ -229,6 +232,7 @@ def derive_worker_target(
         raw_audio_id=record.expected_raw_audio_id,
         control_generation=state.control_generation,
         runner_generation=state.runner_generation,
+        control_event_seq=_next_control_event_seq(db, session_id) - 1,
     )
 
 
@@ -250,9 +254,11 @@ def worker_target_still_current(db: Session, target: FrozenWorkerTarget) -> bool
     if state is None or state.scope_key != autopilot_service.P0A_SCOPE_KEY:
         return False
     if (state.status != "processing_attempt"
+            or state.mode != "autonomous"
             or state.current_command_id != target.record_command_id
             or state.control_generation != target.control_generation
-            or state.runner_generation != target.runner_generation):
+            or state.runner_generation != target.runner_generation
+            or _next_control_event_seq(db, target.session_id) - 1 != target.control_event_seq):
         return False
     record = db.exec(select(RuntimeCommand).where(
         RuntimeCommand.id == target.record_command_id,
@@ -1443,7 +1449,8 @@ def stage_processing_failure(
         return False
     if (state.current_command_id != target.record_command_id
             or state.control_generation != target.control_generation
-            or state.runner_generation != target.runner_generation):
+            or state.runner_generation != target.runner_generation
+            or _next_control_event_seq(db, session_id) - 1 != target.control_event_seq):
         # The frozen target no longer matches the current attempt: a newer
         # worker has already taken over. Never mutate someone else's attempt.
         return False
@@ -1474,7 +1481,27 @@ def stage_processing_failure(
         AutopilotControlEvent.idempotency_key == event_key,
     )).first()
     if prior is not None:
-        _fail("autopilot_failure_event_conflict", "处理中状态仍存在但失败事实已存在")
+        resumed = db.exec(select(AutopilotControlEvent).where(
+            AutopilotControlEvent.session_id == session_id,
+            AutopilotControlEvent.event_seq == target.control_event_seq,
+        )).first()
+        if (resumed is None or resumed.event_type != "resume"
+                or resumed.actor_type != "researcher" or not resumed.actor_id
+                or resumed.command_id != record.id
+                or resumed.scope_key != state.scope_key
+                or resumed.control_generation != state.control_generation
+                or resumed.runner_generation != state.runner_generation
+                or resumed.from_mode != "autonomous" or resumed.to_mode != "autonomous"
+                or resumed.from_status != "paused" or resumed.to_status != "processing_attempt"
+                or resumed.reason_code != "researcher_explicit_resume"
+                or resumed.payload_json != autopilot_ledger.encode_control_event_payload(
+                    "resume", {"reason_code": "researcher_explicit_resume",
+                               "source": "account_resume_endpoint"})):
+            _fail("autopilot_failure_event_conflict", "处理中状态仍存在但失败事实已存在")
+        event_key = f"{event_key}-r{resumed.event_seq}"
+        if db.exec(select(AutopilotControlEvent).where(
+                AutopilotControlEvent.idempotency_key == event_key)).first() is not None:
+            _fail("autopilot_failure_event_conflict", "本次恢复的失败事实已存在")
 
     result = db.execute(
         update(SessionAutopilotState)
@@ -1568,6 +1595,19 @@ def submit(session_id: str, worker: Callable[[str], object]) -> bool:
 
         future.add_done_callback(_release)
         return True
+
+
+def submit_after_resume(session_id: str, worker: Callable[[str], object]) -> bool:
+    """Release only local scheduling ownership after a committed explicit resume.
+
+    The former future can still be waiting on its provider. It is fenced by the
+    persisted resume event and attempt/capture claim generations, so waiting for
+    it to return would unnecessarily strand the new processing episode. Its done
+    callback cannot remove the replacement future (the identity check above).
+    """
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.pop(session_id, None)
+    return submit(session_id, worker)
 
 
 def inflight_for_tests(session_id: str) -> bool:

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ApiError } from "../apiResponse.ts";
-import type { Session } from "../types.ts";
+import type { Session, SessionPlan } from "../types.ts";
 import {
   autopilotServerOwnsConsole,
   AutopilotControlOperationEpoch,
   autopilotConsoleReducer,
   buildAutopilotStartRequest,
+  allowsAutopilotStartSelection,
+  allowsBedsideDefaultStart,
+  autopilotStartPreview,
   buildAutopilotTakeoverRequest,
   completePlanAllowsAutopilotStart,
   initialAutopilotConsoleState,
@@ -109,6 +112,84 @@ test("start request is deterministic, revision-zero, and rejects unsafe session 
   assert.throws(() => buildAutopilotStartRequest(`S-${"a".repeat(100)}`), /不能安全/);
 });
 
+test("指定起点沿用同场幂等键并携带原因，重复确认不会换一条启动事实", () => {
+  const options = { startPresentationOrder: 21, skipReasonCode: "trained_in_prior_sitting", skipNote: "  上一场已练完单要素  " } as const;
+  const request = buildAutopilotStartRequest("S-a1b2c3d4", options);
+  assert.deepEqual(request, {
+    idempotency_key: "p0a.start.S-a1b2c3d4", expected_revision: 0,
+    start_presentation_order: 21, skip_reason_code: "trained_in_prior_sitting", skip_note: "上一场已练完单要素",
+  });
+  assert.deepEqual(buildAutopilotStartRequest("S-a1b2c3d4", options), request);
+  assert.deepEqual(buildAutopilotStartRequest("S-a1b2c3d4", { startPresentationOrder: 1 }),
+    buildAutopilotStartRequest("S-a1b2c3d4"));
+  assert.equal("skip_note" in buildAutopilotStartRequest("S-a1b2c3d4", {
+    startPresentationOrder: 2, skipReasonCode: "other", skipNote: "  ",
+  }), false);
+});
+
+test("指定起点拒绝无原因、无效题号和不安全备注；默认起点不能夹带跳过信息", () => {
+  for (const order of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => buildAutopilotStartRequest("S-1", { startPresentationOrder: order }), /起始题号/);
+  }
+  assert.throws(() => buildAutopilotStartRequest("S-1", { startPresentationOrder: 2 }), /原因/);
+  assert.throws(() => buildAutopilotStartRequest("S-1", {
+    startPresentationOrder: 1, skipReasonCode: "other",
+  }), /不能附带/);
+  for (const note of ["字".repeat(201), "备\u0000注", "备\u200b注"]) {
+    assert.throws(() => buildAutopilotStartRequest("S-1", {
+      startPresentationOrder: 2, skipReasonCode: "other", skipNote: note,
+    }), /200字/);
+  }
+});
+
+function startPlan(): SessionPlan {
+  const items = [
+    { item_id: "SE_fixture", task_type: "单要素" as const, presentation_order: 1, turns: [{ turn_seq: 1, response_role: "命名", scoring_key: null }] },
+    { item_id: "DE_fixture", task_type: "双要素" as const, presentation_order: 21, turns: Array.from({ length: 5 }, (_, i) => ({ turn_seq: i + 1, response_role: `角色${i + 1}`, scoring_key: null })) },
+    { item_id: "ME_fixture", task_type: "多要素" as const, presentation_order: 31, turns: [{ turn_seq: 1, response_role: "要素一", scoring_key: null }] },
+  ].map(item => ({ ...item, image_id: null, display: {} }));
+  return {
+    item_bank_version_id: "bank-fixture", week_no: 2, event_line: "正式训练",
+    autopilot_profile_version_id: null, completion_scope: "canonical_full_source",
+    resolved_position_count: 7, unsupported_position_count: 0, operational_autopilot_ready: true,
+    total_items: items.length, total_turns: 7, items,
+  };
+}
+
+test("起点预览用冻结题号并逐题计算跳过环节，双要素不会当成一环节", () => {
+  const preview = autopilotStartPreview(startPlan(), 31)!;
+  assert.equal(preview.startItem.item_id, "ME_fixture");
+  assert.deepEqual(preview.skippedItems.map(item => item.presentation_order), [1, 21]);
+  assert.equal(preview.skippedTurns, 6);
+  assert.equal(autopilotStartPreview(startPlan(), 2), null, "不可拿数组第2项冒充冻结题号2");
+  assert.equal(autopilotStartPreview(null, 1), null);
+  const bad = startPlan();
+  bad.items[1]!.presentation_order = 1;
+  assert.equal(autopilotStartPreview(bad, 1), null, "重复题号不能进入选择器");
+});
+
+test("起点选择只在权威未启动、记录已读且完全无证据时开放", () => {
+  const idle = parseAutopilotStatusReceipt({
+    scope_key: "disabled", mode: "disabled", status: "idle", state_revision: 0,
+    server_owned: false, takeover_ready: false, current_command_kind: null,
+    position_item_id: null, position_turn_seq: null, last_error_code: null,
+  });
+  assert.equal(allowsAutopilotStartSelection(idle, 0, false), true);
+  assert.equal(allowsAutopilotStartSelection(null, 0, false), false);
+  assert.equal(allowsAutopilotStartSelection(idle, null, false), false);
+  assert.equal(allowsAutopilotStartSelection(idle, 1, false), false);
+  assert.equal(allowsAutopilotStartSelection(idle, 0, true), false);
+  assert.equal(allowsAutopilotStartSelection(parseAutopilotStatusReceipt(safeStatus()), 0, false), false);
+});
+
+test("编辑起点后即使选回1或取消确认也不会被床旁激活抢先启动，明确重置才放行", () => {
+  assert.equal(allowsBedsideDefaultStart(1, false, false), true);
+  assert.equal(allowsBedsideDefaultStart(21, true, false), false);
+  assert.equal(allowsBedsideDefaultStart(21, true, true), false);
+  assert.equal(allowsBedsideDefaultStart(1, true, false), false);
+  assert.equal(allowsBedsideDefaultStart(1, false, true), false);
+});
+
 test("takeover request is deterministic and fenced to a proven server revision", () => {
   assert.deepEqual(buildAutopilotTakeoverRequest("S-a1b2c3d4", 7), {
     idempotency_key: "p0a.takeover.S-a1b2c3d4.7",
@@ -180,6 +261,10 @@ test("adjudicate 呈现资格:只在 AI 自己暂停且有收麦证明时出现,
     takeover_ready: true,
   });
   assert.equal(receiptAllowsAutopilotAdjudication(drained), true);
+  const saved = { ...drained, lastErrorCode: "autopilot_adjudication_saved" };
+  assert.equal(receiptAllowsAutopilotAdjudication(saved), false);
+  assert.equal(receiptAllowsAutopilotResume(saved), true);
+  assert.equal(receiptAllowsAutopilotTakeover(saved), true);
   // resume 允许人工接管态切回;裁定不允许——人工面自己判分。
   const manual = parseAutopilotStatusReceipt({
     ...safeStatus(), mode: "manual", status: "paused",
@@ -567,6 +652,7 @@ test("D1:部署门禁 409 是确定的写前拒绝——按拒因处理,不再�
     // 2026-08-26 同病两例:内容完整性(wk4 SE_花瓶)与设备未唯一配对。
     "autopilot_content_incomplete",
     "autopilot_device_not_paired",
+    "autopilot_start_position_invalid",
   ]) {
     assert.equal(isPrewriteStartRejection(gate(code)), true, code);
   }

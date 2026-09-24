@@ -173,6 +173,29 @@ test("上下文被自动播放策略挂在 suspended:试着 resume;读到的全�
   assert.equal(harness.pending, false);
 });
 
+test("说话后 AudioContext 暂停时的零值不是静音证据,恢复后也不能沿用暂停前的倒计时", () => {
+  const harness = samplerHarness();
+  const context = harness.context as FakeAudioContext;
+  let callbacks = 0;
+  const release = observeTrailingSilence(STREAM, () => { callbacks += 1; }, harness.ports);
+  harness.feed(1_000, 0.002);
+  harness.feed(2_000, 0.2);
+  harness.feed(2_500, 0.002);
+  const readsBeforeSuspension = context.analyser.reads;
+  context.state = "suspended";
+  harness.feed(4_000, 0);
+  assert.equal(callbacks, 0);
+  assert.equal(context.analyser.reads, readsBeforeSuspension);
+
+  context.state = "running";
+  harness.feed(5_000, 0.002);
+  assert.equal(callbacks, 0);
+  harness.feed(2_000, 0.2);
+  harness.feed(VAD_TRAILING_SILENCE_MS + VAD_SAMPLE_INTERVAL_MS * 2, 0.002);
+  assert.equal(callbacks, 1);
+  release();
+});
+
 test("analyser 读数抛错:采样器自拆(close 一次、定时器撤掉),零回调,错误不从定时器里冒出来", () => {
   const harness = samplerHarness();
   const context = harness.context as FakeAudioContext;

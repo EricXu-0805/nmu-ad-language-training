@@ -605,7 +605,7 @@ export function SessionWrapupScreen({
           <div className="form-section-header">
             <div>
               <h3>研究评分结果</h3>
-              <p className="muted">只统计已人工锁定的环节；AI 初评不计入。</p>
+              <p className="muted">题级综合分只统计环节完整且已人工锁定的题；AI 初评与含跳过环节的题不计入。</p>
             </div>
           </div>
           {scoresErr ? (
@@ -621,8 +621,9 @@ export function SessionWrapupScreen({
                 {planHas("多要素") && <ScoreCard title="多要素关键要素率" summary={scores.multi} metric="weekly_me_score_percentile" />}
               </div>
               {scores.excluded_items.length > 0 && (
-                <Alert tone="warn" title={`${scores.excluded_items.length} 项尚未计入研究评分`}>
-                  这些题还没人工锁定，锁定后才能最终完成。
+                <Alert tone="warn" title={`${scores.excluded_items.length} 项未计入题级综合分`}>
+                  以下题目未满足完整计分条件。跳过环节的记录仍保留；其他题目请按提示完成复核。
+                  <ul>{scores.excluded_items.map((reason, index) => <li key={index}>{reason}</li>)}</ul>
                 </Alert>
               )}
             </>

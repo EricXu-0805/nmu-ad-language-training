@@ -37,7 +37,7 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                assessment_definitions, assessment_service,
                assessment_workflow_policy, asr,
                audio_capture, audio_gate, audio_store, audit, auth,
-               autopilot_contract, autopilot_orchestration,
+               autopilot_contract, autopilot_ledger, autopilot_orchestration,
                autopilot_plan_profiles,
                autopilot_positions, autopilot_service,
                caregiver_contract, caregiver_service,
@@ -9111,6 +9111,7 @@ def get_research_dataset(
         request: Request, response: Response,
         data_classification: Literal["research", "simulation"] | None = None,
         cursor: str | None = None, limit: int | None = None,
+        expected_epoch_seq: int | None = None,
         s: DBSession = Depends(get_session)):
     """一个数据集的一页；``.csv`` 后缀返回同一投影的 CSV。
 
@@ -9140,7 +9141,12 @@ def get_research_dataset(
         raise _research_reject(
             "research_dataset_unknown",
             f"未知数据集；可用的是 {list(research_dataset.dataset_keys())}", 404)
-    _research_query_guard(request, {"data_classification", "cursor", "limit"})
+    _research_query_guard(request, {
+        "data_classification", "cursor", "limit", "expected_epoch_seq"})
+    if expected_epoch_seq is not None and (
+            expected_epoch_seq < 1 or data_classification != "research"):
+        raise _research_reject(
+            "research_query_invalid", "期望版本须为真实研究分区的正整数版本号", 422)
     # 这个路径不是真实 URL 的形状——`/research/v1/dataset` 会被
     # `{dataset_key}` 匹配到，等于自己给自己开了一个可达入口并重复计费。
     # 用一个 URL 里不可能出现的记号，只当限速桶的名字。
@@ -9157,6 +9163,11 @@ def get_research_dataset(
         # 只会让演练也需要治理动作。
         binding = (quality_release.bind_research_read(s, config=config)
                    if data_classification == "research" else None)
+        if (expected_epoch_seq is not None
+                and binding.epoch_seq != expected_epoch_seq):
+            raise _research_reject(
+                "research_release_changed",
+                "研究数据已发布新版本，本次未导出。请刷新页面核对新版本后再导出。", 409)
         reader = research_read.reader_for(dataset_key)
         payload = reader(s, config=config,
                          data_classification=data_classification,
@@ -9770,6 +9781,9 @@ class AutopilotStartIn(BaseModel):
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
     )
     expected_revision: int = PydanticField(ge=0)
+    start_presentation_order: int = PydanticField(default=1, ge=1, strict=True)
+    skip_reason_code: Literal["trained_in_prior_sitting", "other"] | None = None
+    skip_note: str | None = PydanticField(default=None, max_length=200)
 
 
 class AutopilotDrainAckIn(BaseModel):
@@ -9894,6 +9908,9 @@ def autopilot_start(
         request, "启动自动驾驶",
         roles={"researcher", "admin", "caregiver_operator"},
         allow_local_m0=True)
+    if (body.start_presentation_order != 1
+            and getattr(request.state, "actor_role", None) == "caregiver_operator"):
+        raise HTTPException(403, "指定起始题须由研究者或管理员确认")
     patient_id = _preauthorize_session_subject_fence(
         request, session_id, s, "启动自动驾驶")
     # 与设备写入共用唯一锁序。进锁后抛弃锁外 ORM
@@ -9938,12 +9955,15 @@ def autopilot_start(
                 detail=provider_readiness.conflict_detail(exc)) from exc
         _ensure_patient_capture_idle_for_autopilot(live)
         try:
-            autopilot_service.start_p0a(
+            outcome = autopilot_service.start_p0a(
                 s,
                 session_id=session_id,
                 idempotency_key=body.idempotency_key,
                 expected_revision=body.expected_revision,
                 actor_id=actor_id,
+                start_presentation_order=body.start_presentation_order,
+                skip_reason_code=body.skip_reason_code,
+                skip_note=body.skip_note,
             )
             result = autopilot_service.get_autopilot_status(
                 s, session_id=session_id)
@@ -9952,6 +9972,10 @@ def autopilot_start(
             _autopilot_write_failure(s, exc)
         except IntegrityError as exc:
             _autopilot_integrity_conflict(s, exc)
+        if body.start_presentation_order > 1 and not outcome.replayed:
+            _audit(s, request, "autopilot_start_position_selected",
+                   f"start_order={body.start_presentation_order} reason={body.skip_reason_code}",
+                   session_id=session_id)
     return result
 
 
@@ -10106,6 +10130,7 @@ def autopilot_takeover(
 )
 def autopilot_resume(
         session_id: str, body: AutopilotResumeIn, request: Request,
+        background_tasks: BackgroundTasks,
         s: DBSession = Depends(get_session)):
     """从安全暂停(或人工接管)恢复自动带练。
 
@@ -10157,13 +10182,17 @@ def autopilot_resume(
             runtime.updated_at = runtime.resumed_at
             s.add(runtime)
         try:
-            autopilot_service.resume_p0a(
+            outcome = autopilot_service.resume_p0a(
                 s,
                 session_id=session_id,
                 idempotency_key=body.idempotency_key,
                 expected_revision=body.expected_revision,
                 actor_id=actor_id,
             )
+            if outcome.replayed and outcome.status == "paused":
+                # An old successful resume retried after a newer pause is only
+                # a readback. Roll back the temporary runtime revival above.
+                s.rollback()
             result = autopilot_service.get_autopilot_status(
                 s, session_id=session_id)
             s.commit()
@@ -10171,6 +10200,10 @@ def autopilot_resume(
             _autopilot_write_failure(s, exc)
         except IntegrityError as exc:
             _autopilot_integrity_conflict(s, exc)
+    if outcome.status == "processing_attempt" and not outcome.replayed:
+        background_tasks.add_task(
+            autopilot_orchestration.submit_after_resume,
+            session_id, _run_p0a_attempt_worker)
     return result
 
 
@@ -10205,13 +10238,13 @@ def autopilot_adjudicate(
         _require_started_visit_plan_session(session_id, s, sess=sess)
         live = _live_row_for_update(s)
         runtime = _runtime_row_for_update(session_id, s)
+        auto_resume = True
         try:
             provider_readiness.require_resume_ready(s)
-        except provider_readiness.ProviderReadinessConflict as exc:
-            s.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail=provider_readiness.conflict_detail(exc)) from exc
+        except provider_readiness.ProviderReadinessConflict:
+            # The provider gate controls automatic continuation, not saving a
+            # named human decision. The service retains all governance gates.
+            auto_resume = False
         _ensure_patient_capture_idle_for_autopilot(live)
         _ensure_runtime_writable(session_id, s, "裁定")
         revived = False
@@ -10242,8 +10275,11 @@ def autopilot_adjudicate(
                 kind=body.kind,
                 reason_code=body.reason_code,
                 note=body.note,
+                auto_resume=auto_resume,
             )
-            if outcome.command is None and revived:
+            if outcome.replayed and outcome.status == "paused":
+                s.rollback()
+            elif outcome.status == "paused" and revived:
                 _pause_runtime_in_transaction(session_id, s)
             result = autopilot_service.get_autopilot_status(
                 s, session_id=session_id)
@@ -10253,9 +10289,10 @@ def autopilot_adjudicate(
         except IntegrityError as exc:
             _autopilot_integrity_conflict(s, exc)
         # 审计走独立会话,必须等本事务 commit 释放 SQLite 写锁后再追加(与中止端点同序)。
-        _audit(s, request, "autopilot_position_adjudicated",
-               f"kind={body.kind} reason={body.reason_code} actor={actor_id}",
-               session_id=session_id)
+        if not outcome.replayed:
+            _audit(s, request, "autopilot_position_adjudicated",
+                   f"kind={body.kind} reason={body.reason_code} actor={actor_id}",
+                   session_id=session_id)
     return result
 
 
@@ -12219,6 +12256,19 @@ def _record_judgement_success(claim: evidence_ledger.AttemptClaim,
             sess.session_id, body, s, control_plane=control_plane,
             worker_target=worker_target)
         _lock_evidence_session(sess.session_id, s)
+        if control_plane == "autopilot_worker":
+            # An early answer preserves its issued prompt level and score, but
+            # partial playback must remain visible to independent reviewers.
+            # Reuse the exact frozen worker target, never the latest command.
+            if worker_target is None:
+                raise RuntimeError("autopilot judgement requires a frozen worker target")
+            record = s.get(RuntimeCommand, worker_target.record_command_id)
+            if record is None:
+                raise RuntimeError("autopilot judgement lost its record command")
+            playback = autopilot_ledger.verify_tts_ended_prerequisite(
+                s, record, require_live_scope=False)
+            if playback.ack_type == "tts_interrupted":
+                result = {**result, "needs_review": True}
         if not evidence_ledger.fenced_attempt_update(
                 s, claim, expected_status="asr_completed", next_status="completed",
                 values={
@@ -15841,7 +15891,10 @@ def session_scores(session_id: str, request: Request, response: Response,
             sess, resource="scores", reason_code=restriction_reason)
     items = list(s.exec(_select(ItemEvent, ItemEvent.session_id == session_id)))
     tbi = {it.id: list(s.exec(_select(TurnEvent, TurnEvent.item_event_id == it.id))) for it in items}
-    return export._reconstruct_scores(items, tbi)
+    return export._reconstruct_scores(
+        items, tbi,
+        skipped_item_ids=frozenset(
+            item_id for item_id, _ in _skipped_autopilot_positions(session_id, s)))
 
 
 class SessionExportIn(BaseModel):
