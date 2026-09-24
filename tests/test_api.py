@@ -1354,6 +1354,41 @@ def test_m0_end_to_end_single_item(client):
     assert ex["deidentified"] is True and ex["sheet_counts"]["turns"] == 1
 
 
+@pytest.mark.parametrize("overrides", [
+    {"presentation_order": 1}, {"task_type": "双要素"}, {"item_id": "unknown-item"},
+])
+def test_manual_item_rejects_a_conflicting_frozen_position(client, overrides):
+    _mk_session(client)
+    response = client.post("/sessions/SM0/items", json={
+        "item_id": "SE_锚", "task_type": "单要素", **overrides})
+    assert response.status_code == 409, response.text
+    with Session(client.test_engine) as db_session:
+        assert db_session.exec(select(models.ItemEvent)).all() == []
+
+
+@pytest.mark.parametrize("digest", [None, "0" * 64])
+def test_manual_item_does_not_guess_when_frozen_bank_binding_is_unavailable(client, digest):
+    _mk_session(client)
+    with Session(client.test_engine) as db_session:
+        row = db_session.get(models.Session, "SM0")
+        row.item_bank_definition_digest = digest
+        db_session.add(row)
+        db_session.commit()
+    response = client.post("/sessions/SM0/items", json={
+        "item_id": "SE_锚", "task_type": "单要素"})
+    assert response.status_code == 409, response.text
+    with Session(client.test_engine) as db_session:
+        assert db_session.exec(select(models.ItemEvent)).all() == []
+
+
+def test_manual_item_accepts_the_correct_explicit_number(client):
+    _mk_session(client)
+    response = client.post("/sessions/SM0/items", json={
+        "item_id": "SE_锚", "task_type": "单要素", "presentation_order": 3})
+    assert response.status_code == 200, response.text
+    assert response.json()["presentation_order"] == 3
+
+
 def test_confirmed_response_is_trimmed_and_cannot_be_blank(client):
     _mk_session(client, sid="S-CONFIRM", pid="P-CONFIRM")
     item = client.post("/sessions/S-CONFIRM/items", json={

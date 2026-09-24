@@ -5158,6 +5158,12 @@ def test_exact_drain_then_explicit_takeover_is_strict_idempotent_and_releases_ma
     assert old_target.status_code == 409
     assert old_target.json()["detail"]["code"] == (
         "autopilot_drain_target_unavailable")
+    # The old/manual client sends no ordinal after takeover.  A new item still
+    # receives the session's authoritative number without a frontend update.
+    manual_item = api_clients.account.post(f"/sessions/{SESSION_ID}/items", json={
+        "item_id": BANK.single_element[0]["item_id"], "task_type": "单要素"})
+    assert manual_item.status_code == 200, manual_item.text
+    assert manual_item.json()["presentation_order"] == 1
 
 
 def test_takeover_requires_exact_drain_and_drain_requires_issued_current_device(

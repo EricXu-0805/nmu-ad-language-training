@@ -876,6 +876,8 @@ def test_completed_attempt_authoritatively_populates_turn_without_second_judge_c
         "item_id": "SE_锚", "task_type": "单要素",
     })
     assert item.status_code == 200, item.text
+    # Manual and pre-release clients omit the number; the frozen plan owns it.
+    assert item.json()["presentation_order"] == 3
 
     conflict = client.post(f"/items/{item.json()['id']}/turns", json={
         "turn_seq": 1, "response_role": "命名", "raw_audio_id": "turn-source",
