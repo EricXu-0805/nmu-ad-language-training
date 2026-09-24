@@ -107,6 +107,32 @@ test("无录音的跳过题可从研究数据入口读取，保留题号与原�
   assert.deepEqual(page.rows, [["SE_熨斗", 2, 1, "skipped", "participant_declined"]]);
 });
 
+test("两张既有试用量表均可选择、翻页取数和按当前版本导出", () => {
+  const fixtures = [
+    {
+      dataset: "questionnaire_records" as const,
+      row: { record_code: "QREC-v1-test-001", phase_ordinal: 2,
+        superseded_by_ordinal: null, computed_total: 7 },
+    },
+    {
+      dataset: "questionnaire_item_values" as const,
+      row: { record_code: "QREC-v1-test-001", item_key: "q1", field_key: "value",
+        final_value: "1", value_source: "human_direct" },
+    },
+  ];
+  for (const { dataset, row } of fixtures) {
+    assert.ok(RESEARCH_DATASET_KEYS.includes(dataset));
+    const columns = Object.keys(row);
+    const page = parseResearchPage(pagePayload({ dataset, columns, rows: [row] }), dataset, "research");
+    assert.deepEqual(page.rows, [Object.values(row)]);
+    const query = { dataset, classification: "research" as const, cursor: "next-page" };
+    assert.equal(researchDatasetPath(query), `/research/v1/${dataset}?data_classification=research&cursor=next-page`);
+    assert.equal(researchDatasetPath({ ...query, csv: true, expectedEpochSeq: 3 }),
+      `/research/v1/${dataset}.csv?data_classification=research&cursor=next-page&expected_epoch_seq=3`);
+    assert.equal(researchCsvFilename(dataset, "research", page.release), `nmu-${dataset}-research-epoch003.csv`);
+  }
+});
+
 test("parseResearchPage：多出一个未声明的列就拒绝渲染整页", () => {
   const rows = [{ ...(pagePayload().rows as Record<string, unknown>[])[0], patient_id: "P-001" }];
   assert.throws(

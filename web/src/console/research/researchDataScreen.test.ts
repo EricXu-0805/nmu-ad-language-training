@@ -64,9 +64,19 @@ test("真实分区没有冻结版本时，屏上解释这不是故障并说清�
   assert.match(screen, /这不是故障/);
   assert.match(screen, /cut_quality_release\.py/);
   assert.match(screen, /两个具名的人/);
+  assert.match(screen, /meta\.release\.bound === false && !currentPage\?\.release/);
 });
 
 test("屏上与导出都说得出这份数据是哪一版", () => {
-  assert.match(screen, /meta\.release\.bound &&[\s\S]{0,400}数据版本/);
+  assert.match(screen, /const currentPage = pageState\.status === "ready" \? pageState\.page : null/);
+  assert.match(screen, /<ResearchDataProvenance meta=\{meta\} page=\{currentPage\}/);
   assert.match(screen, /researchCsvFilename\(\s*dataset, classification,\s*\n\s*pageState\.status === "ready" \? pageState\.page\.release : null\)/);
+});
+
+test("数据集入口使用完整的受支持列表及服务端公布的标题和列数", () => {
+  assert.match(screen, /RESEARCH_DATASET_KEYS\.map\(\(key\) =>/);
+  assert.match(screen, /meta\.datasets\.find\(\(entry\) => entry\.key === key\)/);
+  assert.match(screen, /onClick=\{\(\) => setDataset\(key\)\}/);
+  assert.match(screen, /info\?\.title/);
+  assert.match(screen, /info\?\.columns\.length/);
 });

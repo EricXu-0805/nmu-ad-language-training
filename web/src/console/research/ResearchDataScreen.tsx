@@ -12,6 +12,7 @@ import {
   type ResearchPage,
 } from "./researchDataContract";
 import { ResearchTable } from "./ResearchDataTable";
+import { ResearchDataProvenance } from "./ResearchDataProvenance";
 
 // 一屏两件事：给 PI 与合作者看"数据长什么样"，以及把当前这一页原样导出。
 // 屏上渲染的行与导出的 CSV 是同一个 query（只差 .csv 后缀），所以不可能出现
@@ -57,6 +58,7 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
 
   const cursor = cursorStack[cursorStack.length - 1] ?? null;
   const ready = meta?.configured === true;
+  const currentPage = pageState.status === "ready" ? pageState.page : null;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -205,7 +207,7 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
                 本区数据只用于流程和模型调试，不得并入真实研究结果或写进论文。
               </Alert>
             )}
-            {classification === "research" && meta.release.bound === false && (
+            {classification === "research" && meta.release.bound === false && !currentPage?.release && (
               <Alert tone="warn" title="真实研究分区还没有可发布的冻结版本">
                 <p>
                   这不是故障：研究数据需先由数据管理员发布一个冻结版本，发布后这里才会显示数据。
@@ -251,29 +253,7 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
             <Alert tone="danger" title="导出失败">{downloadError}</Alert>
           )}
 
-          <footer className="form-section">
-            {meta.release.bound && (
-              <p className="muted">
-                数据版本：第 {meta.release.epochSeq} 版 · {meta.release.frozenSessionCount} 个场次 ·
-                截止 {meta.release.asOf}。两份导出的版本号相同才能直接比对。
-              </p>
-            )}
-            <details>
-              <summary>技术详情</summary>
-              <p className="muted">
-                数据字典版本 <code>{meta.schemaVersion}</code> · 假名版本{" "}
-                <code>{meta.pseudonymVersion}</code> · 假名密钥编号{" "}
-                <code>{meta.pseudonymKeyId}</code>
-              </p>
-              {meta.release.bound && (
-                <p className="muted">
-                  数据版本 <code>第 {meta.release.epochSeq} 版</code> · 数据指纹{" "}
-                  <code>{meta.release.aggregatePayloadSha256.slice(0, 12)}</code>
-                </p>
-              )}
-              <p className="muted">{meta.note}</p>
-            </details>
-          </footer>
+          <ResearchDataProvenance meta={meta} page={currentPage} />
         </>
       )}
     </div>

@@ -24,7 +24,7 @@ import {
 } from "../audio/audioRecoveryQueue";
 import { completeAudioOutboxAfterServerAck, sha256Blob, validateAudioUploadReceipt } from "../audio/audioUploadReceipt";
 import { blobStore } from "../audio/blobStore";
-import { Recorder } from "../audio/recorder";
+import { Recorder, releaseMediaStreamTracks } from "../audio/recorder";
 import { bus } from "../sync/bus";
 import type { PatientRecFailureCode, PatientRecMsg, RecState } from "../sync/messages";
 import { newAudioId } from "../lib/ids";
@@ -166,6 +166,10 @@ export function useVoxRecorder(opts: {
     connectionReady, suspended, selfStartAllowed, stopRequested, maxRecordingMs, requireRecordingWseq,
   };
   const mountedRef = useRef(true);
+  const pageForeground = useRef(document.visibilityState === "visible");
+  const isForeground = useCallback(() => (
+    pageForeground.current && document.visibilityState === "visible"
+  ), []);
   const startGeneration = useRef(0);
   const startTimeout = useRef<number | null>(null);
   const startingRef = useRef(false);
@@ -748,7 +752,7 @@ export function useVoxRecorder(opts: {
 
   const permitIsCurrent = useCallback((permit: StartPermit): boolean => {
     const now = latest.current;
-    if (!mountedRef.current || permit.generation !== startGeneration.current || !now.connectionReady || now.suspended || now.stopRequested) return false;
+    if (!mountedRef.current || !isForeground() || permit.generation !== startGeneration.current || !now.connectionReady || now.suspended || now.stopRequested) return false;
     if (now.sessionId !== permit.sessionId || now.turnKey !== permit.turnKey) return false;
     if (permit.kind === "remote") {
       if (now.recSeq !== permit.recSeq || now.commandSeq !== permit.commandSeq) return false;
@@ -759,7 +763,7 @@ export function useVoxRecorder(opts: {
     // 只有新远端录音命令(recSeq 变)、明确停止(recording 离开 idle)或换题才作废。
     if (now.recSeq !== permit.recSeq) return false;
     return now.selfStartAllowed && (now.recording ?? "idle") === "idle";
-  }, []);
+  }, [isForeground]);
 
   const expirePermit = useCallback((permit: StartPermit, showError: boolean) => {
     if (permit.generation !== startGeneration.current) return;
@@ -834,8 +838,20 @@ export function useVoxRecorder(opts: {
         ...(now.requireRecordingWseq ? { recordingWseq: permit.commandSeq } : {}),
       };
       failurePhase = "microphone";
-      let started = await recRef.current.start();
-      if (!started && permitIsCurrent(permit)) started = await recRef.current.start();
+      let prepared = await recRef.current.prepare();
+      if (!prepared && permitIsCurrent(permit)) prepared = await recRef.current.prepare();
+      if (!prepared) {
+        reportStartFailure(permit, "microphone_start_failed");
+        return;
+      }
+      // Permissions can resolve after the page becomes hidden, before its
+      // lifecycle event is delivered. Re-check before the synchronous start,
+      // not only after MediaRecorder has already begun producing bytes.
+      if (!permitIsCurrent(permit)) {
+        recRef.current.discardActive();
+        return;
+      }
+      const started = await recRef.current.startPrepared();
 
       if (!started) {
         reportStartFailure(permit, "microphone_start_failed");
@@ -929,6 +945,13 @@ export function useVoxRecorder(opts: {
     const prevEdge = lastRemoteEdge.current;
     const isEdge = target !== prevEdge.recording || recSeq !== prevEdge.recSeq;
     lastRemoteEdge.current = { recording: target, recSeq };
+    if (!isForeground()) {
+      // A command received in the background is not fresh permission to start
+      // on return. Only a later explicit recSeq can replace this blocked one.
+      blockedRemote.current = { recSeq };
+      setRemoteCommandBlocked(true);
+      return;
+    }
     if (target === "idle" || target === "stopped") {
       if (!isEdge) return;
       // 已消费/已封存的 recSeq 保持记账(consumedRemote/blockedRemote 不清):同一条
@@ -957,7 +980,7 @@ export function useVoxRecorder(opts: {
       void launchStart("remote");
     }
   }, [recording, recSeq, commandSeq, turnKey, connectionReady, saving,
-      invalidateStart, launchStart, stopAndSave]);
+      invalidateStart, isForeground, launchStart, stopAndSave]);
 
   // 场次级暂停(session.paused,无游标边沿可依):同断线一样立即封存许可并停麦(热麦红线)。
   useEffect(() => {
@@ -984,6 +1007,46 @@ export function useVoxRecorder(opts: {
   // getUserMedia 在途的由 dispose 落地即关——两条路都不留热麦克风。
   const stopRef = useRef(stopAndSave);
   stopRef.current = stopAndSave;
+  useEffect(() => {
+    const leaveForeground = () => {
+      pageForeground.current = false;
+      blockedRemote.current = { recSeq: latest.current.recSeq };
+      setRemoteCommandBlocked(true);
+      invalidateStart();
+      const recorder = recRef.current;
+      if (recorder.active) {
+        const stream = recorder.mediaStream;
+        // Preserve the existing manual pause/disconnect contract: stop and
+        // save under the armed identity. Close tracks in this event stack,
+        // without discarding chunks while the asynchronous onstop is pending.
+        void stopRef.current();
+        releaseMediaStreamTracks(stream);
+      } else if (!recorder.stopping) {
+        recorder.discardActive();
+      }
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState !== "visible") leaveForeground();
+      else pageForeground.current = true;
+    };
+    const restoreForeground = () => {
+      // BFCache and freeze/resume need not add a visibilitychange edge. This
+      // restores availability only: the old permit and recSeq remain blocked.
+      pageForeground.current = document.visibilityState === "visible";
+    };
+    document.addEventListener("visibilitychange", visibilityChanged);
+    window.addEventListener("pagehide", leaveForeground);
+    window.addEventListener("pageshow", restoreForeground);
+    document.addEventListener("freeze", leaveForeground);
+    document.addEventListener("resume", restoreForeground);
+    return () => {
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      window.removeEventListener("pagehide", leaveForeground);
+      window.removeEventListener("pageshow", restoreForeground);
+      document.removeEventListener("freeze", leaveForeground);
+      document.removeEventListener("resume", restoreForeground);
+    };
+  }, [invalidateStart]);
   shutdownRef.current = async () => {
     outboxReady.current = false;
     startGeneration.current += 1;

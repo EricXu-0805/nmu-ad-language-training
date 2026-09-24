@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AutopilotMediaError } from "./autopilotMediaError.ts";
+import { PatientAutopilotController } from "./autopilotController.ts";
+import { AutopilotPageLifecycle } from "./autopilotPageLifecycle.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
 import {
   BrowserAutopilotSpeechExecutor,
@@ -116,6 +118,84 @@ function harness(options: { playResult?: Promise<void>; fetch?: Promise<Blob | n
     start: () => executor.start(question()),
     setNow: (value: number) => { now = value; },
   };
+}
+
+for (const stage of ["downloading", "playing", "start_ack_pending"] as const) {
+  for (const trigger of ["visibilitychange", "pagehide", "freeze"] as const) {
+    test(`页面 ${trigger} 在 TTS ${stage} 时同步停播，等待旧请求收敛且不伪造播完`, async () => {
+      const download = deferred<Blob | null>();
+      const startedAck = deferred<void>();
+      const run = harness(stage === "downloading" ? { fetch: download.promise } : {});
+      const acks: string[] = [];
+      let command = question();
+      let recordStarts = 0;
+      const controller = new PatientAutopilotController({
+        sessionId: "S-SPEECH-LIFECYCLE",
+        speech: { start: () => run.start() },
+        recording: { start: () => { recordStarts += 1; throw new Error("不应开麦"); } },
+        transport: {
+          next: async () => command,
+          ack: async (_sessionId, _commandKey, ack) => {
+            acks.push(ack.ack_type);
+            if (ack.ack_type === "tts_started") {
+              if (stage === "start_ack_pending") await startedAck.promise;
+              command = { ...command, state: "started", command_revision: 1 };
+            }
+            return { accepted: true };
+          },
+        },
+        idempotencyKey: (_command, type, seq) => `speech-lifecycle:${type}:${seq}:0001`,
+      });
+      let hidden = false;
+      const handlers = new Map<string, () => void>();
+      let shutdown: Promise<void> | undefined;
+      const lifecycle = new AutopilotPageLifecycle({
+        ownerGeneration: 1,
+        host: {
+          isHidden: () => hidden,
+          supportsFreeze: () => true,
+          addEventListener: (type, handler) => { handlers.set(type, handler); },
+          removeEventListener: (type) => { handlers.delete(type); },
+          scheduleMicrotask: queueMicrotask,
+        },
+        shutdown: () => { shutdown = controller.interruptRecordingForLifecycleAndWait(); },
+      });
+      lifecycle.install();
+      const running = controller.pollOnce();
+      await flush();
+      if (stage !== "downloading") {
+        run.audio.playing();
+        for (let index = 0; index < 8; index += 1) await flush();
+        assert.equal(run.audio.paused, false);
+        assert.deepEqual(acks, ["tts_started"]);
+      }
+      hidden = true;
+      handlers.get(trigger)?.();
+      // No Promise turn is allowed before the physical pause and abort.
+      assert.equal(run.audio.paused, true);
+      assert.equal(run.audio.pauseCalls, 1);
+      assert.equal(run.abortCount(), 1);
+      assert.equal(controller.interruptRecordingForLifecycleAndWait(), shutdown);
+      let drained = false;
+      void shutdown?.then(() => { drained = true; });
+      await flush();
+      if (stage === "start_ack_pending") {
+        assert.equal(drained, false, "旧 ACK 未返回前不能释放执行器所有权");
+        startedAck.resolve();
+      }
+      await Promise.all([running, shutdown]);
+      download.resolve(new Blob(["late-tts"], { type: "audio/wav" }));
+      await flush();
+      run.audio.ended();
+      await controller.pollOnce();
+      assert.equal(controller.state.phase, "paused");
+      assert.equal(recordStarts, 0);
+      assert.equal(run.audio.playCalls, stage === "downloading" ? 0 : 1);
+      assert.deepEqual(acks, stage === "downloading" ? [] : ["tts_started"]);
+      assert.equal(lifecycle.aborted, true);
+      lifecycle.uninstall();
+    });
+  }
 }
 
 test("production playback settles only on playing then ended, and ended is exact-once", async () => {

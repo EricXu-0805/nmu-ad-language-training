@@ -241,6 +241,7 @@ def _session_runtime_status(session_id: str, s: DBSession) -> str:
 def _require_session_operator(
         request: Request, sess: TrainSession, s: DBSession, action: str, *,
         mutation: bool = False,
+        audit_supervision: bool = True,
         allow_withdrawn_safety_exit: bool = False,
         not_found_detail: str = "场次不存在") -> str:
     """Enforce one named researcher owner across the admitted session lifecycle.
@@ -289,7 +290,7 @@ def _require_session_operator(
         # caller may select a resource-specific generic detail so a foreign
         # item/turn is indistinguishable from that resource genuinely missing.
         raise HTTPException(status_code=404, detail=not_found_detail)
-    if role == "admin" and assigned != actor and mutation:
+    if role == "admin" and assigned != actor and mutation and audit_supervision:
         _audit(
             s, request, "session_operator_admin_supervision",
             f"supervised_action={action} runtime_status={status}",
@@ -337,7 +338,8 @@ def _load_session_for_operator(
 
 def _preauthorize_session_subject_fence(
         request: Request, session_id: str, s: DBSession, action: str,
-        *, allow_withdrawn_safety_exit: bool = False,
+    *, allow_withdrawn_safety_exit: bool = False,
+        audit_supervision_before_fence: bool = False,
         not_found_detail: str = "场次不存在") -> str:
     """Authorize the object, then reset before acquiring its subject fence.
 
@@ -356,6 +358,17 @@ def _preauthorize_session_subject_fence(
         not_found_detail=not_found_detail,
     )
     patient_id = sess.patient_id
+    if (audit_supervision_before_fence
+            and getattr(request.state, "actor_role", None) == "admin"
+            and (sess.trainer_id or "").strip() != _actor(request)):
+        # The independent audit session must commit before SQLite's writer
+        # fence. This records permission to attempt the named operation, not
+        # its success; the caller still repeats all mutation guards under lock.
+        _audit(
+            s, request, "session_operator_admin_supervision",
+            f"supervised_action={action} runtime_status={_session_runtime_status(session_id, s)}",
+            patient_id=patient_id, session_id=session_id,
+        )
     s.rollback()
     s.expire_all()
     return patient_id
@@ -7855,16 +7868,20 @@ def _pause_runtime_in_transaction(session_id: str, s: DBSession) -> SessionRunti
 def pause_session(session_id: str, request: Request,
                   s: DBSession = Depends(get_session)):
     patient_id = _preauthorize_session_subject_fence(
-        request, session_id, s, "暂停场次")
+        request, session_id, s, "暂停场次", audit_supervision_before_fence=True)
     with (governance_lock.subject_fence(s, patient_id),
           _LIVE_WRITE_LOCK,
           device_capability.serialized_mutation()):
+        # SQLite ignores FOR UPDATE. Wait for any concurrent start/resume to
+        # commit before deciding which autonomous scope this pause must fence.
+        governance_lock.begin_sqlite_write_fence(s)
         sess = s.exec(select(TrainSession).where(
             TrainSession.session_id == session_id,
         ).with_for_update()).first()
         if not sess:
             raise HTTPException(404, "场次不存在")
-        _require_session_operator(request, sess, s, "暂停场次", mutation=True)
+        _require_session_operator(
+            request, sess, s, "暂停场次", mutation=True, audit_supervision=False)
         _require_started_visit_plan_session(session_id, s, sess=sess)
         _live_row_for_update(s)
         try:
@@ -9920,20 +9937,24 @@ def autopilot_start(
             and getattr(request.state, "actor_role", None) == "caregiver_operator"):
         raise HTTPException(403, "指定起始题须由研究者或管理员确认")
     patient_id = _preauthorize_session_subject_fence(
-        request, session_id, s, "启动自动驾驶")
+        request, session_id, s, "启动自动驾驶", audit_supervision_before_fence=True)
     # 与设备写入共用唯一锁序。进锁后抛弃锁外 ORM
     # 快照，并锁定 LiveState；service 在同一事务内重验场次、
     # runtime、录音授权与唯一活跃设备后才能写命令。
     with (governance_lock.subject_fence(s, patient_id),
           _LIVE_WRITE_LOCK,
           device_capability.serialized_mutation()):
+        # Preauthorization reset the transaction. Acquire SQLite's writer fence
+        # before reading admission, so a committed pause cannot be passed using
+        # the old active runtime or LiveState snapshot.
+        governance_lock.begin_sqlite_write_fence(s)
         sess = s.exec(select(TrainSession).where(
             TrainSession.session_id == session_id,
         ).with_for_update()).first()
         if sess is None:
             raise HTTPException(404, "场次不存在")
         _require_session_operator(
-            request, sess, s, "启动自动驾驶", mutation=True)
+            request, sess, s, "启动自动驾驶", mutation=True, audit_supervision=False)
         if getattr(request.state, "actor_role", None) == "caregiver_operator":
             try:
                 autopilot_plan_profiles.resolve_exact_runnable_demo20(sess)
@@ -10149,7 +10170,24 @@ def autopilot_activate(
         request, "切回已暂停的自动训练", roles={"researcher", "admin"},
         allow_local_m0=True)
     patient_id = _preauthorize_session_subject_fence(
-        request, session_id, s, "切回已暂停的自动训练")
+        request, session_id, s, "切回已暂停的自动训练",
+        audit_supervision_before_fence=True)
+    # Both named authorization attempts must be audited before the independent
+    # audit connection would contend with our SQLite writer transaction. Freeze
+    # the bedside identity too: its audit may never authorize a different slot
+    # discovered after waiting for the writer fence.
+    authorized_previous_session_id = _live_session_id(s.get(LiveState, 1))
+    if (authorized_previous_session_id
+            and authorized_previous_session_id != session_id):
+        previous = s.get(TrainSession, authorized_previous_session_id)
+        if (previous is not None
+                and _session_runtime_status(authorized_previous_session_id, s)
+                not in _TERMINAL_RUNTIME_STATUSES):
+            _require_session_operator(
+                request, previous, s, "切换当前床旁场次", mutation=True,
+                allow_withdrawn_safety_exit=True)
+    s.rollback()
+    s.expire_all()
     with (governance_lock.subject_fence(s, patient_id),
           _LIVE_WRITE_LOCK, device_capability.serialized_mutation()):
         # Preauthorization reset the read transaction. SQLite ignores FOR UPDATE;
@@ -10161,7 +10199,8 @@ def autopilot_activate(
         if sess is None:
             raise HTTPException(404, "场次不存在")
         _require_session_operator(
-            request, sess, s, "切回已暂停的自动训练", mutation=True)
+            request, sess, s, "切回已暂停的自动训练", mutation=True,
+            audit_supervision=False)
         _require_started_visit_plan_session(session_id, s, sess=sess)
         live = _live_row_for_update(s)
         state = s.exec(select(SessionAutopilotState).where(
@@ -10194,6 +10233,10 @@ def autopilot_activate(
             _ensure_recording_allowed_for_session(
                 session_id, s, is_simulation=sess.is_simulation)
             previous_session_id = _live_session_id(live)
+            if previous_session_id != authorized_previous_session_id:
+                raise autopilot_service.AutopilotServiceError(
+                    "autopilot_activation_bedside_busy",
+                    "当前床旁场次已变化，请刷新后重新选择要切回的场次")
             if previous_session_id == session_id:
                 result = autopilot_service.get_autopilot_status(s, session_id=session_id)
                 s.commit()
@@ -10210,7 +10253,7 @@ def autopilot_activate(
                 if previous_runtime.status not in _TERMINAL_RUNTIME_STATUSES:
                     _require_session_operator(
                         request, previous, s, "切换当前床旁场次", mutation=True,
-                        allow_withdrawn_safety_exit=True)
+                        allow_withdrawn_safety_exit=True, audit_supervision=False)
                 if previous_runtime.status not in {
                         "paused", "intervention_completed", *_TERMINAL_RUNTIME_STATUSES}:
                     raise autopilot_service.AutopilotServiceError(

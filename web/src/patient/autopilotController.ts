@@ -705,6 +705,14 @@ export class PatientAutopilotController {
    */
   private safeShutdownAndWait(): Promise<void> {
     if (this.lifecycleShutdown) return this.lifecycleShutdown;
+    if (!this.discardableRecording()) {
+      // A speech player has no recording interrupt() method. Stop it now,
+      // including a pending download/gesture, before waiting for its closed
+      // promise; waiting first would leave the voice playing in the background.
+      // stopAndWait also fences late ACKs and joins the existing runner.
+      this.lifecycleShutdown = this.stopAndWait();
+      return this.lifecycleShutdown;
+    }
     const capture = this.activeRecording ?? (this.activeMedia as AutopilotRecordingCapture | null);
     this.handleRecordingLifecycleInterruption();
     // 麦克风到这里已经同步关掉;还在退避阶梯里等的 ACK 重试没有意义了——立刻让它抛出

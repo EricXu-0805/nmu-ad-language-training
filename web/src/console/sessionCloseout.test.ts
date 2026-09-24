@@ -7,6 +7,7 @@ import {
   hasStructuredCloseoutObservation,
   parseSessionCloseoutRecord,
   parseSessionOutcomeSummary,
+  reconcileSessionCloseoutRequest,
   SESSION_CLOSEOUT_NOTE_MAX_LENGTH,
   sessionCloseoutDraftMatchesRecord,
   sessionCloseoutDraftFromRecord,
@@ -231,4 +232,21 @@ test("unknown, timeout, conflict and server failures require authoritative recon
   assert.equal(closeoutFailureNeedsReconciliation({ status: 503 }), true);
   assert.equal(closeoutFailureNeedsReconciliation({ status: 422 }), false);
   assert.equal(closeoutFailureNeedsReconciliation({ status: 403 }), false);
+});
+
+test("reconciliation distinguishes the unsaved old revision from matching committed content and conflicting edits", () => {
+  const result = buildSessionCloseoutRequest(draft({ report_status: "observation_recorded", note: "本次新备注" }), 2, "closeout-reconcile");
+  assert(result.ok);
+  const request = result.value;
+  const record: SessionCloseoutRecord = {
+    ...request, session_id: "S-CLOSEOUT", schema_version: "session-closeout.v1", revision: 2, locked: false,
+  };
+  assert.equal(reconcileSessionCloseoutRequest(request, { ...record, note: "旧备注" }), "retry");
+  assert.equal(reconcileSessionCloseoutRequest(request, record), "retry", "same content at the old version does not confirm a write");
+  assert.equal(reconcileSessionCloseoutRequest(request, { ...record, revision: 3 }), "confirmed");
+  assert.equal(reconcileSessionCloseoutRequest(request, { ...record, revision: 4, locked: true }), "confirmed");
+  assert.equal(reconcileSessionCloseoutRequest(request, { ...record, revision: 3, note: "另一位工作人员的备注" }), "conflict");
+  assert.equal(reconcileSessionCloseoutRequest(request, { ...record, locked: true }), "conflict");
+  assert.equal(reconcileSessionCloseoutRequest(request, null), "conflict", "an existing record disappearing must not reset its expected revision");
+  assert.equal(reconcileSessionCloseoutRequest({ ...request, expected_revision: 0 }, null), "retry");
 });
