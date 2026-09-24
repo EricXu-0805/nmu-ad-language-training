@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -226,5 +227,102 @@ def test_ledger_verifier_reuses_production_authority_helpers():
         "autopilot_service.legacy_attempt_is_successfully_judged(",
         "asset.delete_gate_passed is not False",
         "status_receipt.takeover_ready is not True",
+        "_require_completed_attempt_review(attempt, answer_now=answer_now)",
+        "_interrupted_browser_judgement_is_legal(session, attempt)",
+        "autopilot_ledger.verify_interrupted_tts_ack(",
+        "autopilot_service._require_completed_operational_attempt(",
     ):
         assert required in source
+
+
+@pytest.mark.parametrize("answer_now", [False, True])
+def test_completed_attempt_requires_the_exact_playback_review_flag(answer_now):
+    browser._require_completed_attempt_review(SimpleNamespace(
+        processing_status="completed", operational_needs_review=answer_now,
+    ), answer_now=answer_now)
+    for wrong_flag in (not answer_now, None, int(answer_now), str(answer_now)):
+        with pytest.raises(browser.BrowserAcceptanceError, match="复核标记"):
+            browser._require_completed_attempt_review(SimpleNamespace(
+                processing_status="completed", operational_needs_review=wrong_flag,
+            ), answer_now=answer_now)
+
+
+@pytest.mark.parametrize("answer_now", [False, True])
+@pytest.mark.parametrize("status", [
+    None, "pending", "processing", "failed", "abandoned",
+    "received", "asr_completed", "technical_failure",
+])
+def test_review_flag_cannot_substitute_for_completed_recognition_and_judgment(answer_now, status):
+    with pytest.raises(browser.BrowserAcceptanceError, match="完成识别与自动判定"):
+        browser._require_completed_attempt_review(SimpleNamespace(
+            processing_status=status, operational_needs_review=answer_now,
+        ), answer_now=answer_now)
+
+
+def _interrupted_judgement_fixture():
+    from app import evidence_ledger
+
+    attempt = SimpleNamespace(
+        id=1, session_id="SIM-REVIEW", item_id="itm-0001", turn_seq=1,
+        attempt_seq=1, is_simulation=True, raw_audio_id="raw-synthetic-review",
+        prompt_level=0, cue_type=None, duration_seconds=0.5,
+        asr_text="螺母", asr_engine_version="harness-synthetic-asr/1", asr_confidence=1.0,
+        operational_answer_type="正确", operational_score=1.0, operational_needs_review=True,
+        judge_mode="规则确定式", judge_engine_version="rule-1", matched_on="target",
+        judge_reason=None, judge_portrait_used=False, contains_target=True,
+    )
+    payloads = [
+        ("attempt_received", {"raw_audio_id": attempt.raw_audio_id, "prompt_level": 0,
+                              "cue_type": None, "duration_seconds": 0.5, "processing_status": "received"}),
+        ("asr_completed", {"asr_engine_version": attempt.asr_engine_version,
+                           "asr_confidence": 1.0, "degraded": False, "hotword_hit": True}),
+        ("judgement_completed", {"answer_type": "正确", "score": 1.0, "needs_review": True,
+                                 "judge_mode": "规则确定式", "judge_engine_version": "rule-1",
+                                 "matched_on": "target", "contains_target": True,
+                                 "truth_scope": "operational_only"}),
+    ]
+    rows = [SimpleNamespace(
+        event_type=kind, item_id=attempt.item_id, turn_seq=1, attempt_seq=1,
+        is_simulation=True, payload_json=evidence_ledger.encode_event_payload(kind, payload),
+    ) for kind, payload in payloads]
+    # Queries stay local; production legality and exact event-payload validators
+    # run unchanged against the ordered synthetic result set.
+    session = SimpleNamespace(exec=lambda _query: rows)
+    return attempt, session, rows
+
+
+def test_interrupted_judgement_keeps_true_review_on_the_actual_rows():
+    attempt, session, rows = _interrupted_judgement_fixture()
+    before = [row.payload_json for row in rows]
+    assert browser._interrupted_browser_judgement_is_legal(session, attempt)
+    assert attempt.operational_needs_review is True
+    assert [row.payload_json for row in rows] == before
+
+
+@pytest.mark.parametrize("fault", [
+    "wrong_score", "wrong_classification", "missing_asr", "missing_judgement",
+    "event_review_false", "attempt_review_false", "wrong_engine", "wrong_target_match",
+])
+def test_interrupted_review_cannot_bypass_rule_legality_or_exact_interactions(fault):
+    from app import evidence_ledger
+
+    attempt, session, rows = _interrupted_judgement_fixture()
+    if fault == "wrong_score":
+        attempt.operational_score = 0.5
+    elif fault == "wrong_classification":
+        attempt.operational_answer_type = "无效分类"
+    elif fault == "missing_asr":
+        rows.pop(1)
+    elif fault == "missing_judgement":
+        rows.pop()
+    elif fault == "event_review_false":
+        payload = json.loads(rows[-1].payload_json)
+        payload["needs_review"] = False
+        rows[-1].payload_json = evidence_ledger.encode_event_payload("judgement_completed", payload)
+    elif fault == "attempt_review_false":
+        attempt.operational_needs_review = False
+    elif fault == "wrong_engine":
+        attempt.judge_engine_version = "unverified-engine"
+    elif fault == "wrong_target_match":
+        attempt.contains_target = False
+    assert not browser._interrupted_browser_judgement_is_legal(session, attempt)

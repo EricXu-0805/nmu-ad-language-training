@@ -1077,6 +1077,48 @@ def read_ledger_snapshot() -> BrowserResult:
     return _read_result_receipt(config.base.root)
 
 
+def _require_completed_attempt_review(attempt, *, answer_now: bool) -> None:
+    """Completion and interrupted-prompt review are separate required facts."""
+    if attempt.processing_status != "completed":
+        raise BrowserAcceptanceError("账本没有证明该录音已完成识别与自动判定")
+    # A correct answer after an explicitly interrupted prompt still needs review
+    # of its partial prompt exposure. Ordinary full-playback acceptance must keep
+    # its original no-review expectation; neither branch accepts a missing flag.
+    if attempt.operational_needs_review is not answer_now:
+        raise BrowserAcceptanceError(
+            "提前回答缺少提示未完整播放的复核标记" if answer_now
+            else "完整朗读流程出现非预期复核标记")
+
+
+def _interrupted_browser_judgement_is_legal(session, attempt) -> bool:
+    """Check original classification and the actual review-bearing event trail.
+
+    The caller already proves the exact interrupted TTS and its captured answer.
+    This deterministic correct-answer harness has two distinct facts: the rule
+    classifier's target match requires no review by itself, while the production
+    commit adds review for partial prompt exposure. Never rewrite either stored
+    row to make it resemble a legacy, fully played prompt.
+    """
+    from app import autopilot_service
+
+    return (
+        attempt.operational_needs_review is True
+        and autopilot_service.legacy_judgement_facts_are_legal(
+            answer_type=attempt.operational_answer_type,
+            score=attempt.operational_score,
+            needs_review=False,
+            judge_mode=attempt.judge_mode,
+            judge_engine_version=attempt.judge_engine_version,
+            matched_on=attempt.matched_on,
+            judge_reason=attempt.judge_reason,
+            judge_portrait_used=attempt.judge_portrait_used,
+            contains_target=attempt.contains_target,
+        )
+        and autopilot_service.legacy_interactions_are_exact(
+            session, attempt, expect_judgement=True)
+    )
+
+
 def _validate_start_pause_database(config, result: BrowserResult, *, answer_now: bool = False) -> None:
     from sqlmodel import Session, select
 
@@ -1490,7 +1532,6 @@ def _validate_start_pause_database(config, result: BrowserResult, *, answer_now:
             or attempt.turn_seq != record.turn_seq
             or attempt.attempt_seq != record.attempt_seq
             or attempt.prompt_level != record.prompt_level
-            or attempt.processing_status != "completed"
             or attempt.processed_at is None
             or attempt.error_code is not None
             or not (attempt.asr_text or "").strip()
@@ -1504,7 +1545,6 @@ def _validate_start_pause_database(config, result: BrowserResult, *, answer_now:
             or attempt.contains_target is not True
             or attempt.operational_answer_type != "正确"
             or attempt.operational_score != 1.0
-            or attempt.operational_needs_review is not False
             or capture.repeat_admission_semantics != "repeat_bound"
             or capture.repeat_protocol_version_id
                 != train_session.repeat_protocol_version_id
@@ -1516,16 +1556,30 @@ def _validate_start_pause_database(config, result: BrowserResult, *, answer_now:
             or capture.repeat_request_id is not None
         ):
             raise BrowserAcceptanceError("账本没有证明该录音已完成识别与自动判定")
+        _require_completed_attempt_review(attempt, answer_now=answer_now)
         try:
             expected_attempt = autopilot_service.legacy_expected_attempt_facts(
                 session, record=record, capture=capture)
+            if answer_now:
+                # The current production terminal verifier admits the explicit
+                # interruption review flag; the legacy-only verifier does not.
+                bank = autopilot_service._session_week_bank(session, attempt.session_id)
+                selected = autopilot_service._select_p0a_content(
+                    train_session, bank, autopilot_service._default_protocol(),
+                    item_id=record.item_id, turn_seq=record.turn_seq)
+                autopilot_service._require_completed_operational_attempt(
+                    session, attempt=attempt, record=record, selected=selected)
         except autopilot_service.AutopilotServiceError as exc:
             raise BrowserAcceptanceError("无法从冻结计划重新推导该次回答的权威事实") from exc
         if (
             not autopilot_service.legacy_attempt_matches_expected_facts(
                 attempt, expected_attempt)
-            or not autopilot_service.legacy_attempt_is_successfully_judged(
-                session, attempt)
+            or not (
+                _interrupted_browser_judgement_is_legal(session, attempt)
+                if answer_now else
+                autopilot_service.legacy_attempt_is_successfully_judged(
+                    session, attempt)
+            )
         ):
             raise BrowserAcceptanceError("账本的接收、识别与判定交互证据不合法")
 
