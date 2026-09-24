@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { Alert } from "../components/Alert";
 import { Button } from "../components/Button";
@@ -27,7 +27,12 @@ const client: QuestionnaireRecordClient = {
 
 // 人工评价量表(SFACS/GDS-15/NPI-Q)的电子记录入口,挂在量表抽屉里。
 // 题词经认证接口随定义包下发,本文件不含任何题词。
-export function QuestionnairePanel({ patientId }: { patientId: string }) {
+export function QuestionnairePanel({ patientId, canExport = false }: { patientId: string; canExport?: boolean }) {
+  const scope = useRef({ patientId, canExport, active: true });
+  scope.current = { patientId, canExport, active: true };
+  useEffect(() => () => { scope.current.active = false; }, []);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
   const [catalog, setCatalog] = useState<QuestionnaireCatalogEntry[] | null>(null);
   const [records, setRecords] = useState<QuestionnaireRecord[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -87,6 +92,30 @@ export function QuestionnairePanel({ patientId }: { patientId: string }) {
     setCreateBusy(false);
   };
 
+  const downloadReview = async (dataset: "records" | "items") => {
+    if (!canExport || exportBusy) return;
+    const owner = scope.current;
+    setExportBusy(true);
+    setExportError(null);
+    try {
+      const blob = await api.questionnaireReviewCsv(patientId, dataset);
+      if (!scope.current.active || scope.current.patientId !== owner.patientId || !scope.current.canExport) return;
+      const url = URL.createObjectURL(blob);
+      try {
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `questionnaire-review-${dataset}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      } finally { URL.revokeObjectURL(url); }
+    } catch (error) {
+      if (scope.current.active && scope.current.patientId === owner.patientId) {
+        setExportError(error instanceof Error ? error.message : "下载失败，请重试");
+      }
+    } finally { if (scope.current.active) setExportBusy(false); }
+  };
+
   const onRecordUpdated = (next: QuestionnaireRecord) => {
     setRecords((previous) => previous === null
       ? previous
@@ -118,6 +147,16 @@ export function QuestionnairePanel({ patientId }: { patientId: string }) {
 
       {records && records.length === 0 && (
         <p className="muted">这位受试者还没有量表电子记录。</p>
+      )}
+      {canExport && records?.some((record) => record.status === "locked") && (
+        <div className="col">
+          <p className="muted">下载已锁定量表的当前核对表，含历次记录及替代序号；不属于冻结研究数据。无需建立训练场次。</p>
+          <div className="row wrap">
+            <Button disabled={exportBusy} onClick={() => void downloadReview("records")}>下载总分核对表</Button>
+            <Button disabled={exportBusy} onClick={() => void downloadReview("items")}>下载逐题核对表</Button>
+          </div>
+          {exportError && <Alert tone="danger" title="核对表未下载">{exportError}</Alert>}
+        </div>
       )}
       {records && records.map((record) => {
         const entry = definitionById.get(record.questionnaire_id) ?? null;

@@ -1,3 +1,4 @@
+import { startBargeInMonitor } from "./autopilotBrowserBargeIn.ts";
 import { fetchExactAutopilotTts } from "./autopilotMediaTransport.ts";
 import { browserAutopilotMediaDependencies } from "./autopilotBrowserMediaDependencies.ts";
 import type { AutopilotSpeechBrowserPorts } from "./autopilotSpeechExecutor.ts";
@@ -35,6 +36,7 @@ export function unlockAutopilotPlayback(): void {
 /** Real browser bindings kept outside the deterministic speech state machine. */
 export const browserAutopilotSpeechPorts: AutopilotSpeechBrowserPorts = {
   enabled: ttsEnabled,
+  startBargeIn: startBargeInMonitor,
   stopSpeaking,
   fetchTts: (sessionId, command, signal) => fetchExactAutopilotTts(
     sessionId, command, signal, browserAutopilotMediaDependencies),

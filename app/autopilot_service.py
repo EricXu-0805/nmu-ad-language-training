@@ -2349,6 +2349,63 @@ def authorize_recording_command(
     return gate.train_session.is_simulation
 
 
+def authorize_barge_in_monitor(
+    db: Session,
+    *,
+    session_id: str,
+    command_key: str,
+    capability_token_hash: str,
+    command_revision: int,
+    control_generation: int,
+    runner_generation: int,
+    now: datetime | None = None,
+) -> bool:
+    """Allow ephemeral local analysis, never capture, for an exact started prompt.
+
+    The ordinary recording command/authorization remains mandatory before any
+    MediaRecorder, persistence or upload. Rechecking after microphone acquisition
+    prevents a late permission result from inheriting a retired prompt.
+    """
+    _validate_idempotency_key(command_key, "command_key")
+    observed_at = _utc_naive(now) if now is not None else _utc_now_naive()
+    command = _command_by_key(db, session_id, command_key)
+    gate = _require_gate(
+        db, session_id, bank=_session_week_bank(db, session_id),
+        protocol=_default_protocol(), now=observed_at,
+        expected_token_hash=capability_token_hash,
+        position_item_id=command.item_id if command is not None else None,
+        position_turn_seq=command.turn_seq if command is not None else None,
+    )
+    state = db.exec(select(SessionAutopilotState).where(
+        SessionAutopilotState.session_id == session_id,
+    ).with_for_update()).first()
+    if (state is None or state.scope_key != P0A_SCOPE_KEY
+            or state.mode != "autonomous" or state.status != "waiting_tts"
+            or command is None or command.id is None
+            or state.current_command_id != command.id
+            or command.kind != "tts" or command.state != "started"
+            or command.started_at is None
+            or command.scope_key != state.scope_key
+            or command.control_generation != state.control_generation
+            or command.runner_generation != state.runner_generation
+            or command.control_generation != control_generation
+            or command.runner_generation != runner_generation
+            or command.revision != command_revision):
+        _fail("autopilot_command_not_current", "本机声音检测所绑定的提问已失效")
+    projection = _project_command(
+        db, command, gate.selected, expected_capability=gate.active_capability)
+    if (not isinstance(projection.payload, DeviceTtsPayload)
+            or projection.payload.purpose not in {"question", "cue"}):
+        _fail("autopilot_command_not_current", "仅提问和提示允许本机声音检测")
+    started = db.exec(select(RuntimeCommandAck).where(
+        RuntimeCommandAck.command_id == command.id,
+        RuntimeCommandAck.ack_type == "tts_started",
+    )).first()
+    if started is None or started.command_revision + 1 != command.revision:
+        _fail("autopilot_command_not_current", "当前提问尚无已开始播放的回执")
+    return gate.train_session.is_simulation
+
+
 def authorized_tts_text(
     db: Session,
     *,

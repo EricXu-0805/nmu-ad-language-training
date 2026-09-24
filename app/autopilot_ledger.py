@@ -993,7 +993,7 @@ def verify_interrupted_tts_ack(
         duration = payload.get("media_duration_ms")
         if (set(payload) != ACK_PAYLOAD_KEYS["tts_interrupted"]
                 or payload.get("media_stopped") is not True
-                or payload.get("interrupt_reason") != "answer_now"
+                or payload.get("interrupt_reason") not in {"answer_now", "voice_activity"}
                 or type(duration) is not int or not 0 <= duration <= 21_600_000
                 or encode_ack_payload("tts_interrupted", payload) != ack.payload_json):
             raise ValueError("invalid stopped media fact")

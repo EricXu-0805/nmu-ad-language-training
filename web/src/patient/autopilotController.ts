@@ -38,11 +38,13 @@ export interface AutopilotSpeechPlayback {
   /** Resolves only after the browser/media element has really begun playback. */
   started: Promise<{ media_duration_ms?: number }>;
   /** Resolves only after the same playback reaches its real ended event. */
-  ended: Promise<{ media_duration_ms?: number; interrupted?: true }>;
+  ended: Promise<{ media_duration_ms?: number; interrupted?: true; interrupt_reason?: "answer_now" | "voice_activity" }>;
   /** Resolves only after playback/fetch teardown can no longer emit audio. */
   closed: Promise<void>;
   /** Stops only a started question/cue; natural ended wins if already observed. */
   answerNow?(): boolean;
+  /** Arm local-only detection only after the started revision is acknowledged. */
+  armBargeIn?(command: TtsCommand): void;
   cancel(): void;
 }
 
@@ -982,6 +984,7 @@ export class PatientAutopilotController {
       await this.refreshCommand();
       const startedCommand = this.currentCommand("tts");
       if (startedCommand.state !== "started") throw new Error("TTS started revision 未确认");
+      if (!this.stopped && !this.patientPauseRequested) playback.armBargeIn?.(startedCommand);
 
       const observedEnd = await endedOutcome;
       if (!observedEnd.ok) {
@@ -1001,7 +1004,8 @@ export class PatientAutopilotController {
       if (this.stopped || this.patientPauseRequested) return;
       const endedAck = await this.sendAck(startedCommand, observedEnd.value.interrupted
         ? {
-            ack_type: "tts_interrupted", media_stopped: true, interrupt_reason: "answer_now",
+            ack_type: "tts_interrupted", media_stopped: true,
+            interrupt_reason: observedEnd.value.interrupt_reason ?? "answer_now",
             media_duration_ms: observedEnd.value.media_duration_ms ?? 0,
           }
         : { ack_type: "tts_ended", media_ended: true,

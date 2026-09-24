@@ -218,6 +218,7 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   const sittingTouched = useRef(false);
   const [phase, setPhase] = useState<PhaseType>("关系建立");
   const [patientSimulation, setPatientSimulation] = useState<boolean | null>(null);
+  const [patientStudyArm, setPatientStudyArm] = useState<string | null>(null);
   const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
   // 服务端权威逐周题库信号(structured/ready_for_research);null=尚未核对成功,fail-closed。
   const [contentStatus, setContentStatus] = useState<TrainingContentStatus | null>(null);
@@ -295,9 +296,12 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
   useEffect(() => {
     let active = true;
     setPatientSimulation(null);
+    setPatientStudyArm(null);
     setPatientLoadError(null);
     api.getPatient(patientId).then((patient) => {
-      if (active) setPatientSimulation(patient.is_simulation_subject === true);
+      if (!active) return;
+      setPatientSimulation(patient.is_simulation_subject === true);
+      setPatientStudyArm(patient.study_arm?.trim() || null);
     }).catch((error) => {
       if (!active) return;
       setPatientLoadError(errorText(error));
@@ -521,6 +525,11 @@ export function VisitPlanCreateScreen({ patientId, canManage = true, onBack }: {
         <Button disabled={mutationBusy} onClick={onBack}>返回登记表</Button>
       </header>
 
+      {patientSimulation !== null && (
+        <Alert tone="info" title={`研究分组：${patientStudyArm || "未填写"}`}>
+          分组标签不会自动切换训练内容。对照组请按已确认的研究方案安排；空白对照不要建立干预训练安排。
+        </Alert>
+      )}
       {!canManage && (
         <Alert tone="warn" title="当前账号为只读角色">
           可以查看既有安排，但不能创建、审核或取消训练安排。

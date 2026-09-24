@@ -28,6 +28,7 @@ import {
   autopilotNextTickDelayMs,
   type AutopilotRuntimeState,
 } from "./autopilotRuntime.ts";
+import type { BargeInObservation } from "./autopilotBrowserBargeIn.ts";
 import { BrowserAutopilotSpeechExecutor } from "./autopilotSpeechExecutor.ts";
 import { browserAutopilotSpeechPorts } from "./autopilotBrowserSpeechPorts.ts";
 import {
@@ -112,6 +113,7 @@ export interface PatientAutopilotView {
   stopForPatientPauseNow(): void;
   stopRecordingNow(): void;
   answerNow?(): boolean;
+  bargeIn?: BargeInObservation | null;
 }
 
 function blockedReason(error: unknown): string {
@@ -188,6 +190,7 @@ export function usePatientAutopilot(input: {
   // 无 server 上下文时(暂停期间整页刷新)收麦交接的去重键:同一命令只钉一次证据。
   const standaloneDrainedKey = useRef<string | null>(null);
   serverContextRef.current = server;
+  const [bargeIn, setBargeIn] = useState<BargeInObservation | null>(null);
   const [localCapturePhase, setLocalCapturePhase] =
     useState<LocalAutopilotCapturePhase | null>(null);
   const capturedSessionRef = useRef<string | null>(null);
@@ -581,7 +584,18 @@ export function usePatientAutopilot(input: {
         sessionId: input.sessionId as string,
         transport: autopilotHttpTransport,
         speech: new BrowserAutopilotSpeechExecutor(
-          input.sessionId as string, browserAutopilotSpeechPorts),
+          input.sessionId as string, {
+            ...browserAutopilotSpeechPorts,
+            observeBargeIn: (observation) => {
+              if (cancelled || lifecycleRef.current?.aborted) return;
+              setBargeIn((before) => {
+                // Preserve the truthful repeat cue through microphone startup for this same answer.
+                if (observation.phase === "closed" && before?.phase === "interrupted"
+                    && before.commandKey === observation.commandKey) return before;
+                return observation;
+              });
+            },
+          }),
         recording: new BrowserAutopilotRecordingExecutor(input.sessionId as string, {
           ownerGeneration: context.ownerGeneration,
           observe: observeCapturePhase,
@@ -764,6 +778,7 @@ export function usePatientAutopilot(input: {
     blockedRetryExhausted,
     assetReadiness,
     localCapturePhase,
+    bargeIn,
     reportAssetReadiness,
     stopMediaNow: () => controllerRef.current?.stop(),
     stopForPatientPauseNow: () => controllerRef.current?.stopForPatientPause(),
