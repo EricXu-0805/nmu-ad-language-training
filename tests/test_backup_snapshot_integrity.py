@@ -25,6 +25,26 @@ assert _SPEC is not None and _SPEC.loader is not None
 _GUARD_MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_GUARD_MODULE)
 
+# Independently transcribed exporter history; do not derive expected test sets
+# from the standalone verifier constants.
+_BASE_SHEETS = (
+    "session", "turns", "attempts", "interactions", "item_scores", "scales",
+    "legacy_unverified_scales", "abnormal", "audio_manifest",
+)
+_CURRENT_SHEETS = (
+    "session", "turns", "attempts", "adjudications", "interactions", "item_scores",
+    "scales", "legacy_unverified_scales", "questionnaire_records",
+    "questionnaire_item_values", "abnormal", "audio_manifest", "repeat_audio_manifest",
+)
+_SUPPORTED_SHEETS = [
+    pytest.param(_BASE_SHEETS, id="base-9"),
+    pytest.param((*_BASE_SHEETS, "repeat_audio_manifest"), id="repeat-10"),
+    pytest.param((*_BASE_SHEETS, "adjudications"), id="prior-backup-10"),
+    pytest.param((*_BASE_SHEETS, "repeat_audio_manifest", "questionnaire_records",
+                  "questionnaire_item_values"), id="questionnaires-12"),
+    pytest.param(_CURRENT_SHEETS, id="current-13"),
+]
+
 
 def _digest(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
@@ -51,14 +71,11 @@ def _database(snapshot: Path, rows: list[tuple] = ()) -> None:
 
 
 def _published_export_fixture(
-        snapshot: Path, *, status: str = "published") -> dict[str, Path]:
+        snapshot: Path, *, status: str = "published",
+        sheet_names: tuple[str, ...] = (*_BASE_SHEETS, "adjudications"),
+        metadata_sheet_names: tuple[str, ...] | None = None) -> dict[str, Path]:
     batch_id = "BATCH-SYNTHETIC"
     classification = "simulation"
-    sheet_names = (
-        "session", "turns", "attempts", "interactions", "item_scores",
-        "scales", "legacy_unverified_scales", "abnormal", "audio_manifest",
-        "adjudications",
-    )
     audio_code = "AUDIO-v1-test-key-0123456789abcdef0123"
     raw_audio_id = "raw-synthetic-export"
     controlled_relative = (
@@ -112,7 +129,11 @@ def _published_export_fixture(
     metadata = {
         "audio_touched": [audio_code],
         "excluded_items": [],
-        "sheet_counts": {name: 1 for name in sheet_names},
+        "sheet_counts": {
+            name: 1 for name in (
+                sheet_names if metadata_sheet_names is None else metadata_sheet_names
+            )
+        },
     }
     manifest = {
         "schema_version": "export-manifest.v1",
@@ -341,17 +362,62 @@ def test_real_alembic_upgrade_head_schema_is_accepted(tmp_path):
 
 
 @pytest.mark.parametrize("status", ["artifacts_ready", "published"])
-def test_export_ledger_and_both_file_realms_close_exactly(status, tmp_path):
+@pytest.mark.parametrize("sheet_names", _SUPPORTED_SHEETS)
+def test_export_ledger_and_both_file_realms_close_exactly(status, sheet_names, tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     _database(snapshot)
-    _published_export_fixture(snapshot, status=status)
+    _published_export_fixture(snapshot, status=status, sheet_names=sheet_names)
     _manifest(snapshot)
 
     completed = _run("verify", snapshot)
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "OK"
+
+
+def test_current_exporter_sheet_contract_remains_supported():
+    from app.export import SHEET_FIELDS
+
+    assert set(SHEET_FIELDS) == set(_CURRENT_SHEETS)
+    assert frozenset(SHEET_FIELDS) == _GUARD_MODULE._EXPORT_SHEET_NAMES
+
+
+@pytest.mark.parametrize("status", ["staging", "artifacts_ready", "published"])
+@pytest.mark.parametrize(
+    ("sheet_names", "metadata_sheet_names", "code"),
+    [
+        pytest.param(tuple(name for name in _CURRENT_SHEETS if name != "session"),
+                     None, "export_metadata_invalid", id="missing-required-sheet"),
+        pytest.param(tuple(name for name in _CURRENT_SHEETS
+                           if name != "questionnaire_records"),
+                     None, "export_metadata_invalid", id="unsupported-partial-questionnaires"),
+        pytest.param((*_CURRENT_SHEETS, "unknown_sheet"), None,
+                     "export_metadata_invalid", id="unknown-sheet"),
+        pytest.param(_CURRENT_SHEETS, _BASE_SHEETS,
+                     "export_artifact_contract_invalid", id="legacy-metadata-extra-artifacts"),
+        pytest.param(_BASE_SHEETS, _CURRENT_SHEETS,
+                     "export_artifact_contract_invalid", id="current-metadata-missing-artifacts"),
+        pytest.param((*_CURRENT_SHEETS, "unknown_sheet"), _CURRENT_SHEETS,
+                     "export_artifact_contract_invalid", id="unknown-artifact-only"),
+    ],
+)
+def test_export_sheet_set_must_be_supported_and_match_every_artifact(
+        status, sheet_names, metadata_sheet_names, code, tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    _database(snapshot)
+    _published_export_fixture(snapshot, status=status, sheet_names=sheet_names,
+                              metadata_sheet_names=metadata_sheet_names)
+    if status == "staging":
+        with sqlite3.connect(snapshot / "app.db") as connection:
+            connection.execute("DELETE FROM exportartifact")
+    # Rebuild every outer hash: rejection must come from the semantic contract,
+    # not an accidental checksum mismatch masking an invalid sheet set.
+    _manifest(snapshot)
+    completed = _run("verify", snapshot)
+    assert completed.returncode == 2
+    assert f"code={code}" in completed.stderr
 
 
 @pytest.mark.parametrize("realm", ["analysis", "controlled"])
@@ -425,12 +491,13 @@ def test_materialized_staging_export_must_settle_before_snapshot(tmp_path):
 
 
 @pytest.mark.parametrize("manifest_present", [True, False])
+@pytest.mark.parametrize("sheet_names", _SUPPORTED_SHEETS)
 def test_exact_staging_publication_intent_is_recoverable_snapshot(
-        manifest_present, tmp_path):
+        manifest_present, sheet_names, tmp_path):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     _database(snapshot)
-    paths = _published_export_fixture(snapshot, status="staging")
+    paths = _published_export_fixture(snapshot, status="staging", sheet_names=sheet_names)
     connection = sqlite3.connect(snapshot / "app.db")
     try:
         # Publication intent is durable before the append-only artifact ledger.

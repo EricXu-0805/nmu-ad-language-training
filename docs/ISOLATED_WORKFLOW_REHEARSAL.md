@@ -28,4 +28,6 @@ python -m harness.isolated_workflow_rehearsal --root /absolute/private-empty-reh
 
 [八项回归测试](../tests/test_isolated_workflow_rehearsal.py) 覆盖完整链及幂等、音频字节绑定、四种不安全路径、提前导入应用和关闭断言的拒绝。另有独立无 Git／无默认数据目录副本复跑：禁止外部连接后仍通过，源码哈希未变，默认数据目录未创建。
 
+完整链回归还将实际 API 导出的临时数据交给原 `backup.sh`，再使用现有恢复校验、物化与隔离启动流程，核验数据库、录音、CSV／manifest 字节、锁分及裁定记录。该额外回归发现并修复了校验器只接受旧表清单、拒绝当前 13 张表的遗漏；现在明确接受历史实际发布的精确表集合，仍拒绝缺表、未知表和元数据与文件不一致。此回归验证本地应用数据恢复；没有伪造 VPS 配置，也不等于实际服务器灾难恢复或真实患者验收。临时上传锁按原备份合同排除，最终录音与导出不能缺失。
+
 模拟导出通过不等于正式研究冻结获批。既有 [冻结数据机械演练](../harness/quality_release_scale.py) 与 [护理员现场交接](CAREGIVER_REHEARSAL_HANDOFF.md)、[真实音频容量预算](CAPACITY_REHEARSAL.md) 分别保留独立结论。原始回执在项目父目录 `审核报告_20260925/full-rehearsal/` 受控留存。
