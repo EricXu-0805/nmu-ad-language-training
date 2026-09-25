@@ -6,6 +6,8 @@ import hashlib
 import json
 import shutil
 import struct
+import subprocess
+import sys
 from types import SimpleNamespace
 import wave
 
@@ -209,7 +211,9 @@ def test_receipt_cannot_be_written_inside_application_repository():
         capacity.run_exercise(capacity.SOURCE_ROOT / "data" / "capacity-proof.json")
 
 
-def test_copy_only_runs_without_codec_tools_and_verifies_transferred_sample(tmp_path, monkeypatch):
+@pytest.mark.parametrize("runtime_subprocess", [False, True], ids=["host-runtime", "lazy-runtime"])
+def test_copy_only_runs_without_codec_tools_and_verifies_transferred_sample(
+        tmp_path, monkeypatch, runtime_subprocess):
     tmp_path.chmod(0o700)
     sample = tmp_path / "uploaded-synthetic.webm"
     sample.write_bytes(bytes(range(256)) * 100)
@@ -223,14 +227,29 @@ def test_copy_only_runs_without_codec_tools_and_verifies_transferred_sample(tmp_
     manifest_digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
     args = {"audit_root": tmp_path, "manifest": manifest,
             "expected_manifest_sha256": manifest_digest}
+    if runtime_subprocess:
+        # On Linux platform.platform() may lazily call subprocess.check_output
+        # for uname. Exercise that dependency even on hosts with warm caches.
+        def runtime_description():
+            return subprocess.check_output(
+                [sys.executable, "-c", "print('runtime-probe-via-stdlib')"],
+                text=True,
+            ).strip()
+        monkeypatch.setattr(capacity, "platform", SimpleNamespace(
+            platform=runtime_description, python_version=capacity.platform.python_version,
+        ))
     # This mode must not invoke a codec process or discover application data.
     def no_process(*args, **kwargs):
         raise AssertionError("copy-only unexpectedly launched external tool")
-    monkeypatch.setattr(capacity.subprocess, "run", no_process)
+    # Replace only the tool's binding, not the shared stdlib module that the
+    # platform runtime probe also uses. Direct codec invocations still fail.
+    monkeypatch.setattr(capacity, "subprocess", SimpleNamespace(run=no_process))
     receipt = tmp_path / "copy-result.json"
     facts = capacity.run_copy_only(receipt, sample, digest, dataset_bytes=40000,
                                    materialized_limit_bytes=2 * capacity.MIB, **args)
     assert facts["codec_decoding_performed_on_this_host"] is False
+    if runtime_subprocess:
+        assert facts["local_runtime"]["system"] == "runtime-probe-via-stdlib"
     assert facts["temporary_payload_removed"] is True
     assert facts["physical_copy_exercise"]["total_logical_bytes_written"] < 2 * capacity.MIB
     assert set(tmp_path.iterdir()) == {receipt, sample, manifest}
