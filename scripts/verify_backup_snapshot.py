@@ -38,9 +38,26 @@ _EXPORT_CLASSIFICATIONS = frozenset({"research", "simulation"})
 _EXPORT_ARTIFACT_KINDS = frozenset({
     "csv", "controlled_audio", "manifest", "staging_receipt",
 })
-_EXPORT_SHEET_NAMES = frozenset({
+_BASE_EXPORT_SHEET_NAMES = frozenset({
     "session", "turns", "attempts", "interactions", "item_scores", "scales",
-    "legacy_unverified_scales", "abnormal", "audio_manifest", "adjudications",
+    "legacy_unverified_scales", "abnormal", "audio_manifest",
+})
+# export-manifest.v1 predates these additions. Historical manifests remain
+# immutable after database migrations, so accept only the exact emitted sets:
+# 609ced8 (base), 6df12f6 (repeat), 3ccb86d (questionnaires), 555c491 (adjudications).
+# Also preserve the prior backup verifier's base+adjudications contract. Do not
+# import app.export: this recovery tool must never initialize application state.
+_REPEAT_EXPORT_SHEET_NAMES = _BASE_EXPORT_SHEET_NAMES | {"repeat_audio_manifest"}
+_QUESTIONNAIRE_EXPORT_SHEET_NAMES = _REPEAT_EXPORT_SHEET_NAMES | {
+    "questionnaire_records", "questionnaire_item_values",
+}
+_EXPORT_SHEET_NAMES = _QUESTIONNAIRE_EXPORT_SHEET_NAMES | {"adjudications"}
+_SUPPORTED_EXPORT_SHEET_SETS = frozenset({
+    _BASE_EXPORT_SHEET_NAMES,
+    _REPEAT_EXPORT_SHEET_NAMES,
+    _QUESTIONNAIRE_EXPORT_SHEET_NAMES,
+    _BASE_EXPORT_SHEET_NAMES | {"adjudications"},
+    _EXPORT_SHEET_NAMES,
 })
 _POST_EXPORT_AUDIO_STATUSES = frozenset({
     "exported", "checksum_verified", "reliability_review_done", "deletable",
@@ -587,7 +604,7 @@ def _export_metadata(raw: str) -> dict[str, object]:
             or not isinstance(metadata["excluded_items"], list)
             or not all(isinstance(value, str) for value in metadata["excluded_items"])
             or not isinstance(metadata["sheet_counts"], dict)
-            or set(metadata["sheet_counts"]) != _EXPORT_SHEET_NAMES
+            or frozenset(metadata["sheet_counts"]) not in _SUPPORTED_EXPORT_SHEET_SETS
             or not all(
                 isinstance(key, str) and type(value) is int and value >= 0
                 for key, value in metadata["sheet_counts"].items()
@@ -634,6 +651,7 @@ def _verify_staging_export_intent(
         manifest_sha256: str, metadata_raw: str,
         publication_raw: str) -> tuple[set[str], set[str]]:
     metadata = _export_metadata(metadata_raw)
+    expected_sheets = set(metadata["sheet_counts"])
     try:
         manifest = json.loads(publication_raw)
     except (TypeError, ValueError) as exc:
@@ -707,7 +725,7 @@ def _verify_staging_export_intent(
         parts = PurePosixPath(relative_path).parts
         if kind == "csv":
             if (len(parts) != 3 or not parts[2].endswith(".csv")
-                    or parts[2][:-4] not in _EXPORT_SHEET_NAMES):
+                    or parts[2][:-4] not in expected_sheets):
                 raise SnapshotError("export_artifact_contract_invalid")
             csv_names.add(parts[2][:-4])
         elif kind == "staging_receipt":
@@ -725,8 +743,8 @@ def _verify_staging_export_intent(
             controlled_codes.append(name_match.group(1))
         else:
             raise SnapshotError("export_artifact_contract_invalid")
-    if (csv_names != _EXPORT_SHEET_NAMES or len(receipt_rows) != 1
-            or len(descriptors) != len(_EXPORT_SHEET_NAMES) + 1 + len(controlled_codes)
+    if (csv_names != expected_sheets or len(receipt_rows) != 1
+            or len(descriptors) != len(expected_sheets) + 1 + len(controlled_codes)
             or len(set(controlled_codes)) != len(controlled_codes)
             or sorted(controlled_codes) != metadata["audio_touched"]):
         raise SnapshotError("export_artifact_contract_invalid")
@@ -1090,6 +1108,7 @@ def _verify_export_semantics(
                     or not isinstance(json_row[1], str)):
                 raise SnapshotError("export_batch_contract_invalid")
             metadata = _export_metadata(json_row[0])
+            expected_sheets = set(metadata["sheet_counts"])
             try:
                 publication_manifest = json.loads(json_row[1])
             except (TypeError, ValueError) as exc:
@@ -1152,7 +1171,7 @@ def _verify_export_semantics(
                 elif kind == "csv":
                     parts = PurePosixPath(relative_path).parts
                     if (len(parts) != 3 or not parts[2].endswith(".csv")
-                            or parts[2][:-4] not in _EXPORT_SHEET_NAMES):
+                            or parts[2][:-4] not in expected_sheets):
                         raise SnapshotError("export_artifact_contract_invalid")
                     csv_names.add(parts[2][:-4])
                 elif kind == "controlled_audio":
@@ -1167,8 +1186,8 @@ def _verify_export_semantics(
                     controlled_receipts.append((checksum, byte_count))
 
             if (len(manifest_rows) != 1 or len(receipt_rows) != 1
-                    or csv_names != _EXPORT_SHEET_NAMES
-                    or len(descriptors) != len(_EXPORT_SHEET_NAMES) + 2 + len(controlled_receipts)):
+                    or csv_names != expected_sheets
+                    or len(descriptors) != len(expected_sheets) + 2 + len(controlled_receipts)):
                 raise SnapshotError("export_artifact_contract_invalid")
             receipt_descriptor, receipt_path = receipt_rows[0]
             if receipt_descriptor["byte_count"] > 4096:

@@ -8,6 +8,7 @@
 判据(全部 fail-closed,读不到就算不健康):
   - 最新一条 `ok` 的时间距现在不超过 --max-age-hours;
   - 最新 `ok` 之后累计的 FAIL 不超过 --max-consecutive-failures;
+  - 精确的 `SKIP code=backup_lock_busy` 只是锁忙记录，不算成功或失败;
   - 最新 `ok` 声明的快照目录真的在盘上,且是目录不是软链接;
   - 备份根所在文件系统剩余空间不低于 --min-free-mb。
 
@@ -25,7 +26,7 @@ import sys
 
 LINE = re.compile(
     r"^\[(?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] "
-    r"(?P<verdict>ok|FAIL)\b(?P<rest>.*)$")
+    r"(?P<verdict>ok|FAIL|SKIP)\b(?P<rest>.*)$")
 SNAPSHOT = re.compile(r"\bsnapshot=(?P<name>[0-9]{8}-[0-9]{6})\b")
 
 
@@ -49,6 +50,11 @@ def _parse(log_path: Path) -> list[tuple[datetime, str, str]]:
             when = datetime.strptime(match["stamp"], "%Y-%m-%d %H:%M:%S")
         except ValueError:
             raise Unevaluable("backup_log_timestamp_invalid") from None
+        # The daily wrapper emits this one benign skip. Unknown skip reasons
+        # or extra fields remain unreadable evidence, never silently ignored.
+        if (match["verdict"] == "SKIP"
+                and match["rest"] != " code=backup_lock_busy"):
+            raise Unevaluable("backup_log_line_unparsable")
         entries.append((when, match["verdict"], match["rest"]))
     if not entries:
         raise Unevaluable("backup_log_empty")
