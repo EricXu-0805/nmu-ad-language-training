@@ -34,6 +34,7 @@ def _evaluate(root: Path, **overrides):
 
 OK_LINE = ("[2026-08-06 02:30:00] ok snapshot=20260806-023000 size=924K "
            "config=ok keep=14")
+LOCK_SKIP = "[2026-08-06 02:40:00] SKIP code=backup_lock_busy"
 
 
 def test_fresh_published_snapshot_is_healthy(tmp_path):
@@ -75,6 +76,70 @@ def test_a_single_failure_after_success_is_tolerated(tmp_path):
     ], ["20260806-023000"])
 
     assert _evaluate(root) == []
+
+
+def test_lock_skip_is_neutral_and_does_not_poison_a_later_success(tmp_path):
+    root = _root(tmp_path, [OK_LINE, LOCK_SKIP], ["20260806-023000"])
+    assert _evaluate(root) == []
+
+    (root / "daily" / "20260806-025000").mkdir()
+    with (root / "backup.log").open("a", encoding="utf-8") as log:
+        log.write("[2026-08-06 02:50:00] ok snapshot=20260806-025000 size=924K\n")
+    assert _evaluate(root) == []
+
+
+def test_recent_lock_skip_does_not_refresh_a_stale_success(tmp_path):
+    root = _root(tmp_path, [
+        "[2026-07-23 02:36:54] ok snapshot=20260723-023654 size=172K",
+        LOCK_SKIP,
+    ], ["20260723-023654"])
+    problems = _evaluate(root)
+    assert len(problems) == 1 and problems[0].startswith("last_backup_stale ")
+
+
+def test_lock_skip_does_not_reset_failures_since_last_success(tmp_path):
+    root = _root(tmp_path, [
+        OK_LINE,
+        "[2026-08-06 02:35:00] FAIL code=base_snapshot_failed rc=1",
+        LOCK_SKIP,
+        "[2026-08-06 02:50:00] FAIL code=base_snapshot_failed rc=1",
+    ], ["20260806-023000"])
+    assert _evaluate(root) == ["consecutive_failures count=2 limit=1"]
+
+
+def test_only_lock_skip_has_no_successful_backup(tmp_path, capsys):
+    root = _root(tmp_path, [LOCK_SKIP], [])
+    assert _evaluate(root) == ["no_successful_backup_ever entries=1"]
+    assert health.main(["--backup-root", str(root), "--min-free-mb", "0"]) == 1
+    assert "UNHEALTHY no_successful_backup_ever" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("body", [
+    "SKIP", "SKIP code=unknown", "SKIP code=backup_lock_busy_extra",
+    "SKIP code=backup_lock_busy snapshot=20260806-023000",
+    "SKIP  code=backup_lock_busy", "SKIP code=backup_lock_busy ",
+    "SKIP code=backup_lock_busy\ufffd", "SKIPPED code=backup_lock_busy",
+])
+def test_unknown_or_extended_skip_remains_unevaluable(tmp_path, body):
+    root = _root(tmp_path, [OK_LINE, f"[2026-08-06 02:40:00] {body}"],
+                 ["20260806-023000"])
+    with pytest.raises(health.Unevaluable, match="^backup_log_line_unparsable$"):
+        _evaluate(root)
+
+
+def test_lock_skip_still_requires_a_valid_timestamp(tmp_path):
+    root = _root(tmp_path, [
+        OK_LINE, "[2026-02-30 02:40:00] SKIP code=backup_lock_busy",
+    ], ["20260806-023000"])
+    with pytest.raises(health.Unevaluable, match="^backup_log_timestamp_invalid$"):
+        _evaluate(root)
+
+
+def test_lock_skip_does_not_hide_missing_snapshot_or_low_space(tmp_path):
+    root = _root(tmp_path, [OK_LINE, LOCK_SKIP], [])
+    problems = _evaluate(root, min_free_mb=2**40)
+    assert "published_snapshot_missing name=20260806-023000" in problems
+    assert any(problem.startswith("disk_space_low ") for problem in problems)
 
 
 def test_log_says_ok_but_the_snapshot_is_not_on_disk(tmp_path):
