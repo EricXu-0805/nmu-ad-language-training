@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -9,6 +10,17 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 GATE = ROOT / "scripts/ci_gate.sh"
 GATE_TEXT = GATE.read_text(encoding="utf-8")
+SKIP_ON_MAIN_PUSH_AND_SCHEDULE = "github.event_name != 'push' && github.event_name != 'schedule'"
+
+
+def _jobs() -> dict[str, str]:
+    body = WORKFLOW[WORKFLOW.index("\njobs:\n") + len("\njobs:\n"):]
+    parts = re.split(r"^  ([A-Za-z][\w-]*):\n", body, flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def _job_level_ifs(job: str) -> list[str]:
+    return re.findall(r"^    if: (.+)$", _jobs()[job], re.M)
 
 
 def test_workflow_calls_the_shared_gate_for_every_core_suite() -> None:
@@ -172,3 +184,38 @@ def test_main_runs_are_never_cancelled_or_replaced_by_a_later_merge() -> None:
     # 所以 main 必须按 SHA 分组,而且不取消在跑的。
     assert "github.ref == 'refs/heads/main' && github.sha || github.ref" in WORKFLOW
     assert "cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}" in WORKFLOW
+
+
+def test_push_runs_only_on_main_and_the_other_triggers_stay() -> None:
+    # 分支上的提交由 pull_request 那次跑;分支 push 再跑一遍是同一棵树的第二份分钟账单。
+    triggers = WORKFLOW[WORKFLOW.index("\non:\n"):WORKFLOW.index("\npermissions:")]
+    assert '\n  push:\n    branches: ["main"]\n' in triggers
+    assert '"**"' not in triggers
+    for trigger in ("pull_request", "workflow_dispatch", "schedule"):
+        assert f"\n  {trigger}:\n" in triggers
+    # pull_request 不加任何过滤:PR 少跑一次,五项必需检查就缺名字。
+    assert not re.search(r"^  pull_request:\n    ", triggers, re.M)
+    assert 'cron: "0 2 * * 1"' in triggers
+
+
+def test_main_push_and_schedule_skip_the_test_suites_but_still_scan_and_build() -> None:
+    # strict 分支保护下,进 main 的树已由 PR run 测过;main 的 push 只为出上线产物,
+    # 每周定时只为让 OSV 与镜像扫描看到新通告。backend/frontend 在这两种事件上不重跑。
+    for job in ("backend", "frontend"):
+        assert _job_level_ifs(job) == [SKIP_ON_MAIN_PUSH_AND_SCHEDULE], job
+    for job in ("supply-chain", "image"):
+        assert _job_level_ifs(job) == [], f"{job} 必须每种事件都跑"
+    jobs = _jobs()
+    assert "scripts/ci_gate.sh --only supply-chain" in jobs["supply-chain"]
+    assert jobs["image"].count("uses: aquasecurity/trivy-action@") == 2
+
+
+def test_release_artifact_is_uploaded_by_main_push_and_never_by_pull_requests() -> None:
+    # 上线脚本只从 main 上该 SHA 的 push run 取产物;PR run 构建的是合并预演提交,传了也用不上。
+    image = _jobs()["image"]
+    (upload,) = [step for step in image.split("\n      - ") if "name: nmu-release-artifacts" in step]
+    assert "\n        if: github.event_name != 'pull_request'\n" in upload
+    assert "\n          retention-days: 30\n" in upload
+    assert "\n          if-no-files-found: error" in upload
+    # PR run 照样构建、扫描、核 dist 与源码的绑定,只少上传这一步。
+    assert len(re.findall(r"^        if: ", image, re.M)) == 1

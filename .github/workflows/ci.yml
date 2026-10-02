@@ -7,8 +7,12 @@
 name: CI
 
 on:
+  # 分支上的提交只由 pull_request 那次跑：strict 分支保护要求 PR 先与 main 同步，测的就是
+  # 合进去的那棵树，分支 push 再跑一遍是同一棵树的第二份分钟账单（仓库私有后按分钟计）。
+  # 没开 PR 的分支因此不跑 CI，要测就开草稿 PR。main 的 push 必须留着：上线脚本只从
+  # main 上该 SHA 的 push run 取产物。
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
   workflow_dispatch:
   schedule:
@@ -33,6 +37,13 @@ concurrency:
 
 jobs:
   backend:
+    # main 的 push 与每周定时不重跑测试：进 main 的树已由 PR run 测过，这两种事件只要上线
+    # 产物和新通告扫描（image、supply-chain）。跳过的 job 记 skipped，整次 run 仍是 success；
+    # job 级 if 先于矩阵展开求值，main 上只会有一条 backend、没有 backend (3.12)/(3.14)——
+    # 必需检查只在更新 main 那一刻核对被推的 SHA，那时这次 run 还没开始，不受影响。
+    # 只写「跳过哪些事件」，新加的触发默认照跑；pull_request 绝不能进来：分支保护把跳过算通过。
+    # 要在 main 上完整重跑，用 workflow_dispatch。
+    if: github.event_name != 'push' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -70,6 +81,8 @@ jobs:
           if-no-files-found: error
 
   frontend:
+    # 条件与理由同 backend。
+    if: github.event_name != 'push' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
@@ -163,8 +176,12 @@ jobs:
           cp -R "$RUNNER_TEMP/nmu-edge-release" "$artifact_dir/caddy"
           cp "$RUNNER_TEMP/nmu-edge-scan.json" "$artifact_dir/caddy/trivy.json"
       - name: 归档同一镜像生成的前端构件与来源
+        # PR run 构建的是合并预演提交，上线从不取它的产物；上面几步照跑，只是不上传。
+        # 留 30 天：上线都是合并后不久就取；回滚靠服务器上的旧树存档，不靠这份。
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         with:
           name: nmu-release-artifacts
           path: ${{ runner.temp }}/nmu-release-artifacts
           if-no-files-found: error
+          retention-days: 30
