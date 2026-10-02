@@ -45,6 +45,90 @@ systemctl list-timers --all 'nmu-*' --no-pager   # 定时器看 NEXT 列，不�
 - 备份 timer 写的是 UTC。机器时区是 UTC，`OnCalendar=19:30` 等于上海 03:30。
   机器时区若改成 Asia/Shanghai，这一行要跟着改，否则备份会挪到中午。
 
+## 系统安全补丁夜间自动装（2026-10-02 入库；装到生产要 Eric 先批准这份配置）
+
+装机起 `APT::Periodic::Unattended-Upgrade` 是 `"0"`：包列表天天刷新，补丁一个不装，
+2026-08-06 到 10-02 手装了 17 轮，周一的 `nmu-os-security` 9-28 那次就是积压了 6 个包告警。
+四份文件把它改成夜里自动装，只装安全补丁，不重启：
+
+| 仓库里 | 装到 | 管什么 |
+| --- | --- | --- |
+| `deploy/apt/52nmu-unattended-upgrades` | `/etc/apt/apt.conf.d/` | 打开安装；不加来源（沿用 50unattended-upgrades 的 jammy、jammy-security 与两条 ESM）；不自动重启；拉黑 `linux-`、`netplan`、`libnetplan`、`grub`、`shim` |
+| `deploy/needrestart/50-nmu-list-only.conf` | `/etc/needrestart/conf.d/` | needrestart 只列不重启，交互式 `apt upgrade` 也不再默认勾上 nmu、sing-box |
+| `deploy/systemd/apt-daily.timer.d/50-nmu-window.conf` | `/etc/systemd/system/apt-daily.timer.d/` | 刷新列表并预下载：每天 17:30 UTC（上海 01:30） |
+| `deploy/systemd/apt-daily-upgrade.timer.d/50-nmu-window.conf` | `/etc/systemd/system/apt-daily-upgrade.timer.d/` | 安装：每天 18:00 UTC（上海 02:00）起，随机推迟至多 5 分钟；`Persistent=false`，白天开机不补装 |
+
+两个片段在子目录里，上面那段 `deploy/systemd/*.timer` 的安装循环和上线脚本都扫不到，
+只能按下面显式装。`tests/test_unattended_upgrades_config.py` 钉住这份配置的形状。
+
+夜里会发生什么：只换盘上的文件。包自己的安装脚本会重启它自己的服务（systemd 更新会重启
+systemd-networkd/resolved/journald，另有 udev、nginx、ssh），各断几秒，落在上海凌晨、
+芝加哥白天；nmu、nmu-caddy、sing-box 从不被重启。所以 nmu 会一直跑着旧的
+libssl/libsqlite3/zlib，直到有人重启它——这台机器没装 update-notifier，库更新不会立任何
+旗子，靠下面的检查点名。会弹配置文件对话框的包（例如本机改过 `/etc/sysctl.conf` 的
+procps）会被跳过，留在积压里，周一照常告警。
+
+`os_security_check.py` 的判据（周一的 `nmu-os-security` 与 `preflight_check.py --os` 共用）：
+
+- 安全积压 > 0 → 失败。装上这份配置之后，夜里装不了的只剩被拉黑的内核/netplan/引导链和
+  会弹对话框的包：内核类走 `deploy/maintenance/kernel_netplan_window.sh` 的窗口（先跑它的
+  `check` 阶段），别的手装。
+- `nmu.service`、`nginx.service` 还映射着被换掉的 `.so` → 失败，原因里点名单元和库：
+  挑没人练的时候 `systemctl restart nmu`（或 nginx），几秒，然后重跑检查。其余单元
+  （sing-box、dbus、ssh…）只记提示，等下一个重启窗口一并换新。
+- `/boot` 里有比正在跑的更新的内核 → 只提示；内核不自动装也不自动重启。
+- 不是 root 跑、读不了 `/proc` → 失败，那样得出的 0 是没看。
+- `--json` 多三个字段：`stale_library_units`（`{单元: [库路径]}`）、`kernel_running`、
+  `kernel_newest_installed`。告警正文先列失败，再以「另注」列提示。
+
+**维护脚本调 apt 的规矩**（夜里 18:00 起 unattended-upgrade 拿着 dpkg 锁，Eric 的窗口又常在
+16:00–19:00 UTC）：每个真装包的 `apt-get` 都带 `-o DPkg::Lock::Timeout=600`，不带的会在半路
+因为拿不到锁直接失败；动 apt 之前先看夜间补丁是不是正在装，正在装就停下等它结束：
+
+```bash
+case "$(systemctl show -p ActiveState --value apt-daily-upgrade.service)" in
+  activating|active|deactivating) echo "夜间补丁正在装,停"; exit 1 ;;
+esac
+DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+  apt-get install -y -o DPkg::Lock::Timeout=600 <只写点名的包>
+```
+
+安装（批准之后，root；目标文件已存在的先挪进 0700 的备份目录）：
+
+```bash
+B=/opt/nmu/os-config-before-$(date +%Y%m%d-%H%M%S); install -d -m 700 "$B"
+for f in /etc/apt/apt.conf.d/52nmu-unattended-upgrades /etc/needrestart/conf.d/50-nmu-list-only.conf \
+         /etc/systemd/system/apt-daily.timer.d/50-nmu-window.conf \
+         /etc/systemd/system/apt-daily-upgrade.timer.d/50-nmu-window.conf; do
+  [ -e "$f" ] && cp -p "$f" "$B/"
+done
+install -m 644 /opt/nmu/app/deploy/apt/52nmu-unattended-upgrades /etc/apt/apt.conf.d/
+install -m 644 /opt/nmu/app/deploy/needrestart/50-nmu-list-only.conf /etc/needrestart/conf.d/
+install -D -m 644 /opt/nmu/app/deploy/systemd/apt-daily.timer.d/50-nmu-window.conf \
+  /etc/systemd/system/apt-daily.timer.d/50-nmu-window.conf
+install -D -m 644 /opt/nmu/app/deploy/systemd/apt-daily-upgrade.timer.d/50-nmu-window.conf \
+  /etc/systemd/system/apt-daily-upgrade.timer.d/50-nmu-window.conf
+systemctl daemon-reload && systemctl restart apt-daily.timer apt-daily-upgrade.timer
+```
+
+`apt-daily.timer` 保留发行版的 `Persistent=true`，restart 时若今天 17:30 已过且还没刷新过，
+会立刻补跑一次刷新加预下载，不装包。当场验收：
+
+```bash
+systemctl list-timers 'apt-daily*' --no-pager   # NEXT 落在 17:30 与 18:00–18:05 UTC
+apt-config dump | grep -E 'Unattended-Upgrade|Automatic-Reboot|Package-Blacklist'
+unattended-upgrade --dry-run --debug 2>&1 | grep -E 'Allowed origins|Initial blacklist'
+```
+
+第二天：`/var/log/unattended-upgrades/unattended-upgrades.log` 有当晚的记录，
+`/var/lib/apt/periodic/upgrade-stamp` 的时间是当晚（只有成功的一轮才会更新它；失败的一轮
+单元照样是绿的，周一的积压检查是兜底），`systemctl show -p ExecMainStartTimestamp nmu`
+没变（证明夜里没重启 nmu），`needrestart -b -r l` 与 `os_security_check.py --json` 看还有
+谁跑在旧库上。
+
+回滚：把四个文件挪进一个 0700 的 `retired-*` 目录（不删），`systemctl daemon-reload &&
+systemctl restart apt-daily.timer apt-daily-upgrade.timer`，回到只刷新列表、不装包。
+
 ## 失败告警（2026-08-07 起）
 
 所有 `nmu-*.service`（含 `nmu.service`/`nmu-caddy.service` 本体）都带
