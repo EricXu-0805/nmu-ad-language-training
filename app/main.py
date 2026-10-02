@@ -16433,13 +16433,19 @@ def _mount_spa(target_app: FastAPI = app, dist_override: Path | None = None) -> 
             raise HTTPException(404, "静态题图不公开")
         if access_policy.protected_api_namespace_alias("/" + full_path):
             raise HTTPException(404, "受保护 API 命名空间不是静态资源")
+        # 外壳与构建号每次回源验证：旧外壳引用的分块换版后就 404，旧构建号会让页面
+        # 以为自己已是新版。不依赖反代是否另加 no-store。
+        revalidate = {"Cache-Control": "no-cache"}
         candidate = _safe_spa_candidate(dist, full_path)
         if candidate is not None:
+            if (candidate.parent == dist.resolve()
+                    and candidate.name in {"index.html", "build-id.txt"}):
+                return FileResponse(candidate, headers=revalidate)
             return FileResponse(candidate)
         index = _safe_spa_candidate(dist, "index.html")
         if index is None:
             raise HTTPException(404, "静态资源不存在")
-        return FileResponse(index)
+        return FileResponse(index, headers=revalidate)
 
 
 _mount_spa()
