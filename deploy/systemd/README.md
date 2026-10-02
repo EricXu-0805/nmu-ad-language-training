@@ -25,7 +25,7 @@ systemctl enable --now nmu-backup.timer nmu-backup-health.timer \
 | `nmu-capacity` | 每天 21:10（05:10） | 占用率、备份增长、还能撑几天 | `capacity.state` |
 | `nmu-restore-drill` | 每周日 21:30（周一 05:30） | 把最新快照真恢复出来并启动应用 | `restore-drill.state` |
 | `nmu-os-security` | 每周一 21:50（周二 05:50） | 数 OS 安全补丁积压 | `os-security.state` |
-| `nmu-health` | 每 10 分钟 | 从外面打一次公网 `/health` | 只在失败时告警 |
+| `nmu-health` | 每 10 分钟，整十分（`OnCalendar=*:0/10`） | 从外面打一次公网 `/health` | 只在失败时告警 |
 
 改完单元必须现场核对，别只看 `systemctl status`：
 

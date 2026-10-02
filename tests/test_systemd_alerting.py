@@ -103,6 +103,45 @@ def test_a_timer_probes_the_public_endpoint():
     assert "nmu-alert@%N.service" in _directives(service).get("OnFailure", [])
 
 
+def _timers() -> list[Path]:
+    return sorted(UNITS.glob("*.timer"))
+
+
+_EXPECTED_TIMERS = frozenset({
+    "nmu-backup.timer", "nmu-backup-health.timer", "nmu-capacity.timer",
+    "nmu-restore-drill.timer", "nmu-os-security.timer", "nmu-health.timer",
+})
+
+
+def test_the_parametrized_timer_list_is_not_empty():
+    names = {path.name for path in _timers()}
+    assert _EXPECTED_TIMERS <= names, (
+        "这些定时器从 deploy/systemd 里消失了：{}".format(
+            ", ".join(sorted(_EXPECTED_TIMERS - names))))
+
+
+@pytest.mark.parametrize("timer", _timers(), ids=lambda p: p.name)
+def test_every_timer_fires_on_the_calendar(timer):
+    """2026-09-30 重启后 nmu-health.timer 晚于开机 5 分钟才被启动：systemd 249 把已过期的
+    OnBootSec 截止点直接丢掉，OnUnitActiveSec 在新一次开机里又没有基准（服务还没跑过），
+    定时器停在 SubState=elapsed、NEXT 为空，ActiveState 却一直是 active——公网探针就此
+    无声停摆。日历触发不依赖「这次开机里启动得够早」，任何时刻启动都会排上下一次。"""
+    assert _directives(timer).get("OnCalendar"), (
+        f"{timer.name} 没有 OnCalendar：只靠 OnBootSec/OnUnitActiveSec 的定时器晚启动一次"
+        "就永远不再触发，而 systemctl status 仍显示 active")
+
+
+@pytest.mark.parametrize("timer", _timers(), ids=lambda p: p.name)
+def test_persistent_is_only_used_with_a_calendar_trigger(timer):
+    """Persistent= 只作用于 OnCalendar；配单调触发时它什么也不做，只会让人以为错过的会补跑。"""
+    directives = _directives(timer)
+    persistent = [value.lower() for value in directives.get("Persistent", [])]
+    if persistent and persistent[-1] in {"1", "yes", "true", "on"}:
+        assert directives.get("OnCalendar"), (
+            f"{timer.name} 写了 Persistent=true 却没有 OnCalendar：这一行是摆设，"
+            "错过的触发不会补跑")
+
+
 def test_web_workers_are_never_multiplied():
     """SQLite 上 `with_for_update()` 编译成裸 SELECT，行级锁一行都不产生；
 
