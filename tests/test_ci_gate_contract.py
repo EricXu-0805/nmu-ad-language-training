@@ -165,3 +165,10 @@ def test_help_does_not_promise_a_fully_offline_gate() -> None:
     assert completed.returncode == 0
     assert "--offline-osv" in completed.stdout
     assert "不是“全离线”模式" in completed.stdout
+
+
+def test_main_runs_are_never_cancelled_or_replaced_by_a_later_merge() -> None:
+    # 上线脚本按 SHA 取 main 上成功的 push run;同组排队的 run 会被后来者顶掉,
+    # 所以 main 必须按 SHA 分组,而且不取消在跑的。
+    assert "github.ref == 'refs/heads/main' && github.sha || github.ref" in WORKFLOW
+    assert "cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}" in WORKFLOW
