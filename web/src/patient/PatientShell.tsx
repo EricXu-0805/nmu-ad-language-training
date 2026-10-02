@@ -392,6 +392,14 @@ export function PatientShell({ allowPageReload = false }: { allowPageReload?: bo
     window.dispatchEvent(new CustomEvent(PATIENT_ACTIVATION_EVENT, { detail: { sessionId } }));
   }, [session, terminal, patientActivated, ttsOn, connectionReady]);
 
+  // 这几个分块要到第一次开麦/停播检测才 import。页面开着时换了 dist,旧分块已被删,
+  // 那一下 404 会被记成「麦克风未能安全启动」。挂载时先取进模块表,之后的同一 import 不再走网络。
+  useEffect(() => {
+    void import("./autopilotBrowserMediaDependencies.ts").catch(() => {});
+    void import("./autopilotMediaTransport.ts").catch(() => {});
+    void import("../audio/foreignOutboxDrain.ts").catch(() => {});
+  }, []);
+
   // useLayoutEffect:paint 前设好 34px 尺度,避免老人端首帧 16px→34px 全屏字号跳变
   useLayoutEffect(() => {
     document.documentElement.dataset.scale = "patient";
