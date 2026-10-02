@@ -820,7 +820,8 @@ def test_waiting_state_recovery_preserves_generation_and_delayed_ack(autopilot_e
 
 
 def _seed_complete_capture_chain(
-        session: Session, *, stop_payload: dict | None = None) -> tuple[int, int]:
+        session: Session, *, stop_payload: dict | None = None,
+        tts_payload: dict | None = None) -> tuple[int, int]:
     now = datetime(2026, 7, 18, 11, 0, 0)
     _seed_session(session, "S-PROOF", "P-PROOF")
     session.commit()
@@ -855,7 +856,7 @@ def _seed_complete_capture_chain(
         device_id_hash=capability.device_id_hash,
         capability_token_hash=capability.token_hash,
         payload_json=autopilot_ledger.encode_ack_payload(
-            "tts_ended", {"media_ended": True, "media_duration_ms": 850}),
+            "tts_ended", tts_payload or {"media_ended": True, "media_duration_ms": 850}),
         received_at=now,
     )
     session.add(tts_ack)
@@ -1101,12 +1102,14 @@ def test_capture_proofs_reject_contradictory_mistyped_or_noncanonical_vad_facts(
                 verify()
 
 
-def test_only_record_stopped_payload_key_set_is_widened():
+def test_only_optional_device_fact_key_sets_are_widened():
     assert autopilot_ledger.ACK_PAYLOAD_KEYS == {
         "tts_started": frozenset({"media_duration_ms"}),
-        "tts_ended": frozenset({"media_ended", "media_duration_ms"}),
+        "tts_ended": frozenset({
+            "media_ended", "media_duration_ms", "barge_in_armed", "barge_in_listened_ms"}),
         "tts_interrupted": frozenset({
-            "media_stopped", "interrupt_reason", "media_duration_ms"}),
+            "media_stopped", "interrupt_reason", "media_duration_ms",
+            "barge_in_armed", "barge_in_listened_ms"}),
         "tts_failed": frozenset({"error_code", "failure_stage"}),
         "record_started": frozenset({"mime_type", "sample_rate_hz", "channels"}),
         "record_stopped": frozenset({"stop_reason", "vad_armed", "vad_voiced_ms"}),
@@ -1115,6 +1118,196 @@ def test_only_record_stopped_payload_key_set_is_widened():
     for ack_type in ("record_started", "record_failed", "tts_ended"):
         with pytest.raises(ValueError, match="unauthorized"):
             autopilot_ledger.encode_ack_payload(ack_type, {"vad_armed": True})
+    for ack_type in ("tts_started", "tts_failed", "record_started", "record_stopped",
+                     "record_failed"):
+        with pytest.raises(ValueError, match="unauthorized"):
+            autopilot_ledger.encode_ack_payload(ack_type, {"barge_in_armed": True})
+
+
+_ENDED = {"media_ended": True, "media_duration_ms": 850}
+_STOPPED = {"media_stopped": True, "interrupt_reason": "answer_now", "media_duration_ms": 650}
+_VOICE_STOPPED = {**_STOPPED, "interrupt_reason": "voice_activity"}
+
+
+def _interrupt_seeded_trigger(session: Session, record_id: int, payload: dict) -> None:
+    """把种子链的触发事实改成「开播之后被停」:同一条提问先 tts_started,再 tts_interrupted。"""
+    record = session.get(RuntimeCommand, record_id)
+    stopped_at = datetime(2026, 7, 18, 11, 0, 0)
+    session.execute(update(RuntimeCommand).where(
+        RuntimeCommand.id == record.predecessor_command_id,
+    ).values(state="cancelled", succeeded_at=None, cancelled_at=stopped_at,
+             started_at=stopped_at - timedelta(seconds=1)))
+    session.execute(update(RuntimeCommandAck).where(
+        RuntimeCommandAck.command_id == record.predecessor_command_id,
+        RuntimeCommandAck.ack_type == "tts_ended",
+    ).values(ack_type="tts_interrupted", device_event_seq=3,
+             payload_json=autopilot_ledger.encode_ack_payload("tts_interrupted", payload)))
+    session.add(RuntimeCommandAck(
+        command_id=record.predecessor_command_id,
+        idempotency_key="ack-tts-started-proof",
+        session_id="S-PROOF",
+        ack_type="tts_started",
+        command_revision=1,
+        control_generation=1,
+        runner_generation=1,
+        device_event_seq=1,
+        device_id_hash="device-hash-proof",
+        capability_token_hash="cap-hash-proof",
+        payload_json=autopilot_ledger.encode_ack_payload(
+            "tts_started", {"media_duration_ms": 3440}),
+        received_at=stopped_at - timedelta(seconds=1),
+    ))
+    session.commit()
+    session.expire_all()
+
+
+def _seed_trigger(session: Session, payload: dict) -> tuple[RuntimeCommand, RuntimeCommand]:
+    interrupted = "media_stopped" in payload
+    record_id, _receipt_id = _seed_complete_capture_chain(
+        session, tts_payload=None if interrupted else payload)
+    if interrupted:
+        _interrupt_seeded_trigger(session, record_id, payload)
+    record = session.get(RuntimeCommand, record_id)
+    return record, session.get(RuntimeCommand, record.predecessor_command_id)
+
+
+def _tts_proofs(session: Session, record: RuntimeCommand, tts: RuntimeCommand) -> dict:
+    """同一条触发回执的四个证明:终态/停播、开麦前提、服务层路由前复核、整条采集链。"""
+    from app import autopilot_service
+
+    terminal = (autopilot_ledger.verify_interrupted_tts_ack if tts.state == "cancelled"
+                else autopilot_ledger.verify_terminal_tts_ack)
+    key = record.trigger_ack_idempotency_key
+    return {
+        "terminal": lambda: terminal(
+            session, tts, ack_idempotency_key=key, require_current_command=False,
+            require_live_scope=False),
+        "prerequisite": lambda: autopilot_ledger.verify_tts_ended_prerequisite(
+            session, record, require_live_scope=False),
+        "service": lambda: autopilot_service._require_terminal_tts_ack(
+            session, session.get(SessionAutopilotState, "S-PROOF"), tts, key),
+        "capture": lambda: autopilot_ledger.verify_immutable_record_capture(session, record),
+    }
+
+
+@pytest.mark.parametrize(("payload", "historical_bytes"), [
+    # 历史形状(生产 902 条 tts_ended 全是这一种)逐字节不变,照样过全部证明。
+    (_ENDED, '{"media_duration_ms":850,"media_ended":true}'),
+    ({**_ENDED, "barge_in_armed": False}, None),
+    ({**_ENDED, "barge_in_armed": True}, None),
+    ({**_ENDED, "barge_in_armed": True, "barge_in_listened_ms": 0}, None),
+    ({**_ENDED, "barge_in_armed": True, "barge_in_listened_ms": 600_000}, None),
+    (_STOPPED, '{"interrupt_reason":"answer_now","media_duration_ms":650,"media_stopped":true}'),
+    ({**_STOPPED, "barge_in_armed": False}, None),
+    ({**_STOPPED, "barge_in_armed": True, "barge_in_listened_ms": 1216}, None),
+    (_VOICE_STOPPED, None),
+    ({**_VOICE_STOPPED, "barge_in_armed": True, "barge_in_listened_ms": 896}, None),
+])
+def test_barge_in_facts_verify_identically_in_every_tts_proof(
+        autopilot_engine, payload, historical_bytes):
+    with Session(autopilot_engine) as session:
+        record, tts = _seed_trigger(session, payload)
+        trigger = session.exec(select(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == tts.id,
+            RuntimeCommandAck.idempotency_key == record.trigger_ack_idempotency_key,
+        )).one()
+        assert json.loads(trigger.payload_json) == payload
+        if historical_bytes is not None:
+            assert trigger.payload_json == historical_bytes
+        proofs = _tts_proofs(session, record, tts)
+        acks = [proofs[name]() for name in ("terminal", "prerequisite", "service")]
+        assert all(ack.id == trigger.id for ack in acks)
+        assert proofs["capture"]().raw_audio_id == "raw-proof-1"
+
+
+@pytest.mark.parametrize("trigger", ["ended", "interrupted"])
+@pytest.mark.parametrize("facts_json", [
+    '"barge_in_armed":null',
+    '"barge_in_armed":1',
+    '"barge_in_armed":"true"',
+    '"barge_in_listened_ms":1200',
+    '"barge_in_armed":false,"barge_in_listened_ms":0',
+    '"barge_in_armed":true,"barge_in_listened_ms":null',
+    '"barge_in_armed":true,"barge_in_listened_ms":true',
+    '"barge_in_armed":true,"barge_in_listened_ms":1200.0',
+    '"barge_in_armed":true,"barge_in_listened_ms":"1200"',
+    '"barge_in_armed":true,"barge_in_listened_ms":-1',
+    '"barge_in_armed":true,"barge_in_listened_ms":600001',
+    '"barge_in_armed":true,"barge_in_noise_floor":1',
+])
+def test_every_tts_proof_rejects_mistyped_contradictory_or_unknown_barge_in_facts(
+        autopilot_engine, trigger, facts_json):
+    with Session(autopilot_engine) as session:
+        base = _ENDED if trigger == "ended" else _STOPPED
+        record, tts = _seed_trigger(session, base)
+        # 规范编码按键名排序:barge_in_* 都排在 media_* / interrupt_reason 之前。
+        canonical = autopilot_ledger.encode_ack_payload(
+            "tts_ended" if trigger == "ended" else "tts_interrupted", base)
+        session.execute(update(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == tts.id,
+            RuntimeCommandAck.idempotency_key == record.trigger_ack_idempotency_key,
+        ).values(payload_json="{" + facts_json + "," + canonical[1:]))
+        session.commit()
+        session.expire_all()
+        _assert_every_tts_proof_rejects(session, record, tts)
+
+
+@pytest.mark.parametrize("payload_json", [
+    # voice_activity 停播却说检测没在听:自相矛盾。
+    '{"barge_in_armed":false,"interrupt_reason":"voice_activity",'
+    '"media_duration_ms":650,"media_stopped":true}',
+    # 键序与空白不规范:同一组事实也不是那条持久化证据。
+    '{"interrupt_reason":"answer_now","media_duration_ms":650,"media_stopped":true,'
+    '"barge_in_armed":true}',
+    '{"barge_in_armed": true,"interrupt_reason":"answer_now",'
+    '"media_duration_ms":650,"media_stopped":true}',
+])
+def test_interruption_proofs_reject_contradictory_or_noncanonical_barge_in_facts(
+        autopilot_engine, payload_json):
+    with Session(autopilot_engine) as session:
+        record, tts = _seed_trigger(session, _STOPPED)
+        session.execute(update(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == tts.id,
+            RuntimeCommandAck.ack_type == "tts_interrupted",
+        ).values(payload_json=payload_json))
+        session.commit()
+        session.expire_all()
+        _assert_every_tts_proof_rejects(session, record, tts)
+
+
+@pytest.mark.parametrize("payload_json", [
+    '{"media_duration_ms":850,"media_ended":true,"barge_in_armed":true}',
+    '{"barge_in_armed":true,"media_duration_ms":850,"media_ended":true,'
+    '"barge_in_listened_ms":10}',
+    '{"barge_in_armed":true, "media_duration_ms":850,"media_ended":true}',
+    '{"media_duration_ms":850.0,"media_ended":true}',
+    '["media_ended"]',
+])
+def test_terminal_proofs_reject_noncanonical_or_mistyped_ended_payloads(
+        autopilot_engine, payload_json):
+    with Session(autopilot_engine) as session:
+        record, tts = _seed_trigger(session, _ENDED)
+        session.execute(update(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == tts.id,
+            RuntimeCommandAck.ack_type == "tts_ended",
+        ).values(payload_json=payload_json))
+        session.commit()
+        session.expire_all()
+        _assert_every_tts_proof_rejects(session, record, tts)
+
+
+def _assert_every_tts_proof_rejects(session: Session, record: RuntimeCommand,
+                                    tts: RuntimeCommand) -> None:
+    from app import autopilot_service
+
+    proofs = _tts_proofs(session, record, tts)
+    for name in ("terminal", "prerequisite", "capture"):
+        with pytest.raises(autopilot_ledger.AutopilotProofError,
+                           match="payload is not canonical evidence"):
+            proofs[name]()
+    with pytest.raises(autopilot_service.AutopilotServiceError) as raised:
+        proofs["service"]()
+    assert raised.value.code == "autopilot_tts_ack_invalid"
 
 
 def test_terminal_record_proof_rejects_ack_after_command_success(

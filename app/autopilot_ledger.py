@@ -19,6 +19,7 @@ from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
 from .autopilot_contract import (
+    BARGE_IN_LISTENED_MS_MAX,
     VAD_VOICED_MS_MAX,
     RecordCommandPayload,
     TtsCommandPayload,
@@ -565,8 +566,11 @@ def fenced_command_transition(
 
 ACK_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "tts_started": frozenset({"media_duration_ms"}),
-    "tts_ended": frozenset({"media_ended", "media_duration_ms"}),
-    "tts_interrupted": frozenset({"media_stopped", "interrupt_reason", "media_duration_ms"}),
+    "tts_ended": frozenset({
+        "media_ended", "media_duration_ms", "barge_in_armed", "barge_in_listened_ms"}),
+    "tts_interrupted": frozenset({
+        "media_stopped", "interrupt_reason", "media_duration_ms",
+        "barge_in_armed", "barge_in_listened_ms"}),
     "tts_failed": frozenset({"error_code", "failure_stage"}),
     "record_started": frozenset({"mime_type", "sample_rate_hz", "channels"}),
     "record_stopped": frozenset({"stop_reason", "vad_armed", "vad_voiced_ms"}),
@@ -601,6 +605,45 @@ def record_stopped_payload_is_valid(payload: object) -> bool:
                 or not 0 <= voiced <= VAD_VOICED_MS_MAX):
             return False
     return True
+
+
+TTS_INTERRUPT_REASONS = frozenset({"answer_now", "voice_activity"})
+MEDIA_DURATION_MS_MAX = 21_600_000
+
+
+def tts_terminal_payload_is_valid(ack_type: str, payload: object) -> bool:
+    """tts_ended / tts_interrupted 载荷的唯一复核口径。
+
+    两个账本证明(播完、停播)与服务层路由前的复核都只经这一处,三处接受的载荷
+    完全相同。新平板可选再带停播检测两个事实,所以与 record_stopped 一样不按精确
+    键集比:必需键在、出现的键都在白名单、类型与值域和契约同口径。调用方另外
+    还要求规范编码逐字节相等。
+    """
+    if not isinstance(payload, dict) or ack_type not in {"tts_ended", "tts_interrupted"}:
+        return False
+    if not set(payload) <= ACK_PAYLOAD_KEYS[ack_type]:
+        return False
+    duration = payload.get("media_duration_ms")
+    if ("media_duration_ms" in payload
+            and (type(duration) is not int or not 0 <= duration <= MEDIA_DURATION_MS_MAX)):
+        return False
+    if ack_type == "tts_ended":
+        if payload.get("media_ended") is not True:
+            return False
+    else:
+        reason = payload.get("interrupt_reason")
+        if (payload.get("media_stopped") is not True or "media_duration_ms" not in payload
+                or not isinstance(reason, str) or reason not in TTS_INTERRUPT_REASONS):
+            return False
+    armed = payload.get("barge_in_armed")
+    if "barge_in_armed" in payload and type(armed) is not bool:
+        return False
+    if "barge_in_listened_ms" in payload:
+        listened = payload["barge_in_listened_ms"]
+        if (armed is not True or type(listened) is not int
+                or not 0 <= listened <= BARGE_IN_LISTENED_MS_MAX):
+            return False
+    return not (payload.get("interrupt_reason") == "voice_activity" and armed is False)
 
 
 CONTROL_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
@@ -952,8 +995,8 @@ def verify_terminal_tts_ack(
         raise AutopilotProofError("TTS trigger is not a persisted tts_ended ACK")
     try:
         payload = json.loads(ack.payload_json)
-        if not isinstance(payload, dict) or payload.get("media_ended") is not True:
-            raise ValueError("missing media_ended")
+        if not tts_terminal_payload_is_valid("tts_ended", payload):
+            raise ValueError("invalid ended media fact")
         if encode_ack_payload("tts_ended", payload) != ack.payload_json:
             raise ValueError("non-canonical TTS ACK payload")
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1020,11 +1063,7 @@ def verify_interrupted_tts_ack(
         raise AutopilotProofError("interruption ordering is inconsistent")
     try:
         payload = json.loads(ack.payload_json)
-        duration = payload.get("media_duration_ms")
-        if (set(payload) != ACK_PAYLOAD_KEYS["tts_interrupted"]
-                or payload.get("media_stopped") is not True
-                or payload.get("interrupt_reason") not in {"answer_now", "voice_activity"}
-                or type(duration) is not int or not 0 <= duration <= 21_600_000
+        if (not tts_terminal_payload_is_valid("tts_interrupted", payload)
                 or encode_ack_payload("tts_interrupted", payload) != ack.payload_json):
             raise ValueError("invalid stopped media fact")
     except (AttributeError, TypeError, ValueError) as exc:

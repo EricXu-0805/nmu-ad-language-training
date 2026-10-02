@@ -4885,12 +4885,14 @@ def _require_terminal_tts_ack(
         _fail("autopilot_tts_ack_invalid", "TTS 回执不是由命令发行设备产生")
     try:
         payload = json.loads(ack.payload_json)
-        canonical = autopilot_ledger.encode_ack_payload("tts_ended", payload)
+        # 与账本两个终态证明同一个复核口径,先验形状再编码:非对象载荷到不了编码器。
+        trusted = (autopilot_ledger.tts_terminal_payload_is_valid("tts_ended", payload)
+                   and autopilot_ledger.encode_ack_payload(
+                       "tts_ended", payload) == ack.payload_json)
     except (TypeError, ValueError) as exc:
         raise AutopilotServiceError(
             "autopilot_tts_ack_invalid", "TTS 结束回执载荷非法") from exc
-    if (not isinstance(payload, dict) or payload.get("media_ended") is not True
-            or canonical != ack.payload_json):
+    if not trusted:
         _fail("autopilot_tts_ack_invalid", "TTS 结束回执没有可信 media_ended 事实")
     return ack
 

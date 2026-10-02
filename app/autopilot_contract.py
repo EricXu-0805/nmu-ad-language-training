@@ -46,6 +46,7 @@ _ACK_FAILURE_STAGES = frozenset({
 })
 
 VAD_VOICED_MS_MAX = 600_000
+BARGE_IN_LISTENED_MS_MAX = 600_000
 
 
 class TtsCommandPayload(BaseModel):
@@ -165,6 +166,13 @@ class AutopilotAckIn(BaseModel):
     vad_armed: bool | None = Field(default=None, strict=True)
     vad_voiced_ms: int | None = Field(
         default=None, strict=True, ge=0, le=VAD_VOICED_MS_MAX)
+    # 提问/提示播放中本机声音停播检测的诊断事实,只随 tts_ended / tts_interrupted 可选上报,
+    # 同样不参与路由与判分:barge_in_armed = 判定器在这句里至少评估过一帧校准之后的声音
+    # (停播真有可能触发);barge_in_listened_ms = 从那一帧到检测关闭或判定器放弃的毫秒,
+    # 只能随 barge_in_armed=true。平板只在语音设置读面声明认得这两键时才发。
+    barge_in_armed: bool | None = Field(default=None, strict=True)
+    barge_in_listened_ms: int | None = Field(
+        default=None, strict=True, ge=0, le=BARGE_IN_LISTENED_MS_MAX)
     raw_audio_id: str | None = Field(
         default=None, min_length=1, max_length=160,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$",
@@ -213,6 +221,13 @@ class AutopilotAckIn(BaseModel):
             raise ValueError("只有 record_stopped 可以携带 VAD 事实")
         if self.vad_voiced_ms is not None and self.vad_armed is not True:
             raise ValueError("vad_voiced_ms 只能随 vad_armed=true 上报")
+        if self.ack_type not in {"tts_ended", "tts_interrupted"} and (
+                self.barge_in_armed is not None or self.barge_in_listened_ms is not None):
+            raise ValueError("只有 tts_ended / tts_interrupted 可以携带停播检测事实")
+        if self.barge_in_listened_ms is not None and self.barge_in_armed is not True:
+            raise ValueError("barge_in_listened_ms 只能随 barge_in_armed=true 上报")
+        if self.interrupt_reason == "voice_activity" and self.barge_in_armed is False:
+            raise ValueError("声音停播只能由在听的检测触发,不能同时报 barge_in_armed=false")
 
         failed = self.ack_type in {"tts_failed", "record_failed"}
         if failed != (self.error_code is not None):
@@ -271,10 +286,11 @@ class AutopilotAckIn(BaseModel):
             payload: dict[str, bool | int | str] = {"media_ended": True}
             if self.media_duration_ms is not None:
                 payload["media_duration_ms"] = self.media_duration_ms
-            return payload
+            return {**payload, **self._barge_in_facts()}
         if self.ack_type == "tts_interrupted":
             return {"media_stopped": True, "interrupt_reason": self.interrupt_reason,
-                    "media_duration_ms": self.media_duration_ms}
+                    "media_duration_ms": self.media_duration_ms,
+                    **self._barge_in_facts()}
         if self.ack_type in {"tts_failed", "record_failed"}:
             assert self.error_code is not None
             failure_payload: dict[str, bool | int | str] = {
@@ -297,6 +313,15 @@ class AutopilotAckIn(BaseModel):
         if self.vad_voiced_ms is not None:
             stopped["vad_voiced_ms"] = self.vad_voiced_ms
         return stopped
+
+    def _barge_in_facts(self) -> dict[str, bool | int]:
+        # 只在键出现时写入:不带这两键的历史载荷逐字节不变,重放幂等也不变。
+        facts: dict[str, bool | int] = {}
+        if self.barge_in_armed is not None:
+            facts["barge_in_armed"] = self.barge_in_armed
+        if self.barge_in_listened_ms is not None:
+            facts["barge_in_listened_ms"] = self.barge_in_listened_ms
+        return facts
 
 
 @dataclass(frozen=True)
