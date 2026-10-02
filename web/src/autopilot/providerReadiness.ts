@@ -84,6 +84,14 @@ function optionalTimestamp(value: unknown): value is string | null {
     && Number.isFinite(Date.parse(value)));
 }
 
+// 服务器存的是不带时区的 UTC(_utc_now_naive),而 JS 把不带时区的日期时间当本地时间:
+// 东八区设备会把北京 11:38 的实测显示成 03:38。补上 Z,下游 new Date() 才是同一时刻。
+const OFFSETLESS_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+
+function utcTimestamp(value: string | null): string | null {
+  return value !== null && OFFSETLESS_DATETIME.test(value) ? `${value}Z` : value;
+}
+
 export function parseProviderReadiness(value: unknown): ProviderReadiness {
   const candidate = record(value);
   const statuses: ProviderReadinessStatus[] = [
@@ -141,8 +149,8 @@ export function parseProviderReadiness(value: unknown): ProviderReadiness {
     allConfiguredCapabilitiesReady: candidate.all_configured_capabilities_ready,
     matchesCurrentConfig,
     tts, asr, llm,
-    checkedAt: candidate.checked_at,
-    expiresAt: candidate.expires_at,
+    checkedAt: utcTimestamp(candidate.checked_at),
+    expiresAt: utcTimestamp(candidate.expires_at),
     actorDisplayId: candidate.actor_display_id as string | null,
     probeFailureCode: candidate.probe_failure_code,
   };

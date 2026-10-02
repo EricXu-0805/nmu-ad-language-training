@@ -163,6 +163,48 @@ test("an expired probe may belong to a previous configuration and still never pe
   }), /内部矛盾/);
 });
 
+test("offset-less probe timestamps are read as UTC instants, not device-local times", () => {
+  // 服务器发的检查时间/有效至是不带时区的 UTC;东八区设备按本地时间解析会早 8 小时。
+  // 期望值由已知 UTC 时刻在同一时区下格式化得出,不写死任何时区的显示字符串。
+  const previousTz = process.env.TZ;
+  process.env.TZ = "Asia/Shanghai";
+  try {
+    const checked = Date.UTC(2026, 8, 17, 3, 38, 16, 104);
+    const expires = Date.UTC(2026, 8, 17, 4, 8, 16, 104);
+    assert.notEqual(new Date(checked).getTimezoneOffset(), 0, "时区没切过去,测不出错位");
+    const parsed = parseProviderReadiness({
+      ...ready(), status: "expired", start_allowed: false,
+      checked_at: "2026-09-17T03:38:16.104012",
+      expires_at: "2026-09-17T04:08:16.104012",
+    });
+    assert.equal(Date.parse(parsed.checkedAt ?? ""), checked);
+    assert.equal(Date.parse(parsed.expiresAt ?? ""), expires);
+    assert.equal(new Date(parsed.checkedAt ?? "").toLocaleString(),
+      new Date(checked).toLocaleString());
+    assert.equal(new Date(parsed.expiresAt ?? "").toLocaleString(),
+      new Date(expires).toLocaleString());
+
+    // 微秒为 0 时服务器不发小数部分。
+    const whole = parseProviderReadiness({
+      ...ready(), checked_at: "2026-09-17T03:38:16", expires_at: "2026-09-17T04:08:16",
+    });
+    assert.equal(Date.parse(whole.checkedAt ?? ""), Date.UTC(2026, 8, 17, 3, 38, 16));
+    assert.equal(Date.parse(whole.expiresAt ?? ""), Date.UTC(2026, 8, 17, 4, 8, 16));
+
+    // 已带偏移的原样保留。
+    const explicit = parseProviderReadiness({
+      ...ready(),
+      checked_at: "2026-09-17T11:38:16.104+08:00",
+      expires_at: "2026-09-17T04:08:16.104Z",
+    });
+    assert.equal(explicit.checkedAt, "2026-09-17T11:38:16.104+08:00");
+    assert.equal(explicit.expiresAt, "2026-09-17T04:08:16.104Z");
+  } finally {
+    if (previousTz === undefined) delete process.env.TZ;
+    else process.env.TZ = previousTz;
+  }
+});
+
 test("only the current schema and the current runtime contract are accepted", () => {
   for (const envelope of [
     { ...ready(), schema_version: "provider-readiness.v1" },
