@@ -19,6 +19,12 @@ on:
 permissions:
   contents: read
 
+# 同一分支或同一 PR 来了新提交，旧提交那次还在跑的就作废。main 不取消：上线脚本按
+# SHA 取 main 上 push run 的产物，每个合进 main 的 SHA 都要有自己跑完的那一次。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 # 第三方 action 一律按 commit SHA 钉，tag 只作注释。理由和底座镜像钉 digest
 # 是同一条：tag 可以被移动，被移动之后没有任何本地信号。这些 action 在 CI 里
 # 拿得到仓库内容，是供应链的一部分，不能比依赖松。

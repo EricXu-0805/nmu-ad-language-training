@@ -31,6 +31,14 @@ def _test_deidentification_key(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fast_password_hashing(monkeypatch):
+    # 生产 600_000 轮(app/auth.py);测试建号、登录都要付这个成本，占整套耗时的一大块。
+    # 轮数写进散列串、校验按串里的轮数算，降到 1_000 不改任何判定路径；生产值由
+    # test_auth.test_production_pbkdf2_iterations_stay_600k 钉住。
+    monkeypatch.setattr(auth, "_PBKDF2_ITERATIONS", 1_000)
+
+
+@pytest.fixture(autouse=True)
 def _reset_auth_state(monkeypatch):
     # 认证靠环境变量 + 进程内粘滞位(限速器/已有账号标记)。逐测试清干净,
     # 避免"上一测试建了账号/触发锁定"渗到下一测试(否则 no-pin-open 会误判为需认证)。

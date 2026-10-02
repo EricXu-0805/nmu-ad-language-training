@@ -6,6 +6,7 @@ cookie 要穿过中间件(用 db.engine)又要被路由(get_session)读到,二�
 """
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -54,6 +55,13 @@ def test_password_hash_roundtrip():
 def test_password_min_length():
     with pytest.raises(ValueError):
         auth.hash_password("short")
+
+
+def test_production_pbkdf2_iterations_stay_600k():
+    """conftest 只在测试里把轮数降到 1_000;生产值与导入时生成的计时占位散列必须仍是 600_000。"""
+    source = (Path(__file__).resolve().parents[1] / "app" / "auth.py").read_text(encoding="utf-8")
+    assert "\n_PBKDF2_ITERATIONS = 600_000\n" in source
+    assert auth._DUMMY_HASH.startswith("pbkdf2_sha256$600000$")
 
 
 # ---------------- 登录 / 会话 / 登出 ----------------
