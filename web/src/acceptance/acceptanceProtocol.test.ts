@@ -4,14 +4,20 @@ import { readFileSync } from "node:fs";
 import {
   ACCEPTANCE_HEADER_FIELDS,
   ACCEPTANCE_ITEMS,
+  ACCEPTANCE_RECEIPT_SCHEMA,
   ACCEPTANCE_STEP_KEYS,
   buildAcceptanceReceipt,
   emptyDraft,
   failedSteps,
   formatAcceptanceText,
+  freezeAcceptanceReceipt,
   missingHeaderFields,
+  newReceiptId,
+  readFrozenAcceptanceReceipt,
   receiptFilename,
+  reviseFrozenDraft,
   shortBuildId,
+  shortReceiptId,
   summarizeAcceptance,
   type AcceptanceDraft,
   type MachineFacts,
@@ -150,7 +156,8 @@ test("屏上显示 8 位短版本号，回执与纯文本保留完整编号", ()
 test("回执带上机器说得出的事实，尤其是构建编号", () => {
   const draft = allPass(filledHeader(emptyDraft()));
   const receipt = buildAcceptanceReceipt(draft, MACHINE);
-  assert.equal(receipt.schema, "nmu-device-acceptance.v1");
+  assert.equal(receipt.schema, "nmu-device-acceptance.v2");
+  assert.equal(ACCEPTANCE_RECEIPT_SCHEMA, "nmu-device-acceptance.v2");
   assert.equal(receipt.machine.buildId, "1755100000000");
   assert.equal(receipt.steps.length, 23);
   assert.deepEqual(receipt.steps.map((step) => step.key), [...ACCEPTANCE_STEP_KEYS]);
@@ -175,11 +182,118 @@ test("纯文本把未勾的项显式标出来，不留白让人以为通过了",
   assert.match(text, /未完成：还有没勾的项/);
 });
 
-test("文件名带设备与日期，且不含路径分隔符", () => {
-  const draft = allPass(filledHeader(emptyDraft()));
+test("文件名带设备、日期与记录编号前 8 位，且不含路径分隔符", () => {
+  const draft = allPass(filledHeader(emptyDraft(RECEIPT_ID, STARTED)));
   draft.header.device = "iPad/第10代";
   draft.header.date = "2026-08-20";
   const name = receiptFilename(buildAcceptanceReceipt(draft, MACHINE));
   assert.ok(!name.includes("/"), name);
-  assert.match(name, /2026-08-20\.json$/);
+  assert.equal(shortReceiptId(RECEIPT_ID), "0f8fad5b");
+  assert.match(name, /-2026-08-20-0f8fad5b\.json$/);
+});
+
+const RECEIPT_ID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+const STARTED = "2026-08-20T01:00:00.000Z";
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+test("草稿一建好就带记录编号和开始时间；表头多了人工填的资产编号", () => {
+  const draft = emptyDraft(RECEIPT_ID, STARTED);
+  assert.equal(draft.receiptId, RECEIPT_ID);
+  assert.equal(draft.startedAtIso, STARTED);
+  assert.equal(draft.supersedesReceiptId, null);
+  assert.match(emptyDraft().receiptId, UUID_V4);
+  assert.notEqual(emptyDraft().receiptId, emptyDraft().receiptId);
+  // 设备型号与资产编号都要人填：JS 认不出是哪一台平板，自动参数不替它们填。
+  assert.ok(ACCEPTANCE_HEADER_FIELDS.some((f) => f.key === "device"));
+  assert.ok(ACCEPTANCE_HEADER_FIELDS.some((f) => f.key === "assetTag"));
+  assert.ok(missingHeaderFields(draft).includes("设备资产编号"));
+});
+
+test("记录编号优先用 randomUUID；没有时（http 打开）退到 getRandomValues，仍是 v4 格式", () => {
+  assert.equal(newReceiptId({
+    randomUUID: () => RECEIPT_ID,
+    getRandomValues: () => { throw new Error("有 randomUUID 时不该走到这里"); },
+  }), RECEIPT_ID);
+  const fromBytes = newReceiptId({
+    getRandomValues: <T extends Uint8Array>(bytes: T): T => {
+      bytes.fill(0xff);
+      return bytes;
+    },
+  });
+  assert.equal(fromBytes, "ffffffff-ffff-4fff-bfff-ffffffffffff");
+  assert.match(fromBytes, UUID_V4);
+});
+
+test("v2 冻结：字节只由内容决定，下载、复制与本机读回用的都是同一串", () => {
+  const draft = allPass(filledHeader(emptyDraft(RECEIPT_ID, STARTED)));
+  draft.notes["5d"] = "断网后 3 秒才关麦";
+  const first = freezeAcceptanceReceipt(draft, MACHINE);
+  // 调用方对象的键序、草稿是不是深拷贝，都不该让字节变。
+  const reordered: MachineFacts = {
+    finishedAtIso: MACHINE.finishedAtIso, screen: MACHINE.screen,
+    buildId: MACHINE.buildId, userAgent: MACHINE.userAgent,
+  };
+  const second = freezeAcceptanceReceipt(structuredClone(draft), reordered);
+  assert.equal(second.json, first.json);
+  assert.equal(first.json, JSON.stringify(first.receipt, null, 2));
+  assert.equal(first.receipt.schema, "nmu-device-acceptance.v2");
+  assert.equal(first.receipt.receiptId, RECEIPT_ID);
+  assert.equal(first.receipt.startedAtIso, STARTED);
+  assert.equal(first.receipt.machine.finishedAtIso, MACHINE.finishedAtIso);
+  assert.equal(first.filename, receiptFilename(first.receipt));
+  assert.equal(first.text, formatAcceptanceText(first.receipt));
+  // 冻结之后草稿再被改，已冻结的字节一个也不动。
+  draft.notes["1"] = "冻结后才写的";
+  assert.doesNotMatch(first.json, /冻结后才写的/);
+  // 本机存回来再读：字节原样，纯文本与文件名都从这串字节推出来。
+  const thawed = readFrozenAcceptanceReceipt(first.json);
+  assert.ok(thawed);
+  assert.equal(thawed.json, first.json);
+  assert.equal(thawed.text, first.text);
+  assert.equal(thawed.filename, first.filename);
+  assert.deepEqual(thawed.receipt, first.receipt);
+});
+
+test("读回冻结字节：v1 回执、坏 JSON、编号不合格式、步骤结构不对的一律不认", () => {
+  const good = freezeAcceptanceReceipt(allPass(filledHeader(emptyDraft(RECEIPT_ID, STARTED))), MACHINE);
+  const parsed = JSON.parse(good.json) as Record<string, unknown>;
+  const variants: unknown[] = [
+    { ...parsed, schema: "nmu-device-acceptance.v1" },
+    { ...parsed, receiptId: "not-a-uuid" },
+    { ...parsed, verdict: "toString" },
+    { ...parsed, steps: [{ key: "1", item: 1, title: "x", outcome: "maybe", note: "" }] },
+    { ...parsed, machine: { ...(parsed.machine as object), buildId: 1 } },
+  ];
+  for (const variant of variants) {
+    assert.equal(readFrozenAcceptanceReceipt(JSON.stringify(variant)), null, JSON.stringify(variant).slice(0, 80));
+  }
+  assert.equal(readFrozenAcceptanceReceipt("{"), null);
+  assert.equal(readFrozenAcceptanceReceipt("null"), null);
+});
+
+test("纯文本带记录编号与开始时间", () => {
+  const text = formatAcceptanceText(
+    buildAcceptanceReceipt(allPass(filledHeader(emptyDraft(RECEIPT_ID, STARTED))), MACHINE));
+  assert.match(text, new RegExp(`记录编号：${RECEIPT_ID}`));
+  assert.match(text, new RegExp(`开始填写：${STARTED}`));
+  assert.doesNotMatch(text, /取代/);
+});
+
+test("冻结后发现填错：内容原样保留，换新编号并写明取代哪一份", () => {
+  const draft = allPass(filledHeader(emptyDraft(RECEIPT_ID, STARTED)));
+  const original = freezeAcceptanceReceipt(draft, MACHINE);
+  const replacement = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+  const revised = reviseFrozenDraft(draft, replacement);
+  assert.equal(revised.receiptId, replacement);
+  assert.equal(revised.supersedesReceiptId, RECEIPT_ID);
+  assert.equal(revised.startedAtIso, STARTED);
+  assert.deepEqual(revised.outcomes, draft.outcomes);
+  assert.deepEqual(revised.header, draft.header);
+  // 原编号那份字节不受影响；新那份冻结后写明它取代谁。
+  assert.equal(draft.receiptId, RECEIPT_ID);
+  const next = freezeAcceptanceReceipt(revised, { ...MACHINE, finishedAtIso: "2026-08-20T03:00:00.000Z" });
+  assert.equal(next.receipt.supersedesReceiptId, RECEIPT_ID);
+  assert.notEqual(next.filename, original.filename);
+  assert.match(next.text, new RegExp(`取代记录 ${RECEIPT_ID}`));
+  assert.equal(JSON.parse(original.json).supersedesReceiptId, null);
 });

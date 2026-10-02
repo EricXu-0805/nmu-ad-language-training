@@ -7,6 +7,10 @@
 // 所以这一层只做三件事：把十三项摊成可勾选的结构、自动记下机器说得出的事实
 // （UA、构建编号、屏幕、时间）、产出一份能归档的 JSON 回执。
 //
+// 回执只冻结一次：记录编号在草稿建好时就定下，冻结那一刻把整份回执序列化成一串
+// 字节，下载、复制拿到的都是这串字节。之后要改只能解冻换新编号——同一个编号要是
+// 对应两份不同内容，事后就分不清哪份算数。
+//
 // 它**永远不会**替人判"通过"：任何一项没勾、或表头没填全，整份回执就是未完成。
 // 全部勾通过也只出"现场记录齐了"，判定仍然是负责人的事。
 
@@ -213,6 +217,8 @@ export interface AcceptanceHeaderField {
 /** 这些字段机器猜不出来，必须现场的人填。少一个都不算完成。 */
 export const ACCEPTANCE_HEADER_FIELDS: readonly AcceptanceHeaderField[] = Object.freeze([
   { key: "device", label: "设备型号", placeholder: "例：iPad 第 10 代 / 联想小新 Pro 14" },
+  // 浏览器认不出是哪一台平板：同型号的几台只能靠贴纸上的编号分开。
+  { key: "assetTag", label: "设备资产编号", placeholder: "平板背面贴纸上的编号；没有贴纸就填「无」" },
   { key: "os", label: "操作系统与版本", placeholder: "例：iPadOS 18.5" },
   { key: "browser", label: "浏览器与版本", placeholder: "例：Safari 18.5（要人工填，自动记录不能代替）" },
   { key: "microphone", label: "麦克风（内置/外接型号）", placeholder: "例：内置 / 得胜 PCM-390" },
@@ -230,6 +236,11 @@ export interface MachineFacts {
 }
 
 export interface AcceptanceDraft {
+  /** 草稿一建好就定下；冻结、下载都认这个编号。 */
+  receiptId: string;
+  /** 解冻改正出来的新记录指向被它取代的那份；第一次填写为 null。 */
+  supersedesReceiptId: string | null;
+  startedAtIso: string;
   header: Record<string, string>;
   outcomes: Record<string, ItemOutcome>;
   notes: Record<string, string>;
@@ -248,8 +259,41 @@ export const VERDICT_LABEL: Record<AcceptanceVerdict, string> = {
   "recorded-all-pass": "现场记录已齐（十三项全部勾了通过）",
 };
 
-export function emptyDraft(): AcceptanceDraft {
+export const ACCEPTANCE_RECEIPT_SCHEMA = "nmu-device-acceptance.v2";
+
+const RECEIPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function isReceiptId(value: unknown): value is string {
+  return typeof value === "string" && RECEIPT_ID.test(value);
+}
+
+interface ReceiptIdRandomSource {
+  randomUUID?(): string;
+  getRandomValues<T extends Uint8Array<ArrayBuffer>>(bytes: T): T;
+}
+
+export function newReceiptId(source: ReceiptIdRandomSource = globalThis.crypto): string {
+  if (typeof source.randomUUID === "function") return source.randomUUID();
+  // randomUUID 只在 https 页面里有；平板用局域网 http 地址打开时退到 getRandomValues 拼 v4。
+  const bytes = source.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/** 屏上和文件名里用的 8 位短编号；完整编号写在回执里。 */
+export function shortReceiptId(receiptId: string): string {
+  return receiptId.slice(0, 8);
+}
+
+export function emptyDraft(
+  receiptId: string = newReceiptId(), startedAtIso: string = new Date().toISOString(),
+): AcceptanceDraft {
   return {
+    receiptId,
+    supersedesReceiptId: null,
+    startedAtIso,
     header: Object.fromEntries(ACCEPTANCE_HEADER_FIELDS.map((f) => [f.key, ""])),
     outcomes: Object.fromEntries(ACCEPTANCE_STEP_KEYS.map((key) => [key, "unset" as ItemOutcome])),
     notes: {},
@@ -279,8 +323,11 @@ export function summarizeAcceptance(draft: AcceptanceDraft): AcceptanceVerdict {
 }
 
 export interface AcceptanceReceipt {
-  schema: "nmu-device-acceptance.v1";
+  schema: typeof ACCEPTANCE_RECEIPT_SCHEMA;
+  receiptId: string;
+  supersedesReceiptId: string | null;
   verdict: AcceptanceVerdict;
+  startedAtIso: string;
   machine: MachineFacts;
   header: Record<string, string>;
   steps: { key: string; item: number; title: string; outcome: ItemOutcome; note: string }[];
@@ -302,9 +349,18 @@ export function buildAcceptanceReceipt(
     note: (draft.notes[step.key] ?? "").trim(),
   })));
   return {
-    schema: "nmu-device-acceptance.v1",
+    schema: ACCEPTANCE_RECEIPT_SCHEMA,
+    receiptId: draft.receiptId,
+    supersedesReceiptId: draft.supersedesReceiptId,
     verdict: summarizeAcceptance(draft),
-    machine,
+    startedAtIso: draft.startedAtIso,
+    // 逐键重建：冻结出来的字节只由内容决定，不随调用方对象的键序变。
+    machine: {
+      userAgent: machine.userAgent,
+      buildId: machine.buildId,
+      screen: machine.screen,
+      finishedAtIso: machine.finishedAtIso,
+    },
     header: Object.fromEntries(
       ACCEPTANCE_HEADER_FIELDS.map((f) => [f.key, (draft.header[f.key] ?? "").trim()]),
     ),
@@ -321,6 +377,9 @@ const OUTCOME_MARK: Record<ItemOutcome, string> = {
 export function formatAcceptanceText(receipt: AcceptanceReceipt): string {
   const lines = [
     `真机验收记录 ${receipt.machine.finishedAtIso}`,
+    `记录编号：${receipt.receiptId}`,
+    ...(receipt.supersedesReceiptId ? [`改正记录：取代记录 ${receipt.supersedesReceiptId}`] : []),
+    `开始填写：${receipt.startedAtIso}`,
     `结论：${VERDICT_LABEL[receipt.verdict]}`,
     "",
     ...ACCEPTANCE_HEADER_FIELDS.map(
@@ -353,5 +412,57 @@ export function shortBuildId(buildId: string): string {
 export function receiptFilename(receipt: AcceptanceReceipt): string {
   const date = (receipt.header.date || "无日期").replace(/[^0-9A-Za-z-]/g, "");
   const device = (receipt.header.device || "无设备").replace(/[^0-9A-Za-z一-龥-]/g, "");
-  return `真机验收-${device}-${date}.json`;
+  return `真机验收-${device}-${date}-${shortReceiptId(receipt.receiptId)}.json`;
+}
+
+export interface FrozenAcceptanceReceipt {
+  receipt: AcceptanceReceipt;
+  /** 冻结那一刻序列化的字节：下载、复制 JSON、存回本机都原样用它。 */
+  json: string;
+  text: string;
+  filename: string;
+}
+
+function frozenFrom(receipt: AcceptanceReceipt, json: string): FrozenAcceptanceReceipt {
+  return { receipt, json, text: formatAcceptanceText(receipt), filename: receiptFilename(receipt) };
+}
+
+export function freezeAcceptanceReceipt(draft: AcceptanceDraft, machine: MachineFacts): FrozenAcceptanceReceipt {
+  const receipt = buildAcceptanceReceipt(draft, machine);
+  return frozenFrom(receipt, JSON.stringify(receipt, null, 2));
+}
+
+const OUTCOMES: readonly string[] = ["pass", "fail", "unset"];
+const MACHINE_KEYS = ["userAgent", "buildId", "screen", "finishedAtIso"];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAcceptanceReceipt(value: unknown): value is AcceptanceReceipt {
+  if (!isRecord(value) || !isRecord(value.machine) || !isRecord(value.header)
+      || !Array.isArray(value.steps)) return false;
+  const machine = value.machine;
+  return value.schema === ACCEPTANCE_RECEIPT_SCHEMA
+    && isReceiptId(value.receiptId)
+    && (value.supersedesReceiptId === null || isReceiptId(value.supersedesReceiptId))
+    && typeof value.verdict === "string" && Object.hasOwn(VERDICT_LABEL, value.verdict)
+    && typeof value.startedAtIso === "string"
+    && MACHINE_KEYS.every((key) => typeof machine[key] === "string")
+    && Object.values(value.header).every((field) => typeof field === "string")
+    && value.steps.every((row: unknown) => isRecord(row) && typeof row.key === "string"
+      && typeof row.note === "string" && OUTCOMES.includes(row.outcome as string))
+    && typeof value.caveat === "string";
+}
+
+/** 从本机存着的冻结字节还原：字节原样保留；解析不出或不是 v2 回执就返回 null。 */
+export function readFrozenAcceptanceReceipt(json: string): FrozenAcceptanceReceipt | null {
+  let value: unknown;
+  try { value = JSON.parse(json); } catch { return null; }
+  return isAcceptanceReceipt(value) ? frozenFrom(value, json) : null;
+}
+
+/** 冻结后发现填错：内容原样搬进一份新编号的草稿，并写明它取代哪一份。 */
+export function reviseFrozenDraft(draft: AcceptanceDraft, receiptId: string = newReceiptId()): AcceptanceDraft {
+  return { ...draft, receiptId, supersedesReceiptId: draft.receiptId };
 }
