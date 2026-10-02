@@ -86,13 +86,21 @@ def _invocation(unit: str, run) -> tuple[str | None, float | None]:
 
 
 def _state_summary(text: str) -> str:
-    """os-security 的 state 是 JSON:把 failures 提到最前,待装的包名就在里面。"""
+    """os-security 的 state 是 JSON:把 failures 提到最前,待装的包名就在里面。
+
+    notes 跟在后面:还跑着旧库、等重启窗口的其余单元只记在 notes 里,只发 failures
+    它们就永远到不了人眼前。
+    """
     try:
         facts = json.loads(text)
     except ValueError:
         return text
     if isinstance(facts, dict) and isinstance(facts.get("failures"), list) and facts["failures"]:
-        return "；".join(str(item) for item in facts["failures"])
+        summary = "；".join(str(item) for item in facts["failures"])
+        notes = facts.get("notes")
+        if isinstance(notes, list) and notes:
+            summary += "\n另注:" + "；".join(str(item) for item in notes)
+        return summary
     return text
 
 

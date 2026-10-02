@@ -21,15 +21,23 @@ jammy-security。没有任何东西在看这个数字，它只会越积越多。
                                  Inst 行，5 个安全内核包积着而这里报 0。所以模拟改用
                                  full-upgrade（把保留的包一起算），万一 full-upgrade
                                  仍有保留项，按名字报失败，不当作通过。
+  nmu/nginx 还映射着被换掉的库 → 退出 1，给出重启命令。补丁装在盘上不等于修好：
+                                 进程不重启就一直跑着旧 libssl/libsqlite3/zlib。夜间
+                                 自动装安全补丁之后盘上的库天天在换，而这台机器没装
+                                 update-notifier，库更新不会立任何旗子，只能自己去
+                                 /proc 里看。其余单元（sing-box、dbus…）只报告，等重启窗口。
+  不是 root 跑的、读不了 /proc → 退出 1。别人的进程映射读不到，那样的 0 是没看。
+  已装内核比正在跑的新          → 只报告。内核类包不自动装，重启窗口由人挑。
 
 顺手职责：--inventory 把 dpkg 全量清单落盘（供应链审计里"裸机 OS 包不在任何
 清单里"那条的记录面）。清单跟着系统走、会漂，所以落在机器上按周留档，不进 git。
 
 用法：
-  os_security_check.py                          # 人读输出
+  os_security_check.py                          # 人读输出（要 root）
   os_security_check.py --json
   os_security_check.py --inventory /opt/nmu/backups/os-packages.txt
   os_security_check.py --simulate-file out.txt  # 测试/离线：喂一份 apt-get -s 输出
+  os_security_check.py --proc-dir P --boot-dir B  # 测试/离线：读假的 /proc、/boot
 """
 from __future__ import annotations
 
@@ -44,6 +52,10 @@ import sys
 
 APT_LISTS = Path("/var/lib/apt/lists")
 REBOOT_REQUIRED = Path("/var/run/reboot-required")
+PROC = Path("/proc")
+BOOT = Path("/boot")
+# 跑在旧库上就要人去重启的单元：nmu 直接服务受试者，nginx 直面公网，重启都只要几秒。
+APP_UNITS = ("nmu.service", "nginx.service")
 
 # apt-get -s upgrade 的行形如：
 #   Inst tar [1.34+dfsg-1ubuntu0.1.22.04.2] (1.34+dfsg-1ubuntu0.1.22.04.6
@@ -53,6 +65,11 @@ _INST = re.compile(r"^Inst\s+(?P<name>\S+)\s+\[(?P<old>[^\]]+)\]\s+\((?P<new>\S+
 #   The following packages have been kept back:
 #     libnetplan0 linux-generic linux-headers-generic linux-image-generic netplan.io
 _KEPT_BACK_HEADER = re.compile(r"^The following packages have been kept back:")
+# /proc/<pid>/maps 的一行以路径收尾。dpkg 换文件是先写新文件再改名盖过去，旧 inode
+# 被删，还映射着它的进程这一行就带 " (deleted)"。只认 apt 管的 /lib、/usr/lib 下的 .so。
+_DELETED_LIBRARY = re.compile(
+    r"\s(/(?:usr/)?lib(?:32|64|x32)?/\S+\.so(?:\.[0-9][0-9.]*)?) \(deleted\)$")
+_KERNEL_RELEASE = re.compile(r"^(\d+)\.(\d+)\.(\d+)-(\d+)")
 
 
 class PendingUpgrade:
@@ -143,6 +160,65 @@ def write_inventory(path: Path) -> int:
     return len(done.stdout.splitlines())
 
 
+def _unit_of(cgroup_text: str) -> str:
+    """进程所属的 systemd 单元。登录会话与用户管理器来来去去，合成 user.slice 一组。"""
+    path = ""
+    for line in cgroup_text.splitlines():
+        hierarchy, _, rest = line.partition(":")
+        controllers, _, candidate = rest.partition(":")
+        if hierarchy == "0" and not controllers:      # cgroup v2
+            path = candidate
+            break
+        if controllers == "name=systemd":             # v1/混合层级
+            path = candidate
+    parts = [part for part in path.split("/") if part]
+    if parts and parts[0] == "user.slice":
+        return "user.slice"
+    for part in reversed(parts):
+        if part.endswith((".service", ".scope")):
+            return part
+    return parts[-1] if parts else "/"
+
+
+def stale_library_units(proc: Path = PROC) -> dict[str, list[str]]:
+    """还映射着被替换掉的共享库的进程，按单元归组：{单元: [库路径…]}。
+
+    扫描途中退出的进程跳过。目录在、映射却读不了的进程让整次扫描抛 PermissionError：
+    跳过它，就是把没看过的当成干净的。
+    """
+    found: dict[str, set[str]] = {}
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            maps = (entry / "maps").read_text(encoding="utf-8", errors="replace")
+            if " (deleted)" not in maps:
+                continue
+            libraries = {matched.group(1) for matched in
+                         map(_DELETED_LIBRARY.search, maps.splitlines()) if matched}
+            if not libraries:
+                continue
+            cgroup = (entry / "cgroup").read_text(encoding="utf-8", errors="replace")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        found.setdefault(_unit_of(cgroup), set()).update(libraries)
+    return {unit: sorted(libraries) for unit, libraries in sorted(found.items())}
+
+
+def kernel_key(release: str) -> tuple[int, ...]:
+    """内核版本按数字比。按字面比，'5.15.0-25' 会排在 '5.15.0-198' 后面。"""
+    matched = _KERNEL_RELEASE.match(release)
+    return tuple(int(group) for group in matched.groups()) if matched else ()
+
+
+def newest_installed_kernel(boot: Path = BOOT) -> str | None:
+    """/boot 里最新的内核映像（GRUB 默认引导的就是它）。vmlinuz、vmlinuz.old 是链接，不算。"""
+    releases = [entry.name.removeprefix("vmlinuz-") for entry in boot.glob("vmlinuz-*")
+                if not entry.is_symlink()]
+    releases = [release for release in releases if kernel_key(release)]
+    return max(releases, key=kernel_key) if releases else None
+
+
 def evaluate(pending: list[PendingUpgrade], age: timedelta | None,
              max_age: timedelta, reboot_required: bool,
              kept_back: list[str] | None = None,
@@ -183,6 +259,83 @@ def evaluate(pending: list[PendingUpgrade], age: timedelta | None,
     return failures, notes
 
 
+def evaluate_running(stale_units: dict[str, list[str]] | None, scan_problem: str | None,
+                     kernel_running: str, kernel_newest: str | None
+                     ) -> tuple[list[str], list[str]]:
+    """补丁装在盘上、内存里跑的还是旧代码。返回 (硬失败, 提示)。"""
+    failures: list[str] = []
+    notes: list[str] = []
+    if scan_problem is not None:
+        failures.append(f"查不了哪些进程还在用被替换的旧库：{scan_problem}；没查过不当作通过")
+    stale_units = stale_units or {}
+    for unit in APP_UNITS:
+        libraries = stale_units.get(unit)
+        if libraries:
+            names = "、".join(Path(library).name for library in libraries[:4])
+            failures.append(
+                f"{unit} 还在用已被替换的旧库（{names}{'…' if len(libraries) > 4 else ''}）："
+                "补丁装在盘上，内存里跑的还是旧代码；修法：挑没人练的时候 "
+                f"systemctl restart {unit.removesuffix('.service')}（几秒），再重跑本检查")
+    others = [unit for unit in stale_units if unit not in APP_UNITS]
+    if others:
+        notes.append(
+            f"另有 {len(others)} 个单元还在用已被替换的旧库（{'、'.join(others[:6])}"
+            f"{'…' if len(others) > 6 else ''}），不算失败，下一个重启窗口一并换新")
+    if (kernel_newest is not None and kernel_key(kernel_running)
+            and kernel_key(kernel_newest) > kernel_key(kernel_running)):
+        notes.append(
+            f"已装内核 {kernel_newest} 比正在跑的 {kernel_running} 新，重启才生效；"
+            "内核类包不自动装也不自动重启，重启窗口由人挑")
+    return failures, notes
+
+
+def assess(simulation: str, max_age: timedelta, *, now: datetime | None = None,
+           lists_dir: Path = APT_LISTS, held: list[str] | None = None,
+           proc: Path = PROC, boot: Path = BOOT, running_kernel: str | None = None,
+           euid: int | None = None) -> dict:
+    """一次完整判定，周检单元与 preflight --os 共用这一份，口径不会分岔。
+
+    apt 模拟输出由调用方给（真跑或 --simulate-file）；held 为 None 时现场读 apt-mark。
+    返回值就是 --json 的主体。
+    """
+    pending = parse_simulation(simulation)
+    kept_back = parse_kept_back(simulation)
+    held = read_holds() if held is None else held
+    age = lists_age(lists_dir, now or datetime.now())
+    reboot_required = REBOOT_REQUIRED.exists()
+    failures, notes = evaluate(pending, age, max_age, reboot_required, kept_back, held)
+
+    stale: dict[str, list[str]] | None = None
+    scan_problem: str | None = None
+    if (os.geteuid() if euid is None else euid) != 0:
+        scan_problem = "不是 root 在跑，读不到别的用户进程的内存映射"
+    else:
+        try:
+            stale = stale_library_units(proc)
+        except OSError as error:
+            scan_problem = f"读不了 {proc} 下的进程映射（{error.strerror or error}）"
+    kernel_running = running_kernel or os.uname().release
+    kernel_newest = newest_installed_kernel(boot)
+    running_failures, running_notes = evaluate_running(
+        stale, scan_problem, kernel_running, kernel_newest)
+    failures += running_failures
+    notes += running_notes
+    return {
+        "ok": not failures,
+        "security_pending": sum(1 for p in pending if p.security),
+        "other_pending": sum(1 for p in pending if not p.security),
+        "lists_age_days": None if age is None else age.days,
+        "reboot_required": reboot_required,
+        "kept_back": kept_back,
+        "held": held,
+        "stale_library_units": stale,
+        "kernel_running": kernel_running,
+        "kernel_newest_installed": kernel_newest,
+        "failures": failures,
+        "notes": notes,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -193,10 +346,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--simulate-file", type=Path, default=None,
                         help="测试/离线：读这份 apt-get -s upgrade 输出，不真跑 apt")
     parser.add_argument("--lists-dir", type=Path, default=APT_LISTS)
+    parser.add_argument("--proc-dir", type=Path, default=PROC,
+                        help="测试/离线：从这棵目录找还在用旧库的进程")
+    parser.add_argument("--boot-dir", type=Path, default=BOOT,
+                        help="测试/离线：从这个目录找已装的内核")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    now = datetime.now()
     try:
         text = (args.simulate_file.read_text(encoding="utf-8")
                 if args.simulate_file else run_simulation())
@@ -204,30 +360,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FAIL] 查不动 apt：{error}。查不动就是没查过，不当作通过。",
               file=sys.stderr)
         return 2
-    pending = parse_simulation(text)
-    kept_back = parse_kept_back(text)
-    held = [] if args.simulate_file else read_holds()
-    age = lists_age(args.lists_dir, now)
-    failures, notes = evaluate(pending, age, timedelta(days=args.max_age_days),
-                               REBOOT_REQUIRED.exists(), kept_back, held)
+    report = assess(text, timedelta(days=args.max_age_days), lists_dir=args.lists_dir,
+                    held=[] if args.simulate_file else None,
+                    proc=args.proc_dir, boot=args.boot_dir)
+    failures, notes = report["failures"], report["notes"]
 
     inventory_count = None
     if args.inventory is not None:
         inventory_count = write_inventory(args.inventory)
 
     if args.json:
-        print(json.dumps({
-            "ok": not failures,
-            "security_pending": sum(1 for p in pending if p.security),
-            "other_pending": sum(1 for p in pending if not p.security),
-            "lists_age_days": None if age is None else age.days,
-            "reboot_required": REBOOT_REQUIRED.exists(),
-            "kept_back": kept_back,
-            "held": held,
-            "inventory_packages": inventory_count,
-            "failures": failures,
-            "notes": notes,
-        }, ensure_ascii=False, indent=2))
+        print(json.dumps({**report, "inventory_packages": inventory_count},
+                         ensure_ascii=False, indent=2))
         return 1 if failures else 0
 
     if inventory_count is not None:
@@ -238,7 +382,8 @@ def main(argv: list[str] | None = None) -> int:
         for failure in failures:
             print(f"  [FAIL] {failure}")
         return 1
-    print(f"[PASS] 安全更新积压为 0（包列表 {0 if age is None else age.days} 天新）")
+    print(f"[PASS] 安全更新积压为 0，nmu/nginx 没在旧库上跑"
+          f"（包列表 {report['lists_age_days'] or 0} 天新）")
     return 0
 
 
