@@ -555,6 +555,76 @@ def test_links_are_wrapped_so_discord_shows_no_preview(world):
     assert re.search(r"(?<!<)https://", content) is None
 
 
+class _Response:
+    def __init__(self, status: int, body: bytes = b"") -> None:
+        self.status = status
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+def test_the_real_sender_posts_json_with_its_own_user_agent(monkeypatch):
+    seen = []
+
+    def fake_urlopen(request, timeout, context):
+        seen.append(request)
+        return _Response(204)
+
+    monkeypatch.setattr(probe.urllib.request, "urlopen", fake_urlopen)
+    payload = {"content": "x", "username": probe.USERNAME, "allowed_mentions": {"parse": []}}
+
+    assert probe._send(WEBHOOK, payload) == (True, "status=204")
+    [request] = seen
+    assert request.get_method() == "POST"
+    # Cloudflare 会 403 掉默认的 Python-urllib UA
+    assert request.get_header("User-agent") == probe.UA
+    assert json.loads(request.data) == payload
+
+
+@pytest.mark.parametrize(("raised", "outcome"), [
+    ("http_error", "http_429"),
+    ("url_error", "err=TimeoutError"),
+    ("incomplete_read", "err=IncompleteRead"),
+    ("remote_disconnected", "err=RemoteDisconnected"),
+])
+def test_the_real_sender_turns_every_transport_failure_into_an_outcome(monkeypatch, raised,
+                                                                        outcome):
+    import http.client
+    import urllib.error
+
+    errors = {
+        "http_error": urllib.error.HTTPError(WEBHOOK, 429, "Too Many Requests", {}, None),
+        "url_error": urllib.error.URLError(TimeoutError("timed out")),
+        "incomplete_read": http.client.IncompleteRead(b""),
+        "remote_disconnected": http.client.RemoteDisconnected("closed"),
+    }
+
+    def fake_urlopen(*_args, **_kwargs):
+        raise errors[raised]
+
+    monkeypatch.setattr(probe.urllib.request, "urlopen", fake_urlopen)
+
+    delivered, said = probe._send(WEBHOOK, {"content": "x"})
+    assert (delivered, said) == (False, outcome)
+    assert "sentinel" not in said
+    ok, info = probe._get_json(WEBHOOK)
+    assert ok is False and "sentinel" not in str(info)
+
+
+def test_the_real_webhook_reader_returns_the_parsed_object(monkeypatch):
+    monkeypatch.setattr(probe.urllib.request, "urlopen",
+                        lambda *_a, **_k: _Response(200, b'{"channel_id": "1"}'))
+
+    assert probe._get_json(WEBHOOK) == (True, {"channel_id": "1"})
+
+
 def test_a_webhook_url_never_leaves_inside_a_message():
     sent: list[dict] = []
     probe.post(WEBHOOK, f"原因里混进了 {WEBHOOK} 这一串", mention=False,

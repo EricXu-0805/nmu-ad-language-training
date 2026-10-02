@@ -44,6 +44,7 @@ import argparse
 import contextlib
 import copy
 from datetime import datetime, timedelta, timezone
+import http.client
 import json
 import math
 import os
@@ -411,7 +412,8 @@ def _send(url: str, payload: dict) -> tuple[bool, str]:
             code = resp.status
     except urllib.error.HTTPError as error:
         return False, f"http_{error.code}"
-    except OSError as error:
+    # http.client 的异常(如 IncompleteRead)不是 OSError;漏接会让这一轮在发送途中崩掉。
+    except (OSError, http.client.HTTPException) as error:
         return False, f"err={type(getattr(error, 'reason', error)).__name__}"
     if code // 100 != 2:
         return False, f"http_{code}"
@@ -425,7 +427,7 @@ def _get_json(url: str) -> tuple[bool, object]:
             return True, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         return False, f"http_{error.code}"
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, http.client.HTTPException) as error:
         return False, f"err={type(error).__name__}"
 
 
