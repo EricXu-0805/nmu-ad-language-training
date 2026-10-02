@@ -27,7 +27,9 @@ length()，原文不进这个进程；要打印的分类码（stop_reason、erro
      upload+ASR、判分（rule / rubric / LLM）、签发、取音+开播；中间隔了暂停/续弹的不算。
   4. LLM 判分：次数、理由长度、超 40 字占比；规则/rubric 判分超 1 s 的次数
      （LLM 超时退回规则判的旁证）。
-  5. 话术播放：tts_interrupted 按打断原因；question/cue 等各自播完与被打断的次数。
+  5. 话术播放：tts_interrupted 按打断原因；question/cue 等各自播完与被打断的次数；提问/提示
+     终态回执上停播检测 barge_in_armed 真/假/缺（false 含部署关掉声音停播），检测在听时老人
+     开口停播占比与点「现在回答」次数，barge_in_listened_ms 分布。
   6. 研究者操作：裁定按种类/原因、续弹、暂停原因、老人主动暂停、接管、中止原因。
   7. 技术失败：technical_failure 的 attempt、tts_failed、record_failed，各按 error_code。
 库头较旧、某张表或某列不在，就在那一项写 n/a: table … absent / column … absent，不猜。
@@ -684,6 +686,9 @@ def _prompt_playback(snap: Snapshot) -> dict:
     outcome_keys = ("ended", "interrupted", "failed", "no_terminal_ack")
     by_purpose = {purpose: dict.fromkeys(outcome_keys, 0) for purpose in TTS_PURPOSES}
     reasons, played = [], []
+    armed = {"true": 0, "false": 0, "missing": 0}
+    voice_while_armed = answer_now_while_armed = 0
+    listened = []
     for command in snap.commands.values():
         if command["kind"] != "tts":
             continue
@@ -704,10 +709,33 @@ def _prompt_playback(snap: Snapshot) -> dict:
             played_ms = interrupted["payload"].get("media_duration_ms")
             if type(played_ms) is int and played_ms >= 0:
                 played.append(played_ms / 1000)
+        terminal = acks.get("tts_ended") or interrupted
+        if purpose not in ("question", "cue") or terminal is None:
+            continue
+        # 停播检测只在提问/提示里开;两个事实只有新平板、且服务端声明认得时才带。
+        flag = terminal["payload"].get("barge_in_armed")
+        armed["true" if flag is True else "false" if flag is False else "missing"] += 1
+        if flag is not True:
+            continue
+        reason = interrupted["payload"].get("interrupt_reason") if terminal is interrupted else None
+        if reason == "voice_activity":
+            voice_while_armed += 1
+        elif reason == "answer_now":
+            answer_now_while_armed += 1
+        listened_ms = terminal["payload"].get("barge_in_listened_ms")
+        if type(listened_ms) is int and 0 <= listened_ms <= 600_000:
+            listened.append(listened_ms)
     return {
         "by_purpose": by_purpose,
         "interrupt_reasons": _tally(reasons),
         "interrupted_played_seconds": _stats(played),
+        "barge_in": {
+            "armed": armed,
+            "voice_activity_while_armed": {"count": voice_while_armed,
+                                           "share": _share(voice_while_armed, armed["true"])},
+            "answer_now_while_armed": answer_now_while_armed,
+            "listened_ms": _stats(listened),
+        },
     }
 
 
@@ -962,10 +990,20 @@ def _md_prompt_playback(metric: dict) -> list[str]:
     for purpose, row in metric["by_purpose"].items():
         lines.append(f"| {purpose} | {row['ended']} | {row['interrupted']} | "
                      f"{row['failed']} | {row['no_terminal_ack']} |")
+    barge_in = metric["barge_in"]
+    armed = barge_in["armed"]
+    voice = barge_in["voice_activity_while_armed"]
     return lines + [
         "",
         f"打断原因：{_counts(metric['interrupt_reasons'])}",
         f"打断前已播（秒）：{_inline(metric['interrupted_played_seconds'], _sec)}",
+        "",
+        f"停播检测 barge_in_armed（只算提问/提示的终态回执）：true {armed['true']} · "
+        f"false {armed['false']} · 缺（旧平板/服务端没声明/未读到设置/刷新补发）{armed['missing']}；"
+        "false 含部署关掉声音停播（switch off）",
+        f"检测在听（true）时：老人开口停播 {voice['count']} / {armed['true']}（{_pct(voice['share'])}） · "
+        f"点「现在回答」{barge_in['answer_now_while_armed']}",
+        f"检测在听的毫秒 barge_in_listened_ms：{_inline(barge_in['listened_ms'])}",
         "",
     ]
 
