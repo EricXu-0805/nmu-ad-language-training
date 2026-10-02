@@ -62,7 +62,7 @@ jobs:
         # 版本钉死,理由与 action 按 SHA 钉同一条:未钉的最新 ruff 会带着本地
         # 从未验证过的新规则进来(首绿尝试就是这样红的——I001 只在 CI 出现)。
         # 升级 = 本地先升、先绿,再改这里。
-        run: pip install pytest==9.1.1 ruff==0.15.15
+        run: pip install pytest==9.1.1 pytest-xdist==3.8.0 ruff==0.15.15
       - name: 共享后端门（ruff + pytest）
         run: NMU_GATE_PYTHON=python scripts/ci_gate.sh --only backend
       - name: 生成 240 场机械容量验收回执（留档用）

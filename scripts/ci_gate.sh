@@ -178,9 +178,19 @@ locked_environment() {
   return $code
 }
 
+# 装了 pytest-xdist 就按核数并行（CI 装了它；仓库私有后按分钟计费，并行能省四成以上）；
+# 本机没装照旧串行，判据不变。
+backend_pytest() {
+  if "$PYTHON" -c "import xdist" >/dev/null 2>&1; then
+    "$PYTHON" -m pytest -q -n auto
+  else
+    "$PYTHON" -m pytest -q
+  fi
+}
+
 if [ "$ONLY" = "all" ] || [ "$ONLY" = "backend" ]; then
   stage "ruff"        ruff_check
-  stage "后端 pytest"  "$PYTHON" -m pytest -q
+  stage "后端 pytest"  backend_pytest
 fi
 
 if [ "$ONLY" = "all" ] || [ "$ONLY" = "frontend" ]; then

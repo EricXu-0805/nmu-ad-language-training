@@ -26,7 +26,7 @@ def _job_level_ifs(job: str) -> list[str]:
 def test_workflow_calls_the_shared_gate_for_every_core_suite() -> None:
     assert 'python: ["3.12", "3.14"]' in WORKFLOW
     assert 'node-version: "25"' in WORKFLOW
-    assert "pytest==9.1.1 ruff==0.15.15" in WORKFLOW
+    assert "pytest==9.1.1 pytest-xdist==3.8.0 ruff==0.15.15" in WORKFLOW
     assert "scripts/ci_gate.sh --only backend" in WORKFLOW
     assert "scripts/ci_gate.sh --only frontend" in WORKFLOW
     assert "scripts/ci_gate.sh --only supply-chain" in WORKFLOW
@@ -219,3 +219,43 @@ def test_release_artifact_is_uploaded_by_main_push_and_never_by_pull_requests() 
     assert "\n          if-no-files-found: error" in upload
     # PR run 照样构建、扫描、核 dist 与源码的绑定,只少上传这一步。
     assert len(re.findall(r"^        if: ", image, re.M)) == 1
+
+
+def _run_backend_gate_with_fake_python(tmp_path: Path, *, xdist_importable: bool) -> str:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake_python = tmp_path / "python"
+    fake_ruff = tmp_path / "ruff"
+    pytest_log = tmp_path / "pytest.log"
+    pytest_log.write_text("", encoding="utf-8")
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"ruff\" ]; then exit 1; fi\n"
+        f"if [ \"$1\" = \"-c\" ]; then exit {0 if xdist_importable else 1}; fi\n"
+        "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pytest\" ]; then "
+        "printf '%s\\n' \"$*\" >> \"$PYTEST_LOG\"; exit 0; fi\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    fake_ruff.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then echo 'ruff 0.15.15'; exit 0; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_ruff.chmod(0o755)
+    env = os.environ.copy()
+    env.update({"NMU_GATE_PYTHON": str(fake_python), "PATH": f"{tmp_path}:{env['PATH']}",
+                "PYTEST_LOG": str(pytest_log)})
+    completed = subprocess.run([str(GATE), "--only", "backend"], cwd=ROOT, check=False,
+                               capture_output=True, text=True, env=env)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    return pytest_log.read_text(encoding="utf-8")
+
+
+def test_backend_gate_runs_pytest_in_parallel_only_when_xdist_is_installed(tmp_path: Path) -> None:
+    # 仓库转私有后 CI 按分钟计费;CI 装了 pytest-xdist 就按核数并行,本机没装照旧串行。
+    assert _run_backend_gate_with_fake_python(tmp_path / "with", xdist_importable=True) == (
+        "-m pytest -q -n auto\n")
+    assert _run_backend_gate_with_fake_python(tmp_path / "without", xdist_importable=False) == (
+        "-m pytest -q\n")
