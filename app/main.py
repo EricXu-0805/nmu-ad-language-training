@@ -10670,8 +10670,12 @@ def autopilot_next(
 )
 def autopilot_voice_settings(
         session_id: str, request: Request,
+        ack_facts: bool = False,
         s: DBSession = Depends(get_session)):
-    """部署声音开关的设备只读面:围栏与 /autopilot/next 相同,账号永远拿不到。"""
+    """部署声音开关的设备只读面:围栏与 /autopilot/next 相同,账号永远拿不到。
+
+    ack_facts=1 时多回一键,列出回执模型认得的可选事实名(见 VoiceSettingsProjection)。
+    """
     token_hash = _require_device_capability_token_hash(request, "读取平板声音设置")
     _require_capability_bound_session(request, session_id, "读取平板声音设置")
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
@@ -10689,7 +10693,7 @@ def autopilot_voice_settings(
         _require_started_visit_plan_session(session_id, s)
         _require_capability_current_live(
             request, s, "读取平板声音设置", live_row=live)
-    return autopilot_service.voice_settings()
+    return autopilot_service.voice_settings(ack_facts=ack_facts)
 
 
 @app.post(

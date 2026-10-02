@@ -115,6 +115,19 @@ def test_switches_are_read_on_every_call(monkeypatch):
         **DEFAULTS, "vad_enabled": False, "vad_trailing_silence_ms": 2000}
 
 
+ADVERTISED = ["barge_in_armed", "barge_in_listened_ms"]
+
+
+def test_ack_facts_are_a_fifth_key_only_when_asked_for(monkeypatch):
+    _settings(monkeypatch)
+    assert autopilot_service.voice_settings().model_dump() == DEFAULTS
+    assert autopilot_service.voice_settings().model_dump_json() == json.dumps(
+        DEFAULTS, separators=(",", ":"))
+    opted = autopilot_service.voice_settings(ack_facts=True).model_dump(mode="json")
+    assert opted == {**DEFAULTS, "ack_facts": ADVERTISED}
+    assert list(opted) == [*DEFAULTS, "ack_facts"]
+
+
 def _voice(client, headers=None, session_id=SESSION_ID):
     return client.get(f"/sessions/{session_id}/autopilot/voice-settings",
                       headers=headers or {})
@@ -163,6 +176,45 @@ def test_paired_device_reads_exactly_the_four_keys_without_writing(api_clients, 
     during = _voice(api_clients.device, api_clients.device_headers)
     assert during.status_code == 200, during.text
     assert _ledger(api_clients.engine) == started
+
+
+@pytest.mark.parametrize(("query", "advertised"), [
+    ("", False), ("?ack_facts=0", False), ("?ack_facts=false", False),
+    ("?ack_facts=1", True), ("?ack_facts=true", True),
+])
+def test_ack_facts_capability_is_opt_in_and_old_tablets_see_identical_bytes(
+        api_clients, monkeypatch, query, advertised):
+    for name in VOICE_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    before = _ledger(api_clients.engine)
+    response = api_clients.device.get(
+        f"/sessions/{SESSION_ID}/autopilot/voice-settings{query}",
+        headers=api_clients.device_headers)
+    assert response.status_code == 200, response.text
+    if advertised:
+        # 新平板显式要了才多一个键;它只往回执里写这里列出的事实名。
+        assert list(response.json()) == [*DEFAULTS, "ack_facts"]
+        assert response.json() == {**DEFAULTS, "ack_facts": ["barge_in_armed",
+                                                             "barge_in_listened_ms"]}
+    else:
+        # af59c28 的平板按精确四键解析:不要的请求逐字节还是原来那份。
+        assert response.content == json.dumps(DEFAULTS, separators=(",", ":")).encode()
+    assert response.headers["cache-control"] == "private, no-store"
+    assert _ledger(api_clients.engine) == before
+
+
+def test_ack_facts_query_does_not_open_the_read_to_anyone_else(api_clients):
+    path = f"/sessions/{SESSION_ID}/autopilot/voice-settings?ack_facts=1"
+    account = api_clients.account.get(path)
+    assert (account.status_code, _response_code(account)) == (403, "device_capability_required")
+    anonymous = api_clients.anonymous.get(path)
+    assert (anonymous.status_code, _response_code(anonymous)) == (401, "device_pair_required")
+    foreign = api_clients.device.get(
+        f"/sessions/{OTHER_SESSION_ID}/autopilot/voice-settings?ack_facts=1",
+        headers=api_clients.device_headers)
+    assert (foreign.status_code, _response_code(foreign)) == (409, "device_session_mismatch")
+    for response in (account, anonymous, foreign):
+        assert "ack_facts" not in response.text
 
 
 def _response_code(response) -> str | None:
