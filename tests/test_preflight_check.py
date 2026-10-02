@@ -294,6 +294,10 @@ def _nmu_root(tmp_path: Path) -> Path:
     root = tmp_path / "opt-nmu"
     (root / "app").mkdir(parents=True)
     (root / "backups").mkdir()
+    # 目录模式写死:导入 app.db 会把进程 umask 设成 077,全量跑时目录就成了 0700,
+    # other 进不去,文件再 0644 也不算暴露。这里要的是 other 进得去的布局。
+    for directory in (root, root / "app", root / "backups"):
+        directory.chmod(0o755)
     return root
 
 
