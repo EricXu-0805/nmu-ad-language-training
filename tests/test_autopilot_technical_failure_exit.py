@@ -1,4 +1,5 @@
-"""技术失败后的唯一出口,按控制台的真实顺序走一遍 API:转人工 → 人工做完这一题 → 切回 AI。
+"""技术失败后的两条出口,按控制台的真实顺序走 API:
+①转人工 → 人工做完这一题 → 切回 AI;②「跳过本题」→ AI 从下一题接着带练。
 
 单测此前只各覆盖一半(worker 技术失败暂停;失败证明可收麦接管;人工态切回 AI),
 三段从没在同一场里连起来走过;截至 2026-10-02 生产 570 次 attempt 零技术失败,现场也没人走过。
@@ -10,13 +11,14 @@ from sqlmodel import Session, select
 from app import asr
 from app.main import _run_p0a_attempt_worker
 from app.models import (
-    AttemptEvent, AutopilotControlEvent, AutopilotPositionAdjudication, InteractionEvent,
-    ItemEvent, LiveState, RuntimeCommand, SessionAutopilotState, SessionOutcomeSummary,
-    SessionRuntimeState, TurnEvent,
+    AttemptEvent, AuditLog, AutopilotControlEvent, AutopilotPositionAdjudication,
+    InteractionEvent, ItemEvent, LiveState, RuntimeCommand, SessionAutopilotState,
+    SessionOutcomeSummary, SessionRuntimeState, TurnEvent,
 )
 from test_autopilot_api import (
-    SESSION_ID, TWO_ONLY_BANK, _WorkerAsr, _ack_body, _adjudicate, _bind_api_bank,
-    _device_next, _drive_issued_question_to_processing_attempt, _drive_to_processing_attempt,
+    SESSION_ID, TWO_ONLY_BANK, _EmptyTranscriptAsr, _WorkerAsr, _ack_body, _adjudicate,
+    _bind_api_bank, _device_next, _drive_followup_processing_attempt_via_current_cue,
+    _drive_issued_question_to_processing_attempt, _drive_to_processing_attempt,
     _enable_p0a, _resume, api_clients as api_clients,
 )
 
@@ -43,17 +45,16 @@ def _snapshot(engine) -> dict:
 
 
 def _assert_ai_exits_refused(clients, revision: int, *, suffix: str) -> None:
-    """失败后控制台亮着的三个 AI 出口:继续 AI 自动带练、老人已答对、跳过本题。"""
+    """失败那一题 AI 接不下去,也没有可确认的回答:继续 AI 自动带练、老人已答对都拒。"""
     resumed = _resume(clients, key=f"resume-after-asr-failure-{suffix}",
                       expected_revision=revision)
     assert resumed.status_code == 409, resumed.text
     assert resumed.json()["detail"]["code"] == "autopilot_attempt_failed"
-    for kind, reason in (("confirmed_correct", "asr_misrecognized"),
-                         ("skip_item", "asr_repeatedly_failed")):
-        refused = _adjudicate(clients, key=f"adjudicate-{kind}-{suffix}",
-                              expected_revision=revision, kind=kind, reason_code=reason)
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"]["code"] == "autopilot_attempt_failed"
+    refused = _adjudicate(clients, key=f"adjudicate-confirmed_correct-{suffix}",
+                          expected_revision=revision, kind="confirmed_correct",
+                          reason_code="asr_misrecognized")
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "autopilot_attempt_failed"
 
 
 def _put_manual_cursor(clients, **overrides) -> None:
@@ -135,12 +136,12 @@ def test_technical_failure_exit_takeover_manual_completion_then_ai_resumes_next_
         "position_item_id": FIRST["item_id"], "last_error_code": "asr_exception"}
     revision = status.json()["state_revision"]
 
-    # 2. 三个 AI 出口全部写前拒绝,一行都不落。
+    # 2. 两个 AI 出口写前拒绝,一行都不落(「跳过本题」另有专测)。
     before = _snapshot(api_clients.engine)
     _assert_ai_exits_refused(api_clients, revision, suffix="0001")
     assert _snapshot(api_clients.engine) == before
 
-    # 3. 失败本身就是收麦证明,drain-ack 只是重放;重放后 AI 出口照样关着,只剩转人工。
+    # 3. 失败本身就是收麦证明,drain-ack 只是重放;重放后这两个 AI 出口照样关着。这里走转人工。
     drained = api_clients.device.post(
         f"/sessions/{SESSION_ID}/autopilot/commands/{capture['record']['command_key']}/drain-ack",
         headers=api_clients.device_headers)
@@ -252,3 +253,179 @@ def test_technical_failure_exit_takeover_manual_completion_then_ai_resumes_next_
                 summary.technical_pause_count) == (3, 2, 1, 3, 1)
         # 接管只记在控制账本里;汇总改数账本之前这里恒为 0(收尾面板「人工接管」跟着显示 0)。
         assert summary.researcher_takeover_count == 1
+
+
+def _fail_current_attempt(clients, monkeypatch) -> int:
+    monkeypatch.setattr(asr, "get_engine", lambda: _WorkerAsr(fails=True))
+    _run_p0a_attempt_worker(SESSION_ID)
+    status = clients.account.get(f"/sessions/{SESSION_ID}/autopilot/status")
+    assert status.status_code == 200, status.text
+    assert (status.json()["status"], status.json()["last_error_code"]) == (
+        "paused", "asr_exception")
+    return status.json()["state_revision"]
+
+
+def _finish_with_feedback(clients, monkeypatch, *, target_word: str, ack_key: str,
+                          device_event_seq: int):
+    monkeypatch.setattr(asr, "get_engine", lambda: _WorkerAsr(text=target_word))
+    _run_p0a_attempt_worker(SESSION_ID)
+    feedback = _device_next(clients)
+    assert feedback is not None and feedback["payload"]["purpose"] == "feedback"
+    return clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{feedback['command_key']}/acks",
+        headers=clients.device_headers,
+        json=_ack_body(feedback, ack_type="tts_ended", ack_key=ack_key,
+                       device_event_seq=device_event_seq, media_ended=True,
+                       media_duration_ms=900))
+
+
+def test_technical_failure_skip_item_records_a_named_skip_and_ai_continues_with_next_item(
+        api_clients, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    capture = _drive_to_processing_attempt(api_clients)
+    revision = _fail_current_attempt(api_clients, monkeypatch)
+    before = _snapshot(api_clients.engine)
+    _assert_ai_exits_refused(api_clients, revision, suffix="skip-0001")
+    assert _snapshot(api_clients.engine) == before
+
+    skipped = _adjudicate(api_clients, key="adjudicate-skip-after-failure-0001",
+                          expected_revision=revision, kind="skip_item",
+                          reason_code="asr_repeatedly_failed")
+    assert skipped.status_code == 200, skipped.text
+    assert {key: skipped.json()[key] for key in (
+        "mode", "status", "position_item_id", "position_turn_seq", "last_error_code")} == {
+        "mode": "autonomous", "status": "waiting_tts", "position_item_id": SECOND["item_id"],
+        "position_turn_seq": 1, "last_error_code": None}
+    question = _device_next(api_clients)
+    assert (question["payload"]["purpose"], question["item_ref"], question["attempt_seq"],
+            question["prompt_level"]) == ("question", "itm-0002", 1, 0)
+    assert question["control_generation"] == capture["record"]["control_generation"] + 1
+
+    # 只追加一条具名跳过收据:不造环节记录,失败那段 attempt 与交互账一字不动。
+    with Session(api_clients.engine) as db:
+        rows = list(db.exec(select(AutopilotPositionAdjudication)))
+        assert [(r.kind, r.item_id, r.turn_seq, r.reason_code, r.source_attempt_id,
+                 r.turn_event_id, r.idempotency_key) for r in rows] == [
+            ("skipped", FIRST["item_id"], 1, "asr_repeatedly_failed", None, None,
+             "adjudicate-skip-after-failure-0001")]
+        assert rows[0].actor_id and rows[0].is_simulation is True
+        assert [a.model_dump() for a in db.exec(
+            select(AttemptEvent).order_by(AttemptEvent.id))] == before["attempts"]
+        assert [i.model_dump() for i in db.exec(
+            select(InteractionEvent).order_by(InteractionEvent.id))] == before["interactions"]
+        assert list(db.exec(select(ItemEvent))) == []
+        assert list(db.exec(select(TurnEvent))) == []
+        assert [e.event_type for e in db.exec(select(AutopilotControlEvent).order_by(
+            AutopilotControlEvent.event_seq))] == ["start", "failure", "resume"]
+        audits = list(db.exec(select(AuditLog).where(
+            AuditLog.action == "autopilot_position_adjudicated")))
+        assert len(audits) == 1 and "kind=skip_item" in audits[0].summary
+
+    replay = _adjudicate(api_clients, key="adjudicate-skip-after-failure-0001",
+                         expected_revision=revision, kind="skip_item",
+                         reason_code="asr_repeatedly_failed")
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["position_item_id"] == SECOND["item_id"]
+    with Session(api_clients.engine) as db:
+        assert len(list(db.exec(select(AutopilotPositionAdjudication)))) == 1
+
+    # AI 把第二题练完,场次照常自动收尾;汇总不替跳过的题声称完成,但照实记下那次失败。
+    _drive_issued_question_to_processing_attempt(
+        api_clients, ack_prefix="ack-after-skip", first_device_event_seq=3)
+    ended = _finish_with_feedback(api_clients, monkeypatch, target_word=SECOND["target_word"],
+                                  ack_key="ack-after-skip-feedback-0001", device_event_seq=5)
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["status"] == "scope_completed"
+    with Session(api_clients.engine) as db:
+        assert db.get(SessionRuntimeState, SESSION_ID).status == "intervention_completed"
+        summary = db.get(SessionOutcomeSummary, SESSION_ID)
+        assert (summary.expected_turns, summary.matched_turns, summary.completed_attempt_turns,
+                summary.audio_evidenced_turns) == (1, 1, 1, 1)
+        assert (summary.total_attempts, summary.completed_attempts,
+                summary.technical_failure_attempts, summary.technical_pause_count,
+                summary.researcher_takeover_count) == (2, 1, 1, 1, 0)
+        assert summary.generator_version == "server-authoritative-closeout.v3"
+
+
+def test_technical_failure_skip_of_the_last_item_leaves_wrapup_to_the_researcher(
+        api_clients, monkeypatch):
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(api_clients)
+    first_done = _finish_with_feedback(
+        api_clients, monkeypatch, target_word=FIRST["target_word"],
+        ack_key="ack-first-feedback-0001", device_event_seq=3)
+    assert first_done.status_code == 200, first_done.text
+    _drive_issued_question_to_processing_attempt(
+        api_clients, ack_prefix="ack-second", first_device_event_seq=4)
+    revision = _fail_current_attempt(api_clients, monkeypatch)
+
+    skipped = _adjudicate(api_clients, key="adjudicate-skip-last-failure-0001",
+                          expected_revision=revision, kind="skip_item", reason_code="other",
+                          note="识别服务报错")
+    assert skipped.status_code == 200, skipped.text
+    assert (skipped.json()["status"], skipped.json()["last_error_code"]) == (
+        "paused", "autopilot_scope_completed")
+    finished = api_clients.account.post(f"/sessions/{SESSION_ID}/finish-intervention")
+    assert finished.status_code == 200, finished.text
+    with Session(api_clients.engine) as db:
+        assert db.get(SessionRuntimeState, SESSION_ID).status == "intervention_completed"
+        summary = db.get(SessionOutcomeSummary, SESSION_ID)
+        assert (summary.expected_turns, summary.completed_attempt_turns,
+                summary.total_attempts, summary.technical_failure_attempts) == (1, 1, 2, 1)
+
+
+def test_technical_failure_after_a_cue_is_skipped_without_reusing_the_earlier_answer(
+        api_clients, monkeypatch):
+    """第二段(提示后)识别失败:第一段虽已判完,也不拿它替这一环节收口。"""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(api_clients)
+    monkeypatch.setattr(asr, "get_engine", lambda: _EmptyTranscriptAsr())
+    _run_p0a_attempt_worker(SESSION_ID)
+    _drive_followup_processing_attempt_via_current_cue(
+        api_clients, suffix="cue-then-failure-0001",
+        tts_device_event_seq=3, record_device_event_seq=4)
+    revision = _fail_current_attempt(api_clients, monkeypatch)
+    before = _snapshot(api_clients.engine)
+    assert [(a["attempt_seq"], a["prompt_level"], a["processing_status"])
+            for a in before["attempts"]] == [(1, 0, "completed"), (2, 1, "technical_failure")]
+    _assert_ai_exits_refused(api_clients, revision, suffix="cue-0001")
+    assert _snapshot(api_clients.engine) == before
+
+    skipped = _adjudicate(api_clients, key="adjudicate-skip-after-cue-failure-0001",
+                          expected_revision=revision, kind="skip_item",
+                          reason_code="asr_repeatedly_failed")
+    assert skipped.status_code == 200, skipped.text
+    assert skipped.json()["position_item_id"] == SECOND["item_id"]
+    with Session(api_clients.engine) as db:
+        assert [(r.kind, r.source_attempt_id, r.turn_event_id) for r in db.exec(
+            select(AutopilotPositionAdjudication))] == [("skipped", None, None)]
+        assert list(db.exec(select(TurnEvent))) == []
+        assert [a.model_dump() for a in db.exec(
+            select(AttemptEvent).order_by(AttemptEvent.id))] == before["attempts"]
+
+
+def test_technical_failure_skip_during_provider_outage_is_saved_and_resume_moves_on(
+        api_clients, monkeypatch):
+    from app import provider_readiness
+    from test_autopilot_adjudication_outage import _unavailable
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(api_clients)
+    revision = _fail_current_attempt(api_clients, monkeypatch)
+    real_readiness = provider_readiness.require_resume_ready
+    monkeypatch.setattr(provider_readiness, "require_resume_ready", _unavailable)
+    saved = _adjudicate(api_clients, key="adjudicate-skip-outage-0001",
+                        expected_revision=revision, kind="skip_item",
+                        reason_code="asr_repeatedly_failed")
+    assert saved.status_code == 200, saved.text
+    assert (saved.json()["status"], saved.json()["last_error_code"]) == (
+        "paused", "autopilot_adjudication_saved")
+    monkeypatch.setattr(provider_readiness, "require_resume_ready", real_readiness)
+    resumed = _resume(api_clients, key="resume-after-saved-skip-0001",
+                      expected_revision=saved.json()["state_revision"])
+    assert resumed.status_code == 200, resumed.text
+    assert (resumed.json()["status"], resumed.json()["position_item_id"]) == (
+        "waiting_tts", SECOND["item_id"])
