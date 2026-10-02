@@ -50,78 +50,14 @@ import type { Session, SessionPlan } from "../../types";
 import { submitReviewedAdjudication } from "./autopilotAdjudication.ts";
 import { hasExactWeek2Single20Profile } from "../../autopilot/demoProfile.ts";
 import { autopilotAttemptView, type AutopilotAttemptView } from "./autopilotAttemptView.ts";
+import {
+  ADJUDICATION_PREWRITE_CODES,
+  AUTOPILOT_CONTENT_GAP_CODES,
+  RESUME_PREWRITE_CODES,
+  autopilotErrorHint,
+  autopilotPausedTone,
+} from "./autopilotErrorHints.ts";
 import { itemSeqLabel, itemSeqSummary } from "../itemNumbering.ts";
-
-// 暂停原因用人话说一遍:研究者对着一串错误码不知道该去平板上看什么。
-// 2026-09-13 演示:平板里留着上一场没传完的录音,自动带练一开麦就 recording_start_failed,
-// 屏上只剩「已安全暂停」,钱凯只能说「进行不了训练」。
-const AUTOPILOT_ERROR_HINTS: Record<string, string> = {
-  recording_start_failed:
-    "老人端麦克风没能启动。常见原因：平板里还留着上一场没传完的录音（系统会在下一次开麦前自动清掉），或浏览器没给麦克风权限。点「继续 AI 自动带练」再试一次；还不行就让老人端页面刷新一下。",
-  microphone_denied: "老人端浏览器拒绝了麦克风权限，请在平板上允许后再点「继续 AI 自动带练」。",
-  microphone_unavailable: "老人端找不到麦克风设备，请检查平板后再继续。",
-  recording_upload_failed: "老人端录音上传或采集收据没有完成，检查网络后再点「继续 AI 自动带练」。",
-  recording_runtime_failed: "老人端录音过程中出错（浏览器录音器异常），让老人端页面刷新一下再点「继续 AI 自动带练」。",
-  device_command_timeout:
-    "老人端没有在限定时间内回应。多半是老人端还在等点屏（屏上显示「点一下，接着听」），让老人点一下屏幕再点「继续 AI 自动带练」；如果屏幕黑了或页面关了，重新打开老人端页面。网络慢时也可能是老人端还在上传上一场没传完的录音，稍等再点「继续 AI 自动带练」。",
-  audio_playback_failed: "老人端放不出这句引导语（拿不到音频、解码失败或浏览器拒绝播放）。检查平板音量和网络，让老人点一下屏幕，再点「继续 AI 自动带练」。",
-  tts_cancelled: "引导语播放被打断（换页、切场或老人端被暂停）。确认老人端还在这一场，再点「继续 AI 自动带练」。",
-  device_runtime_failed: "老人端自动流程内部出错，让老人端页面刷新一下再点「继续 AI 自动带练」。",
-  intervention_completion_evidence_incomplete: "这一题的证据不完整（录音或判定没有落账），AI 不能替它宣布完成。点「转为人工操作」把这一题人工做完。",
-  explicit_repeat_limit: "老人已多次要求重听，达到协议上限，AI 停下等你决定。点「继续 AI 自动带练」AI 会接着这一题（已经答过的，按最后一次回答给下一级提示或反馈）；也可以点「转为人工操作」人工完成。",
-  autopilot_device_rotated: "老人端换了设备或重新配对，AI 已停下。确认新平板已配对到这一场后，点「继续 AI 自动带练」由 AI 接着当前题目；也可以「老人已答对」「跳过本题」，或「转为人工操作」。",
-  // 研究者裁定(老人已答对/跳过本题)的写前 409:服务端在任何写入之前拒绝,
-  // 提示常驻在卡片里,不折成会被下一次轮询抹掉的 uncertain。
-  autopilot_adjudication_requires_pause: "先暂停，等平板收麦后再点。",
-  autopilot_adjudication_saved: "现场决定已保存。AI 服务暂不可用，训练保持暂停；恢复后可继续 AI，或转为人工操作。",
-  autopilot_adjudication_already_recorded: "这个环节的现场决定已经保存，不能重复裁定。请继续 AI 自动带练，或转为人工操作。",
-  autopilot_adjudication_attempt_required: "这一题还没有录到老人的回答，AI 判不了「答对」；可以点「跳过本题」，或点「继续 AI 自动带练」让 AI 重问这一题。",
-  autopilot_attempt_processing: "上一段录音还在判分，几秒后再点。",
-  autopilot_attempt_failed: "上一段录音判分失败，AI 不能接着弹这一题；点「转为人工操作」把这一题人工完成。",
-  autopilot_attempt_abandoned: "上一段录音的判分被暂停打断；可点「继续 AI 自动带练」，用已保存录音接着处理，或转为人工操作。",
-  autopilot_resume_position_unresumable: "人工接管期间答过的这一题，AI 不能接着弹；请人工完成这一题后再切回。",
-  autopilot_scope_completed: "本场可自动带练的题目已全部练完或裁定完毕；请直接进入场次收尾。",
-  autopilot_revision_conflict: "服务器状态已更新，请核对当前题目与环节后重新操作。",
-  autopilot_activation_requires_pause: "请先暂停本场，等待老人端收麦后再继续。",
-  autopilot_activation_processing: "本场上一段回答尚未完成安全暂停，请等待后台处理停止后再继续。",
-  autopilot_activation_bedside_busy: "另一场训练还未安全停止。请先暂停当前床旁场次，等待收麦和回答处理结束，再回到这里继续。",
-  autopilot_takeover_drain_required: "还没有收到老人端停止播放、关闭麦克风的回执，请保持平板在线，收麦完成后再继续。",
-  autopilot_patient_microphone_active: "当前床旁麦克风仍可能在录音，请先完成收麦再继续。",
-  autopilot_device_not_paired: "本场已切回并保持暂停。请在老人端重新连接这场训练，确认配对后再点「继续 AI 自动带练」。",
-  autopilot_device_not_active: "老人端的连接已失效，请重新连接这场训练，确认配对后再继续。",
-};
-function autopilotErrorHint(code: string): string {
-  return AUTOPILOT_ERROR_HINTS[code] ?? `错误码：${code}`;
-}
-
-// 裁定写前拒绝码:服务端明确未写入,可安全回退到刚重取的权威回执并常驻提示。
-const ADJUDICATION_PREWRITE_CODES = new Set([
-  "autopilot_adjudication_requires_pause",
-  "autopilot_adjudication_attempt_required",
-  "autopilot_adjudication_already_recorded",
-  "autopilot_attempt_processing",
-  "autopilot_attempt_failed",
-  "autopilot_attempt_abandoned",
-  "autopilot_scope_completed",
-  "autopilot_revision_conflict",
-]);
-// 「继续」的写前拒绝码(收据 260 起题内续弹新增):同样在任何写入之前拒绝,提示要常驻,
-// 不能折成 2.5 s 后被轮询抹掉的 uncertain。
-const RESUME_PREWRITE_CODES = new Set([
-  "autopilot_attempt_processing",
-  "autopilot_attempt_failed",
-  "autopilot_attempt_abandoned",
-  "autopilot_resume_position_unresumable",
-  "autopilot_scope_completed",
-  "autopilot_revision_conflict",
-  "autopilot_activation_requires_pause",
-  "autopilot_activation_processing",
-  "autopilot_activation_bedside_busy",
-  "autopilot_takeover_drain_required",
-  "autopilot_patient_microphone_active",
-  "autopilot_device_not_paired",
-  "autopilot_device_not_active",
-]);
 
 const ADJUDICATION_REASON_LABELS: Record<AutopilotAdjudicationReason, string> = {
   late_correct_after_window: "超时后才答对",
@@ -366,8 +302,10 @@ export function ServerAutopilotControl({
     };
   }, [classificationProven, hasNamedAccount, session.session_id]);
 
+  // 安全暂停时也能实测:「继续」被 AI 服务实测拒绝(写前 409)后,提示让管理员点的就是它。
+  const providerProbeAllowed = !autopilotServerOwnsConsole(state) || state.phase === "paused";
   const runProviderProbe = async () => {
-    if (!canProbeProvider || providerProbeBusy || autopilotServerOwnsConsole(state)) return;
+    if (!canProbeProvider || providerProbeBusy || !providerProbeAllowed) return;
     setProviderProbeBusy(true);
     setProviderReadinessError(null);
     try {
@@ -650,8 +588,7 @@ export function ServerAutopilotControl({
   const processing = state.phase === "processing_attempt" || state.phase === "manual_draining";
   const paused = state.phase === "paused";
   const contentGap = paused
-    && (state.receipt?.lastErrorCode === "operational_rubric_unavailable"
-      || state.receipt?.lastErrorCode === "operational_protocol_unavailable");
+    && AUTOPILOT_CONTENT_GAP_CODES.has(state.receipt?.lastErrorCode ?? "");
   // 最后一题被裁定后没有下一位可续:服务端留在安全暂停并把它写进 lastErrorCode,
   // 这里收起「继续/裁定」,只留人工接管与去收尾的提示。
   const scopeExhausted = paused && state.receipt?.lastErrorCode === "autopilot_scope_completed";
@@ -715,7 +652,9 @@ export function ServerAutopilotControl({
   return (
     <>
     <Alert
-      tone={manual ? "warn" : active || processing || completed ? "ok" : paused || uncertain || serverFailed || rejected ? "danger" : "warn"}
+      tone={manual ? "warn" : active || processing || completed ? "ok"
+        : paused ? autopilotPausedTone(state.receipt?.lastErrorCode ?? null)
+          : uncertain || serverFailed || rejected ? "danger" : "warn"}
       title={title}
       actions={
         <div className="row wrap">
@@ -776,7 +715,7 @@ export function ServerAutopilotControl({
               {takeoverBusy ? "正在确认麦克风已关闭…" : "转为人工操作"}
             </Button>
           )}
-          {canProbeProvider && !autopilotServerOwnsConsole(state) && (
+          {canProbeProvider && providerProbeAllowed && (
             <Button type="button" variant="secondary" disabled={providerProbeBusy}
               onClick={() => { void runProviderProbe(); }}>
               {providerProbeBusy ? "正在检查 AI 服务…" : "检查 AI 服务"}

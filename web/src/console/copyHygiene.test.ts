@@ -4,8 +4,10 @@ import test from "node:test";
 
 // 演示前文案卫生回归(2026-08 复审):同一功能一个名字、免责小字不吓人、
 // 说明文字对 iPad 可见(不藏 title)、按钮引用与真实按钮名一致。
+// 暂停/拒因提示表单独放在 autopilotErrorHints.ts(有自己的逐码测试),文案卫生一起查。
 const autopilotControl = readFileSync(
-  new URL("./scoring/ServerAutopilotControl.tsx", import.meta.url), "utf8");
+  new URL("./scoring/ServerAutopilotControl.tsx", import.meta.url), "utf8")
+  + readFileSync(new URL("./scoring/autopilotErrorHints.ts", import.meta.url), "utf8");
 const trainingConsole = readFileSync(
   new URL("./scoring/TrainingConsoleScreen.tsx", import.meta.url), "utf8");
 const registry = readFileSync(
