@@ -36,6 +36,7 @@ import {
 import type {
   AutopilotRecordingCapture,
   AutopilotRecordingExecutor,
+  AutopilotRecordingStartOptions,
 } from "./autopilotController.ts";
 import {
   createStopLatch,
@@ -49,7 +50,11 @@ import {
   type RecordingAuthorization,
 } from "./recordingAuthorization.ts";
 import { authorizeExactAutopilotRecording } from "./autopilotMediaTransport.ts";
-import { observeTrailingSilence } from "./autopilotBrowserVoiceActivity.ts";
+import {
+  observeTrailingSilence,
+  type VoiceActivityObservation,
+} from "./autopilotBrowserVoiceActivity.ts";
+import type { VoiceActivityWindows } from "./autopilotVoiceActivity.ts";
 
 type RecordCommand = Extract<NextCommandProjection, { kind: "record" }>;
 type RecordStoppedFacts = Awaited<AutopilotRecordingCapture["stopped"]>;
@@ -117,20 +122,26 @@ export interface AutopilotCaptureBootstrapPorts {
     signal: AbortSignal,
   ): Promise<RecordingAuthorization>;
   /**
-   * 真实开录之后,在录音器已经拿到的那条 MediaStream 上旁听「说完了没」;判到
-   * 尾静默就调一次 onTrailingSilence。返回拆除函数,拆掉之后绝不再回调。
+   * 真实开录之后,在录音器已经拿到的那条 MediaStream 上旁听「说完了没」;按
+   * 服务器给的两个窗口判到尾静默就调一次 onTrailingSilence。返回采样器把手,
+   * 拆掉之后绝不再回调。
    *
    * 可选端口:没有它,或它抛错、或它永远不判,收麦就只剩「说完了」按钮与作答
    * 窗口到点这两条路——与 2026-09-20 之前完全一样。
    */
-  observeVoiceActivity?(stream: MediaStream, onTrailingSilence: () => void): () => void;
+  observeVoiceActivity?(
+    stream: MediaStream,
+    onTrailingSilence: () => void,
+    windows: VoiceActivityWindows,
+  ): VoiceActivityObservation;
 }
 
 export const browserAutopilotCaptureBootstrapPorts: AutopilotCaptureBootstrapPorts = {
   now: () => performance.now(),
   setTimer: (callback, delayMs) => window.setTimeout(callback, delayMs),
   clearTimer: (handle) => window.clearTimeout(handle),
-  observeVoiceActivity: (stream, onTrailingSilence) => observeTrailingSilence(stream, onTrailingSilence),
+  observeVoiceActivity: (stream, onTrailingSilence, windows) =>
+    observeTrailingSilence(stream, onTrailingSilence, windows),
   acquireLease: (signal) => acquireAudioDeviceLease(undefined, signal),
   recoverySnapshot: () => blobStore.recoverySnapshot(),
   drainForeignOutbox: async (currentSessionId, entries) => {
@@ -321,9 +332,12 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   private acquiredLease: AudioDeviceLease | null = null;
   private lateLease: AudioDeviceLease | null = null;
   private maxTimer: number | null = null;
-  // 「说完没」旁听采样器的拆除函数。真实 onstart 之后才有;每条退出路径都拆一次,
-  // 拆过就置空,所以底层采样器只会被拆一次。
-  private voiceActivityRelease: (() => void) | null = null;
+  // 「说完没」旁听采样器。真实 onstart 之后才有;每条退出路径都拆一次,拆过就
+  // 置空,所以底层采样器只会被拆一次。
+  private voiceActivity: VoiceActivityObservation | null = null;
+  // 这次采集用的两个尾静默窗口;null = 不武装(没读到服务器语音设置、读失败、
+  // 服务器关了 VAD,或紧跟在一次开口打断之后)。
+  private readonly voiceActivityWindows: VoiceActivityWindows | null;
   private preStartDeadline: CaptureDeadline | null = null;
   // prepare() 底下的 getUserMedia 可能在判死之后才交出 MediaStream。留住这条
   // Promise，cleanup 才能在 dispose() 之后等它落地——不等就等于在那条流还在
@@ -355,7 +369,8 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
               observe?: LocalAutopilotCaptureObserver,
               ports: ExactCaptureUploadPorts = browserExactCaptureUploadPorts,
               bootstrap: AutopilotCaptureBootstrapPorts
-                = browserAutopilotCaptureBootstrapPorts) {
+                = browserAutopilotCaptureBootstrapPorts,
+              voiceActivityWindows: VoiceActivityWindows | null = null) {
     this.sessionId = sessionId;
     this.command = command;
     this.identity = identity;
@@ -363,6 +378,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
     this.observe = observe;
     this.ports = ports;
     this.bootstrap = bootstrap;
+    this.voiceActivityWindows = voiceActivityWindows;
     this.started = this.startedDeferred.promise;
     this.stopped = this.stoppedDeferred.promise;
     this.closed = this.closedDeferred.promise;
@@ -477,30 +493,49 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   }
 
   /**
-   * 真实 onstart 之后才挂旁听。端口没有、抛错、永远不判,都只是「听不见」:
-   * 按钮与作答窗口到点照旧收麦。判到「说完」走的是与按钮**同一条**内部停止路,
-   * 只是理由记成 silence;闩门先到先得,晚到的判定与晚到的定时器一样作废。
+   * 真实 onstart 之后才挂旁听,而且只在这次采集拿到了窗口时挂。端口没有、抛错、
+   * 永远不判,都只是「听不见」:按钮与作答窗口到点照旧收麦。判到「说完」走的是
+   * 与按钮**同一条**内部停止路,只是理由记成 silence;闩门先到先得,晚到的判定
+   * 与晚到的定时器一样作废。
    */
   private armVoiceActivity(): void {
     const observe = this.bootstrap.observeVoiceActivity;
     const stream = this.recorder.mediaStream;
-    if (!observe || !stream) return;
+    const windows = this.voiceActivityWindows;
+    if (!observe || !stream || windows === null) return;
     try {
-      this.voiceActivityRelease = observe(stream, () => {
+      this.voiceActivity = observe(stream, () => {
         if (this.outcome !== null) return;
         this.signalStop("silence");
-      });
+      }, windows);
     } catch { /* 旁听挂不上,与没有 VAD 时完全一样 */ }
   }
 
   /** 拆旁听采样器。幂等、best-effort:它抛错不改变任何判定,也不挡后面的拆设备。 */
   private releaseVoiceActivity(): void {
-    const release = this.voiceActivityRelease;
-    this.voiceActivityRelease = null;
-    if (release === null) return;
+    const observation = this.voiceActivity;
+    this.voiceActivity = null;
+    if (observation === null) return;
     try {
-      release();
+      observation.release();
     } catch { /* 采样器拆不掉不改变生命周期判定 */ }
+  }
+
+  /**
+   * record_stopped 的两个 VAD 事实,在停止那一刻、拆旁听之前读。只有采样器真读到
+   * 过帧才算武装过;读不出、读出非数,都按没武装报——这两个事实坏了不能连累
+   * 一次已经录下来的作答发不出回执。
+   */
+  private voiceActivityStopFacts(): { vad_armed: boolean; vad_voiced_ms?: number } {
+    let voicedMs: number | null = null;
+    try {
+      voicedMs = this.voiceActivity?.voicedMs() ?? null;
+    } catch { /* 读数坏了就当没武装 */ }
+    if (voicedMs === null || !Number.isFinite(voicedMs)) return { vad_armed: false };
+    return {
+      vad_armed: true,
+      vad_voiced_ms: Math.min(600_000, Math.max(0, Math.round(voicedMs))),
+    };
   }
 
   cancel(): void {
@@ -761,7 +796,9 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
       const stopReason = await Promise.race([
         this.stopLatch.wait(), this.lifecycleDeferred.promise,
       ]);
-      // 有人要求停了:先拆旁听,再撤作答窗口。此后不会再有第二个停止信号进来。
+      // 有人要求停了:先记下旁听在这一刻的事实,再拆旁听,再撤作答窗口。此后不会
+      // 再有第二个停止信号进来。
+      const voiceActivityFacts = this.voiceActivityStopFacts();
       this.releaseVoiceActivity();
       if (this.maxTimer !== null) this.bootstrap.clearTimer(this.maxTimer);
       this.maxTimer = null;
@@ -806,7 +843,9 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
       const completed = await stageAndFinishExactCapture(
         this.command, entry, recording.blob, this.ports);
       this.settled = true;
-      this.stoppedDeferred.resolve(completed.facts);
+      // VAD 事实只随这一次在线收口上报;刷新恢复从 outbox 重建回执时不带它们
+      // (那时已经说不清旁听当时的状态,不报比猜强)。
+      this.stoppedDeferred.resolve({ ...completed.facts, ...voiceActivityFacts });
     } catch (error) {
       this.publish({ ...this.identity, phase: "cleared" });
       // 生命周期已经判死这条捕获时，对外错误码只能是那一条。`interrupt()` 会同步
@@ -894,6 +933,11 @@ export interface BrowserAutopilotRecordingExecutorOptions {
   observe?: LocalAutopilotCaptureObserver;
   ports?: ExactCaptureUploadPorts;
   bootstrap?: AutopilotCaptureBootstrapPorts;
+  /**
+   * 开麦那一刻从服务器语音设置缓存里取静音自动收麦的两个窗口;null = 这次不武装。
+   * 只读缓存、不等网络。缺省恒为 null:只靠按钮与作答窗口到点收麦。
+   */
+  voiceActivityWindows?: () => VoiceActivityWindows | null;
 }
 
 export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExecutor {
@@ -903,6 +947,7 @@ export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExec
   private readonly observe?: LocalAutopilotCaptureObserver;
   private readonly ports: ExactCaptureUploadPorts;
   private readonly bootstrap: AutopilotCaptureBootstrapPorts;
+  private readonly voiceActivityWindows: () => VoiceActivityWindows | null;
   private captureGeneration = 0;
 
   constructor(sessionId: string, options: BrowserAutopilotRecordingExecutorOptions) {
@@ -913,9 +958,13 @@ export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExec
     this.observe = options.observe;
     this.ports = options.ports ?? browserExactCaptureUploadPorts;
     this.bootstrap = options.bootstrap ?? browserAutopilotCaptureBootstrapPorts;
+    this.voiceActivityWindows = options.voiceActivityWindows ?? (() => null);
   }
 
-  start(command: RecordCommand): AutopilotRecordingCapture {
+  start(
+    command: RecordCommand,
+    options: AutopilotRecordingStartOptions = {},
+  ): AutopilotRecordingCapture {
     if (command.state !== "pending") throw new Error("仅 pending 录音命令可开麦");
     // 页面已隐藏时连造都不造：后台开新麦克风没有任何正当理由。
     if (!this.isForeground()) {
@@ -936,6 +985,9 @@ export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExec
       this.observe,
       this.ports,
       this.bootstrap,
+      // 提问刚被老人开口打断:老人正在找词重说,重说之前那段停顿会被读成「说完」
+      // (模拟:700 ms 尾音 + 5 s 停顿,5248 ms 收麦,5760 ms 才开口)。这一次不旁听。
+      options.afterVoiceInterruption === true ? null : this.voiceActivityWindows(),
     );
   }
 }

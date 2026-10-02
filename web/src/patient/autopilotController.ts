@@ -70,6 +70,10 @@ export interface AutopilotRecordingCapture {
     checksum: string;
     byte_count: number;
     duration_seconds: number;
+    /** 「说完没」采样器这次真在听;刷新恢复重建的回执不带。 */
+    vad_armed?: boolean;
+    /** 停止那一刻累计的有声毫秒,只在 vad_armed 为 true 时出现。 */
+    vad_voiced_ms?: number;
   }>;
   /**
    * Resolves only after pending getUserMedia, MediaRecorder, persistence and the
@@ -90,8 +94,16 @@ export interface AutopilotRecordingCapture {
   cancel(): void;
 }
 
+export interface AutopilotRecordingStartOptions {
+  /**
+   * 这条录音紧跟在同一题位的提问/线索被老人开口打断(tts_interrupted,
+   * interrupt_reason=voice_activity)之后:这一次不武装静音自动收麦。
+   */
+  afterVoiceInterruption?: boolean;
+}
+
 export interface AutopilotRecordingExecutor {
-  start(command: RecordCommand): AutopilotRecordingCapture;
+  start(command: RecordCommand, options?: AutopilotRecordingStartOptions): AutopilotRecordingCapture;
 }
 
 /** 一次 ACK 投递在持久化边界上卡住的那个阶段。 */
