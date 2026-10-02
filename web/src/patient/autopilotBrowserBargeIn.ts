@@ -3,7 +3,12 @@ import { BARGE_IN_FRAME_MS, createBargeInDetector } from "./autopilotBargeIn.ts"
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
 
 export type BargeInPhase = "monitoring" | "interrupted" | "unavailable" | "closed";
-export interface BargeInHandle { close(): void; closed: Promise<void> }
+/**
+ * 这句话里检测到底听没听:armed = 判定器至少判过一帧校准之后的声音(停播真有可能触发);
+ * listenedMs = 从那一帧到检测关闭或判定器放弃的毫秒,只在 armed 时有值。
+ */
+export interface BargeInExposure { armed: boolean; listenedMs: number | null }
+export interface BargeInHandle { close(): void; closed: Promise<void>; exposure(): BargeInExposure }
 export interface BargeInObservation {
   sessionId: string;
   commandKey: string;
@@ -74,6 +79,8 @@ export function startBargeInMonitor(input: {
   let pausedForConfirmation = false;
   let setupPending = true;
   let leaseReleased = false;
+  let activeDetector: ReturnType<typeof createBargeInDetector> | null = null;
+  let closedAt: number | null = null;
   let resolveClosed!: () => void;
   const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
   const announce = (phase: BargeInPhase): void => {
@@ -97,6 +104,7 @@ export function startBargeInMonitor(input: {
   const close = (): void => {
     if (finished) return;
     finished = true;
+    closedAt = ports.now();
     abort.abort(new DOMException("提前回答检测已结束", "AbortError"));
     if (timer !== null) { try { ports.clearInterval(timer); } catch { /* late callback is fenced */ } timer = null; }
     if (stream) { stopTracks(stream); stream = null; }
@@ -152,6 +160,7 @@ export function startBargeInMonitor(input: {
       const spectrum = new Float32Array(analyser.frequencyBinCount);
       const sampleRate = context.sampleRate;
       const detector = createBargeInDetector();
+      activeDetector = detector;
       announce("monitoring");
       timer = ports.setInterval(() => {
         if (finished) return;
@@ -186,5 +195,12 @@ export function startBargeInMonitor(input: {
     } catch { if (!finished) unavailable(); }
     finally { setupPending = false; releaseLease(); }
   })();
-  return { close, closed };
+  const exposure = (): BargeInExposure => {
+    const armedAt = activeDetector?.armedAt() ?? null;
+    if (armedAt === null) return { armed: false, listenedMs: null };
+    // 判定器在 push 里同步记下 armedAt,确认停播的回调总在它之后:声音停播必然 armed。
+    const until = activeDetector?.doneAt() ?? closedAt ?? ports.now();
+    return { armed: true, listenedMs: Math.min(600_000, Math.max(0, Math.round(until - armedAt))) };
+  };
+  return { close, closed, exposure };
 }

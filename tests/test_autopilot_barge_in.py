@@ -1,11 +1,12 @@
 # ruff: noqa: F811 -- pytest injects the imported isolated fixture.
 """Local voice monitoring cannot become capture or bypass current authority."""
 from datetime import datetime
+import json
 
 import pytest
 from sqlmodel import Session, select
 
-from app import asr, export
+from app import asr, autopilot_ledger, export
 from app.main import _run_p0a_attempt_worker
 from app.models import (AttemptEvent, AuditLog, AudioAssetRow, Patient,
                         PatientDeviceCapability, RuntimeCommand,
@@ -107,7 +108,8 @@ def test_voice_interruption_preserves_score_review_and_distinct_export(api_clien
     monkeypatch.setenv("ENABLE_LLM_JUDGE", "0")
     monkeypatch.setattr(asr, "get_engine", lambda: _RepeatAsr("胡萝卜"))
     assert _authorization(api_clients, command).status_code == 200
-    facts = {"media_stopped": True, "interrupt_reason": "voice_activity", "media_duration_ms": 750}
+    facts = {"media_stopped": True, "interrupt_reason": "voice_activity", "media_duration_ms": 750,
+             "barge_in_armed": True, "barge_in_listened_ms": 640}
     response = _post(api_clients, command, "tts_interrupted", 2, **facts)
     assert response.status_code == 200, response.text
     record = response.json()["command"]
@@ -123,13 +125,63 @@ def test_voice_interruption_preserves_score_review_and_distinct_export(api_clien
         assert attempt.operational_needs_review is True
         assert export._prompt_playback_evidence(db, attempt) == {
             "prompt_playback_outcome": "interrupted_voice_activity", "prompt_played_ms": 750,
-            "prompt_exposure_needs_review": True}
-        assert export.capture_provenance(db, [attempt])[attempt.id][
-            "prompt_playback_outcome"] == "interrupted_voice_activity"
+            "prompt_exposure_needs_review": True,
+            "prompt_barge_in_armed": True, "prompt_barge_in_listened_ms": 640}
+        provenance = export.capture_provenance(db, [attempt])[attempt.id]
+        assert provenance["prompt_playback_outcome"] == "interrupted_voice_activity"
+        assert provenance["prompt_barge_in_armed"] is True
     feedback = _device_next(api_clients)
     started = _post(api_clients, feedback, "tts_started", 4)
     assert started.status_code == 200, started.text
     assert _authorization(api_clients, started.json()["command"]).status_code == 409
+
+
+@pytest.mark.parametrize(("ack_type", "facts", "other"), [
+    ("tts_ended", {"media_ended": True, "media_duration_ms": 3440,
+                   "barge_in_armed": True, "barge_in_listened_ms": 1850},
+     {"barge_in_armed": False, "barge_in_listened_ms": None}),
+    ("tts_ended", {"media_ended": True, "media_duration_ms": 3440, "barge_in_armed": False},
+     {"barge_in_armed": True}),
+    ("tts_interrupted", {"media_stopped": True, "interrupt_reason": "answer_now",
+                         "media_duration_ms": 650, "barge_in_armed": False},
+     {"barge_in_armed": True}),
+    ("tts_interrupted", {"media_stopped": True, "interrupt_reason": "voice_activity",
+                         "media_duration_ms": 750, "barge_in_armed": True,
+                         "barge_in_listened_ms": 420},
+     {"barge_in_armed": None, "barge_in_listened_ms": None}),
+])
+def test_barge_in_facts_persist_verbatim_replay_identically_and_unlock_recording(
+        api_clients, monkeypatch, ack_type, facts, other):
+    command = _started(api_clients, monkeypatch)
+    response = _post(api_clients, command, ack_type, 2, **facts)
+    assert response.status_code == 200, response.text
+    record = response.json()["command"]
+    assert record["kind"] == "record"
+    replay = _post(api_clients, command, ack_type, 2, **facts)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    # 同一幂等键换一个检测事实(含少带/多带)就是另一份事实:冲突,不是重放。
+    changed = {key: value for key, value in {**facts, **other}.items() if value is not None}
+    conflict = _post(api_clients, command, ack_type, 2, **changed)
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["detail"]["code"] == "autopilot_ack_conflict"
+    with Session(api_clients.engine) as db:
+        trigger = db.exec(select(RuntimeCommandAck).where(
+            RuntimeCommandAck.ack_type == ack_type)).one()
+        assert json.loads(trigger.payload_json) == facts
+        record_command = db.exec(select(RuntimeCommand).where(
+            RuntimeCommand.idempotency_key == record["command_key"])).one()
+        assert autopilot_ledger.verify_tts_ended_prerequisite(db, record_command).id == trigger.id
+
+
+def test_voice_stop_claiming_the_detector_was_not_listening_is_refused(api_clients, monkeypatch):
+    command = _started(api_clients, monkeypatch)
+    before = _ledger(api_clients.engine)
+    refused = _post(api_clients, command, "tts_interrupted", 2, media_stopped=True,
+                    interrupt_reason="voice_activity", media_duration_ms=750,
+                    barge_in_armed=False)
+    assert refused.status_code == 422, refused.text
+    assert _ledger(api_clients.engine) == before
 
 
 BARGE_IN_ENV = "NMU_AUTOPILOT_VOICE_BARGE_IN"

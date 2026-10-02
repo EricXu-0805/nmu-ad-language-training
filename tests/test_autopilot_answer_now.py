@@ -109,9 +109,11 @@ def test_interrupted_question_and_cue_can_finish_capture_and_scoring_without_low
         assert [(row.prompt_level, row.processing_status) for row in attempts] == [(0, "completed"), (1, "completed")]
         assert attempts[-1].contains_target is True
         assert all(row.operational_needs_review is True for row in attempts)
+        # 旧平板的停播回执不带停播检测事实:两列空,不是 false。
         assert export._prompt_playback_evidence(db, attempts[-1]) == {
             "prompt_playback_outcome": "interrupted_answer_now", "prompt_played_ms": 400,
-            "prompt_exposure_needs_review": True}
+            "prompt_exposure_needs_review": True,
+            "prompt_barge_in_armed": None, "prompt_barge_in_listened_ms": None}
         # turns 表与研究读面的 source_prompt_playback_outcome 用同一个证明,同一段录音同一个值。
         provenance = export.capture_provenance(db, attempts)
         assert [provenance[row.id]["prompt_playback_outcome"] for row in attempts] == [

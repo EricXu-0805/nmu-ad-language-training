@@ -821,6 +821,7 @@ def _turn_row(session_code: str, subject_code: str,
         "withdrawn": False,
         "source_stop_reason": capture.get("stop_reason"),
         "source_prompt_playback_outcome": capture.get("prompt_playback_outcome"),
+        "source_prompt_barge_in_armed": capture.get("prompt_barge_in_armed"),
     }
 
 

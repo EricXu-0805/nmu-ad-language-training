@@ -1,4 +1,5 @@
 import type { AutopilotVoiceSettings } from "./autopilotMediaTransport.ts";
+import type { AutopilotOptionalAckFact } from "./autopilotProtocol.ts";
 import type { VoiceActivityWindows } from "./autopilotVoiceActivity.ts";
 
 /**
@@ -59,6 +60,15 @@ export class AutopilotVoiceSettingsCache {
    */
   hasSettings(): boolean {
     return this.latest !== null;
+  }
+
+  /**
+   * 最近一次成功的读面声明过服务端认得这个可选回执事实。还没读到、最近一次读失败、
+   * 回四键的服务端(含回滚后的 af59c28)都为假:回执组装那一刻才问,宁可这一句缺键,
+   * 也不发一条会 422、把床旁卡在同一条信封上的回执。
+   */
+  acceptsAckFact(name: AutopilotOptionalAckFact): boolean {
+    return this.latest?.ack_facts?.includes(name) === true;
   }
 
   /** 这次采集用的两个尾静默窗口;null = 不武装。 */

@@ -235,6 +235,58 @@ test("record_stopped 可选带 VAD 两个事实;只有 stop_reason 那种历史�
   assert.throws(() => parseAutopilotAck({ ...failed, vad_armed: true, vad_voiced_ms: 10 }));
 });
 
+test("提问/提示的终态回执可选带停播检测两个事实;不带的历史形状照样合法", () => {
+  const ended = buildAutopilotAck(questionCommand(), 1, "evt-tts-ended-barge-0002", {
+    ack_type: "tts_ended", media_ended: true, media_duration_ms: 3_440,
+    barge_in_armed: true, barge_in_listened_ms: 1_850,
+  });
+  assert.deepEqual(parseAutopilotAck(ended), ended);
+  const notListening = buildAutopilotAck(questionCommand(), 1, "evt-tts-ended-barge-0003", {
+    ack_type: "tts_ended", media_ended: true, media_duration_ms: 3_440, barge_in_armed: false,
+  });
+  assert.deepEqual(parseAutopilotAck(notListening), notListening);
+  // 旧平板、四键的服务端、IndexedDB 里的旧 envelope:两个键都没有。
+  const historical = buildAutopilotAck(questionCommand(), 1, "evt-tts-ended-old-0004",
+    { ack_type: "tts_ended", media_ended: true, media_duration_ms: 3_440 });
+  assert.equal(Object.hasOwn(historical, "barge_in_armed"), false);
+  assert.deepEqual(parseAutopilotAck(historical), historical);
+
+  const stopped = { ack_type: "tts_interrupted", media_stopped: true, media_duration_ms: 700 } as const;
+  for (const facts of [
+    { interrupt_reason: "answer_now", barge_in_armed: false },
+    { interrupt_reason: "answer_now", barge_in_armed: true, barge_in_listened_ms: 0 },
+    { interrupt_reason: "voice_activity", barge_in_armed: true, barge_in_listened_ms: 600_000 },
+    { interrupt_reason: "voice_activity" },
+  ] as const) {
+    const ack = buildAutopilotAck(questionCommand(), 1, "evt-tts-stop-barge-0005", { ...stopped, ...facts });
+    assert.deepEqual(parseAutopilotAck(ack), ack, JSON.stringify(facts));
+  }
+  // 老人开口停播必然是检测在听时判的:与「没在听」同时出现就是自相矛盾。
+  assert.throws(() => buildAutopilotAck(questionCommand(), 1, "evt-tts-stop-barge-0006",
+    { ...stopped, interrupt_reason: "voice_activity", barge_in_armed: false }));
+
+  // 监听毫秒只在检测真在听时才有。
+  const { barge_in_armed: _armed, ...listenedOnly } = ended;
+  assert.throws(() => parseAutopilotAck(listenedOnly));
+  assert.throws(() => parseAutopilotAck({ ...ended, barge_in_armed: false }));
+  for (const listened of [-1, 600_001, 12.5, "1850", null, Number.NaN]) {
+    assert.throws(() => parseAutopilotAck({ ...ended, barge_in_listened_ms: listened }), String(listened));
+  }
+  for (const flag of ["true", 1, null]) {
+    assert.throws(() => parseAutopilotAck({ ...notListening, barge_in_armed: flag }), String(flag));
+  }
+  // 只属于这两种终态回执。
+  const started = buildAutopilotAck(questionCommand(), 0, "evt-tts-start-barge-0001",
+    { ack_type: "tts_started", media_duration_ms: 3_440 });
+  assert.throws(() => parseAutopilotAck({ ...started, barge_in_armed: false }));
+  const failed = buildAutopilotAck(questionCommand(), 1, "evt-tts-fail-barge-0002",
+    { ack_type: "tts_failed", error_code: "audio_playback_failed" });
+  assert.throws(() => parseAutopilotAck({ ...failed, barge_in_armed: true, barge_in_listened_ms: 10 }));
+  const recordStarted = buildAutopilotAck(recordCommand(), 8, "evt-rec-start-barge-0009",
+    { ack_type: "record_started", mime_type: "audio/webm" });
+  assert.throws(() => parseAutopilotAck({ ...recordStarted, barge_in_armed: false }));
+});
+
 test("failure ACKs use a closed machine-code vocabulary", () => {
   const failure = buildAutopilotAck(
     questionCommand(), 0, "evt-tts-failed-0001",

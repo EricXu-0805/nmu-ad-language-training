@@ -3,9 +3,13 @@ import type {
   AutopilotSpeechPlayback,
 } from "./autopilotController.ts";
 import { AutopilotMediaError } from "./autopilotMediaError.ts";
-import type { NextCommandProjection } from "./autopilotProtocol.ts";
+import type {
+  AutopilotBargeInFacts,
+  AutopilotOptionalAckFact,
+  NextCommandProjection,
+} from "./autopilotProtocol.ts";
 
-import type { BargeInHandle, BargeInObservation } from "./autopilotBrowserBargeIn.ts";
+import type { BargeInExposure, BargeInHandle, BargeInObservation } from "./autopilotBrowserBargeIn.ts";
 
 type TtsCommand = Extract<NextCommandProjection, { kind: "tts" }>;
 
@@ -23,6 +27,11 @@ export interface AutopilotSpeechBrowserPorts {
     observe?(observation: BargeInObservation): void;
   }): BargeInHandle;
   observeBargeIn?(observation: BargeInObservation): void;
+  /**
+   * 服务端回执模型认不认这个可选事实(语音设置读面声明过)。终态回执组装那一刻才问;
+   * 缺省 = 不认:老服务端拒收未知键,一条 422 会把床旁卡在这条信封上。
+   */
+  acceptsAckFact?(name: AutopilotOptionalAckFact): boolean;
   /**
    * play() 被浏览器以「无用户手势」拒绝时的第二条路:等下一次点屏,在那个手势
    * 处理器里**同步**再 play() 一次并把它的 promise 交回来。signal 中止即拒绝。
@@ -64,6 +73,7 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
   private terminal = false;
   private bargeIn: BargeInHandle | null = null;
   private bargeInArmed = false;
+  private bargeInExposure: BargeInExposure | null = null;
   private readonly sessionId: string;
   private readonly command: TtsCommand;
   private readonly ports: AutopilotSpeechBrowserPorts;
@@ -120,8 +130,24 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
     this.bargeIn = null;
     if (monitor) {
       monitor.close();
+      // 关了检测判定器就不再推进:这一刻读到的就是这句话的定值。
+      this.bargeInExposure = monitor.exposure();
       void monitor.closed.then(() => this.closedDeferred.resolve(undefined));
     } else this.closedDeferred.resolve(undefined);
+  }
+
+  bargeInFacts(): AutopilotBargeInFacts {
+    const purpose = this.command.payload.purpose;
+    if ((purpose !== "question" && purpose !== "cue")
+        || this.ports.acceptsAckFact?.("barge_in_armed") !== true) return {};
+    const exposure = this.bargeInExposure;
+    // 检测没开起来(开关关了 409、没权限、没回声消除、这句先播完)也是一个事实:false。
+    if (exposure === null || !exposure.armed) return { barge_in_armed: false };
+    return {
+      barge_in_armed: true,
+      ...(exposure.listenedMs !== null && this.ports.acceptsAckFact("barge_in_listened_ms")
+        ? { barge_in_listened_ms: exposure.listenedMs } : {}),
+    };
   }
 
   answerNow(): boolean { return this.interruptForAnswer("answer_now"); }

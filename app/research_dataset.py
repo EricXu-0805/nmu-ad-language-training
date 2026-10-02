@@ -152,6 +152,15 @@ _TURNS = Dataset(
                "interrupted_voice_activity=老人开口，声音停播；这两种老人都可能没听全；"
                "unverified=有平板录音命令但账本证明不了那句话术怎么结束的；没有平板录音命令"
                "（人工录入、历史场次）为空。被打断不改提示层级，也不推断老人听到了哪几个字"),
+        Column("source_prompt_barge_in_armed", "clear", "boolean",
+               "本环节所依据那次录音之前，那句提问或提示播放时平板的声音停播检测在不在听。"
+               "同样是平板回执里的运行事实，不是研究真值，与导出包 attempts 表的 "
+               "prompt_barge_in_armed 同值：true=检测至少判过一帧校准之后的声音，老人开口"
+               "有可能让朗读停下（不等于整句都在听，也不等于听到了老人）；false=检测没在听，"
+               "包括部署把声音停播关掉（switch off，这时每一行都是 false）、平板没有麦克风"
+               "权限或回声消除、话术在检测校准完之前就播完了；空=旧平板或当时的服务端不认这一项、"
+               "平板还没读到语音设置（或最近一次读失败）、账本证明不了那次播放，或没有平板录音命令"
+               "（人工录入、历史场次）。算声音停播率时只拿 true 的行作分母"),
         Column("asr_text", "forbidden", "-", "语音识别原文：永不出现"),
         Column("confirmed_response_text", "forbidden", "-", "人工确认作答文本：永不出现"),
         Column("judge_reason", "forbidden", "-", "AI 判分理由：永不出现"),

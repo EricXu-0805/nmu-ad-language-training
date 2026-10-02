@@ -27,6 +27,11 @@ analyser 帧、设备 ACK 发出那一拍),断言:任何时刻最多一条活麦
 VAD 开关:平板若读了服务端 GET …/autopilot/voice-settings,就按回执定期望(VAD 关 →
 链 S 也只能撞 max_duration);没读(老平板,VAD 恒开)就按平板常量。跑法见
 scripts/run-caregiver-demo20.sh --browser-check voice-chains。
+
+停播检测事实:平板带 ?ack_facts=1 读语音设置,服务端回五键时列出它认得的可选回执事实。
+提问/提示的终态回执(tts_ended / tts_interrupted)只能带声明过的 barge_in_armed /
+barge_in_listened_ms;关了声音停播(NMU_AUTOPILOT_VOICE_BARGE_IN=0)时 armed 恒为 false。
+浏览器看到的真/假/缺计数与账本里落下的逐条对上。
 """
 from __future__ import annotations
 
@@ -111,6 +116,9 @@ _IDLE_BOUNDARY_ACKS = frozenset({
     "tts_started", "tts_ended", "tts_interrupted", "tts_failed", "record_stopped", "record_failed",
 })
 _VOICE_SETTINGS_PATH = re.compile(r"^/sessions/[^/]+/autopilot/voice-settings$")
+_TERMINAL_TTS_ACKS = frozenset({"tts_ended", "tts_interrupted"})
+# 停播检测只在提问/提示里开;反馈、报答案的回执不该带它的事实。
+_PROMPT_PURPOSES = frozenset({"question", "cue"})
 
 
 @dataclass(frozen=True)
@@ -137,6 +145,7 @@ class VoiceChainsResult:
     continuous_vad_voiced_ms: str
     continuous_listener_loud_ms: str
     max_live_tracks: str
+    prompt_barge_in_armed: str
 
 
 # ----------------------------------------------------------------------------
@@ -226,7 +235,14 @@ def configured_voice_switches(env: Mapping[str, str]) -> dict[str, bool]:
 
 
 def voice_settings_shape_ok(value: object) -> bool:
-    if not isinstance(value, dict) or set(value) != VOICE_SETTINGS_KEYS:
+    # 平板带 ?ack_facts=1 读:认得可选回执事实的服务端多回一个事实名数组。
+    if not isinstance(value, dict):
+        return False
+    if set(value) == VOICE_SETTINGS_KEYS | {"ack_facts"}:
+        facts = value["ack_facts"]
+        if not isinstance(facts, list) or any(not isinstance(name, str) for name in facts):
+            return False
+    elif set(value) != VOICE_SETTINGS_KEYS:
         return False
     if any(type(value[name]) is not bool for name in ("vad_enabled", "barge_in_enabled")):
         return False
@@ -271,6 +287,63 @@ def resolve_voice_expectation(observed: Sequence[Mapping], *, requested: int,
         raise BrowserAcceptanceError(
             f"尾静默窗口 {expectation['trailing_ms']} ms 盖不住伪麦克风 {HUSH_SECONDS:g} s 的静音段")
     return expectation
+
+
+def advertised_ack_facts(observed: Sequence[Mapping]) -> frozenset[str]:
+    """平板按最近一次成功读到的语音设置决定报哪些可选回执事实;四键 = 一个都不报。"""
+    if not observed:
+        return frozenset()
+    return frozenset(observed[-1].get("ack_facts") or ())
+
+
+def barge_in_fact_violations(terminals: Sequence[tuple[str | None, Mapping]], *,
+                             advertised: frozenset[str], barge_in_enabled: bool) -> list[str]:
+    """终态回执上的停播检测事实:服务端声明过才带,带了就自洽,开关关着 armed 恒为 false。
+
+    第一句可能赶在语音设置读到之前组装回执,所以不要求每条都带;但服务端声明了,
+    提问/提示的终态回执里总得有一条带上,否则平板根本没接上这条路。
+    """
+    problems: list[str] = []
+    reported = 0
+    for purpose, body in terminals:
+        armed = body.get("barge_in_armed", _ABSENT)
+        listened = body.get("barge_in_listened_ms", _ABSENT)
+        if armed is _ABSENT and listened is _ABSENT:
+            continue
+        if purpose not in _PROMPT_PURPOSES:
+            problems.append(f"反馈/报答案等非提问/提示话术({purpose})不开停播检测,回执却带了它的事实")
+            continue
+        if "barge_in_armed" not in advertised or (
+                listened is not _ABSENT and "barge_in_listened_ms" not in advertised):
+            problems.append("平板报了服务端没声明认得的停播检测事实(老服务端会 422)")
+            continue
+        if armed is not _ABSENT and type(armed) is not bool:
+            problems.append("停播检测的 barge_in_armed 不是布尔值")
+            continue
+        if listened is not _ABSENT and (armed is not True or type(listened) is not int
+                                        or not 0 <= listened <= 600_000):
+            problems.append("监听毫秒 barge_in_listened_ms 只能随 barge_in_armed=true,且是 0..600000 的整数")
+        if armed is _ABSENT:
+            continue
+        reported += 1
+        if armed and not barge_in_enabled:
+            problems.append("声音停播开关关着,回执却说停播检测在听")
+        if armed is False and body.get("interrupt_reason") == "voice_activity":
+            problems.append("老人开口停播的回执却说停播检测没在听")
+    if ("barge_in_armed" in advertised and reported == 0
+            and any(purpose in _PROMPT_PURPOSES for purpose, _ in terminals)):
+        problems.append("服务端声明认得 barge_in_armed,提问/提示的终态回执却一条都没报")
+    return problems
+
+
+def barge_in_tally(terminals: Sequence[tuple[str | None, Mapping]]) -> str:
+    """提问/提示终态回执上 barge_in_armed 的真/假/缺;浏览器与账本各数一遍对账。"""
+    counts = {"true": 0, "false": 0, "missing": 0}
+    for purpose, body in terminals:
+        if purpose in _PROMPT_PURPOSES:
+            armed = body.get("barge_in_armed")
+            counts["true" if armed is True else "false" if armed is False else "missing"] += 1
+    return ",".join(f"{name}={count}" for name, count in counts.items())
 
 
 def silence_stop_budget_ms(expectation: Mapping, vad_voiced_ms: int | None) -> int:
@@ -611,6 +684,7 @@ def run_voice_chains(config: BrowserAcceptanceConfig) -> VoiceChainsResult:
         "audio_saved": [],
         "voice_settings": [],
         "voice_settings_requests": 0,
+        "terminal_tts": {},
     }
 
     def violation(message: str) -> None:
@@ -723,7 +797,7 @@ def run_voice_chains(config: BrowserAcceptanceConfig) -> VoiceChainsResult:
                 assert isinstance(found, list)
                 found.append(settings)
             else:
-                violation("服务端语音设置回执不是约定的四个字段")
+                violation("服务端语音设置回执不是约定的四个字段(或多一个 ack_facts 的五个)")
         if request.method == "POST" and parsed.path == "/audio" and response.status == 200:
             posted = posted_json(request)
             raw_id = str(posted.get("raw_audio_id")) if posted else "-"
@@ -755,6 +829,10 @@ def run_voice_chains(config: BrowserAcceptanceConfig) -> VoiceChainsResult:
                     bodies = obs["stop_bodies"]
                     assert isinstance(bodies, dict)
                     bodies[key] = posted
+                elif ack_type in _TERMINAL_TTS_ACKS:
+                    terminal_tts = obs["terminal_tts"]
+                    assert isinstance(terminal_tts, dict)
+                    terminal_tts[key] = posted
             else:
                 violation("设备命令 ACK 无法校验")
             try:
@@ -1013,6 +1091,14 @@ def run_voice_chains(config: BrowserAcceptanceConfig) -> VoiceChainsResult:
             heard = {chain: listeners.get(stream) for chain, stream in zip(("silence", "continuous"), streams)}
             for chain in ("silence", "continuous"):
                 problems += listener_violations(heard.get(chain), chain=chain, expectation=expectation)
+            command_table = obs["commands"]
+            terminal_tts = obs["terminal_tts"]
+            assert isinstance(command_table, dict) and isinstance(terminal_tts, dict)
+            terminals = [((command_table.get(key) or {}).get("purpose"), body)
+                         for key, body in terminal_tts.items()]
+            problems += barge_in_fact_violations(
+                terminals, advertised=advertised_ack_facts(voice_settings),
+                barge_in_enabled=switches["barge_in_enabled"])
             if problems:
                 raise BrowserAcceptanceError(problems[0])
             raise_if_violated()
@@ -1051,6 +1137,7 @@ def run_voice_chains(config: BrowserAcceptanceConfig) -> VoiceChainsResult:
                 continuous_vad_voiced_ms=_fact_text(continuous_body, "vad_voiced_ms"),
                 continuous_listener_loud_ms=loud("continuous"),
                 max_live_tracks=str(snapshot.get("maxLiveTracks")),
+                prompt_barge_in_armed=barge_in_tally(terminals),
             )
             _write_receipt(config, result)
             return result
@@ -1155,6 +1242,20 @@ def _validate_voice_ledger(config, result: VoiceChainsResult) -> None:
         if purpose not in {"cue", "feedback", "tell_answer"}:
             raise BrowserAcceptanceError("链 C 判分之后场次没有照常给出下一条话术")
 
+        # 浏览器看到的停播检测事实与账本落下的同一套真/假/缺计数;两条录音的触发回执
+        # 已经在上面经 verify_immutable_record_capture 过了生产证明。
+        terminals = []
+        for command in session.exec(select(RuntimeCommand).where(
+                RuntimeCommand.session_id == result.session_id, RuntimeCommand.kind == "tts")):
+            ack = session.exec(select(RuntimeCommandAck).where(
+                RuntimeCommandAck.command_id == command.id,
+                RuntimeCommandAck.ack_type.in_(_TERMINAL_TTS_ACKS))).first()
+            if ack is not None:
+                speech = autopilot_service.TtsCommandPayload.model_validate_json(command.payload_json)
+                terminals.append((speech.purpose, json.loads(ack.payload_json)))
+        if barge_in_tally(terminals) != result.prompt_barge_in_armed:
+            raise BrowserAcceptanceError("账本里提问/提示终态回执的停播检测事实与浏览器发出的对不上")
+
 
 def validate_voice_ledger() -> None:
     from harness import caregiver_demo_harness
@@ -1195,6 +1296,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"{result.continuous_elapsed_ms} ms,录音 {result.continuous_duration_seconds} s,"
                   f"旁听有声 {result.continuous_listener_loud_ms} ms,vad_armed={result.continuous_vad_armed},"
                   f"vad_voiced_ms={result.continuous_vad_voiced_ms}")
+            print(f"  提问/提示终态回执的停播检测 barge_in_armed:{result.prompt_barge_in_armed}")
         else:
             if args.origin:
                 raise BrowserAcceptanceError("账本核验不接受网页地址")

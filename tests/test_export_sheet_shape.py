@@ -124,11 +124,12 @@ def test_turn_sheet_and_research_turns_both_carry_the_duration():
 def test_turn_sheet_and_research_turns_append_the_same_capture_provenance_columns():
     """PI 手里的 turns.csv 与接口拉的 turns 要能按同名列直接对上。"""
     from app import research_dataset
-    appended = ("source_stop_reason", "source_prompt_playback_outcome")
-    assert export.SHEET_FIELDS["turns"][-2:] == appended
+    appended = ("source_stop_reason", "source_prompt_playback_outcome",
+                "source_prompt_barge_in_armed")
+    assert export.SHEET_FIELDS["turns"][-3:] == appended
     turns = research_dataset.dataset_for("turns")
     assert turns is not None
-    assert research_dataset.published_columns(turns)[-2:] == appended
+    assert research_dataset.published_columns(turns)[-3:] == appended
 
 
 def test_adjudication_sheet_and_research_adjudications_append_the_same_failure_flag():

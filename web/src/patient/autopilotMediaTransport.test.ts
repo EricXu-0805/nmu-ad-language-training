@@ -285,8 +285,10 @@ test("语音设置读面:设备凭据 GET、无正文、不带 cookie,恰好四�
   });
   const settings = await fetchAutopilotVoiceSettings("S/ONE", new AbortController().signal, deps);
   assert.deepEqual(settings, tuned);
+  assert.equal(Object.hasOwn(settings, "ack_facts"), false);
   assert.ok(observed);
-  assert.equal(observed.url, "/sessions/S%2FONE/autopilot/voice-settings");
+  // 每次都显式要可选回执事实清单;不认这个参数的服务端照回四键。
+  assert.equal(observed.url, "/sessions/S%2FONE/autopilot/voice-settings?ack_facts=1");
   assert.equal(observed.init.method, "GET");
   assert.equal(observed.init.credentials, "omit");
   assert.equal(observed.init.cache, "no-store");
@@ -323,6 +325,28 @@ test("语音设置严格解析:多键、缺键、类型或范围不对一律拒�
   ]) {
     assert.deepEqual(await fetchAutopilotVoiceSettings("S/ONE", new AbortController().signal,
       dependencies(async () => Response.json(body)).deps), body);
+  }
+});
+
+test("语音设置第五键 ack_facts:只留平板也认识的事实名;坏形状整份拒绝", async () => {
+  const read = async (body: unknown) => fetchAutopilotVoiceSettings(
+    "S/ONE", new AbortController().signal, dependencies(async () => Response.json(body)).deps);
+  assert.deepEqual(await read({ ...VOICE_SETTINGS, ack_facts: ["barge_in_armed", "barge_in_listened_ms"] }),
+    { ...VOICE_SETTINGS, ack_facts: ["barge_in_armed", "barge_in_listened_ms"] });
+  // 更新的服务端多认一个平板不认识的事实:略过它,不是坏形状。
+  assert.deepEqual(await read({ ...VOICE_SETTINGS, ack_facts: ["vad_noise_floor", "barge_in_armed"] }),
+    { ...VOICE_SETTINGS, ack_facts: ["barge_in_armed"] });
+  assert.deepEqual(await read({ ...VOICE_SETTINGS, ack_facts: [] }), { ...VOICE_SETTINGS, ack_facts: [] });
+  for (const body of [
+    { ...VOICE_SETTINGS, ack_facts: "barge_in_armed" },
+    { ...VOICE_SETTINGS, ack_facts: { barge_in_armed: true } },
+    { ...VOICE_SETTINGS, ack_facts: [1] },
+    { ...VOICE_SETTINGS, ack_facts: [null] },
+    { ...VOICE_SETTINGS, ack_facts: null },
+    { ...VOICE_SETTINGS, ack_facts: ["barge_in_armed"], vad_min_voiced_ms: 450 },
+    { ...VOICE_SETTINGS, ack_facts: ["barge_in_armed"], vad_enabled: "true" },
+  ]) {
+    await assert.rejects(read(body), JSON.stringify(body));
   }
 });
 

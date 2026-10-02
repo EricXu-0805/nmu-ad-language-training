@@ -327,8 +327,17 @@ class DrainTargetProjection(BaseModel):
     state_revision: int = Field(ge=0)
 
 
+AckFactName = Literal["barge_in_armed", "barge_in_listened_ms"]
+ADVERTISED_ACK_FACTS: tuple[AckFactName, ...] = ("barge_in_armed", "barge_in_listened_ms")
+
+
 class VoiceSettingsProjection(BaseModel):
-    """平板按精确四键校验;多一个键或少一个键,平板都会把 VAD 当关闭处理。"""
+    """平板按精确四键校验;多一个键或少一个键,平板都会把 VAD 当关闭处理。
+
+    第五键 ack_facts 只在平板显式要(?ack_facts=1)时出现,列出本服务端回执模型
+    认得的可选事实名。平板只往回执里写列在这里的键:回滚到不认这些键的服务端时
+    它不带参数也照样回四键,新平板就不会发一条 422 把床旁卡死。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -336,6 +345,15 @@ class VoiceSettingsProjection(BaseModel):
     vad_trailing_silence_ms: int
     vad_short_trailing_silence_ms: int
     barge_in_enabled: bool
+    ack_facts: tuple[AckFactName, ...] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unrequested_ack_facts(self, handler):
+        # 省略挂在模型上:没要的请求逐字节还是原来那四键,老平板的精确解析不受影响。
+        data = handler(self)
+        if self.ack_facts is None:
+            data.pop("ack_facts", None)
+        return data
 
 
 class RouteTtsEndedResult(BaseModel):
@@ -582,7 +600,7 @@ def _env_ms(name: str, *, default: int, low: int, high: int) -> int:
     return value if low <= value <= high else default
 
 
-def voice_settings() -> VoiceSettingsProjection:
+def voice_settings(*, ack_facts: bool = False) -> VoiceSettingsProjection:
     trailing = _env_ms(VAD_TRAILING_MS_ENV, default=3_000, low=1_500, high=8_000)
     # 短话窗口(有声不足 900 ms 时用)本来就要比 trailing 等得久:默认 4500 若比运维
     # 调长的 trailing 还短就取 trailing,不让「嗯」之后的慢回答反而被更早截掉。
@@ -593,6 +611,7 @@ def voice_settings() -> VoiceSettingsProjection:
         vad_trailing_silence_ms=trailing,
         vad_short_trailing_silence_ms=short,
         barge_in_enabled=voice_barge_in_enabled(),
+        ack_facts=ADVERTISED_ACK_FACTS if ack_facts else None,
     )
 
 
@@ -4914,12 +4933,14 @@ def _require_terminal_tts_ack(
         _fail("autopilot_tts_ack_invalid", "TTS 回执不是由命令发行设备产生")
     try:
         payload = json.loads(ack.payload_json)
-        canonical = autopilot_ledger.encode_ack_payload("tts_ended", payload)
+        # 与账本两个终态证明同一个复核口径,先验形状再编码:非对象载荷到不了编码器。
+        trusted = (autopilot_ledger.tts_terminal_payload_is_valid("tts_ended", payload)
+                   and autopilot_ledger.encode_ack_payload(
+                       "tts_ended", payload) == ack.payload_json)
     except (TypeError, ValueError) as exc:
         raise AutopilotServiceError(
             "autopilot_tts_ack_invalid", "TTS 结束回执载荷非法") from exc
-    if (not isinstance(payload, dict) or payload.get("media_ended") is not True
-            or canonical != ack.payload_json):
+    if not trusted:
         _fail("autopilot_tts_ack_invalid", "TTS 结束回执没有可信 media_ended 事实")
     return ack
 

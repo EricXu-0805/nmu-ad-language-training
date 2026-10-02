@@ -213,3 +213,10 @@ test("语音设置按场次缓存;开麦只读缓存,刷新在 runner 每一拍�
   assert.doesNotMatch(SOURCE, /await\s+voiceSettings/);
   assert.doesNotMatch(SOURCE, /await\s+[\w.]*refreshInBackground/);
 });
+
+test("停播检测事实报不报,朗读执行器每次组装回执时现问同一份语音设置缓存", () => {
+  const speech = SOURCE.slice(SOURCE.indexOf("new BrowserAutopilotSpeechExecutor("),
+    SOURCE.indexOf("new BrowserAutopilotRecordingExecutor("));
+  // 现问(箭头函数),不是开播那一刻拍下的布尔值:读面晚到也能赶上这一句的回执。
+  assert.match(speech, /acceptsAckFact: \(name\) => voiceSettings\.acceptsAckFact\(name\)/);
+});

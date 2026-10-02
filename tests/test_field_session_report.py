@@ -138,7 +138,7 @@ class _Scene:
     def tts(self, purpose: str, created: float, *, started: float | None = None,
             ended: float | None = None, interrupted: tuple | None = None,
             failed: tuple | None = None, generation: int = 1,
-            cue_level: int = 0) -> tuple[RuntimeCommand, dict]:
+            cue_level: int = 0, barge_in: dict | None = None) -> tuple[RuntimeCommand, dict]:
         lifecycle: dict = {"state": "pending"}
         if started is not None:
             lifecycle = {"state": "started", "started_at": self.utc(started)}
@@ -160,14 +160,15 @@ class _Scene:
         keys = {}
         if started is not None:
             self._ack(command, "tts_started", started, {"media_duration_ms": 4000})
+        # 停播检测两个可选事实只落在终态回执上;不给就是旧平板的历史形状。
         if ended is not None:
             keys["ended"] = self._ack(command, "tts_ended", ended, {
-                "media_duration_ms": 4000, "media_ended": True})
+                "media_duration_ms": 4000, "media_ended": True, **(barge_in or {})})
         if interrupted is not None:
             at, reason, played_ms = interrupted
             keys["interrupted"] = self._ack(command, "tts_interrupted", at, {
                 "interrupt_reason": reason, "media_duration_ms": played_ms,
-                "media_stopped": True})
+                "media_stopped": True, **(barge_in or {})})
         if failed is not None:
             at, code = failed
             self._ack(command, "tts_failed", at, {"error_code": code})
@@ -321,21 +322,26 @@ def _new_scene(db: DBSession, session_id: str, training_date: date, week_no: int
 
 
 def _seed_alpha(scene: _Scene) -> None:
-    c1, keys = scene.tts("question", 0.0, started=1.0, ended=6.0)
+    c1, keys = scene.tts("question", 0.0, started=1.0, ended=6.0,
+                         barge_in={"barge_in_armed": True, "barge_in_listened_ms": 2400})
     raw = scene.record(c1, keys["ended"], started=7.2, stopped=13.2, duration=5.5,
                        stop_payload={"stop_reason": "silence", "vad_armed": True,
                                      "vad_voiced_ms": 2400})
     scene.attempt(raw, created=15.2, processed=16.7, judge_mode="LLM辅助",
                   judge_reason=REASON_20, asr_text=ASR_TEXTS[0])
-    scene.tts("feedback", 16.75, started=18.25, ended=20.0)
+    # 反馈句不开检测;就算回执里出现这两键也不进提问/提示的分母。
+    scene.tts("feedback", 16.75, started=18.25, ended=20.0,
+              barge_in={"barge_in_armed": True, "barge_in_listened_ms": 5000})
 
-    c4, keys = scene.tts("question", 20.1, started=21.0, ended=25.0)
+    c4, keys = scene.tts("question", 20.1, started=21.0, ended=25.0,
+                         barge_in={"barge_in_armed": False})
     raw = scene.record(c4, keys["ended"], started=26.4, stopped=36.4, duration=9.6,
                        stop_payload={"stop_reason": "user_done", "vad_armed": False})
     scene.attempt(raw, created=39.4, processed=39.6, judge_mode="规则确定式",
                   asr_text=ASR_TEXTS[1])
     c6, keys = scene.tts("cue", 39.7, started=41.7, cue_level=1,
-                         interrupted=(43.0, "voice_activity", 1300))
+                         interrupted=(43.0, "voice_activity", 1300),
+                         barge_in={"barge_in_armed": True, "barge_in_listened_ms": 1300})
     # 旧平板：record_stopped 只有 stop_reason，没有 VAD 两个可选事实。
     raw = scene.record(c6, keys["interrupted"], started=43.4, stopped=57.6,
                        duration=14.0, stop_payload={"stop_reason": "max_duration"})
@@ -344,7 +350,8 @@ def _seed_alpha(scene: _Scene) -> None:
     scene.tts("feedback", 61.35, started=63.15, ended=65.0)
 
     c9, keys = scene.tts("question", 65.1, started=66.0,
-                         interrupted=(68.0, "answer_now", 2000))
+                         interrupted=(68.0, "answer_now", 2000),
+                         barge_in={"barge_in_armed": True, "barge_in_listened_ms": 900})
     raw = scene.record(c9, keys["interrupted"], started=68.6, stopped=72.6,
                        duration=3.7, stop_payload={"stop_reason": "silence",
                                                    "vad_armed": True,
@@ -375,7 +382,8 @@ def _seed_bravo(scene: _Scene) -> None:
                   judge_reason=REASON_45, asr_text=ASR_TEXTS[4])
     scene.tts("feedback", 15.65, started=17.15, ended=19.0)
 
-    d4, keys = scene.tts("question", 19.1, started=20.0, ended=24.0)
+    d4, keys = scene.tts("question", 19.1, started=20.0, ended=24.0,
+                         barge_in={"barge_in_armed": False})
     raw = scene.record(d4, keys["ended"], started=25.0, stopped=31.0, duration=5.7,
                        stop_payload={"stop_reason": "user_done", "vad_armed": False})
     answered = scene.attempt(raw, created=33.0, processed=34.5,
@@ -386,7 +394,8 @@ def _seed_bravo(scene: _Scene) -> None:
     scene.control("resume", 290.0, "researcher_explicit_resume", "waiting_tts",
                   generation=2)
     d6, keys = scene.tts("cue", 300.0, started=301.0, ended=305.0, generation=2,
-                         cue_level=1)
+                         cue_level=1,
+                         barge_in={"barge_in_armed": True, "barge_in_listened_ms": 3600})
     scene.record(d6, keys["ended"], started=306.2,
                  failed=(310.0, "microphone_unavailable"))
     scene.adjudicate(answered, "confirmed_correct", "asr_misrecognized", 315.0)
@@ -709,6 +718,35 @@ def test_prompt_playback_outcomes(metrics):
         },
         "interrupt_reasons": {"answer_now": 1, "voice_activity": 1},
         "interrupted_played_seconds": _stats(2, 1.65, 1.93, 2.0),
+        # 分母只有提问/提示的八条终态回执:带了事实的反馈句不算;旧平板两条记「缺」。
+        "barge_in": {
+            "armed": {"true": 4, "false": 2, "missing": 2},
+            "voice_activity_while_armed": {"count": 1, "share": pytest.approx(0.25)},
+            "answer_now_while_armed": 1,
+            # 900 1300 2400 3600
+            "listened_ms": _stats(4, 1850, 3240, 3600),
+        },
+    }
+
+
+def test_barge_in_tally_counts_historical_terminal_acks_as_missing(tmp_path):
+    db = _build_db(tmp_path / "app.db")
+    conn = sqlite3.connect(db)
+    try:
+        # 9/24 之前的平板一个检测事实都不带:所有终态回执都回到历史形状。
+        conn.execute(
+            "UPDATE runtimecommandack SET payload_json = json_remove("
+            "payload_json, '$.barge_in_armed', '$.barge_in_listened_ms') "
+            "WHERE ack_type IN ('tts_ended', 'tts_interrupted')")
+        conn.commit()
+    finally:
+        conn.close()
+    barge_in = _report(db, "--since", "2026-10-01")["metrics"]["prompt_playback"]["barge_in"]
+    assert barge_in == {
+        "armed": {"true": 0, "false": 0, "missing": 8},
+        "voice_activity_while_armed": {"count": 0, "share": None},
+        "answer_now_while_armed": 0,
+        "listened_ms": EMPTY_STATS,
     }
 
 
@@ -758,6 +796,10 @@ def test_markdown_prints_the_numbers_beside_the_baseline(field_db):
         "| └ LLM（LLM辅助） | 2 | 2.75 | 3.75 | 4.00 | — |",
         "| question | 5 | 1 | 0 | 0 |",
         "vad_armed：true 4 · false 2 · 缺（旧平板/未读到设置/刷新补发）1",
+        "停播检测 barge_in_armed（只算提问/提示的终态回执）：true 4 · false 2 · "
+        "缺（旧平板/服务端没声明/未读到语音设置）2；false 含部署关掉声音停播（switch off）",
+        "检测在听（true）时：老人开口停播 1 / 4（25.0%） · 点「现在回答」1",
+        "检测在听的毫秒 barge_in_listened_ms：n=4 · 中位 1850 · p90 3240 · 最大 3600",
     ):
         assert row in done.stdout, row
 

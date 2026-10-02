@@ -469,3 +469,125 @@ def test_only_record_stopped_may_carry_vad_facts(ack_type, shape, facts):
     assert AutopilotAckIn(**base).event_payload() is not None
     with pytest.raises(ValidationError):
         AutopilotAckIn(**base, **facts)
+
+
+_ENDED = {"media_ended": True, "media_duration_ms": 3_440}
+_ANSWER_NOW = {"media_stopped": True, "interrupt_reason": "answer_now", "media_duration_ms": 750}
+_VOICE = {**_ANSWER_NOW, "interrupt_reason": "voice_activity"}
+
+
+def _terminal_tts(ack_type: str, shape: dict, **facts) -> AutopilotAckIn:
+    return AutopilotAckIn(
+        idempotency_key="ack-tts-barge-0001",
+        ack_type=ack_type,
+        control_generation=1,
+        runner_generation=1,
+        command_revision=1,
+        device_event_seq=2,
+        **shape,
+        **facts,
+    )
+
+
+@pytest.mark.parametrize(("ack_type", "shape", "facts", "payload"), [
+    # 旧平板、没声明认这两键的服务端:一个都不发,历史载荷一字不变。
+    ("tts_ended", _ENDED, {}, _ENDED),
+    ("tts_ended", _ENDED, {"barge_in_armed": None, "barge_in_listened_ms": None}, _ENDED),
+    ("tts_ended", _ENDED, {"barge_in_armed": False}, {**_ENDED, "barge_in_armed": False}),
+    ("tts_ended", _ENDED, {"barge_in_armed": True}, {**_ENDED, "barge_in_armed": True}),
+    ("tts_ended", _ENDED, {"barge_in_armed": True, "barge_in_listened_ms": 0},
+     {**_ENDED, "barge_in_armed": True, "barge_in_listened_ms": 0}),
+    ("tts_ended", _ENDED, {"barge_in_armed": True, "barge_in_listened_ms": 600_000},
+     {**_ENDED, "barge_in_armed": True, "barge_in_listened_ms": 600_000}),
+    ("tts_interrupted", _ANSWER_NOW, {}, _ANSWER_NOW),
+    # 点「现在回答」时检测可能根本还没开始听。
+    ("tts_interrupted", _ANSWER_NOW, {"barge_in_armed": False},
+     {**_ANSWER_NOW, "barge_in_armed": False}),
+    ("tts_interrupted", _ANSWER_NOW, {"barge_in_armed": True, "barge_in_listened_ms": 1_216},
+     {**_ANSWER_NOW, "barge_in_armed": True, "barge_in_listened_ms": 1_216}),
+    ("tts_interrupted", _VOICE, {}, _VOICE),
+    ("tts_interrupted", _VOICE, {"barge_in_armed": True, "barge_in_listened_ms": 896},
+     {**_VOICE, "barge_in_armed": True, "barge_in_listened_ms": 896}),
+])
+def test_terminal_tts_barge_in_facts_are_optional_and_persist_verbatim(
+        ack_type, shape, facts, payload):
+    ack = _terminal_tts(ack_type, shape, **facts)
+    assert ack.event_payload() == payload
+    # 服务层会对 model_construct 实例按 python 形态重验;严格类型在重验里也不能松。
+    assert AutopilotAckIn.model_validate(
+        ack.model_dump(mode="python")).event_payload() == payload
+
+
+@pytest.mark.parametrize(("ack_type", "shape"), [
+    ("tts_ended", _ENDED), ("tts_interrupted", _ANSWER_NOW), ("tts_interrupted", _VOICE)])
+@pytest.mark.parametrize("facts", [
+    {"barge_in_listened_ms": 1200},
+    {"barge_in_armed": None, "barge_in_listened_ms": 1200},
+    {"barge_in_armed": False, "barge_in_listened_ms": 0},
+    {"barge_in_armed": 1},
+    {"barge_in_armed": 0},
+    {"barge_in_armed": "true"},
+    {"barge_in_armed": True, "barge_in_listened_ms": True},
+    {"barge_in_armed": True, "barge_in_listened_ms": 1200.0},
+    {"barge_in_armed": True, "barge_in_listened_ms": "1200"},
+    {"barge_in_armed": True, "barge_in_listened_ms": -1},
+    {"barge_in_armed": True, "barge_in_listened_ms": 600_001},
+])
+def test_terminal_tts_rejects_contradictory_or_mistyped_barge_in_facts(ack_type, shape, facts):
+    with pytest.raises(ValidationError):
+        _terminal_tts(ack_type, shape, **facts)
+
+
+def test_voice_activity_stop_cannot_say_the_detector_was_not_listening():
+    with pytest.raises(ValidationError, match="barge_in_armed"):
+        _terminal_tts("tts_interrupted", _VOICE, barge_in_armed=False)
+    assert _terminal_tts("tts_interrupted", _ANSWER_NOW, barge_in_armed=False).event_payload()[
+        "barge_in_armed"] is False
+
+
+@pytest.mark.parametrize("raw", [
+    '{"barge_in_armed": 1}',
+    '{"barge_in_armed": "true"}',
+    '{"barge_in_armed": true, "barge_in_listened_ms": true}',
+    '{"barge_in_armed": true, "barge_in_listened_ms": 1200.0}',
+    '{"barge_in_armed": true, "barge_in_listened_ms": 1e3}',
+    '{"barge_in_listened_ms": 1200}',
+])
+@pytest.mark.parametrize(("ack_type", "shape"), [
+    ("tts_ended", _ENDED), ("tts_interrupted", _ANSWER_NOW)])
+def test_terminal_tts_barge_in_facts_are_strict_on_the_json_wire(raw, ack_type, shape):
+    body = _terminal_tts(ack_type, shape).model_dump(mode="json", exclude_none=True)
+    body.update(json.loads(raw))
+    with pytest.raises(ValidationError):
+        AutopilotAckIn.model_validate_json(json.dumps(body))
+    with pytest.raises(ValidationError):
+        AutopilotAckIn.model_validate(body)
+
+
+@pytest.mark.parametrize(("ack_type", "shape"), [
+    ("tts_started", {}),
+    ("tts_failed", {"error_code": "audio_playback_failed"}),
+    ("record_started", {"mime_type": "audio/webm"}),
+    ("record_failed", {"error_code": "recording_runtime_failed"}),
+    ("record_stopped", {"stop_reason": "silence", "raw_audio_id": "raw-0001",
+                        "receipt_server_seq": 3, "checksum": "c" * 64,
+                        "byte_count": 4096, "duration_seconds": 3.5}),
+])
+@pytest.mark.parametrize("facts", [
+    {"barge_in_armed": True},
+    {"barge_in_armed": False},
+    {"barge_in_armed": True, "barge_in_listened_ms": 1200},
+])
+def test_only_terminal_tts_may_carry_barge_in_facts(ack_type, shape, facts):
+    base = dict(
+        idempotency_key="ack-not-terminal-tts-0001",
+        ack_type=ack_type,
+        control_generation=1,
+        runner_generation=1,
+        command_revision=0,
+        device_event_seq=1,
+        **shape,
+    )
+    assert AutopilotAckIn(**base).event_payload() is not None
+    with pytest.raises(ValidationError):
+        AutopilotAckIn(**base, **facts)

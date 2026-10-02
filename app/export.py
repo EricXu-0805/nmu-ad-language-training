@@ -1333,6 +1333,7 @@ def export_session_bundle(
                 # 所依据那次录音怎么收的口、收音前话术播完没有:运行事实,真值仍看 reviewed_score。
                 "source_stop_reason": source_capture.get("stop_reason"),
                 "source_prompt_playback_outcome": source_capture.get("prompt_playback_outcome"),
+                "source_prompt_barge_in_armed": source_capture.get("prompt_barge_in_armed"),
                 "asr_text": asr, "confirmed_response_text": conf,
                 "asr_confidence": t.asr_confidence, "prompt_level": t.prompt_level,
                 # 本环节收音时长（秒）。它是相对量，不是绝对时间，也**不是反应时**——
@@ -1829,7 +1830,8 @@ def _prompt_playback_evidence(db, attempt: AttemptEvent) -> dict:
 
 def _prompt_playback_for_record(db, record: RuntimeCommand | None) -> dict:
     empty = {"prompt_playback_outcome": None, "prompt_played_ms": None,
-             "prompt_exposure_needs_review": False}
+             "prompt_exposure_needs_review": False,
+             "prompt_barge_in_armed": None, "prompt_barge_in_listened_ms": None}
     if record is None:
         return empty
     try:
@@ -1838,15 +1840,20 @@ def _prompt_playback_for_record(db, record: RuntimeCommand | None) -> dict:
         ack = autopilot_ledger.verify_tts_ended_prerequisite(db, record, require_live_scope=False)
     except autopilot_ledger.AutopilotProofError:
         return {"prompt_playback_outcome": "unverified", "prompt_played_ms": None,
-                "prompt_exposure_needs_review": True}
+                "prompt_exposure_needs_review": True,
+                "prompt_barge_in_armed": None, "prompt_barge_in_listened_ms": None}
     interrupted = ack.ack_type == "tts_interrupted"
     reason = json.loads(ack.payload_json).get("interrupt_reason") if interrupted else None
     outcome = f"interrupted_{reason}" if interrupted else "ended"
+    # 停播检测两键只取过了证明的触发回执:旧平板、四键服务端时期的回执不带,是 None 不是 false。
+    barge_in = json.loads(ack.payload_json)
     return {"prompt_playback_outcome": outcome,
             # Historical ended ACKs used wall-clock elapsed time. Only this new
             # interrupted ACK reports HTMLAudioElement.currentTime.
             "prompt_played_ms": json.loads(ack.payload_json).get("media_duration_ms") if interrupted else None,
-            "prompt_exposure_needs_review": interrupted}
+            "prompt_exposure_needs_review": interrupted,
+            "prompt_barge_in_armed": barge_in.get("barge_in_armed"),
+            "prompt_barge_in_listened_ms": barge_in.get("barge_in_listened_ms")}
 
 
 def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
@@ -1858,11 +1865,13 @@ def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
     采集过程。vad_armed 是新平板才带的可选键；旧平板、平板还没读到语音设置、刷新后补发的回执都不带，为 None。
     播放结局与 attempts 表的 prompt_playback_outcome 同一个函数、同一套取值
     （ended / interrupted_<原因> / unverified），都要过账本对触发回执的证明，同一份
-    导出里两张表不会对同一段录音说两样话。
+    导出里两张表不会对同一段录音说两样话。prompt_barge_in_armed（那句播放时停播检测在不在听）
+    同理取自同一份证明。
     """
     by_audio = {attempt.raw_audio_id: attempt for attempt in attempts}
     facts = {attempt.id: {"stop_reason": None, "vad_armed": None,
-                          "prompt_playback_outcome": None}
+                          "prompt_playback_outcome": None,
+                          "prompt_barge_in_armed": None}
              for attempt in by_audio.values()}
     if not by_audio:
         return facts
@@ -1878,8 +1887,9 @@ def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
         RuntimeCommandAck.ack_type == "record_stopped"))}
     for record in records:
         fact = facts[by_audio[record.expected_raw_audio_id].id]
-        fact["prompt_playback_outcome"] = _prompt_playback_for_record(
-            db, record)["prompt_playback_outcome"]
+        playback = _prompt_playback_for_record(db, record)
+        fact["prompt_playback_outcome"] = playback["prompt_playback_outcome"]
+        fact["prompt_barge_in_armed"] = playback["prompt_barge_in_armed"]
         ack = stopped.get(record.id)
         try:
             payload = json.loads(ack.payload_json) if ack is not None else {}
@@ -2229,6 +2239,7 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         "duration_seconds",
         "presentation_order", "adjudication_kind", "adjudication_reason",
         "source_stop_reason", "source_prompt_playback_outcome",
+        "source_prompt_barge_in_armed",
     ),
     "adjudications": _SESSION_COLS + (
         "item_id", "presentation_order", "turn_seq", "kind", "reason_code", "note",
@@ -2247,6 +2258,8 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         "prompt_playback_outcome", "prompt_played_ms", "prompt_exposure_needs_review",
         # 录音怎么收的口与平板 VAD 是否真在跑:回执里的运行事实,旧回执为空。
         "capture_stop_reason", "capture_vad_armed",
+        # 收音前那句提问/提示播放时停播检测在不在听、听了多少毫秒:声音停播率的分母。
+        "prompt_barge_in_armed", "prompt_barge_in_listened_ms",
     ),
     "interactions": _SESSION_COLS + (
         "event_seq", "item_id", "turn_seq", "attempt_seq", "audio_code",

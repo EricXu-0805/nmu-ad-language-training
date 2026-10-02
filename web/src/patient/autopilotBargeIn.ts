@@ -17,6 +17,8 @@ export function createBargeInDetector() {
   let cooldownUntil = 0;
   let attempts = 0;
   let done = false;
+  let armedAt: number | null = null;
+  let doneAt: number | null = null;
   const baseline: number[] = [];
   let floor = 0.004;
   return {
@@ -34,6 +36,7 @@ export function createBargeInDetector() {
         baseline.push(rms);
         return "none";
       }
+      if (armedAt === null) armedAt = atMs;
       if (baseline.length) {
         baseline.sort((a, b) => a - b);
         // The calibration can contain TTS leakage; cap it instead of making quiet voices impossible.
@@ -47,6 +50,7 @@ export function createBargeInDetector() {
         voicedMs = speechLike ? voicedMs + delta : 0;
         if (voicedMs >= BARGE_IN_ONSET_MS) {
           done = true;
+          doneAt = atMs;
           return "confirmed";
         }
         if (elapsed >= BARGE_IN_CONFIRM_TIMEOUT_MS) {
@@ -54,7 +58,10 @@ export function createBargeInDetector() {
           voicedMs = 0;
           cooldownUntil = atMs + 1_500;
           // Repeated false detections should not keep stopping the prompt.
-          if (attempts >= 2) done = true;
+          if (attempts >= 2) {
+            done = true;
+            doneAt = atMs;
+          }
           return "resume";
         }
         return "none";
@@ -68,5 +75,9 @@ export function createBargeInDetector() {
       attempts += 1;
       return "candidate";
     },
+    /** 校准之后第一帧真被判的时刻;null = 这句话里停播还不可能触发。 */
+    armedAt(): number | null { return armedAt; },
+    /** 判定器不再判的时刻:确认停播,或两次误报后放弃(检测仍开着,但已不会停播)。 */
+    doneAt(): number | null { return doneAt; },
   };
 }

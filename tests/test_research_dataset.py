@@ -112,7 +112,7 @@ def test_capture_provenance_columns_are_appended_and_documented_as_operational_f
     尤其 silence 是平板听到尾部静音后自己收的麦,不等于「老人说完了」。"""
     turns = rd.dataset_for("turns")
     assert turns is not None
-    assert rd.published_columns(turns)[-3:] == (
+    assert rd.published_columns(turns)[-4:-1] == (
         "withdrawn", "source_stop_reason", "source_prompt_playback_outcome")
     described = {column.name: column for column in turns.columns}
     stop_reason = described["source_stop_reason"]
@@ -139,3 +139,17 @@ def test_adjudications_append_a_derived_technical_failure_flag_after_withdrawn()
     assert flag.disclosure == "clear" and flag.dtype == "boolean"
     for phrase in ("technical_failure", "kind=skipped", "原因码", "attempts"):
         assert phrase in flag.description, phrase
+
+
+def test_barge_in_armed_column_is_appended_and_says_false_includes_switch_off():
+    """声音停播的分母。部署关掉停播时每一行都是 false:字典不写明,就会被读成检测坏了。"""
+    turns = rd.dataset_for("turns")
+    assert turns is not None
+    assert rd.published_columns(turns)[-1] == "source_prompt_barge_in_armed"
+    armed = {column.name: column for column in turns.columns}["source_prompt_barge_in_armed"]
+    assert armed.disclosure == "clear" and armed.dtype == "boolean"
+    assert "运行事实" in armed.description and "不是研究真值" in armed.description
+    assert "switch off" in armed.description
+    assert "prompt_barge_in_armed" in armed.description
+    for meaning in ("true", "false", "空"):
+        assert meaning in armed.description, meaning
