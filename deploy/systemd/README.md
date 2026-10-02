@@ -111,6 +111,9 @@ for t in $(systemctl list-unit-files --no-legend 'nmu-*.timer' | awk '{print $1}
 done    # 每个都要 SubState=waiting、NextElapseUSecRealtime 非空、UnitFileState=enabled
 ```
 
+处置:被停用的 `systemctl enable --now <timer>`;停在 elapsed 的、或刚换过 `.timer` 文件的,
+`systemctl daemon-reload` 之后再 `systemctl restart <timer>`。做完按上面两条命令再验一遍。
+
 对应的自动检查:`preflight_check.py --os` 的「无 nmu-* cron 条目」查第一条;
 「定时器在排程」就是上面第二段命令,被停用、被停止或停在 elapsed 的定时器都会被点名;
 `nmu-backup-health` 每天带 `--probe-unit nmu-health.service` 问一次公网探针最近一次
