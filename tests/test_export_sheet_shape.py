@@ -121,6 +121,16 @@ def test_turn_sheet_and_research_turns_both_carry_the_duration():
         "研究取数面一个时长列都没有，而模块契约承诺了「时长」")
 
 
+def test_turn_sheet_and_research_turns_append_the_same_capture_provenance_columns():
+    """PI 手里的 turns.csv 与接口拉的 turns 要能按同名列直接对上。"""
+    from app import research_dataset
+    appended = ("source_stop_reason", "source_prompt_playback_outcome")
+    assert export.SHEET_FIELDS["turns"][-2:] == appended
+    turns = research_dataset.dataset_for("turns")
+    assert turns is not None
+    assert research_dataset.published_columns(turns)[-2:] == appended
+
+
 def test_the_dead_latency_column_is_gone_everywhere():
     """留着最坏：读 schema 的人会以为平台有反应时，而每次量表初评都在把 null 当证据发出去。"""
     from pathlib import Path as _Path

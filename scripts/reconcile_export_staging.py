@@ -43,7 +43,7 @@ _CONTROLLED_AUDIO_NAME = re.compile(
 )
 _AUDIO_FORMATS = frozenset({"webm", "mp3", "wav", "m4a", "ogg"})
 _CLASSIFICATIONS = frozenset({"research", "simulation"})
-_SHEETS = frozenset({
+_BASE_SHEETS = frozenset({
     "session",
     "turns",
     "attempts",
@@ -53,11 +53,25 @@ _SHEETS = frozenset({
     "legacy_unverified_scales",
     "abnormal",
     "audio_manifest",
-    "adjudications",
 })
-_ANALYSIS_NAMES = frozenset(
-    {f"{name}.csv" for name in _SHEETS} | {".staging-receipt.json"}
+# 崩在任何一版导出器上的 pre-intent 残留都要能隔离，所以认的是 verify_backup_snapshot
+# 那一组历史表集（测试钉住两边相等）；不导入 app.export，离线工具不初始化应用状态。
+_REPEAT_SHEETS = _BASE_SHEETS | {"repeat_audio_manifest"}
+_QUESTIONNAIRE_SHEETS = _REPEAT_SHEETS | {
+    "questionnaire_records", "questionnaire_item_values",
+}
+_SUPPORTED_SHEET_SETS = frozenset({
+    _BASE_SHEETS,
+    _REPEAT_SHEETS,
+    _QUESTIONNAIRE_SHEETS,
+    _BASE_SHEETS | {"adjudications"},
+    _QUESTIONNAIRE_SHEETS | {"adjudications"},
+})
+_ANALYSIS_NAME_SETS = frozenset(
+    frozenset({f"{name}.csv" for name in sheets} | {".staging-receipt.json"})
+    for sheets in _SUPPORTED_SHEET_SETS
 )
+_ANALYSIS_FILE_COUNTS = frozenset(len(names) for names in _ANALYSIS_NAME_SETS)
 _INTENT_NAME = "quarantine-intent.json"
 _RECEIPT_NAME = "reconciliation-receipt.json"
 _UNCERTAIN_NAME = "database-commit-uncertain.json"
@@ -235,7 +249,7 @@ def _durably_sync_tree(root: Path) -> None:
                 )
             for name in filenames:
                 file_count += 1
-                if file_count > _MAX_AUDIO_FILES + len(_ANALYSIS_NAMES):
+                if file_count > _MAX_AUDIO_FILES + max(_ANALYSIS_FILE_COUNTS):
                     raise ReconciliationError("staging_fsync_failed")
                 _fsync_regular_file(current_path / name)
         for directory in sorted(
@@ -573,10 +587,11 @@ def _analysis_files(
         entries = tuple(os.scandir(resolved))
     except OSError as exc:
         raise ReconciliationError("analysis_staging_invalid") from exc
-    if {entry.name for entry in entries} != _ANALYSIS_NAMES:
+    names = frozenset(entry.name for entry in entries)
+    if names not in _ANALYSIS_NAME_SETS:
         raise ReconciliationError("analysis_layout_invalid")
     files: list[tuple[str, Path]] = []
-    for name in sorted(_ANALYSIS_NAMES):
+    for name in sorted(names):
         path = resolved / name
         maximum = _MAX_RECEIPT_BYTES if name.startswith(".") else _MAX_CSV_BYTES
         _secure_regular_file(
@@ -980,7 +995,7 @@ def _summary_from_public(value: object, *, controlled: bool) -> TreeSummary:
     if controlled:
         if not 1 <= file_count <= _MAX_AUDIO_FILES:
             raise ReconciliationError("quarantine_intent_invalid")
-    elif file_count != len(_ANALYSIS_NAMES):
+    elif file_count not in _ANALYSIS_FILE_COUNTS:
         raise ReconciliationError("quarantine_intent_invalid")
     return TreeSummary(
         str(value["sha256"]),

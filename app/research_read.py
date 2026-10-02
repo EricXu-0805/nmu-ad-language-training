@@ -36,7 +36,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import and_, or_
 from sqlmodel import Session as DBSession, select
 
-from . import export_security, item_numbering, research_dataset, session_admission
+from . import export, export_security, item_numbering, research_dataset, session_admission
 from .models import (
     AttemptEvent,
     AutopilotPositionAdjudication,
@@ -480,12 +480,12 @@ def list_turns(db: DBSession, *, config, data_classification: str,
     attempt_ids = {turn.source_attempt_id for turn, _, _ in page
                    if turn.source_attempt_id is not None}
     attempt_seq: dict[Any, int] = {}
+    capture: dict[Any, dict[str, Any]] = {}
     if attempt_ids:
-        attempt_seq = {
-            attempt.id: attempt.attempt_seq
-            for attempt in db.exec(select(AttemptEvent).where(
-                AttemptEvent.id.in_(attempt_ids)))
-        }
+        attempts = list(db.exec(select(AttemptEvent).where(
+            AttemptEvent.id.in_(attempt_ids))))
+        attempt_seq = {attempt.id: attempt.attempt_seq for attempt in attempts}
+        capture = export.capture_provenance(db, attempts)
 
     adjudications: dict[tuple[str, str, int], AutopilotPositionAdjudication] = {}
     page_session_ids = {sess.session_id for _, _, sess in page}
@@ -523,7 +523,8 @@ def list_turns(db: DBSession, *, config, data_classification: str,
                 attempt_seq.get(turn.source_attempt_id),
                 adjudications.get((sess.session_id, item.item_id, turn.turn_seq)),
                 presentation_order=item_numbering.presentation_order(
-                    item, historical_plans.get(sess.session_id, {}))))
+                    item, historical_plans.get(sess.session_id, {})),
+                capture=capture.get(turn.source_attempt_id)))
         last_key = [sess.session_id, item.item_id, turn.turn_seq]
 
     next_cursor = (encode_cursor(last_key, config, "turns")
@@ -779,9 +780,11 @@ def _turn_row(session_code: str, subject_code: str,
               item: ItemEvent, turn: TurnEvent,
               source_attempt_seq: int | None,
               adjudication: AutopilotPositionAdjudication | None = None,
-              *, presentation_order: int | None = None) -> dict[str, Any]:
+              *, presentation_order: int | None = None,
+              capture: dict[str, Any] | None = None) -> dict[str, Any]:
     diff = (None if turn.reviewed_score is None or turn.ai_score is None
             else round(turn.reviewed_score - turn.ai_score, 4))
+    capture = capture or {}
     return {
         "session_code": session_code,
         "subject_code": subject_code,
@@ -808,6 +811,8 @@ def _turn_row(session_code: str, subject_code: str,
         # 在训的人必须是 False 而不是 null：SPSS 里 null 是缺失值，
         # `filter withdrawn = 0` 会把在训的人一起滤掉。
         "withdrawn": False,
+        "source_stop_reason": capture.get("stop_reason"),
+        "source_prompt_playback_outcome": capture.get("prompt_playback_outcome"),
     }
 
 

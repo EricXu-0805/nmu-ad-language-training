@@ -138,6 +138,17 @@ _TURNS = Dataset(
                "该环节的受试者是否已登记研究撤回。撤回者的行是墓碑：自然键"
                "（item_id / turn_seq）与本列保留，其余全为空。**统计时必须先按"
                "本列过滤**——行还在是为了让分母稳定，不是为了让内容可用"),
+        Column("source_stop_reason", "clear", "string",
+               "本环节所依据那次录音（source_attempt_seq）是怎么收的麦。这是平板回执里的"
+               "运行事实，不是研究真值：silence=老人开口后平板听到尾部静音、自动收麦；"
+               "user_done=有人按了「说完了可以点这里」；max_duration=作答窗口到点；stream_end=录音被"
+               "暂停或中断强行收口，上传的是半段。silence 不等于老人真的说完了，估计截断率"
+               "要按本列分层抽听录音。没有平板录音命令的环节（人工录入、历史场次）为空"),
+        Column("source_prompt_playback_outcome", "clear", "string",
+               "本环节所依据那次录音之前，那句提问或提示话术播完没有。同样是平板回执里的"
+               "运行事实，不是研究真值：completed=平板报告自然播完；interrupted=没播完就被"
+               "打断（老人开口抢答，或有人按了「现在回答」），老人可能没听全；找不到播放回执"
+               "（人工录入、历史场次）为空。被打断不改提示层级，也不推断老人听到了哪几个字"),
         Column("asr_text", "forbidden", "-", "语音识别原文：永不出现"),
         Column("confirmed_response_text", "forbidden", "-", "人工确认作答文本：永不出现"),
         Column("judge_reason", "forbidden", "-", "AI 判分理由：永不出现"),

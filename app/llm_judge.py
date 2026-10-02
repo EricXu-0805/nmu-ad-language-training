@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -36,33 +37,43 @@ class LlmJudgeProvider(Protocol):
     def judge(self, ji: JudgeInput) -> Optional[LlmJudgement]: ...
 
 
+# 判分 prompt 的全部静态文字;题目与回答只经 build_judge_prompt 填进占位符。
+# QwenJudge.version 带这段文字的摘要:改一个字就是换一版判分,AI 与人工一致性分析靠它分批。
+# 类型定义必须写进 prompt:2026-08-31~09-04 生产上 qwen-plus 自己给「重复」下了
+# 「把目标词说两遍」的定义,49 次含目标词的正确回答被判 0 分;双要素题它又把
+# 「双要素」读成「回答里要有两个要素」。临床口径(0628 行为指标)的「重复」是
+# 「重复一题答案」——照搬上一题的答案或复述问句,不是把正确的词多说一遍。
+JUDGE_PROMPT_TEMPLATE = (
+    "你是言语训练判分员。仅根据下列信息判定老人回答类型,输出 JSON "
+    '{{"answer_type": "正确|部分正确|上位词或相关词|偏题|重复|未识别", "score": 0|0.5|1, "needs_review": bool, "reason": str}}。\n'
+    "题目类型:{task_type}\n目标词:{target_word}\n"
+    "可接受表达:{acceptable_expressions}\n上位词:{upper_terms}\n"
+    "方言俗名:{dialect_synonyms}\n老人回答:{response}\n"
+    "类型定义(严格照此):\n"
+    "- 正确(1分):回答就是目标词、可接受表达或方言俗名;把同一个词说两遍、三遍,"
+    "或前后带「嗯」「这是」之类语气词,仍然是正确。\n"
+    "- 部分正确(0.5分):含目标词但多字、少字或带修饰(如目标词「树」答「大树」,「熨斗」答「熨熨斗」)。\n"
+    "- 上位词或相关词(0.5分):只说了类别或相关的东西(上位词表里的词,或「书」答「书本」这类近义)。\n"
+    "- 偏题(0分):说的是别的东西或别的话题,没有把目标词当作一个完整的词说出来"
+    "(目标词「花」答「花瓶」、「书」答「书架」算偏题,那是别的东西)。\n"
+    "- 重复(0分):只是复述了题目问句或提示语、照搬上一题的答案、或双要素题里照搬本题"
+    "另一个要素,没有回答本题;把目标词本身说两遍不算重复。\n"
+    "- 未识别(0分):听不出在说什么。\n"
+    "本轮只判「目标词」这一个词:双要素、多要素题也只看这一轮的目标词,不要求回答里出现两个要素。\n"
+    "注意:你只产初评,不产最终分;拿不准一律 needs_review=true。reason 用一句话、不超过 40 字。"
+)
+
+
 def build_judge_prompt(ji: JudgeInput) -> str:
     """判分 prompt 只由 JudgeInput 组装;组装前运行时断言无画像键(第二道防线)。"""
     fields = asdict(ji)
     assert_portrait_free(fields)
-    resp = resolve_response_text(ji) or "（无回答）"
-    # 类型定义必须写进 prompt:2026-08-31~09-04 生产上 qwen-plus 自己给「重复」下了
-    # 「把目标词说两遍」的定义,49 次含目标词的正确回答被判 0 分;双要素题它又把
-    # 「双要素」读成「回答里要有两个要素」。临床口径(0628 行为指标)的「重复」是
-    # 「重复一题答案」——照搬上一题的答案或复述问句,不是把正确的词多说一遍。
-    return (
-        "你是言语训练判分员。仅根据下列信息判定老人回答类型,输出 JSON "
-        '{"answer_type": "正确|部分正确|上位词或相关词|偏题|重复|未识别", "score": 0|0.5|1, "needs_review": bool, "reason": str}。\n'
-        f"题目类型:{ji.task_type}\n目标词:{ji.target_word}\n"
-        f"可接受表达:{list(ji.acceptable_expressions)}\n上位词:{list(ji.upper_terms)}\n"
-        f"方言俗名:{list(ji.dialect_synonyms)}\n老人回答:{resp}\n"
-        "类型定义(严格照此):\n"
-        "- 正确(1分):回答就是目标词、可接受表达或方言俗名;把同一个词说两遍、三遍,"
-        "或前后带「嗯」「这是」之类语气词,仍然是正确。\n"
-        "- 部分正确(0.5分):含目标词但多字、少字或带修饰(如目标词「树」答「大树」,「熨斗」答「熨熨斗」)。\n"
-        "- 上位词或相关词(0.5分):只说了类别或相关的东西(上位词表里的词,或「书」答「书本」这类近义)。\n"
-        "- 偏题(0分):说的是别的东西或别的话题,没有把目标词当作一个完整的词说出来"
-        "(目标词「花」答「花瓶」、「书」答「书架」算偏题,那是别的东西)。\n"
-        "- 重复(0分):只是复述了题目问句或提示语、照搬上一题的答案、或双要素题里照搬本题"
-        "另一个要素,没有回答本题;把目标词本身说两遍不算重复。\n"
-        "- 未识别(0分):听不出在说什么。\n"
-        "本轮只判「目标词」这一个词:双要素、多要素题也只看这一轮的目标词,不要求回答里出现两个要素。\n"
-        "注意:你只产初评,不产最终分;拿不准一律 needs_review=true。reason 用一句话、不超过 40 字。"
+    return JUDGE_PROMPT_TEMPLATE.format(
+        task_type=ji.task_type, target_word=ji.target_word,
+        acceptable_expressions=list(ji.acceptable_expressions),
+        upper_terms=list(ji.upper_terms),
+        dialect_synonyms=list(ji.dialect_synonyms),
+        response=resolve_response_text(ji) or "（无回答）",
     )
 
 
@@ -116,7 +127,9 @@ class QwenJudge:
 
     def __init__(self, model: str):
         self._model = model
-        self.version = f"dashscope/{model}"
+        template_sha8 = hashlib.sha256(
+            JUDGE_PROMPT_TEMPLATE.encode("utf-8")).hexdigest()[:8]
+        self.version = f"dashscope/{model}+p{template_sha8}"
 
     def available(self) -> bool:
         return bool(os.environ.get("DASHSCOPE_API_KEY"))

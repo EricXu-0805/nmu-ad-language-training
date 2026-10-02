@@ -105,3 +105,23 @@ def test_the_handover_doc_and_the_registry_cannot_drift_apart():
         assert column in rd.published_columns(turns), column
     assert "(`session_code`, `item_id`, `turn_seq`)" in doc or \
         "`(session_code, item_id, turn_seq)`" in doc, "文档里的自然键写法变了"
+
+
+def test_capture_provenance_columns_are_appended_and_documented_as_operational_facts():
+    """收口方式与播放结局是平板回执,不是研究真值;字典要把闭集里每个取值说清楚,
+    尤其 silence 是平板听到尾部静音后自己收的麦,不等于「老人说完了」。"""
+    turns = rd.dataset_for("turns")
+    assert turns is not None
+    assert rd.published_columns(turns)[-3:] == (
+        "withdrawn", "source_stop_reason", "source_prompt_playback_outcome")
+    described = {column.name: column for column in turns.columns}
+    stop_reason = described["source_stop_reason"]
+    playback = described["source_prompt_playback_outcome"]
+    for column in (stop_reason, playback):
+        assert column.disclosure == "clear" and column.dtype == "string"
+        assert "运行事实" in column.description and "不是研究真值" in column.description
+    for value in ("silence", "user_done", "max_duration", "stream_end"):
+        assert value in stop_reason.description, value
+    assert "尾部静音" in stop_reason.description and "自动收麦" in stop_reason.description
+    for value in ("completed", "interrupted"):
+        assert value in playback.description, value

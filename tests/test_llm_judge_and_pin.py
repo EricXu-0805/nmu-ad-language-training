@@ -1,4 +1,6 @@
 from datetime import datetime
+import hashlib
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -318,3 +320,31 @@ def test_judge_call_caps_output_tokens_and_asks_for_a_one_line_reason(monkeypatc
     _Generation.call = staticmethod(lambda **kwargs: types.SimpleNamespace(output=types.SimpleNamespace(choices=[
         types.SimpleNamespace(message=types.SimpleNamespace(content='{"answer_type": "正确", "score": 1, "needs_rev'))])))
     assert engine.judge(ji) is None
+
+
+def test_judge_engine_version_names_the_static_prompt_template():
+    """09-04 与 09-20 两次改了判分 prompt,版本号却一直是 dashscope/qwen-plus:AI 与人工
+    一致性分析分不出哪批初评出自哪版 prompt。版本号带静态模板的短摘要,不随题目和回答变。"""
+    digest = hashlib.sha256(
+        llm_judge.JUDGE_PROMPT_TEMPLATE.encode("utf-8")).hexdigest()[:8]
+    assert llm_judge.QwenJudge("qwen-plus").version == f"dashscope/qwen-plus+p{digest}"
+    assert llm_judge.QwenJudge("qwen-max").version == f"dashscope/qwen-max+p{digest}"
+
+
+def test_changing_the_prompt_template_changes_the_judge_version(monkeypatch):
+    before = llm_judge.QwenJudge("qwen-plus").version
+    monkeypatch.setattr(llm_judge, "JUDGE_PROMPT_TEMPLATE",
+                        llm_judge.JUDGE_PROMPT_TEMPLATE + "拿不准一律判未识别。\n")
+    after = llm_judge.QwenJudge("qwen-plus").version
+    assert after != before
+    assert re.fullmatch(r"dashscope/qwen-plus\+p[0-9a-f]{8}", after)
+
+
+def test_the_prompt_sent_is_exactly_the_template_filled_with_this_item(monkeypatch):
+    """摘要只算模板。模板之外再往 prompt 里拼静态文字,改了不会换版本号——那样这条就红。"""
+    ji = build_judge_input(item_id="x", task_type="单要素", target_word="锚",
+                           acceptable_expressions=("铁锚",), asr_text="锚")
+    monkeypatch.setattr(llm_judge, "JUDGE_PROMPT_TEMPLATE",
+                        "{task_type}|{target_word}|{acceptable_expressions}|{upper_terms}"
+                        "|{dialect_synonyms}|{response}")
+    assert build_judge_prompt(ji) == "单要素|锚|['铁锚']|[]|[]|锚"
