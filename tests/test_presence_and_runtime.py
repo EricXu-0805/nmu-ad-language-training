@@ -1378,8 +1378,9 @@ def test_heartbeat_rejects_malformed_page_build(client, page_build):
     _training_session(client, "S-PB-BAD", "P-PB-BAD")
     assert _handshake(client, "S-PB-BAD", wseq=100).status_code == 200
 
+    # 末尾换行也拒:换成 Python re 引擎时 `$` 会放过它,审计摘要里就混进控制字符。
     for bad in ("abc", "1" * 9, "1" * 81, "１２３４５６７８９０", "12345 67890",
-                "-123456789", "<!doctype html>", 1234567890):
+                "-123456789", "<!doctype html>", "1234567890\n", 1234567890):
         response = _page_build_heartbeat(client, "S-PB-BAD", bad)
         assert response.status_code == 422, bad
     # 被拒的心跳不留下任何在场事实。
