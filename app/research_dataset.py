@@ -234,6 +234,13 @@ _ADJUDICATIONS = Dataset(
                "trained_in_prior_sitting / other"),
         Column("adjudication_seq", "clear", "integer", "本场内裁定的先后序号（1 起）"),
         Column("withdrawn", "clear", "boolean", "所属受试者是否已登记研究撤回"),
+        Column("position_had_technical_failure", "clear", "boolean",
+               "这一题位（item_id + turn_seq）上有没有哪段录音的 AI 处理技术失败"
+               "（导出包 attempts 表 processing_status=technical_failure），由录音尝试推出，"
+               "不是研究者填的。kind=skipped 且本列为 true 就是「技术失败后跳过」：失败那段"
+               "录音留在导出包 attempts 表，没有环节行；为 false 的 skipped 是没录到回答就"
+               "跳过。研究面没有 attempts 数据集，原因码又可能选了「其他」，区分这两种跳过请"
+               "看本列。撤回者的墓碑行为空"),
         Column("note", "forbidden", "-", "研究者备注（自由文本）：永不出现"),
         Column("actor_id", "forbidden", "-", "裁定人账号：留在库表与审计里，不进研究面"),
         Column("created_at", "forbidden", "-", "绝对时间：永不出现"),

@@ -1349,12 +1349,16 @@ def export_session_bundle(
                 "judge_portrait_used": t.judge_portrait_used})
 
     # --- 研究者现场裁定(含没有录音证据的「跳过」题位)---
+    failed_positions = {(attempt.item_id, attempt.turn_seq) for attempt in attempts
+                        if attempt.processing_status == "technical_failure"}
     adjudication_sheet = [{
         **session_cols(), "item_id": row.item_id, "presentation_order": row.presentation_order,
         "turn_seq": row.turn_seq, "kind": row.kind, "reason_code": row.reason_code,
         "note": export_security.redact_free_text(row.note),
         # 署名留在库表与审计里;去标识导出包不带任何工作人员账号(与其它表页同口径)。
         "adjudication_seq": index + 1,
+        # 技术失败后跳过与没回答就跳过同为 skipped,原因码也可能选「其他」;从 attempt 推出来区分。
+        "position_had_technical_failure": (row.item_id, row.turn_seq) in failed_positions,
     } for index, row in enumerate(adjudications)]
 
     # --- 重建评分汇总 ---
@@ -2228,7 +2232,7 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "adjudications": _SESSION_COLS + (
         "item_id", "presentation_order", "turn_seq", "kind", "reason_code", "note",
-        "adjudication_seq",
+        "adjudication_seq", "position_had_technical_failure",
     ),
     "attempts": _SESSION_COLS + (
         "item_id", "turn_seq", "response_role", "attempt_seq", "audio_code",
