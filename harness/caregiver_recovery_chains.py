@@ -471,6 +471,11 @@ def run_recovery_chains(config: BrowserAcceptanceConfig) -> RecoveryChainsResult
             # 平板的实时状态长轮询由页面自己撤销(sync/useLiveCursor:到客户端期限、能力
             # 更新重探、离线),不是网络故障;真断连会是 ERR_CONNECTION_REFUSED 或 5xx。
             return
+        if (request.method == "POST" and parsed.path.endswith("/barge-in-authorization")
+                and "ERR_ABORTED" in failure):
+            # 停播检测的授权请求挂在检测器自己的 AbortController 上:播完、暂停或换命令时
+            # 检测器关闭,在途授权由平板撤销。真断连是 ERR_CONNECTION_* 或 5xx。
+            return
         violation(f"浏览器网络请求未完成 {request.method} {parsed.path} ({failure or '-'})")
 
     def attach_page(tag: str, page) -> None:

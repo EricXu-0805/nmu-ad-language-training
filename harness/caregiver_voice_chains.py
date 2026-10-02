@@ -774,6 +774,11 @@ def run_voice_chains(config: BrowserAcceptanceConfig) -> VoiceChainsResult:
         if request.method == "GET" and parsed.path == "/live/state" and "ERR_ABORTED" in failure:
             # 平板的实时状态长轮询由页面自己撤销(到客户端期限、能力重探、离线),不是断连。
             return
+        if (request.method == "POST" and parsed.path.endswith("/barge-in-authorization")
+                and "ERR_ABORTED" in failure):
+            # 停播检测的授权请求挂在检测器自己的 AbortController 上:播完、暂停或换命令时
+            # 检测器关闭,在途授权由平板撤销。真断连是 ERR_CONNECTION_* 或 5xx。
+            return
         violation(f"浏览器网络请求未完成 {request.method} {parsed.path} ({failure or '-'})")
 
     def attach_page(tag: str, page) -> None:
