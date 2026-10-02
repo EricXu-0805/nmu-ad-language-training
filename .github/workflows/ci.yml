@@ -37,6 +37,13 @@ concurrency:
 
 jobs:
   backend:
+    # main 的 push 与每周定时不重跑测试：进 main 的树已由 PR run 测过，这两种事件只要上线
+    # 产物和新通告扫描（image、supply-chain）。跳过的 job 记 skipped，整次 run 仍是 success；
+    # job 级 if 先于矩阵展开求值，main 上只会有一条 backend、没有 backend (3.12)/(3.14)——
+    # 必需检查只在更新 main 那一刻核对被推的 SHA，那时这次 run 还没开始，不受影响。
+    # 只写「跳过哪些事件」，新加的触发默认照跑；pull_request 绝不能进来：分支保护把跳过算通过。
+    # 要在 main 上完整重跑，用 workflow_dispatch。
+    if: github.event_name != 'push' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -74,6 +81,8 @@ jobs:
           if-no-files-found: error
 
   frontend:
+    # 条件与理由同 backend。
+    if: github.event_name != 'push' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1

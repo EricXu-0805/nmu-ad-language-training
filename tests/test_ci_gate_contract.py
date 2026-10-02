@@ -10,6 +10,17 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 GATE = ROOT / "scripts/ci_gate.sh"
 GATE_TEXT = GATE.read_text(encoding="utf-8")
+SKIP_ON_MAIN_PUSH_AND_SCHEDULE = "github.event_name != 'push' && github.event_name != 'schedule'"
+
+
+def _jobs() -> dict[str, str]:
+    body = WORKFLOW[WORKFLOW.index("\njobs:\n") + len("\njobs:\n"):]
+    parts = re.split(r"^  ([A-Za-z][\w-]*):\n", body, flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def _job_level_ifs(job: str) -> list[str]:
+    return re.findall(r"^    if: (.+)$", _jobs()[job], re.M)
 
 
 def test_workflow_calls_the_shared_gate_for_every_core_suite() -> None:
@@ -185,3 +196,15 @@ def test_push_runs_only_on_main_and_the_other_triggers_stay() -> None:
     # pull_request 不加任何过滤:PR 少跑一次,五项必需检查就缺名字。
     assert not re.search(r"^  pull_request:\n    ", triggers, re.M)
     assert 'cron: "0 2 * * 1"' in triggers
+
+
+def test_main_push_and_schedule_skip_the_test_suites_but_still_scan_and_build() -> None:
+    # strict 分支保护下,进 main 的树已由 PR run 测过;main 的 push 只为出上线产物,
+    # 每周定时只为让 OSV 与镜像扫描看到新通告。backend/frontend 在这两种事件上不重跑。
+    for job in ("backend", "frontend"):
+        assert _job_level_ifs(job) == [SKIP_ON_MAIN_PUSH_AND_SCHEDULE], job
+    for job in ("supply-chain", "image"):
+        assert _job_level_ifs(job) == [], f"{job} 必须每种事件都跑"
+    jobs = _jobs()
+    assert "scripts/ci_gate.sh --only supply-chain" in jobs["supply-chain"]
+    assert jobs["image"].count("uses: aquasecurity/trivy-action@") == 2
