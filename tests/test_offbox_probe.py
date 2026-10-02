@@ -960,3 +960,372 @@ def test_the_insert_mode_never_overwrites_its_input(tmp_path):
 
     assert result.returncode != 0
     assert original.read_text(encoding="utf-8") == SYNTHETIC_HEARTBEAT
+
+
+# ---------------------------------------------------------------------------
+# 安装器：Eric 在 Mac 上跑。这里测不连任何机器就能测的部分——步骤怎么选、
+# 远端那几段脚本在假 crontab 上的行为、它 grep 的字样探针是不是真的会打印。
+# ---------------------------------------------------------------------------
+
+INSTALLER = OFFBOX / "install_offbox_probe.sh"
+CRONTAB_BASELINE = (
+    "# m h dom mon dow command\n"
+    "*/5 * * * * /usr/bin/python3 /home/eric/.openclaw/workspace/watchdog/discord_watchdog.py"
+    " --arm >> /home/eric/.openclaw/workspace/watchdog/cron.log 2>&1\n"
+    "2-59/5 * * * * /usr/bin/python3 /home/eric/.openclaw/workspace/watchdog-v2/monitor.py\n"
+    "0 14 * * * OPENAI_API_KEY=sk-sentinel-never-print /home/eric/x-feed/run.sh\n"
+)
+
+
+def _installer_text() -> str:
+    return INSTALLER.read_text(encoding="utf-8")
+
+
+def _heredoc(tag: str) -> str:
+    text = _installer_text()
+    start = text.index(f"<<'{tag}'")
+    body = text[text.index("\n", start) + 1:]
+    return body[:body.index(f"\n{tag}\n") + 1]
+
+
+def _constant(name: str) -> str:
+    match = re.search(rf'^{name}="([^"]*)"$', _installer_text(), re.M)
+    assert match, name
+    return match.group(1)
+
+
+def _sha256(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class Remote:
+    """在本机用假 hostname / 文件版 crontab 跑安装器里的远端脚本段。"""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.home = tmp_path / "home"
+        (self.home / ".openclaw" / "bin").mkdir(parents=True)
+        keychain = self.home / ".openclaw" / "bin" / "keychain-get"
+        keychain.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        keychain.chmod(0o700)
+        (self.home / ".openclaw" / "secrets.env").write_text(
+            f"OPENCLAW_DISCORD_DAILY_WEBHOOK={WEBHOOK}\n", encoding="utf-8")
+        self.bin = tmp_path / "bin"
+        self.bin.mkdir()
+        self.crontab = tmp_path / "crontab.txt"
+        self._tool("hostname", 'echo "${FAKE_HOSTNAME:-openclaw-prod}"')
+        self._tool("crontab", "\n".join([
+            'f="$FAKE_CRONTAB"',
+            'case "$1" in',
+            '  -l) [ -f "$f" ] || { echo "no crontab for eric" >&2; exit 1; }; cat "$f" ;;',
+            '  -) if [ -n "${FAKE_CRONTAB_LOSSY:-}" ]; then tail -n +2 > "$f";'
+            ' else cat > "$f"; fi ;;',
+            '  *) cat "$1" > "$f" ;;',
+            "esac",
+        ]))
+        if not any((Path(d) / "sha256sum").exists()
+                   for d in os.environ.get("PATH", "").split(os.pathsep)):
+            self._tool("sha256sum", 'exec shasum -a 256 "$@"')
+        self.env = {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+                    "HOME": str(self.home), "FAKE_CRONTAB": str(self.crontab),
+                    "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+
+    def _tool(self, name: str, body: str) -> None:
+        tool = self.bin / name
+        tool.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        tool.chmod(0o755)
+
+    def backups(self) -> Path:
+        return self.home / ".openclaw" / "backups"
+
+    def run(self, tag: str, *args: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", "-s", "--", *args], input=_heredoc(tag),
+                              env={**self.env, **env}, capture_output=True, text=True,
+                              timeout=60)
+
+
+@pytest.fixture
+def remote(tmp_path) -> Remote:
+    return Remote(tmp_path)
+
+
+def _plan(*flags: str, tmp_path: Path) -> subprocess.CompletedProcess:
+    fake = tmp_path / "plan-bin"
+    fake.mkdir(exist_ok=True)
+    marker = tmp_path / "ssh-was-called"
+    ssh = fake / "ssh"
+    ssh.write_text(f'#!/bin/sh\necho "$@" >> "{marker}"\nexit 99\n', encoding="utf-8")
+    ssh.chmod(0o755)
+    result = subprocess.run(["bash", str(INSTALLER), *flags],
+                            env={"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+                                 "HOME": str(tmp_path)},
+                            capture_output=True, text=True, timeout=60)
+    assert not marker.exists(), "--plan / 参数错误时不许连任何机器"
+    return result
+
+
+@pytest.mark.parametrize(("flags", "stages"), [
+    ([], "0 1 2 3 5"),
+    (["--test-alert"], "0 1 2 3 4 5"),
+    (["--preflight"], "0"),
+    (["--heartbeat"], "6"),
+    (["--verify"], "7"),
+])
+def test_the_installer_runs_the_test_alert_only_when_asked(tmp_path, flags, stages):
+    result = _plan("--plan", *flags, tmp_path=tmp_path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines()[0] == f"stages: {stages}"
+
+
+@pytest.mark.parametrize("flags", [["--heartbeat", "--test-alert"], ["--verify", "--heartbeat"],
+                                   ["--send"], ["--force"]])
+def test_the_installer_rejects_flag_combinations_it_does_not_know(tmp_path, flags):
+    result = _plan("--plan", *flags, tmp_path=tmp_path)
+
+    assert result.returncode == 64
+
+
+def test_only_stage_4_ever_sends_a_test_alert():
+    text = _installer_text()
+    calls = [line for line in text.splitlines()
+             if "--test-alert" in line and "nmu_offbox_probe.py" in line]
+    assert len(calls) == 1
+    body = text[text.index("\nstage4() {\n"):]
+    body = body[:body.index("\n}\n")]
+    assert calls[0] in body
+
+
+def test_the_installer_pins_the_baselines_the_brief_measured():
+    assert _constant("CRONTAB_BASE_SHA") == (
+        "31d8f685282856fe53ec4688d344aadc9dd9a564e313347a0c74b5af7c26b4d7")
+    assert _constant("HEARTBEAT_BASE_SHA") == (
+        "8d478629ba2bc0bc0d3ab26df85c6b6ee1ceb674d414b1507f34b8a6ca2ca9be")
+    assert _constant("DAILY_CHANNEL_ID") == "1490232840397389894"
+    assert _constant("HOST") == "eric@147.182.176.237"
+    assert _constant("REMOTE_DIR") == str(probe.DIR)
+    assert _constant("GOOD_URL") == probe.URL
+    assert _constant("BAD_URL").startswith(probe.URL)    # /health* 不被上线空闲检查计数
+    text = _installer_text()
+    assert "set -euo pipefail" in text
+    assert re.search(r"(?m)^[^#]*\bopenclaw (cron|gateway|channels|secrets)\b", text) is None
+    assert "--print-only" not in text.replace("不跑整份 --print-only", "")
+
+
+def test_preflight_passes_the_crontab_guard_on_the_baseline(remote):
+    remote.crontab.write_text(CRONTAB_BASELINE, encoding="utf-8")
+
+    result = remote.run("PREFLIGHT", _sha256(CRONTAB_BASELINE), str(probe.DIR))
+
+    assert "crontab = 基线 (4 行)" in result.stdout
+    assert "--arm 行数 1" in result.stdout
+    assert "OPENCLAW_DISCORD_DAILY_WEBHOOK 1 行" in result.stdout
+    assert "sentinel" not in result.stdout + result.stderr
+
+
+def test_preflight_stops_with_a_masked_diff_when_the_crontab_moved(remote):
+    remote.backups().mkdir(parents=True)
+    (remote.backups() / "crontab.before-watchdog-20260604-170234").write_text(
+        "# 很旧的一份\n", encoding="utf-8")
+    (remote.backups() / "crontab.before-xfeed").write_text(CRONTAB_BASELINE, encoding="utf-8")
+    moved = CRONTAB_BASELINE.replace("0 14 * * * OPENAI", "0 15 * * * OPENAI")
+    remote.crontab.write_text(moved, encoding="utf-8")
+
+    result = remote.run("PREFLIGHT", _sha256(CRONTAB_BASELINE), str(probe.DIR))
+
+    assert result.returncode == 1
+    assert "crontab.before-xfeed" in result.stdout           # 找到了与基线同 sha 的备份
+    assert "-0 14 * * * OPENAI_API_KEY=" in result.stdout
+    assert "+0 15 * * * OPENAI_API_KEY=" in result.stdout
+    assert "sentinel" not in result.stdout + result.stderr
+    assert "停" in result.stdout
+    assert remote.crontab.read_text(encoding="utf-8") == moved
+
+
+def test_preflight_without_any_backup_still_shows_what_is_there_masked(remote):
+    remote.crontab.write_text(CRONTAB_BASELINE + "* * * * * /bin/true\n", encoding="utf-8")
+
+    result = remote.run("PREFLIGHT", _sha256(CRONTAB_BASELINE), str(probe.DIR))
+
+    assert result.returncode == 1
+    assert "/bin/true" in result.stdout and "sentinel" not in result.stdout
+
+
+def test_preflight_recognises_an_existing_install(remote):
+    line = (OFFBOX / "crontab.line").read_text(encoding="utf-8")
+    remote.crontab.write_text(CRONTAB_BASELINE + line, encoding="utf-8")
+
+    result = remote.run("PREFLIGHT", _sha256(CRONTAB_BASELINE), str(probe.DIR))
+
+    assert result.returncode == 3 and "已经有探针" in result.stdout
+
+
+def test_preflight_refuses_any_other_host(remote):
+    remote.crontab.write_text(CRONTAB_BASELINE, encoding="utf-8")
+
+    result = remote.run("PREFLIGHT", _sha256(CRONTAB_BASELINE), str(probe.DIR),
+                        FAKE_HOSTNAME="nmu-prod")
+
+    assert result.returncode == 1 and "nmu-prod" in result.stdout
+
+
+def test_the_crontab_stage_appends_one_line_and_keeps_every_other_byte(remote):
+    remote.crontab.write_text(CRONTAB_BASELINE, encoding="utf-8")
+    line_file = OFFBOX / "crontab.line"
+
+    result = remote.run("CRONTAB", _sha256(CRONTAB_BASELINE), str(line_file))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert remote.crontab.read_text(encoding="utf-8") == (
+        CRONTAB_BASELINE + line_file.read_text(encoding="utf-8"))
+    [backup] = remote.backups().glob("crontab.before-nmu-probe-*")
+    assert backup.read_text(encoding="utf-8") == CRONTAB_BASELINE
+    assert backup.stat().st_mode & 0o777 == 0o600
+    assert f"回滚:crontab {backup}" in result.stdout
+
+
+def test_the_crontab_stage_writes_nothing_when_the_crontab_moved_after_preflight(remote):
+    remote.crontab.write_text(CRONTAB_BASELINE, encoding="utf-8")
+
+    result = remote.run("CRONTAB", _sha256("something else\n"), str(OFFBOX / "crontab.line"))
+
+    assert result.returncode == 1 and "没动" in result.stdout
+    assert remote.crontab.read_text(encoding="utf-8") == CRONTAB_BASELINE
+
+
+def test_the_crontab_stage_restores_the_backup_when_a_check_fails(remote):
+    remote.crontab.write_text(CRONTAB_BASELINE, encoding="utf-8")
+
+    result = remote.run("CRONTAB", _sha256(CRONTAB_BASELINE), str(OFFBOX / "crontab.line"),
+                        FAKE_CRONTAB_LOSSY="1")       # 写进去时丢了第一行
+
+    assert result.returncode == 1
+    assert "还原" in result.stdout
+    assert remote.crontab.read_text(encoding="utf-8") == CRONTAB_BASELINE
+
+
+def test_the_crontab_stage_only_ever_installs_the_probe_line(remote, tmp_path):
+    remote.crontab.write_text(CRONTAB_BASELINE, encoding="utf-8")
+    other = tmp_path / "other.line"
+    other.write_text("* * * * * /bin/rm -rf /home/eric\n", encoding="utf-8")
+
+    result = remote.run("CRONTAB", _sha256(CRONTAB_BASELINE), str(other))
+
+    assert result.returncode == 1
+    assert remote.crontab.read_text(encoding="utf-8") == CRONTAB_BASELINE
+
+
+def _heartbeat_remote(remote: Remote, tmp_path: Path, source: str = SYNTHETIC_HEARTBEAT):
+    target = remote.home / ".openclaw" / "workspace" / "heartbeat" / "heartbeat.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(source, encoding="utf-8")
+    probe_dir = tmp_path / "nmu-probe"
+    probe_dir.mkdir()
+    (probe_dir / "heartbeat_check.py").write_bytes((OFFBOX / "heartbeat_check.py").read_bytes())
+    # 远端是 /usr/bin/python3;本机/CI 上换成跑测试的这个解释器。
+    script = _heredoc("HEARTBEAT").replace("/usr/bin/python3", sys.executable)
+
+    def run(want: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", "-s", "--", want, str(probe_dir)], input=script,
+                              env={**remote.env, **env}, capture_output=True, text=True,
+                              timeout=60)
+    return target, run
+
+
+def test_the_heartbeat_stage_backs_up_inserts_and_calls_only_the_new_check(remote, tmp_path):
+    target, run = _heartbeat_remote(remote, tmp_path)
+
+    result = run(_sha256(SYNTHETIC_HEARTBEAT))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert target.read_text(encoding="utf-8").count("def check_nmu_probe") == 1
+    [backup] = target.parent.glob("heartbeat.py.before-nmu-probe-*")
+    assert backup.read_text(encoding="utf-8") == SYNTHETIC_HEARTBEAT
+    assert result.stdout.count("WARN NMU 异地探针: 无 state.json") == 2   # 新文件、换上之后各一次
+    assert f"回滚:cp -p {backup} {target}" in result.stdout
+    assert not list(target.parent.glob("*.nmu-probe.new"))
+
+
+def test_the_heartbeat_stage_leaves_a_changed_heartbeat_alone(remote, tmp_path):
+    changed = SYNTHETIC_HEARTBEAT.replace("healthy", "healthy!")
+    target, run = _heartbeat_remote(remote, tmp_path, changed)
+
+    result = run(_sha256(SYNTHETIC_HEARTBEAT))
+
+    assert result.returncode == 1 and "不是基线" in result.stdout
+    assert target.read_text(encoding="utf-8") == changed
+    assert sorted(p.name for p in target.parent.iterdir()) == ["heartbeat.py"]
+
+
+def test_the_heartbeat_stage_recognises_an_earlier_insert(remote, tmp_path):
+    module = _load("heartbeat_check")
+    inserted = module.insert(SYNTHETIC_HEARTBEAT, module.block())
+    target, run = _heartbeat_remote(remote, tmp_path, inserted)
+
+    result = run(_sha256(SYNTHETIC_HEARTBEAT))
+
+    assert result.returncode == 3
+    assert target.read_text(encoding="utf-8") == inserted
+
+
+def test_the_heartbeat_stage_refuses_any_other_host(remote, tmp_path):
+    target, run = _heartbeat_remote(remote, tmp_path)
+
+    result = run(_sha256(SYNTHETIC_HEARTBEAT), FAKE_HOSTNAME="nmu-prod")
+
+    assert result.returncode == 1
+    assert target.read_text(encoding="utf-8") == SYNTHETIC_HEARTBEAT
+
+
+def test_verify_reads_the_age_out_of_a_real_status_line(world):
+    world.tick(HEALTHY)
+    _, status_out, _ = world.run("--status", advance=False)
+    [sed_expr] = re.findall(r"sed -n '([^']*age_s[^']*)'", _heredoc("VERIFY"))
+
+    parsed = subprocess.run(["sed", "-n", sed_expr], input=status_out, capture_output=True,
+                            text=True, timeout=30).stdout.strip()
+
+    assert parsed == "600"
+
+
+def test_the_installer_refuses_to_run_under_zsh_or_dash(tmp_path):
+    # macOS 的 /bin/sh 就是 bash(POSIX 模式),照样能跑;真正会半路炸的是 zsh 与 dash。
+    shells = [shell for shell in ("zsh", "dash")
+              if any((Path(d) / shell).exists()
+                     for d in os.environ.get("PATH", "").split(os.pathsep))]
+    if not shells:
+        pytest.skip("这台机器上既没有 zsh 也没有 dash")
+    for shell in shells:
+        result = subprocess.run([shell, str(INSTALLER), "--plan"], capture_output=True,
+                                text=True, timeout=60, env={"PATH": os.environ["PATH"],
+                                                            "HOME": str(tmp_path)})
+        assert result.returncode == 64, (shell, result.stdout, result.stderr)
+        assert "bash" in result.stdout + result.stderr
+
+
+def test_the_installer_greps_for_what_the_probe_actually_prints(world, tmp_path):
+    selftest = _heredoc("SELFTEST")
+    expects = re.findall(r'^out="\$\(probe[^)]*\)"; expect "[^"]+" "\$out" (.*)$',
+                         selftest, re.M)
+    assert len(expects) == 4
+    scratch = tmp_path / "selftest.json"
+    for site, fragments in zip((HEALTHY, SPA_SHELL, SPA_SHELL, HEALTHY), expects):
+        world.net.site = site
+        _, out, _ = world.run("--dry-run", "--state", str(scratch))
+        for fragment in re.findall(r'"([^"]+)"', fragments):
+            assert fragment in out, (fragment, out)
+
+    text = _installer_text()
+    channel = _constant("DAILY_CHANNEL_ID")
+    assert '*"channel_id=${DAILY_CHANNEL_ID} "*' in text
+    _, out, _ = world.run("--check-webhook")
+    assert f"channel_id={channel} " in out
+    assert '*"test_alert_sent status=204"*' in text
+    _, out, _ = world.run("--test-alert")
+    assert "test_alert_sent status=204" in out
+    verify = _heredoc("VERIFY")
+    assert "grep -q ' UP ok '" in verify and "age_s=" in verify
+    world.tick(HEALTHY)
+    assert " UP ok " in world.log_lines()[-1]
+    _, out, _ = world.run("--status", advance=False)
+    assert re.search(r" age_s=[0-9]+ ", out)
