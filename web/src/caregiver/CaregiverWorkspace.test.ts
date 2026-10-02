@@ -46,6 +46,12 @@ test("patient view remains a separate-window instruction rather than a mounted o
   assert.doesNotMatch(source, /PATIENT_VIEW_EVENT|PatientViewHost|PatientShell/);
 });
 
+test("an old patient page gets the same refresh wording as the research console", () => {
+  assert.match(source, /status\?\.patientPageStale && \(/);
+  assert.match(source, /老人端页面是旧版本，请刷新老人端/);
+  assert.match(source, /请在暂停时或本场结束后刷新；刷新后需再点一次『点一下，开始』/);
+});
+
 test("help copy is owned by caregiverHelpPrompt, not composed in the screen", () => {
   // 文案曾经写死在这个组件里。搬进 caregiverHelpPrompt 之后，「没配通知对象
   // 时不许说已通知」那条保证由 caregiverPolicy.test.ts 按**行为**验，

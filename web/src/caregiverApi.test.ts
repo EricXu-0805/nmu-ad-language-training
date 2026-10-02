@@ -164,6 +164,7 @@ test("status parser derives the exact safe bedside actions", () => {
     runtimeState: "active",
     practiceState: "not_started",
     patientPresence: "online",
+    patientPageStale: false,
     runtimeRevision: 4,
     practiceRevision: 0,
     takeoverReady: false,
@@ -249,6 +250,22 @@ test("status parser derives the exact safe bedside actions", () => {
     takeOver: false,
     end: false,
   });
+});
+
+test("status parser flags an old patient page only while that screen is online here", () => {
+  const parse = (presence: Record<string, unknown>, active = true) => caregiverApiContract.parseStatus({
+    ...STATUS,
+    active_bedside_session: active,
+    patient_presence: { ...STATUS.patient_presence, ...presence },
+  }).patientPageStale;
+  assert.equal(parse({ page_build: "stale" }), true);
+  assert.equal(parse({ page_build: "stale", online: false }), false);
+  assert.equal(parse({ page_build: "stale" }, false), false);
+  for (const pageBuild of ["current", "unknown", "invented", null]) {
+    assert.equal(parse({ page_build: pageBuild }), false, String(pageBuild));
+  }
+  // 旧后端没有这个字段:照常解析,不提醒。
+  assert.equal(parse({}), false);
 });
 
 test("status parser fails closed on unknown server states", () => {

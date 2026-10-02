@@ -450,7 +450,7 @@ export function PatientShell() {
   const commandSeq = session?.mode === "rapport"
     ? rapportStep?.wseq
     : autopilot.mode !== "legacy" ? autopilot.current?.command_seq : cursor?.wseq;
-  usePatientHeartbeat(session?.sessionId, currentScreen, commandSeq ?? session?.wseq);
+  usePatientHeartbeat(session?.sessionId, currentScreen, commandSeq ?? session?.wseq, __BUILD_ID__);
 
   // Generic/legacy TTS gets an exact replay namespace.  It is deliberately
   // absent while a new item is loading, during pause/disconnect/terminal views,

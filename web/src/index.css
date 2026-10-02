@@ -1278,6 +1278,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 }
 .session-presence__copy strong { font-size: var(--text-sm); }
 .session-presence__copy span { color: var(--c-muted); font-size: var(--text-xs); }
+.session-presence__copy .session-presence__stale { color: var(--c-warn-text); }
 .session-control-bar {
   display: flex;
   align-items: center;

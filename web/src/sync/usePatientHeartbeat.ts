@@ -10,15 +10,20 @@ const HEARTBEAT_MS = 5000;
  *
  * 旧后端没有该路由时会返回 404/405：本场关闭额外心跳，但不影响既有 live/state
  * 与 BroadcastChannel 链路，也不把“不支持新能力”伪装成断线。
+ *
+ * pageBuildId 让操作端看出这张页面是不是旧构建。不认识它的旧后端(回滚)整拍 422：
+ * 本页之后不再带，并立刻补发一拍，在场判定不断档。
  */
 export function usePatientHeartbeat(
   sessionId: string | undefined,
   screen: PatientPresenceScreen,
   cursorWseq?: number,
+  pageBuildId?: string,
 ): void {
   const unsupportedSessions = useRef<Set<string>>(new Set());
   const latest = useRef({ sessionId, screen, cursorWseq });
   latest.current = { sessionId, screen, cursorWseq };
+  const pageBuildRejected = useRef(false);
   const inFlight = useRef(false);
   const lastAttemptedSignature = useRef<string | null>(null);
   const queuedForce = useRef(false);
@@ -44,9 +49,14 @@ export function usePatientHeartbeat(
     if (typeof current.cursorWseq === "number" && Number.isFinite(current.cursorWseq)) {
       body.cursor_wseq = current.cursorWseq;
     }
+    if (pageBuildId && !pageBuildRejected.current) body.page_build_id = pageBuildId;
     try {
       await api.patientHeartbeat(body);
     } catch (error) {
+      if (body.page_build_id && error instanceof ApiError && error.status === 422) {
+        pageBuildRejected.current = true;
+        queuedForce.current = true;
+      }
       if (error instanceof ApiError && (error.status === 404 || error.status === 405)) {
         // 只有"路由不存在"(旧后端)才永久关闭本场心跳;"场次不存在"的 404 是业务态
         // (换库/建场竞态),下一拍可能就恢复,闩死会让在场判定整场假离线。

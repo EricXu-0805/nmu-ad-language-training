@@ -466,6 +466,10 @@ function SessionContextBar({ patientId, weekNo, phase, eventLine, presence, onEn
         <div className="session-presence__copy">
           <strong>{presence.screenLabel}</strong>
           {presence.lastSeenLabel && <span>{presence.lastSeenLabel}</span>}
+          {presence.pageStale && <>
+            <strong className="session-presence__stale">老人端页面是旧版本，请刷新老人端</strong>
+            <span>请在暂停时或本场结束后刷新；刷新后需再点一次『点一下，开始』</span>
+          </>}
         </div>
       </div>
       <div className="col" style={{ gap: "var(--sp-1)", alignItems: "flex-start" }}>
