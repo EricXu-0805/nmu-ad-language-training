@@ -2201,7 +2201,7 @@ def _link_source_attempt(db, item_id: str, turn_seq: int, attempt: AttemptEvent)
 
 def test_turns_say_how_the_source_capture_closed_and_whether_its_prompt_played_out(
         db, tmp_path):
-    """环节行跟着它依据的那次录音走:怎么收的口,收音前那句话术播完没有(抢答/「我来回答」打断)。"""
+    """环节行跟着它依据的那次录音走:怎么收的口,收音前那句话术播完没有(抢答或按「现在回答」打断)。"""
     _seed(db)
     _link_source_attempt(db, "SE_锚", 1, _seed_capture_chain(
         db, raw_audio_id="a_vad", item_id="SE_锚", turn_seq=1, command_seq=1,
