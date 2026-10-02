@@ -262,6 +262,17 @@ qwen-plus；如切龙媛还需 cosyvoice-v2——`cosyvoice-v3-plus` 需单独�
 当前 `autopilot/start` 已有独立的模拟与真实研究场次准入分支。P0a 演示只能使用专用模拟档案；真实分支必须显式启用 `ENABLE_AUTOPILOT_REAL_SESSIONS` 且满足其全部前置。这个代码通道不构成正式研究批准，本轮仍只做内部合成演练；不得删除 simulation guard、修改受试者分类或放宽启动门禁来“启用正式研究”。
 受控模拟环境必须同时显式设置 `ALLOW_SIMULATION_DATA=1` 与 `ENABLE_AUTOPILOT_P0A_SIMULATION=1`；后者默认关闭。两者都不会绕过 VisitPlan、provider readiness 或设备 capability。精确绑定的 `week2-single20-demo-v1` 可在双开关下运行 20 题合成模拟计划；默认 canonical 整计划（78 题位，2026-08-21 交互数据包闭合后 `content_freeze_report` 实算 0 个交付缺口）在双开关下同样可跑。这不是真人或正式研究的放行开关——真实场次自动带练由 `ENABLE_AUTOPILOT_REAL_SESSIONS=1` 独立控制，并要求云处理 policy（`CLOUD_PROCESSING_PROVIDER_ID`/`CLOUD_PROCESSING_NOTICE_VERSION`）与逐受试者云授权在案。
 
+平板语音体验另有四个运维开关（2026-10 起），都按请求现读 `.env` 注入的进程环境、改完要重启应用：
+
+| 变量 | 默认 | 取值 |
+|---|---|---|
+| `NMU_AUTOPILOT_VAD` | 开 | `0`/`false`/`off`/`no` 关；关了平板说完不自动收麦，靠「说完了」或 14 秒上限 |
+| `NMU_AUTOPILOT_VAD_TRAILING_MS` | 3000 | 1500–8000 的纯数字，越界或写错回默认 |
+| `NMU_AUTOPILOT_VAD_SHORT_TRAILING_MS` | max(4500, 上一项) | 上一项–10000 的纯数字，有声不足 900 ms 的短话用它 |
+| `NMU_AUTOPILOT_VOICE_BARGE_IN` | 开 | 同上四个关闭值；关了播放中不开检测麦，停播授权返回 409 `autopilot_barge_in_disabled`，平板只留「现在回答」 |
+
+平板经 `GET /sessions/{id}/autopilot/voice-settings` 读前三项（取不到就不挂 VAD）。两项都会改变老人的作答窗口，研究场次用不用、阈值多少由课题组定，不是运维默认值说了算。
+
 ### 7.2 去标识导出 HMAC 密钥
 
 用与账号、PIN 和百炼 Key 无关的随机值，例如在受控终端执行 `openssl rand -base64 32`，把结果仅写入权限为
