@@ -72,6 +72,9 @@ SIMULATION_DATA_ENV = "ALLOW_SIMULATION_DATA"
 # explicit deployment switch.  The two simulation switches above keep their
 # exact historical semantics; neither channel ever implies the other.
 REAL_SESSIONS_ENV = "ENABLE_AUTOPILOT_REAL_SESSIONS"
+# 平板语音体验的运维急停开关。与上面的准入开关相反,它们默认开(9/21 起就是线上
+# 行为),只有显式关闭值才关,且每次请求现读环境。
+VOICE_BARGE_IN_ENV = "NMU_AUTOPILOT_VOICE_BARGE_IN"
 P0A_SOURCE = "p0a_domain_service"
 # Interaction-package consumption (autopilot-interaction.v1): the one gap /
 # failure code for "this week's package is missing, unbound or uncovering",
@@ -95,6 +98,7 @@ _INTERACTION_CATEGORY_TO_PATH: dict[str, ResponsePath] = {
 }
 
 _TRUE_VALUES = frozenset({"1", "true", "yes"})
+_SWITCH_OFF_VALUES = frozenset({"0", "false", "off", "no"})
 _DENIED_CONSENT = frozenset({
     "未同意", "已撤回", "拒绝", "不同意",
     "denied", "withdrawn", "refused", "declined", "rejected",
@@ -543,6 +547,14 @@ def p0a_feature_enabled() -> bool:
 def real_sessions_enabled() -> bool:
     """Autopilot on real research sessions requires its own explicit switch."""
     return _enabled(REAL_SESSIONS_ENV)
+
+
+def _enabled_unless_switched_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() not in _SWITCH_OFF_VALUES
+
+
+def voice_barge_in_enabled() -> bool:
+    return _enabled_unless_switched_off(VOICE_BARGE_IN_ENV)
 
 
 def _enum_value(value: object) -> str:
@@ -2403,6 +2415,9 @@ def authorize_barge_in_monitor(
     )).first()
     if started is None or started.command_revision + 1 != command.revision:
         _fail("autopilot_command_not_current", "当前提问尚无已开始播放的回执")
+    # 排在全部围栏之后:关掉开关只把本该放行的授权改成拒绝,不顶替任何别的拒绝理由。
+    if not voice_barge_in_enabled():
+        _fail("autopilot_barge_in_disabled", "本部署已关闭提问中的本机声音检测")
     return gate.train_session.is_simulation
 
 
