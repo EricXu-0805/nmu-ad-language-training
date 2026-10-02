@@ -93,17 +93,19 @@ DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
   apt-get install -y -o DPkg::Lock::Timeout=600 <只写点名的包>
 ```
 
-安装（批准之后，root；目标文件已存在的先挪进 0700 的备份目录）：
+安装（批准之后，root；目标文件已存在的先连路径一起复制进 0700 的备份目录——两个片段
+同名，平铺会互相覆盖）：
 
 ```bash
+TARGETS="/etc/apt/apt.conf.d/52nmu-unattended-upgrades /etc/needrestart/conf.d/50-nmu-list-only.conf
+  /etc/systemd/system/apt-daily.timer.d/50-nmu-window.conf
+  /etc/systemd/system/apt-daily-upgrade.timer.d/50-nmu-window.conf"
 B=/opt/nmu/os-config-before-$(date +%Y%m%d-%H%M%S); install -d -m 700 "$B"
-for f in /etc/apt/apt.conf.d/52nmu-unattended-upgrades /etc/needrestart/conf.d/50-nmu-list-only.conf \
-         /etc/systemd/system/apt-daily.timer.d/50-nmu-window.conf \
-         /etc/systemd/system/apt-daily-upgrade.timer.d/50-nmu-window.conf; do
-  [ -e "$f" ] && cp -p "$f" "$B/"
-done
-install -m 644 /opt/nmu/app/deploy/apt/52nmu-unattended-upgrades /etc/apt/apt.conf.d/
-install -m 644 /opt/nmu/app/deploy/needrestart/50-nmu-list-only.conf /etc/needrestart/conf.d/
+for f in $TARGETS; do [ -e "$f" ] && cp -p --parents "$f" "$B/"; done
+install -D -m 644 /opt/nmu/app/deploy/apt/52nmu-unattended-upgrades \
+  /etc/apt/apt.conf.d/52nmu-unattended-upgrades
+install -D -m 644 /opt/nmu/app/deploy/needrestart/50-nmu-list-only.conf \
+  /etc/needrestart/conf.d/50-nmu-list-only.conf
 install -D -m 644 /opt/nmu/app/deploy/systemd/apt-daily.timer.d/50-nmu-window.conf \
   /etc/systemd/system/apt-daily.timer.d/50-nmu-window.conf
 install -D -m 644 /opt/nmu/app/deploy/systemd/apt-daily-upgrade.timer.d/50-nmu-window.conf \
@@ -126,8 +128,16 @@ unattended-upgrade --dry-run --debug 2>&1 | grep -E 'Allowed origins|Initial bla
 没变（证明夜里没重启 nmu），`needrestart -b -r l` 与 `os_security_check.py --json` 看还有
 谁跑在旧库上。
 
-回滚：把四个文件挪进一个 0700 的 `retired-*` 目录（不删），`systemctl daemon-reload &&
-systemctl restart apt-daily.timer apt-daily-upgrade.timer`，回到只刷新列表、不装包。
+回滚：四个文件连路径挪进一个 0700 的 `retired-*` 目录（不删），回到只刷新列表、不装包：
+
+```bash
+TARGETS="/etc/apt/apt.conf.d/52nmu-unattended-upgrades /etc/needrestart/conf.d/50-nmu-list-only.conf
+  /etc/systemd/system/apt-daily.timer.d/50-nmu-window.conf
+  /etc/systemd/system/apt-daily-upgrade.timer.d/50-nmu-window.conf"
+R=/opt/nmu/retired-os-config-$(date +%Y%m%d-%H%M%S); install -d -m 700 "$R"
+for f in $TARGETS; do [ -e "$f" ] && mkdir -p "$R$(dirname "$f")" && mv "$f" "$R$f"; done
+systemctl daemon-reload && systemctl restart apt-daily.timer apt-daily-upgrade.timer
+```
 
 ## 失败告警（2026-08-07 起）
 
