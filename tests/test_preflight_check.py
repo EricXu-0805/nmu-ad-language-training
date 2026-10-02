@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -201,6 +202,191 @@ def test_supply_chain_group_fails_loudly_when_it_cannot_look(tmp_path):
     assert check.ok is False and "对不成账" in check.detail
 
 
+WAITING = ("NextElapseUSecRealtime=Fri 2026-10-02 10:10:00 UTC\nSubState=waiting\n"
+           "UnitFileState=enabled\n")
+
+
+def _systemctl(show: dict[str, str], installed: list[str] | None = None):
+    """假 systemctl：list-unit-files 报出已装的定时器，show 按单元名回放属性。"""
+    names = list(show) if installed is None else installed
+
+    def run(argv, **_kwargs):
+        if argv[:2] == ["systemctl", "list-unit-files"]:
+            listing = "".join(f"{name} enabled enabled\n" for name in names)
+            return SimpleNamespace(returncode=0, stdout=listing, stderr="")
+        if argv[:2] == ["systemctl", "show"]:
+            return SimpleNamespace(returncode=0, stdout=show[argv[2]], stderr="")
+        raise AssertionError(f"没预料到的命令：{argv}")
+
+    return run
+
+
+def test_timer_check_passes_when_every_installed_timer_is_waiting():
+    check = preflight.check_timers_scheduled(run=_systemctl({
+        "nmu-backup.timer": WAITING, "nmu-health.timer": WAITING}))
+
+    assert check.ok is True, check.detail
+    assert "2 个" in check.detail
+
+
+def test_an_elapsed_timer_is_named_although_it_still_shows_active():
+    # 2026-09-30 重启后 nmu-health.timer 的原样：active，但再也不会触发。
+    check = preflight.check_timers_scheduled(run=_systemctl({
+        "nmu-backup.timer": WAITING,
+        "nmu-health.timer": ("ActiveState=active\nNextElapseUSecRealtime=\n"
+                             "SubState=elapsed\nUnitFileState=enabled\n"),
+    }))
+
+    assert check.ok is False
+    assert "nmu-health.timer" in check.detail and "elapsed" in check.detail
+    assert "nmu-backup.timer" not in check.detail
+
+
+@pytest.mark.parametrize("shown", [
+    "NextElapseUSecRealtime=\nSubState=waiting\nUnitFileState=enabled\n",
+    "SubState=waiting\nUnitFileState=enabled\n",  # 空属性有的 systemctl 版本干脆不打印
+])
+def test_a_waiting_timer_without_a_next_elapse_is_dead(shown):
+    check = preflight.check_timers_scheduled(run=_systemctl({
+        "nmu-backup.timer": WAITING, "nmu-health.timer": shown}))
+
+    assert check.ok is False
+    assert "nmu-health.timer" in check.detail
+    assert "nmu-backup.timer" not in check.detail
+
+
+def test_a_disabled_timer_is_named_while_it_is_still_waiting():
+    # 停用而没带 --now：此刻还排着，下次开机就不会再起来，也没有任何东西因此失败。
+    check = preflight.check_timers_scheduled(run=_systemctl({
+        "nmu-backup.timer": WAITING,
+        "nmu-health.timer": WAITING.replace("=enabled", "=disabled"),
+    }))
+
+    assert check.ok is False
+    assert "nmu-health.timer" in check.detail and "disabled" in check.detail
+    assert "nmu-backup.timer" not in check.detail
+
+
+def test_missing_systemctl_fails_the_timer_check():
+    def run(argv, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    check = preflight.check_timers_scheduled(run=run)
+
+    assert check.ok is False
+    assert "systemctl" in check.detail
+
+
+def test_no_installed_timer_at_all_is_a_failure_not_a_pass():
+    check = preflight.check_timers_scheduled(run=_systemctl({}, installed=[]))
+
+    assert check.ok is False
+
+
+def _touch(path: Path, mode: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x", encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+def _nmu_root(tmp_path: Path) -> Path:
+    root = tmp_path / "opt-nmu"
+    (root / "app").mkdir(parents=True)
+    (root / "backups").mkdir()
+    return root
+
+
+def test_sensitive_files_closed_to_other_pass(tmp_path):
+    root = _nmu_root(tmp_path)
+    _touch(root / "app-before-deploy-20260831-183746.tar.gz", 0o600)
+    _touch(root / "ops-alert.env", 0o600)
+    _touch(root / "app" / ".env", 0o640)
+    _touch(root / "app" / "README.md", 0o644)  # 不在名单里，谁读都行
+
+    check = preflight.check_sensitive_file_modes(root)
+
+    assert check.ok is True, check.detail
+
+
+@pytest.mark.parametrize("relative", [
+    "app-before-deploy-20260831-183746.tar.gz", "app/release.tgz", "app/app.db",
+    "app/.env", "app/.env.before-20260823-fpkey", "ops-alert.env",
+])
+def test_a_sensitive_file_readable_by_other_is_named(tmp_path, relative):
+    root = _nmu_root(tmp_path)
+    _touch(root / relative, 0o644)
+
+    check = preflight.check_sensitive_file_modes(root)
+
+    assert check.ok is False
+    assert "1 个" in check.detail
+    assert str(root / relative) in check.detail
+
+
+def test_sensitive_file_check_reports_the_count_and_at_most_five_paths(tmp_path):
+    root = _nmu_root(tmp_path)
+    paths = [_touch(root / f"app-before-deploy-{index}.tar.gz", 0o604) for index in range(7)]
+
+    check = preflight.check_sensitive_file_modes(root)
+
+    assert check.ok is False
+    assert "7 个" in check.detail
+    assert sum(str(path) in check.detail for path in paths) == 5
+
+
+def test_sensitive_file_check_looks_two_levels_deep_and_no_further(tmp_path):
+    root = _nmu_root(tmp_path)
+    _touch(root / "app" / "data" / "app.db", 0o644)  # 第三层：不在这条的范围里
+
+    assert preflight.check_sensitive_file_modes(root).ok is True
+
+
+def test_the_tracked_env_template_is_not_treated_as_a_secret(tmp_path):
+    # 入库的模板，rsync -a 每次都按本机的 644 带过去；里面没有秘密。
+    root = _nmu_root(tmp_path)
+    _touch(root / "app" / ".env.example", 0o644)
+
+    assert preflight.check_sensitive_file_modes(root).ok is True
+
+
+def test_sensitive_file_check_fails_when_the_root_cannot_be_listed(tmp_path):
+    check = preflight.check_sensitive_file_modes(tmp_path / "no-such-root")
+
+    assert check.ok is False
+
+
+def _etc(tmp_path: Path) -> Path:
+    etc = tmp_path / "etc"
+    for name in ("cron.d", "cron.daily", "cron.hourly", "cron.weekly"):
+        (etc / name).mkdir(parents=True)
+    return etc
+
+
+def test_cron_without_nmu_entries_passes(tmp_path):
+    etc = _etc(tmp_path)
+    _touch(etc / "cron.d" / "e2scrub_all", 0o644)
+    _touch(etc / "cron.daily" / "logrotate", 0o755)
+
+    assert preflight.check_no_nmu_cron(etc).ok is True
+
+
+@pytest.mark.parametrize("directory", ["cron.d", "cron.daily", "cron.hourly", "cron.weekly"])
+def test_an_nmu_cron_entry_is_named(tmp_path, directory):
+    etc = _etc(tmp_path)
+    _touch(etc / directory / "nmu-backup", 0o755)
+
+    check = preflight.check_no_nmu_cron(etc)
+
+    assert check.ok is False
+    assert str(etc / directory / "nmu-backup") in check.detail
+    assert "nmu-backup.timer" in check.detail
+
+
+def test_absent_cron_directories_mean_no_leftovers(tmp_path):
+    assert preflight.check_no_nmu_cron(tmp_path / "etc").ok is True
+
+
 def test_skipped_groups_do_not_fail_the_run(capsys):
     code = preflight.main([])
 
@@ -242,6 +428,15 @@ def _make_all_automatic_groups_pass(monkeypatch) -> None:
         preflight, "check_os_security",
         lambda: preflight.Check("OS 安全补丁", True, "current"))
     monkeypatch.setattr(
+        preflight, "check_timers_scheduled",
+        lambda: preflight.Check("定时器在排程", True, "waiting"))
+    monkeypatch.setattr(
+        preflight, "check_sensitive_file_modes",
+        lambda: preflight.Check("敏感文件不对 other 可读", True, "closed"))
+    monkeypatch.setattr(
+        preflight, "check_no_nmu_cron",
+        lambda: preflight.Check("无 nmu-* cron 条目", True, "none"))
+    monkeypatch.setattr(
         preflight, "check_public_surface",
         lambda _url: [preflight.Check("公网表面", True, "closed")])
 
@@ -250,6 +445,23 @@ def test_require_all_needs_no_release_evidence_index(tmp_path, monkeypatch):
     _make_all_automatic_groups_pass(monkeypatch)
 
     assert preflight.main([*_all_pass_args(tmp_path), "--require-all"]) == 0
+
+
+def test_os_flag_also_checks_that_the_timers_are_scheduled(monkeypatch, capsys):
+    _make_all_automatic_groups_pass(monkeypatch)
+    monkeypatch.setattr(
+        preflight, "check_timers_scheduled",
+        lambda: preflight.Check(
+            "定时器在排程", False, "nmu-health.timer(SubState=elapsed, NEXT=空)"))
+
+    code = preflight.main(["--os"])
+
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "[PASS] OS 安全补丁" in output
+    assert "[FAIL] 定时器在排程" in output
+    assert "[PASS] 敏感文件不对 other 可读" in output
+    assert "[PASS] 无 nmu-* cron 条目" in output
 
 
 @pytest.mark.parametrize("mode, expected", [(0o640, 1), (0o750, 0)])

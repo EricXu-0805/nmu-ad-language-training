@@ -2,9 +2,14 @@
 Description=Probe the public /health every 10 minutes
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=10min
-# 定时器错过的那次要补跑：机器睡过去再醒来时，最该知道的就是站点还在不在。
+# 只用日历触发。原来是 OnBootSec=5min + OnUnitActiveSec=10min 两条单调触发：
+# 2026-09-30 重启后这个定时器晚于开机 5 分钟才被启动，systemd 249 把已过期的
+# OnBootSec 截止点直接丢掉，OnUnitActiveSec 在新一次开机里又没有基准（服务还没跑过），
+# 定时器就停在 SubState=elapsed、NEXT 为空，而 ActiveState 照样显示 active。
+# 日历触发不管什么时候启动都会排上下一个整十分。
+OnCalendar=*:0/10
+# 错过的那次要补跑：机器睡过去再醒来时，最该知道的就是站点还在不在。
+# Persistent 只对 OnCalendar 生效，原来配单调触发时这一行是摆设。
 Persistent=true
 AccuracySec=1min
 

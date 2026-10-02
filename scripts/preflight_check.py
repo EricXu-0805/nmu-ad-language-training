@@ -9,7 +9,8 @@ D2 走查那天真正只能靠人的，是麦克风、噪声、断网和老人�
   数据库   代码的 alembic 头与库里的头是否一致（只读，一条 SELECT）
   备份     检查备份脚本可执行，并复用 backup_health_check 的新鲜度判据
   依赖     已安装依赖与带哈希锁是否一致
-  操作系统 显式启用时核对安全更新和重启状态
+  操作系统 显式启用时核对安全更新和重启状态、nmu-*.timer 是否真排上了下一次、
+           /opt/nmu 下 tar 包/数据库/env 文件不对 other 可读、cron 里没有 nmu-* 残留
   公网     /health 200、四条红线 404、五个安全头齐、受保护路由 401
 
 不打任何供应商的云 API：那要花钱、要把文本发出去，得由人明确发起。
@@ -20,12 +21,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta
+import fnmatch
 import json
 import os
 from pathlib import Path
 import sqlite3
 import ssl
 import stat
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -44,6 +47,8 @@ REQUIRED_HEADERS = (
     "permissions-policy",
 )
 BACKUP_EXECUTABLES = ("scripts/vps-backup-daily.sh", "scripts/backup.sh")
+SENSITIVE_PATTERNS = ("*.tar.gz", "*.tgz", "*.db", ".env*", "*.env")
+CRON_DIRECTORIES = ("cron.d", "cron.daily", "cron.hourly", "cron.weekly")
 
 
 class Check:
@@ -199,6 +204,141 @@ def check_os_security(max_age_days: int = 3) -> Check:
     return Check(name, True, detail)
 
 
+def _systemd_properties(text: str) -> dict[str, str]:
+    properties: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key.strip()] = value.strip()
+    return properties
+
+
+def check_timers_scheduled(run=subprocess.run) -> Check:
+    """每个装上的 nmu-*.timer 都真的排上了下一次触发。
+
+    2026-09-30 重启后 nmu-health.timer 停在 SubState=elapsed、下一次触发时间为空，
+    ActiveState 却一直是 active——看 status 的人和只认 active 的脚本都看不出来。
+    所以这里只认 SubState=waiting 且 NextElapseUSecRealtime 非空；另要 UnitFileState=enabled，
+    停用而没带 --now 的定时器此刻还排着，下次开机就不会再起来。
+    """
+    name = "定时器在排程"
+    try:
+        listed = run(
+            ["systemctl", "list-unit-files", "--no-legend", "--no-pager", "nmu-*.timer"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        return Check(name, False, f"查不动 systemctl：{error}")
+    if listed.returncode != 0:
+        return Check(name, False, f"systemctl list-unit-files 退出码 {listed.returncode}")
+    timers = sorted({
+        fields[0] for fields in (line.split() for line in listed.stdout.splitlines())
+        if fields and fields[0].startswith("nmu-") and fields[0].endswith(".timer")})
+    if not timers:
+        return Check(name, False, "一个 nmu-*.timer 都没装：备份、健康检查和公网探针都不会跑")
+
+    dead = []
+    for timer in timers:
+        try:
+            shown = run(
+                ["systemctl", "show", timer, "-p", "SubState", "-p", "NextElapseUSecRealtime",
+                 "-p", "UnitFileState"],
+                capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as error:
+            return Check(name, False, f"查不动 systemctl：{error}")
+        if shown.returncode != 0:
+            dead.append(f"{timer}(systemctl show 退出码 {shown.returncode})")
+            continue
+        properties = _systemd_properties(shown.stdout)
+        sub_state = properties.get("SubState", "")
+        next_elapse = properties.get("NextElapseUSecRealtime", "")
+        file_state = properties.get("UnitFileState", "")
+        if sub_state != "waiting" or not next_elapse or file_state != "enabled":
+            dead.append(f"{timer}(SubState={sub_state or '空'}, NEXT={next_elapse or '空'}, "
+                        f"UnitFileState={file_state or '空'})")
+    if dead:
+        return Check(name, False,
+                     f"{len(dead)} 个定时器没在排程：{'；'.join(dead)}；"
+                     "ActiveState=active 不代表会触发，处置见 deploy/systemd/README.md")
+    return Check(name, True, f"{len(timers)} 个 nmu-*.timer 都是 waiting 且排上了下一次")
+
+
+def check_sensitive_file_modes(root: Path = Path("/opt/nmu")) -> Check:
+    """root 下两层以内的打包件、数据库和 env 文件不许对 other 可读。
+
+    这几类文件装着整棵应用树、受试者数据或密钥。tar 按默认 umask 打出来就是 644，
+    这台机器上任何一个账号都能把它们读走。
+    """
+    name = "敏感文件不对 other 可读"
+    try:
+        top = sorted(root.iterdir())
+    except OSError as error:
+        return Check(name, False, f"列不出 {root}：{error.strerror or error}")
+    candidates: list[Path] = []
+    unlisted: list[str] = []
+    for path in top:
+        if path.is_dir() and not path.is_symlink():
+            try:
+                candidates.extend(sorted(path.iterdir()))
+            except OSError:
+                unlisted.append(str(path))
+        else:
+            candidates.append(path)
+
+    exposed = []
+    for path in candidates:
+        # 入库的模板，没有秘密；rsync -a 每次同步都会按本机权限把它带成 644。
+        if path.name == ".env.example":
+            continue
+        if not any(fnmatch.fnmatchcase(path.name, pattern) for pattern in SENSITIVE_PATTERNS):
+            continue
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISREG(mode) and mode & stat.S_IROTH:
+            exposed.append(str(path))
+
+    problems = []
+    if exposed:
+        shown = "、".join(exposed[:5]) + ("…" if len(exposed) > 5 else "")
+        problems.append(f"{len(exposed)} 个文件对 other 可读：{shown}；修法 chmod o-r")
+    if unlisted:
+        problems.append(f"列不出 {'、'.join(unlisted)}，没查过的不当作通过")
+    if problems:
+        return Check(name, False, "；".join(problems))
+    return Check(name, True, f"{root} 两层以内的 tar 包、.db 与 env 文件都不对 other 可读")
+
+
+def check_no_nmu_cron(etc: Path = Path("/etc")) -> Check:
+    """备份只有 nmu-backup.timer 一个入口，cron 里不许再有 nmu-* 条目。
+
+    cron 跑的那一份不带单元里的 PYTHON_BIN，失败了也不触发 OnFailure 告警。
+    """
+    name = "无 nmu-* cron 条目"
+    found: list[str] = []
+    unlisted: list[str] = []
+    for directory_name in CRON_DIRECTORIES:
+        directory = etc / directory_name
+        try:
+            entries = sorted(directory.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            unlisted.append(f"{directory}({error.strerror or error})")
+            continue
+        found.extend(str(entry) for entry in entries if entry.name.startswith("nmu-"))
+    problems = []
+    if found:
+        problems.append(
+            f"{len(found)} 个 cron 条目：{'、'.join(found)}；备份唯一入口是 nmu-backup.timer，"
+            "cron 那份不带 PYTHON_BIN、失败也不告警")
+    if unlisted:
+        problems.append(f"列不出 {'、'.join(unlisted)}，没查过的不当作通过")
+    if problems:
+        return Check(name, False, "；".join(problems))
+    return Check(name, True, "cron.d/daily/hourly/weekly 里没有 nmu-* 条目")
+
+
 def _default_fetch(url: str, timeout: float):
     context = ssl.create_default_context()
     request = urllib.request.Request(url, method="GET")
@@ -325,8 +465,13 @@ def main(argv: list[str] | None = None) -> int:
         checks.append(check_backup_execution(args.app_root))
     checks.append(check_supply_chain(args.lock, sys.executable) if args.lock
                   else Check("依赖与哈希锁一致", None, "未给 --lock"))
-    checks.append(check_os_security() if args.os
-                  else Check("OS 安全补丁", None, "未给 --os"))
+    if args.os:
+        checks.append(check_os_security())
+        checks.append(check_timers_scheduled())
+        checks.append(check_sensitive_file_modes())
+        checks.append(check_no_nmu_cron())
+    else:
+        checks.append(Check("OS 安全补丁", None, "未给 --os"))
     if args.base_url:
         checks.extend(check_public_surface(args.base_url))
     else:
