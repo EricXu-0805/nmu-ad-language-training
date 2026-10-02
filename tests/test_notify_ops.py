@@ -77,20 +77,37 @@ def _no_retry(_seconds):
     pytest.fail("发送成功时不该等待重试")
 
 
-def _write_os_security_state(tmp_path: Path, backups: Path) -> None:
-    """真跑一遍 os_security_check --json，得到与单元 `> state 2>&1` 同形的 state。"""
+def _write_os_security_state(tmp_path: Path, backups: Path, monkeypatch,
+                             security: list[str] = SECURITY,
+                             stale: dict[str, str] | None = None) -> None:
+    """真跑一遍 os_security_check --json，得到与单元 `> state 2>&1` 同形的 state。
+
+    stale：{单元: 库路径}，假 /proc 里还映射着这个已被替换的库的进程。
+    """
     simulation = tmp_path / "apt-simulation.txt"
-    simulation.write_text("".join(
+    simulation.write_text("Calculating upgrade...\n" + "".join(
         f"Inst {name} [1.0-1] (1.0-2 Ubuntu:22.04/jammy-security [amd64])\n"
-        for name in SECURITY), encoding="utf-8")
+        for name in security), encoding="utf-8")
     lists = tmp_path / "apt-lists"
     lists.mkdir()
     (lists / "archive.ubuntu.com_ubuntu_dists_jammy-security_InRelease").write_text(
         "x", encoding="utf-8")
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    for pid, (unit, library) in enumerate((stale or {}).items(), start=800):
+        (proc / str(pid)).mkdir()
+        (proc / str(pid) / "cgroup").write_text(f"0::/system.slice/{unit}\n", encoding="utf-8")
+        (proc / str(pid) / "maps").write_text(
+            f"7f38fcedf000-7f38fcf0a000 r-xp 00000000 08:03 131330     {library} (deleted)\n",
+            encoding="utf-8")
+    (tmp_path / "boot").mkdir()
+    monkeypatch.setattr(os_security, "REBOOT_REQUIRED", tmp_path / "no-reboot-required")
+    monkeypatch.setattr(os_security.os, "geteuid", lambda: 0)
     captured = io.StringIO()
     with redirect_stdout(captured):
         code = os_security.main([
-            "--json", "--simulate-file", str(simulation), "--lists-dir", str(lists)])
+            "--json", "--simulate-file", str(simulation), "--lists-dir", str(lists),
+            "--proc-dir", str(proc), "--boot-dir", str(tmp_path / "boot")])
     assert code == 1
     (backups / "os-security.state").write_text(captured.getvalue(), encoding="utf-8")
 
@@ -111,8 +128,9 @@ def _alert(backups: Path, unit: str, system: FakeSystem, outbox: Outbox) -> str:
     return content
 
 
-def test_os_security_alert_leads_with_the_pending_packages_of_this_run(tmp_path, backups):
-    _write_os_security_state(tmp_path, backups)
+def test_os_security_alert_leads_with_the_pending_packages_of_this_run(
+        tmp_path, backups, monkeypatch):
+    _write_os_security_state(tmp_path, backups, monkeypatch)
     system = FakeSystem(manager=(
         "nmu-os-security.service: Main process exited, code=exited, status=1/FAILURE\n"))
 
@@ -125,6 +143,26 @@ def test_os_security_alert_leads_with_the_pending_packages_of_this_run(tmp_path,
     # 原因在最前面：包名先于日志出现
     assert content.index("libssl3") < content.index("status=1/FAILURE")
     assert any(f"_SYSTEMD_INVOCATION_ID={INVOCATION}" in call for call in system.calls)
+
+
+def test_os_security_alert_leads_with_a_stale_library_and_lists_the_notes_after(
+        tmp_path, backups, monkeypatch):
+    """夜里自动装完补丁、积压是 0，nmu 还跑着旧 libssl：告警打头就是它，
+    其余还在旧库上的单元作为提示跟在后面，不在 Discord 里消失。"""
+    _write_os_security_state(tmp_path, backups, monkeypatch, security=[], stale={
+        "nmu.service": "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+        "sing-box.service": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    })
+    system = FakeSystem(manager=(
+        "nmu-os-security.service: Main process exited, code=exited, status=1/FAILURE\n"))
+
+    content = _alert(backups, "nmu-os-security", system, Outbox())
+
+    reason = content.split("):\n", 1)[1]
+    assert reason.startswith("nmu.service")
+    assert "libssl.so.3" in reason and "systemctl restart nmu" in reason
+    assert (content.index("systemctl restart nmu") < content.index("sing-box.service")
+            < content.index("status=1/FAILURE"))
 
 
 def test_reason_is_capped_at_six_hundred_characters(backups):

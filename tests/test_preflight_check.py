@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -200,6 +202,42 @@ def test_supply_chain_group_fails_loudly_when_it_cannot_look(tmp_path):
     check = preflight.check_supply_chain(tmp_path / "no-such-lock.txt", sys.executable)
 
     assert check.ok is False and "对不成账" in check.detail
+
+
+def _os_box(tmp_path: Path, monkeypatch, nmu_libssl_deleted: bool) -> dict[str, Path]:
+    """积压为 0 的假 apt、新鲜的包列表、以 root 身份扫一棵假 /proc：nmu 映射着 libssl。"""
+    def run(argv, **_kwargs):
+        stdout = "Calculating upgrade...\n" if argv[0] == "apt-get" else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    lists = tmp_path / "lists"
+    lists.mkdir()
+    (lists / "jammy-security_InRelease").write_text("x", encoding="utf-8")
+    process = tmp_path / "proc" / "812"
+    process.mkdir(parents=True)
+    (process / "cgroup").write_text("0::/system.slice/nmu.service\n", encoding="utf-8")
+    (process / "maps").write_text(
+        "7f38fcedf000-7f38fcf0a000 r-xp 00000000 08:03 131330     "
+        "/usr/lib/x86_64-linux-gnu/libssl.so.3"
+        + (" (deleted)" if nmu_libssl_deleted else "") + "\n", encoding="utf-8")
+    return {"lists_dir": lists, "proc": tmp_path / "proc", "boot": tmp_path / "boot"}
+
+
+def test_os_group_fails_while_nmu_still_runs_a_replaced_library(tmp_path, monkeypatch):
+    """夜里自动装了补丁、积压是 0，nmu 却还跑着旧 libssl：上线前的预检也得拦住。"""
+    check = preflight.check_os_security(**_os_box(tmp_path, monkeypatch, True))
+
+    assert check.ok is False
+    assert "nmu.service" in check.detail and "libssl.so.3" in check.detail
+    assert "systemctl restart nmu" in check.detail
+
+
+def test_os_group_passes_once_nmu_runs_the_current_library(tmp_path, monkeypatch):
+    check = preflight.check_os_security(**_os_box(tmp_path, monkeypatch, False))
+
+    assert check.ok is True, check.detail
 
 
 WAITING = ("NextElapseUSecRealtime=Fri 2026-10-02 10:10:00 UTC\nSubState=waiting\n"

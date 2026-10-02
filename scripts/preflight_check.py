@@ -9,8 +9,9 @@ D2 走查那天真正只能靠人的，是麦克风、噪声、断网和老人�
   数据库   代码的 alembic 头与库里的头是否一致（只读，一条 SELECT）
   备份     检查备份脚本可执行，并复用 backup_health_check 的新鲜度判据
   依赖     已安装依赖与带哈希锁是否一致
-  操作系统 显式启用时核对安全更新和重启状态、nmu-*.timer 是否真排上了下一次、
-           /opt/nmu 下 tar 包/数据库/env 文件不对 other 可读、cron 里没有 nmu-* 残留
+  操作系统 显式启用时核对安全更新和重启状态、nmu/nginx 是否还跑着被换掉的旧库、
+           nmu-*.timer 是否真排上了下一次、/opt/nmu 下 tar 包/数据库/env 文件
+           不对 other 可读、cron 里没有 nmu-* 残留
   公网     /health 200、四条红线 404、五个安全头齐、受保护路由 401
 
 不打任何供应商的云 API：那要花钱、要把文本发出去，得由人明确发起。
@@ -170,11 +171,15 @@ def check_supply_chain(lock_path: Path, python_executable: str) -> Check:
                              f"{stats['expected_here']} 个包逐个对上，无锁外来客")
 
 
-def check_os_security(max_age_days: int = 3) -> Check:
-    """操作系统欠的安全补丁。2026-08-06 查出这台机器积了 93 个没人看。
+def check_os_security(max_age_days: int = 3, **paths: Path) -> Check:
+    """操作系统欠的安全补丁，以及补丁装了、nmu/nginx 却还跑着旧库。
 
+    2026-08-06 查出这台机器积了 93 个补丁没人看。判定与每周的 nmu-os-security
+    同一份 assess()：被保留的包（2026-09-11 那次 9/9 绿灯下积着 5 个安全内核包）、
+    还映射着被换掉的 .so 的进程都算在内。要 root 跑。
     只在装了 apt 的机器上有意义（生产裸机是 Ubuntu）；Mac 上跑会失败在
-    "查不动 apt"，所以这组默认关、由 --os 显式打开。
+    "查不动 apt"，所以这组默认关、由 --os 显式打开。paths 只给测试换假目录
+    （lists_dir/proc/boot）。
     """
     name = "OS 安全补丁"
     import importlib.util
@@ -188,17 +193,11 @@ def check_os_security(max_age_days: int = 3) -> Check:
         simulation = module.run_simulation()
     except (OSError, RuntimeError) as error:
         return Check(name, False, f"查不动 apt：{error}")
-    pending = module.parse_simulation(simulation)
-    age = module.lists_age(module.APT_LISTS, datetime.now())
-    # 被保留的包（需要装新依赖的内核/netplan）一起算：2026-09-11 那次 9/9 绿灯下
-    # 还积着 5 个安全内核包，就是这里没算它们。
-    failures, notes = module.evaluate(
-        pending, age, timedelta(days=max_age_days),
-        module.REBOOT_REQUIRED.exists(), module.parse_kept_back(simulation),
-        module.read_holds())
+    report = module.assess(simulation, timedelta(days=max_age_days), **paths)
+    failures, notes = report["failures"], report["notes"]
     if failures:
         return Check(name, False, "；".join(failures + notes))
-    detail = "安全更新积压为 0"
+    detail = "安全更新积压为 0，nmu/nginx 没在旧库上跑"
     if notes:
         detail += "（" + "；".join(notes) + "）"
     return Check(name, True, detail)
