@@ -930,8 +930,11 @@ async function captureAtRealOnstart(
     throwOnTimerCall?: number;
     failClearForArm?: number;
     observeVoiceActivity?: Parameters<typeof bootstrapHarness>[1]["observeVoiceActivity"];
-    /** 开麦那一刻缓存里的 VAD 窗口;省略 = 服务器开着 VAD、默认 3000/4500;null = 不武装。 */
-    voiceActivityWindows?: VoiceActivityWindows | null;
+    /**
+     * 开麦那一刻语音设置缓存的样子。省略 = 读到过设置、服务器开着 VAD、默认 3000/4500;
+     * null = 还没成功读到过(或最近一次读失败);{ windows: null } = 读到了,服务器关了 VAD。
+     */
+    voiceSettings?: { windows: VoiceActivityWindows | null } | null;
     afterVoiceInterruption?: boolean;
   } = {},
 ) {
@@ -947,15 +950,18 @@ async function captureAtRealOnstart(
     failClearForArm: options.failClearForArm,
     observeVoiceActivity: options.observeVoiceActivity,
   });
-  const windows = options.voiceActivityWindows === undefined
-    ? DEFAULT_VOICE_ACTIVITY_WINDOWS : options.voiceActivityWindows;
+  const settings = options.voiceSettings === undefined
+    ? { windows: DEFAULT_VOICE_ACTIVITY_WINDOWS } : options.voiceSettings;
   const executor = new BrowserAutopilotRecordingExecutor(SESSION, {
     ownerGeneration: options.ownerGeneration ?? 7,
     isForeground: () => true,
     observe: (event) => { events.push(event); },
     ports: uploadPorts(uploadCalls, options.uploadFailAt ?? null),
     bootstrap: harness.ports,
-    voiceActivityWindows: () => windows,
+    voiceSettings: {
+      hasSettings: () => settings !== null,
+      vadWindows: () => settings?.windows ?? null,
+    },
   });
 
   const capture = executor.start(
@@ -1725,37 +1731,50 @@ test("attachAutopilotStopReason 收 silence,与 user_done/max_duration 同等持
   assert.throws(() => attachAutopilotStopReason(entry, "user_done"));
 });
 
-test("没读到语音设置(或读失败、或服务器关了 VAD):不武装旁听,record_stopped 报 vad_armed=false、没有有声毫秒", async (context) => {
-  const vad = voiceActivityDouble();
-  const run = await captureAtRealOnstart(context, {
-    ownerGeneration: 55, observeVoiceActivity: vad.observe, voiceActivityWindows: null,
-  });
-  run.device.fireStart();
-  assert.deepEqual(await run.capture.started, { mime_type: "audio/webm" });
-  assert.equal(run.events.at(-1)?.phase, "listening");
-  assert.equal(vad.streams.length, 0);
-  assert.equal(run.harness.calls.includes("observeVoiceActivity"), false);
-  // 作答窗口照旧武装:按钮与到点收麦两条路都在。
-  assert.equal(run.harness.armedHandles.length, 2);
+for (const row of [
+  {
+    // 读到了设置,只是服务器把 VAD 关了:服务器认得这两个事实,如实报没武装。
+    name: "服务器关了 VAD", voiceSettings: { windows: null }, facts: { vad_armed: false },
+  },
+  {
+    // 还没成功读到过设置(老服务器没有这个读面、网络失败、坏形状):说不准服务器认不认
+    // record_stopped 的 VAD 两键——老服务器的回执模型拒绝未知键,带上就整条回执被拒。
+    name: "没成功读到过语音设置", voiceSettings: null, facts: {},
+  },
+]) {
+  test(`${row.name}:不武装旁听,按钮与作答窗口照旧;record_stopped 的 VAD 事实 = ${JSON.stringify(row.facts)}`, async (context) => {
+    const vad = voiceActivityDouble();
+    const run = await captureAtRealOnstart(context, {
+      ownerGeneration: 55, observeVoiceActivity: vad.observe, voiceSettings: row.voiceSettings,
+    });
+    run.device.fireStart();
+    assert.deepEqual(await run.capture.started, { mime_type: "audio/webm" });
+    assert.equal(run.events.at(-1)?.phase, "listening");
+    assert.equal(vad.streams.length, 0);
+    assert.equal(run.harness.calls.includes("observeVoiceActivity"), false);
+    // 作答窗口照旧武装:按钮与到点收麦两条路都在。
+    assert.equal(run.harness.armedHandles.length, 2);
 
-  run.device.pushData(4);
-  run.clock.set(run.clock.now() + 3_000);
-  run.capture.requestStop("user_done");
-  await flushMicrotasks();
-  run.device.fireStop();
-  const facts = await run.capture.stopped;
-  await run.capture.closed;
-  assert.equal(facts.stop_reason, "user_done");
-  assert.equal(facts.vad_armed, false);
-  assert.equal(Object.hasOwn(facts, "vad_voiced_ms"), false);
-  assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
-});
+    run.device.pushData(4);
+    run.clock.set(run.clock.now() + 3_000);
+    run.capture.requestStop("user_done");
+    await flushMicrotasks();
+    run.device.fireStop();
+    const facts = await run.capture.stopped;
+    await run.capture.closed;
+    assert.equal(facts.stop_reason, "user_done");
+    const { stop_reason: _reason, raw_audio_id: _raw, receipt_server_seq: _seq,
+      checksum: _checksum, byte_count: _bytes, duration_seconds: _duration, ...vadFacts } = facts;
+    assert.deepEqual(vadFacts, row.facts);
+    assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
+  });
+}
 
 test("服务器调过的两个尾静默窗口原样交给旁听端口", async (context) => {
   const vad = voiceActivityDouble();
   const tuned = { trailingSilenceMs: 5_000, shortTrailingSilenceMs: 7_000 };
   const run = await captureAtRealOnstart(context, {
-    ownerGeneration: 56, observeVoiceActivity: vad.observe, voiceActivityWindows: tuned,
+    ownerGeneration: 56, observeVoiceActivity: vad.observe, voiceSettings: { windows: tuned },
   });
   run.device.fireStart();
   await run.capture.started;

@@ -203,8 +203,8 @@ test("语音设置按场次缓存;开麦只读缓存,刷新在 runner 每一拍�
   assert.match(SOURCE, /voiceSettings\?\.sessionId !== sessionId/);
   assert.match(SOURCE, /new AutopilotVoiceSettingsCache\(\s*sessionId,/);
   assert.match(SOURCE, /fetchAutopilotVoiceSettings\(/);
-  // 执行器拿到的是读缓存的函数,不是一次网络请求。
-  assert.match(SOURCE, /voiceActivityWindows: \(\) => voiceSettings\.vadWindows\(\)/);
+  // 执行器拿到的是这份缓存本身(开麦时只读它),不是一次网络请求。
+  assert.match(SOURCE, /new BrowserAutopilotRecordingExecutor\([^)]*?voiceSettings,\n/);
   // tick 里先顺手发起刷新、再进 pollOnce;刷新的返回值不进任何 await。
   const tick = SOURCE.slice(SOURCE.indexOf("const tick = async () => {"));
   const refreshAt = tick.indexOf("voiceSettings.refreshInBackground();");

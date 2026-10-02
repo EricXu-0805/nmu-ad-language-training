@@ -316,6 +316,19 @@ export type CaptureInterruptDisposition =
 
 type CaptureOutcome = "successful_stop" | "lifecycle_failure";
 
+/** 这次采集的 VAD 安排,开麦那一刻从服务器语音设置缓存定下来,之后不再变。 */
+interface CaptureVoiceActivityPlan {
+  /** 两个尾静默窗口;null = 不武装。 */
+  windows: VoiceActivityWindows | null;
+  /** 缓存里有一份成功读到的服务器语音设置:服务器认得 record_stopped 的 VAD 两键。 */
+  reportFacts: boolean;
+}
+
+const NO_VOICE_ACTIVITY: CaptureVoiceActivityPlan = Object.freeze({
+  windows: null,
+  reportFacts: false,
+});
+
 class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   readonly started: AutopilotRecordingCapture["started"];
   readonly stopped: AutopilotRecordingCapture["stopped"];
@@ -335,9 +348,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   // 「说完没」旁听采样器。真实 onstart 之后才有;每条退出路径都拆一次,拆过就
   // 置空,所以底层采样器只会被拆一次。
   private voiceActivity: VoiceActivityObservation | null = null;
-  // 这次采集用的两个尾静默窗口;null = 不武装(没读到服务器语音设置、读失败、
-  // 服务器关了 VAD,或紧跟在一次开口打断之后)。
-  private readonly voiceActivityWindows: VoiceActivityWindows | null;
+  private readonly voiceActivityPlan: CaptureVoiceActivityPlan;
   private preStartDeadline: CaptureDeadline | null = null;
   // prepare() 底下的 getUserMedia 可能在判死之后才交出 MediaStream。留住这条
   // Promise，cleanup 才能在 dispose() 之后等它落地——不等就等于在那条流还在
@@ -370,7 +381,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
               ports: ExactCaptureUploadPorts = browserExactCaptureUploadPorts,
               bootstrap: AutopilotCaptureBootstrapPorts
                 = browserAutopilotCaptureBootstrapPorts,
-              voiceActivityWindows: VoiceActivityWindows | null = null) {
+              voiceActivityPlan: CaptureVoiceActivityPlan = NO_VOICE_ACTIVITY) {
     this.sessionId = sessionId;
     this.command = command;
     this.identity = identity;
@@ -378,7 +389,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
     this.observe = observe;
     this.ports = ports;
     this.bootstrap = bootstrap;
-    this.voiceActivityWindows = voiceActivityWindows;
+    this.voiceActivityPlan = voiceActivityPlan;
     this.started = this.startedDeferred.promise;
     this.stopped = this.stoppedDeferred.promise;
     this.closed = this.closedDeferred.promise;
@@ -501,7 +512,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   private armVoiceActivity(): void {
     const observe = this.bootstrap.observeVoiceActivity;
     const stream = this.recorder.mediaStream;
-    const windows = this.voiceActivityWindows;
+    const windows = this.voiceActivityPlan.windows;
     if (!observe || !stream || windows === null) return;
     try {
       this.voiceActivity = observe(stream, () => {
@@ -524,9 +535,11 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   /**
    * record_stopped 的两个 VAD 事实,在停止那一刻、拆旁听之前读。只有采样器真读到
    * 过帧才算武装过;读不出、读出非数,都按没武装报——这两个事实坏了不能连累
-   * 一次已经录下来的作答发不出回执。
+   * 一次已经录下来的作答发不出回执。开麦时没成功读到过服务器语音设置的,两个都
+   * 不报:说不准服务器认不认这两个键,老服务器的回执模型拒收未知键。
    */
-  private voiceActivityStopFacts(): { vad_armed: boolean; vad_voiced_ms?: number } {
+  private voiceActivityStopFacts(): { vad_armed?: boolean; vad_voiced_ms?: number } {
+    if (!this.voiceActivityPlan.reportFacts) return {};
     let voicedMs: number | null = null;
     try {
       voicedMs = this.voiceActivity?.voicedMs() ?? null;
@@ -926,6 +939,14 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   }
 }
 
+/** 服务器语音设置缓存在执行器眼里的样子;开麦那一刻只读它,不等网络。 */
+export interface AutopilotVoiceSettingsSource {
+  /** 缓存里有一份成功读到的设置(最近一次读取没失败)。 */
+  hasSettings(): boolean;
+  /** 静音自动收麦的两个窗口;null = 不武装(没有设置,或服务器关了 VAD)。 */
+  vadWindows(): VoiceActivityWindows | null;
+}
+
 export interface BrowserAutopilotRecordingExecutorOptions {
   /** 本次 owner lease 代际；屏显事件靠它加 captureGeneration 区分新旧捕获。 */
   ownerGeneration: number;
@@ -933,11 +954,8 @@ export interface BrowserAutopilotRecordingExecutorOptions {
   observe?: LocalAutopilotCaptureObserver;
   ports?: ExactCaptureUploadPorts;
   bootstrap?: AutopilotCaptureBootstrapPorts;
-  /**
-   * 开麦那一刻从服务器语音设置缓存里取静音自动收麦的两个窗口;null = 这次不武装。
-   * 只读缓存、不等网络。缺省恒为 null:只靠按钮与作答窗口到点收麦。
-   */
-  voiceActivityWindows?: () => VoiceActivityWindows | null;
+  /** 缺省 = 没有设置:只靠按钮与作答窗口到点收麦,回执不带 VAD 两键。 */
+  voiceSettings?: AutopilotVoiceSettingsSource;
 }
 
 export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExecutor {
@@ -947,7 +965,7 @@ export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExec
   private readonly observe?: LocalAutopilotCaptureObserver;
   private readonly ports: ExactCaptureUploadPorts;
   private readonly bootstrap: AutopilotCaptureBootstrapPorts;
-  private readonly voiceActivityWindows: () => VoiceActivityWindows | null;
+  private readonly voiceSettings: AutopilotVoiceSettingsSource | null;
   private captureGeneration = 0;
 
   constructor(sessionId: string, options: BrowserAutopilotRecordingExecutorOptions) {
@@ -958,7 +976,7 @@ export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExec
     this.observe = options.observe;
     this.ports = options.ports ?? browserExactCaptureUploadPorts;
     this.bootstrap = options.bootstrap ?? browserAutopilotCaptureBootstrapPorts;
-    this.voiceActivityWindows = options.voiceActivityWindows ?? (() => null);
+    this.voiceSettings = options.voiceSettings ?? null;
   }
 
   start(
@@ -972,6 +990,7 @@ export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExec
         "device_runtime_failed", "页面已离开前台，拒绝开启麦克风");
     }
     this.captureGeneration += 1;
+    const settings = this.voiceSettings;
     return new BrowserAutopilotCapture(
       this.sessionId,
       command,
@@ -985,9 +1004,12 @@ export class BrowserAutopilotRecordingExecutor implements AutopilotRecordingExec
       this.observe,
       this.ports,
       this.bootstrap,
-      // 提问刚被老人开口打断:老人正在找词重说,重说之前那段停顿会被读成「说完」
-      // (模拟:700 ms 尾音 + 5 s 停顿,5248 ms 收麦,5760 ms 才开口)。这一次不旁听。
-      options.afterVoiceInterruption === true ? null : this.voiceActivityWindows(),
+      settings === null ? NO_VOICE_ACTIVITY : {
+        // 提问刚被老人开口打断:老人正在找词重说,重说之前那段停顿会被读成「说完」
+        // (模拟:700 ms 尾音 + 5 s 停顿,5248 ms 收麦,5760 ms 才开口)。这一次不旁听。
+        windows: options.afterVoiceInterruption === true ? null : settings.vadWindows(),
+        reportFacts: settings.hasSettings(),
+      },
     );
   }
 }

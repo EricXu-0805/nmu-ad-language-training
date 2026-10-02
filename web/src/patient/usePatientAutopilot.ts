@@ -624,7 +624,7 @@ export function usePatientAutopilot(input: {
         recording: new BrowserAutopilotRecordingExecutor(input.sessionId as string, {
           ownerGeneration: context.ownerGeneration,
           observe: observeCapturePhase,
-          voiceActivityWindows: () => voiceSettings.vadWindows(),
+          voiceSettings,
         }),
         ackDelivery: context.delivery,
         initialRuntime: restored.runtime,

@@ -123,6 +123,26 @@ test("读取端口同步抛错:算一次失败,不外抛,五分钟后照常再�
   assert.equal(calls, 2);
 });
 
+test("hasSettings:只有缓存里有一份成功读到的设置才为真(服务器关了 VAD 也算读到)", async () => {
+  const run = harness();
+  const cache = new AutopilotVoiceSettingsCache("S-VOICE", run.ports);
+  assert.equal(cache.hasSettings(), false);
+  cache.refreshInBackground();
+  assert.equal(cache.hasSettings(), false);
+  run.fetches[0].resolve({ ...SETTINGS, vad_enabled: false });
+  await settle();
+  assert.equal(cache.hasSettings(), true);
+  assert.equal(cache.vadWindows(), null);
+
+  run.advance(AUTOPILOT_VOICE_SETTINGS_REFRESH_MS);
+  cache.refreshInBackground();
+  run.fetches[1].reject(new Error("404"));
+  await settle();
+  assert.equal(cache.hasSettings(), false);
+  cache.dispose();
+  assert.equal(cache.hasSettings(), false);
+});
+
 test("dispose:中止在途读取,迟到的结果不再生效,之后也不再刷新", async () => {
   const run = harness();
   const cache = new AutopilotVoiceSettingsCache("S-VOICE", run.ports);

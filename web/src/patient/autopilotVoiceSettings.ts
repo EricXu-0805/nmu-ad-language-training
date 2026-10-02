@@ -53,6 +53,14 @@ export class AutopilotVoiceSettingsCache {
     });
   }
 
+  /**
+   * 缓存里有一份成功读到的设置。读面与 record_stopped 的 VAD 两键是同一份服务端
+   * 契约:读不到(老服务器没有这个读面、网络失败、坏形状)就不报那两个键。
+   */
+  hasSettings(): boolean {
+    return this.latest !== null;
+  }
+
   /** 这次采集用的两个尾静默窗口;null = 不武装。 */
   vadWindows(): VoiceActivityWindows | null {
     const settings = this.latest;
