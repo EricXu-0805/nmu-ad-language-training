@@ -1319,6 +1319,7 @@ def export_session_bundle(
                         or source_attempt.turn_seq != t.turn_seq):
                     raise ValueError("环节关联的原始 attempt 不属于本场次/本环节，拒绝导出")
                 source_attempt_seq = source_attempt.attempt_seq
+            source_capture = provenance.get(t.source_attempt_id, {})
             adjudicated = adjudication_by_position.get((it.item_id, t.turn_seq))
             turn_sheet.append({
                 **session_cols(), "item_id": it.item_id,
@@ -1329,6 +1330,9 @@ def export_session_bundle(
                 "adjudication_reason": adjudicated.reason_code if adjudicated else None,
                 "response_role": t.response_role,
                 "source_attempt_seq": source_attempt_seq,
+                # 所依据那次录音怎么收的口、收音前话术播完没有:运行事实,真值仍看 reviewed_score。
+                "source_stop_reason": source_capture.get("stop_reason"),
+                "source_prompt_playback_outcome": source_capture.get("prompt_playback_outcome"),
                 "asr_text": asr, "confirmed_response_text": conf,
                 "asr_confidence": t.asr_confidence, "prompt_level": t.prompt_level,
                 # 本环节收音时长（秒）。它是相对量，不是绝对时间，也**不是反应时**——
@@ -1837,44 +1841,58 @@ def _prompt_playback_evidence(db, attempt: AttemptEvent) -> dict:
             "prompt_exposure_needs_review": interrupted}
 
 
+_PLAYBACK_OUTCOME_BY_ACK = {"tts_ended": "completed", "tts_interrupted": "interrupted"}
+
+
 def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
-    """每段录音怎么收的口：平板 record_stopped 回执里的运行事实，不是研究真值。
+    """每段录音怎么收的口、收音前那句话术播完没有：平板回执里的运行事实，不是研究真值。
 
     按 attempt.id 返回；导出包与研究读面共用这一份，免得两边口径分岔。录音命令靠
     expected_raw_audio_id 找，没有平板录音命令的（人工录音、历史场次）一律为空。
     stop_reason 只出闭集，库里别的值出 None 而不拦整份导出：它和播放结局一样只描述
     采集过程。vad_armed 是新平板才带的可选键，旧回执、旧平板为 None。
+    播放结局认录音命令登记的那条触发回执（trigger_ack_idempotency_key），不认同一
+    条 TTS 上别的回执。
     """
     by_audio = {attempt.raw_audio_id: attempt for attempt in attempts}
-    facts = {attempt.id: {"stop_reason": None, "vad_armed": None}
+    facts = {attempt.id: {"stop_reason": None, "vad_armed": None,
+                          "prompt_playback_outcome": None}
              for attempt in by_audio.values()}
     if not by_audio:
         return facts
-    attempt_by_record = {
-        record.id: by_audio[record.expected_raw_audio_id]
-        for record in db.exec(select(RuntimeCommand).where(
+    records = [
+        record for record in db.exec(select(RuntimeCommand).where(
             RuntimeCommand.kind == "record",
             RuntimeCommand.expected_raw_audio_id.in_(list(by_audio))))
-        if record.session_id == by_audio[record.expected_raw_audio_id].session_id}
-    if not attempt_by_record:
+        if record.session_id == by_audio[record.expected_raw_audio_id].session_id]
+    if not records:
         return facts
-    for ack in db.exec(select(RuntimeCommandAck).where(
-            RuntimeCommandAck.command_id.in_(list(attempt_by_record)),
-            RuntimeCommandAck.ack_type == "record_stopped")):
+    stopped = {ack.command_id: ack for ack in db.exec(select(RuntimeCommandAck).where(
+        RuntimeCommandAck.command_id.in_([record.id for record in records]),
+        RuntimeCommandAck.ack_type == "record_stopped"))}
+    playback = {
+        (ack.command_id, ack.idempotency_key): _PLAYBACK_OUTCOME_BY_ACK[ack.ack_type]
+        for ack in db.exec(select(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id.in_(
+                [record.predecessor_command_id for record in records]),
+            RuntimeCommandAck.ack_type.in_(list(_PLAYBACK_OUTCOME_BY_ACK))))}
+    for record in records:
+        fact = facts[by_audio[record.expected_raw_audio_id].id]
+        fact["prompt_playback_outcome"] = playback.get(
+            (record.predecessor_command_id, record.trigger_ack_idempotency_key))
+        ack = stopped.get(record.id)
         try:
-            payload = json.loads(ack.payload_json)
+            payload = json.loads(ack.payload_json) if ack is not None else {}
         except ValueError:
-            payload = None
+            payload = {}
         if not isinstance(payload, dict):
             continue
         stop_reason = payload.get("stop_reason")
         vad_armed = payload.get("vad_armed")
-        facts[attempt_by_record[ack.command_id].id] = {
-            "stop_reason": (stop_reason if isinstance(stop_reason, str)
-                            and stop_reason in autopilot_ledger.RECORD_STOP_REASONS
-                            else None),
-            "vad_armed": vad_armed if isinstance(vad_armed, bool) else None,
-        }
+        fact["stop_reason"] = (
+            stop_reason if isinstance(stop_reason, str)
+            and stop_reason in autopilot_ledger.RECORD_STOP_REASONS else None)
+        fact["vad_armed"] = vad_armed if isinstance(vad_armed, bool) else None
     return facts
 
 
@@ -2210,6 +2228,7 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         "element_value", "ai_human_diff", "judge_portrait_used",
         "duration_seconds",
         "presentation_order", "adjudication_kind", "adjudication_reason",
+        "source_stop_reason", "source_prompt_playback_outcome",
     ),
     "adjudications": _SESSION_COLS + (
         "item_id", "presentation_order", "turn_seq", "kind", "reason_code", "note",

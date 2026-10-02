@@ -2188,3 +2188,42 @@ def test_attempts_sheet_says_how_each_capture_was_closed(db, tmp_path):
     written = tmp_path / "research" / result["batch_id"] / "attempts.csv"
     with written.open(encoding="utf-8-sig", newline="") as handle:
         assert next(csv.reader(handle)) == list(export.SHEET_FIELDS["attempts"])
+
+
+def _link_source_attempt(db, item_id: str, turn_seq: int, attempt: AttemptEvent) -> None:
+    turn = db.exec(select(TurnEvent).join(
+        ItemEvent, TurnEvent.item_event_id == ItemEvent.id).where(
+            ItemEvent.item_id == item_id, TurnEvent.turn_seq == turn_seq)).one()
+    turn.source_attempt_id = attempt.id
+    db.add(turn)
+    db.commit()
+
+
+def test_turns_say_how_the_source_capture_closed_and_whether_its_prompt_played_out(
+        db, tmp_path):
+    """环节行跟着它依据的那次录音走:怎么收的口,收音前那句话术播完没有(抢答/「我来回答」打断)。"""
+    _seed(db)
+    _link_source_attempt(db, "SE_锚", 1, _seed_capture_chain(
+        db, raw_audio_id="a_vad", item_id="SE_锚", turn_seq=1, command_seq=1,
+        stop_payload='{"stop_reason":"silence","vad_armed":true}'))
+    _link_source_attempt(db, "DE_斧子+树", 1, _seed_capture_chain(
+        db, raw_audio_id="a_barge_in", item_id="DE_斧子+树", turn_seq=1,
+        response_role="左命名", command_seq=3, playback_ack="tts_interrupted",
+        stop_payload='{"stop_reason":"user_done"}'))
+    _link_source_attempt(db, "DE_斧子+树", 2, _seed_capture_chain(
+        db, raw_audio_id="a_no_playback_ack", item_id="DE_斧子+树", turn_seq=2,
+        response_role="左作用", command_seq=5, playback_ack=None,
+        stop_payload='{"stop_reason":"max_duration"}'))
+
+    result = _export_bundle(db, "S9", write_dir=tmp_path)
+
+    turns = {(row["item_id"], row["turn_seq"]): (
+        row["source_stop_reason"], row["source_prompt_playback_outcome"])
+        for row in result["sheets"]["turns"]}
+    assert turns[("SE_锚", 1)] == ("silence", "completed")
+    assert turns[("DE_斧子+树", 1)] == ("user_done", "interrupted")
+    assert turns[("DE_斧子+树", 2)] == ("max_duration", None)
+    # 没有关联录音的环节(人工录入)两列都空。
+    assert turns[("DE_斧子+树", 3)] == (None, None)
+    assert export.SHEET_FIELDS["turns"][-3:] == (
+        "adjudication_reason", "source_stop_reason", "source_prompt_playback_outcome")
