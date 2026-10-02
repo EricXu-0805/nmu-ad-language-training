@@ -289,7 +289,7 @@ if [ "$have" != "$want" ]; then
   exit 1
 fi
 staged="${hb}.nmu-probe.new"
-/usr/bin/python3 -B "$dir/heartbeat_check.py" --insert "$hb" --out "$staged" </dev/null
+/usr/bin/python3 -B "$dir/heartbeat_check.py" --insert "$hb" --out "$staged" </dev/null | sed 's/^/  /'
 echo "  新文件单独调一次:$(/usr/bin/python3 -B "$dir/heartbeat_check.py" --call "$staged" </dev/null)"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup="${hb}.before-nmu-probe-${stamp}"
@@ -355,8 +355,7 @@ echo "deploy/offbox @ $(git -C "$REPO" --no-pager log -1 --format='%h %s' -- dep
 
 for s in $STAGES; do "stage$s"; done
 
-case "$MODE" in
-  install)
+if [ "$MODE" = "install" ]; then
     cat <<'AFTER'
 == 装好了。以后用得上的几条(都在 Mac 上敲) ==
   看状态:  ssh eric@147.182.176.237 '/usr/bin/python3 -B ~/.openclaw/workspace/nmu-probe/nmu_offbox_probe.py --status'
@@ -367,8 +366,4 @@ case "$MODE" in
   整个撤掉(先回滚 crontab):ssh eric@147.182.176.237 'gio trash ~/.openclaw/workspace/nmu-probe'
   下一步(可选):bash deploy/offbox/install_offbox_probe.sh --heartbeat
 AFTER
-    ;;
-  heartbeat)
-    echo "回滚 heartbeat:按上面打印的「回滚:」那一行,在 VPS 上 cp -p 回去"
-    ;;
-esac
+fi
