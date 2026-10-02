@@ -401,6 +401,114 @@ test("还没点屏激活、题图还没就绪、麦克风相位已被生命周�
   assert.doesNotMatch(cleared, /请听完再回答/);
 });
 
+// ---------------- 开口打断:提醒只属于被打断那一句和紧接着那条录音 ----------------
+
+const INTERRUPTED_QUESTION = {
+  sessionId: "S-ONE", commandKey: "cmd-question-stage-0001", itemRef: "itm-0001",
+  turnSeq: 1, attemptSeq: 1, controlGeneration: 3, runnerGeneration: 7,
+  phase: "interrupted",
+};
+
+/** 同一回答位置(同题、同环节、同尝试、同代际)上的另一条朗读命令。 */
+function samePositionSpeechView(purpose, commandKey) {
+  const view = questionPlayingView(purpose);
+  view.current = { ...view.current, command_key: commandKey };
+  view.runtime = { ...view.runtime, command: view.current };
+  view.bargeIn = INTERRUPTED_QUESTION;
+  return view;
+}
+
+for (const [purpose, commandKey] of [
+  ["feedback", "cmd-feedback-stage-0003"],
+  ["tell_answer", "cmd-tell-answer-stage-0003"],
+]) {
+  test(`打断之后同一回答位置的${purpose}朗读:照常说正在朗读,不再叫老人从头回答`, async (context) => {
+    const markup = await renderView(context, samePositionSpeechView(purpose, commandKey));
+    assert.match(markup, /正在为您朗读/);
+    assert.doesNotMatch(markup, /从头/);
+    assert.doesNotMatch(markup, /朗读已停止/);
+    assert.doesNotMatch(markup, /刚才的开头还没有录下/);
+  });
+}
+
+test("打断之后重播的提问(新命令):不说「从头回答」,「现在回答」照常可点", async (context) => {
+  const markup = await renderView(context, samePositionSpeechView("question", "cmd-question-stage-0002"));
+  assert.match(markup, /正在为您朗读/);
+  assert.doesNotMatch(markup, /从头/);
+  assert.match(markup, />现在回答<\/button>/);
+  // 这一句没有在检测开口:提示仍是请听完。
+  assert.match(markup, /请听完再回答/);
+});
+
+test("被打断的那一句本身和紧接着的录音:仍提醒看到「正在听您说」后从头完整说", async (context) => {
+  const prompt = samePositionSpeechView("question", INTERRUPTED_QUESTION.commandKey);
+  prompt.runtime = { ...prompt.runtime, phase: "waiting_server_after_tts" };
+  const promptMarkup = await renderView(context, prompt);
+  assert.match(promptMarkup, /朗读已停止，看到「正在听您说」后从头回答/);
+  assert.match(promptMarkup, /刚才的开头还没有录下，请稍候再完整说一次/);
+  assert.doesNotMatch(promptMarkup, />现在回答<\/button>/);
+
+  const ready = await stageMarkup(context, (view) => {
+    view.current = { ...view.current, state: "pending", command_revision: 0 };
+    view.runtime = { ...view.runtime, phase: "record_ready", command: view.current };
+    view.localCapturePhase = null;
+    view.bargeIn = INTERRUPTED_QUESTION;
+  });
+  assert.match(ready, /朗读已停止，看到「正在听您说」后从头回答/);
+  assert.match(ready, /刚才的开头还没有录下，请稍候再完整说一次/);
+});
+
+// ---------------- 「想回答时可以开口」只在真的在检测时出现 ----------------
+
+function monitoringView(mutate = () => {}) {
+  const view = questionPlayingView();
+  view.bargeIn = { ...INTERRUPTED_QUESTION, phase: "monitoring" };
+  mutate(view);
+  return view;
+}
+
+test("提问在播且提前回答检测正在听:提示可以直接开口", async (context) => {
+  const markup = await renderView(context, monitoringView());
+  assert.match(markup, /想回答时可以开口，或点「现在回答」/);
+  assert.doesNotMatch(markup, /请听完再回答/);
+});
+
+test("检测不可用、已关闭、属于别的命令:一律提示请听完再回答", async (context) => {
+  for (const mutate of [
+    (view) => { view.bargeIn = { ...view.bargeIn, phase: "unavailable" }; },
+    (view) => { view.bargeIn = { ...view.bargeIn, phase: "closed" }; },
+    (view) => { view.bargeIn = { ...view.bargeIn, commandKey: "cmd-question-stage-0000" }; },
+    (view) => { view.bargeIn = null; },
+  ]) {
+    const markup = await renderView(context, monitoringView(mutate));
+    assert.match(markup, /请听完再回答/);
+    assert.doesNotMatch(markup, /想回答时可以开口/);
+  }
+});
+
+test("残留的 monitoring 不算在听:朗读还没开始、已经播完、或已经换成录音命令", async (context) => {
+  const notStarted = monitoringView((view) => {
+    view.current = { ...view.current, state: "pending", command_revision: 0 };
+    view.runtime = { ...view.runtime, phase: "tts_ready", command: view.current };
+  });
+  const ended = monitoringView((view) => {
+    view.runtime = { ...view.runtime, phase: "waiting_server_after_tts" };
+  });
+  for (const view of [notStarted, ended]) {
+    const markup = await renderView(context, view);
+    assert.match(markup, /请听完再回答/);
+    assert.doesNotMatch(markup, /想回答时可以开口/);
+  }
+  const recordReady = await stageMarkup(context, (view) => {
+    view.current = { ...view.current, state: "pending", command_revision: 0 };
+    view.runtime = { ...view.runtime, phase: "record_ready", command: view.current };
+    view.localCapturePhase = null;
+    view.bargeIn = { ...INTERRUPTED_QUESTION, phase: "monitoring" };
+  });
+  assert.match(recordReady, /请听完再回答/);
+  assert.doesNotMatch(recordReady, /想回答时可以开口/);
+});
+
 test("自动停播只在同一回答和同一控制世代提醒重说", async (context) => {
   const observation = {
     sessionId: "S-ONE", commandKey: "prior-prompt", itemRef: "itm-0001",

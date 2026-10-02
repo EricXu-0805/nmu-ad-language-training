@@ -40,6 +40,7 @@ import { browserAutopilotMediaDependencies } from "./autopilotBrowserMediaDepend
 import { AutopilotVoiceSettingsCache } from "./autopilotVoiceSettings.ts";
 import {
   captureIdentityIsNewer,
+  retainBargeInObservation,
   sameCaptureIdentity,
   type LocalAutopilotCaptureEvent,
   type LocalAutopilotCapturePhase,
@@ -631,8 +632,10 @@ export function usePatientAutopilot(input: {
           assetGateRef.current as PatientAssetMediaGate
         ).waitFor(command, signal),
         onState: (runtime) => {
-          if (!cancelled) setServer((before) => before?.delivery === context.delivery
+          if (cancelled) return;
+          setServer((before) => before?.delivery === context.delivery
             ? { ...before, current: runtime.command, runtime } : before);
+          setBargeIn((before) => retainBargeInObservation(before, runtime.command));
         },
       });
       context.controller = controller;
