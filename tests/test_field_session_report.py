@@ -44,12 +44,14 @@ BRAVO = "SID-REAL-BRAVO-9e2f"
 SIM = "SID-SIM-CHARLIE-4b8a"
 OLD = "SID-REAL-OLD-DELTA-1f3c"
 EMPTY = "SID-REAL-EMPTY-ECHO-6d0e"
+EARLY_EMPTY = "SID-REAL-EMPTY-FOXTROT-2a7b"
 PATIENTS = {
     ALPHA: "PID-ZHANG-SAN-0042",
     BRAVO: "PID-LI-SI-0077",
     SIM: "PID-SIM-WANG-WU-0013",
     OLD: "PID-ZHAO-LIU-0005",
     EMPTY: "PID-QIAN-QI-0099",
+    EARLY_EMPTY: "PID-SUN-BA-0031",
 }
 
 # 只要在输出里出现一次就算泄露的东西：回答原文、判分理由原文、研究者备注、话术原文。
@@ -567,6 +569,20 @@ def test_session_count_keeps_only_the_latest(field_db):
         {"n": 1, "week_no": 3, "commands": 7, "record_stopped": 2, "attempts": 2,
          "runtime_status": "aborted"},
     ]
+
+
+def test_session_count_only_mentions_empty_sessions_inside_its_window(field_db):
+    engine = create_engine(f"sqlite:///{field_db}")
+    with DBSession(engine) as db:
+        _new_scene(db, EARLY_EMPTY, date(2026, 10, 2), 2,
+                   datetime(2026, 10, 2, 1, 0, 0), SHANGHAI)
+        db.commit()
+    engine.dispose()
+    assert _report(field_db, "--since", "2026-10-01")["scope"][
+        "excluded_without_commands"] == 2
+    # 最近 1 场是 10-04 那场：10-05 那场没命令的在窗口里，10-02 那场在窗口之前，不提。
+    latest = _report(field_db, "--since", "2026-10-01", "--session-count", "1")
+    assert latest["scope"]["excluded_without_commands"] == 1
 
 
 @pytest.mark.parametrize("extra", [[], ["--json"], ["--include-simulation"],

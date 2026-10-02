@@ -217,12 +217,17 @@ def _load_sessions(conn, schema, snap: Snapshot, *, since: date | None,
         f"{first_command} AS first_command_at FROM session s{where}", params).fetchall()
     kept = [row for row in rows
             if not with_commands or row["first_command_at"] is not None]
-    snap.excluded_without_commands = len(rows) - len(kept)
+    empty = [row for row in rows
+             if with_commands and row["first_command_at"] is None]
     # 同一天的几场按第一条命令的时刻排；session_id 只做最后的稳定次序，从不输出。
     kept.sort(key=lambda row: (row["training_date"] or "",
                                row["first_command_at"] or "", row["session_id"]))
-    if session_count is not None:
+    if session_count is not None and kept:
         kept = kept[-session_count:]
+        # 只提最近 N 场那段日子里没命令的场次；更早的与这份报告无关。
+        start = kept[0]["training_date"] or ""
+        empty = [row for row in empty if (row["training_date"] or "") >= start]
+    snap.excluded_without_commands = len(empty)
     snap.sessions = [{"session_id": row["session_id"], "week_no": row["week_no"]}
                      for row in kept]
 
