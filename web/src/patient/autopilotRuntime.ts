@@ -413,7 +413,12 @@ export function canPlayAutopilotSpeech(state: AutopilotRuntimeState): boolean {
     && state.command.state === "pending";
 }
 
-/** The only state from which future UI integration may call getUserMedia. */
+/**
+ * 唯一允许**录音**开麦的相位:一条 exact、pending 的服务器录音命令,经
+ * runRecording 交给录音执行器。麦克风另外只会在一处打开——提问/线索 started
+ * 之后的提前回答检测(runSpeech → armBargeIn → startBargeInMonitor),只在本机
+ * 分析有没有人开口,不录音、不上传,服务器关掉开关时授权路由回 409、根本不开。
+ */
 export function canOpenAutopilotMicrophone(state: AutopilotRuntimeState): boolean {
   return state.phase === "record_ready"
     && state.command?.kind === "record"

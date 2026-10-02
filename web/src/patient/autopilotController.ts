@@ -1042,8 +1042,9 @@ export class PatientAutopilotController {
   }
 
   private async runRecording(): Promise<void> {
-    // This method is the sole microphone admission point. The reducer guard in
-    // runOnce proves an exact, pending server record command exists first.
+    // 唯一的**录音**入口:runOnce 里的 reducer 闸先证明存在一条 exact、pending 的
+    // 服务器录音命令。麦克风的另一条路是 runSpeech 在提问/线索 started 之后武装
+    // 的提前回答检测(armBargeIn),只在本机分析、从不录音。
     const initial = this.currentCommand("record");
     let capture: AutopilotRecordingCapture;
     try {
