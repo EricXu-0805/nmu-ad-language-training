@@ -999,7 +999,7 @@ def _md_prompt_playback(metric: dict) -> list[str]:
         f"打断前已播（秒）：{_inline(metric['interrupted_played_seconds'], _sec)}",
         "",
         f"停播检测 barge_in_armed（只算提问/提示的终态回执）：true {armed['true']} · "
-        f"false {armed['false']} · 缺（旧平板/服务端没声明/未读到设置/刷新补发）{armed['missing']}；"
+        f"false {armed['false']} · 缺（旧平板/服务端没声明/未读到语音设置）{armed['missing']}；"
         "false 含部署关掉声音停播（switch off）",
         f"检测在听（true）时：老人开口停播 {voice['count']} / {armed['true']}（{_pct(voice['share'])}） · "
         f"点「现在回答」{barge_in['answer_now_while_armed']}",

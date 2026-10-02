@@ -797,7 +797,7 @@ def test_markdown_prints_the_numbers_beside_the_baseline(field_db):
         "| question | 5 | 1 | 0 | 0 |",
         "vad_armed：true 4 · false 2 · 缺（旧平板/未读到设置/刷新补发）1",
         "停播检测 barge_in_armed（只算提问/提示的终态回执）：true 4 · false 2 · "
-        "缺（旧平板/服务端没声明/未读到设置/刷新补发）2；false 含部署关掉声音停播（switch off）",
+        "缺（旧平板/服务端没声明/未读到语音设置）2；false 含部署关掉声音停播（switch off）",
         "检测在听（true）时：老人开口停播 1 / 4（25.0%） · 点「现在回答」1",
         "检测在听的毫秒 barge_in_listened_ms：n=4 · 中位 1850 · p90 3240 · 最大 3600",
     ):
