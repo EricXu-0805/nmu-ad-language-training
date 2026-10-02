@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:5b7e76df-1ae7-7ffe-c124-0c54c76c7e79",
+  "serialNumber": "urn:uuid:6a056f09-c696-fa24-9664-99103526e61f",
   "version": 1,
   "metadata": {
     "component": {
@@ -9241,16 +9241,16 @@
     {
       "type": "operating-system",
       "name": "libcrypto3",
-      "version": "3.5.8-r0",
-      "purl": "pkg:apk/alpine/libcrypto3@3.5.8-r0",
-      "bom-ref": "pkg:apk/alpine/libcrypto3@3.5.8-r0"
+      "version": "3.5.9-r0",
+      "purl": "pkg:apk/alpine/libcrypto3@3.5.9-r0",
+      "bom-ref": "pkg:apk/alpine/libcrypto3@3.5.9-r0"
     },
     {
       "type": "operating-system",
       "name": "libssl3",
-      "version": "3.5.8-r0",
-      "purl": "pkg:apk/alpine/libssl3@3.5.8-r0",
-      "bom-ref": "pkg:apk/alpine/libssl3@3.5.8-r0"
+      "version": "3.5.9-r0",
+      "purl": "pkg:apk/alpine/libssl3@3.5.9-r0",
+      "bom-ref": "pkg:apk/alpine/libssl3@3.5.9-r0"
     },
     {
       "type": "operating-system",

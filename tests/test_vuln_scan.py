@@ -171,18 +171,18 @@ def test_the_committed_waivers_parse_and_carry_a_real_argument():
     """挡住把 reason 写成'风险低'。豁免要能被人推翻才有意义。"""
     path = ROOT / "security" / "vuln-waivers.json"
     raw = json.loads(path.read_text(encoding="utf-8"))
-    live, _ = vs.load_waivers(path, date(2026, 8, 6))
-    assert live, "至少解析得出来"
+    live, expired = vs.load_waivers(path, date(2026, 8, 6))
+    assert set(live) | set(expired) == {item["id"] for item in raw["waivers"]}, "每条都解析得出来"
     for item in raw["waivers"]:
         assert len(item["reason"]) >= 60, f"{item['id']} 的理由太短，说不清为什么不适用"
         assert item.get("exit"), f"{item['id']} 没写什么时候解除"
 
 
-def test_replaying_the_recorded_response_is_clean_as_of_2026_08_06():
-    """钉住 2026-08-06 那次真扫的结论。它证明的是那份记录，不是今天的世界——
-    今天的结论要靠 CI 里连网那一步重新查。"""
+def test_replaying_the_recorded_response_is_clean_as_of_2026_10_02():
+    """钉住 2026-10-02 那次真扫的结论（react-router 升到 7.18.4、撤掉唯一豁免后重录）。
+    它证明的是那份记录，不是今天的世界——今天的结论要靠 CI 里连网那一步重新查。"""
     assert vs.main([
         "--sbom", str(ROOT / "sbom.cdx.json"),
         "--offline", str(ROOT / "security" / "osv-response.json"),
         "--waivers", str(ROOT / "security" / "vuln-waivers.json"),
-        "--today", "2026-08-06"]) == 0
+        "--today", "2026-10-02"]) == 0
