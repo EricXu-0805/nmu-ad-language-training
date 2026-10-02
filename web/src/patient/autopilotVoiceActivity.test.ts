@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_VOICE_ACTIVITY_WINDOWS,
   VAD_ABSOLUTE_MIN_RMS,
   VAD_CALIBRATION_MS,
   VAD_FULL_UTTERANCE_MS,
@@ -271,6 +272,35 @@ test("定时器卡住之后补来的一帧最多记 500 ms:不能把没观察到
   }
   assert.equal(state, "stopped");
   assert.equal(frames, (VAD_TRAILING_SILENCE_MS - VAD_MAX_FRAME_GAP_MS * 2) / 100);
+});
+
+test("两个尾静默窗口由服务器语音设置传入:整句用 trailingSilenceMs,短话用 shortTrailingSilenceMs", () => {
+  const windows = { trailingSilenceMs: 5_000, shortTrailingSilenceMs: 7_000 };
+  const full = createVoiceActivityDetector(windows);
+  const fullTrace = feed(full, [[1_000, QUIET], [2_000, SPEECH], [10_000, QUIET]], 100);
+  // 默认 3 s 的那一帧还在等;静满 5 s 才判说完。
+  assert.equal(fullTrace.states.get(3_000 + VAD_TRAILING_SILENCE_MS), "trailing_silence");
+  assert.equal(fullTrace.stoppedAt, 3_000 + windows.trailingSilenceMs);
+
+  const short = createVoiceActivityDetector(windows);
+  const shortTrace = feed(short, [[1_000, QUIET], [600, SPEECH], [10_000, QUIET]], 100);
+  assert.equal(shortTrace.states.get(1_600 + VAD_SHORT_UTTERANCE_TRAILING_SILENCE_MS),
+    "trailing_silence");
+  assert.equal(shortTrace.stoppedAt, 1_600 + windows.shortTrailingSilenceMs);
+});
+
+test("不传窗口就是 3000/4500 的默认值,与收据 262 的行为逐帧相同", () => {
+  assert.deepEqual(DEFAULT_VOICE_ACTIVITY_WINDOWS, {
+    trailingSilenceMs: VAD_TRAILING_SILENCE_MS,
+    shortTrailingSilenceMs: VAD_SHORT_UTTERANCE_TRAILING_SILENCE_MS,
+  });
+  const segments: readonly Segment[] = [
+    [1_000, QUIET], [600, SPEECH], [2_000, QUIET], [1_500, SPEECH], [8_000, QUIET],
+  ];
+  const implicit = feed(createVoiceActivityDetector(), segments, 64);
+  const explicit = feed(createVoiceActivityDetector(DEFAULT_VOICE_ACTIVITY_WINDOWS), segments, 64);
+  assert.deepEqual([...explicit.states], [...implicit.states]);
+  assert.equal(explicit.stoppedAt, implicit.stoppedAt);
 });
 
 test("常量就是收据 262 里说的那几个数", () => {
