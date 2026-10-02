@@ -515,7 +515,9 @@ export function isDeviceFactsShape(value: unknown): value is AcceptanceDeviceFac
 const UNKNOWN = "未知";
 
 function show(value: unknown): string {
-  return typeof value === "string" || typeof value === "number" ? String(value) : UNKNOWN;
+  if (typeof value === "number") return String(value);
+  if (typeof value !== "string") return UNKNOWN;
+  return value === "" ? "（空）" : value;
 }
 
 function yesNo(value: unknown): string {

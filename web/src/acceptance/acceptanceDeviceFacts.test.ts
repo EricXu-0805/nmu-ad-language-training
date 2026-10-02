@@ -444,6 +444,15 @@ test("纯文本摘要：说清采集时间、型号以人工为准、检测条�
   assert.match(text, /提前回答检测条件（只看这台平板，服务器开关另算）：满足/);
 });
 
+test("桌面 Chromium 报空字符串型号：摘要写「（空）」，不留一个看不见的空白", async () => {
+  const env = {
+    navigator: { userAgentData: { brands: [], getHighEntropyValues: async () => ({ model: "", platformVersion: "27.0.1" }) } },
+  } as unknown as DeviceFactEnvironment;
+  const facts = await collectAcceptanceDeviceFacts(env, ports(new GrantingLockManager()));
+  assert.equal(facts.userAgentData?.model, "");
+  assert.match(formatDeviceFactsLines(facts).join("\n"), /浏览器自报型号 （空），系统版本 27\.0\.1/);
+});
+
 test("存回本机再读：设备参数结构要过关，乱数据不认", async () => {
   const { env } = tablet();
   const facts = await collectAcceptanceDeviceFacts(env, ports(new GrantingLockManager()));
