@@ -22,6 +22,7 @@ import {
   type AcceptanceDraft,
   type MachineFacts,
 } from "./acceptanceProtocol.ts";
+import { collectAcceptanceDeviceFacts, type DeviceFactEnvironment } from "./acceptanceDeviceFacts.ts";
 
 const MACHINE: MachineFacts = {
   userAgent: "Mozilla/5.0 (iPad; CPU OS 18_5)",
@@ -201,6 +202,7 @@ test("草稿一建好就带记录编号和开始时间；表头多了人工填�
   assert.equal(draft.receiptId, RECEIPT_ID);
   assert.equal(draft.startedAtIso, STARTED);
   assert.equal(draft.supersedesReceiptId, null);
+  assert.equal(draft.deviceFacts, null);
   assert.match(emptyDraft().receiptId, UUID_V4);
   assert.notEqual(emptyDraft().receiptId, emptyDraft().receiptId);
   // 设备型号与资产编号都要人填：JS 认不出是哪一台平板，自动参数不替它们填。
@@ -240,6 +242,7 @@ test("v2 冻结：字节只由内容决定，下载、复制与本机读回用�
   assert.equal(first.receipt.receiptId, RECEIPT_ID);
   assert.equal(first.receipt.startedAtIso, STARTED);
   assert.equal(first.receipt.machine.finishedAtIso, MACHINE.finishedAtIso);
+  assert.equal(first.receipt.deviceFacts, null);
   assert.equal(first.filename, receiptFilename(first.receipt));
   assert.equal(first.text, formatAcceptanceText(first.receipt));
   // 冻结之后草稿再被改，已冻结的字节一个也不动。
@@ -263,6 +266,7 @@ test("读回冻结字节：v1 回执、坏 JSON、编号不合格式、步骤结
     { ...parsed, verdict: "toString" },
     { ...parsed, steps: [{ key: "1", item: 1, title: "x", outcome: "maybe", note: "" }] },
     { ...parsed, machine: { ...(parsed.machine as object), buildId: 1 } },
+    { ...parsed, deviceFacts: { collectedAtIso: 1 } },
   ];
   for (const variant of variants) {
     assert.equal(readFrozenAcceptanceReceipt(JSON.stringify(variant)), null, JSON.stringify(variant).slice(0, 80));
@@ -271,11 +275,12 @@ test("读回冻结字节：v1 回执、坏 JSON、编号不合格式、步骤结
   assert.equal(readFrozenAcceptanceReceipt("null"), null);
 });
 
-test("纯文本带记录编号与开始时间", () => {
+test("纯文本带记录编号与开始时间；没点「采集设备参数」就明说未采集", () => {
   const text = formatAcceptanceText(
     buildAcceptanceReceipt(allPass(filledHeader(emptyDraft(RECEIPT_ID, STARTED))), MACHINE));
   assert.match(text, new RegExp(`记录编号：${RECEIPT_ID}`));
   assert.match(text, new RegExp(`开始填写：${STARTED}`));
+  assert.match(text, /设备参数：未采集/);
   assert.doesNotMatch(text, /取代/);
 });
 
@@ -296,4 +301,32 @@ test("冻结后发现填错：内容原样保留，换新编号并写明取代�
   assert.notEqual(next.filename, original.filename);
   assert.match(next.text, new RegExp(`取代记录 ${RECEIPT_ID}`));
   assert.equal(JSON.parse(original.json).supersedesReceiptId, null);
+});
+
+test("设备参数原样进回执与纯文本；设备型号、资产编号仍只认人工填的", async () => {
+  const env = {
+    navigator: {
+      maxTouchPoints: 5,
+      userAgentData: { mobile: false, platform: "Android", brands: [], getHighEntropyValues: async () => ({ model: "SM-X200" }) },
+    },
+  } as unknown as DeviceFactEnvironment;
+  const deviceFacts = await collectAcceptanceDeviceFacts(env, {
+    acquireLease: () => Promise.reject(new Error("没有麦克风接口时不该要锁")),
+    setTimeout: (callback, ms) => setTimeout(callback, ms),
+    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    now: () => Date.parse("2026-08-20T01:30:00.000Z"),
+  });
+  const draft = filledHeader(emptyDraft(RECEIPT_ID, STARTED));
+  draft.header.device = "人工填的型号";
+  draft.header.assetTag = "NMU-T03";
+  draft.deviceFacts = deviceFacts;
+  const frozen = freezeAcceptanceReceipt(draft, MACHINE);
+  assert.deepEqual(frozen.receipt.deviceFacts, deviceFacts);
+  assert.equal(frozen.receipt.header.device, "人工填的型号");
+  assert.equal(frozen.receipt.header.assetTag, "NMU-T03");
+  assert.match(frozen.text, /设备参数：自动采集于 2026-08-20T01:30:00\.000Z/);
+  assert.match(frozen.text, /浏览器自报型号 SM-X200/);
+  assert.match(frozen.text, /设备资产编号：NMU-T03/);
+  // 冻结字节读回来，设备参数一层不少。
+  assert.deepEqual(readFrozenAcceptanceReceipt(frozen.json)?.receipt.deviceFacts, deviceFacts);
 });

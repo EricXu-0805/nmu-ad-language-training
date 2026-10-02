@@ -7,12 +7,17 @@
  * 记录页在那一刻恰好用不了。所以只下载 JSON + 复制纯文本。
  *
  * 「完成并冻结」只生成一次回执字节，之后下载、复制拿到的都是那一份；冻结后表单只读，
- * 要改就解冻换新编号。
+ * 要改就解冻换新编号。「采集设备参数」由工作人员点，开麦前先拿与老人端共用的设备锁。
  */
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Alert } from "../components/Alert";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import {
+  collectAcceptanceDeviceFacts,
+  formatDeviceFactsLines,
+  type DeviceFactEnvironment,
+} from "./acceptanceDeviceFacts.ts";
 import {
   ACCEPTANCE_HEADER_FIELDS,
   ACCEPTANCE_ITEMS,
@@ -59,6 +64,7 @@ export function AcceptanceScreen() {
   // 旧 WebView 上剪贴板会静默失败；失败时把要复制的内容直接摆出来让人长按复制。
   const [copyResult, setCopyResult] = useState<{ kind: CopyKind; ok: boolean } | null>(null);
   const [confirmingReset, setConfirmingReset] = useState(false);
+  const [probing, setProbing] = useState(false);
   const facts = useMemo(machineFacts, []);
 
   const { draft } = work;
@@ -86,6 +92,20 @@ export function AcceptanceScreen() {
     updateDraft((prev) => ({ ...prev, outcomes: { ...prev.outcomes, [key]: value } }));
   const setNote = (key: string, value: string) =>
     updateDraft((prev) => ({ ...prev, notes: { ...prev.notes, [key]: value } }));
+
+  const collectDeviceFacts = () => {
+    if (probing || locked) return;
+    setProbing(true);
+    const receiptId = draft.receiptId;
+    void collectAcceptanceDeviceFacts(window as unknown as DeviceFactEnvironment)
+      .then((deviceFacts) => {
+        // 采集期间开了新记录或冻结了：结果不属于眼前这份，丢掉。
+        setWork((prev) => (prev.frozenJson !== null || prev.draft.receiptId !== receiptId
+          ? prev
+          : { ...prev, draft: { ...prev.draft, deviceFacts } }));
+      })
+      .finally(() => setProbing(false));
+  };
 
   const freeze = () => {
     setCopyResult(null);
@@ -191,6 +211,33 @@ export function AcceptanceScreen() {
         ))}
       </section>
 
+      <section className="form-section" aria-label="设备参数">
+        <div className="form-section-header">
+          <div>
+            <h2>采集这台设备的参数</h2>
+            <p className="muted">
+              自动读取浏览器报得出的参数（系统、屏幕、触控、麦克风设置等）写进记录。
+              会短暂打开麦克风两次读设置，不录音、不保存声音；第一次可能弹出麦克风权限，请点「允许」。
+            </p>
+            <p className="muted">
+              <strong>在老人端开始练习之前做</strong>：老人端正在用麦克风时这里不开麦，只记其余参数。
+              设备型号和资产编号仍以上面人工填写的为准。
+            </p>
+          </div>
+        </div>
+        <div className="form-actions">
+          <button type="button" className="button button--secondary button--md"
+                  disabled={locked || probing} onClick={collectDeviceFacts}>
+            {probing ? "正在采集…" : draft.deviceFacts === null ? "采集设备参数" : "重新采集设备参数"}
+          </button>
+        </div>
+        <div className="acceptance-step">
+          {formatDeviceFactsLines(draft.deviceFacts).map((line) => (
+            <p key={line} className="muted">{line.trim()}</p>
+          ))}
+        </div>
+      </section>
+
       {ACCEPTANCE_ITEMS.map((item) => (
         <section className="form-section" key={item.no}
                  aria-label={`第 ${item.no} 项 ${item.title}`}>
@@ -265,7 +312,8 @@ export function AcceptanceScreen() {
         {frozen === null ? (
           <>
             <div className="form-actions">
-              <button type="button" className="button button--primary button--md" onClick={freeze}>
+              <button type="button" className="button button--primary button--md"
+                      disabled={probing} onClick={freeze}>
                 完成并冻结
               </button>
               <button type="button" className="button button--quiet button--md"

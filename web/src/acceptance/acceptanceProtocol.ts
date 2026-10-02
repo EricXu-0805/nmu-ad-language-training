@@ -5,7 +5,8 @@
 // 验的第几项，事后没人说得清；而"沿用旧结果"恰恰是这张表明令禁止的事。
 //
 // 所以这一层只做三件事：把十三项摊成可勾选的结构、自动记下机器说得出的事实
-// （UA、构建编号、屏幕、时间）、产出一份能归档的 JSON 回执。
+// （UA、构建编号、屏幕、时间，以及点「采集设备参数」时浏览器报得出的那些）、
+// 产出一份能归档的 JSON 回执。
 //
 // 回执只冻结一次：记录编号在草稿建好时就定下，冻结那一刻把整份回执序列化成一串
 // 字节，下载、复制拿到的都是这串字节。之后要改只能解冻换新编号——同一个编号要是
@@ -13,6 +14,12 @@
 //
 // 它**永远不会**替人判"通过"：任何一项没勾、或表头没填全，整份回执就是未完成。
 // 全部勾通过也只出"现场记录齐了"，判定仍然是负责人的事。
+
+import {
+  formatDeviceFactsLines,
+  isDeviceFactsShape,
+  type AcceptanceDeviceFacts,
+} from "./acceptanceDeviceFacts.ts";
 
 export type ItemOutcome = "pass" | "fail" | "unset";
 
@@ -244,6 +251,8 @@ export interface AcceptanceDraft {
   header: Record<string, string>;
   outcomes: Record<string, ItemOutcome>;
   notes: Record<string, string>;
+  /** 点「采集设备参数」才有；没点为 null。 */
+  deviceFacts: AcceptanceDeviceFacts | null;
 }
 
 export type AcceptanceVerdict =
@@ -297,6 +306,7 @@ export function emptyDraft(
     header: Object.fromEntries(ACCEPTANCE_HEADER_FIELDS.map((f) => [f.key, ""])),
     outcomes: Object.fromEntries(ACCEPTANCE_STEP_KEYS.map((key) => [key, "unset" as ItemOutcome])),
     notes: {},
+    deviceFacts: null,
   };
 }
 
@@ -329,6 +339,7 @@ export interface AcceptanceReceipt {
   verdict: AcceptanceVerdict;
   startedAtIso: string;
   machine: MachineFacts;
+  deviceFacts: AcceptanceDeviceFacts | null;
   header: Record<string, string>;
   steps: { key: string; item: number; title: string; outcome: ItemOutcome; note: string }[];
   caveat: string;
@@ -361,6 +372,7 @@ export function buildAcceptanceReceipt(
       screen: machine.screen,
       finishedAtIso: machine.finishedAtIso,
     },
+    deviceFacts: draft.deviceFacts,
     header: Object.fromEntries(
       ACCEPTANCE_HEADER_FIELDS.map((f) => [f.key, (draft.header[f.key] ?? "").trim()]),
     ),
@@ -387,6 +399,7 @@ export function formatAcceptanceText(receipt: AcceptanceReceipt): string {
     `页面版本号：${receipt.machine.buildId}`,
     `屏幕：${receipt.machine.screen}`,
     `UA：${receipt.machine.userAgent}`,
+    ...formatDeviceFactsLines(receipt.deviceFacts),
     "",
   ];
   for (const item of ACCEPTANCE_ITEMS) {
@@ -449,6 +462,7 @@ function isAcceptanceReceipt(value: unknown): value is AcceptanceReceipt {
     && typeof value.verdict === "string" && Object.hasOwn(VERDICT_LABEL, value.verdict)
     && typeof value.startedAtIso === "string"
     && MACHINE_KEYS.every((key) => typeof machine[key] === "string")
+    && (value.deviceFacts === null || isDeviceFactsShape(value.deviceFacts))
     && Object.values(value.header).every((field) => typeof field === "string")
     && value.steps.every((row: unknown) => isRecord(row) && typeof row.key === "string"
       && typeof row.note === "string" && OUTCOMES.includes(row.outcome as string))
