@@ -1191,7 +1191,9 @@ class Remote:
         return log.read_text(encoding="utf-8").split() if log.exists() else []
 
     def run(self, tag: str, *args: str, **env: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["bash", "-s", "--", *args], input=_heredoc(tag),
+        # 远端是 /usr/bin/python3;本机/CI 上换成跑测试的这个解释器。
+        script = _heredoc(tag).replace("/usr/bin/python3", sys.executable)
+        return subprocess.run(["bash", "-s", "--", *args], input=script,
                               env={**self.env, **env}, capture_output=True, text=True,
                               timeout=60)
 
@@ -1247,8 +1249,10 @@ def test_the_installer_refuses_to_install_from_outside_a_git_checkout(tmp_path):
     fake = tmp_path / "bin"
     fake.mkdir()
     marker = tmp_path / "ssh-was-called"
-    (fake / "ssh").write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 99\n', encoding="utf-8")
-    (fake / "ssh").chmod(0o755)
+    # shasum 也放一个:CI 镜像上有没有它,不该决定这条测试走到哪一步。
+    for tool in ("ssh", "shasum"):
+        (fake / tool).write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 99\n', encoding="utf-8")
+        (fake / tool).chmod(0o755)
 
     result = subprocess.run(["bash", str(copy / "install_offbox_probe.sh"), "--preflight"],
                             env={"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
