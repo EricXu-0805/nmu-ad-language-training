@@ -401,7 +401,7 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
 
 - 根因：`5684a3a`（A08）在 `rapport_reply_create` 的处理快照里放了裸 `state.revision`；控制台 `useAudioSaved` 先写 `recording=idle`（推 revision）再请求回应，并发顺序不定，idle 先落就把回应判成「场次进度或授权已变化」→ 自动带练随机停，研究者要手点「让机器人回应」。
 - 改法：快照改比 `_rapport_fence_position(state)` = `(sectionKey, questionIdx)`；暂停/中止（status）、撤回、受试者、trainer、治理版本、云授权照旧拦。测试：准入与落账之间并发写 → 200；同窗口暂停 → 409；同窗口换问 → 409（旧代码上第一条红）。控制台轮次标签并进 `replyMeta`。
-- 上线方式（Codex 之后的口径）：main 分支保护 → 分支 CI 绿后同 SHA fast-forward（PR #4 自动标 merged）；前端产物取 push 事件 run 归档的 `nmu-release-artifacts/dist`（pull_request 事件构建的是合并预演提交）；生产树 nmu:nmu、750/640 在服务端统一落（本机 rsync 是 openrsync）。rsync 带过去 4 个本地空目录（`web/public{,/content,/img}`、`web/src/design`）让完整清单闭包判 INVALID，`rmdir` 后 MATCH；本地同样删掉。
+- 上线方式（Codex 之后的口径；仓库转私有后分支 push 不再跑 CI，本句已按新口径改写）：main 分支保护 → PR CI 绿后同 SHA fast-forward（PR #4 自动标 merged）→ 等 main 上该 SHA 的 push run 跑绿（只跑 image 与 supply-chain，backend/frontend 显示 skipped）→ 只部署曾是 main 顶端的 SHA；前端产物只取这次 push run 归档的 `nmu-release-artifacts/dist`（pull_request 事件构建的是合并预演提交，也不上传这份产物）；生产树 nmu:nmu、750/640 在服务端统一落（本机 rsync 是 openrsync）。rsync 带过去 4 个本地空目录（`web/public{,/content,/img}`、`web/src/design`）让完整清单闭包判 INVALID，`rmdir` 后 MATCH；本地同样删掉。
 - 清理：Codex 留下的 worktree `a15-required-check-rejection-20260907` 与本地 codex/* 分支已删；origin 上三条 codex/* 远程分支未删（自动审批拦了 push --delete）。
 
 ## 2026-09-05 上线记录（`c2fd7fd`：属相一问单轮，零迁移）
