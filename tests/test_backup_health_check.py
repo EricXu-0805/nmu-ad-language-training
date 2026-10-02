@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -228,3 +229,105 @@ def test_cli_reports_two_when_facts_are_unreadable(tmp_path, capsys):
 
     assert code == 2
     assert "UNHEALTHY backup_log_unreadable" in capsys.readouterr().out
+
+
+BOOT_CLOCK = 50_000.0  # 单调时钟此刻：开机后 50000 秒
+
+
+def _probe(**properties: str):
+    """假 `systemctl show nmu-health.service`。"""
+    values = {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0",
+              "ExecMainExitTimestampMonotonic": "0", **properties}
+
+    def run(argv, **_kwargs):
+        assert argv[:3] == ["systemctl", "show", "nmu-health.service"], argv
+        return SimpleNamespace(returncode=0, stderr="", stdout="".join(
+            f"{key}={value}\n" for key, value in values.items()))
+
+    return run
+
+
+def _exited(minutes_ago: float) -> str:
+    return str(int((BOOT_CLOCK - minutes_ago * 60) * 1_000_000))
+
+
+def _staleness(run) -> list[str]:
+    return health.probe_staleness(
+        "nmu-health.service", max_age_minutes=30, run=run, monotonic=lambda: BOOT_CLOCK)
+
+
+def test_a_probe_that_succeeded_minutes_ago_is_fresh():
+    assert _staleness(_probe(ExecMainExitTimestampMonotonic=_exited(9))) == []
+
+
+def test_a_probe_whose_last_success_is_over_thirty_minutes_old_is_stale():
+    problems = _staleness(_probe(ExecMainExitTimestampMonotonic=_exited(47)))
+
+    assert problems == ["probe_stale unit=nmu-health.service age_minutes=47.0 limit=30"]
+
+
+def test_a_probe_that_never_ran_since_boot_is_stale():
+    # 2026-09-30 重启后的原样：定时器停在 elapsed，服务在这次开机里一次都没跑过。
+    assert _staleness(_probe()) == ["probe_never_ran_since_boot unit=nmu-health.service"]
+
+
+def test_a_failed_last_probe_is_not_a_recent_success():
+    problems = _staleness(_probe(
+        Result="exit-code", ExecMainStatus="22", ExecMainExitTimestampMonotonic=_exited(3)))
+
+    assert problems == [
+        "probe_last_run_failed unit=nmu-health.service result=exit-code status=22"]
+
+
+def test_a_probe_running_right_now_is_alive():
+    # 起跑时 systemd 把上一轮的退出时间清零，此刻的 0 不是「从没跑过」。
+    assert _staleness(_probe(ActiveState="activating")) == []
+
+
+def test_probe_state_that_cannot_be_read_is_a_problem_not_health():
+    def run(argv, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    problems = _staleness(run)
+
+    assert len(problems) == 1
+    assert problems[0].startswith("probe_unevaluable unit=nmu-health.service ")
+
+
+def test_cli_reports_a_stale_probe_even_when_the_backup_is_fresh(tmp_path, capsys):
+    root = _root(tmp_path, [OK_LINE], ["20260806-023000"])
+    state = tmp_path / "health.state"
+
+    code = health.main(
+        ["--backup-root", str(root), "--min-free-mb", "0", "--max-age-hours", "1000000",
+         "--probe-unit", "nmu-health.service", "--state-file", str(state)],
+        run=_probe(ExecMainExitTimestampMonotonic=_exited(47)), monotonic=lambda: BOOT_CLOCK)
+
+    assert code == 1
+    assert "UNHEALTHY probe_stale unit=nmu-health.service" in capsys.readouterr().out
+    assert "probe_stale" in state.read_text(encoding="utf-8")
+
+
+def test_cli_keeps_both_verdicts_when_the_log_is_unreadable_and_the_probe_stale(
+        tmp_path, capsys):
+    root = tmp_path / "backups"
+    (root / "daily").mkdir(parents=True)
+
+    code = health.main(
+        ["--backup-root", str(root), "--probe-unit", "nmu-health.service"],
+        run=_probe(), monotonic=lambda: BOOT_CLOCK)
+
+    assert code == 2
+    output = capsys.readouterr().out
+    assert "UNHEALTHY backup_log_unreadable" in output
+    assert "probe_never_ran_since_boot" in output
+
+
+def test_cli_without_probe_unit_never_asks_systemd(tmp_path):
+    root = _root(tmp_path, [OK_LINE], ["20260806-023000"])
+
+    def run(argv, **_kwargs):
+        raise AssertionError(f"没给 --probe-unit 却查了 systemd：{argv}")
+
+    assert health.main(["--backup-root", str(root), "--min-free-mb", "0",
+                        "--max-age-hours", "1000000"], run=run) == 0

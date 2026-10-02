@@ -10,7 +10,8 @@
   - 最新 `ok` 之后累计的 FAIL 不超过 --max-consecutive-failures;
   - 精确的 `SKIP code=backup_lock_busy` 只是锁忙记录，不算成功或失败;
   - 最新 `ok` 声明的快照目录真的在盘上,且是目录不是软链接;
-  - 备份根所在文件系统剩余空间不低于 --min-free-mb。
+  - 备份根所在文件系统剩余空间不低于 --min-free-mb;
+  - 给了 --probe-unit 时,那个探针单元最近一次成功距今不超过 --probe-max-age-minutes。
 
 只用标准库:VPS 上跑这个脚本的解释器不保证有 SQLAlchemy(这正是十四夜失败的
 起因),不能再给它加依赖。
@@ -22,7 +23,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
+import time
 
 LINE = re.compile(
     r"^\[(?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] "
@@ -108,7 +111,46 @@ def evaluate(log_path: Path, daily_dir: Path, now: datetime, *,
     return problems
 
 
-def main(argv: list[str] | None = None) -> int:
+def probe_staleness(unit: str, *, max_age_minutes: float, run=subprocess.run,
+                    monotonic=time.monotonic) -> list[str]:
+    """探针单元最近一次成功是否还在窗口内。返回问题码列表,空 = 新鲜。
+
+    探针的定时器自己死掉时什么都不会失败:2026-09-30 重启后 nmu-health.timer 停在
+    elapsed,ActiveState 仍是 active,没有一次 OnFailure。只能从这里问它最近一次成功
+    是什么时候。最近一轮失败时 systemd 给不出更早那次成功的时刻,按不健康报。
+    """
+    try:
+        done = run(["systemctl", "show", unit, "-p", "ActiveState", "-p", "Result",
+                    "-p", "ExecMainStatus", "-p", "ExecMainExitTimestampMonotonic"],
+                   capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as error:
+        return [f"probe_unevaluable unit={unit} err={error.__class__.__name__}"]
+    if done.returncode != 0:
+        return [f"probe_unevaluable unit={unit} rc={done.returncode}"]
+    facts: dict[str, str] = {}
+    for line in done.stdout.splitlines():
+        key, _, value = line.partition("=")
+        facts[key.strip()] = value.strip()
+    # 起跑时 systemd 把上一轮的退出时间清零;正在探说明定时器活着,结论归这一轮自己的 OnFailure。
+    if facts.get("ActiveState") == "activating":
+        return []
+    exited = facts.get("ExecMainExitTimestampMonotonic", "")
+    if not exited.isdigit():
+        return [f"probe_unevaluable unit={unit} exit_timestamp={exited or 'missing'}"]
+    if int(exited) == 0:
+        return [f"probe_never_ran_since_boot unit={unit}"]
+    if facts.get("Result") != "success":
+        return [f"probe_last_run_failed unit={unit} result={facts.get('Result') or '?'} "
+                f"status={facts.get('ExecMainStatus') or '?'}"]
+    age_minutes = (monotonic() - int(exited) / 1_000_000) / 60
+    if age_minutes > max_age_minutes:
+        return [f"probe_stale unit={unit} age_minutes={age_minutes:.1f} "
+                f"limit={max_age_minutes}"]
+    return []
+
+
+def main(argv: list[str] | None = None, *, run=subprocess.run,
+         monotonic=time.monotonic) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backup-root", default="/opt/nmu/backups", type=Path)
     # 30 小时而不是 24:timer 带 RandomizedDelaySec=600,再留一次维护窗的余量。
@@ -118,6 +160,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-free-mb", default=1024, type=int)
     parser.add_argument("--state-file", type=Path, default=None,
                         help="把结论写到这里(0600),给不方便读退出码的调用方")
+    parser.add_argument("--probe-unit", default=None,
+                        help="顺带核对这个探针单元最近一次成功的时间(生产给 nmu-health.service)")
+    # 探针每 10 分钟一次:30 分钟 = 连着错过两次以上。
+    parser.add_argument("--probe-max-age-minutes", default=30.0, type=float)
     args = parser.parse_args(argv)
 
     root = args.backup_root
@@ -129,11 +175,16 @@ def main(argv: list[str] | None = None) -> int:
             max_consecutive_failures=args.max_consecutive_failures,
             min_free_mb=args.min_free_mb)
     except Unevaluable as error:
-        verdict = f"UNHEALTHY {error}"
+        problems = [str(error)]
         code = 2
     else:
-        verdict = "HEALTHY" if not problems else "UNHEALTHY " + "; ".join(problems)
         code = 0 if not problems else 1
+    if args.probe_unit:
+        stale = probe_staleness(args.probe_unit, max_age_minutes=args.probe_max_age_minutes,
+                                run=run, monotonic=monotonic)
+        problems.extend(stale)
+        code = code or (1 if stale else 0)
+    verdict = "HEALTHY" if not problems else "UNHEALTHY " + "; ".join(problems)
 
     line = f"[{now:%F %T}] {verdict}"
     print(line)

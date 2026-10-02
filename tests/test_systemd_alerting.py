@@ -162,3 +162,11 @@ def test_web_workers_are_never_multiplied():
             if re.search(r"(?:^|\s)(--workers|-w)(?:[=\s]\d)", line):
                 offenders.append(f"{path.name}: {line}")
     assert not offenders, "uvicorn 必须单 worker：\n" + "\n".join(offenders)
+
+
+def test_the_daily_health_verdict_asks_when_the_public_probe_last_succeeded():
+    """探针定时器自己死掉时什么都不会失败（9/30 重启后它停在 elapsed，一次 OnFailure 都没有），
+    只能由每天的健康判定去问它最近一次成功是什么时候。"""
+    service = (UNITS / "nmu-backup-health.service").read_text(encoding="utf-8")
+
+    assert "--probe-unit nmu-health.service" in service
