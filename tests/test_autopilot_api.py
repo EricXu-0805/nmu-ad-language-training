@@ -6795,6 +6795,37 @@ def test_resume_still_refuses_when_the_latest_probe_failed_even_after_it_expired
     assert stale.json()["detail"]["code"] == "provider_readiness_expired"
 
 
+def test_resume_refuses_a_probe_of_the_previous_configuration_before_and_after_expiry(
+        api_clients: ApiClients, monkeypatch):
+    """上线改了引擎版本(指纹变了),旧实测不能拿来恢复:过期前报 config_mismatch,
+    过期后投影先判过期、报 expired,配置已变仍由 matches_current_config 拒。"""
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    first = _device_next(api_clients)
+    assert first is not None
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{first['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    current = provider_readiness.capture_configuration()
+    monkeypatch.setattr(provider_readiness, "capture_configuration",
+                        lambda **_kwargs: replace(current, fingerprint="f" * 64))
+    fresh = _resume(api_clients, key="resume-config-changed-fresh-0001",
+                    expected_revision=drained.json()["state_revision"])
+    assert fresh.status_code == 409, fresh.text
+    assert fresh.json()["detail"]["code"] == "provider_readiness_config_mismatch"
+    real_now = provider_readiness._utc_now_naive
+    monkeypatch.setattr(provider_readiness, "_utc_now_naive",
+                        lambda: real_now() + timedelta(hours=2))
+    readiness = api_clients.account.get("/ai/provider-readiness").json()
+    assert (readiness["status"], readiness["matches_current_config"]) == ("expired", False)
+    stale = _resume(api_clients, key="resume-config-changed-stale-0001",
+                    expected_revision=drained.json()["state_revision"])
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "provider_readiness_expired"
+
+
 def test_replayed_device_failure_ack_does_not_pause_a_manually_resumed_runtime(
         api_clients: ApiClients, monkeypatch):
     """平板丢了响应会原样重发失败回执。重放在「人工接管 + 账号恢复」之后到达时,

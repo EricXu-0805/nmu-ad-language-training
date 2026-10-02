@@ -488,10 +488,13 @@ def readiness_projection(session: DBSession, *,
         and row.config_fingerprint == current.fingerprint
         and row.runtime_contract == current.runtime_contract)
     expired = row.expires_at <= checked_now
-    if not matches:
-        status = "config_mismatch"
-    elif expired:
+    # 先判过期再判配置:过了 TTL 的实测不论配置变没变都得重测,再报「配置已变」只会
+    # 让人以为出了别的事(2026-10 判分版本号并进 prompt 摘要,上一次实测早已过期)。
+    # 配置事实照样由 matches_current_config 给出,恢复门单独看它。
+    if expired:
         status = "expired"
+    elif not matches:
+        status = "config_mismatch"
     elif not row.required_capabilities_ready:
         status = "required_capability_failed"
     else:
@@ -500,7 +503,8 @@ def readiness_projection(session: DBSession, *,
         # The response schema describes THIS projection's structure, so it is
         # always the current constant.  A historical row's own schema version
         # is an input to `matches` above and nothing else: it downgrades the
-        # row to config_mismatch rather than changing the wire contract.
+        # row to config_mismatch (or expired, once past its TTL) rather than
+        # changing the wire contract.
         schema_version=SCHEMA_VERSION,
         # Returned verbatim on purpose.  Substituting the current constant here
         # would let an old runtime contract masquerade as the current one; the
@@ -559,12 +563,14 @@ def require_resume_ready(session: DBSession) -> ReadinessProjection:
     但一场训练 40 分钟起步,安全暂停后常常已过 30 分钟 TTL;研究者账号又没权限
     重新探测,只能干等管理员——2026-09-13 复核坐实的死角。过期只是「距上次实测久了」,
     不是「供应商不可用」;真不可用时下一句 TTS/ASR 会失败,自动带练照样安全暂停。
-    没探测过、配置已变、必需能力失败的,仍然拒。投影先判过期再判能力,所以一次
-    失败的实测过了 TTL 也会投成 expired——这里单独再看 required_capabilities_ready,
-    最近一次实测是失败的就不放(对抗复核 2026-09-13)。
+    没探测过、配置已变、必需能力失败的,仍然拒。投影先判过期再判配置和能力,所以
+    旧配置的实测、失败的实测过了 TTL 都会投成 expired——这里单独再看
+    matches_current_config 与 required_capabilities_ready:实测的不是当前配置、
+    或最近一次实测是失败的,都不放(对抗复核 2026-09-13;配置一条 2026-10-02)。
     """
     projection = readiness_projection(session)
     if (projection.status not in {"ready", "expired"}
+            or not projection.matches_current_config
             or not projection.required_capabilities_ready):
         raise ProviderReadinessConflict(projection)
     return projection
