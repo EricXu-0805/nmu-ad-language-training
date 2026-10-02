@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import time
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -116,7 +117,8 @@ def kind_of(payload: dict) -> str:
 class World:
     """一个装好的探针目录 + 一张假网 + 一个假时钟；tick() 就是 cron 跑一轮。"""
 
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, module=None) -> None:
+        self.mod = module or probe
         self.home = home
         self.base = home / ".openclaw" / "workspace" / "nmu-probe"
         self.base.mkdir(parents=True)
@@ -138,8 +140,9 @@ class World:
     def run(self, *argv: str, advance: bool = True) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = probe.main(list(argv), base=self.base, run=self.net, send=self.outbox,
-                              get=self._get, sleep=self.slept.append, clock=lambda: self.now)
+            code = self.mod.main(list(argv), base=self.base, run=self.net, send=self.outbox,
+                                 get=self._get, sleep=self.slept.append,
+                                 clock=lambda: self.now)
         if advance:
             self.now += RUN
         return code, out.getvalue(), err.getvalue()
@@ -797,6 +800,73 @@ def test_the_probe_paths_live_under_the_openclaw_workspace():
     assert str(probe.KEYCHAIN_GET) == "/home/eric/.openclaw/bin/keychain-get"
     assert probe.WEBHOOK_SECRET == "OPENCLAW_DISCORD_DAILY_WEBHOOK"
     assert probe.DOWN_AFTER_RUNS == 2 and probe.SILENCE_MAX_S == 24 * 3600
+
+
+# ---------------------------------------------------------------------------
+# 变异检查：把实现改坏，对应的场景必须红。改的是源码文本而不是 monkeypatch，
+# 钉住的是「这行代码不对时测试真会失败」，而不是「换了替身测试会失败」。
+# ---------------------------------------------------------------------------
+
+def _mutant(old: str, new: str):
+    source = (OFFBOX / "nmu_offbox_probe.py").read_text(encoding="utf-8")
+    assert source.count(old) == 1, f"变异锚点应当正好出现一次：{old!r}"
+    module = types.ModuleType("offbox_probe_mutant")
+    sys.modules[module.__name__] = module
+    exec(compile(source.replace(old, new, 1), "nmu_offbox_probe_mutant.py", "exec"),
+         module.__dict__)
+    return module
+
+
+def _one_failed_run_sends_nothing(world: World) -> None:
+    world.tick(HEALTHY)
+    world.tick(TIMEOUT)
+    assert world.outbox.tries == []
+
+
+def _an_undelivered_down_is_sent_on_the_next_run(world: World) -> None:
+    world.outbox = Outbox(False, False)
+    world.tick(TIMEOUT)
+    world.tick(TIMEOUT)
+    world.tick(TIMEOUT)
+    assert world.kinds() == ["down"]
+
+
+def _a_silence_beyond_24h_is_ignored(world: World) -> None:
+    world.silence_until(str(T0 + 25 * 3600))
+    world.tick(TIMEOUT)
+    world.tick(TIMEOUT)
+    assert world.kinds() == ["down"]
+
+
+def _a_spa_shell_is_a_failure(world: World) -> None:
+    world.tick(SPA_SHELL)
+    world.tick(SPA_SHELL)
+    assert world.kinds() == ["down"]
+
+
+MUTATIONS = [
+    ("down-after-1-run", "DOWN_AFTER_RUNS = 2\n", "DOWN_AFTER_RUNS = 1\n",
+     _one_failed_run_sends_nothing),
+    # 发送失败就把欠账清掉并落盘:下一轮再也不会补发。
+    ("drop-owed-retry",
+     "        if not delivered:\n            return sent, outcome\n",
+     '        if not delivered:\n            state["owed"].clear()\n'
+     "            save_state(path, state)\n            return sent, outcome\n",
+     _an_undelivered_down_is_sent_on_the_next_run),
+    ("no-24h-silence-cap", "now < until <= now + SILENCE_MAX_S", "now < until",
+     _a_silence_beyond_24h_is_ignored),
+    ("no-body-check", "if expect is not None and not _body_matches(body, expect):", "if False:",
+     _a_spa_shell_is_a_failure),
+]
+
+
+@pytest.mark.parametrize(("old", "new", "scenario"), [m[1:] for m in MUTATIONS],
+                         ids=[m[0] for m in MUTATIONS])
+def test_each_mandated_mutation_turns_its_scenario_red(tmp_path, old, new, scenario):
+    scenario(World(tmp_path / "real"))
+
+    with pytest.raises(AssertionError):
+        scenario(World(tmp_path / "mutant", _mutant(old, new)))
 
 
 # ---------------------------------------------------------------------------
