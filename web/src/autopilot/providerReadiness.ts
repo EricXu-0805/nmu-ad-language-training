@@ -18,7 +18,8 @@ export interface ProviderCapabilityReadiness {
 export interface ProviderReadiness {
   // Exactly one accepted response schema, never a v1∪v2 union: the server
   // always projects the current version, and a historical v1 probe surfaces as
-  // config_mismatch inside a v2 envelope rather than as a v1 response.
+  // config_mismatch (or expired, once past its TTL) inside a v2 envelope rather
+  // than as a v1 response.
   schemaVersion: "provider-readiness.v2";
   runtimeContract: "p0a_sim_first_single_v1";
   status: ProviderReadinessStatus;
@@ -113,8 +114,9 @@ export function parseProviderReadiness(value: unknown): ProviderReadiness {
   const startAllowed = candidate.start_allowed;
   const status = candidate.status as ProviderReadinessStatus;
   const matchesCurrentConfig = candidate.matches_current_config;
+  // 服务器先判过期再判配置,expired 可以是旧配置的实测;其余状态与配置事实一一对应。
   const statusMatchesConfigFact = status === "missing" || status === "config_mismatch"
-    ? !matchesCurrentConfig : matchesCurrentConfig;
+    ? !matchesCurrentConfig : status === "expired" || matchesCurrentConfig;
   const allConfiguredSuccesses = tts.success && asr.success
     && (!llm.configured || llm.success);
   if (startAllowed !== (candidate.status === "ready")

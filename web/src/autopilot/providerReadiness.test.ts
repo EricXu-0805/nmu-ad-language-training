@@ -138,6 +138,31 @@ test("every v2 status projection parses with its own invariants", () => {
   assert.equal(mismatch.startAllowed, false);
 });
 
+test("an expired probe may belong to a previous configuration and still never permits a start", () => {
+  // 服务器先判过期再判配置:过了 TTL 的旧配置实测投成 expired,配置已变的事实
+  // 留在 matches_current_config 里。其余状态仍与配置事实一一对应。
+  const parsed = parseProviderReadiness({
+    ...ready(), status: "expired", start_allowed: false, matches_current_config: false,
+  });
+  assert.equal(parsed.status, "expired");
+  assert.equal(parsed.matchesCurrentConfig, false);
+  assert.equal(parsed.startAllowed, false);
+  assert.equal(providerReadinessLabel(parsed), "AI 服务实测已过期，需管理员重新检查");
+  for (const status of ["ready", "required_capability_failed"]) {
+    assert.throws(() => parseProviderReadiness({
+      ...ready(), status, start_allowed: status === "ready",
+      required_capabilities_ready: status === "ready",
+      all_configured_capabilities_ready: status === "ready",
+      tts: status === "ready" ? capability()
+        : capability({ success: false, failure_code: "tts_audio_invalid" }),
+      matches_current_config: false,
+    }), /内部矛盾/);
+  }
+  assert.throws(() => parseProviderReadiness({
+    ...ready(), status: "expired", start_allowed: true, matches_current_config: false,
+  }), /内部矛盾/);
+});
+
 test("only the current schema and the current runtime contract are accepted", () => {
   for (const envelope of [
     { ...ready(), schema_version: "provider-readiness.v1" },
