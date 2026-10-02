@@ -14,8 +14,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import (audio_store, autopilot_service, content, export, export_security,
-                 repeat_intent)
+from app import (audio_store, autopilot_ledger, autopilot_service, content, export,
+                 export_security, repeat_intent)
 from app.enums import AudioStatus
 from app.export import DIRECT_IDENTIFIER_COLUMNS, mask_text, pseudonymize
 from app.models import (
@@ -2232,9 +2232,24 @@ def _link_source_attempt(db, item_id: str, turn_seq: int, attempt: AttemptEvent)
     db.commit()
 
 
+def _proof_by_trigger_ack(db, record, *, require_live_scope=True):
+    """播放证明的替身:只认录音命令登记的那条触发回执,缺了就和真证明一样抛错。
+
+    真证明还要核 TTS 话术契约、回执绑定与修订号,由账本测试和 answer-now/停播的真
+    API 流程覆盖;这里只测导出把证明结果放进哪一列、用什么取值。"""
+    ack = db.exec(select(RuntimeCommandAck).where(
+        RuntimeCommandAck.command_id == record.predecessor_command_id,
+        RuntimeCommandAck.idempotency_key == record.trigger_ack_idempotency_key)).first()
+    if ack is None:
+        raise autopilot_ledger.AutopilotProofError("no trigger ACK")
+    return ack
+
+
 def test_turns_say_how_the_source_capture_closed_and_whether_its_prompt_played_out(
-        db, tmp_path):
-    """环节行跟着它依据的那次录音走:怎么收的口,收音前那句话术播完没有(抢答或按「现在回答」打断)。"""
+        db, tmp_path, monkeypatch):
+    """环节行跟着它依据的那次录音走:怎么收的口,收音前那句话术播完没有(抢答或按「现在回答」打断)。
+    播放结局与 attempts 表同一个函数、同一套取值。"""
+    monkeypatch.setattr(autopilot_ledger, "verify_tts_ended_prerequisite", _proof_by_trigger_ack)
     _seed(db)
     _link_source_attempt(db, "SE_锚", 1, _seed_capture_chain(
         db, raw_audio_id="a_vad", item_id="SE_锚", turn_seq=1, command_seq=1,
@@ -2253,9 +2268,10 @@ def test_turns_say_how_the_source_capture_closed_and_whether_its_prompt_played_o
     turns = {(row["item_id"], row["turn_seq"]): (
         row["source_stop_reason"], row["source_prompt_playback_outcome"])
         for row in result["sheets"]["turns"]}
-    assert turns[("SE_锚", 1)] == ("silence", "completed")
-    assert turns[("DE_斧子+树", 1)] == ("user_done", "interrupted")
-    assert turns[("DE_斧子+树", 2)] == ("max_duration", None)
+    assert turns[("SE_锚", 1)] == ("silence", "ended")
+    assert turns[("DE_斧子+树", 1)] == ("user_done", "interrupted_answer_now")
+    # 有录音命令却证明不了那句话术怎么结束的:和 attempts 表一样记 unverified,不当成空。
+    assert turns[("DE_斧子+树", 2)] == ("max_duration", "unverified")
     # 没有关联录音的环节(人工录入)两列都空。
     assert turns[("DE_斧子+树", 3)] == (None, None)
     assert export.SHEET_FIELDS["turns"][-3:] == (

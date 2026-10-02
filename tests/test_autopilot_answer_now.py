@@ -112,6 +112,10 @@ def test_interrupted_question_and_cue_can_finish_capture_and_scoring_without_low
         assert export._prompt_playback_evidence(db, attempts[-1]) == {
             "prompt_playback_outcome": "interrupted_answer_now", "prompt_played_ms": 400,
             "prompt_exposure_needs_review": True}
+        # turns 表与研究读面的 source_prompt_playback_outcome 用同一个证明,同一段录音同一个值。
+        provenance = export.capture_provenance(db, attempts)
+        assert [provenance[row.id]["prompt_playback_outcome"] for row in attempts] == [
+            "interrupted_answer_now", "interrupted_answer_now"]
     feedback = _device_next(api_clients)
     assert feedback["payload"]["purpose"] == "feedback"
     started = _post(api_clients, feedback, "tts_started", 7)

@@ -146,8 +146,10 @@ _TURNS = Dataset(
                "要按本列分层抽听录音。没有平板录音命令的环节（人工录入、历史场次）为空"),
         Column("source_prompt_playback_outcome", "clear", "string",
                "本环节所依据那次录音之前，那句提问或提示话术播完没有。同样是平板回执里的"
-               "运行事实，不是研究真值：completed=平板报告自然播完；interrupted=没播完就被"
-               "打断（老人开口抢答，或有人按了「现在回答」），老人可能没听全；找不到播放回执"
+               "运行事实，不是研究真值，取值与导出包 attempts 表的 prompt_playback_outcome "
+               "相同：ended=平板报告自然播完；interrupted_answer_now=有人按了「现在回答」；"
+               "interrupted_voice_activity=老人开口，声音停播；这两种老人都可能没听全；"
+               "unverified=有平板录音命令但账本证明不了那句话术怎么结束的；没有平板录音命令"
                "（人工录入、历史场次）为空。被打断不改提示层级，也不推断老人听到了哪几个字"),
         Column("asr_text", "forbidden", "-", "语音识别原文：永不出现"),
         Column("confirmed_response_text", "forbidden", "-", "人工确认作答文本：永不出现"),

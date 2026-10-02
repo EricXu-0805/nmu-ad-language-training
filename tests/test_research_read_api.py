@@ -19,7 +19,7 @@ from starlette.datastructures import QueryParams, URL
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import (auth, content, db, export_security, quality_release,
+from app import (auth, autopilot_ledger, content, db, export_security, quality_release,
                  repeat_intent, main, research_dataset, research_read,
                  resource_limits, session_admission)
 from app.db import get_session
@@ -41,7 +41,7 @@ from app.models import (
     QuestionnaireItemValue,
     QuestionnaireRecord,
 )
-from test_export import _seed_capture_chain
+from test_export import _proof_by_trigger_ack, _seed_capture_chain
 
 
 BANK = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
@@ -986,6 +986,8 @@ def test_turns_carry_how_the_source_capture_closed_and_whether_its_prompt_played
         research_env, monkeypatch):
     """与导出包 turns.csv 同名同值:两边用的是同一个 export.capture_provenance。"""
     _with_key(monkeypatch)
+    # 播放证明用导出测试同一个替身:这里只测读面把证明结果放进哪一列。
+    monkeypatch.setattr(autopilot_ledger, "verify_tts_ended_prerequisite", _proof_by_trigger_ack)
     with Session(research_env) as session:
         item = session.exec(select(ItemEvent).where(
             ItemEvent.session_id == "S-REAL-1")).first()
@@ -1012,7 +1014,7 @@ def test_turns_carry_how_the_source_capture_closed_and_whether_its_prompt_played
     closed = {row["turn_seq"]: (row["source_stop_reason"],
                                 row["source_prompt_playback_outcome"])
               for row in payload["rows"]}
-    assert closed == {1: ("silence", "interrupted"), 2: (None, None)}
+    assert closed == {1: ("silence", "interrupted_answer_now"), 2: (None, None)}
 
 
 def test_the_schema_surface_stays_readable_without_a_key_but_carries_no_data(

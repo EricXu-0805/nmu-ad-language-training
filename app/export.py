@@ -1820,6 +1820,10 @@ def _prompt_playback_evidence(db, attempt: AttemptEvent) -> dict:
         RuntimeCommand.expected_raw_audio_id == attempt.raw_audio_id,
         RuntimeCommand.kind == "record",
     )).first()
+    return _prompt_playback_for_record(db, record)
+
+
+def _prompt_playback_for_record(db, record: RuntimeCommand | None) -> dict:
     empty = {"prompt_playback_outcome": None, "prompt_played_ms": None,
              "prompt_exposure_needs_review": False}
     if record is None:
@@ -1841,9 +1845,6 @@ def _prompt_playback_evidence(db, attempt: AttemptEvent) -> dict:
             "prompt_exposure_needs_review": interrupted}
 
 
-_PLAYBACK_OUTCOME_BY_ACK = {"tts_ended": "completed", "tts_interrupted": "interrupted"}
-
-
 def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
     """每段录音怎么收的口、收音前那句话术播完没有：平板回执里的运行事实，不是研究真值。
 
@@ -1851,8 +1852,9 @@ def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
     expected_raw_audio_id 找，没有平板录音命令的（人工录音、历史场次）一律为空。
     stop_reason 只出闭集，库里别的值出 None 而不拦整份导出：它和播放结局一样只描述
     采集过程。vad_armed 是新平板才带的可选键；旧平板、平板还没读到语音设置、刷新后补发的回执都不带，为 None。
-    播放结局认录音命令登记的那条触发回执（trigger_ack_idempotency_key），不认同一
-    条 TTS 上别的回执。
+    播放结局与 attempts 表的 prompt_playback_outcome 同一个函数、同一套取值
+    （ended / interrupted_<原因> / unverified），都要过账本对触发回执的证明，同一份
+    导出里两张表不会对同一段录音说两样话。
     """
     by_audio = {attempt.raw_audio_id: attempt for attempt in attempts}
     facts = {attempt.id: {"stop_reason": None, "vad_armed": None,
@@ -1870,16 +1872,10 @@ def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
     stopped = {ack.command_id: ack for ack in db.exec(select(RuntimeCommandAck).where(
         RuntimeCommandAck.command_id.in_([record.id for record in records]),
         RuntimeCommandAck.ack_type == "record_stopped"))}
-    playback = {
-        (ack.command_id, ack.idempotency_key): _PLAYBACK_OUTCOME_BY_ACK[ack.ack_type]
-        for ack in db.exec(select(RuntimeCommandAck).where(
-            RuntimeCommandAck.command_id.in_(
-                [record.predecessor_command_id for record in records]),
-            RuntimeCommandAck.ack_type.in_(list(_PLAYBACK_OUTCOME_BY_ACK))))}
     for record in records:
         fact = facts[by_audio[record.expected_raw_audio_id].id]
-        fact["prompt_playback_outcome"] = playback.get(
-            (record.predecessor_command_id, record.trigger_ack_idempotency_key))
+        fact["prompt_playback_outcome"] = _prompt_playback_for_record(
+            db, record)["prompt_playback_outcome"]
         ack = stopped.get(record.id)
         try:
             payload = json.loads(ack.payload_json) if ack is not None else {}

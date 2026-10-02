@@ -123,5 +123,6 @@ def test_capture_provenance_columns_are_appended_and_documented_as_operational_f
     for value in ("silence", "user_done", "max_duration", "stream_end"):
         assert value in stop_reason.description, value
     assert "尾部静音" in stop_reason.description and "自动收麦" in stop_reason.description
-    for value in ("completed", "interrupted"):
+    for value in ("ended", "interrupted_answer_now", "interrupted_voice_activity", "unverified"):
         assert value in playback.description, value
+    assert "prompt_playback_outcome" in playback.description

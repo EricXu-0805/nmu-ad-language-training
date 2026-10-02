@@ -124,6 +124,8 @@ def test_voice_interruption_preserves_score_review_and_distinct_export(api_clien
         assert export._prompt_playback_evidence(db, attempt) == {
             "prompt_playback_outcome": "interrupted_voice_activity", "prompt_played_ms": 750,
             "prompt_exposure_needs_review": True}
+        assert export.capture_provenance(db, [attempt])[attempt.id][
+            "prompt_playback_outcome"] == "interrupted_voice_activity"
     feedback = _device_next(api_clients)
     started = _post(api_clients, feedback, "tts_started", 4)
     assert started.status_code == 200, started.text
