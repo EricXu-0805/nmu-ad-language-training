@@ -32,6 +32,7 @@ systemctl enable --now nmu-backup.timer nmu-backup-health.timer \
 ```bash
 systemctl start nmu-backup.service
 tail -3 /opt/nmu/backups/backup.log     # 运维真相在这里，不在 status 字段
+systemctl list-timers --all 'nmu-*' --no-pager   # 定时器看 NEXT 列，不看 active，见文末
 ```
 
 ## 与本机布局绑定的两个事实
@@ -86,3 +87,32 @@ journal 推到 Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,�
 
 `tests/test_systemd_alerting.py` 把这三条钉住:每个单元必须有 OnFailure、
 `Restart=always` 必须配得上 burst、单元里不许出现 `|| true`、必须存在公网探针单元。
+
+## 定时器：唯一入口、维护重启、怎么验收（2026-10-02 起）
+
+2026-09-30 重启后 `nmu-health.timer` 晚于开机 5 分钟才被启动。它当时只有
+`OnBootSec=5min` + `OnUnitActiveSec=10min` 两条单调触发：systemd 249 丢掉已过期的
+开机截止点,`OnUnitActiveSec` 在新一次开机里又没有基准,定时器停在 `SubState=elapsed`、
+没有下一次触发时间,`systemctl status` 却一直显示 `active`。公网探针就此停摆,
+没有任何东西因此失败,也就没有任何告警。
+
+- **`nmu-backup.timer` 是唯一的备份入口。** `/etc/cron.d`、`cron.daily`、`cron.hourly`、
+  `cron.weekly` 里不许有 `nmu-*` 条目,手工补跑也走 `systemctl start nmu-backup.service`。
+  cron 那份不带单元里的 `PYTHON_BIN`(上文十四夜那条路径),失败了也不触发 `OnFailure`。
+- **维护重启不得停用定时器。** 重启前不要 `disable` / `mask` 任何 `nmu-*.timer`,也不要
+  打算重启后再手工一个个起回来:它们是 `enabled` 的,开机时随 `timers.target` 自己起来。
+  停用不会让任何东西失败、也没有告警,忘了恢复就是无声停摆。重启后按下一条验收。
+- **验收读 `SubState` 和 `NEXT`,不读 `ActiveState`。**
+
+```bash
+systemctl list-timers --all 'nmu-*' --no-pager    # 每一行 NEXT 都要有时间,不能是 n/a
+for t in $(systemctl list-unit-files --no-legend 'nmu-*.timer' | awk '{print $1}'); do
+  systemctl show "$t" -p Id -p SubState -p NextElapseUSecRealtime -p UnitFileState
+done    # 每个都要 SubState=waiting、NextElapseUSecRealtime 非空、UnitFileState=enabled
+```
+
+对应的自动检查:`preflight_check.py --os` 的「无 nmu-* cron 条目」查第一条;
+「定时器在排程」就是上面第二段命令,被停用、被停止或停在 elapsed 的定时器都会被点名;
+`nmu-backup-health` 每天带 `--probe-unit nmu-health.service` 问一次公网探针最近一次
+成功是什么时候,超过 30 分钟即不健康。所有定时器只用 `OnCalendar`:单调触发晚启动一次
+就再也不触发,`Persistent=true` 对它也不起作用。`tests/test_systemd_alerting.py` 钉住这两条。
