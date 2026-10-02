@@ -819,7 +819,8 @@ def test_waiting_state_recovery_preserves_generation_and_delayed_ack(autopilot_e
         assert recovered.lease_owner == "new-runner"
 
 
-def _seed_complete_capture_chain(session: Session) -> tuple[int, int]:
+def _seed_complete_capture_chain(
+        session: Session, *, stop_payload: dict | None = None) -> tuple[int, int]:
     now = datetime(2026, 7, 18, 11, 0, 0)
     _seed_session(session, "S-PROOF", "P-PROOF")
     session.commit()
@@ -919,7 +920,7 @@ def _seed_complete_capture_chain(session: Session) -> tuple[int, int]:
         device_id_hash=capability.device_id_hash,
         capability_token_hash=capability.token_hash,
         payload_json=autopilot_ledger.encode_ack_payload(
-            "record_stopped", {"stop_reason": "silence"}),
+            "record_stopped", stop_payload or {"stop_reason": "silence"}),
         receipt_server_seq=receipt.server_seq,
         raw_audio_id=audio.raw_audio_id,
         checksum=checksum,
@@ -1030,6 +1031,90 @@ def test_terminal_record_proof_rejects_noncanonical_or_unbounded_ack_payload(
             match="payload is not canonical evidence",
         ):
             autopilot_ledger.verify_terminal_record_capture(session, record_id)
+
+
+@pytest.mark.parametrize("stop_payload", [
+    {"stop_reason": "silence"},
+    {"stop_reason": "user_done", "vad_armed": False},
+    {"stop_reason": "max_duration", "vad_armed": True},
+    {"stop_reason": "silence", "vad_armed": True, "vad_voiced_ms": 0},
+    {"stop_reason": "user_done", "vad_armed": True, "vad_voiced_ms": 600_000},
+])
+def test_record_stopped_vad_facts_verify_in_every_capture_proof(
+        autopilot_engine, stop_payload):
+    with Session(autopilot_engine) as session:
+        record_id, receipt_id = _seed_complete_capture_chain(
+            session, stop_payload=stop_payload)
+        stopped = session.exec(select(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == record_id,
+            RuntimeCommandAck.ack_type == "record_stopped",
+        )).one()
+        assert json.loads(stopped.payload_json) == stop_payload
+        record = session.get(RuntimeCommand, record_id)
+        proofs = [
+            autopilot_ledger.verify_immutable_record_capture(session, record),
+            autopilot_ledger.verify_terminal_record_capture(session, record_id),
+            autopilot_ledger.verify_settled_record_capture(session, record_id),
+            autopilot_ledger.verify_record_capture_for_attempt(session, record_id),
+        ]
+        assert proofs[0].receipt_server_seq == receipt_id
+        assert all(proof == proofs[0] for proof in proofs)
+
+
+@pytest.mark.parametrize("payload_json", [
+    '{"stop_reason":"silence","vad_voiced_ms":1200}',
+    '{"stop_reason":"silence","vad_armed":false,"vad_voiced_ms":1200}',
+    '{"stop_reason":"silence","vad_armed":null}',
+    '{"stop_reason":"silence","vad_armed":1}',
+    '{"stop_reason":"silence","vad_armed":"true"}',
+    '{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":null}',
+    '{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":true}',
+    '{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":1200.0}',
+    '{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":"1200"}',
+    '{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":-1}',
+    '{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":600001}',
+    '{"vad_armed":true,"vad_voiced_ms":1200}',
+    '{"stop_reason":["silence"],"vad_armed":true}',
+    '{"stop_reason":"silence","vad_armed":true,"vad_noise_floor":1}',
+    '{"vad_armed":true,"stop_reason":"silence"}',
+    '{"stop_reason":"silence", "vad_armed":true}',
+])
+def test_capture_proofs_reject_contradictory_mistyped_or_noncanonical_vad_facts(
+        autopilot_engine, payload_json):
+    with Session(autopilot_engine) as session:
+        record_id, _receipt_id = _seed_complete_capture_chain(session)
+        session.execute(update(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id == record_id,
+            RuntimeCommandAck.ack_type == "record_stopped",
+        ).values(payload_json=payload_json))
+        session.commit()
+        session.expire_all()
+        record = session.get(RuntimeCommand, record_id)
+        for verify in (
+                lambda: autopilot_ledger.verify_immutable_record_capture(session, record),
+                lambda: autopilot_ledger.verify_settled_record_capture(session, record_id),
+                lambda: autopilot_ledger.verify_terminal_record_capture(session, record_id)):
+            with pytest.raises(
+                autopilot_ledger.AutopilotProofError,
+                match="payload is not canonical evidence",
+            ):
+                verify()
+
+
+def test_only_record_stopped_payload_key_set_is_widened():
+    assert autopilot_ledger.ACK_PAYLOAD_KEYS == {
+        "tts_started": frozenset({"media_duration_ms"}),
+        "tts_ended": frozenset({"media_ended", "media_duration_ms"}),
+        "tts_interrupted": frozenset({
+            "media_stopped", "interrupt_reason", "media_duration_ms"}),
+        "tts_failed": frozenset({"error_code", "failure_stage"}),
+        "record_started": frozenset({"mime_type", "sample_rate_hz", "channels"}),
+        "record_stopped": frozenset({"stop_reason", "vad_armed", "vad_voiced_ms"}),
+        "record_failed": frozenset({"error_code", "failure_stage"}),
+    }
+    for ack_type in ("record_started", "record_failed", "tts_ended"):
+        with pytest.raises(ValueError, match="unauthorized"):
+            autopilot_ledger.encode_ack_payload(ack_type, {"vad_armed": True})
 
 
 def test_terminal_record_proof_rejects_ack_after_command_success(

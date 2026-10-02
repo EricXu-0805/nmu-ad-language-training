@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -365,3 +367,105 @@ def test_response_path_rejects_free_form_branch_names():
             cue_level=1,
             response_path="client_selected_branch",
         )
+
+
+def _record_stopped(stop_reason: str = "silence", **facts) -> AutopilotAckIn:
+    return AutopilotAckIn(
+        idempotency_key="ack-record-vad-0001",
+        ack_type="record_stopped",
+        control_generation=1,
+        runner_generation=1,
+        command_revision=1,
+        device_event_seq=2,
+        raw_audio_id="raw-vad-0001",
+        receipt_server_seq=3,
+        checksum="c" * 64,
+        byte_count=4096,
+        duration_seconds=3.5,
+        stop_reason=stop_reason,
+        **facts,
+    )
+
+
+@pytest.mark.parametrize(("stop_reason", "facts", "payload"), [
+    # 旧平板两个键都不发:历史 {"stop_reason"} 原样不变。
+    ("user_done", {}, {"stop_reason": "user_done"}),
+    ("user_done", {"vad_armed": None, "vad_voiced_ms": None}, {"stop_reason": "user_done"}),
+    ("max_duration", {"vad_armed": False}, {"stop_reason": "max_duration", "vad_armed": False}),
+    ("silence", {"vad_armed": True}, {"stop_reason": "silence", "vad_armed": True}),
+    ("silence", {"vad_armed": True, "vad_voiced_ms": 0},
+     {"stop_reason": "silence", "vad_armed": True, "vad_voiced_ms": 0}),
+    ("user_done", {"vad_armed": True, "vad_voiced_ms": 600_000},
+     {"stop_reason": "user_done", "vad_armed": True, "vad_voiced_ms": 600_000}),
+])
+def test_record_stopped_vad_facts_are_optional_and_persist_verbatim(stop_reason, facts, payload):
+    ack = _record_stopped(stop_reason, **facts)
+    assert ack.event_payload() == payload
+    # 服务层会对 model_construct 实例按 python 形态重验;严格类型在重验里也不能松。
+    assert AutopilotAckIn.model_validate(
+        ack.model_dump(mode="python")).event_payload() == payload
+
+
+@pytest.mark.parametrize("facts", [
+    {"vad_voiced_ms": 1200},
+    {"vad_armed": None, "vad_voiced_ms": 1200},
+    {"vad_armed": False, "vad_voiced_ms": 0},
+    {"vad_armed": 1},
+    {"vad_armed": 0},
+    {"vad_armed": "true"},
+    {"vad_armed": "yes"},
+    {"vad_armed": True, "vad_voiced_ms": True},
+    {"vad_armed": True, "vad_voiced_ms": 1200.0},
+    {"vad_armed": True, "vad_voiced_ms": "1200"},
+    {"vad_armed": True, "vad_voiced_ms": -1},
+    {"vad_armed": True, "vad_voiced_ms": 600_001},
+])
+def test_record_stopped_rejects_contradictory_or_mistyped_vad_facts(facts):
+    with pytest.raises(ValidationError):
+        _record_stopped(**facts)
+
+
+@pytest.mark.parametrize("raw", [
+    '{"vad_armed": 1}',
+    '{"vad_armed": "true"}',
+    '{"vad_armed": true, "vad_voiced_ms": true}',
+    '{"vad_armed": true, "vad_voiced_ms": 1200.0}',
+    '{"vad_armed": true, "vad_voiced_ms": 1e3}',
+    '{"vad_voiced_ms": 1200}',
+])
+def test_record_stopped_vad_facts_are_strict_on_the_json_wire(raw):
+    body = _record_stopped().model_dump(mode="json", exclude_none=True)
+    body.update(json.loads(raw))
+    with pytest.raises(ValidationError):
+        AutopilotAckIn.model_validate_json(json.dumps(body))
+    with pytest.raises(ValidationError):
+        AutopilotAckIn.model_validate(body)
+
+
+@pytest.mark.parametrize(("ack_type", "shape"), [
+    ("tts_started", {}),
+    ("tts_ended", {"media_ended": True}),
+    ("tts_interrupted", {"media_stopped": True, "interrupt_reason": "voice_activity",
+                         "media_duration_ms": 750}),
+    ("tts_failed", {"error_code": "audio_playback_failed"}),
+    ("record_started", {"mime_type": "audio/webm"}),
+    ("record_failed", {"error_code": "recording_runtime_failed"}),
+])
+@pytest.mark.parametrize("facts", [
+    {"vad_armed": True},
+    {"vad_armed": False},
+    {"vad_armed": True, "vad_voiced_ms": 1200},
+])
+def test_only_record_stopped_may_carry_vad_facts(ack_type, shape, facts):
+    base = dict(
+        idempotency_key="ack-not-stopped-0001",
+        ack_type=ack_type,
+        control_generation=1,
+        runner_generation=1,
+        command_revision=0,
+        device_event_seq=1,
+        **shape,
+    )
+    assert AutopilotAckIn(**base).event_payload() is not None
+    with pytest.raises(ValidationError):
+        AutopilotAckIn(**base, **facts)
