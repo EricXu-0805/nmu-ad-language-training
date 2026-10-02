@@ -41,6 +41,7 @@ from app.models import (
     QuestionnaireItemValue,
     QuestionnaireRecord,
 )
+from test_export import _seed_capture_chain
 
 
 BANK = content.load_item_bank(content.CONTENT_DIR / "item_bank_v1.json")
@@ -979,6 +980,39 @@ def test_columns_the_dictionary_declares_as_variables_actually_carry_values(
         "source_attempt_seq 整列都是 null——字典宣称它是关联的原始尝试序号"
     for row in turns:
         assert "source_attempt_id" not in row, "反查成序号，不能把主键漏出去"
+
+
+def test_turns_carry_how_the_source_capture_closed_and_whether_its_prompt_played_out(
+        research_env, monkeypatch):
+    """与导出包 turns.csv 同名同值:两边用的是同一个 export.capture_provenance。"""
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        item = session.exec(select(ItemEvent).where(
+            ItemEvent.session_id == "S-REAL-1")).first()
+        attempt = _seed_capture_chain(
+            session, session_id="S-REAL-1", raw_audio_id="AUDIO-VAD-1",
+            item_id=item.item_id, turn_seq=1, command_seq=1,
+            playback_ack="tts_interrupted",
+            stop_payload='{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":1200}')
+        turn = session.exec(select(TurnEvent).where(
+            TurnEvent.item_event_id == item.id)).first()
+        turn.source_attempt_id = attempt.id
+        session.add(turn)
+        # 没有关联录音的环节(人工录入):两列都空。
+        session.add(TurnEvent(
+            item_event_id=item.id, turn_seq=2, response_role="命名",
+            prompt_level=1, judge_portrait_used=False))
+        session.commit()
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
+
+    payload = _client("steward").get(
+        "/research/v1/turns?data_classification=research").json()
+    assert payload["columns"][-2:] == [
+        "source_stop_reason", "source_prompt_playback_outcome"]
+    closed = {row["turn_seq"]: (row["source_stop_reason"],
+                                row["source_prompt_playback_outcome"])
+              for row in payload["rows"]}
+    assert closed == {1: ("silence", "interrupted"), 2: (None, None)}
 
 
 def test_the_schema_surface_stays_readable_without_a_key_but_carries_no_data(
