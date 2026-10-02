@@ -130,6 +130,10 @@ export type AutopilotAck =
     checksum: string;
     byte_count: number;
     duration_seconds: number;
+    /** 「说完没」采样器这次真读到过帧(静音自动收麦确实在听)。 */
+    vad_armed?: boolean;
+    /** 停止那一刻判定器累计的有声毫秒;只在 vad_armed 为 true 时出现。 */
+    vad_voiced_ms?: number;
   })
   | (AckBase & {
     ack_type: "record_failed";
@@ -362,16 +366,21 @@ export function parseAutopilotAck(value: unknown): AutopilotAck {
       }
       break;
     case "record_stopped":
+      // VAD 两键必须 optional:旧平板不发,IndexedDB 存量 envelope 里也没有,
+      // required 会让刷新恢复把历史 ACK 判非法。
       if (exact([
         "stop_reason", "raw_audio_id", "receipt_server_seq", "checksum",
         "byte_count", "duration_seconds",
-      ])
+      ], ["vad_armed", "vad_voiced_ms"])
           && oneOf(row.stop_reason, AUTOPILOT_STOP_REASONS)
           && RAW_AUDIO_ID.test(typeof row.raw_audio_id === "string" ? row.raw_audio_id : "")
           && safeInteger(row.receipt_server_seq, 1)
           && typeof row.checksum === "string" && CHECKSUM.test(row.checksum)
           && safeInteger(row.byte_count, 1)
-          && finiteNumber(row.duration_seconds, 0, 21_600)) {
+          && finiteNumber(row.duration_seconds, 0, 21_600)
+          && (!Object.hasOwn(row, "vad_armed") || typeof row.vad_armed === "boolean")
+          && (!Object.hasOwn(row, "vad_voiced_ms")
+            || (row.vad_armed === true && safeInteger(row.vad_voiced_ms, 0, 600_000)))) {
         return row as unknown as AutopilotAck;
       }
       break;
