@@ -88,7 +88,7 @@ EXCLUDED_LABELS = {
     "no_attempt": "没有 attempt（如「再说一遍」）",
     "technical_failure": "技术失败",
     "not_judged": "attempt 没判完",
-    "no_next_tts": "下一条命令不是 TTS",
+    "no_next_tts": "后面没有接着的 TTS（如场次到此结束）",
     "crossed_pause": "中间隔了暂停/续弹（控制代际变了）",
     "next_tts_not_started": "下一条 TTS 没开播",
 }
