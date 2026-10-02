@@ -9,7 +9,8 @@ D2 走查那天真正只能靠人的，是麦克风、噪声、断网和老人�
   数据库   代码的 alembic 头与库里的头是否一致（只读，一条 SELECT）
   备份     检查备份脚本可执行，并复用 backup_health_check 的新鲜度判据
   依赖     已安装依赖与带哈希锁是否一致
-  操作系统 显式启用时核对安全更新和重启状态、nmu-*.timer 是否真排上了下一次
+  操作系统 显式启用时核对安全更新和重启状态、nmu-*.timer 是否真排上了下一次、
+           /opt/nmu 下 tar 包/数据库/env 文件不对 other 可读
   公网     /health 200、四条红线 404、五个安全头齐、受保护路由 401
 
 不打任何供应商的云 API：那要花钱、要把文本发出去，得由人明确发起。
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -45,6 +47,7 @@ REQUIRED_HEADERS = (
     "permissions-policy",
 )
 BACKUP_EXECUTABLES = ("scripts/vps-backup-daily.sh", "scripts/backup.sh")
+SENSITIVE_PATTERNS = ("*.tar.gz", "*.tgz", "*.db", ".env*", "*.env")
 
 
 class Check:
@@ -254,6 +257,53 @@ def check_timers_scheduled(run=subprocess.run) -> Check:
     return Check(name, True, f"{len(timers)} 个 nmu-*.timer 都是 waiting 且排上了下一次")
 
 
+def check_sensitive_file_modes(root: Path = Path("/opt/nmu")) -> Check:
+    """root 下两层以内的打包件、数据库和 env 文件不许对 other 可读。
+
+    这几类文件装着整棵应用树、受试者数据或密钥。tar 按默认 umask 打出来就是 644，
+    这台机器上任何一个账号都能把它们读走。
+    """
+    name = "敏感文件不对 other 可读"
+    try:
+        top = sorted(root.iterdir())
+    except OSError as error:
+        return Check(name, False, f"列不出 {root}：{error.strerror or error}")
+    candidates: list[Path] = []
+    unlisted: list[str] = []
+    for path in top:
+        if path.is_dir() and not path.is_symlink():
+            try:
+                candidates.extend(sorted(path.iterdir()))
+            except OSError:
+                unlisted.append(str(path))
+        else:
+            candidates.append(path)
+
+    exposed = []
+    for path in candidates:
+        # 入库的模板，没有秘密；rsync -a 每次同步都会按本机权限把它带成 644。
+        if path.name == ".env.example":
+            continue
+        if not any(fnmatch.fnmatchcase(path.name, pattern) for pattern in SENSITIVE_PATTERNS):
+            continue
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISREG(mode) and mode & stat.S_IROTH:
+            exposed.append(str(path))
+
+    problems = []
+    if exposed:
+        shown = "、".join(exposed[:5]) + ("…" if len(exposed) > 5 else "")
+        problems.append(f"{len(exposed)} 个文件对 other 可读：{shown}；修法 chmod o-r")
+    if unlisted:
+        problems.append(f"列不出 {'、'.join(unlisted)}，没查过的不当作通过")
+    if problems:
+        return Check(name, False, "；".join(problems))
+    return Check(name, True, f"{root} 两层以内的 tar 包、.db 与 env 文件都不对 other 可读")
+
+
 def _default_fetch(url: str, timeout: float):
     context = ssl.create_default_context()
     request = urllib.request.Request(url, method="GET")
@@ -383,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.os:
         checks.append(check_os_security())
         checks.append(check_timers_scheduled())
+        checks.append(check_sensitive_file_modes())
     else:
         checks.append(Check("OS 安全补丁", None, "未给 --os"))
     if args.base_url:

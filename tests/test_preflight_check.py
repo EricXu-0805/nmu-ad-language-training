@@ -270,6 +270,79 @@ def test_no_installed_timer_at_all_is_a_failure_not_a_pass():
     assert check.ok is False
 
 
+def _touch(path: Path, mode: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x", encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+def _nmu_root(tmp_path: Path) -> Path:
+    root = tmp_path / "opt-nmu"
+    (root / "app").mkdir(parents=True)
+    (root / "backups").mkdir()
+    return root
+
+
+def test_sensitive_files_closed_to_other_pass(tmp_path):
+    root = _nmu_root(tmp_path)
+    _touch(root / "app-before-deploy-20260831-183746.tar.gz", 0o600)
+    _touch(root / "ops-alert.env", 0o600)
+    _touch(root / "app" / ".env", 0o640)
+    _touch(root / "app" / "README.md", 0o644)  # 不在名单里，谁读都行
+
+    check = preflight.check_sensitive_file_modes(root)
+
+    assert check.ok is True, check.detail
+
+
+@pytest.mark.parametrize("relative", [
+    "app-before-deploy-20260831-183746.tar.gz", "app/release.tgz", "app/app.db",
+    "app/.env", "app/.env.before-20260823-fpkey", "ops-alert.env",
+])
+def test_a_sensitive_file_readable_by_other_is_named(tmp_path, relative):
+    root = _nmu_root(tmp_path)
+    _touch(root / relative, 0o644)
+
+    check = preflight.check_sensitive_file_modes(root)
+
+    assert check.ok is False
+    assert "1 个" in check.detail
+    assert str(root / relative) in check.detail
+
+
+def test_sensitive_file_check_reports_the_count_and_at_most_five_paths(tmp_path):
+    root = _nmu_root(tmp_path)
+    paths = [_touch(root / f"app-before-deploy-{index}.tar.gz", 0o604) for index in range(7)]
+
+    check = preflight.check_sensitive_file_modes(root)
+
+    assert check.ok is False
+    assert "7 个" in check.detail
+    assert sum(str(path) in check.detail for path in paths) == 5
+
+
+def test_sensitive_file_check_looks_two_levels_deep_and_no_further(tmp_path):
+    root = _nmu_root(tmp_path)
+    _touch(root / "app" / "data" / "app.db", 0o644)  # 第三层：不在这条的范围里
+
+    assert preflight.check_sensitive_file_modes(root).ok is True
+
+
+def test_the_tracked_env_template_is_not_treated_as_a_secret(tmp_path):
+    # 入库的模板，rsync -a 每次都按本机的 644 带过去；里面没有秘密。
+    root = _nmu_root(tmp_path)
+    _touch(root / "app" / ".env.example", 0o644)
+
+    assert preflight.check_sensitive_file_modes(root).ok is True
+
+
+def test_sensitive_file_check_fails_when_the_root_cannot_be_listed(tmp_path):
+    check = preflight.check_sensitive_file_modes(tmp_path / "no-such-root")
+
+    assert check.ok is False
+
+
 def test_skipped_groups_do_not_fail_the_run(capsys):
     code = preflight.main([])
 
@@ -314,6 +387,9 @@ def _make_all_automatic_groups_pass(monkeypatch) -> None:
         preflight, "check_timers_scheduled",
         lambda: preflight.Check("定时器在排程", True, "waiting"))
     monkeypatch.setattr(
+        preflight, "check_sensitive_file_modes",
+        lambda: preflight.Check("敏感文件不对 other 可读", True, "closed"))
+    monkeypatch.setattr(
         preflight, "check_public_surface",
         lambda _url: [preflight.Check("公网表面", True, "closed")])
 
@@ -337,6 +413,7 @@ def test_os_flag_also_checks_that_the_timers_are_scheduled(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "[PASS] OS 安全补丁" in output
     assert "[FAIL] 定时器在排程" in output
+    assert "[PASS] 敏感文件不对 other 可读" in output
 
 
 @pytest.mark.parametrize("mode, expected", [(0o640, 1), (0o750, 0)])
