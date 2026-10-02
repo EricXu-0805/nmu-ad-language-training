@@ -20,7 +20,8 @@ import pytest
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-SHELL_SCRIPTS = sorted(SCRIPTS.glob("*.sh"))
+# deploy/ 下的安装器(如 deploy/offbox/install_offbox_probe.sh)同样是人照着 runbook 敲的。
+SHELL_SCRIPTS = sorted(SCRIPTS.glob("*.sh")) + sorted((SCRIPTS.parent / "deploy").rglob("*.sh"))
 
 # 裸 $var 或 \$var 紧跟一个非 ASCII 字符。${var} 与 "$var" 后跟空白都不算。
 BARE_VAR_BEFORE_WIDE = re.compile(r"\$\{?\\?\$?[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_}])[^\x00-\x7F]")

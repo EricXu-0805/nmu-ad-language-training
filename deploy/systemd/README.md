@@ -176,8 +176,12 @@ journal 推到 Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,�
    OnFailure 是死的。补丁积压攒到 106 个那次就是这么攒起来的。现在保留退出码,
    `chmod` 从 `ExecStartPost` 挪进命令内部(失败时 ExecStartPost 不执行,state 权限会松)。
 3. **「进程活着但站点不服务」这一整档没有任何检查。** 备份脚本直接 sqlite3 打开磁盘上
-   的 app.db,服务死没死它照写 ok。新增 `nmu-health.timer`,每 10 分钟从外面打一次
-   公网 `/health`,一条覆盖「返 500」「Caddy 死了」「证书过期」「磁盘满转只读」。
+   的 app.db,服务死没死它照写 ok。新增 `nmu-health.timer`,每 10 分钟从应用进程外面打一次
+   公网 `/health`,覆盖「进程不应答、返 5xx」「Caddy 死了」「证书过期」。
+   **「磁盘满转只读」它看不出来**:`/health` 返回一个常量(`app/main.py` 的 `health()`),
+   不碰库也不碰盘,只证明进程还在应答;库和盘的毛病要等每天一次的 `nmu-backup-health`
+   与 `nmu-capacity`。它也跑在这台机器上,机器宕了或出口断了它和它的告警一起没了,
+   那一档归文末的异地探针。
 
 `tests/test_systemd_alerting.py` 把这三条钉住:每个单元必须有 OnFailure、
 `Restart=always` 必须配得上 burst、单元里不许出现 `|| true`、必须存在公网探针单元。
@@ -213,3 +217,56 @@ done    # 每个都要 SubState=waiting、NextElapseUSecRealtime 非空、UnitFi
 `nmu-backup-health` 每天带 `--probe-unit nmu-health.service` 问一次公网探针最近一次
 成功是什么时候,超过 30 分钟即不健康。所有定时器只用 `OnCalendar`:单调触发晚启动一次
 就再也不触发,`Persistent=true` 对它也不起作用。`tests/test_systemd_alerting.py` 钉住这两条。
+
+## 异地探针(2026-10 起,跑在 OpenClaw VPS 上)
+
+`nmu-health` 从本机打回本机的公网地址,机器宕了、机房出口断了,它和它的 `OnFailure`
+告警一起没了。`deploy/offbox/` 补这一档:探针跑在 Eric 的 OpenClaw VPS(`openclaw-prod`,
+DigitalOcean 纽约)。这台 NMU 机器上不装任何东西,只是每 10 分钟多收一个来自
+`147.182.176.237` 的 `GET /health`(重试时最多 3 个),上线脚本的空闲检查不数它。
+
+| 项 | 取值 |
+| --- | --- |
+| 在哪跑 | `openclaw-prod` 的 user crontab 一行 `4-59/10`(UTC 每小时 04/14/…/54 分,避开 watchdog 与本机探针),套 `flock -n`;文件在 `~/.openclaw/workspace/nmu-probe/`(0700) |
+| 一轮怎么判 | 最多试 3 次,每次最多 15 秒,间隔 20 秒;HTTP 200 且正文是 `/health` 的应答才算通(SPA 外壳也回 200) |
+| 不算 NMU 的 | 三次都不通时先探 Discord API,它也没应答 = 纽约这头的问题,只记账、不计数 |
+| DNS | 名字解析失败再钉 IP(`--resolve`,Host 与 SNI 不变)探一次:钉 IP 就通记 `dns`,照样算挂,用户靠的就是这个域名 |
+| 何时报 | 连续 2 轮失败报一次 DOWN 并 @Eric(10-22 分钟发现);恢复报一次 RECOVERED,带中断时长;中间不重复。近 30 天最长一次停机 4 分 51 秒,上线与重启不会触发 |
+| 报到哪 | `#daily-digest`,用 `OPENCLAW_DISCORD_DAILY_WEBHOOK`(本机告警的 `/opt/nmu/ops-alert.env` 当初是从同一个值复制的),署名「NMU 异地探针」,正文写明「从纽约看」;发不出去的下一轮补发,DOWN 一直没发出去就恢复的合成一条补报 |
+| 它自己停了 | OpenClaw 22:00 CT 的 Heartbeat 多一行「NMU 异地探针」:超过 25 分钟没跑 WARN,DOWN 中 ERROR,24 小时内有未到阈值的失败 WARN |
+
+安装、核对、回滚都由 Eric 在 Mac 上跑(写 crontab、真发 Discord 消息,agent 过不了):
+
+```bash
+bash deploy/offbox/install_offbox_probe.sh --plan        # 只列步骤,不连机器
+bash deploy/offbox/install_offbox_probe.sh               # 预检 → 推送 → 零消息自测 → 核频道 → 装 crontab
+bash deploy/offbox/install_offbox_probe.sh --verify      # 下一个 :x4 之后,零消息核对
+bash deploy/offbox/install_offbox_probe.sh --heartbeat   # 把 check_nmu_probe 插进 heartbeat.py
+```
+
+预检要求 crontab 与 `heartbeat.py` 的 sha256 等于 2026-10-02 量到的基线,不符就列差异停下,
+不在别人改过的文件上动手。`--test-alert` 只有显式给了才真发一条测试消息。
+
+维护要停站超过 10 分钟,先静默。文件里是 epoch 秒,只认未来 24 小时以内的值,不是整数
+一律不认,所以忘了删也最多管 24 小时:
+
+```bash
+ssh eric@147.182.176.237 'date -u -d "+90 min" +%s > ~/.openclaw/workspace/nmu-probe/silence-until'
+```
+
+静默只压「新的 DOWN」:在窗口里开始又结束的故障一条都不发,过了窗口还挂着照报。
+看状态:`ssh eric@147.182.176.237 '/usr/bin/python3 -B ~/.openclaw/workspace/nmu-probe/nmu_offbox_probe.py --status'`。
+回滚:`crontab ~/.openclaw/backups/crontab.before-nmu-probe-<时间戳>`;插过 Heartbeat 的再
+`cp -p heartbeat.py.before-nmu-probe-<时间戳> heartbeat.py`;最后 `gio trash ~/.openclaw/workspace/nmu-probe`。
+
+它的边界:
+
+- 只从纽约一个点看。美国这侧的线路问题可能误报;国内用户到南京那一段(GFW、CN2)出问题它看不到。
+- 与 `openclaw-prod` 同生共死:那台机器挂了,探针和 Heartbeat 一起没了,只能靠 22:00 CT 那条
+  Heartbeat 没来发现。反过来让 NMU 数「30 分钟没收到 147.182.176.237 的 /health」是第二期的事。
+- `/health` 只证明进程在应答,库和盘的毛病两个探针都看不见。
+- x-feed 在 14:00、17:30 UTC 把那台单核机器占满约 7 分钟;三次重试加两轮门槛应能吸收,
+  饿死超过 10 分钟仍可能误报一次 DOWN。
+- 四条告警共用一个 webhook(Heartbeat、watchdog、本机告警的副本、这个探针):轮换
+  `OPENCLAW_DISCORD_DAILY_WEBHOOK` 时,`/opt/nmu/ops-alert.env` 与 Mac 的
+  `~/Library/nmu-backup/ops-webhook.env` 要一起换,否则会一起哑掉。
