@@ -641,6 +641,9 @@ export function ServerAutopilotControl({
     : null;
   const heardVisible = heardPosition !== null && (active || processing || paused);
   const heard = heardVisible && attempts !== null ? autopilotAttemptView(attempts, heardPosition) : null;
+  // 这一题最后一段录音技术失败:服务端拒「继续」与「老人已答对」,只收「跳过本题」和转人工。
+  // 只在能裁定时成立:跳过已保存而 AI 服务暂不可用时位置仍停在失败那题,要靠「继续」往下走。
+  const positionAttemptFailed = canAdjudicate && heard?.verdict.kind === "failed";
   const title = manual ? "AI 自动带练已转为人工接管"
     : active ? "AI 正在控制当前环节"
     : processing ? "AI 正在处理当前回答"
@@ -693,7 +696,8 @@ export function ServerAutopilotControl({
                       : isSimulation ? "启动 AI 自动带练（演练）"
                         : "启动 AI 自动带练"}
           </Button>
-          {receiptAllowsAutopilotResume(state.receipt) && !contentGap && !scopeExhausted && (
+          {receiptAllowsAutopilotResume(state.receipt) && !contentGap && !scopeExhausted
+            && !positionAttemptFailed && (
             <Button type="button" variant="primary" disabled={controlBusy}
               onClick={() => setConfirmResume(true)}>
               {resumeBusy ? "正在恢复 AI 自动带练…"
@@ -702,13 +706,15 @@ export function ServerAutopilotControl({
           )}
           {canAdjudicate && (
             <>
-              <Button type="button" variant="secondary" disabled={controlBusy}
-                onClick={() => openAdjudication("confirmed_correct")}>
-                {adjudicateBusy ? "正在记录裁定…" : "老人已答对"}
-              </Button>
+              {!positionAttemptFailed && (
+                <Button type="button" variant="secondary" disabled={controlBusy}
+                  onClick={() => openAdjudication("confirmed_correct")}>
+                  {adjudicateBusy ? "正在记录裁定…" : "老人已答对"}
+                </Button>
+              )}
               <Button type="button" variant="secondary" disabled={controlBusy}
                 onClick={() => openAdjudication("skip_item")}>
-                跳过本题
+                {adjudicateBusy && positionAttemptFailed ? "正在记录裁定…" : "跳过本题"}
               </Button>
             </>
           )}
@@ -742,8 +748,12 @@ export function ServerAutopilotControl({
           <>{autopilotErrorHint("autopilot_adjudication_saved")}</>
         ) : (
           <>
-            AI 已安全暂停，题目停在当前位置。点「继续 AI 自动带练」由 AI 接着当前题目（已经答过的，按最后一次回答给下一级提示或反馈）；或点「转为人工操作」由你人工继续本场。
-            {canAdjudicate && (
+            {positionAttemptFailed ? (
+              <>AI 已安全暂停：这一题最后一段录音处理出错，AI 不能接着做，也判不了「答对」。可点「跳过本题」，原因选「识别反复出错」或「其他」：跳过连同账号名和原因一起记录，不算老人答错，那段录音原样保留，保存后 AI 从下一题继续（AI 服务不可用时保持暂停）；或点「转为人工操作」把这一题人工做完。</>
+            ) : (
+              <>AI 已安全暂停，题目停在当前位置。点「继续 AI 自动带练」由 AI 接着当前题目（已经答过的，按最后一次回答给下一级提示或反馈）；或点「转为人工操作」由你人工继续本场。</>
+            )}
+            {canAdjudicate && !positionAttemptFailed && (
               <div style={{ marginTop: "var(--sp-1)" }}>
                 老人其实答对了、或这题不该再问，可点「老人已答对」结束当前环节，或「跳过本题」结束本题剩余环节。保存决定后会尝试继续；AI 服务不可用时保持暂停。AI 自己的判定原样保留，你的决定连同账号名和原因一起记录；研究评分仍以事后复核为准。
               </div>

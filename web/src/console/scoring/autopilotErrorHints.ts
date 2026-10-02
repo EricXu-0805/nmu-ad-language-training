@@ -9,17 +9,16 @@ const RECORDING_START_FAILED_HINT = "老人端麦克风没能启动。常见原�
 const MICROPHONE_DENIED_HINT = "老人端浏览器拒绝了麦克风权限，请在平板上允许后再点「继续 AI 自动带练」。";
 const MICROPHONE_UNAVAILABLE_HINT = "老人端找不到麦克风设备，请检查平板后再继续。";
 const CONTENT_GAP_HINT = "下一题缺少自动训练内容，AI 已停下，不会跳题。请点「转为人工操作」继续。";
-const ASR_FAILURE_HINT = "AI 没能识别刚才那段录音（语音识别出错），已停下。这一题 AI 不能接着做，请点「转为人工操作」人工完成。";
+const ASR_FAILURE_HINT = "AI 没能识别刚才那段录音（语音识别出错），已停下。这一题 AI 不能接着做：可点「跳过本题」（原因选「识别反复出错」或「其他」），或点「转为人工操作」人工完成。";
 const PROVIDER_READINESS_HINT = "AI 服务实测已过期或未通过，请管理员先点『检查 AI 服务』。";
 
 /**
  * 处理录音时的内部校验失败:具体是哪一道闸只有研究团队看得懂,提示里把码一起给出。
  * 录音此时已经保存,「继续」会用已保存录音再处理一次;处理状态已判失败的,服务端会
- * 用 autopilot_attempt_failed 拒绝,那条提示会让人转人工。
+ * 用 autopilot_attempt_failed 拒绝,那条提示让人跳过本题或转人工。
  */
 const WORKER_INTERNAL_CODES = [
   "autopilot_worker_exception",
-  "autopilot_attempt_technical_failure",
   "autopilot_attempt_result_invalid",
   "autopilot_attempt_route_failed",
   "autopilot_attempt_commit_fence_lost",
@@ -74,11 +73,13 @@ export const AUTOPILOT_ERROR_HINTS: Readonly<Record<string, string>> = Object.fr
   asr_invalid_result: ASR_FAILURE_HINT,
   asr_degraded: ASR_FAILURE_HINT,
   asr_recovery_state_invalid: ASR_FAILURE_HINT,
-  judgement_exception: "AI 判分出错，已停下。这一题 AI 不能接着做，请点「转为人工操作」人工完成。",
+  judgement_exception: "AI 判分出错，已停下。这一题 AI 不能接着做：可点「跳过本题」（原因选「识别反复出错」或「其他」），或点「转为人工操作」人工完成。",
   cloud_provider_boundary_unknown: "AI 识别/判分服务的数据去向无法确认（服务器配置问题），为保护受试者数据 AI 已停下。这一题请点「转为人工操作」人工完成，并请管理员检查 AI 服务配置。",
   cloud_processing_not_authorized: "这位受试者没有有效的云处理授权，AI 不能把录音送去云端识别，已停下。这一题请点「转为人工操作」人工完成；要继续 AI 带练，请先在受试者档案完成云处理授权。",
   ...Object.fromEntries(WORKER_INTERNAL_CODES.map((code) => [code,
     `AI 处理刚才那段录音时内部出错，已停下（录音已保存）。可以点「继续 AI 自动带练」再试；仍不行请点「转为人工操作」，并把这段提示截图发给研究团队（错误码：${code}）。`])),
+  // worker 兜底码:attempt 已判技术失败(只是没带错误码),「继续」会被 autopilot_attempt_failed 拒。
+  autopilot_attempt_technical_failure: "AI 处理刚才那段录音时出错，已停下（录音已保存）。这一题 AI 不能接着做：可点「跳过本题」（原因选「识别反复出错」或「其他」），或点「转为人工操作」人工完成；并把这段提示截图发给研究团队（错误码：autopilot_attempt_technical_failure）。",
   intervention_completion_evidence_incomplete: "这一题的证据不完整（录音或判定没有落账），AI 不能替它宣布完成。点「转为人工操作」把这一题人工做完。",
   explicit_repeat_limit: "老人已多次要求重听，达到协议上限，AI 停下等你决定。点「继续 AI 自动带练」AI 会接着这一题（已经答过的，按最后一次回答给下一级提示或反馈）；也可以点「转为人工操作」人工完成。",
   legacy_repeat_recovery_complete: "本场开始于「再说一遍」规则上线之前，AI 已处理完遗留的那段录音并就此停下，本场不能再继续带练；请直接进入场次收尾。",
@@ -90,7 +91,7 @@ export const AUTOPILOT_ERROR_HINTS: Readonly<Record<string, string>> = Object.fr
   autopilot_adjudication_already_recorded: "这个环节的现场决定已经保存，不能重复裁定。请继续 AI 自动带练，或转为人工操作。",
   autopilot_adjudication_attempt_required: "这一题还没有录到老人的回答，AI 判不了「答对」；可以点「跳过本题」，或点「继续 AI 自动带练」让 AI 重问这一题。",
   autopilot_attempt_processing: "上一段录音还在判分，几秒后再点。",
-  autopilot_attempt_failed: "上一段录音判分失败，AI 不能接着弹这一题；点「转为人工操作」把这一题人工完成。",
+  autopilot_attempt_failed: "上一段录音判分失败，AI 不能接着弹这一题，也判不了「答对」；可点「跳过本题」（原因选「识别反复出错」或「其他」），或点「转为人工操作」把这一题人工完成。",
   autopilot_attempt_abandoned: "上一段录音的判分被暂停打断；可点「继续 AI 自动带练」，用已保存录音接着处理，或转为人工操作。",
   autopilot_resume_position_unresumable: "人工接管期间答过的这一题，AI 不能接着弹；请人工完成这一题后再切回。",
   autopilot_scope_completed: "本场可自动带练的题目已全部练完或裁定完毕；请直接进入场次收尾。",
@@ -103,14 +104,14 @@ export const AUTOPILOT_ERROR_HINTS: Readonly<Record<string, string>> = Object.fr
   autopilot_device_not_paired: "本场已切回并保持暂停。请在老人端重新连接这场训练，确认配对后再点「继续 AI 自动带练」。",
   autopilot_device_not_active: "老人端的连接已失效，请重新连接这场训练，确认配对后再继续。",
   ...Object.fromEntries(PROVIDER_READINESS_CODES.map((code) => [code, PROVIDER_READINESS_HINT])),
-  autopilot_cloud_processing_required: "AI 判分要用云端转写，这位受试者还没有有效的云处理授权。请先在受试者档案完成云处理授权，再点「继续 AI 自动带练」；也可以点「转为人工操作」。",
+  autopilot_cloud_processing_required: "AI 判分要用云端转写，这位受试者还没有有效的云处理授权。请先在受试者档案完成云处理授权再回来操作；也可以点「转为人工操作」。",
 });
 
 export function autopilotErrorHint(code: string): string {
   return Object.hasOwn(AUTOPILOT_ERROR_HINTS, code) ? AUTOPILOT_ERROR_HINTS[code] : `错误码：${code}`;
 }
 
-// 「继续 / 切回 AI」被拒时的提示。技术失败那一题在 AI 托管下只能转人工；已经在人工态时
+// 「继续 / 切回 AI」被拒时的提示。技术失败那一题在 AI 托管下只能跳过或转人工；已经在人工态时
 // 「转为人工操作」按钮不再显示，同一个码的意思变成「这一题还没人工做完」。
 export function autopilotResumeRefusalHint(code: string, manual: boolean): string {
   if (manual && code === "autopilot_attempt_failed") {
@@ -129,6 +130,8 @@ export const ADJUDICATION_PREWRITE_CODES: ReadonlySet<string> = new Set([
   "autopilot_attempt_abandoned",
   "autopilot_scope_completed",
   "autopilot_revision_conflict",
+  // 云处理授权(P0a 门禁)同样在写入前拒绝;技术失败那一题点「跳过本题」也会撞上它。
+  "autopilot_cloud_processing_required",
 ]);
 // 「继续」的写前拒绝码(收据 260 起题内续弹新增):同样在任何写入之前拒绝,提示要常驻,
 // 不能折成 2.5 s 后被轮询抹掉的 uncertain。AI 服务实测(provider_readiness.require_resume_ready)
