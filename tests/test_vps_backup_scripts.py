@@ -121,13 +121,20 @@ if [[ "$command_arg" == *"NMU_SNAPSHOT_FACTS_CONTRACT=1"* ]]; then
   else
     exit 2
   fi
-  "$PYTHON_BIN" -I - "$FAKE_REMOTE_ROOT/daily/$stamp" <<'PY'
+  # 只有远端命令真的要了多链接文件的路径（%P），这里才按新合同放行顶层安全名录音。
+  linked_audio_contract=0
+  if [[ "$command_arg" == *"%P"* ]]; then
+    linked_audio_contract=1
+  fi
+  "$PYTHON_BIN" -I - "$FAKE_REMOTE_ROOT/daily/$stamp" "$linked_audio_contract" <<'PY'
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 
 root = Path(sys.argv[1])
+linked_audio_contract = sys.argv[2] == "1"
 files = 0
 byte_count = 0
 directory_count = 0
@@ -144,7 +151,10 @@ for current, directories, filenames in os.walk(root, followlinks=False):
         if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
             invalid += 1
             continue
-        if meta.st_nlink != 1:
+        relative = (current_path / name).relative_to(root).as_posix()
+        if meta.st_nlink != 1 and not (
+                linked_audio_contract
+                and re.fullmatch(r"audio/[A-Za-z0-9][A-Za-z0-9._-]*", relative)):
             invalid += 1
             continue
         files += 1
@@ -188,6 +198,9 @@ if [[ "$src" == */ ]] && [[ " $* " != *" -x "* ]]; then
   exit 96
 fi
 printf '%s\n' "$src" >> "$TRANSFER_LOG"
+if [ -n "${RSYNC_ARGS_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$RSYNC_ARGS_LOG"
+fi
 remote_path=${src#*:}
 relative=${remote_path#"$NMU_BACKUP_REMOTE_ROOT"}
 source="$FAKE_REMOTE_ROOT$relative"
@@ -624,6 +637,193 @@ def test_pull_rejects_received_tree_that_changed_after_preflight(tmp_path):
     assert "snapshot_changed_during_transfer" in (local / "pull.log").read_text()
 
 
+def _snapshot_facts_awk() -> str:
+    text = (ROOT / "scripts" / "vps-backup-pull.sh").read_text(encoding="utf-8")
+    match = re.search(r"^SNAPSHOT_FACTS_AWK='([^']*)'$", text, re.M)
+    assert match, "vps-backup-pull.sh 里找不到远端事实的 awk 程序 SNAPSHOT_FACTS_AWK"
+    return match.group(1)
+
+
+@pytest.mark.skipif(shutil.which("awk") is None, reason="awk not installed")
+@pytest.mark.parametrize(("lines", "expected"), [
+    (["d 4096 3", "f 100 1", "f 200 2 audio/aud-1.webm", "d 4096 2"], "2 300 2 0"),
+    (["d 4096 3", "f 200 2 audio/aud-1.webm.m4a"], "1 200 1 0"),
+    (["d 4096 3", "f 200 2 app.db"], "0 0 1 1"),
+    (["d 4096 3", "f 200 2 MANIFEST.sha256"], "0 0 1 1"),
+    (["d 4096 3", "f 200 2 config/env"], "0 0 1 1"),
+    (["d 4096 3", "f 200 2 exports/research/BATCH/audio_manifest.csv"], "0 0 1 1"),
+    (["d 4096 3", "f 200 2 audio/nested/aud-1.webm"], "0 0 1 1"),
+    (["d 4096 3", "f 200 2 audio/.aud-1.webm.link"], "0 0 1 1"),
+    (["d 4096 3", "f 200 2 audio/aud 1.webm"], "0 0 1 1"),
+    (["d 4096 3", "f -200 2 audio/aud-1.webm"], "0 0 1 1"),
+    (["d 4096 3", "f 200 2"], "0 0 1 1"),
+    (["d 4096 3", "l 10 1"], "0 0 1 1"),
+])
+def test_remote_facts_allow_multi_link_files_only_as_top_level_safe_audio(lines, expected):
+    completed = subprocess.run(
+        ["awk", _snapshot_facts_awk()], input="\n".join(lines) + "\n",
+        check=False, capture_output=True, text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == expected
+
+
+def _link_remote_audio(remote: Path, older_stamp: str, newer_stamp: str) -> None:
+    """VPS 打开录音去重后的样子：较新快照的录音是较旧那份的硬链接。"""
+    older = remote / "daily" / older_stamp / "audio" / "aud-test.webm"
+    newer = remote / "daily" / newer_stamp / "audio" / "aud-test.webm"
+    newer.unlink()
+    os.link(older, newer)
+
+
+def test_pull_lands_sibling_linked_remote_audio_as_independent_strict_files(tmp_path):
+    project, remote, local, env = _pull_harness(tmp_path)
+    older = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d-%H%M%S")
+    newer = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    for stamp in (older, newer):
+        _create_remote_snapshot(remote, stamp, b"unchanged-recording")
+    _link_remote_audio(remote, older, newer)
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == 0, completed.stderr
+    landed = [local / "daily" / stamp / "audio" / "aud-test.webm" for stamp in (older, newer)]
+    assert [path.stat().st_nlink for path in landed] == [1, 1]
+    assert landed[0].stat().st_ino != landed[1].stat().st_ino
+    for stamp in (older, newer):
+        verified = subprocess.run(
+            [sys.executable, "-I", str(GUARD_SOURCE), "verify-vps",
+             str(local / "daily" / stamp)],
+            check=False, capture_output=True, text=True,
+        )
+        assert verified.returncode == 0, verified.stderr
+
+
+def test_pull_skips_the_payload_of_an_already_archived_unchanged_stamp(tmp_path):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, stamp, b"archived-recording")
+    assert _run_pull(project, env).returncode == 0
+    transfers = Path(env["TRANSFER_LOG"])
+    before = len(transfers.read_text().splitlines())
+
+    replay = _run_pull(project, env)
+
+    assert replay.returncode == 0, replay.stderr
+    remote_prefix = (f"{env['NMU_BACKUP_SSH_USER']}@{env['NMU_BACKUP_SSH_HOST']}:"
+                     f"{env['NMU_BACKUP_REMOTE_ROOT']}")
+    assert transfers.read_text().splitlines()[before:] == [
+        f"{remote_prefix}/daily/{stamp}/MANIFEST.sha256",
+        f"{remote_prefix}/backup.log",
+    ]
+    assert re.search(r" ok snapshots=1 pulled=0 unchanged=1 used_mb=[0-9]+$",
+                     (local / "pull.log").read_text().splitlines()[-1])
+
+
+def test_pull_copies_unchanged_bytes_from_the_newest_local_archive(tmp_path):
+    project, remote, local, env = _pull_harness(tmp_path)
+    args_log = tmp_path / "rsync-args.log"
+    env["RSYNC_ARGS_LOG"] = str(args_log)
+    older = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d-%H%M%S")
+    newer = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, older, b"unchanged-recording")
+    assert _run_pull(project, env).returncode == 0
+    first = args_log.read_text().splitlines()
+    assert not any("--copy-dest" in line for line in first)
+
+    _create_remote_snapshot(remote, newer, b"unchanged-recording")
+    second = _run_pull(project, env)
+
+    assert second.returncode == 0, second.stderr
+    data_calls = [line for line in args_log.read_text().splitlines()[len(first):]
+                  if f"/daily/{newer}/ " in line]
+    assert len(data_calls) == 1
+    arguments = data_calls[0].split()
+    assert "--checksum" in arguments
+    assert f"--copy-dest={(local / 'daily' / older).resolve()}" in arguments
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+def test_real_rsync_copy_dest_with_checksum_lands_correct_independent_files(tmp_path):
+    source, basis, destination = (tmp_path / name for name in ("source", "basis", "destination"))
+    for directory in (source / "audio", basis / "audio", destination):
+        directory.mkdir(parents=True)
+    (source / "audio" / "same.webm").write_bytes(b"unchanged-recording")
+    shutil.copy2(source / "audio" / "same.webm", basis / "audio" / "same.webm")
+    # 同长同时间、字节不同：只比长度+时间的话会把基底的旧字节当成新快照的。
+    (source / "app.db").write_bytes(b"database-v2")
+    (basis / "app.db").write_bytes(b"database-v1")
+    source_time = (source / "app.db").stat()
+    os.utime(basis / "app.db", ns=(source_time.st_atime_ns, source_time.st_mtime_ns))
+    allowlist = tmp_path / "files-from"
+    allowlist.write_bytes(b"./app.db\0./audio/same.webm\0")
+
+    completed = subprocess.run(
+        [
+            shutil.which("rsync") or "rsync",
+            "-a", "-x", "--no-links", "--no-devices", "--no-specials", "--no-implied-dirs",
+            "--checksum", f"--copy-dest={basis}",
+            "--from0", f"--files-from={allowlist}", f"{source}/", f"{destination}/",
+        ],
+        check=False, capture_output=True, text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (destination / "app.db").read_bytes() == b"database-v2"
+    assert (destination / "audio" / "same.webm").read_bytes() == b"unchanged-recording"
+    for name in ("app.db", "audio/same.webm"):
+        assert (destination / name).stat().st_nlink == 1
+        assert (destination / name).stat().st_ino != (basis / name).stat().st_ino
+
+
+def _gnu_find() -> str | None:
+    for candidate in ("gfind", "find"):
+        path = shutil.which(candidate)
+        if path is None:
+            continue
+        probe = subprocess.run([path, "--version"], check=False, capture_output=True, text=True)
+        if probe.returncode == 0 and "GNU findutils" in probe.stdout:
+            return path
+    return None
+
+
+@pytest.mark.skipif(_gnu_find() is None, reason="needs GNU find -printf, as on the VPS")
+def test_real_remote_facts_command_accepts_linked_audio_and_rejects_other_links(tmp_path):
+    project, remote, local, env = _pull_harness(tmp_path)
+    finder = tmp_path / "gnu-find"
+    finder.mkdir()
+    (finder / "find").symlink_to(_gnu_find())
+    ssh_stub = Path(env["PATH"].split(":", 1)[0]) / "ssh"
+    body = ssh_stub.read_text(encoding="utf-8")
+    ssh_stub.write_text(body.replace(
+        'command_arg="${!#}"\n',
+        'command_arg="${!#}"\n'
+        'if [[ "$command_arg" == *"NMU_SNAPSHOT_FACTS_CONTRACT=1"* ]]; then\n'
+        '  PATH="$GNU_FIND_DIR:$PATH" exec bash -c '
+        '"${command_arg//$NMU_BACKUP_REMOTE_ROOT/$FAKE_REMOTE_ROOT}"\n'
+        'fi\n', 1), encoding="utf-8")
+    env["GNU_FIND_DIR"] = str(finder)
+    older = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d-%H%M%S")
+    newer = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    for stamp in (older, newer):
+        _create_remote_snapshot(remote, stamp, b"unchanged-recording")
+    _link_remote_audio(remote, older, newer)
+
+    linked_audio = _run_pull(project, env)
+
+    assert linked_audio.returncode == 0, linked_audio.stderr
+    assert (local / "daily" / newer / "audio" / "aud-test.webm").stat().st_nlink == 1
+
+    config = remote / "daily" / newer / "config"
+    (config / "env").unlink()
+    os.link(remote / "daily" / older / "config" / "env", config / "env")
+    linked_config = _run_pull(project, env)
+
+    assert linked_config.returncode != 0
+    assert "remote_snapshot_facts_invalid" in (local / "pull.log").read_text()
+
+
 def _daily_harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     app = tmp_path / "app"
     scripts = app / "scripts"
@@ -984,3 +1184,201 @@ def test_daily_uses_app_venv_when_python_bin_is_unset(tmp_path):
     assert " verify-vps " in f" {invocations} "
     assert " publish-vps " in f" {invocations} "
     assert len(invocations.splitlines()) >= 8
+
+
+# ---------------------------------------------------------------------------
+# 录音硬链接去重开关（NMU_BACKUP_LINK_AUDIO，默认关）
+# ---------------------------------------------------------------------------
+
+_OK_LINE = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ok snapshot=(?P<stamp>[0-9]{8}-[0-9]{6}) "
+    r"size=\S+ config=ok keep=14 source_bytes=[0-9]+ source_dirs=[0-9]+ "
+    r"reserve_bytes=[0-9]+(?P<tail>.*)$")
+_LINK_TAIL = re.compile(
+    r"^ linked=(?P<linked>[0-9]+) new_bytes=(?P<new_bytes>[0-9]+) "
+    r"cmp_mismatch=(?P<mismatch>[0-9]+)$")
+
+
+def _add_live_audio(app: Path, raw_id: str, payload: bytes) -> Path:
+    audio = app / "data" / "audio"
+    audio.mkdir(exist_ok=True)
+    path = audio / f"{raw_id}.webm"
+    path.write_bytes(payload)
+    connection = sqlite3.connect(app / "data" / "app.db")
+    try:
+        connection.execute(
+            "INSERT INTO audioassetrow "
+            "(raw_audio_id,status,withdrawn,withdrawal_status,checksum,byte_count,"
+            "audio_format,is_simulation,data_classification,patient_turn_ref_version,"
+            "is_reliability_sample,contains_direct_identifier,delete_gate_passed) "
+            "VALUES (?,?,?,?,?,?,?,0,'research',2,0,0,0)",
+            (raw_id, "recorded", 0, None, hashlib.sha256(payload).hexdigest(),
+             len(payload), "webm"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def _traced_daily_harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path]:
+    """每轮快照名由测试指定（同一秒连跑两次会撞名），解释器调用全部留痕。"""
+    app, root, env = _daily_harness(tmp_path)
+    stubs = Path(env["PATH"].split(":", 1)[0])
+    real_date = shutil.which("date") or "/bin/date"
+    _make_executable(stubs / "date", f'''#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = "+%Y%m%d-%H%M%S" ] && [ -n "${{FAKE_STAMP:-}}" ]; then
+  printf '%s\\n' "$FAKE_STAMP"
+  exit 0
+fi
+exec {real_date} "$@"
+''')
+    trace = tmp_path / "python-trace.log"
+    traced_python = tmp_path / "traced-python"
+    _make_executable(
+        traced_python,
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$PYTHON_TRACE\"\n"
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+    )
+    env["PYTHON_BIN"] = str(traced_python)
+    env["PYTHON_TRACE"] = str(trace)
+    env.pop("NMU_BACKUP_LINK_AUDIO", None)
+    return app, root, env, trace
+
+
+def _run_daily(app: Path, env: dict[str, str], stamp: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "scripts/vps-backup-daily.sh"], cwd=app,
+        env={**env, "FAKE_STAMP": stamp}, check=False, capture_output=True, text=True,
+    )
+
+
+def _ok_lines(root: Path) -> list[re.Match[str]]:
+    lines = (root / "backup.log").read_text(encoding="utf-8").splitlines()
+    matches = [_OK_LINE.fullmatch(line) for line in lines if "] ok " in line]
+    assert all(matches), lines
+    return matches
+
+
+def _verify_vps(snapshot: Path, *link_root: Path) -> subprocess.CompletedProcess[str]:
+    extra = ["--link-root", str(link_root[0])] if link_root else []
+    return subprocess.run(
+        [sys.executable, "-I", str(GUARD_SOURCE), "verify-vps", *extra, str(snapshot)],
+        check=False, capture_output=True, text=True,
+    )
+
+
+@pytest.mark.parametrize("switch", [None, "true"])
+def test_daily_switch_off_is_the_previous_behaviour(switch, tmp_path):
+    app, root, env, trace = _traced_daily_harness(tmp_path)
+    if switch is not None:
+        env["NMU_BACKUP_LINK_AUDIO"] = switch
+    live = _add_live_audio(app, "aud-old", b"unchanged-recording")
+
+    for stamp in ("20261001-193000", "20261002-193000"):
+        completed = _run_daily(app, env, stamp)
+        assert completed.returncode == 0, completed.stderr
+
+    older, newer = (root / "daily" / stamp for stamp in ("20261001-193000", "20261002-193000"))
+    inodes = set()
+    for snapshot in (older, newer):
+        copied = snapshot / "audio" / "aud-old.webm"
+        assert copied.stat().st_nlink == 1
+        inodes.add(copied.stat().st_ino)
+        assert _verify_vps(snapshot).returncode == 0
+        assert sorted(path.relative_to(snapshot).as_posix()
+                      for path in snapshot.rglob("*") if path.is_file()) == sorted(
+            ["MANIFEST.sha256", "app.db", "audio/aud-old.webm",
+             *(f"config/{name}" for name in _GUARD.VPS_CONFIG_FILES)])
+    assert len(inodes) == 2 and live.stat().st_ino not in inodes
+    assert [match["tail"] for match in _ok_lines(root)] == ["", ""]
+    calls = [line for line in trace.read_text(encoding="utf-8").splitlines()
+             if " verify-vps " in f" {line} " or " publish-vps " in f" {line} "]
+    assert len(calls) == 4
+    assert all(re.fullmatch(
+        r"-I \S+/verify_backup_snapshot\.py "
+        r"(verify-vps \S+/daily/\.[0-9]{8}-[0-9]{6}\.partial\.[0-9]+"
+        r"|publish-vps \S+/daily/\.[0-9]{8}-[0-9]{6}\.partial\.[0-9]+ \S+/daily/[0-9]{8}-[0-9]{6})",
+        line) for line in calls), calls
+
+
+def test_daily_switch_on_links_unchanged_audio_and_survives_rotation(tmp_path):
+    app, root, env, trace = _traced_daily_harness(tmp_path)
+    env["NMU_BACKUP_LINK_AUDIO"] = "1"
+    daily = root / "daily"
+    old_live = _add_live_audio(app, "aud-old", b"unchanged-recording")
+
+    first = _run_daily(app, env, "20261001-193000")
+    assert first.returncode == 0, first.stderr
+    new_live = _add_live_audio(app, "aud-new", b"recorded-after-the-first-backup")
+    second = _run_daily(app, env, "20261002-193000")
+    assert second.returncode == 0, second.stderr
+
+    older, newer = daily / "20261001-193000", daily / "20261002-193000"
+    shared = newer / "audio" / "aud-old.webm"
+    assert shared.stat().st_ino == (older / "audio" / "aud-old.webm").stat().st_ino
+    assert shared.stat().st_nlink == 2
+    assert (newer / "audio" / "aud-new.webm").stat().st_nlink == 1
+    for live in (old_live, new_live):
+        assert live.stat().st_nlink == 1
+        assert live.stat().st_ino not in {
+            path.stat().st_ino for path in daily.rglob("*.webm")}
+
+    tails = [_LINK_TAIL.fullmatch(match["tail"]) for match in _ok_lines(root)]
+    assert all(tails), tails
+    assert [(tail["linked"], tail["mismatch"]) for tail in tails] == [("0", "0"), ("1", "0")]
+    newer_bytes = sum(path.stat().st_size for path in newer.rglob("*") if path.is_file())
+    assert int(tails[1]["new_bytes"]) == newer_bytes - len(b"unchanged-recording")
+
+    strict = _verify_vps(newer)
+    assert strict.returncode == 2
+    assert "code=snapshot_hardlinked_file" in strict.stderr
+    for snapshot in (older, newer):
+        assert _verify_vps(snapshot, daily).returncode == 0
+    assert any(re.fullmatch(
+        r"-I \S+/verify_backup_snapshot\.py verify-vps --link-root \S+/daily "
+        r"\S+/daily/\.20261002-193000\.partial\.[0-9]+", line)
+        for line in trace.read_text(encoding="utf-8").splitlines())
+
+    # 轮转删掉最旧一份后，较新的快照照样自证；下一份接着与它共享。
+    shutil.rmtree(older)
+    assert shared.stat().st_nlink == 1
+    assert _verify_vps(newer).returncode == 0
+    third = _run_daily(app, env, "20261003-193000")
+    assert third.returncode == 0, third.stderr
+    newest = daily / "20261003-193000"
+    for name in ("aud-old.webm", "aud-new.webm"):
+        assert (newest / "audio" / name).stat().st_ino == (newer / "audio" / name).stat().st_ino
+    assert _LINK_TAIL.fullmatch(_ok_lines(root)[-1]["tail"])["linked"] == "2"
+    assert _verify_vps(newest, daily).returncode == 0
+
+
+def test_daily_switch_on_copies_afresh_when_previous_bytes_differ(tmp_path):
+    app, root, env, _trace = _traced_daily_harness(tmp_path)
+    env["NMU_BACKUP_LINK_AUDIO"] = "1"
+    live = _add_live_audio(app, "aud-old", b"unchanged-recording")
+    assert _run_daily(app, env, "20261001-193000").returncode == 0
+    older = root / "daily" / "20261001-193000" / "audio" / "aud-old.webm"
+    with older.open("r+b") as handle:
+        handle.write(b"U")  # 同名同长，只有字节不同：上一份那里已经坏了
+
+    completed = _run_daily(app, env, "20261002-193000")
+
+    assert completed.returncode == 0, completed.stderr
+    copied = root / "daily" / "20261002-193000" / "audio" / "aud-old.webm"
+    assert copied.stat().st_ino != older.stat().st_ino
+    assert copied.stat().st_nlink == 1
+    assert copied.read_bytes() == live.read_bytes()
+    tail = _LINK_TAIL.fullmatch(_ok_lines(root)[-1]["tail"])
+    assert (tail["linked"], tail["mismatch"]) == ("0", "1")
+    assert _verify_vps(copied.parents[1]).returncode == 0
+
+
+def test_backup_unit_reads_an_optional_switch_file_and_never_turns_it_on():
+    unit = (ROOT / "deploy" / "systemd" / "nmu-backup.service").read_text(encoding="utf-8")
+    directives = [line.strip() for line in unit.splitlines()
+                  if line.strip() and not line.strip().startswith("#")]
+
+    assert "EnvironmentFile=-/opt/nmu/backup-dedup.env" in directives
+    assert not any("NMU_BACKUP_LINK_AUDIO" in line for line in directives)

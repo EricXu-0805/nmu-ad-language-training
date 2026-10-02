@@ -389,12 +389,104 @@ find "$WORK" -type d -exec chmod 700 {} +
 find "$WORK" -type f -exec chmod 600 {} +
 chmod 600 "$LOG"
 
+# 录音硬链接去重，默认关：只有单元环境（EnvironmentFile=-/opt/nmu/backup-dedup.env）
+# 给出 NMU_BACKUP_LINK_AUDIO=1 才做，其他任何值都等于没开，命令和日志与以前逐字节相同。
+# 打开时，与最新一份已发布快照同名、同长、同权限且逐字节相同（cmp 语义）的录音换成
+# 指向那一份的硬链接：先建点开头的临时名再原子 rename。链接源只取 daily/ 下严格
+# 时间戳快照，从不取 live data/；有一个字节不同就保留这次的新副本并计入 cmp_mismatch。
+# 校验与发布随之带 --link-root，由校验器证明共享 inode 的每个链接都在相邻快照里。
+LINK_NOTE=""
+if [ "${NMU_BACKUP_LINK_AUDIO:-}" = 1 ]; then
+  FAIL_CODE="audio_link_failed"
+  if LINK_FACTS=$("$PYTHON_CMD" -I - "$DAILY" "$WORK" "$APP/data" <<'PY' 2>/dev/null
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+daily = Path(sys.argv[1]).resolve(strict=True)
+work = Path(sys.argv[2]).resolve(strict=True)
+live = Path(sys.argv[3]).resolve(strict=False)
+if (work.parent != daily or live == daily or live in daily.parents
+        or daily in live.parents):
+    raise SystemExit(2)
+stamp = re.compile(r"^[0-9]{8}-[0-9]{6}$")
+published = sorted(
+    entry.name for entry in os.scandir(daily)
+    if stamp.fullmatch(entry.name) and entry.is_dir(follow_symlinks=False))
+work_audio = work / "audio"
+previous = daily / published[-1] / "audio" if published else None
+linkable = (
+    previous is not None and work_audio.is_dir() and not work_audio.is_symlink()
+    and previous.is_dir() and not previous.is_symlink())
+
+
+def same_bytes(left: str, right: Path) -> bool:
+    with open(left, "rb") as fresh, open(right, "rb") as kept:
+        while True:
+            chunk = fresh.read(1024 * 1024)
+            if chunk != kept.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+
+linked = linked_bytes = mismatched = 0
+for entry in sorted(os.scandir(work_audio) if linkable else (), key=lambda item: item.name):
+    meta = entry.stat(follow_symlinks=False)
+    if (entry.name.startswith(".") or entry.is_symlink()
+            or not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1):
+        raise SystemExit(2)
+    source = previous / entry.name
+    try:
+        kept = source.lstat()
+    except FileNotFoundError:
+        continue
+    if (not stat.S_ISREG(kept.st_mode) or kept.st_size != meta.st_size
+            or kept.st_dev != meta.st_dev or kept.st_uid != meta.st_uid
+            or stat.S_IMODE(kept.st_mode) != stat.S_IMODE(meta.st_mode)):
+        continue
+    if not same_bytes(entry.path, source):
+        mismatched += 1
+        continue
+    temporary = work_audio / f".{entry.name}.link"
+    os.link(source, temporary)
+    os.replace(temporary, entry.path)
+    linked += 1
+    linked_bytes += meta.st_size
+total = 0
+for current, _directories, names in os.walk(work):
+    for name in names:
+        total += (Path(current) / name).lstat().st_size
+print(linked, total - linked_bytes, mismatched)
+PY
+  ); then
+    :
+  else
+    fail "audio_link_failed"
+  fi
+  read -r LINKED_FILES NEW_BYTES CMP_MISMATCH LINK_EXTRA <<< "$LINK_FACTS"
+  if [ -n "${LINK_EXTRA:-}" ] || [ -z "${CMP_MISMATCH:-}" ]; then
+    fail "audio_link_output_invalid"
+  fi
+  LINK_NOTE=" linked=$LINKED_FILES new_bytes=$NEW_BYTES cmp_mismatch=$CMP_MISMATCH"
+fi
+
 FAIL_CODE="snapshot_verify_failed"
-"$PYTHON_CMD" -I "$GUARD" verify-vps "$WORK" >/dev/null
+if [ -n "$LINK_NOTE" ]; then
+  "$PYTHON_CMD" -I "$GUARD" verify-vps --link-root "$DAILY" "$WORK" >/dev/null
+else
+  "$PYTHON_CMD" -I "$GUARD" verify-vps "$WORK" >/dev/null
+fi
 
 FINAL="$DAILY/$NEW"
 FAIL_CODE="snapshot_publish_failed"
-"$PYTHON_CMD" -I "$GUARD" publish-vps "$WORK" "$FINAL" >/dev/null
+if [ -n "$LINK_NOTE" ]; then
+  "$PYTHON_CMD" -I "$GUARD" publish-vps --link-root "$DAILY" "$WORK" "$FINAL" >/dev/null
+else
+  "$PYTHON_CMD" -I "$GUARD" publish-vps "$WORK" "$FINAL" >/dev/null
+fi
 # 此时快照已经通过 VPS 合同并原子发布；后续轮转/日志失败不得把有效完成态
 # 误删或伪装成 partial。
 CURRENT_PATH=""
@@ -410,6 +502,6 @@ find "$DAILY" -mindepth 1 -maxdepth 1 -type d -name "$SNAP_GLOB" -print \
 
 SZ=$(du -sh "$FINAL" | cut -f1)
 FAIL_CODE="success_log_failed"
-note "ok snapshot=$NEW size=$SZ config=ok keep=$KEEP source_bytes=$SOURCE_BYTES source_dirs=$SOURCE_DIRECTORIES reserve_bytes=$RESERVE_BYTES"
+note "ok snapshot=$NEW size=$SZ config=ok keep=$KEEP source_bytes=$SOURCE_BYTES source_dirs=$SOURCE_DIRECTORIES reserve_bytes=$RESERVE_BYTES$LINK_NOTE"
 CURRENT_PATH=""
 CURRENT_STAMP=""

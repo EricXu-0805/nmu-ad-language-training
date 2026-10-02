@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import importlib.util
 import errno
+import os
 from pathlib import Path
 import shutil
 import stat
@@ -489,3 +490,130 @@ def test_platform_without_allocated_block_measurement_fails_closed(tmp_path, mon
     with pytest.raises(OSError, match="snapshot_allocated_size_unavailable") as error:
         capacity.snapshot_storage_bytes(path)
     assert error.value.errno == errno.ENOTSUP
+
+
+# ---------------------------------------------------------------------------
+# 每日快照之间硬链接共享录音（备份开关 NMU_BACKUP_LINK_AUDIO=1）
+# ---------------------------------------------------------------------------
+
+
+def _blocks(*paths: Path) -> int:
+    return sum(path.lstat().st_blocks * 512 for path in paths)
+
+
+def _linked_backups(tmp_path: Path, *, days: int = 3, newest_linked: bool = True,
+                    outside_link: bool = False) -> Path:
+    """每份快照库各自独立；同一段录音从第一份起硬链接到后面每一份。"""
+    root = tmp_path / "backups"
+    daily = root / "daily"
+    daily.mkdir(parents=True)
+    start = datetime(2026, 10, 1, 19, 30)
+    first = None
+    for index in range(days):
+        snapshot = daily / (start + timedelta(days=index)).strftime(capacity.STAMP_FORMAT)
+        (snapshot / "audio").mkdir(parents=True)
+        (snapshot / "app.db").write_bytes(bytes([index + 1]) * 20_000)
+        target = snapshot / "audio" / "aud-shared.webm"
+        if first is None or (index == days - 1 and not newest_linked):
+            target.write_bytes(b"a" * 50_000)
+            first = first or target
+        else:
+            os.link(first, target)
+    if outside_link:
+        os.link(first, tmp_path / "live-copy.webm")
+    last = start + timedelta(days=days - 1)
+    (root / "backup.log").write_text(
+        f"[{last:%F %T}] ok snapshot={last:%Y%m%d-%H%M%S} size=1M config=ok keep=14 "
+        "linked=1 new_bytes=20000 cmp_mismatch=0\n")
+    return root
+
+
+def test_inodes_shared_across_snapshots_are_credited_once_to_their_last_holder(tmp_path):
+    root = _linked_backups(tmp_path)
+    snapshots = sorted((root / "daily").iterdir())
+    shared = snapshots[0] / "audio" / "aud-shared.webm"
+    assert shared.stat().st_nlink == 3
+
+    measurements = capacity.snapshot_measurements(root / "daily")
+
+    own = [_blocks(s, s / "audio", s / "app.db") for s in snapshots]
+    assert [credit for *_, credit in measurements] == own[:-1] + [own[-1] + _blocks(shared)]
+    # 新快照先整份暂存再链接：复制预算仍按每份完整逻辑大小。
+    full_copy = [max(20_000, _blocks(s / "app.db")) + max(50_000, _blocks(shared))
+                 + _blocks(s, s / "audio") for s in snapshots]
+    assert [budget for _, budget, _ in measurements] == full_copy
+
+
+def test_a_link_outside_the_snapshots_means_rotation_never_frees_the_inode(tmp_path):
+    root = _linked_backups(tmp_path, outside_link=True)
+    snapshots = sorted((root / "daily").iterdir())
+
+    measurements = capacity.snapshot_measurements(root / "daily")
+
+    assert [credit for *_, credit in measurements] == [
+        _blocks(s, s / "audio", s / "app.db") for s in snapshots]
+
+
+def test_linked_projection_charges_new_audio_once_instead_of_once_per_kept_copy():
+    # 每份 10 MiB 库等非录音部分，录音每天新增 20 MiB；14 份都已链接。
+    series = _series([10 + 20 * day for day in range(14)])
+    linked_audio = [20 * day * capacity.MIB for day in range(14)]
+    credits = [10 * capacity.MIB] * 14
+
+    full = capacity.retention_projection(
+        series, keep=14, horizon_days=30, free_bytes=3000 * capacity.MIB,
+        existing_allocated=credits)
+    linked = capacity.retention_projection(
+        series, keep=14, horizon_days=30, free_bytes=3000 * capacity.MIB,
+        existing_allocated=credits, linked_audio=linked_audio)
+
+    assert full["backup_net_retained_growth_mb_per_day"] == 280
+    assert full["days_left"] == 8
+    assert linked["backup_net_retained_growth_mb_per_day"] == 20
+    assert linked["next_snapshot_baseline_mb"] == 270  # 暂存时仍要一整份
+    assert linked["next_snapshot_retained_cost_mb"] == 30  # 库 + 一天的新录音
+    # 第 d 天峰值 = 已累计 20d + 当天整份暂存 270+20(d+1)；第 29 天最高。
+    assert linked["backup_peak_additional_mb"] == 1450
+    assert linked["backup_net_change_mb"] == 600
+    assert linked["days_left"] is None
+    assert linked["projection_status"] == "no_exhaustion_within_horizon"
+
+
+def test_unlinked_projection_output_is_unchanged_when_no_audio_link_is_given():
+    series = _series(list(range(100, 240, 10)))
+    plain = capacity.retention_projection(
+        series, keep=14, horizon_days=30, free_bytes=4400 * capacity.MIB)
+
+    assert plain == capacity.retention_projection(
+        series, keep=14, horizon_days=30, free_bytes=4400 * capacity.MIB,
+        linked_audio=None)
+    assert "next_snapshot_retained_cost_mb" not in plain
+
+
+def test_evaluate_switches_to_the_linked_model_only_when_the_newest_snapshot_is_linked(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(capacity.shutil, "disk_usage",
+                        _usage(1_000_000_000, 100_000_000, 900_000_000))
+    linked_root = _linked_backups(tmp_path / "on")
+    stopped_root = _linked_backups(tmp_path / "off", newest_linked=False)
+
+    linked = capacity.evaluate(linked_root, None, max_used_pct=85, min_free_mb=0,
+                               min_days_left=30)
+    stopped = capacity.evaluate(stopped_root, None, max_used_pct=85, min_free_mb=0,
+                                min_days_left=30)
+
+    assert linked["snapshot_model"] == "linked_audio"
+    assert linked["rotation_credit_measurement"] == "nonaudio_allocated_bytes_only"
+    assert "unchanged_audio_relinked_into_every_new_snapshot" in linked["assumptions"]
+    snapshots = sorted((linked_root / "daily").iterdir())
+    assert linked["next_snapshot_retained_cost_mb"] == round(
+        (max(20_000, _blocks(snapshots[-1] / "app.db"))
+         + _blocks(snapshots[-1], snapshots[-1] / "audio")) / capacity.MIB, 4)
+    # 开关关掉后最新一份是整份副本：按整份模型预测，但旧快照共享的 inode 仍只算一次。
+    assert "snapshot_model" not in stopped
+    assert stopped["rotation_credit_measurement"] == "last_link_allocated_bytes_only"
+
+    assert capacity.main(["--backup-root", str(linked_root), "--min-free-mb", "1"]) == 0
+    assert capsys.readouterr().out.rstrip().endswith(" snapshot_model=linked_audio")
+    assert capacity.main(["--backup-root", str(stopped_root), "--min-free-mb", "1"]) == 0
+    assert "snapshot_model" not in capsys.readouterr().out

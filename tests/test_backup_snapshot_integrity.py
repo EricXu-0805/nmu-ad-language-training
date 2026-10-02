@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -1789,3 +1790,169 @@ def test_fresh_current_head_snapshot_still_passes_end_to_end(tmp_path):
         ).fetchone()[0] == CURRENT_HEAD
     finally:
         connection.close()
+
+
+# --------------------------------------------------------------------------
+# VPS 每日快照之间硬链接共享未变录音（默认严格，给 --link-root 才放宽）
+# --------------------------------------------------------------------------
+
+
+def _linked_daily(tmp_path: Path, payload: bytes = b"shared-final-audio"):
+    """两份严格时间戳 VPS 快照，录音是同一个 inode，库与配置各自独立。"""
+    daily = tmp_path / "daily"
+    older = daily / "20261001-193419"
+    newer = daily / "20261002-193055"
+    for snapshot in (older, newer):
+        (snapshot / "audio").mkdir(parents=True)
+    (older / "audio" / "aud-shared.webm").write_bytes(payload)
+    os.link(older / "audio" / "aud-shared.webm", newer / "audio" / "aud-shared.webm")
+    _database(older, [
+        ("aud-shared", "recorded", 0, None, _digest(payload), len(payload), "webm"),
+    ])
+    shutil.copyfile(older / "app.db", newer / "app.db")
+    for snapshot in (older, newer):
+        (snapshot / "config").mkdir()
+        for name in _GUARD_MODULE.VPS_CONFIG_FILES:
+            (snapshot / "config" / name).write_text(f"synthetic {name}\n", encoding="utf-8")
+        _manifest(snapshot)
+    _harden(daily)
+    return daily, older, newer
+
+
+def _run_link_root(command: str, snapshot: Path, link_root: Path,
+                   *extra: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-I", str(GUARD), command, "--link-root", str(link_root),
+         str(snapshot), *(str(path) for path in extra)],
+        check=False, capture_output=True, text=True,
+    )
+
+
+def test_sibling_linked_audio_passes_only_with_link_root(tmp_path):
+    daily, older, newer = _linked_daily(tmp_path)
+    assert (newer / "audio" / "aud-shared.webm").stat().st_nlink == 2
+
+    strict = _run("verify-vps", newer, harden=False)
+    assert strict.returncode == 2
+    assert "code=snapshot_hardlinked_file" in strict.stderr
+
+    for snapshot in (older, newer):
+        linked = _run_link_root("verify-vps", snapshot, daily)
+        assert linked.returncode == 0, linked.stderr
+        assert linked.stdout.strip() == "OK"
+
+
+@pytest.mark.parametrize("extra_link", [
+    "live-audio-outside-daily",
+    "unpublished-partial-inside-daily",
+    "non-timestamp-copy-inside-daily",
+    "same-snapshot-under-another-name",
+])
+def test_link_root_rejects_any_link_outside_strict_sibling_snapshots(extra_link, tmp_path):
+    daily, older, newer = _linked_daily(tmp_path)
+    target = {
+        "live-audio-outside-daily": tmp_path / "app" / "data" / "audio" / "aud-shared.webm",
+        "unpublished-partial-inside-daily":
+            daily / ".20261003-193000.partial.4242" / "audio" / "aud-shared.webm",
+        "non-timestamp-copy-inside-daily": daily / "held-copy" / "audio" / "aud-shared.webm",
+        "same-snapshot-under-another-name": older / "audio" / "aud-renamed.webm",
+    }[extra_link]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.link(newer / "audio" / "aud-shared.webm", target)
+
+    completed = _run_link_root("verify-vps", newer, daily)
+
+    assert completed.returncode == 2
+    assert "code=snapshot_hardlink_outside_link_root" in completed.stderr
+    assert "aud-shared" not in completed.stdout + completed.stderr
+
+
+def test_link_root_does_not_count_links_reached_through_a_symlinked_sibling(tmp_path):
+    daily, _older, newer = _linked_daily(tmp_path)
+    live = tmp_path / "app" / "data"
+    (live / "audio").mkdir(parents=True)
+    os.link(newer / "audio" / "aud-shared.webm", live / "audio" / "aud-shared.webm")
+    (daily / "20261003-193000").symlink_to(live, target_is_directory=True)
+
+    completed = _run_link_root("verify-vps", newer, daily)
+
+    assert completed.returncode == 2
+    assert "code=snapshot_hardlink_outside_link_root" in completed.stderr
+
+
+@pytest.mark.parametrize("relative", ["app.db", "MANIFEST.sha256", "config/env"])
+def test_link_root_never_relaxes_database_manifest_or_config(relative, tmp_path):
+    daily, older, newer = _linked_daily(tmp_path)
+    (newer / relative).unlink()
+    os.link(older / relative, newer / relative)
+
+    completed = _run_link_root("verify-vps", newer, daily)
+
+    assert completed.returncode == 2
+    assert "code=snapshot_hardlinked_file" in completed.stderr
+
+
+def test_link_root_must_be_the_real_parent_of_the_snapshot(tmp_path):
+    daily, _older, newer = _linked_daily(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    alias = tmp_path / "daily-alias"
+    alias.symlink_to(daily, target_is_directory=True)
+
+    for link_root in (elsewhere, alias):
+        completed = _run_link_root("verify-vps", newer, link_root)
+        assert completed.returncode == 2
+        assert "code=snapshot_link_root_invalid" in completed.stderr
+
+
+def test_byte_flip_in_a_shared_inode_fails_every_snapshot_that_holds_it(tmp_path):
+    daily, older, newer = _linked_daily(tmp_path)
+    with (newer / "audio" / "aud-shared.webm").open("r+b") as handle:
+        first = handle.read(1)
+        handle.seek(0)
+        handle.write(bytes([first[0] ^ 0x01]))
+
+    for snapshot in (older, newer):
+        completed = _run_link_root("verify-vps", snapshot, daily)
+        assert completed.returncode == 2
+        assert "code=manifest_hash_mismatch" in completed.stderr
+        # 不靠清单也拦得住：库里登记的 checksum/byte_count 才是录音的权威。
+        with pytest.raises(_GUARD_MODULE.SnapshotError) as caught:
+            _GUARD_MODULE.verify_snapshot(
+                snapshot, require_manifest=False, require_vps_config=True,
+                link_root=daily)
+        assert caught.value.code == "audio_authoritative_file_mismatch"
+
+
+def test_publish_vps_needs_link_root_for_a_sibling_linked_staging(tmp_path):
+    daily, older, newer = _linked_daily(tmp_path)
+    staging = daily / ".20261003-193000.partial.4242"
+    newer.rename(staging)
+    destination = daily / "20261003-193000"
+
+    strict = _run("publish-vps", staging, destination, harden=False)
+    assert strict.returncode == 2
+    assert "code=snapshot_hardlinked_file" in strict.stderr
+    assert staging.is_dir() and not destination.exists()
+
+    published = _run_link_root("publish-vps", staging, daily, destination)
+
+    assert published.returncode == 0, published.stderr
+    assert destination.is_dir() and not staging.exists()
+    assert ((destination / "audio" / "aud-shared.webm").stat().st_ino
+            == (older / "audio" / "aud-shared.webm").stat().st_ino)
+    assert _run_link_root("verify-vps", destination, daily).returncode == 0
+
+
+def test_a_linked_staging_can_only_be_published_as_a_timestamp_inside_its_link_root(tmp_path):
+    daily, _older, newer = _linked_daily(tmp_path)
+    staging = daily / ".20261003-193000.partial.4242"
+    newer.rename(staging)
+    elsewhere = tmp_path / "held"
+    elsewhere.mkdir(mode=0o700)
+
+    for destination in (elsewhere / "20261003-193000", daily / "held-20261003"):
+        completed = _run_link_root("publish-vps", staging, daily, destination)
+        assert completed.returncode == 2
+        assert "code=publish_link_root_mismatch" in completed.stderr
+        assert staging.is_dir() and not destination.exists()

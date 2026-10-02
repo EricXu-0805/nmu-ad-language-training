@@ -45,7 +45,7 @@ class DrillFailure(RuntimeError):
 
 def _verify_snapshot(snapshot: Path, python: str, *, source_verifier: Path | None = None,
                      source_verifier_sha256: str | None = None,
-                     require_vps_config: bool = True) -> bytes:
+                     require_vps_config: bool = True, in_place: bool = True) -> bytes:
     guard = source_verifier or ROOT / "scripts" / "verify_backup_snapshot.py"
     try:
         if guard.is_symlink() or not guard.is_file():
@@ -61,13 +61,18 @@ def _verify_snapshot(snapshot: Path, python: str, *, source_verifier: Path | Non
         source_manifest = manifest.read_bytes()
         # Execute the bytes that passed the pin, never reopen a replaceable
         # archival pathname at subprocess launch. The verifier is standalone.
+        # 原地的 VPS 快照可能与相邻每日快照共享录音 inode（备份去重开关打开时），
+        # 由校验器证明链接都在兄弟快照里。历史校验器不认这个参数，照旧严格。
+        link_root = (["--link-root", str(snapshot.resolve().parent)]
+                     if in_place and require_vps_config and source_verifier is None else [])
         with tempfile.TemporaryDirectory(prefix="nmu-restore-verifier-") as guard_dir:
             frozen_guard = Path(guard_dir) / "verify_backup_snapshot.py"
             frozen_guard.write_bytes(guard_bytes)
             frozen_guard.chmod(0o600)
             result = subprocess.run(
                 [python, "-I", "-B", str(frozen_guard),
-                 "verify-vps" if require_vps_config else "verify", str(snapshot.resolve())],
+                 "verify-vps" if require_vps_config else "verify", str(snapshot.resolve()),
+                 *link_root],
                 capture_output=True, text=True)
     except OSError as exc:
         raise DrillFailure("快照或校验器不可读取") from exc
@@ -115,7 +120,7 @@ def _verify_materialized(work: Path, source_manifest: bytes, python: str, *,
     manifest.chmod(0o600)
     _verify_snapshot(work, python, source_verifier=source_verifier,
                      source_verifier_sha256=source_verifier_sha256,
-                     require_vps_config=False)
+                     require_vps_config=False, in_place=False)
     # Migration and lifespan can legitimately change the copied DB. Do not
     # leave the pre-start manifest masquerading as a receipt for changed bytes.
     manifest.unlink()

@@ -10,6 +10,11 @@
 增长没有测量。days_left 仅报告预测期内备份写入空间不足的时点；None 不代表
 无限寿命或整个服务器安全。发布时的额外副本、临时保留目录须另做一次性预算。
 
+备份打开录音硬链接去重（NMU_BACKUP_LINK_AUDIO=1）后，相邻快照共享未变录音的 inode：
+共享 inode 只计一次，块量记在最后一个持有它的快照上。最新一份与更早快照共享录音时
+改用链接模型：下一份仍先整份暂存（峰值照旧按整份），留下来的只是库等非录音部分加一天
+的新录音；未变录音会被链进以后每一份，轮转只抵扣非录音块量。
+
 只用标准库。快照不足两个不同日期时不猜测尺寸趋势。
 """
 from __future__ import annotations
@@ -19,6 +24,7 @@ from datetime import datetime
 import errno
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -43,11 +49,15 @@ def directory_bytes(path: Path) -> int:
     return total
 
 
-def snapshot_storage_bytes(path: Path) -> tuple[int, int]:
+def snapshot_storage_bytes(path: Path, *,
+                           shared_inodes: dict[tuple[int, int], list[int]] | None = None,
+                           owner: int = 0) -> tuple[int, int]:
     """(复制预算, 已分配字节)：文件取 max(逻辑, 块量)，目录计真实块量。
 
     现存快照被轮转时只能抵扣第二项，不能把稀疏文件的逻辑长度当可释放空间。
-    不支持块计量的平台拒绝预测；读取失败也不能静默漏掉文件。
+    不支持块计量的平台拒绝预测；读取失败也不能静默漏掉文件。给了 shared_inodes 时，
+    多链接文件的块量不计入第二项，改记进该表 [持有者, 块量, st_nlink, 已见链接数]，
+    由调用方按最后一个持有者统一抵扣。
     """
     meta = path.lstat()
     if stat.S_ISLNK(meta.st_mode):
@@ -59,20 +69,28 @@ def snapshot_storage_bytes(path: Path) -> tuple[int, int]:
         raise OSError(errno.ENOTSUP, "snapshot_allocated_size_unavailable", str(path))
     allocated = blocks * 512
     if stat.S_ISREG(meta.st_mode):
+        links = getattr(meta, "st_nlink", 1)
+        if shared_inodes is not None and links > 1:
+            record = shared_inodes.setdefault(
+                (meta.st_dev, meta.st_ino), [owner, allocated, links, 0])
+            record[0] = owner
+            record[3] += 1
+            return max(meta.st_size, allocated), 0
         return max(meta.st_size, allocated), allocated
     copy_budget = allocated
     for child in path.iterdir():
-        child_budget, child_allocated = snapshot_storage_bytes(child)
+        child_budget, child_allocated = snapshot_storage_bytes(
+            child, shared_inodes=shared_inodes, owner=owner)
         copy_budget += child_budget
         allocated += child_allocated
     return copy_budget, allocated
 
 
-def snapshot_measurements(daily: Path) -> list[tuple[datetime, int, int]]:
-    """(时刻, 复制预算, 实际分配)；只读严格时间戳完成目录，不跟随符号链接。"""
-    measurements: list[tuple[datetime, int, int]] = []
+def _snapshot_directories(daily: Path) -> list[tuple[datetime, Path]]:
+    """严格时间戳完成目录，按时间排列；不跟随符号链接。"""
+    found: list[tuple[datetime, Path]] = []
     if not daily.is_dir():
-        return measurements
+        return found
     for child in sorted(daily.iterdir()):
         try:
             when = datetime.strptime(child.name, STAMP_FORMAT)
@@ -81,9 +99,60 @@ def snapshot_measurements(daily: Path) -> list[tuple[datetime, int, int]]:
         meta = child.lstat()
         if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode):
             continue
-        copy_budget, allocated = snapshot_storage_bytes(child)
-        measurements.append((when, copy_budget, allocated))
-    return measurements
+        found.append((when, child))
+    return found
+
+
+def snapshot_measurements(daily: Path) -> list[tuple[datetime, int, int]]:
+    """(时刻, 复制预算, 轮转可抵扣的已分配字节)。
+
+    多份快照硬链接共享的 inode 只计一次，记在最后一个持有它的快照上：只有轮转到那一份
+    才真的释放。还有链接落在这些快照之外的（数到的链接少于 st_nlink），轮转永远释放
+    不了，不抵扣。没有共享 inode 时与逐目录块量相同。
+    """
+    measurements: list[list] = []
+    shared: dict[tuple[int, int], list[int]] = {}
+    for when, child in _snapshot_directories(daily):
+        copy_budget, allocated = snapshot_storage_bytes(
+            child, shared_inodes=shared, owner=len(measurements))
+        measurements.append([when, copy_budget, allocated])
+    for owner, allocated, links, seen in shared.values():
+        if seen == links:
+            measurements[owner][2] += allocated
+    return [(when, copy_budget, allocated) for when, copy_budget, allocated in measurements]
+
+
+def linked_audio_profile(daily: Path) -> list[tuple[datetime, int, int, bool]]:
+    """(时刻, 顶层 audio/ 复制预算, 非录音已分配字节, 录音是否与更早快照共享 inode)。
+
+    非录音部分（库、清单、配置、导出、全部目录）从不被备份链接，块量逐份独立。
+    """
+    profile: list[tuple[datetime, int, int, bool]] = []
+    seen: set[tuple[int, int]] = set()
+    for when, child in _snapshot_directories(daily):
+        audio_root = child / "audio"
+        audio_budget = 0
+        nonaudio = 0
+        shares = False
+        current: set[tuple[int, int]] = set()
+        for directory, _dirnames, filenames in os.walk(child):
+            directory_path = Path(directory)
+            nonaudio += directory_path.lstat().st_blocks * 512
+            for name in filenames:
+                meta = (directory_path / name).lstat()
+                if stat.S_ISLNK(meta.st_mode):
+                    continue
+                if directory_path != audio_root:
+                    nonaudio += meta.st_blocks * 512
+                    continue
+                audio_budget += max(meta.st_size, meta.st_blocks * 512)
+                if meta.st_nlink > 1:
+                    key = (meta.st_dev, meta.st_ino)
+                    shares = shares or key in seen
+                    current.add(key)
+        seen |= current
+        profile.append((when, audio_budget, nonaudio, shares))
+    return profile
 
 
 def snapshot_series(daily: Path) -> list[tuple[datetime, int]]:
@@ -143,29 +212,54 @@ def observed_retention_keep(log_path: Path) -> int | None:
 
 def retention_projection(series: list[tuple[datetime, int]], *, keep: int,
                          horizon_days: float, free_bytes: int,
-                         existing_allocated: list[int] | None = None) -> dict[str, object]:
+                         existing_allocated: list[int] | None = None,
+                         linked_audio: list[int] | None = None) -> dict[str, object]:
     """保留全部当前快照；未来每天写完一份后才移除最旧快照。
 
     不知道下一次定时器距现在几小时，因此保守按立即发生计第 0 天。
     新增按复制预算预测，现存快照只抵扣真实已分配块；可用量来自 disk_usage。
+
+    给了 linked_audio（逐份顶层 audio/ 的复制预算，与 series 对齐）就按录音链接模型：
+    每天仍先整份暂存（峰值按整份），链接后留下非录音部分加一天的新录音；未变录音会被
+    链进以后每一份，轮转只抵扣非录音部分，existing_allocated 此时应是各份非录音块量。
     """
+    if linked_audio is not None and len(linked_audio) != len(series):
+        raise ValueError("linked audio measurements must match the copy series")
     distinct_days, slope = daily_size_trend(series)
     latest_size = None
     if series:
         latest_day = series[-1][0].date()
         latest_size = max(size for when, size in series if when.date() == latest_day)
+    nonaudio_slope = audio_slope = latest_nonaudio = None
+    if linked_audio is not None and slope is not None:
+        nonaudio = [(when, size - audio) for (when, size), audio in zip(series, linked_audio)]
+        _, nonaudio_slope = daily_size_trend(nonaudio)
+        _, audio_slope = daily_size_trend(
+            [(when, audio) for (when, _), audio in zip(series, linked_audio)])
+        latest_nonaudio = max(size for when, size in nonaudio if when.date() == latest_day)
+    if slope is None:
+        net_growth = None
+    elif linked_audio is None:
+        net_growth = slope * keep
+    else:
+        # 新录音只留一份；库等非录音部分每份各存一份，跟着保留份数放大。
+        net_growth = audio_slope + nonaudio_slope * keep
     result: dict[str, object] = {
         "next_snapshot_baseline_mb": round(latest_size / MIB, 4) if latest_size is not None else None,
         "next_snapshot_copy_fits": latest_size < free_bytes if latest_size is not None else None,
         "observed_snapshot_days": distinct_days,
         "snapshot_size_growth_mb_per_day": round(slope / MIB, 4) if slope is not None else None,
         "backup_net_retained_growth_mb_per_day": (
-            round(slope * keep / MIB, 4) if slope is not None else None),
+            round(net_growth / MIB, 4) if net_growth is not None else None),
         "backup_peak_additional_mb": None,
         "backup_net_change_mb": None,
         "days_left": None,
         "projection_status": "insufficient_history",
     }
+    if linked_audio is not None:
+        result["next_snapshot_retained_cost_mb"] = (
+            round((latest_nonaudio + nonaudio_slope + audio_slope) / MIB, 4)
+            if latest_nonaudio is not None else None)
     if slope is None:
         return result
     assert latest_size is not None
@@ -178,9 +272,15 @@ def retention_projection(series: list[tuple[datetime, int]], *, keep: int,
     days_left = None
     for day in range(math.ceil(horizon_days)):
         next_size = latest_size + slope * (day + 1)
-        retained += next_size
-        queue.append(next_size)
-        additional = retained - initial
+        if linked_audio is None:
+            retained += next_size
+            queue.append(next_size)
+            additional = retained - initial
+        else:
+            additional = retained + next_size - initial
+            next_nonaudio = latest_nonaudio + nonaudio_slope * (day + 1)
+            retained += next_nonaudio + audio_slope
+            queue.append(next_nonaudio)
         peak = max(peak, additional)
         if days_left is None and additional >= free_bytes:
             days_left = day
@@ -210,9 +310,20 @@ def evaluate(backup_root: Path, data_dir: Path | None, *, max_used_pct: float,
     series = [(when, copy_budget) for when, copy_budget, _ in measurements]
     allocated = [actual for _, _, actual in measurements]
     gross_per_day = growth_bytes_per_day(series)
+    profile = linked_audio_profile(backup_root / "daily")
+    # 只有最新一份确实与更早快照共享录音，才认定下一份还会链接。
+    linked = (bool(profile) and profile[-1][3]
+              and [when for when, *_ in profile] == [when for when, _ in series])
     projection = retention_projection(
         series, keep=keep, horizon_days=min_days_left, free_bytes=usage.free,
-        existing_allocated=allocated)
+        existing_allocated=[nonaudio for _, _, nonaudio, _ in profile] if linked else allocated,
+        linked_audio=[audio for _, audio, _, _ in profile] if linked else None)
+    if linked:
+        rotation_credit = "nonaudio_allocated_bytes_only"
+    elif any(shares for *_, shares in profile):
+        rotation_credit = "last_link_allocated_bytes_only"
+    else:
+        rotation_credit = "existing_allocated_bytes_only"
     observed_keep = observed_retention_keep(backup_root / "backup.log")
 
     problems: list[str] = []
@@ -256,7 +367,7 @@ def evaluate(backup_root: Path, data_dir: Path | None, *, max_used_pct: float,
         "projection_horizon_days": min_days_left,
         "projection_scope": "scheduled_daily_backup_retention_only",
         "snapshot_measurement": "max_logical_allocated_files_plus_allocated_directories",
-        "rotation_credit_measurement": "existing_allocated_bytes_only",
+        "rotation_credit_measurement": rotation_credit,
         "total_days_left": None,
         "unmeasured_growth": ["live_data", "other_logs_and_files",
                               "unattributed_filesystem_metadata"],
@@ -267,6 +378,9 @@ def evaluate(backup_root: Path, data_dir: Path | None, *, max_used_pct: float,
         **projection,
         "problems": problems,
     }
+    if linked:
+        facts["snapshot_model"] = "linked_audio"
+        facts["assumptions"].append("unchanged_audio_relinked_into_every_new_snapshot")
     if data_dir is not None and data_dir.is_dir():
         facts["data_dir_mb"] = directory_bytes(data_dir) // MIB
     return facts
@@ -312,6 +426,8 @@ def main(argv: list[str] | None = None) -> int:
             f"scope=daily_backups_only horizon={args.min_days_left}d "
             f"projection={facts['projection_status']} "
             f"retention_contract={facts['retention_contract_status']} total_days_left=未知")
+    if "snapshot_model" in facts:
+        line += f" snapshot_model={facts['snapshot_model']}"
 
     print(json.dumps(facts, ensure_ascii=False, indent=2) if args.json else line)
     if args.state_file is not None:

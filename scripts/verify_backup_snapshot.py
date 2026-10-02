@@ -4,6 +4,12 @@
 The default diagnostics intentionally contain stable reason codes only.  Backup
 trees contain research identifiers in filenames, so paths and raw audio ids must
 not be copied into systemd, launchd, Docker, or terminal logs.
+
+Every file must have exactly one link by default.  ``--link-root`` (verify-vps
+and publish-vps only) relaxes that for top-level ``audio/`` files alone, and only
+when every link of the inode is the same name inside a sibling strict-timestamp
+snapshot of that root: the VPS daily job may share unchanged recordings between
+consecutive published snapshots, never with live data or any other path.
 """
 from __future__ import annotations
 
@@ -22,6 +28,7 @@ from sqlalchemy import create_engine, inspect
 
 
 _HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
+_STRICT_SNAPSHOT_NAME = re.compile(r"^[0-9]{8}-[0-9]{6}$")
 _SAFE_AUDIO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 _AUDIO_EXTENSIONS = frozenset({".webm", ".mp3", ".wav", ".m4a", ".ogg"})
 _AUDIO_FORMATS = frozenset({"webm", "mp3", "wav", "m4a", "ogg"})
@@ -439,6 +446,67 @@ def _root(path: str | Path) -> Path:
         raise SnapshotError("snapshot_root_unresolvable") from exc
 
 
+class _SiblingLinks:
+    """Proof that a multi-link audio inode stays inside sibling snapshots.
+
+    The link root must be the snapshot's own parent on the same device.  Sibling
+    audio directories are listed lazily: a root with no shared inode (every Mac
+    archive) never pays for the scan.
+    """
+
+    def __init__(self, root: Path, link_root: str | Path):
+        candidate = Path(link_root)
+        try:
+            meta = candidate.lstat()
+            if stat.S_ISLNK(meta.st_mode) or not stat.S_ISDIR(meta.st_mode):
+                raise SnapshotError("snapshot_link_root_invalid")
+            resolved = candidate.resolve(strict=True)
+            same_device = root.stat().st_dev == meta.st_dev
+        except SnapshotError:
+            raise
+        except OSError as exc:
+            raise SnapshotError("snapshot_link_root_invalid") from exc
+        if root.parent != resolved or not same_device:
+            raise SnapshotError("snapshot_link_root_invalid")
+        self._root = root
+        self._link_root = resolved
+        self._audio_directories: tuple[Path, ...] | None = None
+
+    def _siblings(self) -> tuple[Path, ...]:
+        if self._audio_directories is None:
+            directories: list[Path] = []
+            for entry in os.scandir(self._link_root):
+                if (entry.name == self._root.name
+                        or not _STRICT_SNAPSHOT_NAME.fullmatch(entry.name)
+                        or not entry.is_dir(follow_symlinks=False)):
+                    continue
+                audio = Path(entry.path) / "audio"
+                try:
+                    audio_meta = audio.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISDIR(audio_meta.st_mode):
+                    directories.append(audio)
+            self._audio_directories = tuple(directories)
+        return self._audio_directories
+
+    def proves(self, path: Path, meta: os.stat_result) -> bool:
+        """Every link is this snapshot's ``audio/<name>`` or a sibling's."""
+        if (path.parent != self._root / "audio"
+                or not stat.S_ISREG(meta.st_mode) or meta.st_nlink < 2):
+            return False
+        found = 1
+        for audio in self._siblings():
+            try:
+                other = (audio / path.name).lstat()
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISREG(other.st_mode) and other.st_dev == meta.st_dev
+                    and other.st_ino == meta.st_ino):
+                found += 1
+        return found == meta.st_nlink
+
+
 def _sha256(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     total = 0
@@ -452,7 +520,9 @@ def _sha256(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
-def _regular_files_and_directories(root: Path) -> tuple[dict[str, Path], set[str]]:
+def _regular_files_and_directories(
+        root: Path, links: _SiblingLinks | None = None,
+) -> tuple[dict[str, Path], set[str]]:
     files: dict[str, Path] = {}
     directories: set[str] = {"."}
     try:
@@ -478,7 +548,10 @@ def _regular_files_and_directories(root: Path) -> tuple[dict[str, Path], set[str
                 if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
                     raise SnapshotError("snapshot_non_regular_file")
                 if meta.st_nlink != 1:
-                    raise SnapshotError("snapshot_hardlinked_file")
+                    if links is None or current_path != root / "audio":
+                        raise SnapshotError("snapshot_hardlinked_file")
+                    if not links.proves(path, meta):
+                        raise SnapshotError("snapshot_hardlink_outside_link_root")
                 if stat.S_IMODE(meta.st_mode) != 0o600:
                     raise SnapshotError("snapshot_permissions_invalid")
                 if len(files) >= MAX_SNAPSHOT_FILES:
@@ -782,8 +855,10 @@ def _verify_staging_export_intent(
     return expected_files, expected_directories
 
 
-def _verify_manifest(root: Path) -> tuple[dict[str, Path], set[str]]:
-    files, directories = _regular_files_and_directories(root)
+def _verify_manifest(
+        root: Path, links: _SiblingLinks | None = None,
+) -> tuple[dict[str, Path], set[str]]:
+    files, directories = _regular_files_and_directories(root, links)
     manifest = files.get("MANIFEST.sha256")
     if manifest is None:
         raise SnapshotError("manifest_missing")
@@ -847,7 +922,9 @@ def _open_database(database: Path) -> sqlite3.Connection:
         raise SnapshotError("sqlite_unreadable") from exc
 
 
-def _audio_files(root: Path) -> dict[str, tuple[Path, str, int]]:
+def _audio_files(
+        root: Path, links: _SiblingLinks | None = None,
+) -> dict[str, tuple[Path, str, int]]:
     audio_root = root / "audio"
     if not audio_root.exists():
         return {}
@@ -870,9 +947,15 @@ def _audio_files(root: Path) -> dict[str, tuple[Path, str, int]]:
             raise SnapshotError("audio_entry_unreadable") from exc
         if entry.name.startswith("."):
             raise SnapshotError("audio_transient_file")
-        if (entry.is_symlink() or not stat.S_ISREG(meta.st_mode)
-                or meta.st_nlink != 1):
+        if entry.is_symlink() or not stat.S_ISREG(meta.st_mode):
             raise SnapshotError("audio_non_regular_file")
+        if meta.st_nlink != 1:
+            try:
+                proven = links is not None and links.proves(Path(entry.path), meta)
+            except OSError as exc:
+                raise SnapshotError("audio_entry_unreadable") from exc
+            if not proven:
+                raise SnapshotError("audio_non_regular_file")
         suffix = Path(entry.name).suffix.lower()
         raw_audio_id = entry.name[:-len(suffix)] if suffix else ""
         if suffix not in _AUDIO_EXTENSIONS or not _SAFE_AUDIO_ID.fullmatch(raw_audio_id):
@@ -888,8 +971,9 @@ def _audio_files(root: Path) -> dict[str, tuple[Path, str, int]]:
 
 
 def _verify_audio_semantics(
-        root: Path, connection: sqlite3.Connection) -> None:
-    audio_files = _audio_files(root)
+        root: Path, connection: sqlite3.Connection,
+        links: _SiblingLinks | None = None) -> None:
+    audio_files = _audio_files(root, links)
     unmatched_audio_files = set(audio_files)
     try:
         table = connection.execute(
@@ -1322,18 +1406,20 @@ def _verify_vps_config(root: Path) -> None:
 
 def verify_snapshot(
         path: str | Path, *, require_manifest: bool = True,
-        require_vps_config: bool = False) -> Path:
+        require_vps_config: bool = False,
+        link_root: str | Path | None = None) -> Path:
     root = _root(path)
+    links = None if link_root is None else _SiblingLinks(root, link_root)
     if require_manifest:
-        files, directories = _verify_manifest(root)
+        files, directories = _verify_manifest(root, links)
     else:
-        files, directories = _regular_files_and_directories(root)
+        files, directories = _regular_files_and_directories(root, links)
     database = root / "app.db"
     if not database.exists():
         raise SnapshotError("database_missing")
     connection = _open_database(database)
     try:
-        _verify_audio_semantics(root, connection)
+        _verify_audio_semantics(root, connection, links)
         _verify_export_semantics(files, directories, connection)
     finally:
         connection.close()
@@ -1387,8 +1473,8 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _durably_sync_tree(root: Path) -> None:
-    files, directories = _regular_files_and_directories(root)
+def _durably_sync_tree(root: Path, links: _SiblingLinks | None = None) -> None:
+    files, directories = _regular_files_and_directories(root, links)
     try:
         for path in files.values():
             descriptor = os.open(path, os.O_RDONLY)
@@ -1407,15 +1493,23 @@ def _durably_sync_tree(root: Path) -> None:
 
 def publish_snapshot(
         source: str | Path, destination: str | Path, *,
-        require_vps_config: bool = False) -> None:
+        require_vps_config: bool = False,
+        link_root: str | Path | None = None) -> None:
     source_root = verify_snapshot(
-        source, require_vps_config=require_vps_config)
-    _durably_sync_tree(source_root)
+        source, require_vps_config=require_vps_config, link_root=link_root)
+    links = None if link_root is None else _SiblingLinks(source_root, link_root)
+    _durably_sync_tree(source_root, links)
     destination_path = Path(destination)
     try:
         destination_parent = destination_path.parent.resolve(strict=True)
     except OSError as exc:
         raise SnapshotError("publish_parent_missing") from exc
+    # Shared inodes stay provable only between strict-timestamp siblings of the
+    # same root; a linked snapshot published anywhere else would orphan them.
+    if links is not None and (
+            destination_parent != source_root.parent
+            or not _STRICT_SNAPSHOT_NAME.fullmatch(destination_path.name)):
+        raise SnapshotError("publish_link_root_mismatch")
     try:
         same_filesystem = source_root.stat().st_dev == destination_parent.stat().st_dev
     except OSError as exc:
@@ -1452,6 +1546,7 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("snapshot")
     verify_vps = subparsers.add_parser("verify-vps")
     verify_vps.add_argument("snapshot")
+    verify_vps.add_argument("--link-root")
     audio = subparsers.add_parser("verify-audio")
     audio.add_argument("snapshot")
     compare = subparsers.add_parser("compare")
@@ -1466,6 +1561,7 @@ def _parser() -> argparse.ArgumentParser:
     publish_vps = subparsers.add_parser("publish-vps")
     publish_vps.add_argument("source")
     publish_vps.add_argument("destination")
+    publish_vps.add_argument("--link-root")
     manifest_files = subparsers.add_parser("manifest-files")
     manifest_files.add_argument("manifest")
     return parser
@@ -1477,7 +1573,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "verify":
             verify_snapshot(args.snapshot)
         elif args.command == "verify-vps":
-            verify_snapshot(args.snapshot, require_vps_config=True)
+            verify_snapshot(args.snapshot, require_vps_config=True,
+                            link_root=args.link_root)
         elif args.command == "verify-audio":
             verify_snapshot(args.snapshot, require_manifest=False)
         elif args.command == "compare":
@@ -1493,7 +1590,8 @@ def main(argv: list[str] | None = None) -> int:
             publish_snapshot(args.source, args.destination)
         elif args.command == "publish-vps":
             publish_snapshot(
-                args.source, args.destination, require_vps_config=True)
+                args.source, args.destination, require_vps_config=True,
+                link_root=args.link_root)
         elif args.command == "manifest-files":
             for rel in manifest_file_list(args.manifest):
                 print(rel)

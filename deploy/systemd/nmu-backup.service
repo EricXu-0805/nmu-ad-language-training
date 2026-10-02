@@ -8,5 +8,8 @@ ExecStart=/opt/nmu/app/scripts/vps-backup-daily.sh
 # 不给这一行，脚本会回退到系统 python3——那个解释器没有 SQLAlchemy，
 # 数据库备份合同检查直接抛 ModuleNotFoundError。见 deploy/systemd/README.md。
 Environment=PYTHON_BIN=/opt/nmu/venv/bin/python
+# 录音硬链接去重开关，默认关：文件不存在、或其中不是 NMU_BACKUP_LINK_AUDIO=1，
+# 备份与以前逐字节相同。打开前先换 Mac 端拉取脚本与校验器，顺序见 DEPLOY.md 第 8 节。
+EnvironmentFile=-/opt/nmu/backup-dedup.env
 Nice=10
 IOSchedulingClass=idle
