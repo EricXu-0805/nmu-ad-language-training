@@ -44,12 +44,12 @@ npm run build
 - 前端不得自行增加外部字体、CDN、遥测或绕过后端守卫直连第三方模型。
 - 浏览器 IndexedDB/localStorage 只作设备侧暂存或缓存，不能作为研究事件的唯一事实源。
 - 录音必须校验服务端回执的音频 ID、字节数和 SHA-256，再确认源设备 IndexedDB 副本已清理，才可发出“已保存”并推进环节。
-- 跨刷新音频 outbox、服务端 checksum/字节数收据和终态处置标记已接入。旧版遗留缓存只在服务端能证明同 ID 完整性时自动清理；404、未上传、无 checksum 或归属不一致的孤儿继续保留/隔离。任何收尾电脑的本地删除都不能冒充另一台平板已清理的证据。
+- 跨刷新音频 outbox、服务端 checksum/字节数收据和终态处置标记已接入。旧版遗留缓存的清理逻辑（`src/audio/audioCacheSweep.ts`，只清服务端能证明同 ID 完整性的副本）目前**没有接到任何页面，不会自动运行**（2026-10-02 核对）；遗留副本和 404、未上传、无 checksum 或归属不一致的孤儿一样留在设备上。任何收尾电脑的本地删除都不能冒充另一台平板已清理的证据。
 - 真实研究只有 `recording_allowed=true` 且其余准入条件明确满足时才可启动录音；空值不是允许。模拟场次必须由服务端显式标记并由部署环境单独开启。
 - **两条录音路径不是同一套规则，别混着读**：
   - *旧手动/legacy 路径*：仍然由用户或研究者点“开始/结束”，单段有 5 分钟安全上限。
   - *exact/autopilot 路径*：页面首次进入或刷新后仍需一次“点一下，开始”做浏览器激活；此后，当前 exact TTS 音频真正 media ended、设备提交 `tts_ended`、且服务端已签发当前 record 命令时，前端**自动**请求麦克风，不再要求第二次点“开始回答”，开麦前也没有旧的 900 ms 固定等待（`AUTOPILOT_IDLE_TICK_MS` 仍在，但只是没有可执行媒体时的有界轮询节拍；`record_ready` + pending record 命令时该间隔为 0）。浏览器权限、同意/资格/录音允许、场次分类、capability 与当前命令等门禁仍可随时阻断并安全暂停。
-- **exact/autopilot 的停止路径自 2026-09-21 起有一条说完后的尾静默自动收麦**（`autopilotVoiceActivity.ts` 纯判定 + `autopilotBrowserVoiceActivity.ts` 在 Recorder 已持有的同一条流上量 RMS）：开口 = 连续 ≥250 ms 高于自适应噪声底 ×3；开口后累计有声 ≥450 ms 且静满 3 s（有声不足 900 ms 的短话静满 4.5 s）以 `stop_reason=silence` 收麦；没检测到说话永远不自动收，AudioContext 建不起来或被挂起时静默失效。这仍不是「ASR 之后的沉默判定」，也不改判分口径。协议层服务端录音硬上限 15 秒，前端约 14 秒主动结束；这 1 秒是 `CAPTURE_STOP_JITTER_TOLERANCE_MS`，**只覆盖定时器迟到与 `Recorder.stop()`/媒体事件派发的抖动**，不是给上传或网络往返用的——上传发生在物理停麦之后。取得麦克风权限及权限返回后的第二次服务端授权都发生在 `MediaRecorder.start()` 之前，共用独立的开录前预算；老人的约 14 秒作答窗口从真实 `onstart` 起算。`stop_reason=max_duration` 只表示计时到限，**不**表示检测到沉默、患者说完或回答完整。“说完了可以点这里”这个可选提前结束按钮保留。
+- **exact/autopilot 的停止路径自 2026-09-21 起有一条说完后的尾静默自动收麦**（`autopilotVoiceActivity.ts` 纯判定 + `autopilotBrowserVoiceActivity.ts` 在 Recorder 已持有的同一条流上量 RMS）：开口 = 连续 ≥250 ms 高于自适应噪声底 ×3；开口后累计有声 ≥450 ms 且静满 3 s（有声不足 900 ms 的短话静满 4.5 s）以 `stop_reason=silence` 收麦；没检测到说话永远不自动收，AudioContext 建不起来或被挂起时静默失效。这仍不是「ASR 之后的沉默判定」，也不改判分口径。协议层服务端录音硬上限 15 秒，前端约 14 秒主动结束；这 1 秒是 `CAPTURE_STOP_JITTER_TOLERANCE_MS`，**只覆盖定时器迟到与 `Recorder.stop()`/媒体事件派发的抖动**，不是给上传或网络往返用的——上传发生在物理停麦之后。取得麦克风权限及权限返回后的第二次服务端授权都发生在 `MediaRecorder.start()` 之前，共用独立的开录前预算；老人的约 14 秒作答窗口从真实 `onstart` 起算。`stop_reason=max_duration` 只表示计时到限，**不**表示检测到沉默、患者说完或回答完整。“说完了可以点这里”这个可选提前结束按钮保留。VAD 只在服务端 `voice-settings` 明确 `vad_enabled=true` 时挂上，尾静默参数随设置下发；取不到设置、形状不对或请求失败都按关闭处理。声音停播（2026-09-24 起）关闭时授权返回 409 `autopilot_barge_in_disabled`，页面只留「现在回答」。被停播打断后的那一次重说不挂 VAD，免得重说前的停顿被判成说完。
 - 停止之后、上传/收据/ACK 尚未闭合的那段时间，患者端显示“已收音，正在保存，请稍候”，主开始/结束按钮隐藏。这一条目前只有实现与自动 render 测试证据，本轮**没有**抓到该过渡态的现场截图，不得写成真人目视验收。`audioSaved` 也只代表音频已保存，不能单独代表业务完成；推进仍依赖服务端完整的 terminal evidence/receipt/ACK。
 - 原始声纹不是“去标识数据”，必须与分析表分开治理。
 - 前端只能把服务端明确声明的“完整计划可自动执行”视为自动驾驶就绪；未知、`draft` 或 `operational_autopilot_ready=false` 均关闭启动入口，服务端仍做最终重验。
