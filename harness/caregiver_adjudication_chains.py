@@ -224,6 +224,11 @@ def run_adjudication_chains(config: BrowserAcceptanceConfig) -> AdjudicationChai
             if obs["runtime_paused"]:
                 return status == 409 and code == "autopilot_runtime_inactive"
             return not obs["autopilot_started"] and status == 409 and code == "autopilot_not_active"
+        if (request.method == "POST" and path.endswith("/barge-in-authorization")
+                and obs["runtime_paused"] and status == 409 and code == "autopilot_runtime_inactive"):
+            # 暂停落在问句/线索播放期间:声音停播检测开麦后的第二次授权撞上已暂停的场次,
+            # 平板按「检测不可用」处理、不开麦。与 voice-chains 同口径,只在本走查自己暂停后放行。
+            return True
         if request.method == "GET" and path.endswith("/autopilot/drain-target"):
             # 恢复/裁定刚 200、平板的收麦协调器还按暂停态多问了一次收麦目标:服务端已不在
             # 暂停态 → 409,平板按可重试处理后转去拿新命令。只在这个窗口里放行。

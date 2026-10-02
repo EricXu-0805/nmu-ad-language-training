@@ -291,10 +291,17 @@ def run_recovery_chains(config: BrowserAcceptanceConfig) -> RecoveryChainsResult
                             and obs["session_id"] not in obs["attached_session_ids"])  # type: ignore[operator]
         if (in_repair_window and (
                 (request.method == "POST" and path == "/live/patient-heartbeat" and status == 401)
+                or (request.method == "GET" and path == "/live/state" and status == 401)
                 or (request.method == "GET" and path == "/live/state" and status == 409
                     and code == "device_session_changed"))):
-            # 新场次 B 已开、平板还攥着旧场次 A 的凭据:心跳 401 / 实时状态 409 就是
-            # 「这台配的是另一场」的信号(哪个先到看时序),紧接着工作人员在屏上重新配对。
+            # 新场次 B 已开、平板还攥着旧场次 A 的凭据:心跳 401 / 实时状态 401 或 409 就是
+            # 「这台配的是另一场」的信号(凭据先被吊销就是 401,哪个先到看时序),紧接着
+            # 工作人员在屏上重新配对。
+            return True
+        if (request.method == "POST" and path.endswith("/barge-in-authorization")
+                and status == 409 and code == "autopilot_runtime_inactive"
+                and (obs["pause_requested"] or (obs["device_failure_induced"] and not obs["resumed"]))):
+            # 暂停落在问句/线索播放期间,声音停播检测的第二次授权撞上已暂停的场次;平板不开麦。
             return True
         if request.method == "GET" and path.endswith("/autopilot/next"):
             if obs["device_failure_induced"] and not obs["resumed"]:
