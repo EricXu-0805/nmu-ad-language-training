@@ -282,6 +282,67 @@ def test_persisted_ready_probe_becomes_mismatch_after_api_key_rotation(
         assert mismatch.start_allowed is False
 
 
+class _PromptStampedLlm(FakeLlm):
+    # 判分版本号并进 prompt 摘要之后的形状(d9b42f9):模型没换,指纹照样变。
+    version = "fake-llm/model-v3+p0123abcd"
+
+
+def test_expired_probe_reports_expired_even_when_config_also_changed(tmp_path):
+    """过期先于配置比对:旧配置的实测过了 TTL 报 expired,配置事实仍如实给出。"""
+    engine = create_engine(f"sqlite:///{tmp_path / 'expired-and-changed.db'}")
+    SQLModel.metadata.create_all(engine)
+    now = datetime(2026, 9, 17, 3, 38, 16)
+    old = _configuration()
+    new = _configuration(llm_engine=_PromptStampedLlm())
+    assert old.fingerprint != new.fingerprint
+    with Session(engine) as session:
+        provider_readiness.persist_probe(
+            session, result=provider_readiness.run_synthetic_probe(old),
+            actor_display_id="ADMIN-1", checked_at=now)
+        session.commit()
+        stale = provider_readiness.readiness_projection(
+            session, configuration=new, now=now + timedelta(days=15))
+        fresh = provider_readiness.readiness_projection(
+            session, configuration=new, now=now + timedelta(minutes=1))
+
+    assert stale.status == "expired"
+    assert stale.matches_current_config is False
+    assert stale.start_allowed is False
+    # 没过 TTL 的旧配置实测仍报 config_mismatch:这时配置变了是唯一的拒因。
+    assert fresh.status == "config_mismatch"
+    assert fresh.matches_current_config is False
+    assert fresh.start_allowed is False
+
+
+def test_resume_refuses_an_expired_probe_of_a_previous_configuration(
+        tmp_path, monkeypatch):
+    """恢复只放过「实测过、只是久了」;实测的是旧配置,过了 TTL 也照样拒。"""
+    engine = create_engine(f"sqlite:///{tmp_path / 'resume-changed.db'}")
+    SQLModel.metadata.create_all(engine)
+    now = datetime(2026, 9, 17, 3, 38, 16)
+    old = _configuration()
+    new = _configuration(llm_engine=_PromptStampedLlm())
+    with Session(engine) as session:
+        provider_readiness.persist_probe(
+            session, result=provider_readiness.run_synthetic_probe(old),
+            actor_display_id="ADMIN-1", checked_at=now)
+        session.commit()
+        monkeypatch.setattr(provider_readiness, "_utc_now_naive",
+                            lambda: now + timedelta(days=15))
+        monkeypatch.setattr(provider_readiness, "capture_configuration",
+                            lambda **_kwargs: old)
+        assert provider_readiness.require_resume_ready(session).status == "expired"
+        monkeypatch.setattr(provider_readiness, "capture_configuration",
+                            lambda **_kwargs: new)
+        with pytest.raises(provider_readiness.ProviderReadinessConflict) as refused:
+            provider_readiness.require_resume_ready(session)
+        with pytest.raises(provider_readiness.ProviderReadinessConflict):
+            provider_readiness.require_start_ready(session)
+
+    assert refused.value.projection.matches_current_config is False
+    assert refused.value.code == "provider_readiness_expired"
+
+
 def test_probe_ledger_schema_has_no_sensitive_payload_columns():
     forbidden = {
         "api_key", "key_hash", "audio", "audio_bytes", "transcript", "text",
