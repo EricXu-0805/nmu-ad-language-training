@@ -4,15 +4,22 @@
  * 事实（UA、构建编号、屏幕、时间）自动记进回执。
  *
  * 刻意不往服务器写：验收当天可能正好在验"断网会怎样"，一个需要联网才能保存的
- * 记录页在那一刻恰好用不了。所以只下载 JSON + 复制纯文本。
+ * 记录页在那一刻恰好用不了。所以草稿只存本机 localStorage，交出去靠下载 JSON +
+ * 复制纯文本。
  *
  * 「完成并冻结」只生成一次回执字节，之后下载、复制拿到的都是那一份；冻结后表单只读，
  * 要改就解冻换新编号。「采集设备参数」由工作人员点，开麦前先拿与老人端共用的设备锁。
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Alert } from "../components/Alert";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import {
+  browserAcceptanceStorage,
+  loadAcceptanceWork,
+  saveAcceptanceWork,
+  type AcceptanceWork,
+} from "./acceptanceDraftStore.ts";
 import {
   collectAcceptanceDeviceFacts,
   formatDeviceFactsLines,
@@ -45,10 +52,8 @@ const VERDICT_TONE = {
 
 type CopyKind = "text" | "json";
 
-interface AcceptanceWork {
-  draft: AcceptanceDraft;
-  /** 已冻结回执的原始字节；没冻结为 null。 */
-  frozenJson: string | null;
+function localTime(iso: string): string {
+  return new Date(iso).toLocaleString("zh-CN", { hour12: false });
 }
 
 function machineFacts(): { userAgent: string; buildId: string; screen: string } {
@@ -60,7 +65,12 @@ function machineFacts(): { userAgent: string; buildId: string; screen: string } 
 }
 
 export function AcceptanceScreen() {
-  const [work, setWork] = useState<AcceptanceWork>(() => ({ draft: emptyDraft(), frozenJson: null }));
+  const storage = useMemo(browserAcceptanceStorage, []);
+  // 只读一次：既用来初始化，也用来告诉现场这份是从本机恢复的。
+  const [restored] = useState(() => loadAcceptanceWork(storage));
+  const [work, setWork] = useState<AcceptanceWork>(
+    () => restored ?? { draft: emptyDraft(), frozenJson: null });
+  const [stored, setStored] = useState(true);
   // 旧 WebView 上剪贴板会静默失败；失败时把要复制的内容直接摆出来让人长按复制。
   const [copyResult, setCopyResult] = useState<{ kind: CopyKind; ok: boolean } | null>(null);
   const [confirmingReset, setConfirmingReset] = useState(false);
@@ -80,6 +90,10 @@ export function AcceptanceScreen() {
   const copyFallbackText = frozen && copyResult && !copyResult.ok
     ? (copyResult.kind === "text" ? frozen.text : frozen.json)
     : null;
+
+  useEffect(() => {
+    setStored(saveAcceptanceWork(storage, work));
+  }, [storage, work]);
 
   const updateDraft = (change: (prev: AcceptanceDraft) => AcceptanceDraft) => {
     setCopyResult(null);
@@ -182,12 +196,22 @@ export function AcceptanceScreen() {
             这是一份改正记录，冻结后会写明它取代记录 {shortReceiptId(draft.supersedesReceiptId)}。
           </p>
         )}
+        {restored !== null && restored.draft.receiptId === draft.receiptId && (
+          <p className="muted">
+            这份记录是本机上次留下的（{localTime(draft.startedAtIso)} 开始填写），已原样恢复。
+            要另起一份，点页面底部的「开始新记录」。
+          </p>
+        )}
+        <p className="muted">
+          填的内容自动存在这台设备的浏览器里，刷新或误点返回不会丢；不上传服务器。
+        </p>
+        {!stored && (
+          <Alert tone="warn" title="这台设备存不了草稿">
+            浏览器不让本页存数据（私隐模式、站点存储被禁或已满）：刷新、返回或关掉页面，
+            填的内容就没了。请一次填完，冻结后立刻保存记录文件。
+          </Alert>
+        )}
       </section>
-
-      <Alert tone="warn" role="note" title="不写老人姓名或编号">
-        表头和每一项备注都不写老人的姓名、受试者编号或床号；验收只用虚构受试者。
-        「验收人」一栏填工作人员真名。
-      </Alert>
 
       <section className="form-section" aria-label="设备与场地">
         <div className="form-section-header">
@@ -198,6 +222,10 @@ export function AcceptanceScreen() {
             </p>
           </div>
         </div>
+        <Alert tone="warn" role="note" title="不写老人姓名或编号">
+          表头和每一项备注都不写老人的姓名、受试者编号或床号；验收只用虚构受试者。
+          「验收人」一栏填工作人员真名。
+        </Alert>
         {ACCEPTANCE_HEADER_FIELDS.map((field) => (
           <label key={field.key} className="field">
             <span>{field.label}</span>
@@ -330,7 +358,7 @@ export function AcceptanceScreen() {
           <>
             <p>
               已冻结：记录编号 <span className="mono">{shortReceiptId(frozen.receipt.receiptId)}</span>，
-              冻结于 {frozen.receipt.machine.finishedAtIso}。
+              冻结于 {localTime(frozen.receipt.machine.finishedAtIso)}。
             </p>
             <div className="form-actions">
               <button type="button" className="button button--primary button--md" onClick={download}>
