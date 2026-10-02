@@ -90,7 +90,8 @@ test("新增的现场项目:现在回答、停播误停与漏停、找词停顿�
   assert.ok(ACCEPTANCE_ITEMS[12]!.steps.some((step) => /中止/.test(step.title) && /第二场/.test(step.title)));
 });
 
-test("结论与免责小字跟着项数走,不再写死八项", () => {
+test("结论与免责小字说的是十三项,不再是八项", () => {
+  assert.equal(ACCEPTANCE_ITEMS.length, 13);
   const receipt = buildAcceptanceReceipt(allPass(filledHeader(emptyDraft())), MACHINE);
   assert.doesNotMatch(receipt.caveat, /八项/);
   assert.match(receipt.caveat, /十三项全部通过/);

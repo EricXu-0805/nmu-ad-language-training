@@ -2,8 +2,8 @@
 // 2026-09-13 演示:平板里留着上一场没传完的录音,自动带练一开麦就 recording_start_failed,
 // 屏上只剩「已安全暂停」,钱凯只能说「进行不了训练」。
 //
-// 服务端能写进 last_error_code 的码由 autopilotErrorHints.test.ts 按 app/ 的 grep 逐个钉住,
-// 加了新码那条测试会先红。
+// 服务端能写进 last_error_code 的码在 autopilotErrorHints.test.ts 里按 app/ 的 grep 列成
+// 清单逐个钉住。服务端加了新码,先按那几条 grep 把它补进清单,测试再逼着这里补提示。
 
 const RECORDING_START_FAILED_HINT = "老人端麦克风没能启动。常见原因：平板里还留着上一场没传完的录音（系统会在下一次开麦前自动清掉），或浏览器没给麦克风权限。点「继续 AI 自动带练」再试一次；还不行就让老人端页面刷新一下。";
 const MICROPHONE_DENIED_HINT = "老人端浏览器拒绝了麦克风权限，请在平板上允许后再点「继续 AI 自动带练」。";
