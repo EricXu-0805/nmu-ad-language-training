@@ -1942,3 +1942,17 @@ def test_publish_vps_needs_link_root_for_a_sibling_linked_staging(tmp_path):
     assert ((destination / "audio" / "aud-shared.webm").stat().st_ino
             == (older / "audio" / "aud-shared.webm").stat().st_ino)
     assert _run_link_root("verify-vps", destination, daily).returncode == 0
+
+
+def test_a_linked_staging_can_only_be_published_as_a_timestamp_inside_its_link_root(tmp_path):
+    daily, _older, newer = _linked_daily(tmp_path)
+    staging = daily / ".20261003-193000.partial.4242"
+    newer.rename(staging)
+    elsewhere = tmp_path / "held"
+    elsewhere.mkdir(mode=0o700)
+
+    for destination in (elsewhere / "20261003-193000", daily / "held-20261003"):
+        completed = _run_link_root("publish-vps", staging, daily, destination)
+        assert completed.returncode == 2
+        assert "code=publish_link_root_mismatch" in completed.stderr
+        assert staging.is_dir() and not destination.exists()

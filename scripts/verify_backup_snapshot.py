@@ -1497,14 +1497,19 @@ def publish_snapshot(
         link_root: str | Path | None = None) -> None:
     source_root = verify_snapshot(
         source, require_vps_config=require_vps_config, link_root=link_root)
-    _durably_sync_tree(
-        source_root,
-        None if link_root is None else _SiblingLinks(source_root, link_root))
+    links = None if link_root is None else _SiblingLinks(source_root, link_root)
+    _durably_sync_tree(source_root, links)
     destination_path = Path(destination)
     try:
         destination_parent = destination_path.parent.resolve(strict=True)
     except OSError as exc:
         raise SnapshotError("publish_parent_missing") from exc
+    # Shared inodes stay provable only between strict-timestamp siblings of the
+    # same root; a linked snapshot published anywhere else would orphan them.
+    if links is not None and (
+            destination_parent != source_root.parent
+            or not _STRICT_SNAPSHOT_NAME.fullmatch(destination_path.name)):
+        raise SnapshotError("publish_link_root_mismatch")
     try:
         same_filesystem = source_root.stat().st_dev == destination_parent.stat().st_dev
     except OSError as exc:

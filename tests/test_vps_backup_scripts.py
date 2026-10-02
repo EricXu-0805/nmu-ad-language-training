@@ -1243,6 +1243,7 @@ exec {real_date} "$@"
     )
     env["PYTHON_BIN"] = str(traced_python)
     env["PYTHON_TRACE"] = str(trace)
+    env.pop("NMU_BACKUP_LINK_AUDIO", None)
     return app, root, env, trace
 
 

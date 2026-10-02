@@ -386,7 +386,7 @@ export NMU_BACKUP_MAX_PULL_DIRECTORIES=50000
 
 1. Mac：`scripts/install-macos-offsite-pull.sh <ssh-user> <ssh-host>` 重装拉取脚本与校验器，它会重记 `verifier.sha256`。装完对还没链接的 VPS 跑一次，必须是 `ok`，已归档快照计入 `unchanged`。VPS 先打开而 Mac 没换，Mac 每次拉取都会报 `remote_snapshot_facts_invalid` 并整体退 2，异地副本就此中断。
 2. VPS：按正常发布带上本版代码，再把 `deploy/systemd/nmu-backup.service` `install -m 644` 到 `/etc/systemd/system/` 并 `systemctl daemon-reload`。开关文件不存在，下一次备份与以前相同。
-3. 打开：`install -m 600 /dev/null /opt/nmu/backup-dedup.env && printf 'NMU_BACKUP_LINK_AUDIO=1\n' > /opt/nmu/backup-dedup.env`，然后 `systemctl start nmu-backup.service`。第一份只会与上一份整份快照链接，旧的整份快照 14 天内轮换掉。
+3. 打开：`install -m 600 /dev/null /opt/nmu/backup-dedup.env && printf 'NMU_BACKUP_LINK_AUDIO=1\n' > /opt/nmu/backup-dedup.env`，然后 `systemctl start nmu-backup.service`。文件保持 0600：预检把 `/opt/nmu` 下的 `*.env` 当敏感文件，other 可读会报失败。第一份只会与上一份整份快照链接，旧的整份快照 14 天内轮换掉。
 4. 验收：`tail -1 /opt/nmu/backups/backup.log` 带 `linked=`；`find /opt/nmu/backups/daily -type f -links +1 | wc -l` 大于 0；`/opt/nmu/venv/bin/python -I /opt/nmu/app/scripts/verify_backup_snapshot.py verify-vps --link-root /opt/nmu/backups/daily /opt/nmu/backups/daily/<最新>` 输出 `OK`；下一次 Mac 拉取 `ok`；`capacity.state` 末尾有 `snapshot_model=linked_audio`；`systemctl start nmu-restore-drill.service` 后 `restore-drill.state` 为通过。
 5. 关掉：删掉 `/opt/nmu/backup-dedup.env`（或改成别的值）。之后又是整份副本；已链接的旧快照照样能验，14 天内轮换掉；Mac 两种都认。
 
