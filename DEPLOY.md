@@ -273,6 +273,8 @@ qwen-plus；如切龙媛还需 cosyvoice-v2——`cosyvoice-v3-plus` 需单独�
 
 平板经 `GET /sessions/{id}/autopilot/voice-settings` 读前三项（取不到就不挂 VAD）。两项都会改变老人的作答窗口，研究场次用不用、阈值多少由课题组定，不是运维默认值说了算。
 
+声音停播的分母：平板读语音设置时带 `?ack_facts=1`，服务端多回一个 `ack_facts` 列出它认得的可选回执事实，平板才在提问/提示的 `tts_ended`/`tts_interrupted` 里报 `barge_in_armed`（这句播放时检测在不在听）与 `barge_in_listened_ms`；导出 attempts/turns 与研究读面据此给出分母。`NMU_AUTOPILOT_VOICE_BARGE_IN` 关着时这些行都是 `false`。**回滚到不认这两键的版本（如 `af59c28`）只能在空闲闸、没有待投递平板回执时做，回滚后刷新平板**：旧网页包解析不了 IndexedDB 里带新键的待投递回执，会卡在那一条上。服务端单独回滚本身不卡：旧服务端忽略 `?ack_facts=1` 只回四键，新平板见四键就不发这两键（2026-10-02 本机真 Chrome 走查实测，零 422）。
+
 ### 7.2 去标识导出 HMAC 密钥
 
 用与账号、PIN 和百炼 Key 无关的随机值，例如在受控终端执行 `openssl rand -base64 32`，把结果仅写入权限为
