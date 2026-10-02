@@ -8171,7 +8171,8 @@ def _assess_intervention_completion(
 
 _OUTCOME_SUMMARY_SCHEMA_VERSION = "session-outcome-summary.v1"
 # v2(2026-10-02):「人工接管」改数自动驾驶控制账本里的 takeover，v1 只数从未能写入的旧交互。
-_OUTCOME_SUMMARY_GENERATOR_VERSION = "server-authoritative-closeout.v2"
+# v3(2026-10-02):技术失败后跳过的题位，失败那段尝试照实计数、不算完成环节，v2 遇到它就 409。
+_OUTCOME_SUMMARY_GENERATOR_VERSION = "server-authoritative-closeout.v3"
 
 
 def _ensure_session_outcome_summary(
@@ -8217,6 +8218,7 @@ def _ensure_session_outcome_summary(
             interactions=interactions,
             generated_at=datetime.now(),
             autopilot_takeovers=takeovers,
+            skipped_positions=_skipped_autopilot_positions(sess.session_id, s),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail={

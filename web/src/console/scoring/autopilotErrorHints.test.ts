@@ -142,9 +142,32 @@ test("人工态下点「切回 AI」被技术失败挡住:不再叫人去点已�
   assert.doesNotMatch(manual, /转为人工操作/);
   assert.match(manual, /人工.*做完/);
   assert.match(manual, /切回 AI 自动带练/);
-  // 还在 AI 托管下暂停时,转人工就是唯一出口,原提示不变。
+  // 还在 AI 托管下暂停时,原提示不变(跳过本题与转人工两条出口都在里面)。
   assert.equal(autopilotResumeRefusalHint("autopilot_attempt_failed", false),
     autopilotErrorHint("autopilot_attempt_failed"));
   assert.equal(autopilotResumeRefusalHint("autopilot_attempt_processing", true),
     autopilotErrorHint("autopilot_attempt_processing"));
+});
+
+test("识别/判分技术失败:AI 托管下给两条真出口「跳过本题」「转为人工操作」;人工态切回被拒不提跳过", () => {
+  // autopilot_attempt_technical_failure 是 worker 兜底码:attempt 同样已判技术失败,
+  // 服务端照样拒「继续」,不能再按其他内部码那样叫人点「继续」重试。
+  for (const code of ["asr_exception", "asr_invalid_result", "asr_degraded",
+    "asr_recovery_state_invalid", "judgement_exception", "autopilot_attempt_failed",
+    "autopilot_attempt_technical_failure"]) {
+    assert.match(autopilotErrorHint(code), /可点「跳过本题」（原因选「识别反复出错」或「其他」）/, code);
+    assert.match(autopilotErrorHint(code), /「转为人工操作」/, code);
+    assert.doesNotMatch(autopilotErrorHint(code), /继续 AI 自动带练/, code);
+  }
+  assert.match(autopilotErrorHint("autopilot_attempt_technical_failure"),
+    /错误码：autopilot_attempt_technical_failure/);
+  // 人工态没有「跳过本题」按钮(裁定只在 AI 自己暂停时出现)。
+  assert.doesNotMatch(autopilotResumeRefusalHint("autopilot_attempt_failed", true), /跳过本题/);
+});
+
+test("裁定被云处理授权挡下也是写前拒绝:提示常驻,且不叫人去点这一态可能不显示的「继续」", () => {
+  // 技术失败那一题点「跳过本题」也过同一道门禁;不在集合里,控制台会显示「待核实」直到下一次轮询。
+  assert.ok(ADJUDICATION_PREWRITE_CODES.has("autopilot_cloud_processing_required"));
+  assert.match(autopilotErrorHint("autopilot_cloud_processing_required"), /云处理授权/);
+  assert.doesNotMatch(autopilotErrorHint("autopilot_cloud_processing_required"), /继续 AI 自动带练/);
 });

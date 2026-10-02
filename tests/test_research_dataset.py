@@ -126,3 +126,16 @@ def test_capture_provenance_columns_are_appended_and_documented_as_operational_f
     for value in ("ended", "interrupted_answer_now", "interrupted_voice_activity", "unverified"):
         assert value in playback.description, value
     assert "prompt_playback_outcome" in playback.description
+
+
+def test_adjudications_append_a_derived_technical_failure_flag_after_withdrawn():
+    """研究面没有 attempts 数据集;技术失败后跳过要靠这一列认,原因码可能选的是「其他」。"""
+    adjudications = rd.dataset_for("adjudications")
+    assert adjudications is not None
+    assert rd.published_columns(adjudications)[-2:] == (
+        "withdrawn", "position_had_technical_failure")
+    flag = {column.name: column for column in adjudications.columns}[
+        "position_had_technical_failure"]
+    assert flag.disclosure == "clear" and flag.dtype == "boolean"
+    for phrase in ("technical_failure", "kind=skipped", "原因码", "attempts"):
+        assert phrase in flag.description, phrase

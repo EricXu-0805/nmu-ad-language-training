@@ -2049,6 +2049,34 @@ def test_withdrawn_subject_questionnaire_records_never_export(db, tmp_path):
     assert not list(tmp_path.rglob("*.csv"))
 
 
+def test_skip_after_technical_failure_exports_the_failed_attempt_and_the_skip_receipt(
+        db, tmp_path):
+    """技术失败后跳过:不造环节行;失败那段在 attempts 表页照实出,跳过收据在 adjudications 表页,
+    position_had_technical_failure 把它和「没回答就跳过」分开(不新增原因码)。"""
+    _seed(db)
+    path, checksum = audio_store.save_blob("a_failed", b"failed-voice", "audio/wav")
+    db.add(AudioAssetRow(raw_audio_id="a_failed", session_id="S9", turn_key="SE_跳过#1",
+                         audio_format=path.suffix.lstrip("."), checksum=checksum))
+    db.add(AttemptEvent(
+        session_id="S9", item_id="SE_跳过", turn_seq=1, response_role="命名", attempt_seq=1,
+        raw_audio_id="a_failed", prompt_level=0, processing_status="technical_failure",
+        error_code="asr_exception"))
+    db.add(AutopilotPositionAdjudication(
+        session_id="S9", item_id="SE_跳过", turn_seq=1, presentation_order=2, kind="skipped",
+        reason_code="asr_repeatedly_failed", actor_id="researcher-qk",
+        control_generation=1, state_revision=3, idempotency_key="skip-after-failure-0001"))
+    db.commit()
+    result = _export_bundle(db, "S9", write_dir=tmp_path)
+    assert not any(row["item_id"] == "SE_跳过" for row in result["sheets"]["turns"])
+    assert [(row["processing_status"], row["error_code"], row["truth_scope"])
+            for row in result["sheets"]["attempts"] if row["item_id"] == "SE_跳过"] == [
+        ("technical_failure", "asr_exception", "operational_only")]
+    assert [(row["item_id"], row["kind"], row["reason_code"],
+             row["position_had_technical_failure"])
+            for row in result["sheets"]["adjudications"]] == [
+        ("SE_跳过", "skipped", "asr_repeatedly_failed", True)]
+
+
 def test_adjudications_export_beside_ai_verdict_without_staff_identity(db, tmp_path):
     """研究者现场裁定与 AI 判类并列进 turns 行、单独一张 adjudications 表页;
     署名留在库表,去标识导出包不带工作人员账号;备注走同一套红线。"""
@@ -2083,9 +2111,10 @@ def test_adjudications_export_beside_ai_verdict_without_staff_identity(db, tmp_p
     assert untouched["adjudication_kind"] is None and untouched["adjudication_reason"] is None
     sheet = result["sheets"]["adjudications"]
     assert [(row["item_id"], row["presentation_order"], row["turn_seq"], row["kind"],
-             row["reason_code"], row["adjudication_seq"]) for row in sheet] == [
-        ("SE_锚", 1, 1, "confirmed_correct", "asr_misrecognized", 1),
-        ("SE_锚", 1, 2, "skipped", "participant_declined", 2)]
+             row["reason_code"], row["adjudication_seq"],
+             row["position_had_technical_failure"]) for row in sheet] == [
+        ("SE_锚", 1, 1, "confirmed_correct", "asr_misrecognized", 1, False),
+        ("SE_锚", 1, 2, "skipped", "participant_declined", 2, False)]
     # 自由文本整条红线,不做部分遮盖:备注可能夹着老人原话或证件号。
     assert sheet[0]["note"] == export_security.redact_free_text("任意文本")
     assert "320102199001011234" not in str(result["sheets"])

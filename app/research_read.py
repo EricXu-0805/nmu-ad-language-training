@@ -575,6 +575,7 @@ def list_adjudications(db: DBSession, *, config, data_classification: str,
     # 本场内先后序号按落库顺序(id)算,只算这一页涉及的场次。
     page_session_ids = {sess.session_id for _, sess in page}
     seq_by_id: dict[int, int] = {}
+    failed_positions: set[tuple[str, str, int]] = set()
     if page_session_ids:
         counters: dict[str, int] = {}
         for row in db.exec(select(AutopilotPositionAdjudication).where(
@@ -584,6 +585,11 @@ def list_adjudications(db: DBSession, *, config, data_classification: str,
             counters[row.session_id] = counters.get(row.session_id, 0) + 1
             if row.id is not None:
                 seq_by_id[row.id] = counters[row.session_id]
+        # 与导出包 adjudications 表页同一口径:题位上有过技术失败的 attempt。
+        failed_positions = set(db.exec(
+            select(AttemptEvent.session_id, AttemptEvent.item_id, AttemptEvent.turn_seq)
+            .where(AttemptEvent.session_id.in_(page_session_ids),
+                   AttemptEvent.processing_status == "technical_failure")).all())
 
     rows: list[dict[str, Any]] = []
     last_key: list[Any] | None = None
@@ -611,6 +617,8 @@ def list_adjudications(db: DBSession, *, config, data_classification: str,
                 "reason_code": row.reason_code,
                 "adjudication_seq": seq_by_id.get(row.id) if row.id is not None else None,
                 "withdrawn": False,
+                "position_had_technical_failure": (
+                    (sess.session_id, row.item_id, row.turn_seq) in failed_positions),
             })
         last_key = [sess.session_id, row.item_id, row.turn_seq]
 

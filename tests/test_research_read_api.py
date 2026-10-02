@@ -26,6 +26,7 @@ from app.db import get_session
 from app.main import app
 from app.models import (
     AttemptEvent,
+    AudioAssetRow,
     AuditLog,
     AutopilotPositionAdjudication,
     ItemEvent,
@@ -1521,6 +1522,33 @@ def test_adjudications_dataset_shows_skipped_positions_pseudonymously_with_tombs
     # 环节表里没有这个题位:跳过不伪造环节行。
     turns = client.get("/research/v1/turns?data_classification=research").json()["rows"]
     assert all(row["item_id"] != "SE_熨斗" for row in turns)
+
+
+def test_adjudications_tell_a_skip_after_technical_failure_from_an_unanswered_skip(
+        research_env, monkeypatch):
+    """研究面没有 attempts 数据集:同为 kind=skipped,靠 position_had_technical_failure 区分,
+    按题位(item_id, turn_seq)看那里有没有处理失败的录音;撤回者墓碑照旧为空。"""
+    _with_key(monkeypatch)
+    with Session(research_env) as session:
+        session.add(AudioAssetRow(raw_audio_id="AUDIO-FAILED-1", session_id="S-REAL-1",
+                                  turn_key="SE_熨斗#1"))
+        session.add(AttemptEvent(
+            session_id="S-REAL-1", item_id="SE_熨斗", turn_seq=1, response_role="命名",
+            attempt_seq=1, raw_audio_id="AUDIO-FAILED-1", prompt_level=0,
+            processing_status="technical_failure", error_code="asr_exception"))
+        session.add(AutopilotPositionAdjudication(
+            session_id="S-REAL-1", item_id="SE_熨斗", turn_seq=2, presentation_order=2,
+            kind="skipped", reason_code="other", actor_id="RESEARCHER",
+            control_generation=1, state_revision=4, idempotency_key="adjudicate-real-0002"))
+        session.commit()
+    _freeze_epoch(research_env, "S-REAL-1", "S-GONE-1")
+
+    payload = _client("steward").get(
+        "/research/v1/adjudications?data_classification=research").json()
+    assert payload["columns"][-1] == "position_had_technical_failure"
+    flags = {(row["withdrawn"], row["turn_seq"]): row["position_had_technical_failure"]
+             for row in payload["rows"]}
+    assert flags == {(False, 1): True, (False, 2): False, (True, 1): None}
 
 
 @pytest.mark.parametrize("binding_valid", [True, False])

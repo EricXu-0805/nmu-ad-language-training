@@ -131,6 +131,16 @@ def test_turn_sheet_and_research_turns_append_the_same_capture_provenance_column
     assert research_dataset.published_columns(turns)[-2:] == appended
 
 
+def test_adjudication_sheet_and_research_adjudications_append_the_same_failure_flag():
+    """技术失败后跳过与没回答就跳过同为 kind=skipped;两边用同名末列区分,不新增原因码。"""
+    from app import research_dataset
+    assert export.SHEET_FIELDS["adjudications"][-1] == "position_had_technical_failure"
+    adjudications = research_dataset.dataset_for("adjudications")
+    assert adjudications is not None
+    assert research_dataset.published_columns(adjudications)[-1] == (
+        "position_had_technical_failure")
+
+
 def test_the_dead_latency_column_is_gone_everywhere():
     """留着最坏：读 schema 的人会以为平台有反应时，而每次量表初评都在把 null 当证据发出去。"""
     from pathlib import Path as _Path

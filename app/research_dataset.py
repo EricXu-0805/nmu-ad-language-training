@@ -127,7 +127,8 @@ _TURNS = Dataset(
                "判分是否用过画像：恒为 false，这一列是★画像不进判分的审计证据"),
         Column("adjudication_kind", "clear", "string",
                "研究者现场裁定：confirmed_correct（老人其实答对）/ terminated_no_verdict"
-               "（本题到此为止）/ 空=AI 自行收口。没有任何回答就被跳过的题位没有环节行，"
+               "（本题到此为止）/ 空=AI 自行收口。没有可收口回答就被跳过的题位（没回答，"
+               "或最后一段录音技术失败）没有环节行，"
                "只出现在 adjudications 数据集（kind=skipped）。裁定不改 ai_* 列，也不是"
                "研究真值；真值仍看 reviewed_score / score_locked"),
         Column("adjudication_reason", "clear", "string",
@@ -217,7 +218,7 @@ _QUESTIONNAIRE_ITEM_VALUES = Dataset(
 _ADJUDICATIONS = Dataset(
     key="adjudications",
     title="研究者现场裁定",
-    grain="一行一个被研究者现场裁定的题位（含没有任何回答就被跳过的题位）",
+    grain="一行一个被研究者现场裁定的题位（含没有可收口回答就被跳过的题位）",
     columns=(
         Column("session_code", "pseudonym", "string", "场次假名"),
         Column("subject_code", "pseudonym", "string", "受试者假名"),
@@ -227,13 +228,22 @@ _ADJUDICATIONS = Dataset(
         Column("turn_seq", "clear", "integer", "环节序号"),
         Column("kind", "clear", "string",
                "confirmed_correct（老人其实答对，按最后一次回答收口）/ terminated_no_verdict"
-               "（本题到此为止，按最后一次回答收口）/ skipped（没有任何回答就跳过，无环节行）"),
+               "（本题到此为止，按最后一次回答收口）/ skipped（没有可收口的回答就跳过："
+               "没回答，或最后一段录音技术失败，两种看 position_had_technical_failure；"
+               "无环节行）"),
         Column("reason_code", "clear", "string",
                "裁定原因闭集：late_correct_after_window / asr_misrecognized / "
                "staff_judged_correct / participant_declined / asr_repeatedly_failed / "
                "trained_in_prior_sitting / other"),
         Column("adjudication_seq", "clear", "integer", "本场内裁定的先后序号（1 起）"),
         Column("withdrawn", "clear", "boolean", "所属受试者是否已登记研究撤回"),
+        Column("position_had_technical_failure", "clear", "boolean",
+               "这一题位（item_id + turn_seq）上有没有哪段录音的 AI 处理技术失败"
+               "（导出包 attempts 表 processing_status=technical_failure），由录音尝试推出，"
+               "不是研究者填的。kind=skipped 且本列为 true 就是「技术失败后跳过」：失败那段"
+               "录音留在导出包 attempts 表，没有环节行；为 false 的 skipped 是没录到回答就"
+               "跳过。研究面没有 attempts 数据集，原因码又可能选了「其他」，区分这两种跳过请"
+               "看本列。撤回者的墓碑行为空"),
         Column("note", "forbidden", "-", "研究者备注（自由文本）：永不出现"),
         Column("actor_id", "forbidden", "-", "裁定人账号：留在库表与审计里，不进研究面"),
         Column("created_at", "forbidden", "-", "绝对时间：永不出现"),

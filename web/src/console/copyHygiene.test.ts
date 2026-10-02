@@ -83,6 +83,29 @@ test("研究者裁定按钮的文案说真话:AI 判定保留、决定连账号�
   }
 });
 
+test("技术失败那一题只亮服务端真收的出口:收起「继续」「老人已答对」,留「跳过本题」与转人工", () => {
+  // 服务端对这种题位写前拒「继续」与「老人已答对」(autopilot_attempt_failed)。控件无法在
+  // node:test 里挂载(useReducer 初始态固定是 checking),以接线守卫钉住门控与这一态的正文。
+  // 只在「跳过本题」真的亮着时成立(canAdjudicate 已排除人工态、跳过已保存、内容缺口、全部练完)。
+  assert.match(autopilotControl,
+    /const positionAttemptFailed = canAdjudicate && heard\?\.verdict\.kind === "failed";/);
+  assert.match(autopilotControl,
+    /receiptAllowsAutopilotResume\(state\.receipt\) && !contentGap && !scopeExhausted\s*&& !positionAttemptFailed && \(/);
+  assert.match(autopilotControl,
+    /\{!positionAttemptFailed && \(\s*<Button type="button" variant="secondary" disabled=\{controlBusy\}\s*onClick=\{\(\) => openAdjudication\("confirmed_correct"\)\}>/);
+  assert.match(autopilotControl,
+    /onClick=\{\(\) => openAdjudication\("skip_item"\)\}>\s*\{adjudicateBusy && positionAttemptFailed \? "正在记录裁定…" : "跳过本题"\}/);
+  // 这一态的正文只引用真实存在的按钮,说清跳过的后果与原因怎么选;通用的「继续」正文与
+  // 「老人已答对」说明不出现。
+  assert.match(autopilotControl,
+    /\{positionAttemptFailed \? \(\s*<>AI 已安全暂停：这一题最后一段录音处理出错，AI 不能接着做，也判不了「答对」。可点「跳过本题」，原因选「识别反复出错」或「其他」/);
+  assert.match(autopilotControl, /\{canAdjudicate && !positionAttemptFailed && \(/);
+  // 训练台顶部的「场次已暂停」条对所有 AI 暂停态共用一句话;技术失败、下一题缺内容、全部
+  // 练完时卡片都不显示「继续 AI 自动带练」,这句话不能点名它(浏览器走查时看到的)。
+  assert.doesNotMatch(trainingConsole, /卡片点「继续 AI 自动带练」/);
+  assert.match(trainingConsole, /AI 仍托管本场。要继续，请按「AI 自动带练」卡片里的提示操作，或点「转为人工操作」。/);
+});
+
 test("自动带练启动拒因逐分支说真话,不再一律折成「麦克风还未确认关闭」", () => {
   // 旧 catch-all:任何 prepareOwnership 失败都硬写成同一句麦克风文案(Eric
   // 2026-08-25 实测被误导一整晚)。麦克风文案只允许出现在 TrainingConsoleScreen

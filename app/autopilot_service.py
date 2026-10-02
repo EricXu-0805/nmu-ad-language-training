@@ -3900,6 +3900,24 @@ def _completed_attempts_at(
     return attempts
 
 
+def _position_ended_in_technical_failure(
+    db: Session, session_id: str, item_id: str, turn_seq: int,
+) -> bool:
+    """题位最后一段录音判分技术失败、此前各段都已判完:这一题已没有可收口的回答。
+
+    只认这一种形状;更早一段失败(人工补录过)或还有没判完的,仍由 _completed_attempts_at
+    按原口径拒绝。
+    """
+    attempts = list(db.exec(select(AttemptEvent).where(
+        AttemptEvent.session_id == session_id,
+        AttemptEvent.item_id == item_id,
+        AttemptEvent.turn_seq == turn_seq,
+    ).order_by(AttemptEvent.attempt_seq)))
+    return (bool(attempts)
+            and attempts[-1].processing_status == "technical_failure"
+            and all(a.processing_status == "completed" for a in attempts[:-1]))
+
+
 def _resume_target_and_route(
     db: Session,
     *,
@@ -4521,7 +4539,9 @@ def adjudicate_p0a_position(
       confirmed_correct  老人其实答对了(超时后/识别错/研究者在场判定):按最后一次
                          已完成 attempt 收口本题位,AI 判类原样保留,再进下一题。
       skip_item          跳过本题:当前题位若有回答按 terminated_no_verdict 收口,
-                         本题其余没答过的题位落 skipped 收据(不造录音证据)。
+                         本题其余没答过的题位落 skipped 收据(不造录音证据)。当前题位
+                         最后一段录音技术失败时没有可收口的回答,它也落 skipped;
+                         confirmed_correct 对这种题位照旧拒绝。
     与 resume 同一安全闸:必须是安全暂停 + 本代际收麦/媒体终止证明。裁定行只追加、
     具名、带闭集原因;研究真值仍只走事后复核锁分。同键重放只读当前状态。供应商
     暂不可用时 auto_resume=False 仍记录现场决定,保持安全暂停等研究者明确继续。
@@ -4619,7 +4639,16 @@ def adjudicate_p0a_position(
         db, session_id, bank=resolved_bank, protocol=resolved_protocol, now=observed_at,
         position_item_id=target.item_id, position_turn_seq=target.turn_seq,
         require_entire_plan_supported=True)
-    attempts = _completed_attempts_at(db, session_id, target.item_id, target.turn_seq)
+    if _position_ended_in_technical_failure(db, session_id, target.item_id, target.turn_seq):
+        if kind != "skip_item":
+            _fail("autopilot_attempt_failed",
+                  "这一题最后一段录音判分失败,没有可确认的回答,判不了「答对」;"
+                  "可以「跳过本题」,或「转为人工操作」")
+        # 失败那段没有判类可收口:不造 TurnEvent,题位落 skipped 收据;失败与更早的
+        # attempt 原样保留,导出 attempts 表按 item_id/turn_seq 能对上。
+        attempts: list[AttemptEvent] = []
+    else:
+        attempts = _completed_attempts_at(db, session_id, target.item_id, target.turn_seq)
 
     plan_items = resolved.session_plan.items
 
