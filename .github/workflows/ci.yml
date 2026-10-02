@@ -176,9 +176,10 @@ jobs:
           cp -R "$RUNNER_TEMP/nmu-edge-release" "$artifact_dir/caddy"
           cp "$RUNNER_TEMP/nmu-edge-scan.json" "$artifact_dir/caddy/trivy.json"
       - name: 归档同一镜像生成的前端构件与来源
-        # PR run 构建的是合并预演提交，上线从不取它的产物；上面几步照跑，只是不上传。
+        # 只有 push（即 main）run 上传：上线脚本只按 --event push 取该 SHA 的产物。PR run 构建的
+        # 是合并预演提交，每周定时与手动 run 也不是上线来源；上面几步照跑，只是不上传。
         # 留 30 天：上线都是合并后不久就取；回滚靠服务器上的旧树存档，不靠这份。
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
         with:
           name: nmu-release-artifacts
