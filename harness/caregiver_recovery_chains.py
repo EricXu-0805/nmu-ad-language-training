@@ -459,7 +459,12 @@ def run_recovery_chains(config: BrowserAcceptanceConfig) -> RecoveryChainsResult
             return  # 链 A 的故障注入本身
         if bool(obs["teardown_started"]):
             return
-        violation(f"浏览器网络请求未完成 {request.method} {parsed.path}")
+        failure = str(request.failure or "")
+        if request.method == "GET" and parsed.path == "/live/state" and "ERR_ABORTED" in failure:
+            # 平板的实时状态长轮询由页面自己撤销(sync/useLiveCursor:到客户端期限、能力
+            # 更新重探、离线),不是网络故障;真断连会是 ERR_CONNECTION_REFUSED 或 5xx。
+            return
+        violation(f"浏览器网络请求未完成 {request.method} {parsed.path} ({failure or '-'})")
 
     def attach_page(tag: str, page) -> None:
         page.on("pageerror", lambda _error: violation(f"[{tag}] 页面运行出错"))
@@ -542,6 +547,8 @@ def run_recovery_chains(config: BrowserAcceptanceConfig) -> RecoveryChainsResult
             pair_dialog.wait_for(state="hidden", timeout=20_000)
             attached = obs["attached_session_ids"]
             assert isinstance(attached, list)
+            # 配对框可能先于 /device/pair 的响应事件派发到本进程就收起来了:轮询,不一次性判。
+            _wait_for(lambda: len(attached) >= 1, (patient,), timeout_seconds=10, label="平板配对回执")
             if attached[:1] != [old_session]:
                 raise BrowserAcceptanceError("平板没有先配到旧场次 A")
             caregiver.get_by_text("老人画面已打开", exact=True).wait_for(state="visible", timeout=25_000)
