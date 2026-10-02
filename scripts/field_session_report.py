@@ -35,8 +35,9 @@ length()，原文不进这个进程；要打印的分类码（stop_reason、erro
 时钟：RuntimeCommand / RuntimeCommandAck / 控制事件存 UTC；AttemptEvent、
 InteractionEvent、TtsServeEvidence、AuditLog 存服务进程本地时间（生产 .env 设
 TZ=Asia/Shanghai，即 +8 h）。脚本拿同一段录音的 record_stopped 回执与 attempt 落行
-时间配对求偏移中位，不在 +8 h ± 60 s 内就拒绝出报告；在的话本地列一律按整 8 h 折回
-UTC——不按测得的中位折，那个中位里含着几秒 ASR（attempt 是 ASR 出结果才落行的）。
+时间配对：偏移中位不在 +8 h ± 60 s 内，或哪一场有一对比 +8 h 早了 60 s 以上（attempt
+只会晚于收麦回执，早了只能是那场换过 TZ），就拒绝出报告。通过的话本地列一律按整 8 h
+折回 UTC——不按测得的中位折，那个中位里含着几秒 ASR（attempt 是 ASR 出结果才落行的）。
 
 退出码：0 = 出了报告；2 = 拒绝（库不存在或读不了、不是平台库、时钟偏移不对）。
 """
@@ -394,38 +395,54 @@ def _share(count: int, total: int) -> float | None:
 
 def _hms(seconds: float) -> str:
     sign = "-" if seconds < 0 else "+"
-    whole, fraction = divmod(abs(seconds), 1)
-    hours, rest = divmod(int(whole), 3600)
-    minutes, secs = divmod(rest, 60)
-    return f"{sign}{hours}:{minutes:02d}:{secs + fraction:04.1f}"
+    hours, tenths = divmod(round(abs(seconds) * 10), 36000)
+    minutes, tenths = divmod(tenths, 600)
+    return f"{sign}{hours}:{minutes:02d}:{tenths / 10:04.1f}"
 
 
 def _clock(snap: Snapshot) -> dict:
     by_audio = {attempt["raw_audio_id"]: attempt for attempt in snap.attempts
                 if attempt["raw_audio_id"]}
-    offsets = []
+    numbers = {session["session_id"]: number
+               for number, session in enumerate(snap.sessions, 1)}
+    pairs: list[tuple[int, float]] = []
     for acks in snap.acks.values():
         stop = acks.get("record_stopped")
         attempt = by_audio.get(stop["raw_audio_id"]) if stop else None
         if attempt and attempt["created_at"] and stop["at"]:
-            offsets.append((attempt["created_at"] - stop["at"]).total_seconds())
+            pairs.append((numbers[attempt["session_id"]],
+                          (attempt["created_at"] - stop["at"]).total_seconds()))
     clock = {
         "status": "not_detectable",
-        "pairs": len(offsets),
+        "pairs": len(pairs),
         "median_offset_seconds": None,
+        "min_offset_seconds": None,
         "expected_offset_seconds": LOCAL_OFFSET_SECONDS,
         "tolerance_seconds": OFFSET_TOLERANCE_SECONDS,
     }
-    if not offsets:
+    if not pairs:
         return clock
+    offsets = [offset for _, offset in pairs]
     median = statistics.median(offsets)
     if abs(median - LOCAL_OFFSET_SECONDS) > OFFSET_TOLERANCE_SECONDS:
         raise Refused(
             "clock_offset_unexpected",
-            f"本地时间列比 UTC 列快 {_hms(median)}（{len(offsets)} 对同一段录音的 "
-            "record_stopped 回执与 attempt 落行），不在 +8 h ± 60 s 内；本地列怎么折回 "
-            "UTC 没有依据，拒绝出报告。先核对生产 .env 的 TZ。")
-    clock.update(status="ok", median_offset_seconds=round(median, 3))
+            f"本地时间列比 UTC 列快 {_hms(median)}（{len(pairs)} 对同一段录音的 "
+            "record_stopped 回执与 attempt 落行取中位），不在 +8 h ± 60 s 内；本地列怎么"
+            "折回 UTC 没有依据，拒绝出报告。先核对生产 .env 的 TZ。")
+    # attempt 是 ASR 出结果才落行的，ASR 慢、暂停后续弹只会让偏移变大、不会变小。
+    # 中位只看多数：少数几场若在别的 TZ 下写库（库里出过同列历史混口径），只有
+    # 「比 +8 h 早」这一侧能把它们揪出来，否则会按 8 h 错折、混进聚合。
+    early = sorted({number for number, offset in pairs
+                    if offset < LOCAL_OFFSET_SECONDS - OFFSET_TOLERANCE_SECONDS})
+    if early:
+        raise Refused(
+            "clock_offset_unexpected",
+            f"第 {'、'.join(map(str, early))} 场有 attempt 落行按 +8 h 折算后比它的 "
+            "record_stopped 回执早了 60 s 以上——attempt 只可能晚于收麦回执，说明这几场的"
+            "本地时间列不是 +8 h（TZ 变过）；拒绝出报告。先核对生产 .env 的 TZ。")
+    clock.update(status="ok", median_offset_seconds=round(median, 3),
+                 min_offset_seconds=round(min(offsets), 3))
     return clock
 
 
@@ -994,8 +1011,9 @@ def render_markdown(report: dict) -> str:
     if clock["status"] == "ok":
         clock_line = (
             f"本地列比 UTC 列快 {_hms(clock['median_offset_seconds'])}"
-            f"（{clock['pairs']} 对同一段录音的 record_stopped 回执 ↔ attempt 落行，"
-            "中位里含几秒 ASR）；本地列按整 8 h 折回 UTC")
+            f"（{clock['pairs']} 对同一段录音的 record_stopped 回执 ↔ attempt 落行取中位，"
+            f"最小 {_hms(clock['min_offset_seconds'])}，里面含着 ASR 耗时）；"
+            "本地列按整 8 h 折回 UTC")
     else:
         clock_line = "没有可配对的录音，测不出偏移；用不到本地列的指标照常算"
     lines = [

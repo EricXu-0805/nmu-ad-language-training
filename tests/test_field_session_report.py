@@ -409,21 +409,26 @@ def _seed_old(scene: _Scene) -> None:
     scene.tts("feedback", 15.05, started=17.0, ended=19.0)
 
 
-def _build_db(path: Path, *, local_offset: timedelta = SHANGHAI) -> Path:
+def _build_db(path: Path, *, local_offset: timedelta = SHANGHAI,
+              offsets: dict[str, timedelta] | None = None) -> Path:
+    """offsets 按场次覆盖本地列的时区：模拟「某几场写库时服务进程换过 TZ」。"""
+    def offset(session_id: str) -> timedelta:
+        return (offsets or {}).get(session_id, local_offset)
+
     engine = create_engine(f"sqlite:///{path}")
     SQLModel.metadata.create_all(engine)
     with DBSession(engine) as db:
         _seed_alpha(_new_scene(db, ALPHA, date(2026, 10, 3), 2,
-                               datetime(2026, 10, 3, 1, 0, 0), local_offset))
+                               datetime(2026, 10, 3, 1, 0, 0), offset(ALPHA)))
         _seed_simulation(_new_scene(db, SIM, date(2026, 10, 3), 2,
-                                    datetime(2026, 10, 3, 6, 0, 0), local_offset,
+                                    datetime(2026, 10, 3, 6, 0, 0), offset(SIM),
                                     simulation=True))
         _seed_bravo(_new_scene(db, BRAVO, date(2026, 10, 4), 3,
-                               datetime(2026, 10, 4, 1, 0, 0), local_offset))
+                               datetime(2026, 10, 4, 1, 0, 0), offset(BRAVO)))
         _seed_old(_new_scene(db, OLD, date(2026, 9, 20), 2,
-                             datetime(2026, 9, 20, 1, 0, 0), local_offset))
+                             datetime(2026, 9, 20, 1, 0, 0), offset(OLD)))
         _new_scene(db, EMPTY, date(2026, 10, 5), 4,
-                   datetime(2026, 10, 5, 1, 0, 0), local_offset)
+                   datetime(2026, 10, 5, 1, 0, 0), offset(EMPTY))
         db.commit()
     engine.dispose()
     return path
@@ -492,9 +497,37 @@ def test_clock_offset_is_detected_from_paired_captures(field_db):
         "pairs": 7,
         # 8 h + ASR 中位 2.5 s：attempt 是 ASR 出结果才落行的。
         "median_offset_seconds": pytest.approx(28802.5),
+        "min_offset_seconds": pytest.approx(28802.0),
         "expected_offset_seconds": 28800,
         "tolerance_seconds": 60,
     }
+
+
+def test_refuses_when_a_minority_of_sessions_ran_in_another_timezone(tmp_path):
+    # 5 对 +8 h、2 对 UTC：中位仍落在 +8 h，只有「比 +8 h 早」这一侧揪得出第 2 场。
+    db = _build_db(tmp_path / "app.db", offsets={BRAVO: timedelta(0)})
+    done = _run("--db", str(db), "--since", "2026-10-01")
+    assert done.returncode == 2
+    assert done.stdout == ""
+    assert "REFUSED code=clock_offset_unexpected" in done.stderr
+    assert "第 2 场" in done.stderr
+
+
+def test_a_capture_resumed_much_later_does_not_trip_the_clock_check(tmp_path):
+    # 暂停后续弹，attempt 半小时后才落行：偏移只会被抬高，不能因此拒绝。
+    db = _build_db(tmp_path / "app.db")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "UPDATE attemptevent SET created_at = datetime(created_at, '+30 minutes') "
+            "WHERE raw_audio_id = ?", (f"{ALPHA}-raw-2",))
+        conn.commit()
+    finally:
+        conn.close()
+    clock = _report(db, "--since", "2026-10-01")["clock"]
+    assert clock["status"] == "ok"
+    assert clock["median_offset_seconds"] == pytest.approx(28802.5)
+    assert clock["min_offset_seconds"] == pytest.approx(28802.0)
 
 
 def test_scope_is_real_sessions_with_commands_numbered_in_date_order(field_db):
