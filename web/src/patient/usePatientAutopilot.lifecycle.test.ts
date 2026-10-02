@@ -147,3 +147,19 @@ test("录音执行器拿到的是本次 owner 代际，屏显事件才可能被�
   assert.match(SOURCE, /ownerGeneration: context\.ownerGeneration/);
   assert.match(SOURCE, /observe: observeCapturePhase/);
 });
+
+test("语音设置按场次缓存;开麦只读缓存,刷新在 runner 每一拍后台发起、从不 await", () => {
+  // 场次一换就换一份缓存,上一场的设置不进这一场。
+  assert.match(SOURCE, /voiceSettings\?\.sessionId !== sessionId/);
+  assert.match(SOURCE, /new AutopilotVoiceSettingsCache\(\s*sessionId,/);
+  assert.match(SOURCE, /fetchAutopilotVoiceSettings\(/);
+  // 执行器拿到的是读缓存的函数,不是一次网络请求。
+  assert.match(SOURCE, /voiceActivityWindows: \(\) => voiceSettings\.vadWindows\(\)/);
+  // tick 里先顺手发起刷新、再进 pollOnce;刷新的返回值不进任何 await。
+  const tick = SOURCE.slice(SOURCE.indexOf("const tick = async () => {"));
+  const refreshAt = tick.indexOf("voiceSettings.refreshInBackground();");
+  const pollAt = tick.indexOf(".pollOnce()");
+  assert.ok(refreshAt > 0 && pollAt > refreshAt, "刷新必须在 pollOnce 之前发起");
+  assert.doesNotMatch(SOURCE, /await\s+voiceSettings/);
+  assert.doesNotMatch(SOURCE, /await\s+[\w.]*refreshInBackground/);
+});

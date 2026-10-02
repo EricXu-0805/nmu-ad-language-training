@@ -33,9 +33,11 @@ import { BrowserAutopilotSpeechExecutor } from "./autopilotSpeechExecutor.ts";
 import { browserAutopilotSpeechPorts } from "./autopilotBrowserSpeechPorts.ts";
 import {
   acknowledgeExactAutopilotDrain,
+  fetchAutopilotVoiceSettings,
   fetchExactAutopilotDrainTarget,
 } from "./autopilotMediaTransport.ts";
 import { browserAutopilotMediaDependencies } from "./autopilotBrowserMediaDependencies.ts";
+import { AutopilotVoiceSettingsCache } from "./autopilotVoiceSettings.ts";
 import {
   captureIdentityIsNewer,
   sameCaptureIdentity,
@@ -191,6 +193,8 @@ export function usePatientAutopilot(input: {
   const standaloneDrainedKey = useRef<string | null>(null);
   serverContextRef.current = server;
   const [bargeIn, setBargeIn] = useState<BargeInObservation | null>(null);
+  // 服务器语音开关(VAD 窗口)按场次缓存,跨 runner 重启保留,五分钟最多读一次。
+  const voiceSettingsRef = useRef<AutopilotVoiceSettingsCache | null>(null);
   const [localCapturePhase, setLocalCapturePhase] =
     useState<LocalAutopilotCapturePhase | null>(null);
   const capturedSessionRef = useRef<string | null>(null);
@@ -266,6 +270,12 @@ export function usePatientAutopilot(input: {
     setAssetReadiness(null);
     setLocalCapturePhase(null);
     wakeCoordinatorRef.current?.reset();
+  }, [input.sessionId]);
+
+  // 换场次或卸载:中止在途的语音设置读取,旧场次的设置不带进新场次。
+  useEffect(() => () => {
+    voiceSettingsRef.current?.dispose();
+    voiceSettingsRef.current = null;
   }, [input.sessionId]);
 
   // 服务器取得控制权后的同窗一次性唤醒(console 权威回执→本 hook):监听只锁存,
@@ -580,6 +590,20 @@ export function usePatientAutopilot(input: {
       setServer((before) => before?.delivery === context.delivery
         ? { ...before, current: restored.current, runtime: restored.runtime } : before);
       if (!canStartAutopilotRunner(restored.runtime)) return;
+      const sessionId = input.sessionId as string;
+      let voiceSettings = voiceSettingsRef.current;
+      if (voiceSettings?.sessionId !== sessionId) {
+        voiceSettings?.dispose();
+        voiceSettings = new AutopilotVoiceSettingsCache(
+          sessionId,
+          {
+            fetch: (id, signal) => fetchAutopilotVoiceSettings(
+              id, signal, browserAutopilotMediaDependencies),
+            now: () => performance.now(),
+          },
+        );
+        voiceSettingsRef.current = voiceSettings;
+      }
       controller = new PatientAutopilotController({
         sessionId: input.sessionId as string,
         transport: autopilotHttpTransport,
@@ -599,6 +623,7 @@ export function usePatientAutopilot(input: {
         recording: new BrowserAutopilotRecordingExecutor(input.sessionId as string, {
           ownerGeneration: context.ownerGeneration,
           observe: observeCapturePhase,
+          voiceActivityWindows: () => voiceSettings.vadWindows(),
         }),
         ackDelivery: context.delivery,
         initialRuntime: restored.runtime,
@@ -615,6 +640,9 @@ export function usePatientAutopilot(input: {
       const tick = async () => {
         // pre-start 期间页面隐藏之后本窗口彻底停：重新可见不自动恢复、不自动重开麦。
         if (lifecycleRef.current?.aborted) return;
+        // runner 启动的第一拍就读一次,之后五分钟最多一次;只发起、不等,
+        // 提问→开麦那一拍不会多一个网络往返。
+        voiceSettings.refreshInBackground();
         const runtime = await (controller as PatientAutopilotController).pollOnce();
         if (cancelled || lifecycleRef.current?.aborted) return;
         if (runtime.phase === "paused" || runtime.phase === "scope_completed") return;
