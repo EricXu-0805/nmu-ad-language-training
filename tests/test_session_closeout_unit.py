@@ -54,7 +54,17 @@ class InteractionEvidence:
     payload_json: str = "{}"
 
 
+@dataclass(frozen=True)
+class TakeoverEvidence:
+    event_seq: int
+    # The control ledger row carries actor ids and reason codes; none may enter the digest.
+    actor_id: str = "researcher-1"
+
+
 GENERATED_AT = datetime(2026, 7, 19, 10, 30, 0)
+# Digest of _evidence() under the v1 projection, frozen before autopilot takeovers were
+# counted. Summaries written then must keep verifying when the session had no takeover.
+V1_BASELINE_DIGEST = "b6b2563f52bb0ba5c62e159f1c086529fc5ebe892ce736b942db6cf7396e0730"
 
 
 def _evidence():
@@ -84,7 +94,7 @@ def _evidence():
     return turns, attempts, interactions
 
 
-def _build(turns, attempts, interactions):
+def _build(turns, attempts, interactions, **extra):
     return build_session_outcome_summary(
         session_id="S-CLOSEOUT-1",
         schema_version="outcome-v1",
@@ -96,6 +106,7 @@ def _build(turns, attempts, interactions):
         attempts=attempts,
         interactions=interactions,
         generated_at=GENERATED_AT,
+        **extra,
     )
 
 
@@ -153,6 +164,40 @@ def test_summary_digest_changes_only_for_canonical_non_text_evidence():
     changed_audio[0] = replace(changed_audio[0], raw_audio_id="audio-a-v2")
 
     assert _build(turns, changed_audio, interactions).source_digest != baseline.source_digest
+
+
+def test_summary_without_autopilot_takeovers_keeps_the_v1_digest():
+    turns, attempts, interactions = _evidence()
+    assert _build(turns, attempts, interactions).source_digest == V1_BASELINE_DIGEST
+    assert _build(turns, attempts, interactions,
+                  autopilot_takeovers=[]).source_digest == V1_BASELINE_DIGEST
+
+
+def test_autopilot_control_takeovers_are_counted_and_bound_into_the_digest():
+    """真实的接管只记在自动驾驶控制账本里；旧的 researcher_takeover 交互写入口一律 409。"""
+    turns, attempts, interactions = _evidence()
+    takeovers = [TakeoverEvidence(9), TakeoverEvidence(5, actor_id="researcher-2")]
+    summary = _build(turns, attempts, interactions, autopilot_takeovers=takeovers)
+
+    # 旧交互 1 条 + 控制账本 2 条。
+    assert summary.researcher_takeover_count == 3
+    assert summary.source_digest != V1_BASELINE_DIGEST
+    reordered = _build(turns, attempts, interactions, autopilot_takeovers=[
+        replace(row, actor_id="someone-else") for row in reversed(takeovers)])
+    assert reordered.source_digest == summary.source_digest
+    one_less = _build(turns, attempts, interactions, autopilot_takeovers=takeovers[:1])
+    assert one_less.researcher_takeover_count == 2
+    assert one_less.source_digest not in {summary.source_digest, V1_BASELINE_DIGEST}
+    assert "researcher-" not in json.dumps(summary.to_dict(), default=str)
+
+
+def test_duplicate_or_invalid_autopilot_takeover_fails_closed():
+    turns, attempts, interactions = _evidence()
+    with pytest.raises(ValueError, match="duplicate autopilot takeover"):
+        _build(turns, attempts, interactions,
+               autopilot_takeovers=[TakeoverEvidence(4), TakeoverEvidence(4)])
+    with pytest.raises(ValueError, match="takeover.event_seq"):
+        _build(turns, attempts, interactions, autopilot_takeovers=[TakeoverEvidence(0)])
 
 
 @pytest.mark.parametrize(

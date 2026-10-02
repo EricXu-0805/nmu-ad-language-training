@@ -63,7 +63,7 @@ from .models import (AbnormalEvent, AssessmentEvent, AssessmentInstance,
                      AttemptCaptureProcessing,
                      AttemptEvent, AuditLog, AudioAssetRow,
                      AudioCaptureReceipt, AudioLocalCopyDisposalReceipt,
-                     AutopilotPositionAdjudication,
+                     AutopilotControlEvent, AutopilotPositionAdjudication,
                      CaregiverHelpRequest,
                      ExportBatch, InteractionEvent,
                      InteractionPresentationReceipt, ItemEvent, LiveState,
@@ -8170,7 +8170,8 @@ def _assess_intervention_completion(
 
 
 _OUTCOME_SUMMARY_SCHEMA_VERSION = "session-outcome-summary.v1"
-_OUTCOME_SUMMARY_GENERATOR_VERSION = "server-authoritative-closeout.v1"
+# v2(2026-10-02):「人工接管」改数自动驾驶控制账本里的 takeover，v1 只数从未能写入的旧交互。
+_OUTCOME_SUMMARY_GENERATOR_VERSION = "server-authoritative-closeout.v2"
 
 
 def _ensure_session_outcome_summary(
@@ -8199,6 +8200,10 @@ def _ensure_session_outcome_summary(
     interactions = list(s.exec(select(InteractionEvent).where(
         InteractionEvent.session_id == sess.session_id).order_by(
             InteractionEvent.event_seq)))
+    takeovers = list(s.exec(select(AutopilotControlEvent).where(
+        AutopilotControlEvent.session_id == sess.session_id,
+        AutopilotControlEvent.event_type == "takeover").order_by(
+            AutopilotControlEvent.event_seq)))
     try:
         values = session_closeout.build_session_outcome_summary(
             session_id=sess.session_id,
@@ -8211,6 +8216,7 @@ def _ensure_session_outcome_summary(
             attempts=attempts,
             interactions=interactions,
             generated_at=datetime.now(),
+            autopilot_takeovers=takeovers,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail={

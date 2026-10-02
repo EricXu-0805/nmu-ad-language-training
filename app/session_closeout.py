@@ -17,6 +17,9 @@ from typing import Protocol
 
 
 SOURCE_SCHEMA_VERSION = "session-outcome-source-v1"
+# v2 = v1 + 控制账本里的接管。没有接管的场次仍按 v1 原样投影、摘要逐字节不变，
+# 这样改口径之前冻结的不可变汇总照旧能复核。
+SOURCE_SCHEMA_VERSION_WITH_TAKEOVERS = "session-outcome-source-v2"
 CLOSEOUT_SCHEMA_VERSION = "session-closeout.v1"
 CLOSEOUT_REQUEST_SCHEMA_VERSION = "session-closeout-request-v1"
 
@@ -79,6 +82,12 @@ class InteractionEvidenceRow(Protocol):
     item_id: str | None
     turn_seq: int | None
     attempt_seq: int | None
+
+
+class TakeoverEvidenceRow(Protocol):
+    """One researcher takeover recorded in the autopilot control ledger."""
+
+    event_seq: int
 
 
 @dataclass(frozen=True)
@@ -174,6 +183,7 @@ def build_session_outcome_summary(
     attempts: Iterable[AttemptEvidenceRow],
     interactions: Iterable[InteractionEvidenceRow],
     generated_at: datetime,
+    autopilot_takeovers: Iterable[TakeoverEvidenceRow] = (),
 ) -> SessionOutcomeValues:
     """Build deterministic summary values from non-text evidence projections.
 
@@ -306,13 +316,23 @@ def build_session_outcome_summary(
             "attempt_seq": attempt_seq,
         })
 
+    # 旧的 researcher_takeover 交互写入口一律 409，真实接管只记在控制账本里；
+    # 只数交互会让「人工接管」永远是 0。
+    takeover_sequences: set[int] = set()
+    for row in autopilot_takeovers:
+        event_seq = _positive_int(row.event_seq, "takeover.event_seq")
+        if event_seq in takeover_sequences:
+            raise ValueError(f"duplicate autopilot takeover event_seq: {event_seq}")
+        takeover_sequences.add(event_seq)
+    researcher_takeover_count += len(takeover_sequences)
+
     canonical_turns.sort(key=lambda row: (row["item_id"], row["turn_seq"]))
     canonical_attempts.sort(key=lambda row: (
         row["item_id"], row["turn_seq"], row["attempt_seq"],
         row["raw_audio_id"],
     ))
     canonical_interactions.sort(key=lambda row: row["event_seq"])
-    source_projection = {
+    source_projection: dict[str, object] = {
         "source_schema_version": SOURCE_SCHEMA_VERSION,
         "session": {
             "session_id": session_id,
@@ -324,6 +344,9 @@ def build_session_outcome_summary(
         "attempts": canonical_attempts,
         "interactions": canonical_interactions,
     }
+    if takeover_sequences:
+        source_projection["source_schema_version"] = SOURCE_SCHEMA_VERSION_WITH_TAKEOVERS
+        source_projection["autopilot_takeovers"] = sorted(takeover_sequences)
     source_digest = hashlib.sha256(
         _canonical_bytes(source_projection)).hexdigest()
 
