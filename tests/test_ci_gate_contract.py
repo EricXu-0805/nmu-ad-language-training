@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -172,3 +173,15 @@ def test_main_runs_are_never_cancelled_or_replaced_by_a_later_merge() -> None:
     # 所以 main 必须按 SHA 分组,而且不取消在跑的。
     assert "github.ref == 'refs/heads/main' && github.sha || github.ref" in WORKFLOW
     assert "cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}" in WORKFLOW
+
+
+def test_push_runs_only_on_main_and_the_other_triggers_stay() -> None:
+    # 分支上的提交由 pull_request 那次跑;分支 push 再跑一遍是同一棵树的第二份分钟账单。
+    triggers = WORKFLOW[WORKFLOW.index("\non:\n"):WORKFLOW.index("\npermissions:")]
+    assert '\n  push:\n    branches: ["main"]\n' in triggers
+    assert '"**"' not in triggers
+    for trigger in ("pull_request", "workflow_dispatch", "schedule"):
+        assert f"\n  {trigger}:\n" in triggers
+    # pull_request 不加任何过滤:PR 少跑一次,五项必需检查就缺名字。
+    assert not re.search(r"^  pull_request:\n    ", triggers, re.M)
+    assert 'cron: "0 2 * * 1"' in triggers

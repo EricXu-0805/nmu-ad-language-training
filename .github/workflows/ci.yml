@@ -7,8 +7,12 @@
 name: CI
 
 on:
+  # 分支上的提交只由 pull_request 那次跑：strict 分支保护要求 PR 先与 main 同步，测的就是
+  # 合进去的那棵树，分支 push 再跑一遍是同一棵树的第二份分钟账单（仓库私有后按分钟计）。
+  # 没开 PR 的分支因此不跑 CI，要测就开草稿 PR。main 的 push 必须留着：上线脚本只从
+  # main 上该 SHA 的 push run 取产物。
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
   workflow_dispatch:
   schedule:
