@@ -331,16 +331,19 @@ def _ack_body(command: dict, *, ack_type: str, ack_key: str,
 
 
 def _drive_to_processing_attempt(
-        clients: ApiClients, *, stop_reason: str = "silence") -> dict:
+        clients: ApiClients, *, stop_reason: str = "silence",
+        stop_facts: dict | None = None) -> dict:
     """Use only public device APIs to persist a proof-complete P0a capture."""
     started = _start(clients)
     assert started.status_code == 200, started.text
-    return _drive_issued_question_to_processing_attempt(clients, stop_reason=stop_reason)
+    return _drive_issued_question_to_processing_attempt(
+        clients, stop_reason=stop_reason, stop_facts=stop_facts)
 
 
 def _drive_issued_question_to_processing_attempt(
         clients: ApiClients, *, stop_reason: str = "silence",
-        ack_prefix: str = "ack-worker", first_device_event_seq: int = 1) -> dict:
+        ack_prefix: str = "ack-worker", first_device_event_seq: int = 1,
+        stop_facts: dict | None = None) -> dict:
     """已签发的提问 → 念完 → 录一段 → 上传 → 收麦回执;停在 processing_attempt。"""
     tts = _device_next(clients)
     assert tts is not None
@@ -401,6 +404,7 @@ def _drive_issued_question_to_processing_attempt(
             checksum=upload_fact["checksum"],
             byte_count=upload_fact["bytes"],
             duration_seconds=1.5,
+            **(stop_facts or {}),
         ),
     )
     assert stopped.status_code == 200, stopped.text
@@ -4754,6 +4758,175 @@ def test_record_stopped_exact_replay_keeps_single_capture_row_and_identity(
             after.processing_owner, after.processing_generation,
         )
         assert after_snapshot == before_snapshot
+
+
+def _replay_record_stopped(clients: ApiClients, capture: dict, **stop_facts):
+    record = capture["record"]
+    return clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{record['command_key']}/acks",
+        headers=clients.device_headers,
+        json=_ack_body(
+            record,
+            ack_type="record_stopped",
+            ack_key="ack-worker-record-stopped-0001",
+            device_event_seq=2,
+            stop_reason=capture["stop_reason"],
+            raw_audio_id=capture["raw_audio_id"],
+            receipt_server_seq=capture["receipt_server_seq"],
+            checksum=capture["checksum"],
+            byte_count=capture["byte_count"],
+            duration_seconds=capture["duration_seconds"],
+            **stop_facts,
+        ),
+    )
+
+
+def _ack_ledger(engine) -> dict:
+    with Session(engine) as session:
+        return {
+            "acks": [row.model_dump() for row in session.exec(
+                select(RuntimeCommandAck).order_by(RuntimeCommandAck.id))],
+            "commands": [row.model_dump() for row in session.exec(
+                select(RuntimeCommand).order_by(RuntimeCommand.id))],
+            "state": session.get(SessionAutopilotState, SESSION_ID).model_dump(),
+            "devices": [row.model_dump() for row in session.exec(
+                select(PatientDeviceCapability))],
+            "captures": [row.model_dump() for row in session.exec(
+                select(AttemptCaptureProcessing))],
+        }
+
+
+@pytest.mark.parametrize(("stop_reason", "stop_facts", "persisted"), [
+    ("silence", {"vad_armed": True, "vad_voiced_ms": 1234},
+     '{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":1234}'),
+    ("user_done", {"vad_armed": True, "vad_voiced_ms": 0},
+     '{"stop_reason":"user_done","vad_armed":true,"vad_voiced_ms":0}'),
+    ("max_duration", {"vad_armed": True},
+     '{"stop_reason":"max_duration","vad_armed":true}'),
+    ("user_done", {"vad_armed": False},
+     '{"stop_reason":"user_done","vad_armed":false}'),
+    ("user_done", {}, '{"stop_reason":"user_done"}'),
+])
+def test_record_stopped_vad_facts_persist_verbatim_and_feed_the_worker(
+        api_clients: ApiClients, monkeypatch, stop_reason, stop_facts, persisted):
+    """VAD 诊断事实只进回执账本:落库逐字(规范键序),判分照常;旧平板形状一字不变。"""
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(
+        api_clients, stop_reason=stop_reason, stop_facts=stop_facts)
+    with Session(api_clients.engine) as session:
+        stopped = session.exec(select(RuntimeCommandAck).where(
+            RuntimeCommandAck.ack_type == "record_stopped")).one()
+        assert stopped.payload_json == persisted
+    monkeypatch.setattr(asr, "get_engine", lambda: _WorkerAsr())
+    _run_p0a_attempt_worker(SESSION_ID)
+    with Session(api_clients.engine) as session:
+        attempt = session.exec(select(AttemptEvent)).one()
+        assert (attempt.raw_audio_id, attempt.processing_status) == (
+            capture["raw_audio_id"], "completed")
+    feedback = _device_next(api_clients)
+    assert feedback is not None and feedback["payload"]["purpose"] == "feedback"
+
+
+@pytest.mark.parametrize("first", [{}, {"vad_armed": True, "vad_voiced_ms": 1234}])
+def test_record_stopped_replay_is_identical_only_with_identical_vad_facts(
+        api_clients: ApiClients, monkeypatch, first):
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(api_clients, stop_facts=first)
+    before = _ack_ledger(api_clients.engine)
+    replay = _replay_record_stopped(api_clients, capture, **first)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    # 落库的是规范键序,设备端 JSON 键序不同仍是同一事实。
+    reordered = _replay_record_stopped(api_clients, capture, **dict(reversed(first.items())))
+    assert reordered.status_code == 200, reordered.text
+    assert reordered.json()["replayed"] is True
+    for changed in ({}, {"vad_armed": False}, {"vad_armed": True},
+                    {"vad_armed": True, "vad_voiced_ms": 1234},
+                    {"vad_armed": True, "vad_voiced_ms": 1235}):
+        if changed == first:
+            continue
+        conflict = _replay_record_stopped(api_clients, capture, **changed)
+        assert conflict.status_code == 409, (changed, conflict.text)
+        assert conflict.json()["detail"]["code"] == "autopilot_ack_conflict"
+    assert _ack_ledger(api_clients.engine) == before
+
+
+@pytest.mark.parametrize("stop_facts", [
+    {"vad_voiced_ms": 1200},
+    {"vad_armed": False, "vad_voiced_ms": 1200},
+    {"vad_armed": None, "vad_voiced_ms": 1200},
+    {"vad_armed": 1},
+    {"vad_armed": "true"},
+    {"vad_armed": True, "vad_voiced_ms": True},
+    {"vad_armed": True, "vad_voiced_ms": 1200.0},
+    {"vad_armed": True, "vad_voiced_ms": "1200"},
+    {"vad_armed": True, "vad_voiced_ms": -1},
+    {"vad_armed": True, "vad_voiced_ms": 600_001},
+])
+def test_record_stopped_with_bad_vad_facts_is_refused_before_any_write(
+        api_clients: ApiClients, monkeypatch, stop_facts):
+    _enable_p0a(monkeypatch)
+    assert _start(api_clients).status_code == 200
+    tts = _device_next(api_clients)
+    ended = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{tts['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(tts, ack_type="tts_ended", ack_key="ack-bad-vad-tts-ended",
+                       device_event_seq=1, media_ended=True, media_duration_ms=800))
+    assert ended.status_code == 200, ended.text
+    record = ended.json()["command"]
+    before = _ack_ledger(api_clients.engine)
+    refused = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{record['command_key']}/acks",
+        headers=api_clients.device_headers,
+        json=_ack_body(
+            record, ack_type="record_stopped", ack_key="ack-bad-vad-record-stopped",
+            device_event_seq=2, stop_reason="silence",
+            raw_audio_id=record["payload"]["raw_audio_id"], receipt_server_seq=1,
+            checksum="0" * 64, byte_count=1, duration_seconds=1.0, **stop_facts))
+    assert refused.status_code == 422, refused.text
+    assert _ack_ledger(api_clients.engine) == before
+
+
+def test_vad_carrying_capture_is_a_media_terminal_proof_after_worker_failure(
+        api_clients: ApiClients, monkeypatch):
+    _enable_p0a(monkeypatch)
+    capture = _drive_to_processing_attempt(
+        api_clients, stop_facts={"vad_armed": True, "vad_voiced_ms": 2100})
+    monkeypatch.setattr(asr, "get_engine", lambda: _WorkerAsr(fails=True))
+    _run_p0a_attempt_worker(SESSION_ID)
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/"
+        f"{capture['record']['command_key']}/drain-ack",
+        headers=api_clients.device_headers,
+    )
+    assert drained.status_code == 200, drained.text
+    assert drained.json()["replayed"] is True
+
+
+def test_vad_carrying_first_answer_settles_through_pause_and_adjudication(
+        api_clients: ApiClients, monkeypatch):
+    """暂停后的历史采集复核(verify_settled_record_capture)同样认带 VAD 事实的收麦回执。"""
+    _enable_p0a(monkeypatch)
+    _bind_api_bank(api_clients, monkeypatch, TWO_ONLY_BANK)
+    _drive_to_processing_attempt(
+        api_clients, stop_facts={"vad_armed": True, "vad_voiced_ms": 640})
+    monkeypatch.setattr(asr, "get_engine", lambda: _EmptyTranscriptAsr())
+    _run_p0a_attempt_worker(SESSION_ID)
+    cue = _device_next(api_clients)
+    assert cue is not None and cue["payload"]["purpose"] == "cue"
+    assert api_clients.account.post(f"/sessions/{SESSION_ID}/pause").status_code == 200
+    drained = api_clients.device.post(
+        f"/sessions/{SESSION_ID}/autopilot/commands/{cue['command_key']}/drain-ack",
+        headers=api_clients.device_headers)
+    assert drained.status_code == 200, drained.text
+    adjudicated = _adjudicate(
+        api_clients, key="adjudicate-vad-capture-0001",
+        expected_revision=drained.json()["state_revision"],
+        kind="confirmed_correct", reason_code="asr_misrecognized")
+    assert adjudicated.status_code == 200, adjudicated.text
+    assert adjudicated.json()["position_item_id"] == TWO_ONLY_BANK.single_element[1]["item_id"]
 
 
 def test_device_rotation_during_active_processing_fences_both_claims_and_pauses(
