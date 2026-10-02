@@ -440,3 +440,97 @@ def test_ledger_verifier_reuses_the_production_capture_proof():
     source = Path(voice.__file__).read_text(encoding="utf-8")
     assert "autopilot_ledger.verify_immutable_record_capture(" in source
     assert "_assert_imported_engine_binding(" in source
+
+
+# ---------------------------------------------------------------------------
+# 停播检测两个可选回执事实:平板带 ?ack_facts=1 读语音设置,服务端回五键
+# ---------------------------------------------------------------------------
+_BOTH = ["barge_in_armed", "barge_in_listened_ms"]
+
+
+def test_voice_settings_shape_accepts_the_opt_in_fifth_key():
+    assert voice.voice_settings_shape_ok({**_settings(), "ack_facts": _BOTH})
+    assert voice.voice_settings_shape_ok({**_settings(), "ack_facts": []})
+    for bad in ("barge_in_armed", [1], [None], None, {"barge_in_armed": True}):
+        assert not voice.voice_settings_shape_ok({**_settings(), "ack_facts": bad}), bad
+    assert not voice.voice_settings_shape_ok({**_settings(), "ack_facts": _BOTH, "extra": 1})
+    assert not voice.voice_settings_shape_ok({**_settings(vad_enabled=1), "ack_facts": _BOTH})
+
+
+def test_advertised_ack_facts_follow_the_latest_settings():
+    assert voice.advertised_ack_facts([]) == frozenset()
+    assert voice.advertised_ack_facts([_settings()]) == frozenset()
+    assert voice.advertised_ack_facts([{**_settings(), "ack_facts": _BOTH}, _settings()]) == frozenset()
+    assert voice.advertised_ack_facts([_settings(), {**_settings(), "ack_facts": ["barge_in_armed", "x"]}]) \
+        == frozenset({"barge_in_armed", "x"})
+
+
+_ENDED = {"ack_type": "tts_ended", "media_ended": True, "media_duration_ms": 3000}
+_STOPPED = {"ack_type": "tts_interrupted", "media_stopped": True, "interrupt_reason": "answer_now",
+            "media_duration_ms": 700}
+
+
+def _terminals(*rows):
+    return [(purpose, {**base, **facts}) for purpose, base, facts in rows]
+
+
+@pytest.mark.parametrize(("terminals", "advertised", "enabled"), [
+    # 开关开着:在听或没听上都可能;反馈句不带。
+    (_terminals(("question", _ENDED, {"barge_in_armed": True, "barge_in_listened_ms": 1200}),
+                ("cue", _STOPPED, {"barge_in_armed": False}),
+                ("feedback", _ENDED, {})), frozenset(_BOTH), True),
+    # 第一句可能赶在语音设置读到之前组装回执:缺键可以,只要后面有一条带上。
+    (_terminals(("question", _ENDED, {}), ("question", _ENDED, {"barge_in_armed": False})),
+     frozenset(_BOTH), True),
+    # NMU_AUTOPILOT_VOICE_BARGE_IN=0:授权 409,检测从没听过,一律 false。
+    (_terminals(("question", _ENDED, {"barge_in_armed": False}),
+                ("question", _STOPPED, {"barge_in_armed": False})), frozenset(_BOTH), False),
+    # 四键的服务端:一个键都不带。
+    (_terminals(("question", _ENDED, {}), ("cue", _STOPPED, {})), frozenset(), True),
+    # 只声明 armed:不带监听毫秒。
+    (_terminals(("question", _ENDED, {"barge_in_armed": True})), frozenset({"barge_in_armed"}), True),
+])
+def test_barge_in_facts_that_pass(terminals, advertised, enabled):
+    assert voice.barge_in_fact_violations(
+        terminals, advertised=advertised, barge_in_enabled=enabled) == []
+
+
+@pytest.mark.parametrize(("terminals", "advertised", "enabled", "message"), [
+    (_terminals(("question", _ENDED, {"barge_in_armed": True, "barge_in_listened_ms": 300})),
+     frozenset(_BOTH), False, "关着"),
+    (_terminals(("question", _ENDED, {"barge_in_armed": False})), frozenset(), True, "没声明"),
+    (_terminals(("question", _ENDED, {})), frozenset(_BOTH), True, "一条都没"),
+    (_terminals(("question", _ENDED, {"barge_in_armed": True}),
+                ("feedback", _ENDED, {"barge_in_armed": False})), frozenset(_BOTH), True, "反馈"),
+    (_terminals(("question", _ENDED, {"barge_in_armed": "true"})), frozenset(_BOTH), True, "布尔"),
+    (_terminals(("question", _ENDED, {"barge_in_armed": False, "barge_in_listened_ms": 0})),
+     frozenset(_BOTH), True, "监听毫秒"),
+    (_terminals(("question", _ENDED, {"barge_in_listened_ms": 10})), frozenset(_BOTH), True, "监听毫秒"),
+    (_terminals(("question", _ENDED, {"barge_in_armed": True, "barge_in_listened_ms": 600_001})),
+     frozenset(_BOTH), True, "监听毫秒"),
+    (_terminals(("question", _ENDED, {"barge_in_armed": True, "barge_in_listened_ms": 10})),
+     frozenset({"barge_in_armed"}), True, "没声明"),
+    (_terminals(("cue", {**_STOPPED, "interrupt_reason": "voice_activity"}, {"barge_in_armed": False})),
+     frozenset(_BOTH), True, "开口停播"),
+])
+def test_barge_in_facts_that_fail(terminals, advertised, enabled, message):
+    problems = voice.barge_in_fact_violations(
+        terminals, advertised=advertised, barge_in_enabled=enabled)
+    assert any(message in problem for problem in problems), problems
+
+
+def test_barge_in_tally_counts_only_question_and_cue():
+    terminals = _terminals(
+        ("question", _ENDED, {"barge_in_armed": True, "barge_in_listened_ms": 1200}),
+        ("cue", _STOPPED, {"barge_in_armed": False}),
+        ("question", _ENDED, {}),
+        ("feedback", _ENDED, {"barge_in_armed": True}),
+        ("tell_answer", _ENDED, {}))
+    assert voice.barge_in_tally(terminals) == "true=1,false=1,missing=1"
+    assert voice.barge_in_tally([]) == "true=0,false=0,missing=0"
+
+
+def test_ledger_verifier_recounts_the_terminal_tts_facts():
+    source = Path(voice.__file__).read_text(encoding="utf-8")
+    assert "barge_in_tally(" in source
+    assert "result.prompt_barge_in_armed" in source
