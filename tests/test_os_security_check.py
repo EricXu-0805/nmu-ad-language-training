@@ -6,8 +6,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import os
 from pathlib import Path
 import sys
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -120,8 +123,14 @@ def _cli(tmp_path, text, monkeypatch, extra=()):
     lists = tmp_path / "lists"
     lists.mkdir(exist_ok=True)
     (lists / "jammy_index").write_text("x")
+    # 进程与内核两项读假的 /proc、/boot:跑测试这台机器(Mac 上根本没有 /proc)不该左右判定。
+    for fake in ("proc", "boot"):
+        (tmp_path / fake).mkdir(exist_ok=True)
     monkeypatch.setattr(osc, "REBOOT_REQUIRED", tmp_path / "no-reboot-required")
-    return osc.main(["--simulate-file", str(sim), "--lists-dir", str(lists), *extra])
+    monkeypatch.setattr(osc.os, "geteuid", lambda: 0)
+    return osc.main(["--simulate-file", str(sim), "--lists-dir", str(lists),
+                     "--proc-dir", str(tmp_path / "proc"), "--boot-dir", str(tmp_path / "boot"),
+                     *extra])
 
 
 def test_cli_exits_one_on_pending_security(tmp_path, monkeypatch, capsys):
@@ -251,3 +260,180 @@ def test_read_holds_survives_a_missing_apt_mark(monkeypatch):
         raise FileNotFoundError("apt-mark")
     monkeypatch.setattr(osc.subprocess, "run", boom)
     assert osc.read_holds() == []
+
+
+# ---------------- 补丁装在盘上，内存里跑的还是旧代码 ----------------
+# 自动装安全更新只换盘上的文件：nmu 不重启就一直跑着旧 libssl/libsqlite3/zlib。
+# 这台机器没有 update-notifier，库更新不会立任何旗子，所以要自己去 /proc 里看。
+
+def _maps_line(path: str, deleted: bool = True) -> str:
+    return (f"7f38fcedf000-7f38fcf0a000 r-xp 00000000 08:03 131330"
+            f"                     {path}{' (deleted)' if deleted else ''}")
+
+
+SSL = "/usr/lib/x86_64-linux-gnu/libssl.so.3"
+CRYPTO = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3"
+LIBC = "/usr/lib/x86_64-linux-gnu/libc.so.6"
+# 都带 (deleted)，但都不是 apt 换掉的共享库：匿名内存、共享内存段、临时文件、数据文件、
+# 区域数据，以及 /opt、/usr/local 下不归 apt 管的 .so。
+NOT_APT_LIBRARIES = (
+    "7f0000000000-7f0000001000 rw-s 00000000 00:01 1   /memfd:pulseaudio (deleted)",
+    "7f0000002000-7f0000003000 rw-s 00000000 00:05 2   /SYSV00000000 (deleted)",
+    _maps_line("/tmp/ffiXa81b2"),
+    _maps_line("/var/lib/nmu/app.db"),
+    _maps_line("/usr/lib/locale/locale-archive"),
+    _maps_line("/opt/nmu/python3.14/lib/python3.14/lib-dynload/_ssl.cpython-314-x86_64-linux-gnu.so"),
+    _maps_line("/usr/local/lib/libfoo.so.1"),
+)
+
+
+def _process(proc: Path, pid: int, cgroup: str, *maps: str) -> None:
+    directory = proc / str(pid)
+    directory.mkdir(parents=True)
+    (directory / "cgroup").write_text(cgroup, encoding="utf-8")
+    (directory / "maps").write_text("\n".join(maps) + "\n", encoding="utf-8")
+
+
+def test_a_replaced_library_is_attributed_to_the_unit_that_still_maps_it(tmp_path):
+    proc = tmp_path / "proc"
+    _process(proc, 812, "0::/system.slice/nmu.service\n", _maps_line(SSL), _maps_line(LIBC, False))
+    _process(proc, 813, "0::/system.slice/nmu.service\n", _maps_line(CRYPTO))
+    _process(proc, 640, "0::/system.slice/dbus.service\n", _maps_line(LIBC, False))
+    # cgroup v1/混合层级：取 name=systemd 那一行；模板实例取到实例名为止。
+    _process(proc, 700, "12:pids:/system.slice/nginx.service\n"
+                        "1:name=systemd:/system.slice/nginx.service\n", _maps_line(CRYPTO))
+    _process(proc, 701, "0::/system.slice/system-getty.slice/getty@tty1.service\n",
+             _maps_line(LIBC))
+    # 登录会话和用户管理器来来去去，合成一组。
+    _process(proc, 9001, "0::/user.slice/user-0.slice/session-7.scope\n", _maps_line(SSL))
+    _process(proc, 9002, "0::/user.slice/user-0.slice/user@0.service/init.scope\n",
+             _maps_line(LIBC))
+    _process(proc, 1, "0::/init.scope\n", _maps_line(LIBC))
+    _process(proc, 1500, "0::/system.slice/packagekit.service\n", *NOT_APT_LIBRARIES)
+    (proc / "self").mkdir()
+    (proc / "sys").mkdir()
+
+    assert osc.stale_library_units(proc) == {
+        "getty@tty1.service": [LIBC],
+        "init.scope": [LIBC],
+        "nginx.service": [CRYPTO],
+        "nmu.service": [CRYPTO, SSL],
+        "user.slice": [LIBC, SSL],
+    }
+
+
+def test_a_process_that_exits_mid_scan_is_skipped(tmp_path):
+    proc = tmp_path / "proc"
+    (proc / "4242").mkdir(parents=True)          # 读 maps 之前进程已经退出
+    _process(proc, 812, "0::/system.slice/nmu.service\n", _maps_line(SSL))
+
+    assert osc.stale_library_units(proc) == {"nmu.service": [SSL]}
+
+
+def test_a_process_whose_maps_cannot_be_read_makes_the_scan_fail(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root 读得了 0000 的文件，造不出读不了的映射")
+    proc = tmp_path / "proc"
+    _process(proc, 812, "0::/system.slice/nmu.service\n", _maps_line(SSL))
+    (proc / "812" / "maps").chmod(0)
+
+    with pytest.raises(PermissionError):
+        osc.stale_library_units(proc)
+
+
+def test_a_stale_app_unit_fails_and_names_the_unit_and_the_library():
+    failures, notes = osc.evaluate_running(
+        {"nmu.service": [CRYPTO, SSL], "nginx.service": [CRYPTO]}, None,
+        "5.15.0-194-generic", "5.15.0-194-generic")
+
+    assert len(failures) == 2 and notes == []
+    nmu = next(f for f in failures if f.startswith("nmu.service"))
+    assert "libssl.so.3" in nmu and "libcrypto.so.3" in nmu
+    assert "systemctl restart nmu" in nmu
+    assert any(f.startswith("nginx.service") and "systemctl restart nginx" in f
+               for f in failures)
+
+
+def test_stale_core_units_are_a_note_for_the_next_reboot_window():
+    """sing-box 一重启就断用户、dbus 重启会牵连整机：只记一笔，等重启窗口一并换新。"""
+    failures, notes = osc.evaluate_running(
+        {"dbus.service": [LIBC], "sing-box.service": [LIBC], "user.slice": [SSL]}, None,
+        "5.15.0-194-generic", None)
+
+    assert failures == []
+    [note] = notes
+    assert "dbus.service" in note and "sing-box.service" in note and "重启窗口" in note
+
+
+def test_a_newer_installed_kernel_is_a_note_in_numeric_order(tmp_path):
+    boot = tmp_path / "boot"
+    boot.mkdir()
+    for release in ("5.15.0-25-generic", "5.15.0-194-generic", "5.15.0-198-generic"):
+        (boot / f"vmlinuz-{release}").write_text("x")
+    (boot / "vmlinuz").symlink_to("vmlinuz-5.15.0-198-generic")
+    (boot / "vmlinuz.old").symlink_to("vmlinuz-5.15.0-194-generic")
+
+    # 这就是陷阱：按字面比，25 排在 198 后面。
+    assert max(["5.15.0-198-generic", "5.15.0-25-generic"]) == "5.15.0-25-generic"
+    assert osc.newest_installed_kernel(boot) == "5.15.0-198-generic"
+    assert osc.newest_installed_kernel(tmp_path / "no-boot") is None
+
+    failures, notes = osc.evaluate_running({}, None, "5.15.0-194-generic", "5.15.0-198-generic")
+    assert failures == []
+    [note] = notes
+    assert "5.15.0-198-generic" in note and "5.15.0-194-generic" in note
+    assert osc.evaluate_running({}, None, "5.15.0-198-generic", "5.15.0-198-generic") == ([], [])
+
+
+def _assess(tmp_path, **overrides):
+    lists = tmp_path / "lists"
+    lists.mkdir(exist_ok=True)
+    (lists / "jammy_index").write_text("x")
+    (tmp_path / "proc").mkdir(exist_ok=True)
+    kwargs = dict(lists_dir=lists, held=[], proc=tmp_path / "proc", boot=tmp_path / "boot",
+                  running_kernel="5.15.0-194-generic", euid=0)
+    kwargs.update(overrides)
+    return osc.assess("Calculating upgrade...\n", MAX_AGE, **kwargs)
+
+
+def test_not_running_as_root_fails_instead_of_passing_unlooked(tmp_path):
+    """非 root 读不到别的用户的进程映射：那样得出的 0 是没看，不是没有。"""
+    report = _assess(tmp_path, euid=1000)
+
+    assert report["ok"] is False
+    assert report["stale_library_units"] is None
+    assert any("root" in failure for failure in report["failures"])
+
+
+def test_an_unreadable_proc_fails_instead_of_passing_unlooked(tmp_path):
+    report = _assess(tmp_path, proc=tmp_path / "no-proc-here")
+
+    assert report["ok"] is False
+    assert report["stale_library_units"] is None
+    assert any("没查过不当作通过" in failure for failure in report["failures"])
+
+
+def test_a_clean_box_passes_with_the_running_code_fields_filled(tmp_path):
+    report = _assess(tmp_path)
+
+    assert report["ok"] is True, report["failures"]
+    assert report["stale_library_units"] == {}
+    assert report["kernel_running"] == "5.15.0-194-generic"
+    assert report["kernel_newest_installed"] is None
+
+
+def test_cli_json_carries_the_running_code_fields(tmp_path, monkeypatch, capsys):
+    import json
+    _process(tmp_path / "proc", 812, "0::/system.slice/nmu.service\n", _maps_line(SSL))
+    (tmp_path / "boot").mkdir()
+    (tmp_path / "boot" / "vmlinuz-5.15.0-198-generic").write_text("x")
+
+    code = _cli(tmp_path, "Calculating upgrade...\n", monkeypatch, extra=["--json"])
+
+    report = json.loads(capsys.readouterr().out)
+    assert code == 1 and report["ok"] is False
+    assert report["security_pending"] == 0
+    assert report["stale_library_units"] == {"nmu.service": [SSL]}
+    assert report["kernel_running"] == os.uname().release
+    assert report["kernel_newest_installed"] == "5.15.0-198-generic"
+    assert report["failures"][0].startswith("nmu.service")
