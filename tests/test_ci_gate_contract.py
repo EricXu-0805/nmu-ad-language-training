@@ -208,3 +208,14 @@ def test_main_push_and_schedule_skip_the_test_suites_but_still_scan_and_build() 
     jobs = _jobs()
     assert "scripts/ci_gate.sh --only supply-chain" in jobs["supply-chain"]
     assert jobs["image"].count("uses: aquasecurity/trivy-action@") == 2
+
+
+def test_release_artifact_is_uploaded_by_main_push_and_never_by_pull_requests() -> None:
+    # 上线脚本只从 main 上该 SHA 的 push run 取产物;PR run 构建的是合并预演提交,传了也用不上。
+    image = _jobs()["image"]
+    (upload,) = [step for step in image.split("\n      - ") if "name: nmu-release-artifacts" in step]
+    assert "\n        if: github.event_name != 'pull_request'\n" in upload
+    assert "\n          retention-days: 30\n" in upload
+    assert "\n          if-no-files-found: error" in upload
+    # PR run 照样构建、扫描、核 dist 与源码的绑定,只少上传这一步。
+    assert len(re.findall(r"^        if: ", image, re.M)) == 1
