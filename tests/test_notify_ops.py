@@ -55,7 +55,7 @@ class FakeSystem:
                 f"InvocationID={self.invocation}\n"
                 f"InactiveExitTimestampMonotonic={started}\n"))
         if argv[0] == "journalctl":
-            if f"_SYSTEMD_INVOCATION_ID={INVOCATION}" in argv:
+            if self.invocation and f"_SYSTEMD_INVOCATION_ID={self.invocation}" in argv:
                 body = self.output + (self.manager if "+" in argv else "")
             else:
                 body = self.previous + "\n" + self.output + self.manager
