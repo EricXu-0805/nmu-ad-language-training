@@ -757,7 +757,7 @@ def test_markdown_prints_the_numbers_beside_the_baseline(field_db):
         "| upload+ASR：record_stopped → ASR 落行 | 5 | 2.50 | 2.80 | 3.00 | 2.94 |",
         "| └ LLM（LLM辅助） | 2 | 2.75 | 3.75 | 4.00 | — |",
         "| question | 5 | 1 | 0 | 0 |",
-        "vad_armed：true 4 · false 2 · 缺（旧平板没上报）1",
+        "vad_armed：true 4 · false 2 · 缺（旧平板/未读到设置/刷新补发）1",
     ):
         assert row in done.stdout, row
 

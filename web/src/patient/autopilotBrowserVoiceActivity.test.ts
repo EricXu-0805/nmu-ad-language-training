@@ -267,3 +267,22 @@ test("voicedMs:读到帧之前是 null;之后是判定器累计的有声毫秒,�
   assert.equal(sampler.voicedMs(), frozen);
   assert.equal(frozen, 32 * VAD_SAMPLE_INTERVAL_MS);
 });
+
+test("voicedMs:音频图中途暂停换了判定器,暂停前听到的有声毫秒照样算进去", () => {
+  const harness = samplerHarness();
+  const context = harness.context as FakeAudioContext;
+  const sampler = observe(harness, () => {});
+  harness.feed(1_000, 0.002);
+  harness.feed(2_000, 0.2);
+  const beforeSuspension = sampler.voicedMs();
+  assert.equal(beforeSuspension, 32 * VAD_SAMPLE_INTERVAL_MS);
+  context.state = "suspended";
+  harness.feed(500, 0);
+  // 回执里的 vad_voiced_ms 是这段录音里听到的有声总量,不能因为系统中断一下就归零。
+  assert.equal(sampler.voicedMs(), beforeSuspension);
+  context.state = "running";
+  harness.feed(1_000, 0.002);
+  harness.feed(1_000, 0.2);
+  assert.equal(sampler.voicedMs(), (beforeSuspension ?? 0) + 16 * VAD_SAMPLE_INTERVAL_MS);
+  sampler.release();
+});

@@ -22,7 +22,7 @@ length()，原文不进这个进程；要打印的分类码（stop_reason、erro
 养老院八场 149 轮的只读测量（收据 260 §八）：
   1. 提问念完 → 开麦：触发录音的 tts_ended → 该录音命令的 record_started；打断后开麦单列。
   2. 录音段：record_started → record_stopped 与平板报的 duration_seconds，按
-     stop_reason 分；silence 收麦的 vad_voiced_ms；vad_armed 真/假/缺（旧平板不报）。
+     stop_reason 分；silence 收麦的 vad_voiced_ms；vad_armed 真/假/缺（旧平板、还没读到语音设置、刷新后补发的回执都不报）。
   3. 老人说完 → 机器人开口：record_stopped → 下一条 TTS 的 tts_started，拆成
      upload+ASR、判分（rule / rubric / LLM）、签发、取音+开播；中间隔了暂停/续弹的不算。
   4. LLM 判分：次数、理由长度、超 40 字占比；规则/rubric 判分超 1 s 的次数
@@ -542,7 +542,7 @@ def _recording(snap: Snapshot) -> dict:
             device[key].append(duration)
         if span is not None and duration is not None:
             overhead.append(span - duration)
-        # 两个 VAD 事实是可选的：旧平板一个都不发，照样参与其它统计。
+        # 两个 VAD 事实是可选的：旧平板、还没读到语音设置、刷新后补发的回执都不带，照样参与其它统计。
         flag = payload.get("vad_armed")
         armed["true" if flag is True else "false" if flag is False else "missing"] += 1
         voiced_ms = payload.get("vad_voiced_ms")
@@ -895,7 +895,7 @@ def _md_recording(metric: dict) -> list[str]:
              metric["stop_to_ack_overhead_seconds"]),
         "",
         f"vad_armed：true {armed['true']} · false {armed['false']} · "
-        f"缺（旧平板没上报）{armed['missing']}",
+        f"缺（旧平板/未读到设置/刷新补发）{armed['missing']}",
         f"silence 收麦的 vad_voiced_ms（毫秒）：{_inline(metric['silence_vad_voiced_ms'])}",
         "",
     ]

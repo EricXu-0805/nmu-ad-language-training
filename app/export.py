@@ -1850,7 +1850,7 @@ def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
     按 attempt.id 返回；导出包与研究读面共用这一份，免得两边口径分岔。录音命令靠
     expected_raw_audio_id 找，没有平板录音命令的（人工录音、历史场次）一律为空。
     stop_reason 只出闭集，库里别的值出 None 而不拦整份导出：它和播放结局一样只描述
-    采集过程。vad_armed 是新平板才带的可选键，旧回执、旧平板为 None。
+    采集过程。vad_armed 是新平板才带的可选键；旧平板、平板还没读到语音设置、刷新后补发的回执都不带，为 None。
     播放结局认录音命令登记的那条触发回执（trigger_ack_idempotency_key），不认同一
     条 TTS 上别的回执。
     """

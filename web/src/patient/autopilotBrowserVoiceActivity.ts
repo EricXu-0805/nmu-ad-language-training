@@ -72,6 +72,7 @@ export function observeTrailingSilence(
   let timer: number | null = null;
   let released = false;
   let detector = createVoiceActivityDetector(windows);
+  let voicedBeforeReset = 0;
   let sampled = false;
 
   const release = (): void => {
@@ -113,7 +114,9 @@ export function observeTrailingSilence(
         if (context?.state !== "running") {
           // 系统中断也可能发生在老人已开口之后。丢弃先前的倒计时,恢复后
           // 重新观察开口,不能把音频图暂停误认为老人说完。录音器的按钮和
-          // 原始作答上限继续生效,这里只降级 VAD。
+          // 原始作答上限继续生效,这里只降级 VAD。已经听到的有声毫秒留着,
+          // 回执里的 vad_voiced_ms 是整段录音的有声总量。
+          voicedBeforeReset += detector.voicedMs;
           detector = createVoiceActivityDetector(windows);
           return;
         }
@@ -134,6 +137,6 @@ export function observeTrailingSilence(
   }
   return {
     release,
-    voicedMs: () => (sampled ? detector.voicedMs : null),
+    voicedMs: () => (sampled ? voicedBeforeReset + detector.voicedMs : null),
   };
 }
