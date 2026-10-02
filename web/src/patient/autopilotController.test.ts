@@ -4219,3 +4219,148 @@ for (const pauseAfterClick of [false, true]) {
     }
   });
 }
+
+// ---------------- 开口打断之后那一次录音不旁听(静音收麦) ----------------
+//
+// 老人在提问声里开口 → 朗读停住、tts_interrupted(voice_activity)→ 屏上请老人
+// 从头说。紧接着这条录音里,老人重说之前的那段找词停顿会被 VAD 读成「说完」
+// (模拟:700 ms 尾音 + 5 s 停顿,5248 ms 收麦,5760 ms 才开口)。控制器要把
+// 「这条录音紧跟在一次开口打断之后」明确交给执行器;题位换了就不再算。
+
+function cueCommand(state: "pending" | "started" = "pending"): NextCommandProjection {
+  return {
+    ...questionCommand(state),
+    command_key: "cmd-cue-controller-0003",
+    command_seq: 3,
+    attempt_seq: 2,
+    prompt_level: 1,
+    payload: {
+      speech_key: "wk2.01.cue1.unknown",
+      speech_text: "它是钓鱼时用的。",
+      purpose: "cue",
+      response_path: "unknown",
+    },
+  } as NextCommandProjection;
+}
+
+function cueRecordCommand(state: "pending" | "started" = "pending"): NextCommandProjection {
+  const base = recordCommand(state) as Extract<NextCommandProjection, { kind: "record" }>;
+  return {
+    ...base,
+    command_key: "cmd-cue-record-controller-0004",
+    command_seq: 4,
+    attempt_seq: 2,
+    prompt_level: 1,
+    payload: {
+      ...base.payload,
+      raw_audio_id: "raw-controller-issued-0002",
+      presentation_speech_key: "controller.cue",
+      presentation_speech_text: "它是钓鱼时用的。",
+      presentation_purpose: "cue",
+    },
+  };
+}
+
+type EndedFact = Awaited<ReturnType<AutopilotSpeechExecutor["start"]>["ended"]>;
+
+/** 每段朗读按给定结局收口;每次开麦记下控制器交给执行器的选项。 */
+function interruptionHarness(endings: EndedFact[], queue: Array<NextCommandProjection | null>) {
+  const events: string[] = [];
+  const acks: AutopilotAck[] = [];
+  const startOptions: Array<{ rawAudioId: string; options: unknown }> = [];
+  const speech: AutopilotSpeechExecutor = {
+    start: () => {
+      const ended = endings.shift();
+      if (!ended) throw new Error("朗读次数超出预期");
+      return {
+        started: Promise.resolve({ media_duration_ms: 3_000 }),
+        ended: Promise.resolve(ended),
+        closed: Promise.resolve(),
+        cancel: () => {},
+      };
+    },
+  };
+  const recording: AutopilotRecordingExecutor = {
+    start: (command, options) => {
+      startOptions.push({ rawAudioId: command.payload.raw_audio_id, options });
+      return {
+        started: Promise.resolve({ mime_type: "audio/webm", channels: 1 }),
+        stopped: Promise.resolve({
+          stop_reason: "user_done",
+          raw_audio_id: command.payload.raw_audio_id,
+          receipt_server_seq: 51,
+          checksum: CHECKSUM,
+          byte_count: 4_096,
+          duration_seconds: 6.5,
+        }),
+        closed: Promise.resolve(),
+        cancel: () => {},
+      };
+    },
+  };
+  const controller = new PatientAutopilotController({
+    sessionId: "S-VOICE-INTERRUPT",
+    transport: transportQueue(queue, events, acks),
+    speech,
+    recording,
+    idempotencyKey: fixedAckKey,
+  });
+  return { controller, acks, startOptions };
+}
+
+for (const row of [
+  {
+    name: "老人开口打断(voice_activity):这次录音不旁听",
+    ended: { interrupted: true, media_duration_ms: 700, interrupt_reason: "voice_activity" } as EndedFact,
+    ackType: "tts_interrupted",
+    expected: true,
+  },
+  {
+    name: "点「现在回答」(answer_now):老人还没开口,照常旁听",
+    ended: { interrupted: true, media_duration_ms: 700 } as EndedFact,
+    ackType: "tts_interrupted",
+    expected: false,
+  },
+  {
+    name: "提问自然播完:照常旁听",
+    ended: { media_duration_ms: 3_000 } as EndedFact,
+    ackType: "tts_ended",
+    expected: false,
+  },
+]) {
+  test(`提问结局决定紧接着那条录音旁不旁听——${row.name}`, async () => {
+    const run = interruptionHarness([row.ended], [
+      questionCommand(), questionCommand("started"), recordCommand(),
+      recordCommand(), recordCommand("started"), null,
+    ]);
+    const afterSpeech = await run.controller.pollOnce();
+    assert.equal(afterSpeech.phase, "record_ready");
+    const afterRecord = await run.controller.pollOnce();
+    assert.equal(afterRecord.phase, "waiting_server_after_record");
+    assert.deepEqual(run.acks.map((ack) => ack.ack_type),
+      ["tts_started", row.ackType, "record_started", "record_stopped"]);
+    // 控制器每次都显式给出这个判断,不靠执行器默认值。
+    assert.deepEqual(run.startOptions, [{
+      rawAudioId: "raw-controller-issued-0001",
+      options: { afterVoiceInterruption: row.expected },
+    }]);
+  });
+}
+
+test("开口打断只管同一题位那一次录音:下一句线索正常播完,它的录音照常旁听", async () => {
+  const run = interruptionHarness([
+    { interrupted: true, media_duration_ms: 700, interrupt_reason: "voice_activity" },
+    { media_duration_ms: 2_400 },
+  ], [
+    questionCommand(), questionCommand("started"), recordCommand(),
+    recordCommand(), recordCommand("started"), cueCommand(),
+    cueCommand(), cueCommand("started"), cueRecordCommand(),
+    cueRecordCommand(), cueRecordCommand("started"), null,
+  ]);
+  for (let turn = 0; turn < 4; turn += 1) await run.controller.pollOnce();
+  assert.equal(run.controller.state.phase, "waiting_server_after_record");
+  assert.deepEqual(run.startOptions, [
+    { rawAudioId: "raw-controller-issued-0001", options: { afterVoiceInterruption: true } },
+    { rawAudioId: "raw-controller-issued-0002", options: { afterVoiceInterruption: false } },
+  ]);
+});

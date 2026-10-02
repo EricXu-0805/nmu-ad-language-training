@@ -519,6 +519,9 @@ export class PatientAutopilotController {
   // 随 tts_ended 收据一起采纳的那条 pending 录音命令。下一拍据此跳过开头的
   // /next：服务器刚刚在同一条响应里签发了它，再读一次只是多一个往返。一次性。
   private receiptAdoptedRecordKey: string | null = null;
+  // 最近一次被老人开口打断(voice_activity)的提问/线索。同一题位紧接着的那条录音
+  // 不武装静音自动收麦;下一段朗读开始就作废。只在本控制器内存里,刷新即失。
+  private voiceInterruptedPrompt: TtsCommand | null = null;
 
   constructor(options: PatientAutopilotControllerOptions) {
     this.sessionId = options.sessionId;
@@ -961,6 +964,7 @@ export class PatientAutopilotController {
 
   private async runSpeech(): Promise<void> {
     const initial = this.currentCommand("tts");
+    this.voiceInterruptedPrompt = null;
     let playback: AutopilotSpeechPlayback;
     try { playback = this.speech.start(initial); }
     catch (error) {
@@ -1023,6 +1027,9 @@ export class PatientAutopilotController {
         : { ack_type: "tts_ended", media_ended: true,
             ...(observedEnd.value.media_duration_ms === undefined
               ? {} : { media_duration_ms: observedEnd.value.media_duration_ms }) });
+      if (endedAck.ack_type === "tts_interrupted" && endedAck.interrupt_reason === "voice_activity") {
+        this.voiceInterruptedPrompt = startedCommand;
+      }
       // 服务器在接受 tts_ended 的同一条响应里就签发了下一条录音命令(收据权威)。
       // 直接采纳它，省掉一个 /next 往返；证明不足或 reducer 不认，才照旧读 /next。
       if (!this.adoptReceiptRecordCommand(startedCommand, endedAck)) {
@@ -1039,8 +1046,11 @@ export class PatientAutopilotController {
     // runOnce proves an exact, pending server record command exists first.
     const initial = this.currentCommand("record");
     let capture: AutopilotRecordingCapture;
-    try { capture = this.recording.start(initial); }
-    catch (error) {
+    try {
+      capture = this.recording.start(initial, {
+        afterVoiceInterruption: this.followsVoiceInterruption(initial),
+      });
+    } catch (error) {
       await this.mediaFailure(
         "record",
         autopilotMediaErrorCode(error, "recording_start_failed"),
@@ -1186,6 +1196,18 @@ export class PatientAutopilotController {
       if (this.activeMedia === capture) this.activeMedia = null;
       if (this.activeRecording === capture) this.activeRecording = null;
     }
+  }
+
+  /** 这条录音是否紧跟在同一题位、同一控制代际的那次开口打断之后。 */
+  private followsVoiceInterruption(record: RecordCommand): boolean {
+    const prompt = this.voiceInterruptedPrompt;
+    return prompt !== null
+      && prompt.control_generation === record.control_generation
+      && prompt.runner_generation === record.runner_generation
+      && prompt.item_ref === record.item_ref
+      && prompt.turn_seq === record.turn_seq
+      && prompt.attempt_seq === record.attempt_seq
+      && prompt.prompt_level === record.prompt_level;
   }
 
   /**
