@@ -100,6 +100,10 @@ test("技术失败那一题只亮服务端真收的出口:收起「继续」「�
   assert.match(autopilotControl,
     /\{positionAttemptFailed \? \(\s*<>AI 已安全暂停：这一题最后一段录音处理出错，AI 不能接着做，也判不了「答对」。可点「跳过本题」，原因选「识别反复出错」或「其他」/);
   assert.match(autopilotControl, /\{canAdjudicate && !positionAttemptFailed && \(/);
+  // 训练台顶部的「场次已暂停」条对所有 AI 暂停态共用一句话;技术失败、下一题缺内容、全部
+  // 练完时卡片都不显示「继续 AI 自动带练」,这句话不能点名它(浏览器走查时看到的)。
+  assert.doesNotMatch(trainingConsole, /卡片点「继续 AI 自动带练」/);
+  assert.match(trainingConsole, /AI 仍托管本场。要继续，请按「AI 自动带练」卡片里的提示操作，或点「转为人工操作」。/);
 });
 
 test("自动带练启动拒因逐分支说真话,不再一律折成「麦克风还未确认关闭」", () => {

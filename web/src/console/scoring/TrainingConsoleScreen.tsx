@@ -1915,7 +1915,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
         <SessionControlBar paused={paused} loading={recoveryPending} busy={runtimeControl.busy || pausePending || wrapupPending}
           resumeBlocked={observerMode || Boolean(apFailure)}
           resumeBlockedHint={observerMode
-            ? "已暂停；AI 仍托管本场。要继续，请在「AI 自动带练」卡片点「继续 AI 自动带练」或「转为人工操作」。"
+            ? "已暂停；AI 仍托管本场。要继续，请按「AI 自动带练」卡片里的提示操作，或点「转为人工操作」。"
             : apFailure ? "已暂停；技术失败已锁定本场，请按红色提示处理，或结束本场后重新开一场。" : null}
           recoveredLabel={recoveredLabel}
           terminalStatus={runtimeControl.terminalStatus} onExit={onExit}
