@@ -171,7 +171,7 @@ export function ResearchDataScreen({ onBack }: { onBack: () => void }) {
                 <h3>选数据集与分区</h3>
                 <p className="muted">
                   各表可按受试者与场次编号相互对照；真实与模拟数据分开查看，不会混在一起。
-                  没有录音就跳过的题，请在「研究者现场裁定」中按题号核对。
+                  没录到回答、或录音处理出错后跳过的题，请在「研究者现场裁定」中按题号核对。
                 </p>
               </div>
             </div>

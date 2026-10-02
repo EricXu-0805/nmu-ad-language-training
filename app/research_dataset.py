@@ -127,7 +127,8 @@ _TURNS = Dataset(
                "判分是否用过画像：恒为 false，这一列是★画像不进判分的审计证据"),
         Column("adjudication_kind", "clear", "string",
                "研究者现场裁定：confirmed_correct（老人其实答对）/ terminated_no_verdict"
-               "（本题到此为止）/ 空=AI 自行收口。没有任何回答就被跳过的题位没有环节行，"
+               "（本题到此为止）/ 空=AI 自行收口。没有可收口回答就被跳过的题位（没回答，"
+               "或最后一段录音技术失败）没有环节行，"
                "只出现在 adjudications 数据集（kind=skipped）。裁定不改 ai_* 列，也不是"
                "研究真值；真值仍看 reviewed_score / score_locked"),
         Column("adjudication_reason", "clear", "string",
@@ -217,7 +218,7 @@ _QUESTIONNAIRE_ITEM_VALUES = Dataset(
 _ADJUDICATIONS = Dataset(
     key="adjudications",
     title="研究者现场裁定",
-    grain="一行一个被研究者现场裁定的题位（含没有任何回答就被跳过的题位）",
+    grain="一行一个被研究者现场裁定的题位（含没有可收口回答就被跳过的题位）",
     columns=(
         Column("session_code", "pseudonym", "string", "场次假名"),
         Column("subject_code", "pseudonym", "string", "受试者假名"),
@@ -227,7 +228,9 @@ _ADJUDICATIONS = Dataset(
         Column("turn_seq", "clear", "integer", "环节序号"),
         Column("kind", "clear", "string",
                "confirmed_correct（老人其实答对，按最后一次回答收口）/ terminated_no_verdict"
-               "（本题到此为止，按最后一次回答收口）/ skipped（没有任何回答就跳过，无环节行）"),
+               "（本题到此为止，按最后一次回答收口）/ skipped（没有可收口的回答就跳过："
+               "没回答，或最后一段录音技术失败，两种看 position_had_technical_failure；"
+               "无环节行）"),
         Column("reason_code", "clear", "string",
                "裁定原因闭集：late_correct_after_window / asr_misrecognized / "
                "staff_judged_correct / participant_declined / asr_repeatedly_failed / "

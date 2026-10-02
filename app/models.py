@@ -878,8 +878,9 @@ class AutopilotPositionAdjudication(SQLModel, table=True):
                             (TurnEvent 的 ai_* 原样抄 attempt,AI 原判不动),AI 进下一题。
       terminated_no_verdict 这一题位不再追问,按最后一次 attempt 收口(跳过本题时
                             当前题位若已有回答走这条)。
-      skipped               题位没有任何回答就跳过:不造 TurnEvent,恢复/完成门/
-                            导出按「研究者跳过」识别,绝不伪造录音证据。
+      skipped               题位没有可收口的回答就跳过(没回答,或最后一段录音技术失败):
+                            不造 TurnEvent,恢复/完成门/导出按「研究者跳过」识别,绝不伪造
+                            录音证据;技术失败那段 attempt 原样留在 attempt 表。
     研究真值(reviewed_score / score_locked)仍只走事后复核锁分;本表只是运行流程的
     可归责收据,导出里与 AI 判类并列。
     """
