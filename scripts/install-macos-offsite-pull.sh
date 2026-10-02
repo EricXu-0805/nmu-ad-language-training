@@ -26,6 +26,13 @@ fi
 SSH_USER="$1"
 SSH_HOST="$2"
 REMOTE_ROOT="${3:-/opt/nmu/backups}"
+# 已归档快照不再整份重下（vps-backup-pull.sh 的同名开关）默认关。要打开就在安装时
+# 显式给 NMU_BACKUP_PULL_SKIP_ARCHIVED=1；重装时不给就回到关。
+SKIP_ARCHIVED="${NMU_BACKUP_PULL_SKIP_ARCHIVED:-0}"
+case "$SKIP_ARCHIVED" in
+  0|1) : ;;
+  *) echo "NMU_BACKUP_PULL_SKIP_ARCHIVED 只能是 0 或 1" >&2; exit 64 ;;
+esac
 
 [ "$(uname -s)" = "Darwin" ] || { echo "只面向 macOS 工作站" >&2; exit 64; }
 
@@ -73,6 +80,7 @@ NMU_BACKUP_SSH_HOST='$SSH_HOST'
 NMU_BACKUP_REMOTE_ROOT='$REMOTE_ROOT'
 NMU_BACKUP_LOCAL_ROOT='$ROOT/offsite'
 PYTHON_BIN='$ROOT/venv/bin/python'
+NMU_BACKUP_PULL_SKIP_ARCHIVED='$SKIP_ARCHIVED'
 EOF
 chmod 600 "$ROOT/config.env"
 

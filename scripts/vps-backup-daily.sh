@@ -394,6 +394,8 @@ chmod 600 "$LOG"
 # 打开时，与最新一份已发布快照同名、同长、同权限且逐字节相同（cmp 语义）的录音换成
 # 指向那一份的硬链接：先建点开头的临时名再原子 rename。链接源只取 daily/ 下严格
 # 时间戳快照，从不取 live data/；有一个字节不同就保留这次的新副本并计入 cmp_mismatch。
+# 上一份那个文件只要还有校验器数不到的名字（daily/ 之外，或换了文件名），链上去的
+# 新快照就证不出来、每晚验失败，所以同样另存新副本并计入 outside_links。
 # 校验与发布随之带 --link-root，由校验器证明共享 inode 的每个链接都在相邻快照里。
 LINK_NOTE=""
 if [ "${NMU_BACKUP_LINK_AUDIO:-}" = 1 ]; then
@@ -422,6 +424,23 @@ linkable = (
     and previous.is_dir() and not previous.is_symlink())
 
 
+def visible_links(name: str, kept: os.stat_result) -> int:
+    """校验器 --link-root 能数到的链接：各份已发布快照的 audio/<同名>。"""
+    count = 0
+    for snapshot in published:
+        audio = daily / snapshot / "audio"
+        try:
+            if not stat.S_ISDIR(audio.lstat().st_mode):
+                continue
+            other = (audio / name).lstat()
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISREG(other.st_mode) and other.st_dev == kept.st_dev
+                and other.st_ino == kept.st_ino):
+            count += 1
+    return count
+
+
 def same_bytes(left: str, right: Path) -> bool:
     with open(left, "rb") as fresh, open(right, "rb") as kept:
         while True:
@@ -432,7 +451,7 @@ def same_bytes(left: str, right: Path) -> bool:
                 return True
 
 
-linked = linked_bytes = mismatched = 0
+linked = linked_bytes = mismatched = outside = 0
 for entry in sorted(os.scandir(work_audio) if linkable else (), key=lambda item: item.name):
     meta = entry.stat(follow_symlinks=False)
     if (entry.name.startswith(".") or entry.is_symlink()
@@ -450,6 +469,9 @@ for entry in sorted(os.scandir(work_audio) if linkable else (), key=lambda item:
     if not same_bytes(entry.path, source):
         mismatched += 1
         continue
+    if kept.st_nlink != visible_links(entry.name, kept):
+        outside += 1
+        continue
     temporary = work_audio / f".{entry.name}.link"
     os.link(source, temporary)
     os.replace(temporary, entry.path)
@@ -459,18 +481,18 @@ total = 0
 for current, _directories, names in os.walk(work):
     for name in names:
         total += (Path(current) / name).lstat().st_size
-print(linked, total - linked_bytes, mismatched)
+print(linked, total - linked_bytes, mismatched, outside)
 PY
   ); then
     :
   else
     fail "audio_link_failed"
   fi
-  read -r LINKED_FILES NEW_BYTES CMP_MISMATCH LINK_EXTRA <<< "$LINK_FACTS"
-  if [ -n "${LINK_EXTRA:-}" ] || [ -z "${CMP_MISMATCH:-}" ]; then
+  read -r LINKED_FILES NEW_BYTES CMP_MISMATCH OUTSIDE_LINKS LINK_EXTRA <<< "$LINK_FACTS"
+  if [ -n "${LINK_EXTRA:-}" ] || [ -z "${OUTSIDE_LINKS:-}" ]; then
     fail "audio_link_output_invalid"
   fi
-  LINK_NOTE=" linked=$LINKED_FILES new_bytes=$NEW_BYTES cmp_mismatch=$CMP_MISMATCH"
+  LINK_NOTE=" linked=$LINKED_FILES new_bytes=$NEW_BYTES cmp_mismatch=$CMP_MISMATCH outside_links=$OUTSIDE_LINKS"
 fi
 
 FAIL_CODE="snapshot_verify_failed"

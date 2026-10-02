@@ -31,6 +31,9 @@ LINE = re.compile(
     r"^\[(?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] "
     r"(?P<verdict>ok|FAIL|SKIP)\b(?P<rest>.*)$")
 SNAPSHOT = re.compile(r"\bsnapshot=(?P<name>[0-9]{8}-[0-9]{6})\b")
+# 录音去重打开后 ok 行末尾的两个异常计数；开关关着时没有这两个字段。
+LINK_ANOMALIES = (("cmp_mismatch", "audio_cmp_mismatch"),
+                  ("outside_links", "audio_outside_links"))
 
 
 class Unevaluable(Exception):
@@ -99,6 +102,12 @@ def evaluate(log_path: Path, daily_dir: Path, now: datetime, *,
         published = daily_dir / snapshot["name"]
         if published.is_symlink() or not published.is_dir():
             problems.append(f"published_snapshot_missing name={snapshot['name']}")
+
+    # 只看最新一次成功：下一份快照已经另存了新副本，旧的那次由当时的告警交代。
+    for field, code in LINK_ANOMALIES:
+        count = re.search(rf"\b{field}=(?P<count>[0-9]+)\b", rest)
+        if count is not None and int(count["count"]) > 0:
+            problems.append(f"{code} count={int(count['count'])}")
 
     try:
         free_mb = shutil.disk_usage(daily_dir).free // (1024 * 1024)

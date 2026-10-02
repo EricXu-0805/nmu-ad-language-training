@@ -175,6 +175,39 @@ def test_low_disk_space_is_reported(tmp_path):
     assert problems[0].startswith("disk_space_low ")
 
 
+LINKED_OK_LINE = (OK_LINE + " source_bytes=4096 source_dirs=3 reserve_bytes=0 "
+                  "linked=3 new_bytes=2048 cmp_mismatch=0 outside_links=0")
+
+
+def test_linked_backup_with_clean_counts_is_healthy(tmp_path):
+    root = _root(tmp_path, [LINKED_OK_LINE], ["20260806-023000"])
+
+    assert _evaluate(root) == []
+
+
+def test_kept_recording_whose_bytes_changed_is_reported(tmp_path):
+    line = LINKED_OK_LINE.replace("cmp_mismatch=0", "cmp_mismatch=2")
+    root = _root(tmp_path, [line], ["20260806-023000"])
+
+    assert _evaluate(root) == ["audio_cmp_mismatch count=2"]
+
+
+def test_kept_recording_with_a_link_outside_daily_is_reported(tmp_path):
+    line = LINKED_OK_LINE.replace("outside_links=0", "outside_links=1")
+    root = _root(tmp_path, [line], ["20260806-023000"])
+
+    assert _evaluate(root) == ["audio_outside_links count=1"]
+
+
+def test_link_anomalies_are_read_from_the_latest_success_only(tmp_path):
+    earlier = LINKED_OK_LINE.replace("02:30:00", "02:20:00").replace(
+        "20260806-023000", "20260806-022000").replace("cmp_mismatch=0", "cmp_mismatch=1")
+    root = _root(tmp_path, [earlier, LINKED_OK_LINE],
+                 ["20260806-022000", "20260806-023000"])
+
+    assert _evaluate(root) == []
+
+
 def test_unreadable_log_is_unevaluable_not_healthy(tmp_path):
     root = tmp_path / "backups"
     (root / "daily").mkdir(parents=True)

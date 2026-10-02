@@ -700,8 +700,28 @@ def test_pull_lands_sibling_linked_remote_audio_as_independent_strict_files(tmp_
         assert verified.returncode == 0, verified.stderr
 
 
+def test_pull_redownloads_and_compares_an_archived_stamp_by_default(tmp_path):
+    project, remote, local, env = _pull_harness(tmp_path)
+    env.pop("NMU_BACKUP_PULL_SKIP_ARCHIVED", None)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, stamp, b"archived-recording")
+    assert _run_pull(project, env).returncode == 0
+    transfers = Path(env["TRANSFER_LOG"])
+    before = len(transfers.read_text().splitlines())
+
+    replay = _run_pull(project, env)
+
+    assert replay.returncode == 0, replay.stderr
+    remote_prefix = (f"{env['NMU_BACKUP_SSH_USER']}@{env['NMU_BACKUP_SSH_HOST']}:"
+                     f"{env['NMU_BACKUP_REMOTE_ROOT']}")
+    assert f"{remote_prefix}/daily/{stamp}/" in transfers.read_text().splitlines()[before:]
+    assert re.search(r" ok snapshots=1 pulled=0 unchanged=1 used_mb=[0-9]+$",
+                     (local / "pull.log").read_text().splitlines()[-1])
+
+
 def test_pull_skips_the_payload_of_an_already_archived_unchanged_stamp(tmp_path):
     project, remote, local, env = _pull_harness(tmp_path)
+    env["NMU_BACKUP_PULL_SKIP_ARCHIVED"] = "1"
     stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
     _create_remote_snapshot(remote, stamp, b"archived-recording")
     assert _run_pull(project, env).returncode == 0
@@ -719,6 +739,26 @@ def test_pull_skips_the_payload_of_an_already_archived_unchanged_stamp(tmp_path)
     ]
     assert re.search(r" ok snapshots=1 pulled=0 unchanged=1 used_mb=[0-9]+$",
                      (local / "pull.log").read_text().splitlines()[-1])
+
+
+def test_offsite_installer_writes_the_skip_switch_off_unless_asked(tmp_path):
+    text = (ROOT / "scripts" / "install-macos-offsite-pull.sh").read_text(encoding="utf-8")
+    start = text.index('cat > "$ROOT/config.env" <<EOF')
+    config_lines = text[text.index("\n", start) + 1:text.index("\nEOF\n", start)].splitlines()
+    assert "NMU_BACKUP_PULL_SKIP_ARCHIVED='$SKIP_ARCHIVED'" in config_lines
+    gate = text[text.index('SKIP_ARCHIVED="'):text.index("esac\n", text.index('SKIP_ARCHIVED="')) + 5]
+    probe = gate + 'printf %s "$SKIP_ARCHIVED"\n'
+    base = {key: value for key, value in os.environ.items()
+            if key != "NMU_BACKUP_PULL_SKIP_ARCHIVED"}
+
+    def run(**extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", "-c", probe], env={**base, **extra},
+                              check=False, capture_output=True, text=True)
+
+    assert (run().returncode, run().stdout) == (0, "0")
+    assert (run(NMU_BACKUP_PULL_SKIP_ARCHIVED="1").stdout) == "1"
+    assert run(NMU_BACKUP_PULL_SKIP_ARCHIVED="yes").returncode == 64
+    assert run(NMU_BACKUP_PULL_SKIP_ARCHIVED="1' x='").returncode == 64
 
 
 def test_pull_copies_unchanged_bytes_from_the_newest_local_archive(tmp_path):
@@ -1196,7 +1236,7 @@ _OK_LINE = re.compile(
     r"reserve_bytes=[0-9]+(?P<tail>.*)$")
 _LINK_TAIL = re.compile(
     r"^ linked=(?P<linked>[0-9]+) new_bytes=(?P<new_bytes>[0-9]+) "
-    r"cmp_mismatch=(?P<mismatch>[0-9]+)$")
+    r"cmp_mismatch=(?P<mismatch>[0-9]+) outside_links=(?P<outside>[0-9]+)$")
 
 
 def _add_live_audio(app: Path, raw_id: str, payload: bytes) -> Path:
@@ -1373,6 +1413,35 @@ def test_daily_switch_on_copies_afresh_when_previous_bytes_differ(tmp_path):
     tail = _LINK_TAIL.fullmatch(_ok_lines(root)[-1]["tail"])
     assert (tail["linked"], tail["mismatch"]) == ("0", "1")
     assert _verify_vps(copied.parents[1]).returncode == 0
+
+
+@pytest.mark.parametrize("stray_name", ["outside", "inside-other-name"])
+def test_daily_switch_on_copies_afresh_when_the_kept_file_has_a_link_the_verifier_cannot_see(
+        stray_name, tmp_path):
+    app, root, env, _trace = _traced_daily_harness(tmp_path)
+    env["NMU_BACKUP_LINK_AUDIO"] = "1"
+    live = _add_live_audio(app, "aud-old", b"unchanged-recording")
+    assert _run_daily(app, env, "20261001-193000").returncode == 0
+    daily = root / "daily"
+    older = daily / "20261001-193000" / "audio" / "aud-old.webm"
+    # 校验器只数 daily/ 下严格时间戳兄弟快照里同名的 audio/<name>；别处多一个名字，
+    # 链上去的新快照就证不出来，每晚都会验失败。
+    stray = (tmp_path / "stray-copy.webm" if stray_name == "outside"
+             else daily / "20261001-193000" / "audio" / "aud-alias.webm")
+    os.link(older, stray)
+
+    completed = _run_daily(app, env, "20261002-193000")
+
+    assert completed.returncode == 0, completed.stderr
+    newer = daily / "20261002-193000"
+    copied = newer / "audio" / "aud-old.webm"
+    assert copied.stat().st_nlink == 1
+    assert copied.stat().st_ino != older.stat().st_ino
+    assert copied.read_bytes() == live.read_bytes()
+    assert older.stat().st_nlink == 2
+    tail = _LINK_TAIL.fullmatch(_ok_lines(root)[-1]["tail"])
+    assert (tail["linked"], tail["mismatch"], tail["outside"]) == ("0", "0", "1")
+    assert _verify_vps(newer, daily).returncode == 0
 
 
 def test_backup_unit_reads_an_optional_switch_file_and_never_turns_it_on():
