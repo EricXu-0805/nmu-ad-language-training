@@ -343,6 +343,37 @@ def test_sensitive_file_check_fails_when_the_root_cannot_be_listed(tmp_path):
     assert check.ok is False
 
 
+def _etc(tmp_path: Path) -> Path:
+    etc = tmp_path / "etc"
+    for name in ("cron.d", "cron.daily", "cron.hourly", "cron.weekly"):
+        (etc / name).mkdir(parents=True)
+    return etc
+
+
+def test_cron_without_nmu_entries_passes(tmp_path):
+    etc = _etc(tmp_path)
+    _touch(etc / "cron.d" / "e2scrub_all", 0o644)
+    _touch(etc / "cron.daily" / "logrotate", 0o755)
+
+    assert preflight.check_no_nmu_cron(etc).ok is True
+
+
+@pytest.mark.parametrize("directory", ["cron.d", "cron.daily", "cron.hourly", "cron.weekly"])
+def test_an_nmu_cron_entry_is_named(tmp_path, directory):
+    etc = _etc(tmp_path)
+    _touch(etc / directory / "nmu-backup", 0o755)
+
+    check = preflight.check_no_nmu_cron(etc)
+
+    assert check.ok is False
+    assert str(etc / directory / "nmu-backup") in check.detail
+    assert "nmu-backup.timer" in check.detail
+
+
+def test_absent_cron_directories_mean_no_leftovers(tmp_path):
+    assert preflight.check_no_nmu_cron(tmp_path / "etc").ok is True
+
+
 def test_skipped_groups_do_not_fail_the_run(capsys):
     code = preflight.main([])
 
@@ -390,6 +421,9 @@ def _make_all_automatic_groups_pass(monkeypatch) -> None:
         preflight, "check_sensitive_file_modes",
         lambda: preflight.Check("敏感文件不对 other 可读", True, "closed"))
     monkeypatch.setattr(
+        preflight, "check_no_nmu_cron",
+        lambda: preflight.Check("无 nmu-* cron 条目", True, "none"))
+    monkeypatch.setattr(
         preflight, "check_public_surface",
         lambda _url: [preflight.Check("公网表面", True, "closed")])
 
@@ -414,6 +448,7 @@ def test_os_flag_also_checks_that_the_timers_are_scheduled(monkeypatch, capsys):
     assert "[PASS] OS 安全补丁" in output
     assert "[FAIL] 定时器在排程" in output
     assert "[PASS] 敏感文件不对 other 可读" in output
+    assert "[PASS] 无 nmu-* cron 条目" in output
 
 
 @pytest.mark.parametrize("mode, expected", [(0o640, 1), (0o750, 0)])

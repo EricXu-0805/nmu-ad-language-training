@@ -10,7 +10,7 @@ D2 走查那天真正只能靠人的，是麦克风、噪声、断网和老人�
   备份     检查备份脚本可执行，并复用 backup_health_check 的新鲜度判据
   依赖     已安装依赖与带哈希锁是否一致
   操作系统 显式启用时核对安全更新和重启状态、nmu-*.timer 是否真排上了下一次、
-           /opt/nmu 下 tar 包/数据库/env 文件不对 other 可读
+           /opt/nmu 下 tar 包/数据库/env 文件不对 other 可读、cron 里没有 nmu-* 残留
   公网     /health 200、四条红线 404、五个安全头齐、受保护路由 401
 
 不打任何供应商的云 API：那要花钱、要把文本发出去，得由人明确发起。
@@ -48,6 +48,7 @@ REQUIRED_HEADERS = (
 )
 BACKUP_EXECUTABLES = ("scripts/vps-backup-daily.sh", "scripts/backup.sh")
 SENSITIVE_PATTERNS = ("*.tar.gz", "*.tgz", "*.db", ".env*", "*.env")
+CRON_DIRECTORIES = ("cron.d", "cron.daily", "cron.hourly", "cron.weekly")
 
 
 class Check:
@@ -304,6 +305,36 @@ def check_sensitive_file_modes(root: Path = Path("/opt/nmu")) -> Check:
     return Check(name, True, f"{root} 两层以内的 tar 包、.db 与 env 文件都不对 other 可读")
 
 
+def check_no_nmu_cron(etc: Path = Path("/etc")) -> Check:
+    """备份只有 nmu-backup.timer 一个入口，cron 里不许再有 nmu-* 条目。
+
+    cron 跑的那一份不带单元里的 PYTHON_BIN，失败了也不触发 OnFailure 告警。
+    """
+    name = "无 nmu-* cron 条目"
+    found: list[str] = []
+    unlisted: list[str] = []
+    for directory_name in CRON_DIRECTORIES:
+        directory = etc / directory_name
+        try:
+            entries = sorted(directory.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            unlisted.append(f"{directory}({error.strerror or error})")
+            continue
+        found.extend(str(entry) for entry in entries if entry.name.startswith("nmu-"))
+    problems = []
+    if found:
+        problems.append(
+            f"{len(found)} 个 cron 条目：{'、'.join(found)}；备份唯一入口是 nmu-backup.timer，"
+            "cron 那份不带 PYTHON_BIN、失败也不告警")
+    if unlisted:
+        problems.append(f"列不出 {'、'.join(unlisted)}，没查过的不当作通过")
+    if problems:
+        return Check(name, False, "；".join(problems))
+    return Check(name, True, "cron.d/daily/hourly/weekly 里没有 nmu-* 条目")
+
+
 def _default_fetch(url: str, timeout: float):
     context = ssl.create_default_context()
     request = urllib.request.Request(url, method="GET")
@@ -434,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
         checks.append(check_os_security())
         checks.append(check_timers_scheduled())
         checks.append(check_sensitive_file_modes())
+        checks.append(check_no_nmu_cron())
     else:
         checks.append(Check("OS 安全补丁", None, "未给 --os"))
     if args.base_url:
