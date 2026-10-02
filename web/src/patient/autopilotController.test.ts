@@ -4364,3 +4364,62 @@ test("开口打断只管同一题位那一次录音:下一句线索正常播完,
     { rawAudioId: "raw-controller-issued-0002", options: { afterVoiceInterruption: false } },
   ]);
 });
+
+// ---------------- 停播检测事实:两种终态回执都原样带上播放报告的那一份 ----------------
+for (const row of [
+  {
+    name: "自然播完",
+    ended: { media_duration_ms: 3_000 } as EndedFact,
+    facts: { barge_in_armed: true, barge_in_listened_ms: 1_850 },
+    expected: { ack_type: "tts_ended", media_ended: true, media_duration_ms: 3_000,
+      barge_in_armed: true, barge_in_listened_ms: 1_850 },
+  },
+  {
+    name: "点「现在回答」时检测还没开始听",
+    ended: { interrupted: true, media_duration_ms: 700 } as EndedFact,
+    facts: { barge_in_armed: false },
+    expected: { ack_type: "tts_interrupted", media_stopped: true, interrupt_reason: "answer_now",
+      media_duration_ms: 700, barge_in_armed: false },
+  },
+  {
+    name: "老人开口停播",
+    ended: { interrupted: true, media_duration_ms: 700, interrupt_reason: "voice_activity" } as EndedFact,
+    facts: { barge_in_armed: true, barge_in_listened_ms: 420 },
+    expected: { ack_type: "tts_interrupted", media_stopped: true, interrupt_reason: "voice_activity",
+      media_duration_ms: 700, barge_in_armed: true, barge_in_listened_ms: 420 },
+  },
+  {
+    name: "服务端没声明认这两键",
+    ended: { media_duration_ms: 3_000 } as EndedFact,
+    facts: {},
+    expected: { ack_type: "tts_ended", media_ended: true, media_duration_ms: 3_000 },
+  },
+]) {
+  test(`终态回执原样带上播放报告的停播检测事实,且在播放收口之后才取——${row.name}`, async () => {
+    const acks: AutopilotAck[] = [];
+    let closed = false;
+    const readAfterClose: boolean[] = [];
+    const controller = new PatientAutopilotController({
+      sessionId: "S-BARGE-IN-FACTS",
+      transport: transportQueue([questionCommand(), questionCommand("started"), recordCommand()], [], acks),
+      speech: { start: () => ({
+        started: Promise.resolve({ media_duration_ms: 3_000 }),
+        ended: Promise.resolve(row.ended),
+        closed: Promise.resolve().then(() => { closed = true; }),
+        bargeInFacts: () => { readAfterClose.push(closed); return row.facts; },
+        cancel: () => {},
+      }) },
+      recording: { start: () => { throw new Error("没有录音命令就不能开麦"); } },
+      idempotencyKey: fixedAckKey,
+    });
+    await controller.pollOnce();
+    const terminal = acks.find((ack) => ack.ack_type === row.expected.ack_type);
+    assert.ok(terminal, JSON.stringify(acks.map((ack) => ack.ack_type)));
+    const {
+      idempotency_key: _key, control_generation: _control, runner_generation: _runner,
+      command_revision: _revision, device_event_seq: _seq, ...facts
+    } = terminal;
+    assert.deepEqual(facts, row.expected);
+    assert.deepEqual(readAfterClose, [true], "播放收口之后取一次,检测已关、定值不再变");
+  });
+}

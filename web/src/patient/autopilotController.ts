@@ -8,6 +8,7 @@ import {
 import {
   buildAutopilotAck,
   type AutopilotAck,
+  type AutopilotBargeInFacts,
   type AutopilotErrorCode,
   type AutopilotFailureStage,
   type AutopilotMimeType,
@@ -45,6 +46,11 @@ export interface AutopilotSpeechPlayback {
   answerNow?(): boolean;
   /** Arm local-only detection only after the started revision is acknowledged. */
   armBargeIn?(command: TtsCommand): void;
+  /**
+   * 这句提问/提示里停播检测的事实,在 closed 之后、终态回执组装时取;服务端没声明
+   * 认这两键或不是提问/提示时为空对象。
+   */
+  bargeInFacts?(): AutopilotBargeInFacts;
   cancel(): void;
 }
 
@@ -1018,15 +1024,18 @@ export class PatientAutopilotController {
       await playback.closed;
       // A pause/withdrawal that wins after the click must never open a recorder.
       if (this.stopped || this.patientPauseRequested) return;
+      const bargeInFacts = playback.bargeInFacts?.() ?? {};
       const endedAck = await this.sendAck(startedCommand, observedEnd.value.interrupted
         ? {
             ack_type: "tts_interrupted", media_stopped: true,
             interrupt_reason: observedEnd.value.interrupt_reason ?? "answer_now",
             media_duration_ms: observedEnd.value.media_duration_ms ?? 0,
+            ...bargeInFacts,
           }
         : { ack_type: "tts_ended", media_ended: true,
             ...(observedEnd.value.media_duration_ms === undefined
-              ? {} : { media_duration_ms: observedEnd.value.media_duration_ms }) });
+              ? {} : { media_duration_ms: observedEnd.value.media_duration_ms }),
+            ...bargeInFacts });
       if (endedAck.ack_type === "tts_interrupted" && endedAck.interrupt_reason === "voice_activity") {
         this.voiceInterruptedPrompt = startedCommand;
       }

@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { DeviceCredentialSelection } from "../api.ts";
+import type { BargeInExposure } from "./autopilotBrowserBargeIn.ts";
 import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import { PatientAutopilotController } from "./autopilotController.ts";
+import { fetchAutopilotVoiceSettings } from "./autopilotMediaTransport.ts";
 import { AutopilotPageLifecycle } from "./autopilotPageLifecycle.ts";
-import type { NextCommandProjection } from "./autopilotProtocol.ts";
+import type {
+  AutopilotAck,
+  AutopilotOptionalAckFact,
+  NextCommandProjection,
+} from "./autopilotProtocol.ts";
 import {
   BrowserAutopilotSpeechExecutor,
   type AutopilotSpeechBrowserPorts,
 } from "./autopilotSpeechExecutor.ts";
+import { AutopilotVoiceSettingsCache } from "./autopilotVoiceSettings.ts";
 
 type TtsCommand = Extract<NextCommandProjection, { kind: "tts" }>;
 
@@ -458,3 +466,218 @@ test("不是手势问题的 play() 拒绝(NotSupportedError 等)仍直接 play_r
   assert.deepEqual(run.announced, []);
   assert.equal(run.waiting(), false);
 });
+
+// ── 停播检测两个事实:播放收口那一刻定值,回执组装那一刻才问服务端认不认 ──────────
+function bargeInHarness(options: {
+  purpose?: "question" | "cue" | "feedback";
+  exposure?: BargeInExposure;
+  accepts?: (name: AutopilotOptionalAckFact) => boolean;
+} = {}) {
+  const audio = new AudioDouble();
+  const monitors: Array<{ closes: number; reads: number; onConfirmed(): boolean }> = [];
+  const base = question();
+  const command: TtsCommand = options.purpose === "feedback"
+    ? { ...base, payload: { speech_key: "wk2.01.feedback", speech_text: "说得很好。", purpose: "feedback" } }
+    : options.purpose === "cue"
+      ? { ...base, prompt_level: 2, attempt_seq: 3,
+        payload: { speech_key: "wk2.01.cue2", speech_text: "它是橙色的。", purpose: "cue" } }
+      : base;
+  const ports: AutopilotSpeechBrowserPorts = {
+    enabled: () => true,
+    stopSpeaking: () => {},
+    fetchTts: () => Promise.resolve(new Blob(["tts"], { type: "audio/wav" })),
+    createAudio: () => audio as unknown as HTMLAudioElement,
+    createObjectUrl: () => "blob:test-1",
+    revokeObjectUrl: () => {},
+    now: () => 100,
+    startBargeIn: (input) => {
+      const monitor = { closes: 0, reads: 0, onConfirmed: input.onConfirmed };
+      monitors.push(monitor);
+      return {
+        close: () => { monitor.closes += 1; },
+        closed: Promise.resolve(),
+        exposure: () => {
+          monitor.reads += 1;
+          return options.exposure ?? { armed: true, listenedMs: 900 };
+        },
+      };
+    },
+    acceptsAckFact: options.accepts ?? (() => true),
+  };
+  const executor = new BrowserAutopilotSpeechExecutor("S-SPEECH", ports);
+  return {
+    audio,
+    monitors,
+    command,
+    start: () => executor.start(command),
+    started: (): TtsCommand => ({ ...command, state: "started", command_revision: 1 }),
+  };
+}
+
+async function playedOut(run: ReturnType<typeof bargeInHarness>, arm = true) {
+  const playback = run.start();
+  await flush();
+  run.audio.playing();
+  await playback.started;
+  if (arm) playback.armBargeIn?.(run.started());
+  run.audio.ended();
+  await playback.closed;
+  return playback;
+}
+
+test("停播检测事实取自收口时那一份定值;服务端两键都认才两键都报", async () => {
+  const run = bargeInHarness();
+  const playback = await playedOut(run);
+  assert.deepEqual(playback.bargeInFacts?.(), { barge_in_armed: true, barge_in_listened_ms: 900 });
+  assert.deepEqual(playback.bargeInFacts?.(), { barge_in_armed: true, barge_in_listened_ms: 900 });
+  assert.equal(run.monitors.length, 1);
+  assert.deepEqual([run.monitors[0].closes, run.monitors[0].reads], [1, 1], "关检测后只读一次");
+});
+
+test("服务端没声明认这两键:空对象,回执一个键都不带", async () => {
+  const run = bargeInHarness({ accepts: () => false });
+  const playback = await playedOut(run);
+  assert.deepEqual(playback.bargeInFacts?.(), {});
+});
+
+test("只声明认 barge_in_armed:只报 armed,不报监听毫秒", async () => {
+  const run = bargeInHarness({ accepts: (name) => name === "barge_in_armed" });
+  const playback = await playedOut(run);
+  assert.deepEqual(playback.bargeInFacts?.(), { barge_in_armed: true });
+});
+
+test("检测没走出校准、或这句播完时根本没武装:armed=false,不报监听毫秒", async () => {
+  const unarmed = bargeInHarness({ exposure: { armed: false, listenedMs: null } });
+  assert.deepEqual((await playedOut(unarmed)).bargeInFacts?.(), { barge_in_armed: false });
+  const neverStarted = bargeInHarness();
+  assert.deepEqual((await playedOut(neverStarted, false)).bargeInFacts?.(), { barge_in_armed: false });
+  assert.equal(neverStarted.monitors.length, 0);
+});
+
+test("反馈句不是提问/提示:不开检测,也不报这两个事实", async () => {
+  const run = bargeInHarness({ purpose: "feedback" });
+  const playback = await playedOut(run);
+  assert.equal(run.monitors.length, 0);
+  assert.deepEqual(playback.bargeInFacts?.(), {});
+});
+
+test("线索被老人开口停播、或点「现在回答」:同样带检测事实", async () => {
+  const voice = bargeInHarness({ purpose: "cue", exposure: { armed: true, listenedMs: 420 } });
+  const stopped = voice.start();
+  await flush();
+  voice.audio.playing();
+  await stopped.started;
+  stopped.armBargeIn?.(voice.started());
+  voice.audio.currentTime = 1.2;
+  assert.equal(voice.monitors[0].onConfirmed(), true);
+  await stopped.closed;
+  assert.deepEqual(await stopped.ended,
+    { interrupted: true, media_duration_ms: 1_200, interrupt_reason: "voice_activity" });
+  assert.deepEqual(stopped.bargeInFacts?.(), { barge_in_armed: true, barge_in_listened_ms: 420 });
+
+  const button = bargeInHarness({ exposure: { armed: false, listenedMs: null } });
+  const answered = button.start();
+  await flush();
+  button.audio.playing();
+  await answered.started;
+  answered.armBargeIn?.(button.started());
+  assert.equal(answered.answerNow?.(), true);
+  await answered.closed;
+  assert.deepEqual(answered.bargeInFacts?.(), { barge_in_armed: false });
+});
+
+test("服务端认不认在回执组装那一刻才问:开播时还没读到设置,收口后读到了照样报", async () => {
+  let accepted = false;
+  const run = bargeInHarness({ accepts: () => accepted });
+  const playback = await playedOut(run);
+  assert.deepEqual(playback.bargeInFacts?.(), {});
+  accepted = true;
+  assert.deepEqual(playback.bargeInFacts?.(), { barge_in_armed: true, barge_in_listened_ms: 900 });
+});
+
+const VOICE_CREDENTIAL: DeviceCredentialSelection = {
+  source: "active",
+  record: { capability: "x".repeat(43), sessionId: "S-SPEECH", expiresAt: "2026-07-19T12:00:00Z" },
+  headers: { "X-Device-Capability": "x".repeat(43) },
+};
+
+for (const row of [
+  {
+    name: "四键(不认 ?ack_facts 的服务端,如回滚后的 af59c28):检测武装了也一个键都不发",
+    body: { vad_enabled: true, vad_trailing_silence_ms: 3_000, vad_short_trailing_silence_ms: 4_500,
+      barge_in_enabled: true },
+    expected: {},
+  },
+  {
+    name: "五键声明两个事实:tts_ended 带上检测事实",
+    body: { vad_enabled: true, vad_trailing_silence_ms: 3_000, vad_short_trailing_silence_ms: 4_500,
+      barge_in_enabled: true, ack_facts: ["barge_in_armed", "barge_in_listened_ms"] },
+    expected: { barge_in_armed: true, barge_in_listened_ms: 900 },
+  },
+]) {
+  test(`语音设置读面 → 缓存 → 执行器 → 回执:${row.name}`, async () => {
+    const requested: string[] = [];
+    const settings = new AutopilotVoiceSettingsCache("S-SPEECH", {
+      fetch: (sessionId, signal) => fetchAutopilotVoiceSettings(sessionId, signal, {
+        fetchImpl: async (input) => { requested.push(String(input)); return Response.json(row.body); },
+        selectCredential: () => VOICE_CREDENTIAL,
+        handleAuthorizationFailure: () => false,
+        csrf: () => ({}),
+        nextCommand: async () => null,
+      }),
+      now: () => 0,
+    });
+    settings.refreshInBackground();
+    for (let turn = 0; turn < 4; turn += 1) await flush();
+    assert.deepEqual(requested, ["/sessions/S-SPEECH/autopilot/voice-settings?ack_facts=1"]);
+
+    const audio = new AudioDouble();
+    const executor = new BrowserAutopilotSpeechExecutor("S-SPEECH", {
+      enabled: () => true,
+      stopSpeaking: () => {},
+      fetchTts: () => Promise.resolve(new Blob(["tts"], { type: "audio/wav" })),
+      createAudio: () => audio as unknown as HTMLAudioElement,
+      createObjectUrl: () => "blob:test-1",
+      revokeObjectUrl: () => {},
+      now: () => 100,
+      startBargeIn: () => ({
+        close: () => {}, closed: Promise.resolve(),
+        exposure: () => ({ armed: true, listenedMs: 900 }),
+      }),
+      acceptsAckFact: (name) => settings.acceptsAckFact(name),
+    });
+    const acks: AutopilotAck[] = [];
+    let command: NextCommandProjection = question();
+    const controller = new PatientAutopilotController({
+      sessionId: "S-SPEECH",
+      speech: executor,
+      recording: { start: () => { throw new Error("不应开麦"); } },
+      transport: {
+        next: async () => command,
+        ack: async (_sessionId, _commandKey, ack) => {
+          acks.push(ack);
+          if (ack.ack_type === "tts_started") command = { ...command, state: "started", command_revision: 1 };
+          return { accepted: true };
+        },
+      },
+      idempotencyKey: (_command, type, seq) => `speech-barge-facts:${type}:${seq}:0001`,
+    });
+    const running = controller.pollOnce();
+    await flush();
+    audio.playing();
+    for (let turn = 0; turn < 8; turn += 1) await flush();
+    audio.ended();
+    await running;
+    const ended = acks.find((ack) => ack.ack_type === "tts_ended");
+    assert.ok(ended, JSON.stringify(acks.map((ack) => ack.ack_type)));
+    const { barge_in_armed: armed, barge_in_listened_ms: listened } = ended as Record<string, unknown>;
+    assert.deepEqual(Object.fromEntries(Object.entries({
+      barge_in_armed: armed, barge_in_listened_ms: listened,
+    }).filter(([, value]) => value !== undefined)), row.expected);
+    if (Object.keys(row.expected).length === 0) {
+      assert.equal(Object.hasOwn(ended, "barge_in_armed"), false);
+      assert.equal(Object.hasOwn(ended, "barge_in_listened_ms"), false);
+    }
+    settings.dispose();
+  });
+}

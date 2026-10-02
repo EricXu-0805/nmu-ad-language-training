@@ -611,6 +611,7 @@ export function usePatientAutopilot(input: {
         speech: new BrowserAutopilotSpeechExecutor(
           input.sessionId as string, {
             ...browserAutopilotSpeechPorts,
+            acceptsAckFact: (name) => voiceSettings.acceptsAckFact(name),
             observeBargeIn: (observation) => {
               if (cancelled || lifecycleRef.current?.aborted) return;
               setBargeIn((before) => {
