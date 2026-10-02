@@ -119,6 +119,7 @@ def _logged_in_client(eng, username: str) -> TestClient:
      access_policy.AccessKind.DEVICE, None),
     ("GET", "/sessions/S/patient-presentation", access_policy.AccessKind.DEVICE, None),
     ("GET", "/sessions/S/autopilot/next", access_policy.AccessKind.DEVICE, None),
+    ("GET", "/sessions/S/autopilot/voice-settings", access_policy.AccessKind.DEVICE, None),
     ("GET", "/sessions/S/autopilot/drain-target",
      access_policy.AccessKind.DEVICE, None),
     ("POST", "/sessions/S/autopilot/commands/C/tts",

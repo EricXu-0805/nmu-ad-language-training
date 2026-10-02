@@ -10664,6 +10664,34 @@ def autopilot_next(
     return result
 
 
+@app.get(
+    "/sessions/{session_id}/autopilot/voice-settings",
+    response_model=autopilot_service.VoiceSettingsProjection,
+)
+def autopilot_voice_settings(
+        session_id: str, request: Request,
+        s: DBSession = Depends(get_session)):
+    """部署声音开关的设备只读面:围栏与 /autopilot/next 相同,账号永远拿不到。"""
+    token_hash = _require_device_capability_token_hash(request, "读取平板声音设置")
+    _require_capability_bound_session(request, session_id, "读取平板声音设置")
+    with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
+        s.rollback()
+        s.expire_all()
+        live = _live_row_for_update(s)
+        _require_capability_bound_session(request, session_id, "读取平板声音设置")
+        # 与 next 同一次锁内复核、同一组 401 码。这里没有已落库的终态要收口,
+        # 所以过期/仅恢复也直接拒,不进 next 的终态暂停分支。
+        status, _capability = device_capability.revalidate_active_for_write(
+            s, token_hash, session_id)
+        if status is not device_capability.CapabilityResolution.VALID:
+            s.rollback()
+            raise _capability_error(status)
+        _require_started_visit_plan_session(session_id, s)
+        _require_capability_current_live(
+            request, s, "读取平板声音设置", live_row=live)
+    return autopilot_service.voice_settings()
+
+
 @app.post(
     "/sessions/{session_id}/autopilot/commands/{command_key}/acks",
     response_model=autopilot_service.ApplyDeviceAckResult,

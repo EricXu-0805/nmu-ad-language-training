@@ -890,7 +890,8 @@ REPEAT_DIGEST = repeat_intent.ACTIVE_REPEAT_INTENT_DEFINITION_DIGEST
 _T0 = datetime(2026, 1, 1, 8, 0, 0)
 
 
-def _seed_repeat_capture(s, *, raw_audio_id="a_repeat"):
+def _seed_repeat_capture(s, *, raw_audio_id="a_repeat",
+                         stopped_payload_json='{"stop_reason":"max_duration"}'):
     """Build one genuine, fully valid repeat chain — no CHECK is bypassed."""
     path, checksum = audio_store.save_blob(raw_audio_id, b"repeat-voice", "audio/wav")
     s.add(AudioAssetRow(
@@ -978,7 +979,7 @@ def _seed_repeat_capture(s, *, raw_audio_id="a_repeat"):
         session_id="S9", ack_type="record_stopped", command_revision=0,
         control_generation=1, runner_generation=1, device_event_seq=2,
         device_id_hash="d" * 64, capability_token_hash="t" * 64,
-        payload_json='{"stop_reason":"max_duration"}',
+        payload_json=stopped_payload_json,
         receipt_server_seq=receipt.server_seq, raw_audio_id=raw_audio_id,
         checksum=checksum, byte_count=len(b"repeat-voice"),
         duration_seconds=1.5, received_at=_T0 + timedelta(seconds=19)))
@@ -1076,6 +1077,38 @@ def test_repeat_capture_exports_as_metadata_only_with_exactly_four_columns(
         blob = path.read_bytes()
         for needle in forbidden:
             assert needle.encode("utf-8") not in blob, (path.name, needle)
+
+
+@pytest.mark.parametrize("stopped_payload_json", [
+    '{"stop_reason":"max_duration","vad_armed":false}',
+    '{"stop_reason":"max_duration","vad_armed":true}',
+    '{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":1830}',
+])
+def test_repeat_capture_with_vad_facts_exports_like_the_historical_shape(
+        db, tmp_path, stopped_payload_json):
+    _seed(db)
+    _seed_repeat_capture(db, stopped_payload_json=stopped_payload_json)
+    result = _export_bundle(db, "S9", write_dir=tmp_path)
+    rows = result["sheets"]["repeat_audio_manifest"]
+    assert [(row["capture_kind"], row["repeat_ordinal"], row["outcome"]) for row in rows] == [
+        ("explicit_repeat", 1, "replayed")]
+
+
+@pytest.mark.parametrize("stopped_payload_json", [
+    '{"stop_reason":"max_duration","vad_voiced_ms":1830}',
+    '{"stop_reason":"max_duration","vad_armed":false,"vad_voiced_ms":1830}',
+    '{"stop_reason":"max_duration","vad_armed":"true"}',
+    '{"stop_reason":"max_duration","vad_armed":true,"vad_voiced_ms":1830.0}',
+])
+def test_repeat_capture_with_contradictory_vad_facts_refuses_the_whole_export(
+        db, tmp_path, stopped_payload_json):
+    _seed(db)
+    _seed_repeat_capture(db, stopped_payload_json=stopped_payload_json)
+    before = _snapshot_export_state(db, tmp_path)
+    with pytest.raises(ValueError, match="重复请求证据链不成立"):
+        _export_bundle(db, "S9", write_dir=tmp_path)
+    db.rollback()
+    assert _snapshot_export_state(db, tmp_path) == before
 
 
 def _snapshot_export_state(db, tmp_path) -> tuple:

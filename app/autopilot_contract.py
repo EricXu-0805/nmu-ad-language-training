@@ -45,6 +45,8 @@ _ACK_FAILURE_STAGES = frozenset({
     "executor_start_failed",
 })
 
+VAD_VOICED_MS_MAX = 600_000
+
 
 class TtsCommandPayload(BaseModel):
     """由服务端从冻结计划/协议生成；设备不能回填自由话术。"""
@@ -157,6 +159,12 @@ class AutopilotAckIn(BaseModel):
     stop_reason: Literal[
         "silence", "user_done", "max_duration", "stream_end",
     ] | None = None
+    # 平板尾静默检测的诊断事实,只随 record_stopped 可选上报,不参与任何路由与判分:
+    # vad_armed = 这段录音里采样器是否真在跑;vad_voiced_ms = 判定器累计的有声毫秒,
+    # 只能随 vad_armed=true。严格类型:1/"true" 冒充不了布尔,true/1.0 冒充不了整数。
+    vad_armed: bool | None = Field(default=None, strict=True)
+    vad_voiced_ms: int | None = Field(
+        default=None, strict=True, ge=0, le=VAD_VOICED_MS_MAX)
     raw_audio_id: str | None = Field(
         default=None, min_length=1, max_length=160,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$",
@@ -200,6 +208,11 @@ class AutopilotAckIn(BaseModel):
                 raise ValueError("成功收麦回执不得携带 error_code")
         elif any(value is not None for value in receipt_fields):
             raise ValueError("只有 record_stopped 可以携带录音收据字段")
+        if self.ack_type != "record_stopped" and (
+                self.vad_armed is not None or self.vad_voiced_ms is not None):
+            raise ValueError("只有 record_stopped 可以携带 VAD 事实")
+        if self.vad_voiced_ms is not None and self.vad_armed is not True:
+            raise ValueError("vad_voiced_ms 只能随 vad_armed=true 上报")
 
         failed = self.ack_type in {"tts_failed", "record_failed"}
         if failed != (self.error_code is not None):
@@ -278,7 +291,12 @@ class AutopilotAckIn(BaseModel):
                 payload["channels"] = self.channels
             return payload
         assert self.stop_reason is not None
-        return {"stop_reason": self.stop_reason}
+        stopped: dict[str, bool | int | str] = {"stop_reason": self.stop_reason}
+        if self.vad_armed is not None:
+            stopped["vad_armed"] = self.vad_armed
+        if self.vad_voiced_ms is not None:
+            stopped["vad_voiced_ms"] = self.vad_voiced_ms
+        return stopped
 
 
 @dataclass(frozen=True)

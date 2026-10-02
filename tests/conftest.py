@@ -1,6 +1,7 @@
 import pytest
 
-from app import audio_store, auth, cloud_processing, export, export_security, resource_limits
+from app import (audio_store, auth, autopilot_service, cloud_processing, export,
+                 export_security, resource_limits)
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +19,15 @@ def _no_cloud_key(monkeypatch):
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.delenv(cloud_processing.PROVIDER_ID_ENV, raising=False)
     monkeypatch.delenv(cloud_processing.NOTICE_VERSION_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _default_voice_switches(monkeypatch):
+    # 平板语音开关与窗口都有默认;机器上设过的值不能渗进测试、悄悄改掉默认路径。
+    for name in (autopilot_service.VOICE_BARGE_IN_ENV, autopilot_service.VAD_ENV,
+                 autopilot_service.VAD_TRAILING_MS_ENV,
+                 autopilot_service.VAD_SHORT_TRAILING_MS_ENV):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

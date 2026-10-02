@@ -7,11 +7,13 @@ from sqlmodel import Session, select
 
 from app import asr, export
 from app.main import _run_p0a_attempt_worker
-from app.models import (AttemptEvent, AudioAssetRow, Patient,
+from app.models import (AttemptEvent, AuditLog, AudioAssetRow, Patient,
                         PatientDeviceCapability, RuntimeCommand,
-                        RuntimeCommandAck, SessionRuntimeState)
+                        RuntimeCommandAck, SessionAutopilotState,
+                        SessionRuntimeState)
 from test_autopilot_api import (  # noqa: F401
-    PATIENT_ID, SESSION_ID, _device_next, _enable_p0a, _start, api_clients,
+    OTHER_SESSION_ID, PATIENT_ID, SESSION_ID, _device_next, _enable_p0a, _start,
+    api_clients,
 )
 from test_autopilot_answer_now import _post
 from test_autopilot_repeat import _complete_record, _RepeatAsr
@@ -126,3 +128,78 @@ def test_voice_interruption_preserves_score_review_and_distinct_export(api_clien
     started = _post(api_clients, feedback, "tts_started", 4)
     assert started.status_code == 200, started.text
     assert _authorization(api_clients, started.json()["command"]).status_code == 409
+
+
+BARGE_IN_ENV = "NMU_AUTOPILOT_VOICE_BARGE_IN"
+
+
+def _ledger(engine) -> dict:
+    with Session(engine) as db:
+        return {
+            "state": db.get(SessionAutopilotState, SESSION_ID).model_dump(),
+            "runtime": db.get(SessionRuntimeState, SESSION_ID).model_dump(),
+            "commands": [row.model_dump() for row in db.exec(
+                select(RuntimeCommand).order_by(RuntimeCommand.id))],
+            "acks": [row.model_dump() for row in db.exec(
+                select(RuntimeCommandAck).order_by(RuntimeCommandAck.id))],
+            "devices": [row.model_dump() for row in db.exec(select(PatientDeviceCapability))],
+            "audio": [row.model_dump() for row in db.exec(select(AudioAssetRow))],
+            "audit": [row.model_dump() for row in db.exec(select(AuditLog).order_by(AuditLog.id))],
+        }
+
+
+@pytest.mark.parametrize("value", [None, "", "1", "true", "on", "yes", "enabled"])
+def test_barge_in_switch_defaults_on(api_clients, monkeypatch, value):
+    command = _started(api_clients, monkeypatch)
+    if value is None:
+        monkeypatch.delenv(BARGE_IN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(BARGE_IN_ENV, value)
+    result = _authorization(api_clients, command)
+    assert result.status_code == 200, result.text
+    assert result.json()["barge_in_authorized"] is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "off", "no", "FALSE", " Off ", "No"])
+def test_disabled_barge_in_refuses_with_its_own_code_and_writes_nothing(
+        api_clients, monkeypatch, value):
+    command = _started(api_clients, monkeypatch)
+    stale = _authorization(api_clients, command, command_revision=command["command_revision"] + 1)
+    assert stale.status_code == 409
+    monkeypatch.setenv(BARGE_IN_ENV, value)
+    before = _ledger(api_clients.engine)
+    result = _authorization(api_clients, command)
+    assert result.status_code == 409, result.text
+    assert result.json()["detail"]["code"] == "autopilot_barge_in_disabled"
+    # 与其它自动驾驶 409 同一个信封:平板按既有「不可用」路径处理,不需要认新形状。
+    assert set(result.json()) == set(stale.json()) == {"detail"}
+    assert set(result.json()["detail"]) == set(stale.json()["detail"]) == {"code", "message"}
+    assert _ledger(api_clients.engine) == before
+    # 开关按请求读、不在导入时缓存:同一进程里撤掉立刻恢复放行。
+    monkeypatch.delenv(BARGE_IN_ENV)
+    assert _authorization(api_clients, command).status_code == 200
+
+
+def test_disabled_barge_in_is_checked_only_after_every_existing_fence(api_clients, monkeypatch):
+    command = _started(api_clients, monkeypatch)
+    monkeypatch.setenv(BARGE_IN_ENV, "0")
+    stale = _authorization(api_clients, command, runner_generation=command["runner_generation"] + 1)
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "autopilot_command_not_current"
+    body = {key: command[key] for key in (
+        "command_revision", "control_generation", "runner_generation")}
+    path = f"/autopilot/commands/{command['command_key']}/barge-in-authorization"
+    account = api_clients.account.post(f"/sessions/{SESSION_ID}{path}", json=body)
+    assert account.status_code == 403
+    assert account.json()["detail"]["code"] == "device_capability_required"
+    assert api_clients.anonymous.post(f"/sessions/{SESSION_ID}{path}", json=body).status_code == 401
+    foreign = api_clients.device.post(
+        f"/sessions/{OTHER_SESSION_ID}{path}", headers=api_clients.device_headers, json=body)
+    assert foreign.status_code == 409
+    assert foreign.json()["detail"]["code"] == "device_session_mismatch"
+    with Session(api_clients.engine) as db:
+        db.get(Patient, PATIENT_ID).consent_status = "withdrawn"
+        db.commit()
+    withdrawn = _authorization(api_clients, command)
+    assert withdrawn.status_code == 409
+    assert withdrawn.json()["detail"]["code"] != "autopilot_barge_in_disabled"

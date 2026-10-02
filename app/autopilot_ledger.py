@@ -18,7 +18,11 @@ from typing import Any, Literal
 from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
-from .autopilot_contract import RecordCommandPayload, TtsCommandPayload
+from .autopilot_contract import (
+    VAD_VOICED_MS_MAX,
+    RecordCommandPayload,
+    TtsCommandPayload,
+)
 from .enums import AudioStatus
 from .models import (
     AudioAssetRow,
@@ -565,13 +569,39 @@ ACK_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "tts_interrupted": frozenset({"media_stopped", "interrupt_reason", "media_duration_ms"}),
     "tts_failed": frozenset({"error_code", "failure_stage"}),
     "record_started": frozenset({"mime_type", "sample_rate_hz", "channels"}),
-    "record_stopped": frozenset({"stop_reason"}),
+    "record_stopped": frozenset({"stop_reason", "vad_armed", "vad_voiced_ms"}),
     "record_failed": frozenset({"error_code", "failure_stage"}),
 }
 
 RECORD_STOP_REASONS = frozenset({
     "silence", "user_done", "max_duration", "stream_end",
 })
+
+
+def record_stopped_payload_is_valid(payload: object) -> bool:
+    """record_stopped 是唯一不按精确键集复核的回执。
+
+    旧平板只发 {"stop_reason"},新平板可选再带 VAD 两个事实,所以这里只要求
+    必需键在、出现的键都在白名单、类型与值域合法;其余回执类型仍是精确键集。
+    编码器只拒未知键,证明不了类型,故逐键按契约同一口径复核。
+    """
+    if not isinstance(payload, dict):
+        return False
+    if ("stop_reason" not in payload
+            or not set(payload) <= ACK_PAYLOAD_KEYS["record_stopped"]):
+        return False
+    stop_reason = payload["stop_reason"]
+    if not isinstance(stop_reason, str) or stop_reason not in RECORD_STOP_REASONS:
+        return False
+    if "vad_armed" in payload and type(payload["vad_armed"]) is not bool:
+        return False
+    if "vad_voiced_ms" in payload:
+        voiced = payload["vad_voiced_ms"]
+        if (payload.get("vad_armed") is not True or type(voiced) is not int
+                or not 0 <= voiced <= VAD_VOICED_MS_MAX):
+            return False
+    return True
+
 
 CONTROL_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "start": frozenset({"source"}),
@@ -1090,8 +1120,7 @@ def verify_immutable_record_capture(
         raise AutopilotProofError("record command has no stopped ACK")
     try:
         payload = json.loads(ack.payload_json)
-        if (not isinstance(payload, dict)
-                or payload.get("stop_reason") not in RECORD_STOP_REASONS
+        if (not record_stopped_payload_is_valid(payload)
                 or encode_ack_payload("record_stopped", payload) != ack.payload_json):
             raise ValueError("invalid or non-canonical record_stopped payload")
     except (TypeError, ValueError, json.JSONDecodeError) as exc:

@@ -101,6 +101,8 @@ _ROUTE_RULES = (
            label="读取当前老人端呈现文本"),
     _route({"GET", "HEAD"}, r"/sessions/[^/]+/autopilot/next", AccessKind.DEVICE,
            label="读取当前自动驾驶命令"),
+    _route({"GET", "HEAD"}, r"/sessions/[^/]+/autopilot/voice-settings", AccessKind.DEVICE,
+           label="读取自动驾驶平板声音设置"),
     _route({"GET", "HEAD"}, r"/sessions/[^/]+/autopilot/drain-target",
            AccessKind.DEVICE, label="恢复当前自动驾驶收麦目标"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/commands/[^/]+/tts",
