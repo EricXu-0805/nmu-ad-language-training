@@ -7,6 +7,7 @@ import {
   acknowledgeExactAutopilotDrain,
   authorizeExactAutopilotRecording,
   authorizeExactAutopilotBargeIn,
+  fetchAutopilotVoiceSettings,
   fetchExactAutopilotDrainTarget,
   fetchExactAutopilotTts,
   type AutopilotMediaTransportDependencies,
@@ -266,6 +267,84 @@ test("paused refresh recovers only the exact opaque drain target", async () => {
   }), { status: 200 }));
   await assert.rejects(() => fetchExactAutopilotDrainTarget(
     "S/ONE", new AbortController().signal, extra.deps), /封闭契约/);
+});
+
+const VOICE_SETTINGS = {
+  vad_enabled: true,
+  vad_trailing_silence_ms: 3_000,
+  vad_short_trailing_silence_ms: 4_500,
+  barge_in_enabled: true,
+};
+
+test("语音设置读面:设备凭据 GET、无正文、不带 cookie,恰好四个键", async () => {
+  let observed: { url: string; init: RequestInit } | null = null;
+  const tuned = { ...VOICE_SETTINGS, vad_trailing_silence_ms: 5_000, vad_short_trailing_silence_ms: 6_000 };
+  const { deps } = dependencies(async (input, init = {}) => {
+    observed = { url: String(input), init };
+    return Response.json(tuned);
+  });
+  const settings = await fetchAutopilotVoiceSettings("S/ONE", new AbortController().signal, deps);
+  assert.deepEqual(settings, tuned);
+  assert.ok(observed);
+  assert.equal(observed.url, "/sessions/S%2FONE/autopilot/voice-settings");
+  assert.equal(observed.init.method, "GET");
+  assert.equal(observed.init.credentials, "omit");
+  assert.equal(observed.init.cache, "no-store");
+  assert.equal(Object.hasOwn(observed.init, "body"), false);
+  // 与收麦目标读面同一口径:只读的 GET 只带设备凭据,不带 CSRF。
+  assert.deepEqual(observed.init.headers, { "X-Device-Capability": "x".repeat(43) });
+});
+
+test("语音设置严格解析:多键、缺键、类型或范围不对一律拒绝(调用方据此关掉 VAD)", async () => {
+  const { barge_in_enabled: _barge, ...threeKeys } = VOICE_SETTINGS;
+  for (const body of [
+    { ...VOICE_SETTINGS, vad_min_voiced_ms: 450 },
+    threeKeys,
+    { ...VOICE_SETTINGS, vad_enabled: "true" },
+    { ...VOICE_SETTINGS, barge_in_enabled: 1 },
+    { ...VOICE_SETTINGS, vad_trailing_silence_ms: 1_499 },
+    { ...VOICE_SETTINGS, vad_trailing_silence_ms: 8_001 },
+    { ...VOICE_SETTINGS, vad_trailing_silence_ms: 3_000.5 },
+    // 短话窗口不得比整句窗口短,也不得超过 10 s。
+    { ...VOICE_SETTINGS, vad_trailing_silence_ms: 5_000, vad_short_trailing_silence_ms: 4_999 },
+    { ...VOICE_SETTINGS, vad_short_trailing_silence_ms: 10_001 },
+    { ...VOICE_SETTINGS, vad_short_trailing_silence_ms: "4500" },
+    null,
+    [VOICE_SETTINGS],
+  ]) {
+    await assert.rejects(fetchAutopilotVoiceSettings("S/ONE", new AbortController().signal,
+      dependencies(async () => Response.json(body)).deps), JSON.stringify(body));
+  }
+  // 边界值本身合法:整句 1500/8000、短话等于整句或 10000。
+  for (const body of [
+    { ...VOICE_SETTINGS, vad_trailing_silence_ms: 1_500, vad_short_trailing_silence_ms: 1_500 },
+    { ...VOICE_SETTINGS, vad_trailing_silence_ms: 8_000, vad_short_trailing_silence_ms: 10_000 },
+    { ...VOICE_SETTINGS, vad_enabled: false, barge_in_enabled: false },
+  ]) {
+    assert.deepEqual(await fetchAutopilotVoiceSettings("S/ONE", new AbortController().signal,
+      dependencies(async () => Response.json(body)).deps), body);
+  }
+});
+
+test("语音设置读面失败:非 2xx 走设备凭据失效处理后拒绝;没有当前场次凭据就不发请求;悬挂请求有期限", async () => {
+  const { deps, authFailures } = dependencies(async () => new Response(JSON.stringify({
+    detail: { code: "device_capability_revoked", message: "revoked" },
+  }), { status: 401, headers: { "Content-Type": "application/json" } }));
+  await assert.rejects(fetchAutopilotVoiceSettings("S/ONE", new AbortController().signal, deps),
+    (error: unknown) => error instanceof ApiError && error.status === 401);
+  assert.deepEqual(authFailures, [401]);
+
+  let calls = 0;
+  const foreign = dependencies(async () => { calls += 1; return Response.json(VOICE_SETTINGS); }).deps;
+  foreign.selectCredential = () => ({ ...credential, record: { ...credential.record!, sessionId: "S/TWO" } });
+  await assert.rejects(fetchAutopilotVoiceSettings("S/ONE", new AbortController().signal, foreign),
+    (error: unknown) => error instanceof ApiError && error.status === 401);
+  assert.equal(calls, 0);
+
+  const hanging = dependencies(() => new Promise<Response>(() => undefined)).deps;
+  hanging.requestTimeoutMs = 5;
+  await assert.rejects(fetchAutopilotVoiceSettings("S/ONE", new AbortController().signal, hanging),
+    (error: unknown) => error instanceof ApiError && error.status === 408);
 });
 
 test("a never-returning drain request reaches a finite fail-closed deadline", async () => {
