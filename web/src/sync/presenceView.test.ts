@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { presenceViewFrom, relativeSeen } from "./presenceView.ts";
 
@@ -86,4 +87,38 @@ test("D4②:presence 视图带原始 screen 事实——只在在线态断言,�
   assert.equal(presenceViewFrom({
     sessionId: "S1", checking: true, unsupported: false, unavailable: false, presence: null,
   }).screen, null);
+});
+
+test("老人端页面旧版本:只在在线且服务端判 stale 时提醒", () => {
+  const seen = new Date(NOW - 2_000).toISOString();
+  const view = (online: boolean, pageBuild?: string) => presenceViewFrom({
+    sessionId: "S1", checking: false, unsupported: false, unavailable: false, now: NOW,
+    presence: { session_id: "S1", screen: "waiting", online, last_seen_at: seen,
+      ...(pageBuild === undefined ? {} : { page_build: pageBuild }) },
+  });
+  assert.equal(view(true, "stale").pageStale, true);
+  // 断开后谁也不知道屏上跑的是哪一版:不提醒。
+  assert.equal(view(false, "stale").pageStale, false);
+  // 旧后端没有这个字段、服务端下不了结论或给了不认识的值:不提醒。
+  assert.equal(view(true).pageStale, false);
+  for (const pageBuild of ["current", "unknown", "future_value"]) {
+    assert.equal(view(true, pageBuild).pageStale, false, pageBuild);
+  }
+  for (const flags of [{ checking: true }, { unsupported: true }, { unavailable: true }]) {
+    assert.equal(presenceViewFrom({
+      sessionId: "S1", checking: false, unsupported: false, unavailable: false, now: NOW,
+      presence: { session_id: "S1", online: true, page_build: "stale" }, ...flags,
+    }).pageStale, false);
+  }
+  assert.equal(presenceViewFrom({
+    sessionId: null, checking: false, unsupported: false, unavailable: false, presence: null,
+  }).pageStale, false);
+});
+
+test("SessionContextBar 把旧页面提醒和刷新时机写在在场状态旁边", () => {
+  const shell = readFileSync(new URL("../console/ConsoleShell.tsx", import.meta.url), "utf8");
+  const bar = shell.slice(shell.indexOf("function SessionContextBar("));
+  assert.match(bar, /presence\.pageStale && /);
+  assert.match(bar, /老人端页面是旧版本，请刷新老人端/);
+  assert.match(bar, /请在暂停时或本场结束后刷新；刷新后需再点一次『点一下，开始』/);
 });

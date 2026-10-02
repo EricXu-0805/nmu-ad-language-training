@@ -8,6 +8,8 @@ export interface PatientPresenceView {
   lastSeenLabel: string | null;
   /** 原始 screen 事实:只有在线态才断言(离线后屏上是什么没人知道)。 */
   screen: string | null;
+  /** 服务端判定受试者端页面是旧构建:同样只在在线态断言。 */
+  pageStale: boolean;
 }
 
 export interface PresencePayload {
@@ -15,6 +17,8 @@ export interface PresencePayload {
   screen?: string;
   last_seen_at?: string | null;
   online?: boolean;
+  // 旧后端没有这个字段。
+  page_build?: string;
 }
 
 const SCREEN_LABELS: Record<string, string> = {
@@ -48,11 +52,11 @@ export function presenceViewFrom(input: {
 }): PatientPresenceView {
   const { sessionId, checking, unsupported, unavailable, presence } = input;
   const now = input.now ?? Date.now();
-  if (!sessionId) return { state: "unseen", screenLabel: "尚未建立场次", lastSeenLabel: null, screen: null };
-  if (checking) return { state: "checking", screenLabel: "正在确认受试者端", lastSeenLabel: null, screen: null };
-  if (unsupported) return { state: "unsupported", screenLabel: "该版本不支持受试者端在线状态", lastSeenLabel: null, screen: null };
-  if (unavailable) return { state: "unavailable", screenLabel: "暂时无法读取双端状态", lastSeenLabel: relativeSeen(presence?.last_seen_at, now), screen: null };
-  if (!presence) return { state: "unseen", screenLabel: "等待受试者端打开本场次", lastSeenLabel: null, screen: null };
+  if (!sessionId) return { state: "unseen", screenLabel: "尚未建立场次", lastSeenLabel: null, screen: null, pageStale: false };
+  if (checking) return { state: "checking", screenLabel: "正在确认受试者端", lastSeenLabel: null, screen: null, pageStale: false };
+  if (unsupported) return { state: "unsupported", screenLabel: "该版本不支持受试者端在线状态", lastSeenLabel: null, screen: null, pageStale: false };
+  if (unavailable) return { state: "unavailable", screenLabel: "暂时无法读取双端状态", lastSeenLabel: relativeSeen(presence?.last_seen_at, now), screen: null, pageStale: false };
+  if (!presence) return { state: "unseen", screenLabel: "等待受试者端打开本场次", lastSeenLabel: null, screen: null, pageStale: false };
   if (presence.online !== true) {
     // 设备断开后没人知道屏上是什么:绝不再断言「正在看题/正在看结束提示」。
     return {
@@ -60,6 +64,7 @@ export function presenceViewFrom(input: {
       screenLabel: "已断开，画面未知",
       lastSeenLabel: relativeSeen(presence.last_seen_at, now),
       screen: null,
+      pageStale: false,
     };
   }
   return {
@@ -67,5 +72,6 @@ export function presenceViewFrom(input: {
     screenLabel: SCREEN_LABELS[presence.screen ?? ""] ?? "受试者端已打开",
     lastSeenLabel: relativeSeen(presence.last_seen_at, now),
     screen: presence.screen ?? null,
+    pageStale: presence.page_build === "stale",
   };
 }

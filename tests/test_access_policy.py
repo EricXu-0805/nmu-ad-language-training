@@ -254,6 +254,8 @@ def _logged_in_client(eng, username: str) -> TestClient:
     ("POST", "/future-unclassified-mutation", access_policy.AccessKind.ACCOUNT,
      access_policy.ADMIN_ROLES),
     ("GET", "/patient", access_policy.AccessKind.PUBLIC, None),
+    # 老人端在问候页免凭据轮询它判断页面是否旧版本。
+    ("GET", "/build-id.txt", access_policy.AccessKind.PUBLIC, None),
     ("POST", "/device/attach", access_policy.AccessKind.DEVICE_ATTACH, None),
     ("PATCH", "/patients/P", access_policy.AccessKind.ACCOUNT,
      access_policy.TRAINING_OPERATION_ROLES),

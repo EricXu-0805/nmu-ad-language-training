@@ -373,6 +373,8 @@ export interface PatientHeartbeatRequest {
   screen: PatientPresenceScreen;
   cursor_wseq?: number;
   client_ts?: string;
+  // 本页编译时的构建号;旧后端不认识它,会以 422 拒收整拍心跳。
+  page_build_id?: string;
 }
 
 export interface PatientPresence {
@@ -381,6 +383,7 @@ export interface PatientPresence {
   last_seen_at: string | null;
   online: boolean;
   cursor_wseq?: number | null;
+  page_build?: "current" | "stale" | "unknown";
 }
 
 export interface PatientHeartbeatResponse {

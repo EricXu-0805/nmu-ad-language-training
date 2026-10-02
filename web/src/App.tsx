@@ -34,7 +34,7 @@ export default function App() {
         </>} />
         <Route path="/patient" element={
           <Boundary variant="patient">
-            <Suspense fallback={<PatientLoading />}><PatientShell /></Suspense>
+            <Suspense fallback={<PatientLoading />}><PatientShell allowPageReload /></Suspense>
           </Boundary>
         } />
         {/* 现场准备用的设备基础检查:不登录、不碰任何受试者数据,只测这台机器本身。 */}

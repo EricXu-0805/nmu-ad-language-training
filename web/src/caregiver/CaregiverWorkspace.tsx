@@ -266,6 +266,11 @@ function SessionScreen({
           {status?.patientPresence === "online" && (
             <p>老人画面已打开。请留在老人旁边。</p>
           )}
+          {status?.patientPageStale && (
+            <Alert tone="warn" title="老人端页面是旧版本，请刷新老人端">
+              请在暂停时或本场结束后刷新；刷新后需再点一次『点一下，开始』
+            </Alert>
+          )}
         </section>
 
         <section className="form-section" aria-labelledby="caregiver-actions-title">

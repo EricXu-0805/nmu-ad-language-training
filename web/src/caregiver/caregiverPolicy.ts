@@ -153,6 +153,8 @@ export interface CaregiverSessionStatus extends CaregiverOperationalBoundary {
   runtimeState: CaregiverRuntimeState;
   practiceState: CaregiverPracticeState;
   patientPresence: CaregiverPatientPresence;
+  /** 老人画面在线且服务端判它是旧构建。 */
+  patientPageStale: boolean;
   runtimeRevision: number;
   practiceRevision: number;
   /** 只有服务器已持久化精确收麦证据时才为 true。 */

@@ -52,6 +52,17 @@ def test_spa_fallback_keeps_safe_files_and_client_routes(tmp_path):
     assert client.get("/console/session/demo").text == "SAFE-SPA"
 
 
+def test_spa_shell_and_build_id_must_be_revalidated(tmp_path):
+    """外壳与版本号文件不许被浏览器/中间层当成新鲜缓存,否则刷新仍拿到旧页面。"""
+    dist, _secret, client = _spa(tmp_path)
+    (dist / "build-id.txt").write_text("1234567890\n", encoding="ascii")
+    for path in ("/patient", "/console/session/demo", "/index.html", "/build-id.txt"):
+        for method in ("get", "head"):
+            response = getattr(client, method)(path)
+            assert response.status_code == 200, (method, path)
+            assert response.headers["cache-control"] == "no-cache", (method, path)
+
+
 @pytest.mark.parametrize("path", [
     "/content/item_bank_v1.json",
     "/CONTENT/item_bank_v1.json",

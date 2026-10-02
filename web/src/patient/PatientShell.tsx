@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { api, DEVICE_CAPABILITY_UPDATED_EVENT, getDeviceCapability } from "../api";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  api, DEVICE_CAPABILITY_UPDATED_EVENT, devicePairingOrAttachInFlight, getDeviceCapability,
+} from "../api";
 import { PinPrompt, PIN_PROMPT_MANUAL_OPEN_EVENT } from "../components/PinPrompt";
 import { bus } from "../sync/bus";
 import { PATIENT_ACTIVATION_EVENT } from "../sync/messages";
@@ -35,6 +37,14 @@ import {
   type PatientPauseOutbox,
 } from "./patientPause";
 import { RapportStage } from "./RapportStage";
+import {
+  browserStaleReloadPorts,
+  reloadStalePatientPage,
+  shouldOfferStaleReload,
+  useDeployedBuildId,
+  type StaleReloadOutcome,
+  type StaleReloadPorts,
+} from "./patientStaleReload";
 import { ttsToggleTitle } from "./ttsEngineLabel";
 import {
   clearTtsContext,
@@ -67,7 +77,8 @@ function withPatientPauseStorageLock<T>(
 // 老人端外壳:旧流程仍是只读游标显示器；只有服务器证明 P0a 活跃后，
 // 才互斥切换到独立的设备命令/ACK 运行器。
 // 无 session 超时、无自动黑屏、对沉默与错误宽容(永不报错、永不闪红)。
-export function PatientShell() {
+// allowPageReload 只由独立 /patient 路由传入:叠层与操作端同一页面,不能给整页刷新入口。
+export function PatientShell({ allowPageReload = false }: { allowPageReload?: boolean } = {}) {
   const { session, cursor, rapportStep, connection } = useLiveCursor();
   const { bound: patientBindingActive, hint: attachHint } = usePatientBinding();
   // 浏览器要手势才肯放声(生产三台设备实证):自动带练那条话术在等老人点一下屏。
@@ -381,6 +392,14 @@ export function PatientShell() {
     window.dispatchEvent(new CustomEvent(PATIENT_ACTIVATION_EVENT, { detail: { sessionId } }));
   }, [session, terminal, patientActivated, ttsOn, connectionReady]);
 
+  // 这几个分块要到第一次开麦/停播检测才 import。页面开着时换了 dist,旧分块已被删,
+  // 那一下 404 会被记成「麦克风未能安全启动」。挂载时先取进模块表,之后的同一 import 不再走网络。
+  useEffect(() => {
+    void import("./autopilotBrowserMediaDependencies.ts").catch(() => {});
+    void import("./autopilotMediaTransport.ts").catch(() => {});
+    void import("../audio/foreignOutboxDrain.ts").catch(() => {});
+  }, []);
+
   // useLayoutEffect:paint 前设好 34px 尺度,避免老人端首帧 16px→34px 全屏字号跳变
   useLayoutEffect(() => {
     document.documentElement.dataset.scale = "patient";
@@ -450,7 +469,7 @@ export function PatientShell() {
   const commandSeq = session?.mode === "rapport"
     ? rapportStep?.wseq
     : autopilot.mode !== "legacy" ? autopilot.current?.command_seq : cursor?.wseq;
-  usePatientHeartbeat(session?.sessionId, currentScreen, commandSeq ?? session?.wseq);
+  usePatientHeartbeat(session?.sessionId, currentScreen, commandSeq ?? session?.wseq, __BUILD_ID__);
 
   // Generic/legacy TTS gets an exact replay namespace.  It is deliberately
   // absent while a new item is loading, during pause/disconnect/terminal views,
@@ -479,6 +498,22 @@ export function PatientShell() {
   // capabilityEpoch 每次能力变化都会自增触发重渲染,这里读到的配对状态因此新鲜。
   void capabilityEpoch;
   const devicePaired = patientBindingActive || getDeviceCapability() !== null;
+
+  const deployedBuildId = useDeployedBuildId(allowPageReload && import.meta.env.PROD);
+  const staleReloadOffered = shouldOfferStaleReload({
+    enabled: allowPageReload,
+    screen: !session ? "greeting" : terminal ? "complete" : "session",
+    pageBuildId: __BUILD_ID__,
+    deployedBuildId,
+    connection,
+    hasActiveCapability: getDeviceCapability() !== null,
+  });
+  const staleReloadOfferedRef = useRef(staleReloadOffered);
+  staleReloadOfferedRef.current = staleReloadOffered;
+  const staleReloadPorts = useMemo(() => browserStaleReloadPorts({
+    deviceTransportBusy: devicePairingOrAttachInFlight,
+    stillOffered: () => staleReloadOfferedRef.current,
+  }), []);
 
   let body: React.ReactNode;
   if (!session) {
@@ -519,10 +554,17 @@ export function PatientShell() {
             <small>请工作人员点这里完成配对</small>
           </button>
         )}
+        {staleReloadOffered && <StaleReloadEntry ports={staleReloadPorts} />}
       </Centered>
     );
   } else if (terminal) {
-    body = <Centered><div className="target">今天辛苦了</div><p className="question">今天的练习已经结束</p></Centered>;
+    body = (
+      <Centered>
+        <div className="target">今天辛苦了</div>
+        <p className="question">今天的练习已经结束</p>
+        {staleReloadOffered && <StaleReloadEntry ports={staleReloadPorts} />}
+      </Centered>
+    );
   } else if (session.mode === "rapport") {
     // 暂停不卸载舞台:卸载会丢掉保存失败的 pendingSave 与重试入口,恢复后该段回答
     // 从流程里无声消失。舞台保持挂载,休息屏由舞台自己渲染,录音经 suspended 立即停麦。
@@ -611,6 +653,24 @@ export function PatientShell() {
       mode={autopilot.mode} />
     <PinPrompt />
   </>;
+}
+
+// 与「换一位受试者或重新配对」同一种安静样式:给工作人员用,老人不会把它当主按钮。
+function StaleReloadEntry({ ports }: { ports: StaleReloadPorts }) {
+  const [outcome, setOutcome] = useState<StaleReloadOutcome | "checking" | null>(null);
+  return (
+    <button type="button" className="patient-pair-entry patient-pair-entry--quiet"
+      disabled={outcome === "checking" || outcome === "reloaded"}
+      onClick={() => {
+        setOutcome("checking");
+        void reloadStalePatientPage(ports).then(setOutcome);
+      }}>
+      页面有更新
+      <small>{outcome === "busy" ? "正在连接或保存，请稍后再点"
+        : outcome === "unreachable" ? "暂时连不上服务器，请稍后再点"
+          : "请工作人员点这里刷新"}</small>
+    </button>
+  );
 }
 
 // 点击式启动:浏览器要求页面有过一次点击才放行语音(user activation)。

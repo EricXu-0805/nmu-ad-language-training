@@ -300,6 +300,9 @@ function parseStatus(value: unknown): CaregiverSessionStatus {
     patientPresence: candidate.active_bedside_session
       ? (presence.online ? "online" : "offline")
       : "unknown",
+    // 旧后端没有 page_build;只有服务端明说 stale 才提醒。
+    patientPageStale: candidate.active_bedside_session && presence.online
+      && presence.page_build === "stale",
     runtimeRevision: integerField(candidate, "runtime_revision"),
     practiceRevision: autopilot.stateRevision,
     takeoverReady: autopilot.takeoverReady,
