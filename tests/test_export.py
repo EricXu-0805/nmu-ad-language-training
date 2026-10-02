@@ -2062,3 +2062,129 @@ def test_adjudications_export_beside_ai_verdict_without_staff_identity(db, tmp_p
             assert "researcher-qk" not in row.values(), f"{name} 泄露工作人员账号"
             assert "adjudicated_by" not in row
     assert set(export.SHEET_FIELDS["adjudications"]) == set(sheet[0])
+
+
+# ==========================================================================
+# 录音怎么收的口:VAD 尾静音自动收麦、按「说完了」、窗口到点原来只在 record_stopped
+# 回执里,导出包分不出来。新列只追加在表尾(列序是对外契约)。
+# ==========================================================================
+
+def _seed_capture_chain(
+        s, *, raw_audio_id: str, item_id: str, turn_seq: int, command_seq: int,
+        session_id: str = "S9", response_role: str = "命名", attempt_seq: int = 1,
+        playback_ack: str | None = "tts_ended",
+        stop_payload: str | None = '{"stop_reason":"silence"}') -> AttemptEvent:
+    """一次自动带练录音的回执链:提问 TTS → 播放回执 → 录音命令 → record_stopped → attempt。
+
+    TTS 占 command_seq,录音命令占下一个;两条回执的设备序号与之相同,所以同一场次里
+    各条链的 command_seq 要隔 2。playback_ack / stop_payload 给 None 就不落那条回执。
+    """
+    voice = f"voice-{raw_audio_id}".encode("ascii")
+    path, checksum = audio_store.save_blob(raw_audio_id, voice, "audio/wav")
+    turn_key = f"{item_id}#{turn_seq}"
+    s.add(AudioAssetRow(raw_audio_id=raw_audio_id, session_id=session_id,
+                        turn_key=turn_key, audio_format=path.suffix.lstrip("."),
+                        checksum=checksum))
+    generations = dict(session_id=session_id, control_generation=1, runner_generation=1)
+    issued = dict(item_id=item_id, turn_seq=turn_seq, turn_key=turn_key,
+                  attempt_seq=attempt_seq, prompt_level=0,
+                  issued_capability_token_hash="t" * 64, issued_device_id_hash="d" * 64,
+                  revision=1, **generations)
+    interrupted = playback_ack == "tts_interrupted"
+    tts = RuntimeCommand(
+        idempotency_key=f"cmd-tts-{raw_audio_id}", command_seq=command_seq, kind="tts",
+        state="cancelled" if interrupted else "succeeded", issued_at=_T0,
+        cancelled_at=_T0 if interrupted else None,
+        succeeded_at=None if interrupted else _T0, **issued)
+    s.add(tts)
+    s.commit()
+    s.refresh(tts)
+    device = dict(device_id_hash="d" * 64, capability_token_hash="t" * 64,
+                  command_revision=1, **generations)
+    trigger_key = f"ack-playback-{raw_audio_id}"
+    if playback_ack is not None:
+        s.add(RuntimeCommandAck(
+            command_id=tts.id, idempotency_key=trigger_key, ack_type=playback_ack,
+            device_event_seq=command_seq, received_at=_T0,
+            payload_json=(
+                '{"interrupt_reason":"answer_now","media_duration_ms":650,"media_stopped":true}'
+                if interrupted else '{"media_duration_ms":2100,"media_ended":true}'),
+            **device))
+    record = RuntimeCommand(
+        idempotency_key=f"cmd-record-{raw_audio_id}", command_seq=command_seq + 1,
+        kind="record", state="succeeded", issued_at=_T0 + timedelta(seconds=1),
+        succeeded_at=_T0 + timedelta(seconds=9), predecessor_command_id=tts.id,
+        trigger_ack_idempotency_key=trigger_key, expected_raw_audio_id=raw_audio_id,
+        **issued)
+    receipt = AudioCaptureReceipt(
+        raw_audio_id=raw_audio_id, session_id=session_id, turn_key=turn_key,
+        received_at=_T0 + timedelta(seconds=8), duration_seconds=1.5,
+        byte_count=len(voice), checksum=checksum, data_classification="research")
+    s.add_all([record, receipt])
+    s.commit()
+    s.refresh(record)
+    s.refresh(receipt)
+    if stop_payload is not None:
+        s.add(RuntimeCommandAck(
+            command_id=record.id, idempotency_key=f"ack-stopped-{raw_audio_id}",
+            ack_type="record_stopped", device_event_seq=command_seq + 1,
+            payload_json=stop_payload, receipt_server_seq=receipt.server_seq,
+            raw_audio_id=raw_audio_id, checksum=checksum, byte_count=len(voice),
+            duration_seconds=1.5, received_at=_T0 + timedelta(seconds=8), **device))
+    attempt = AttemptEvent(
+        session_id=session_id, item_id=item_id, turn_seq=turn_seq,
+        response_role=response_role, attempt_seq=attempt_seq,
+        raw_audio_id=raw_audio_id, prompt_level=0, processing_status="completed")
+    s.add(attempt)
+    s.commit()
+    s.refresh(attempt)
+    return attempt
+
+
+def test_attempts_sheet_says_how_each_capture_was_closed(db, tmp_path):
+    """收口理由只出闭集;vad_armed 只有新平板回执才带,旧回执、旧平板、人工录音一律空。"""
+    _seed(db)
+    _seed_capture_chain(
+        db, raw_audio_id="a_vad", item_id="SE_锚", turn_seq=1, command_seq=1,
+        stop_payload='{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":1830}')
+    _seed_capture_chain(
+        db, raw_audio_id="a_button", item_id="DE_斧子+树", turn_seq=1,
+        response_role="左命名", command_seq=3,
+        stop_payload='{"stop_reason":"user_done","vad_armed":false}')
+    _seed_capture_chain(
+        db, raw_audio_id="a_old_tablet", item_id="DE_斧子+树", turn_seq=2,
+        response_role="左作用", command_seq=5,
+        stop_payload='{"stop_reason":"max_duration"}')
+    _seed_capture_chain(
+        db, raw_audio_id="a_tampered", item_id="DE_斧子+树", turn_seq=3,
+        response_role="右命名", command_seq=7,
+        stop_payload='{"stop_reason":"teleported","vad_armed":"yes"}')
+    _seed_capture_chain(
+        db, raw_audio_id="a_no_stop_ack", item_id="DE_斧子+树", turn_seq=4,
+        response_role="右作用", command_seq=9, stop_payload=None)
+    # 人工控制台录音:没有平板录音命令。
+    db.add(AttemptEvent(
+        session_id="S9", item_id="DE_斧子+树", turn_seq=5, response_role="关系识别",
+        attempt_seq=1, raw_audio_id="a_plain", prompt_level=0,
+        processing_status="completed"))
+    db.commit()
+
+    result = _export_bundle(db, "S9", write_dir=tmp_path)
+
+    rows = {row["audio_code"]: row for row in result["sheets"]["attempts"]}
+
+    def closed(raw_audio_id):
+        row = rows[export_security.pseudonymize_audio(raw_audio_id)]
+        return row["capture_stop_reason"], row["capture_vad_armed"]
+
+    assert closed("a_vad") == ("silence", True)
+    assert closed("a_button") == ("user_done", False)
+    assert closed("a_old_tablet") == ("max_duration", None)
+    assert closed("a_tampered") == (None, None)
+    assert closed("a_no_stop_ack") == (None, None)
+    assert closed("a_plain") == (None, None)
+    assert export.SHEET_FIELDS["attempts"][-3:] == (
+        "prompt_exposure_needs_review", "capture_stop_reason", "capture_vad_armed")
+    written = tmp_path / "research" / result["batch_id"] / "attempts.csv"
+    with written.open(encoding="utf-8-sig", newline="") as handle:
+        assert next(csv.reader(handle)) == list(export.SHEET_FIELDS["attempts"])

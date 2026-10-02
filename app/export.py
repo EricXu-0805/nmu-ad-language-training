@@ -21,7 +21,7 @@ import re
 import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 from uuid import uuid4
 
 from sqlalchemy import or_
@@ -1268,6 +1268,7 @@ def export_session_bundle(
     attempts_by_id = {
         attempt.id: attempt for attempt in attempts if attempt.id is not None
     }
+    provenance = capture_provenance(db, attempts)
 
     def subject_cols() -> dict:
         return {"subject_code": subj}
@@ -1466,6 +1467,8 @@ def export_session_bundle(
             "is_simulation": attempt.is_simulation,
             "truth_scope": "operational_only",
             **_prompt_playback_evidence(db, attempt),
+            "capture_stop_reason": provenance[attempt.id]["stop_reason"],
+            "capture_vad_armed": provenance[attempt.id]["vad_armed"],
         })
 
     interaction_sheet = []
@@ -1834,6 +1837,47 @@ def _prompt_playback_evidence(db, attempt: AttemptEvent) -> dict:
             "prompt_exposure_needs_review": interrupted}
 
 
+def capture_provenance(db, attempts: Iterable[AttemptEvent]) -> dict[int, dict]:
+    """每段录音怎么收的口：平板 record_stopped 回执里的运行事实，不是研究真值。
+
+    按 attempt.id 返回；导出包与研究读面共用这一份，免得两边口径分岔。录音命令靠
+    expected_raw_audio_id 找，没有平板录音命令的（人工录音、历史场次）一律为空。
+    stop_reason 只出闭集，库里别的值出 None 而不拦整份导出：它和播放结局一样只描述
+    采集过程。vad_armed 是新平板才带的可选键，旧回执、旧平板为 None。
+    """
+    by_audio = {attempt.raw_audio_id: attempt for attempt in attempts}
+    facts = {attempt.id: {"stop_reason": None, "vad_armed": None}
+             for attempt in by_audio.values()}
+    if not by_audio:
+        return facts
+    attempt_by_record = {
+        record.id: by_audio[record.expected_raw_audio_id]
+        for record in db.exec(select(RuntimeCommand).where(
+            RuntimeCommand.kind == "record",
+            RuntimeCommand.expected_raw_audio_id.in_(list(by_audio))))
+        if record.session_id == by_audio[record.expected_raw_audio_id].session_id}
+    if not attempt_by_record:
+        return facts
+    for ack in db.exec(select(RuntimeCommandAck).where(
+            RuntimeCommandAck.command_id.in_(list(attempt_by_record)),
+            RuntimeCommandAck.ack_type == "record_stopped")):
+        try:
+            payload = json.loads(ack.payload_json)
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            continue
+        stop_reason = payload.get("stop_reason")
+        vad_armed = payload.get("vad_armed")
+        facts[attempt_by_record[ack.command_id].id] = {
+            "stop_reason": (stop_reason if isinstance(stop_reason, str)
+                            and stop_reason in autopilot_ledger.RECORD_STOP_REASONS
+                            else None),
+            "vad_armed": vad_armed if isinstance(vad_armed, bool) else None,
+        }
+    return facts
+
+
 def _row_fingerprint(row, *, identity) -> tuple:
     """Every column of one row, in the table's own declared order.
 
@@ -2182,6 +2226,8 @@ SHEET_FIELDS: dict[str, tuple[str, ...]] = {
         # 没走到那条路径。列契约必须覆盖**所有**分支，不是抽样到的那些。
         "judge_portrait_used", "processing_status",
         "prompt_playback_outcome", "prompt_played_ms", "prompt_exposure_needs_review",
+        # 录音怎么收的口与平板 VAD 是否真在跑:回执里的运行事实,旧回执为空。
+        "capture_stop_reason", "capture_vad_armed",
     ),
     "interactions": _SESSION_COLS + (
         "event_seq", "item_id", "turn_seq", "attempt_seq", "audio_code",
