@@ -284,6 +284,12 @@ def check_sensitive_file_modes(root: Path = Path("/opt/nmu")) -> Check:
         else:
             candidates.append(path)
 
+    def other_can_enter(directory: Path) -> bool:
+        try:
+            return bool(directory.stat().st_mode & stat.S_IXOTH)
+        except OSError:
+            return True
+
     exposed = []
     for path in candidates:
         # 入库的模板，没有秘密；rsync -a 每次同步都会按本机权限把它带成 644。
@@ -295,7 +301,9 @@ def check_sensitive_file_modes(root: Path = Path("/opt/nmu")) -> Check:
             mode = path.lstat().st_mode
         except OSError:
             continue
-        if stat.S_ISREG(mode) and mode & stat.S_IROTH:
+        # 0644 的文件放在 other 进不去的目录里(如 0700 的 backups/)就读不到，不算暴露。
+        if (stat.S_ISREG(mode) and mode & stat.S_IROTH
+                and other_can_enter(root) and other_can_enter(path.parent)):
             exposed.append(str(path))
 
     problems = []
