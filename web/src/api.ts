@@ -179,6 +179,10 @@ const patientBindingStore = createPatientBindingStore(localStorage);
 // twice before React renders its disabled button.
 let pairingGeneration = 0;
 let pairingPending = false;
+let attachRequestsInFlight = 0;
+// 老人端整页刷新的安全闸:服务端可能已签发能力而本页还没收到回执。
+export const devicePairingOrAttachInFlight = (): boolean =>
+  pairingPending || attachRequestsInFlight > 0;
 export const getPatientBinding = (): PatientBindingRecord | null =>
   patientBindingStore.get();
 export const clearPatientBinding = (): void => {
@@ -437,6 +441,7 @@ async function attachPatientDevice(): Promise<AttachResult> {
   const activeAtStart = deviceStore.get();
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), ATTACH_REQUEST_TIMEOUT_MS);
+  attachRequestsInFlight += 1;
   try {
     const res = await fetch("/device/attach", {
       method: "POST",
@@ -480,6 +485,7 @@ async function attachPatientDevice(): Promise<AttachResult> {
   } catch {
     return { disposition: "quiet_retry", hint: null };
   } finally {
+    attachRequestsInFlight -= 1;
     window.clearTimeout(timeout);
   }
 }

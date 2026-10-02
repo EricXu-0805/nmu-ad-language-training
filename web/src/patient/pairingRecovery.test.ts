@@ -86,7 +86,7 @@ function pairingHarness() {
   assert(start >= 0 && end > start, "production pairing boundary must be present");
   const compiled = ts.transpileModule(source.slice(start, end) + `
     globalThis.testApi = {pairDevice, pairDeviceWithCode, attachPatientDevice,
-      clearPatientBinding, clearDeviceCapability};`, {
+      clearPatientBinding, clearDeviceCapability, devicePairingOrAttachInFlight};`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText;
   const context = vm.createContext({
@@ -109,6 +109,7 @@ function pairingHarness() {
     attachPatientDevice: () => Promise<{ disposition: string; hint: string | null }>;
     clearPatientBinding: () => void;
     clearDeviceCapability: () => void;
+    devicePairingOrAttachInFlight: () => boolean;
   };
   return {
     api, bindings, capabilities, requests, events, local, session,
@@ -145,6 +146,23 @@ for (const status of [200, 401]) for (const afterPair of [false, true]) {
     assert.equal(h.events.includes("nmu:device-pair-required"), false);
   });
 }
+
+test("page-reload fence reports pairing and attach requests until their responses settle", async () => {
+  const h = pairingHarness();
+  h.bindings.save(bindingRecord("OLD"));
+  assert.equal(h.api.devicePairingOrAttachInFlight(), false);
+  const attach = h.api.attachPatientDevice();
+  assert.equal(h.api.devicePairingOrAttachInFlight(), true);
+  h.respond(0, 200, capabilityRecord("A"));
+  assert.equal((await attach).disposition, "attached");
+  assert.equal(h.api.devicePairingOrAttachInFlight(), false);
+
+  const pair = h.api.pairDeviceWithCode("123456");
+  assert.equal(h.api.devicePairingOrAttachInFlight(), true);
+  h.respond(1, 401, { detail: "incorrect code" });
+  await assert.rejects(pair);
+  assert.equal(h.api.devicePairingOrAttachInFlight(), false);
+});
 
 test("manual pairing suppresses new automatic attaches and duplicate token rotations", async () => {
   const h = pairingHarness();
