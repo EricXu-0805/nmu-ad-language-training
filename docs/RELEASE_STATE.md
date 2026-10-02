@@ -9,6 +9,22 @@
 > 这里只记录事实，不代表任何批准。系统能不能给真实老人使用见
 > `docs/handover/七道门现状表.md`。
 
+## 2026-10-02 18:12 UTC 上线记录（`af59c28`：审计修复批——平板语音开关 + 导出收麦来源列 + 运维告警与预检加固 + urllib3 2.8.0，同窗口换定时器、隔离旧 cron、存档改 0600、装 libxpm4；零迁移，库头仍 `a7c3e9d2b641`）
+
+**Eric 跑上线脚本 264（收据 265），第 0–15 步全过；上线后核对、语音开关切换与仓库转私有见收据 268。** 第 3b 步空闲门：上线前 10 分钟生产零非轮询请求。
+
+- 应用提交 `af59c28aeeb140008bb39f345a0f404e8dc2ad67`（[PR #30](https://github.com/EricXu-0805/nmu-ad-language-training/pull/30)，集成分支 `integrate/audit-fixes-20261002`；push run 36986815537 与 pull_request run 36986818692 各五项 success，09:24 UTC 同 SHA fast-forward 进 main）。产物取自 main 上同 SHA 的 push run 36989627934（五项 success，10:03 UTC 跑完），`source-commit` 一致，`verify_browser_dist` 通过。相对上一版部署树 `a2da5e7`：迁移图零变化，依赖锁只变 urllib3，备份校验器未变，VPS 与 Mac 两份校验器不用重装。
+- 内容（收据 265 §五）：服务端四个语音开关与 `GET …/autopilot/voice-settings`；平板读开关，停播后那次重说不挂静音检测；导出与研究面加收麦方式、播放结局四列；判分版本带提示词模板摘要；收尾汇总「人工接管」改数控制账本；只读场次报告 `scripts/field_session_report.py`；告警正文带原因，公网探针开机补跑先等站点起来；预检 `--os` 加三项（9 → 12）。
+- 依赖：第 3c 步先在生产 `pip --dry-run` 演练，只许装 urllib3 2.8.0 一项；第 7b 步用底座解释器的 pip 按哈希换装，venv 里 **urllib3 2.8.0**。
+- 语音开关：第 8b 步给 `.env` 写 `NMU_AUTOPILOT_VAD=0`、`NMU_AUTOPILOT_VOICE_BARGE_IN=0`（原文件备份 `/opt/nmu/env-before-264-20261002-181209`），新版起服时两项都关。**18:33 UTC 两项改为开**：Eric 13:33 CT 明确要求，Claude 跑 `267-语音开关切换.sh on on`（备份 `/opt/nmu/env-before-267-20261002-183351`），重启后进程环境 `NMU_AUTOPILOT_VAD=1`、`NMU_AUTOPILOT_VOICE_BARGE_IN=1`，本机与公网 `/health` 200。声音停播即时生效；静音自动收麦要老人端刷新一次页面，不刷新最多五分钟后自己读到。267 第一次被空闲门挡下：近 10 分钟 5 条非轮询请求，查明是调查 agent 打开页面、取静态文件，没有 API 写请求；空闲门改为不把这两类算作在练，复查为 0 才执行。
+- 定时器：换掉有变化的 `nmu-backup-health.service`、`nmu-health.service`、`nmu-health.timer`，旧文件在 `/opt/nmu/systemd-before-264-20261002-181221`。`nmu-health.timer` 改日历触发 `OnCalendar=*:0/10`，18:12:22 手动跑一次成功，**18:20:19 UTC 按点触发成功**，是 9/30 09:36 UTC 停摆以来第一次按点跑；其余五个定时器 NEXT 都在。
+- 旧 cron `/etc/cron.daily/nmu-backup` 移入 0700 隔离目录 `/opt/nmu/retired-cron-20261002-181223`（不删），受管备份 `nmu-backup.timer` 照旧。`/opt/nmu` 顶层 23 个世界可读的存档改 0600（不删），审计核过其中 21 个带 `app/.env`。
+- 系统包：libxpm4 安全更新到 `1:3.5.12-1ubuntu0.22.04.4`，`nginx -t` 通过后重启 nginx（libxpm4 只经 image-filter 模块进 nginx）。内核 198 与 netplan 不在本窗口，要开 KiwiVM 控制台另约。
+- 完整预检（`--require-all --os`）**12/12**。树核 `verify_deployed_tree --capture` 在生产只读采集，**MATCH source_files=843 browser_files=21**（对 `af59c28` + CI run 36989627934 的 `dist/browser-dist-sha256.json`）。
+- `last-deploy.state`：`commit = af59c28…`，`receipt = PM_20260730_自动对话/265-审计修复批收据-20261002.md`。
+- 仓库 2026-10-02 转为私有（Eric 批准；转前确认运行期和自动化任务都不靠匿名拉取 raw 文件）。分支保护逐项不变：5 项必需检查、strict、管理员也受约束、禁强推禁删；匿名打开仓库页与题库 raw 文件均 404。本文的 PR 与 Actions 链接从此要有权限的 GitHub 账号才能打开。私有仓库的 Actions 按分钟计（Pro 每月含 3,000 分钟），CI 随之收窄：分支 push 不跑，main 的 push 与每周定时只跑 image 与 supply-chain，PR run 不再上传上线产物。上线口径改为 PR CI 绿 → 同 SHA fast-forward → 等 main 上该 SHA 的 push run 跑绿 → 只部署曾是 main 顶端的 SHA；本次即按此执行。
+- 未验：真机平板（型号、浏览器、回声消除、麦克风指示灯）没上机，认证后的生产训练没做。工程部署完成不等于临床或研究批准。
+
 ## 2026-09-25 UTC 追加验收（应用仍为 `1ab262a`，未再次换版）
 
 本轮前段新增隔离验收工具、回归测试与交接资料，未修改运行期应用、题库、评分、前端、数据库结构或现网配置，未重启生产应用；后续发现的独立备份校验器遗漏单列于本节末。现网业务应用仍是下方 `1ab262a`，不能把运维工具提交称为新的业务应用上线。
