@@ -106,7 +106,7 @@ BASELINE_ELDER_TO_ROBOT = {
 
 
 class Refused(Exception):
-    """稳定拒绝码 + 一句人话；不带路径、场次或任何行内容。"""
+    """稳定拒绝码 + 一句人话；不带路径、session_id 或任何行内容，场次只报编号。"""
 
     def __init__(self, code: str, detail: str):
         super().__init__(code)
