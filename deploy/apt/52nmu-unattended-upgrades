@@ -1,0 +1,26 @@
+// 装到 /etc/apt/apt.conf.d/52nmu-unattended-upgrades（root:root 0644）。
+// 排在 20auto-upgrades、50unattended-upgrades 之后读，同名键以这里为准；那两份不改。
+// 入库不等于已装：装、验、回滚见 deploy/systemd/README.md「系统安全补丁夜间自动装」。
+//
+// 来源沿用 50unattended-upgrades 自带的 jammy、jammy-security 与两条 ESM，这里一个都不加，
+// 等于只装安全补丁。没有全局 Dpkg::Options：写在这里会漏进机器上每一次 apt 调用；
+// 会弹配置文件对话框的包 unattended-upgrade 自己跳过，留在积压里等人装。
+
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+
+// 不替人重启：重启要挑没人练的时候，内核还要开着 KiwiVM 控制台。
+Unattended-Upgrade::Automatic-Reboot "false";
+
+// 从包名开头匹配的正则（unattended-upgrade 用 re.match）。拉黑的包也不会被它自动删。
+// 内核、netplan、引导链生效都要重启，一坏就是开不了机或连不上网，只在维护窗口里装：
+// deploy/maintenance/kernel_netplan_window.sh。
+Unattended-Upgrade::Package-Blacklist {
+    "linux-";
+    "netplan";
+    "libnetplan";
+    "grub";
+    "shim";
+};
+
+Unattended-Upgrade::SyslogEnable "true";
