@@ -72,9 +72,14 @@ SIMULATION_DATA_ENV = "ALLOW_SIMULATION_DATA"
 # explicit deployment switch.  The two simulation switches above keep their
 # exact historical semantics; neither channel ever implies the other.
 REAL_SESSIONS_ENV = "ENABLE_AUTOPILOT_REAL_SESSIONS"
-# 平板语音体验的运维急停开关。与上面的准入开关相反,它们默认开(9/21 起就是线上
-# 行为),只有显式关闭值才关,且每次请求现读环境。
+# 平板语音体验的运维开关。与上面的准入开关相反,两个布尔开关默认开(9/21 起就是
+# 线上行为),只有显式关闭值才关;两个尾静默窗口无法解析或越界一律回默认。全部按
+# 请求现读环境。服务端只经 voice-settings 把它们下发给平板,自己据此拦的只有提问
+# 中声音检测的授权。
 VOICE_BARGE_IN_ENV = "NMU_AUTOPILOT_VOICE_BARGE_IN"
+VAD_ENV = "NMU_AUTOPILOT_VAD"
+VAD_TRAILING_MS_ENV = "NMU_AUTOPILOT_VAD_TRAILING_MS"
+VAD_SHORT_TRAILING_MS_ENV = "NMU_AUTOPILOT_VAD_SHORT_TRAILING_MS"
 P0A_SOURCE = "p0a_domain_service"
 # Interaction-package consumption (autopilot-interaction.v1): the one gap /
 # failure code for "this week's package is missing, unbound or uncovering",
@@ -104,6 +109,7 @@ _DENIED_CONSENT = frozenset({
     "denied", "withdrawn", "refused", "declined", "rejected",
 })
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+_ENV_MS_RE = re.compile(r"[0-9]{1,6}")
 # Closed identity of the explicit-repeat safe pause.  It is deliberately not a
 # technical failure code and must never be counted as one.
 REPEAT_PAUSE_SOURCE = "repeat_intent_protocol"
@@ -319,6 +325,17 @@ class DrainTargetProjection(BaseModel):
 
     command_key: str
     state_revision: int = Field(ge=0)
+
+
+class VoiceSettingsProjection(BaseModel):
+    """平板按精确四键校验;多一个键或少一个键,平板都会把 VAD 当关闭处理。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    vad_enabled: bool
+    vad_trailing_silence_ms: int
+    vad_short_trailing_silence_ms: int
+    barge_in_enabled: bool
 
 
 class RouteTtsEndedResult(BaseModel):
@@ -555,6 +572,28 @@ def _enabled_unless_switched_off(name: str) -> bool:
 
 def voice_barge_in_enabled() -> bool:
     return _enabled_unless_switched_off(VOICE_BARGE_IN_ENV)
+
+
+def _env_ms(name: str, *, default: int, low: int, high: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if _ENV_MS_RE.fullmatch(raw) is None:
+        return default
+    value = int(raw)
+    return value if low <= value <= high else default
+
+
+def voice_settings() -> VoiceSettingsProjection:
+    trailing = _env_ms(VAD_TRAILING_MS_ENV, default=3_000, low=1_500, high=8_000)
+    # 短话窗口(有声不足 900 ms 时用)本来就要比 trailing 等得久:默认 4500 若比运维
+    # 调长的 trailing 还短就取 trailing,不让「嗯」之后的慢回答反而被更早截掉。
+    short = _env_ms(VAD_SHORT_TRAILING_MS_ENV, default=max(4_500, trailing),
+                    low=trailing, high=10_000)
+    return VoiceSettingsProjection(
+        vad_enabled=_enabled_unless_switched_off(VAD_ENV),
+        vad_trailing_silence_ms=trailing,
+        vad_short_trailing_silence_ms=short,
+        barge_in_enabled=voice_barge_in_enabled(),
+    )
 
 
 def _enum_value(value: object) -> str:

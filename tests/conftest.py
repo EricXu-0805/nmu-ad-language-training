@@ -23,8 +23,11 @@ def _no_cloud_key(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _default_voice_switches(monkeypatch):
-    # 平板语音急停开关默认开;机器上设过的关闭值不能渗进测试、悄悄改掉默认路径。
-    monkeypatch.delenv(autopilot_service.VOICE_BARGE_IN_ENV, raising=False)
+    # 平板语音开关与窗口都有默认;机器上设过的值不能渗进测试、悄悄改掉默认路径。
+    for name in (autopilot_service.VOICE_BARGE_IN_ENV, autopilot_service.VAD_ENV,
+                 autopilot_service.VAD_TRAILING_MS_ENV,
+                 autopilot_service.VAD_SHORT_TRAILING_MS_ENV):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)
