@@ -202,7 +202,8 @@ def test_supply_chain_group_fails_loudly_when_it_cannot_look(tmp_path):
     assert check.ok is False and "对不成账" in check.detail
 
 
-WAITING = "NextElapseUSecRealtime=Fri 2026-10-02 10:10:00 UTC\nSubState=waiting\n"
+WAITING = ("NextElapseUSecRealtime=Fri 2026-10-02 10:10:00 UTC\nSubState=waiting\n"
+           "UnitFileState=enabled\n")
 
 
 def _systemctl(show: dict[str, str], installed: list[str] | None = None):
@@ -233,7 +234,7 @@ def test_an_elapsed_timer_is_named_although_it_still_shows_active():
     check = preflight.check_timers_scheduled(run=_systemctl({
         "nmu-backup.timer": WAITING,
         "nmu-health.timer": ("ActiveState=active\nNextElapseUSecRealtime=\n"
-                             "SubState=elapsed\n"),
+                             "SubState=elapsed\nUnitFileState=enabled\n"),
     }))
 
     assert check.ok is False
@@ -242,8 +243,8 @@ def test_an_elapsed_timer_is_named_although_it_still_shows_active():
 
 
 @pytest.mark.parametrize("shown", [
-    "NextElapseUSecRealtime=\nSubState=waiting\n",
-    "SubState=waiting\n",  # 空属性有的 systemctl 版本干脆不打印
+    "NextElapseUSecRealtime=\nSubState=waiting\nUnitFileState=enabled\n",
+    "SubState=waiting\nUnitFileState=enabled\n",  # 空属性有的 systemctl 版本干脆不打印
 ])
 def test_a_waiting_timer_without_a_next_elapse_is_dead(shown):
     check = preflight.check_timers_scheduled(run=_systemctl({
@@ -251,6 +252,18 @@ def test_a_waiting_timer_without_a_next_elapse_is_dead(shown):
 
     assert check.ok is False
     assert "nmu-health.timer" in check.detail
+    assert "nmu-backup.timer" not in check.detail
+
+
+def test_a_disabled_timer_is_named_while_it_is_still_waiting():
+    # 停用而没带 --now：此刻还排着，下次开机就不会再起来，也没有任何东西因此失败。
+    check = preflight.check_timers_scheduled(run=_systemctl({
+        "nmu-backup.timer": WAITING,
+        "nmu-health.timer": WAITING.replace("=enabled", "=disabled"),
+    }))
+
+    assert check.ok is False
+    assert "nmu-health.timer" in check.detail and "disabled" in check.detail
     assert "nmu-backup.timer" not in check.detail
 
 

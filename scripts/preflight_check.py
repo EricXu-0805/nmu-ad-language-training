@@ -218,7 +218,8 @@ def check_timers_scheduled(run=subprocess.run) -> Check:
 
     2026-09-30 重启后 nmu-health.timer 停在 SubState=elapsed、下一次触发时间为空，
     ActiveState 却一直是 active——看 status 的人和只认 active 的脚本都看不出来。
-    所以这里只认 SubState=waiting 且 NextElapseUSecRealtime 非空。
+    所以这里只认 SubState=waiting 且 NextElapseUSecRealtime 非空；另要 UnitFileState=enabled，
+    停用而没带 --now 的定时器此刻还排着，下次开机就不会再起来。
     """
     name = "定时器在排程"
     try:
@@ -239,7 +240,8 @@ def check_timers_scheduled(run=subprocess.run) -> Check:
     for timer in timers:
         try:
             shown = run(
-                ["systemctl", "show", timer, "-p", "SubState", "-p", "NextElapseUSecRealtime"],
+                ["systemctl", "show", timer, "-p", "SubState", "-p", "NextElapseUSecRealtime",
+                 "-p", "UnitFileState"],
                 capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as error:
             return Check(name, False, f"查不动 systemctl：{error}")
@@ -249,8 +251,10 @@ def check_timers_scheduled(run=subprocess.run) -> Check:
         properties = _systemd_properties(shown.stdout)
         sub_state = properties.get("SubState", "")
         next_elapse = properties.get("NextElapseUSecRealtime", "")
-        if sub_state != "waiting" or not next_elapse:
-            dead.append(f"{timer}(SubState={sub_state or '空'}, NEXT={next_elapse or '空'})")
+        file_state = properties.get("UnitFileState", "")
+        if sub_state != "waiting" or not next_elapse or file_state != "enabled":
+            dead.append(f"{timer}(SubState={sub_state or '空'}, NEXT={next_elapse or '空'}, "
+                        f"UnitFileState={file_state or '空'})")
     if dead:
         return Check(name, False,
                      f"{len(dead)} 个定时器没在排程：{'；'.join(dead)}；"
