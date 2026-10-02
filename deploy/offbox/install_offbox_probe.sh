@@ -167,8 +167,10 @@ stage1() {
   RSH "install -d -m 700 '$REMOTE_DIR'"
   push "$PROBE" "$REMOTE_DIR/nmu_offbox_probe.py"
   push "$LINE_FILE" "$REMOTE_DIR/crontab.line"
-  RSH "/usr/bin/python3 -B '$REMOTE_DIR/nmu_offbox_probe.py' --status </dev/null" \
-    || { echo "  ✗ 推上去的脚本跑不起来,停"; exit 1; }
+  local out
+  out="$(RSH "/usr/bin/python3 -B '$REMOTE_DIR/nmu_offbox_probe.py' --status </dev/null" 2>&1)" \
+    || { echo "  ✗ 推上去的脚本跑不起来,停:${out}"; exit 1; }
+  echo "  --status:${out}"
 }
 
 stage2() {
@@ -340,6 +342,10 @@ done
 for f in "$PROBE" "$LINE_FILE" "$HB_CHECK"; do
   [ -f "$f" ] || { echo "缺 ${f},停"; exit 1; }
 done
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "${REPO} 不是 git 仓库:装上去的东西对不上任何一个提交,停"
+  exit 1
+fi
 if [ -n "$(git -C "$REPO" --no-pager status --porcelain -- deploy/offbox)" ]; then
   echo "deploy/offbox 有没提交的改动,装上去的东西对不上任何一个提交,停:"
   git -C "$REPO" --no-pager status --short -- deploy/offbox

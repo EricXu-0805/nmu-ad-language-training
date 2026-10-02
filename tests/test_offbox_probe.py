@@ -1014,13 +1014,21 @@ class Remote:
         self.bin.mkdir()
         self.crontab = tmp_path / "crontab.txt"
         self._tool("hostname", 'echo "${FAKE_HOSTNAME:-openclaw-prod}"')
+        # 每次写入都记一笔(.writes);FAKE_CRONTAB_MODE 让「写进去的」和「给的」不一样。
         self._tool("crontab", "\n".join([
             'f="$FAKE_CRONTAB"',
             'case "$1" in',
             '  -l) [ -f "$f" ] || { echo "no crontab for eric" >&2; exit 1; }; cat "$f" ;;',
-            '  -) if [ -n "${FAKE_CRONTAB_LOSSY:-}" ]; then tail -n +2 > "$f";'
-            ' else cat > "$f"; fi ;;',
-            '  *) cat "$1" > "$f" ;;',
+            '  -) cat > "$f.incoming"',
+            '     case "${FAKE_CRONTAB_MODE:-}" in',
+            '       lossy) tail -n +2 "$f.incoming" > "$f" ;;',
+            "       extra-blank) awk 'NR>1{print prev} {prev=$0} END{print \"\"; print prev}'"
+            ' "$f.incoming" > "$f" ;;',
+            "       mangle) sed 's#2-59/5#3-59/5#' \"$f.incoming\" > \"$f\" ;;",
+            '       *) cat "$f.incoming" > "$f" ;;',
+            "     esac",
+            '     rm -f "$f.incoming"; echo write >> "$f.writes" ;;',
+            '  *) cat "$1" > "$f"; echo restore >> "$f.writes" ;;',
             "esac",
         ]))
         if not any((Path(d) / "sha256sum").exists()
@@ -1037,6 +1045,10 @@ class Remote:
 
     def backups(self) -> Path:
         return self.home / ".openclaw" / "backups"
+
+    def writes(self) -> list[str]:
+        log = self.crontab.with_name(self.crontab.name + ".writes")
+        return log.read_text(encoding="utf-8").split() if log.exists() else []
 
     def run(self, tag: str, *args: str, **env: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", "-s", "--", *args], input=_heredoc(tag),
@@ -1084,6 +1096,27 @@ def test_the_installer_rejects_flag_combinations_it_does_not_know(tmp_path, flag
     result = _plan("--plan", *flags, tmp_path=tmp_path)
 
     assert result.returncode == 64
+
+
+def test_the_installer_refuses_to_install_from_outside_a_git_checkout(tmp_path):
+    copy = tmp_path / "loose" / "deploy" / "offbox"
+    copy.mkdir(parents=True)
+    for name in ("install_offbox_probe.sh", "nmu_offbox_probe.py", "crontab.line",
+                 "heartbeat_check.py"):
+        (copy / name).write_bytes((OFFBOX / name).read_bytes())
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    marker = tmp_path / "ssh-was-called"
+    (fake / "ssh").write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 99\n', encoding="utf-8")
+    (fake / "ssh").chmod(0o755)
+
+    result = subprocess.run(["bash", str(copy / "install_offbox_probe.sh"), "--preflight"],
+                            env={"PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+                                 "HOME": str(tmp_path), "GIT_CEILING_DIRECTORIES": str(tmp_path)},
+                            capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 1 and "不是 git 仓库" in result.stdout
+    assert not marker.exists()
 
 
 def test_only_stage_4_ever_sends_a_test_alert():
@@ -1178,6 +1211,7 @@ def test_the_crontab_stage_appends_one_line_and_keeps_every_other_byte(remote):
     assert result.returncode == 0, result.stdout + result.stderr
     assert remote.crontab.read_text(encoding="utf-8") == (
         CRONTAB_BASELINE + line_file.read_text(encoding="utf-8"))
+    assert remote.writes() == ["write"]                       # 一次 crontab -,没有别的写入
     [backup] = remote.backups().glob("crontab.before-nmu-probe-*")
     assert backup.read_text(encoding="utf-8") == CRONTAB_BASELINE
     assert backup.stat().st_mode & 0o777 == 0o600
@@ -1191,17 +1225,24 @@ def test_the_crontab_stage_writes_nothing_when_the_crontab_moved_after_preflight
 
     assert result.returncode == 1 and "没动" in result.stdout
     assert remote.crontab.read_text(encoding="utf-8") == CRONTAB_BASELINE
+    assert remote.writes() == []
 
 
-def test_the_crontab_stage_restores_the_backup_when_a_check_fails(remote):
+@pytest.mark.parametrize(("mode", "caught_by"), [
+    ("lossy", "行"),                  # 丢了第一行
+    ("extra-blank", "写入后"),        # 多出一行空行:只有行数核得出来
+    ("mangle", "逐字节"),             # 改了别的条目一个字:只有逐字节比对核得出来
+])
+def test_the_crontab_stage_restores_the_backup_when_a_check_fails(remote, mode, caught_by):
     remote.crontab.write_text(CRONTAB_BASELINE, encoding="utf-8")
 
     result = remote.run("CRONTAB", _sha256(CRONTAB_BASELINE), str(OFFBOX / "crontab.line"),
-                        FAKE_CRONTAB_LOSSY="1")       # 写进去时丢了第一行
+                        FAKE_CRONTAB_MODE=mode)
 
     assert result.returncode == 1
-    assert "还原" in result.stdout
+    assert caught_by in result.stdout and "还原" in result.stdout
     assert remote.crontab.read_text(encoding="utf-8") == CRONTAB_BASELINE
+    assert remote.writes() == ["write", "restore"]
 
 
 def test_the_crontab_stage_only_ever_installs_the_probe_line(remote, tmp_path):
@@ -1213,6 +1254,7 @@ def test_the_crontab_stage_only_ever_installs_the_probe_line(remote, tmp_path):
 
     assert result.returncode == 1
     assert remote.crontab.read_text(encoding="utf-8") == CRONTAB_BASELINE
+    assert remote.writes() == []          # 不是「写进去再还原」,是根本不写
 
 
 def _heartbeat_remote(remote: Remote, tmp_path: Path, source: str = SYNTHETIC_HEARTBEAT):
