@@ -22,7 +22,7 @@
 - 系统包：libxpm4 安全更新到 `1:3.5.12-1ubuntu0.22.04.4`，`nginx -t` 通过后重启 nginx（libxpm4 只经 image-filter 模块进 nginx）。内核 198 与 netplan 不在本窗口，要开 KiwiVM 控制台另约。
 - 完整预检（`--require-all --os`）**12/12**。树核 `verify_deployed_tree --capture` 在生产只读采集，**MATCH source_files=843 browser_files=21**（对 `af59c28` + CI run 36989627934 的 `dist/browser-dist-sha256.json`）。
 - `last-deploy.state`：`commit = af59c28…`，`receipt = PM_20260730_自动对话/265-审计修复批收据-20261002.md`。
-- 仓库 2026-10-02 转为私有（Eric 批准；转前确认运行期和自动化任务都不靠匿名拉取 raw 文件）。分支保护逐项不变：5 项必需检查、strict、管理员也受约束、禁强推禁删；匿名打开仓库页与题库 raw 文件均 404。本文的 PR 与 Actions 链接从此要有权限的 GitHub 账号才能打开。私有仓库的 Actions 按分钟计（Pro 每月含 3,000 分钟），CI 随之收窄：分支 push 不跑，main 的 push 与每周定时只跑 image 与 supply-chain，PR run 不再上传上线产物。上线口径改为 PR CI 绿 → 同 SHA fast-forward → 等 main 上该 SHA 的 push run 跑绿 → 只部署曾是 main 顶端的 SHA；本次即按此执行。
+- 仓库 2026-10-02 转为私有（Eric 批准；转前确认运行期和自动化任务都不靠匿名拉取 raw 文件）。分支保护逐项不变：5 项必需检查、strict、管理员也受约束、禁强推禁删；匿名打开仓库页与题库 raw 文件均 404。本文的 PR 与 Actions 链接从此要有权限的 GitHub 账号才能打开。私有仓库的 Actions 按分钟计（Pro 每月含 3,000 分钟，Eric 14:41 CT 定不另买），CI 随之收窄：分支 push 不跑，main 的 push 与每周定时只跑 image 与 supply-chain，PR run 不再上传上线产物，上传的只留 30 天。存储也按量计（Pro 含 1 GB）：同日删掉 109 个旧上线产物包，只留回滚要用的 5 份——`af59c28` 的 main 与分支 push run 各一份、`a2da5e7`、`1ab262a`、`3f49f32`，删后全部产物 427 个、115.8 MB（见收据 268 §四）。上线口径改为 PR CI 绿 → 同 SHA fast-forward → 等 main 上该 SHA 的 push run 跑绿 → 只部署曾是 main 顶端的 SHA；本次即按此执行。
 - 未验：真机平板（型号、浏览器、回声消除、麦克风指示灯）没上机，认证后的生产训练没做。工程部署完成不等于临床或研究批准。
 
 ## 2026-09-25 UTC 追加验收（应用仍为 `1ab262a`，未再次换版）
