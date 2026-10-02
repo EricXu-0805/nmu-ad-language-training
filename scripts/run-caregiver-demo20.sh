@@ -15,6 +15,7 @@ usage() {
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check start-position
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check answer-now
   scripts/run-caregiver-demo20.sh [--port 端口] --browser-check voice-barge-in
+  scripts/run-caregiver-demo20.sh [--port 端口] --browser-check voice-chains
   scripts/run-caregiver-demo20.sh --help
 
 作用：
@@ -31,6 +32,16 @@ usage() {
   求助那一段同时证明两件事：没配通知通道时屏上绝不出现「已送达」，
   而且库里也确实没有人写过 delivered。
   默认不执行浏览器验收，原有人工演练行为不变。
+
+  --browser-check voice-chains
+  全程不点「说完了」：伪麦克风先说约 1.6 秒再静 7 秒，证明平板尾静默
+  自动收麦（stop_reason=silence）按时触发；再换成不停顿的说话，证明没有
+  尾静默时只会撞作答窗口（max_duration）；同时普查老人页麦克风与音频图。
+  只有这个模式会把父 shell 里的 NMU_AUTOPILOT_VAD、
+  NMU_AUTOPILOT_VAD_TRAILING_MS、NMU_AUTOPILOT_VAD_SHORT_TRAILING_MS、
+  NMU_AUTOPILOT_VOICE_BARGE_IN 传给临时服务（值只许字母数字），例如
+    NMU_AUTOPILOT_VAD=0 scripts/run-caregiver-demo20.sh --browser-check voice-chains
+  VAD 关时第一段也只能撞作答窗口；平板没读服务端语音设置时走查直接判失败。
 
 默认端口：8815
 前置条件：web/dist/index.html 已完成构建，且 .venv 可用。
@@ -69,15 +80,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --browser-check)
       [ "$#" -ge 2 ] || {
-        echo "错误：--browser-check 后需要 start-pause、recovery-chains、adjudication-chains、start-position、answer-now 或 voice-barge-in" >&2
+        echo "错误：--browser-check 后需要 start-pause、recovery-chains、adjudication-chains、start-position、answer-now、voice-barge-in 或 voice-chains" >&2
         exit 64
       }
       [ -z "$BROWSER_CHECK" ] || {
         echo "错误：--browser-check 不能重复" >&2
         exit 64
       }
-      [ "$2" = "start-pause" ] || [ "$2" = "recovery-chains" ] || [ "$2" = "adjudication-chains" ] || [ "$2" = "start-position" ] || [ "$2" = "answer-now" ] || [ "$2" = "voice-barge-in" ] || {
-        echo "错误：--browser-check 只支持 start-pause、recovery-chains、adjudication-chains、start-position、answer-now 或 voice-barge-in" >&2
+      [ "$2" = "start-pause" ] || [ "$2" = "recovery-chains" ] || [ "$2" = "adjudication-chains" ] || [ "$2" = "start-position" ] || [ "$2" = "answer-now" ] || [ "$2" = "voice-barge-in" ] || [ "$2" = "voice-chains" ] || {
+        echo "错误：--browser-check 只支持 start-pause、recovery-chains、adjudication-chains、start-position、answer-now、voice-barge-in 或 voice-chains" >&2
         exit 64
       }
       BROWSER_CHECK="$2"
@@ -98,6 +109,30 @@ esac
 if [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ]; then
   echo "错误：端口必须在 1024–65535 之间" >&2
   exit 64
+fi
+
+# voice-chains 是唯一放行父 shell 语音开关的模式：名字写死、值只许 1–16 位字母数字，
+# 其余变量照旧被 env -i 挡在外面。字符集逐个写出，不靠随 locale 变的 [a-z] 区间。
+VOICE_SWITCH_ENV=()
+add_voice_switch() {
+  [ -n "$2" ] || return 0
+  case "$2" in
+    *[!0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]*)
+      echo "错误：${1} 只能是 1–16 位字母或数字" >&2
+      exit 64
+      ;;
+  esac
+  if [ "${#2}" -gt 16 ]; then
+    echo "错误：${1} 只能是 1–16 位字母或数字" >&2
+    exit 64
+  fi
+  VOICE_SWITCH_ENV+=("$1=$2")
+}
+if [ "$BROWSER_CHECK" = "voice-chains" ]; then
+  add_voice_switch NMU_AUTOPILOT_VAD "${NMU_AUTOPILOT_VAD-}"
+  add_voice_switch NMU_AUTOPILOT_VAD_TRAILING_MS "${NMU_AUTOPILOT_VAD_TRAILING_MS-}"
+  add_voice_switch NMU_AUTOPILOT_VAD_SHORT_TRAILING_MS "${NMU_AUTOPILOT_VAD_SHORT_TRAILING_MS-}"
+  add_voice_switch NMU_AUTOPILOT_VOICE_BARGE_IN "${NMU_AUTOPILOT_VOICE_BARGE_IN-}"
 fi
 
 REPO="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -240,6 +275,9 @@ HARNESS_ENV=(
 if [ -n "$BROWSER_CHECK" ]; then
   HARNESS_ENV+=("NMU_HARNESS_TTS_DURATION_PROFILE=browser-start-pause")
 fi
+if [ "${#VOICE_SWITCH_ENV[@]}" -gt 0 ]; then
+  HARNESS_ENV+=("${VOICE_SWITCH_ENV[@]}")
+fi
 
 env -i "${HARNESS_ENV[@]}" \
   "$PYTHON" -m harness.caregiver_demo_harness --migrate-and-seed
@@ -346,6 +384,15 @@ elif [ "$BROWSER_CHECK" = "answer-now" ]; then
   env -i "${HARNESS_ENV[@]}" \
     "$PYTHON" -m harness.caregiver_browser_acceptance --verify-answer-now-ledger
   echo "真实 Chrome 提前回答、录音判分与账本核验已全部通过"
+  exit 0
+elif [ "$BROWSER_CHECK" = "voice-chains" ]; then
+  echo "真实 Chrome 尾静默自动收麦走查开始（不显示临时凭据）…"
+  env -i "${HARNESS_ENV[@]}" \
+    "$BROWSER_PYTHON" -I "$REPO/harness/caregiver_voice_chains.py" \
+    --voice-chains --origin "http://127.0.0.1:$PORT"
+  env -i "${HARNESS_ENV[@]}" \
+    "$PYTHON" -m harness.caregiver_voice_chains --verify-ledger
+  echo "真实 Chrome 尾静默自动收麦（说完静下来→silence；一直说→max_duration）、麦克风普查与账本核验已全部通过"
   exit 0
 elif [ -n "$BROWSER_CHECK" ]; then
   echo "真实 Chrome 验收开始（不显示临时凭据）…"

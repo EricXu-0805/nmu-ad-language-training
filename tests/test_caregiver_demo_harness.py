@@ -378,6 +378,65 @@ def test_shell_missing_dist_stops_before_creating_temp_root(tmp_path):
     assert list(scratch.iterdir()) == []
 
 
+def _fake_repo_with_script(tmp_path: Path) -> tuple[Path, Path]:
+    """只有启动器和 .venv/bin/python 的空仓库:参数过了关也会停在缺 dist 那一步。"""
+    source = shared.PLATFORM_ROOT / "scripts" / "run-caregiver-demo20.sh"
+    fake_repo = _private_root(tmp_path, "fake-repo")
+    scripts = fake_repo / "scripts"
+    scripts.mkdir()
+    copied = scripts / source.name
+    shutil.copy2(source, copied)
+    python_dir = fake_repo / ".venv" / "bin"
+    python_dir.mkdir(parents=True)
+    (python_dir / "python").symlink_to(sys.executable)
+    return fake_repo, copied
+
+
+def test_shell_accepts_the_voice_chains_browser_check(tmp_path):
+    fake_repo, copied = _fake_repo_with_script(tmp_path)
+    scratch = _private_root(tmp_path, "voice-chains-scratch")
+    result = subprocess.run(
+        ["/bin/bash", str(copied), "--browser-check", "voice-chains"],
+        cwd=str(fake_repo),
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TMPDIR": str(scratch),
+             "NMU_AUTOPILOT_VAD": "0", "NMU_AUTOPILOT_VAD_TRAILING_MS": "3000"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    # 不认识的模式在参数阶段就退 64;认得的模式才会走到「缺 dist」这一步。
+    assert result.returncode == 1, result.stderr
+    assert "web/dist/index.html" in result.stderr
+    assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("NMU_AUTOPILOT_VAD", "0;touch pwned"),
+        ("NMU_AUTOPILOT_VAD", "off ok"),
+        ("NMU_AUTOPILOT_VOICE_BARGE_IN", "$(id)"),
+        ("NMU_AUTOPILOT_VAD_TRAILING_MS", "3000\nCONSOLE_PIN=1"),
+        ("NMU_AUTOPILOT_VAD_SHORT_TRAILING_MS", "9" * 17),
+    ],
+)
+def test_shell_rejects_unsafe_voice_switch_values_before_writing(tmp_path, name, value):
+    fake_repo, copied = _fake_repo_with_script(tmp_path)
+    scratch = _private_root(tmp_path, "voice-switch-scratch")
+    result = subprocess.run(
+        ["/bin/bash", str(copied), "--browser-check", "voice-chains"],
+        cwd=str(fake_repo),
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TMPDIR": str(scratch), name: value},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 64, result.stderr
+    assert name in result.stderr
+    assert value not in result.stderr
+    assert list(scratch.iterdir()) == []
+
+
 def test_shell_cleanup_and_minimal_environment_are_structurally_pinned():
     script = shared.PLATFORM_ROOT / "scripts" / "run-caregiver-demo20.sh"
     text = script.read_text(encoding="utf-8")
@@ -395,6 +454,16 @@ def test_shell_cleanup_and_minimal_environment_are_structurally_pinned():
     assert '--browser-check start-pause' in text
     assert '--browser-check adjudication-chains' in text
     assert 'browser-adjudication-chains-result.json' not in text
+    assert '--browser-check voice-chains' in text
+    assert '"$REPO/harness/caregiver_voice_chains.py"' in text
+    assert '-m harness.caregiver_voice_chains --verify-ledger' in text
+    assert 'browser-voice-chains-result.json' not in text
+    # 语音开关只放行这四个名字,而且只在 voice-chains 模式下进 HARNESS_ENV。
+    from harness import caregiver_voice_chains
+    for name in caregiver_voice_chains.VOICE_SWITCH_ENVS:
+        assert f'add_voice_switch {name} "${{{name}-}}"' in text
+    assert text.index('if [ "$BROWSER_CHECK" = "voice-chains" ]; then') < text.index('add_voice_switch NMU_')
+    assert text.index('add_voice_switch NMU_') < text.index('mktemp -d')
     assert 'BROWSER_PYTHON' in text
     assert 'from playwright.sync_api import sync_playwright' in text
     assert '不会自动联网安装' in text
