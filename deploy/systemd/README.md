@@ -48,9 +48,18 @@ tail -3 /opt/nmu/backups/backup.log     # 运维真相在这里，不在 status 
 
 所有 `nmu-*.service`（含 `nmu.service`/`nmu-caddy.service` 本体）都带
 `OnFailure=nmu-alert@%N.service`：单元进入 failed 时,`nmu-alert@.service` 用系统
-python3 跑 `scripts/notify_ops.py --unit <单元名>`,把主机名 + journal 尾部推到
-Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,成功永远安静。
+python3 跑 `scripts/notify_ops.py --unit <单元名>`,把主机名、失败原因和这一轮的
+journal 推到 Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,成功永远安静。
 
+- 失败原因排在消息最前面(取前 600 字):`nmu-os-security` / `nmu-restore-drill` /
+  `nmu-capacity` / `nmu-backup-health` 取各自的 state 文件,`nmu-backup` 取
+  `backup.log` 最后一行,`nmu-health` 取这一轮 curl 自己的输出。2026-09-28 那次
+  os-security 告警里一个待装的包都没有:结论整份重定向进了 state 文件,journal 里只剩
+  systemd 自己那几行。state 文件不是这一轮写的(脚本在写结论之前就挂了),消息里会标出来。
+- 日志只取失败的这一轮(`systemctl show -p InvocationID` → `journalctl
+  _SYSTEMD_INVOCATION_ID=…`);拿不到 InvocationID 才退回 `-n 12`,并注明可能混有上一轮。
+- 发送失败隔 30 秒再试一次;两次都失败,`nmu-alert@` 自己退非零进 failed,
+  `systemctl --failed` 里看得见。
 - webhook 只存在 `/opt/nmu/ops-alert.env`(0600,一行 `NMU_OPS_WEBHOOK=…`),不进
   仓库、不进单元正文;换频道=换这个文件,不动代码。
 - Mac 侧对应物:`install-macos-offsite-pull.sh` 生成的 `run-pull.sh` 在拉取失败
