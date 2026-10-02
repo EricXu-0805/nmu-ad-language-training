@@ -984,3 +984,200 @@ def test_daily_uses_app_venv_when_python_bin_is_unset(tmp_path):
     assert " verify-vps " in f" {invocations} "
     assert " publish-vps " in f" {invocations} "
     assert len(invocations.splitlines()) >= 8
+
+
+# ---------------------------------------------------------------------------
+# 录音硬链接去重开关（NMU_BACKUP_LINK_AUDIO，默认关）
+# ---------------------------------------------------------------------------
+
+_OK_LINE = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ok snapshot=(?P<stamp>[0-9]{8}-[0-9]{6}) "
+    r"size=\S+ config=ok keep=14 source_bytes=[0-9]+ source_dirs=[0-9]+ "
+    r"reserve_bytes=[0-9]+(?P<tail>.*)$")
+_LINK_TAIL = re.compile(
+    r"^ linked=(?P<linked>[0-9]+) new_bytes=(?P<new_bytes>[0-9]+) "
+    r"cmp_mismatch=(?P<mismatch>[0-9]+)$")
+
+
+def _add_live_audio(app: Path, raw_id: str, payload: bytes) -> Path:
+    audio = app / "data" / "audio"
+    audio.mkdir(exist_ok=True)
+    path = audio / f"{raw_id}.webm"
+    path.write_bytes(payload)
+    connection = sqlite3.connect(app / "data" / "app.db")
+    try:
+        connection.execute(
+            "INSERT INTO audioassetrow "
+            "(raw_audio_id,status,withdrawn,withdrawal_status,checksum,byte_count,"
+            "audio_format,is_simulation,data_classification,patient_turn_ref_version,"
+            "is_reliability_sample,contains_direct_identifier,delete_gate_passed) "
+            "VALUES (?,?,?,?,?,?,?,0,'research',2,0,0,0)",
+            (raw_id, "recorded", 0, None, hashlib.sha256(payload).hexdigest(),
+             len(payload), "webm"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def _traced_daily_harness(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path]:
+    """每轮快照名由测试指定（同一秒连跑两次会撞名），解释器调用全部留痕。"""
+    app, root, env = _daily_harness(tmp_path)
+    stubs = Path(env["PATH"].split(":", 1)[0])
+    real_date = shutil.which("date") or "/bin/date"
+    _make_executable(stubs / "date", f'''#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = "+%Y%m%d-%H%M%S" ] && [ -n "${{FAKE_STAMP:-}}" ]; then
+  printf '%s\\n' "$FAKE_STAMP"
+  exit 0
+fi
+exec {real_date} "$@"
+''')
+    trace = tmp_path / "python-trace.log"
+    traced_python = tmp_path / "traced-python"
+    _make_executable(
+        traced_python,
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$PYTHON_TRACE\"\n"
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+    )
+    env["PYTHON_BIN"] = str(traced_python)
+    env["PYTHON_TRACE"] = str(trace)
+    return app, root, env, trace
+
+
+def _run_daily(app: Path, env: dict[str, str], stamp: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "scripts/vps-backup-daily.sh"], cwd=app,
+        env={**env, "FAKE_STAMP": stamp}, check=False, capture_output=True, text=True,
+    )
+
+
+def _ok_lines(root: Path) -> list[re.Match[str]]:
+    lines = (root / "backup.log").read_text(encoding="utf-8").splitlines()
+    matches = [_OK_LINE.fullmatch(line) for line in lines if "] ok " in line]
+    assert all(matches), lines
+    return matches
+
+
+def _verify_vps(snapshot: Path, *link_root: Path) -> subprocess.CompletedProcess[str]:
+    extra = ["--link-root", str(link_root[0])] if link_root else []
+    return subprocess.run(
+        [sys.executable, "-I", str(GUARD_SOURCE), "verify-vps", *extra, str(snapshot)],
+        check=False, capture_output=True, text=True,
+    )
+
+
+@pytest.mark.parametrize("switch", [None, "true"])
+def test_daily_switch_off_is_the_previous_behaviour(switch, tmp_path):
+    app, root, env, trace = _traced_daily_harness(tmp_path)
+    if switch is not None:
+        env["NMU_BACKUP_LINK_AUDIO"] = switch
+    live = _add_live_audio(app, "aud-old", b"unchanged-recording")
+
+    for stamp in ("20261001-193000", "20261002-193000"):
+        completed = _run_daily(app, env, stamp)
+        assert completed.returncode == 0, completed.stderr
+
+    older, newer = (root / "daily" / stamp for stamp in ("20261001-193000", "20261002-193000"))
+    inodes = set()
+    for snapshot in (older, newer):
+        copied = snapshot / "audio" / "aud-old.webm"
+        assert copied.stat().st_nlink == 1
+        inodes.add(copied.stat().st_ino)
+        assert _verify_vps(snapshot).returncode == 0
+        assert sorted(path.relative_to(snapshot).as_posix()
+                      for path in snapshot.rglob("*") if path.is_file()) == sorted(
+            ["MANIFEST.sha256", "app.db", "audio/aud-old.webm",
+             *(f"config/{name}" for name in _GUARD.VPS_CONFIG_FILES)])
+    assert len(inodes) == 2 and live.stat().st_ino not in inodes
+    assert [match["tail"] for match in _ok_lines(root)] == ["", ""]
+    calls = [line for line in trace.read_text(encoding="utf-8").splitlines()
+             if " verify-vps " in f" {line} " or " publish-vps " in f" {line} "]
+    assert len(calls) == 4
+    assert all(re.fullmatch(
+        r"-I \S+/verify_backup_snapshot\.py "
+        r"(verify-vps \S+/daily/\.[0-9]{8}-[0-9]{6}\.partial\.[0-9]+"
+        r"|publish-vps \S+/daily/\.[0-9]{8}-[0-9]{6}\.partial\.[0-9]+ \S+/daily/[0-9]{8}-[0-9]{6})",
+        line) for line in calls), calls
+
+
+def test_daily_switch_on_links_unchanged_audio_and_survives_rotation(tmp_path):
+    app, root, env, trace = _traced_daily_harness(tmp_path)
+    env["NMU_BACKUP_LINK_AUDIO"] = "1"
+    daily = root / "daily"
+    old_live = _add_live_audio(app, "aud-old", b"unchanged-recording")
+
+    first = _run_daily(app, env, "20261001-193000")
+    assert first.returncode == 0, first.stderr
+    new_live = _add_live_audio(app, "aud-new", b"recorded-after-the-first-backup")
+    second = _run_daily(app, env, "20261002-193000")
+    assert second.returncode == 0, second.stderr
+
+    older, newer = daily / "20261001-193000", daily / "20261002-193000"
+    shared = newer / "audio" / "aud-old.webm"
+    assert shared.stat().st_ino == (older / "audio" / "aud-old.webm").stat().st_ino
+    assert shared.stat().st_nlink == 2
+    assert (newer / "audio" / "aud-new.webm").stat().st_nlink == 1
+    for live in (old_live, new_live):
+        assert live.stat().st_nlink == 1
+        assert live.stat().st_ino not in {
+            path.stat().st_ino for path in daily.rglob("*.webm")}
+
+    tails = [_LINK_TAIL.fullmatch(match["tail"]) for match in _ok_lines(root)]
+    assert all(tails), tails
+    assert [(tail["linked"], tail["mismatch"]) for tail in tails] == [("0", "0"), ("1", "0")]
+    newer_bytes = sum(path.stat().st_size for path in newer.rglob("*") if path.is_file())
+    assert int(tails[1]["new_bytes"]) == newer_bytes - len(b"unchanged-recording")
+
+    strict = _verify_vps(newer)
+    assert strict.returncode == 2
+    assert "code=snapshot_hardlinked_file" in strict.stderr
+    for snapshot in (older, newer):
+        assert _verify_vps(snapshot, daily).returncode == 0
+    assert any(re.fullmatch(
+        r"-I \S+/verify_backup_snapshot\.py verify-vps --link-root \S+/daily "
+        r"\S+/daily/\.20261002-193000\.partial\.[0-9]+", line)
+        for line in trace.read_text(encoding="utf-8").splitlines())
+
+    # 轮转删掉最旧一份后，较新的快照照样自证；下一份接着与它共享。
+    shutil.rmtree(older)
+    assert shared.stat().st_nlink == 1
+    assert _verify_vps(newer).returncode == 0
+    third = _run_daily(app, env, "20261003-193000")
+    assert third.returncode == 0, third.stderr
+    newest = daily / "20261003-193000"
+    for name in ("aud-old.webm", "aud-new.webm"):
+        assert (newest / "audio" / name).stat().st_ino == (newer / "audio" / name).stat().st_ino
+    assert _LINK_TAIL.fullmatch(_ok_lines(root)[-1]["tail"])["linked"] == "2"
+    assert _verify_vps(newest, daily).returncode == 0
+
+
+def test_daily_switch_on_copies_afresh_when_previous_bytes_differ(tmp_path):
+    app, root, env, _trace = _traced_daily_harness(tmp_path)
+    env["NMU_BACKUP_LINK_AUDIO"] = "1"
+    live = _add_live_audio(app, "aud-old", b"unchanged-recording")
+    assert _run_daily(app, env, "20261001-193000").returncode == 0
+    older = root / "daily" / "20261001-193000" / "audio" / "aud-old.webm"
+    with older.open("r+b") as handle:
+        handle.write(b"U")  # 同名同长，只有字节不同：上一份那里已经坏了
+
+    completed = _run_daily(app, env, "20261002-193000")
+
+    assert completed.returncode == 0, completed.stderr
+    copied = root / "daily" / "20261002-193000" / "audio" / "aud-old.webm"
+    assert copied.stat().st_ino != older.stat().st_ino
+    assert copied.stat().st_nlink == 1
+    assert copied.read_bytes() == live.read_bytes()
+    tail = _LINK_TAIL.fullmatch(_ok_lines(root)[-1]["tail"])
+    assert (tail["linked"], tail["mismatch"]) == ("0", "1")
+    assert _verify_vps(copied.parents[1]).returncode == 0
+
+
+def test_backup_unit_reads_an_optional_switch_file_and_never_turns_it_on():
+    unit = (ROOT / "deploy" / "systemd" / "nmu-backup.service").read_text(encoding="utf-8")
+    directives = [line.strip() for line in unit.splitlines()
+                  if line.strip() and not line.strip().startswith("#")]
+
+    assert "EnvironmentFile=-/opt/nmu/backup-dedup.env" in directives
+    assert not any("NMU_BACKUP_LINK_AUDIO" in line for line in directives)
