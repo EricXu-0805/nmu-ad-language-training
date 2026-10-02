@@ -20,6 +20,9 @@ SOURCE_SCHEMA_VERSION = "session-outcome-source-v1"
 # v2 = v1 + 控制账本里的接管。没有接管的场次仍按 v1 原样投影、摘要逐字节不变，
 # 这样改口径之前冻结的不可变汇总照旧能复核。
 SOURCE_SCHEMA_VERSION_WITH_TAKEOVERS = "session-outcome-source-v2"
+# v3 = v2 + 研究者跳过、但留有录音尝试的题位（技术失败后跳过）。跳过题位上没有尝试的
+# 场次仍按 v1/v2 原样投影，已冻结汇总的摘要逐字节不变。
+SOURCE_SCHEMA_VERSION_WITH_SKIPPED_ATTEMPTS = "session-outcome-source-v3"
 CLOSEOUT_SCHEMA_VERSION = "session-closeout.v1"
 CLOSEOUT_REQUEST_SCHEMA_VERSION = "session-closeout-request-v1"
 
@@ -184,10 +187,14 @@ def build_session_outcome_summary(
     interactions: Iterable[InteractionEvidenceRow],
     generated_at: datetime,
     autopilot_takeovers: Iterable[TakeoverEvidenceRow] = (),
+    skipped_positions: Iterable[tuple[str, int]] = (),
 ) -> SessionOutcomeValues:
     """Build deterministic summary values from non-text evidence projections.
 
     Every ``turn_evidence`` row represents one expected frozen-plan turn.
+    ``skipped_positions`` are plan positions a researcher skipped; they are never
+    expected turns, and attempts recorded there before the skip are counted but
+    never complete a turn.
     Duplicate or internally inconsistent evidence fails closed instead of being
     silently collapsed.  ``generated_at`` is persisted but intentionally omitted
     from ``source_digest`` so an identical source snapshot has an identical hash.
@@ -232,6 +239,19 @@ def build_session_outcome_summary(
             "audio_evidenced": audio_evidenced,
         })
 
+    # 研究者跳过的题位不在 expected 里；技术失败后跳过的题位留着那几段尝试，
+    # 照实计入尝试次数，但不算「AI 完成环节」。
+    skipped_keys: set[tuple[str, int]] = set()
+    for item_id, turn_seq in skipped_positions:
+        key = (_required_text(item_id, "skipped.item_id"),
+               _positive_int(turn_seq, "skipped.turn_seq"))
+        if key in expected_keys:
+            raise ValueError(f"skipped position is also expected: {key[0]}#{key[1]}")
+        if key in skipped_keys:
+            raise ValueError(f"duplicate skipped position: {key[0]}#{key[1]}")
+        skipped_keys.add(key)
+    skipped_attempt_keys: set[tuple[str, int]] = set()
+
     canonical_attempts: list[dict[str, object]] = []
     attempt_keys: set[tuple[str, int, int]] = set()
     completed_turn_keys: set[tuple[str, int]] = set()
@@ -259,8 +279,11 @@ def build_session_outcome_summary(
                 needs_review, "attempt.operational_needs_review")
 
         turn_key = (item_id, turn_seq)
-        if turn_key not in expected_keys:
+        skipped = turn_key in skipped_keys
+        if turn_key not in expected_keys and not skipped:
             raise ValueError(f"attempt outside expected plan: {item_id}#{turn_seq}")
+        if skipped:
+            skipped_attempt_keys.add(turn_key)
         key = (item_id, turn_seq, attempt_seq)
         if key in attempt_keys:
             raise ValueError(
@@ -269,7 +292,8 @@ def build_session_outcome_summary(
         prompt_counts[prompt_level] += 1
         if processing_status == "completed":
             completed_attempts += 1
-            completed_turn_keys.add(turn_key)
+            if not skipped:
+                completed_turn_keys.add(turn_key)
         if needs_review is True:
             needs_review_attempts += 1
         if processing_status == "technical_failure":
@@ -347,6 +371,11 @@ def build_session_outcome_summary(
     if takeover_sequences:
         source_projection["source_schema_version"] = SOURCE_SCHEMA_VERSION_WITH_TAKEOVERS
         source_projection["autopilot_takeovers"] = sorted(takeover_sequences)
+    if skipped_attempt_keys:
+        source_projection["source_schema_version"] = (
+            SOURCE_SCHEMA_VERSION_WITH_SKIPPED_ATTEMPTS)
+        source_projection["skipped_positions"] = [
+            [item_id, turn_seq] for item_id, turn_seq in sorted(skipped_keys)]
     source_digest = hashlib.sha256(
         _canonical_bytes(source_projection)).hexdigest()
 

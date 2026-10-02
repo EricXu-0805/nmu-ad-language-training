@@ -191,6 +191,55 @@ def test_autopilot_control_takeovers_are_counted_and_bound_into_the_digest():
     assert "researcher-" not in json.dumps(summary.to_dict(), default=str)
 
 
+def test_attempts_on_skipped_positions_are_counted_but_never_complete_a_turn():
+    """技术失败后研究者跳过：题位不在 expected 里，那几段尝试照实计数、绑进摘要。"""
+    turns, attempts, interactions = _evidence()
+    skipped_attempts = [
+        AttemptEvidence("C", 1, 1, "audio-c-1", 0, "completed", False),
+        AttemptEvidence("C", 1, 2, "audio-c-2", 1, "technical_failure", None),
+    ]
+    with pytest.raises(ValueError, match="attempt outside expected plan: C#1"):
+        _build(turns, attempts + skipped_attempts, interactions)
+
+    summary = _build(turns, attempts + skipped_attempts, interactions,
+                     skipped_positions=[("C", 1), ("D", 1)])
+    baseline = _build(turns, attempts, interactions)
+    assert (summary.expected_turns, summary.matched_turns,
+            summary.completed_attempt_turns, summary.audio_evidenced_turns) == (
+        baseline.expected_turns, baseline.matched_turns,
+        baseline.completed_attempt_turns, baseline.audio_evidenced_turns)
+    assert (summary.total_attempts, summary.completed_attempts,
+            summary.technical_failure_attempts) == (6, 3, 2)
+    assert (summary.prompt_level_0_count, summary.prompt_level_1_count) == (2, 2)
+    assert summary.source_digest not in {baseline.source_digest, V1_BASELINE_DIGEST}
+    reordered = _build(turns, list(reversed(attempts + skipped_attempts)), interactions,
+                       skipped_positions=[("D", 1), ("C", 1)])
+    assert reordered.source_digest == summary.source_digest
+    fewer_skips = _build(turns, attempts + skipped_attempts, interactions,
+                         skipped_positions=[("C", 1)])
+    assert fewer_skips.source_digest != summary.source_digest
+
+
+def test_skipped_positions_without_attempts_keep_the_v1_and_v2_digests():
+    turns, attempts, interactions = _evidence()
+    assert _build(turns, attempts, interactions,
+                  skipped_positions=[("C", 1)]).source_digest == V1_BASELINE_DIGEST
+    takeovers = [TakeoverEvidence(5)]
+    assert _build(turns, attempts, interactions, autopilot_takeovers=takeovers,
+                  skipped_positions=[("C", 1)]).source_digest == _build(
+        turns, attempts, interactions, autopilot_takeovers=takeovers).source_digest
+
+
+def test_skipped_position_that_is_also_expected_or_repeated_fails_closed():
+    turns, attempts, interactions = _evidence()
+    with pytest.raises(ValueError, match="skipped position is also expected: A#1"):
+        _build(turns, attempts, interactions, skipped_positions=[("A", 1)])
+    with pytest.raises(ValueError, match="duplicate skipped position: C#1"):
+        _build(turns, attempts, interactions, skipped_positions=[("C", 1), ("C", 1)])
+    with pytest.raises(ValueError, match="skipped.turn_seq"):
+        _build(turns, attempts, interactions, skipped_positions=[("C", 0)])
+
+
 def test_duplicate_or_invalid_autopilot_takeover_fails_closed():
     turns, attempts, interactions = _evidence()
     with pytest.raises(ValueError, match="duplicate autopilot takeover"):
