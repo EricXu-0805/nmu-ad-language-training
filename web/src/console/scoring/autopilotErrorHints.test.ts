@@ -8,6 +8,7 @@ import {
   RESUME_PREWRITE_CODES,
   autopilotErrorHint,
   autopilotPausedTone,
+  autopilotResumeRefusalHint,
 } from "./autopilotErrorHints.ts";
 
 // 服务端能写进自动带练状态 last_error_code 的码。2026-10-02 在 a2da5e7 上对 app/ 逐处 grep:
@@ -134,4 +135,16 @@ test("四种下一题内容缺口都按内容缺口处理(不给继续/裁定)",
 
 test("没有逐个写提示的码照旧把错误码给出来,方便研究团队排查", () => {
   assert.equal(autopilotErrorHint("autopilot_state_invalid"), "错误码：autopilot_state_invalid");
+});
+
+test("人工态下点「切回 AI」被技术失败挡住:不再叫人去点已经不显示的「转为人工操作」", () => {
+  const manual = autopilotResumeRefusalHint("autopilot_attempt_failed", true);
+  assert.doesNotMatch(manual, /转为人工操作/);
+  assert.match(manual, /人工.*做完/);
+  assert.match(manual, /切回 AI 自动带练/);
+  // 还在 AI 托管下暂停时,转人工就是唯一出口,原提示不变。
+  assert.equal(autopilotResumeRefusalHint("autopilot_attempt_failed", false),
+    autopilotErrorHint("autopilot_attempt_failed"));
+  assert.equal(autopilotResumeRefusalHint("autopilot_attempt_processing", true),
+    autopilotErrorHint("autopilot_attempt_processing"));
 });

@@ -3885,7 +3885,8 @@ def _completed_attempts_at(
     ).order_by(AttemptEvent.attempt_seq)))
     if any(a.processing_status == "technical_failure" for a in attempts):
         _fail("autopilot_attempt_failed",
-              "这一题上一段录音判分失败,AI 不能接着弹;请「转为人工操作」处理这一题")
+              "这一题上一段录音判分失败,AI 不能接着弹;请「转为人工操作」处理这一题,"
+              "已在人工操作中的先把这一题人工做完再切回")
     unfinished = [a for a in attempts if a.processing_status != "completed"]
     if unfinished:
         # 安全暂停会作废所有在途 worker 的处理租约(evidence_ledger.invalidate_processing_claims):

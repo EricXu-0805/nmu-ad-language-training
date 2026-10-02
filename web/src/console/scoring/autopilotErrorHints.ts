@@ -110,6 +110,15 @@ export function autopilotErrorHint(code: string): string {
   return Object.hasOwn(AUTOPILOT_ERROR_HINTS, code) ? AUTOPILOT_ERROR_HINTS[code] : `错误码：${code}`;
 }
 
+// 「继续 / 切回 AI」被拒时的提示。技术失败那一题在 AI 托管下只能转人工；已经在人工态时
+// 「转为人工操作」按钮不再显示，同一个码的意思变成「这一题还没人工做完」。
+export function autopilotResumeRefusalHint(code: string, manual: boolean): string {
+  if (manual && code === "autopilot_attempt_failed") {
+    return "这一题上一段录音判分失败，还没有人工做完；先在下方人工面板把这一题做完，再点「切回 AI 自动带练」。";
+  }
+  return autopilotErrorHint(code);
+}
+
 // 裁定写前拒绝码:服务端明确未写入,可安全回退到刚重取的权威回执并常驻提示。
 export const ADJUDICATION_PREWRITE_CODES: ReadonlySet<string> = new Set([
   "autopilot_adjudication_requires_pause",

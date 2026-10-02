@@ -56,6 +56,7 @@ import {
   RESUME_PREWRITE_CODES,
   autopilotErrorHint,
   autopilotPausedTone,
+  autopilotResumeRefusalHint,
 } from "./autopilotErrorHints.ts";
 import { itemSeqLabel, itemSeqSummary } from "../itemNumbering.ts";
 
@@ -495,7 +496,9 @@ export function ServerAutopilotControl({
         const code = autopilotConflictCode(error);
         if (code === null || !RESUME_PREWRITE_CODES.has(code)) throw error;
         acceptReceipt(latest);
-        setControlNotice({ label: "未能继续", text: autopilotErrorHint(code) });
+        setControlNotice({
+          label: "未能继续", text: autopilotResumeRefusalHint(code, latest.mode === "manual"),
+        });
       }
     } catch (error) {
       const message = error instanceof ApiError ? error.detail
