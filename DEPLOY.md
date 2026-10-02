@@ -293,15 +293,15 @@ Compose 的 external `APPDATA_VOLUME`。在 Docker-aware 定时任务、单元�
 **2026-07-17 留存的裸机运维记录（本轮未连接服务器，必须现场复核，不能作为当前 build 或 Compose 卷的备份验收证据）：**
 
 - **VPS 端**：systemd `nmu-backup.timer` 每日 03:30（上海）调用
-  `scripts/vps-backup-daily.sh`。脚本先在隐藏 staging 中生成 SQLite 在线快照，复制已完成录音、导出与六份重建配置（`.env`、Caddyfile、应用/Caddy/备份 service 和备份 timer），再执行完整 manifest、SQLite `integrity_check`、外键检查、当前 Alembic head/恢复表列合同及 DB↔录音双向语义闭包。复制前按 SQLite 逻辑页、录音、两类导出与配置估算源逻辑字节、文件数和目录数，并加入文件/目录 metadata、至少 64MiB/10% 增长余量和 `NMU_BACKUP_RESERVE_BYTES` 硬保留空间（默认 512MiB）；源文件最多 99999 个、目录最多 10000 个，可分别用 `NMU_BACKUP_SOURCE_FILE_LIMIT` / `NMU_BACKUP_SOURCE_DIRECTORY_LIMIT` 向下收紧，不能调高 current snapshot 合同。空间不足、文件/目录超限或源目录不可扫描时 fail-closed。所有检查和落盘同步成功后才同文件系统原子发布 `/opt/nmu/backups/daily/<时间戳>/`；任何一步失败都删除未完成 payload，只在权限 `0600` 的 `backup.log` 保留固定原因码且不得写 `ok`。VPS 只保留最近 14 份。解释器按显式 `PYTHON_BIN` → `/opt/nmu/app/.venv/bin/python` → `python3` 解析，并由同一个解释器完成预检、快照和发布；systemd 单元应显式设置 `Environment=PYTHON_BIN=/opt/nmu/app/.venv/bin/python`，且该环境须包含部署锁文件声明的 SQLAlchemy 等运行依赖。**运维真相看 `/opt/nmu/backups/backup.log` 审计行**，不要只看 systemd 状态。
-- **异地副本**：受控运维工作站定时调用 `scripts/vps-backup-pull.sh`。每份远端快照先进入私有 `.incoming`，用同一 current-only VPS 合同验证后原子发布；同名重放只有完整树逐字节一致才接受，差异进入 `conflicts/`，旧 Alembic head 进入 `legacy-unvalidated/`。传输前会聚合验证单快照/本轮的文件数、目录数与字节数并校验本地剩余空间；随后只先拉取固定名称且最大 64MiB 的 manifest，由严格解析器生成权限 `0600`、NUL 分隔的临时 allowlist，第二次 rsync 只接收 manifest 列出的精确文件路径。接收后先重新取得同一远端快照的文件/字节/目录/非法类型事实，必须与 preflight 完全一致，再核对本地接收事实并验证内容；临时 allowlist 无论成败都删除。任何未成为清单文件父级的空目录（包括 orphan/staging/classification）都按 current-only 合同拒绝并隔离，不能在拉取时静默净化；真正的历史版本必须由运维员按 8.1 SOP 做明确的 `legacy-unvalidated/` handoff，不得靠重命名伪装为当前合格快照。默认上限可通过六个 `NMU_BACKUP_MAX_*` 环境变量向下收紧或按经批准容量调整。该白名单会阻断探测后注入的未列名文件/目录洪泛，但受损远端仍可能在探测与传输之间放大已列名文件，所以异地根目录必须位于**独立、加密且有硬 quota/限容的卷**，代码门不能替代宿主配额。脚本不会根据可能已受损的远端目录名自动删除本地已完成存档；深历史容量、配额和修剪由受控本地存储/Time Machine 运维负责。这里描述的是**持久化备份副本**的流向；启用云 ASR/LLM 时，音频和回答文本仍会按本文开头的数据流发往第三方云，不能据此宣称“患者数据只在自有机器间流动”。
+  `scripts/vps-backup-daily.sh`。脚本先在隐藏 staging 中生成 SQLite 在线快照，复制已完成录音、导出与六份重建配置（`.env`、Caddyfile、应用/Caddy/备份 service 和备份 timer），再执行完整 manifest、SQLite `integrity_check`、外键检查、当前 Alembic head/恢复表列合同及 DB↔录音双向语义闭包。复制前按 SQLite 逻辑页、录音、两类导出与配置估算源逻辑字节、文件数和目录数，并加入文件/目录 metadata、至少 64MiB/10% 增长余量和 `NMU_BACKUP_RESERVE_BYTES` 硬保留空间（默认 512MiB）；源文件最多 99999 个、目录最多 10000 个，可分别用 `NMU_BACKUP_SOURCE_FILE_LIMIT` / `NMU_BACKUP_SOURCE_DIRECTORY_LIMIT` 向下收紧，不能调高 current snapshot 合同。空间不足、文件/目录超限或源目录不可扫描时 fail-closed。所有检查和落盘同步成功后才同文件系统原子发布 `/opt/nmu/backups/daily/<时间戳>/`；任何一步失败都删除未完成 payload，只在权限 `0600` 的 `backup.log` 保留固定原因码且不得写 `ok`。VPS 只保留最近 14 份；相邻快照之间是否硬链接共享未变录音由默认关的开关决定，见 8.3。解释器按显式 `PYTHON_BIN` → `/opt/nmu/app/.venv/bin/python` → `python3` 解析，并由同一个解释器完成预检、快照和发布；systemd 单元应显式设置 `Environment=PYTHON_BIN=/opt/nmu/app/.venv/bin/python`，且该环境须包含部署锁文件声明的 SQLAlchemy 等运行依赖。**运维真相看 `/opt/nmu/backups/backup.log` 审计行**，不要只看 systemd 状态。
+- **异地副本**：受控运维工作站定时调用 `scripts/vps-backup-pull.sh`。每份远端快照先进入私有 `.incoming`，用同一 current-only VPS 合同验证后原子发布；同名重放只有完整树逐字节一致才接受，差异进入 `conflicts/`，旧 Alembic head 进入 `legacy-unvalidated/`。已经归档的同名快照，远端 manifest 与本地逐字节相同、文件/字节/目录数一致且本地这份仍过 `verify-vps` 时只拉 manifest、计入 `unchanged`，不再整份下载；任一项不符才整份下载并逐字节比对。新快照以本地最新一份为 `--copy-dest` 基底并带 `--checksum`，相同内容在本机复制。远端顶层 `audio/` 的多链接文件（8.3 开关打开后）被接受，其余硬链接照拒；落地的都是独立文件，本地校验仍要求 nlink=1。传输前会聚合验证单快照/本轮的文件数、目录数与字节数并校验本地剩余空间；随后只先拉取固定名称且最大 64MiB 的 manifest，由严格解析器生成权限 `0600`、NUL 分隔的临时 allowlist，第二次 rsync 只接收 manifest 列出的精确文件路径。接收后先重新取得同一远端快照的文件/字节/目录/非法类型事实，必须与 preflight 完全一致，再核对本地接收事实并验证内容；临时 allowlist 无论成败都删除。任何未成为清单文件父级的空目录（包括 orphan/staging/classification）都按 current-only 合同拒绝并隔离，不能在拉取时静默净化；真正的历史版本必须由运维员按 8.1 SOP 做明确的 `legacy-unvalidated/` handoff，不得靠重命名伪装为当前合格快照。默认上限可通过六个 `NMU_BACKUP_MAX_*` 环境变量向下收紧或按经批准容量调整。该白名单会阻断探测后注入的未列名文件/目录洪泛，但受损远端仍可能在探测与传输之间放大已列名文件，所以异地根目录必须位于**独立、加密且有硬 quota/限容的卷**，代码门不能替代宿主配额。脚本不会根据可能已受损的远端目录名自动删除本地已完成存档；深历史容量、配额和修剪由受控本地存储/Time Machine 运维负责。这里描述的是**持久化备份副本**的流向；启用云 ASR/LLM 时，音频和回答文本仍会按本文开头的数据流发往第三方云，不能据此宣称“患者数据只在自有机器间流动”。
 
 ### 8.1 恢复 SOP（必须做真实演练）
 
 `sha256sum -c` 只能证明清单中的字节，不能证明数据库可恢复、版本正确或录音与数据库一致。正式恢复必须由具名运维员执行：
 
 1. 先在隔离恢复环境选定快照；VPS 完整快照执行
-   `python3 -I scripts/verify_backup_snapshot.py verify-vps <快照目录>`（容器内 `backup.sh` 产生的无配置快照使用 `verify`）。验证器只接受当前 Alembic head，并检查 manifest 全覆盖、权限/文件类型、SQLite/FK、恢复 schema 及 DB↔audio 闭包。
+   `python3 -I scripts/verify_backup_snapshot.py verify-vps <快照目录>`（容器内 `backup.sh` 产生的无配置快照使用 `verify`）。验证器只接受当前 Alembic head，并检查 manifest 全覆盖、权限/文件类型、SQLite/FK、恢复 schema 及 DB↔audio 闭包。8.3 开关打开后，原地校验 VPS `daily/` 里的快照要加 `--link-root /opt/nmu/backups/daily`；从快照复制出来的副本和 Mac 异地副本照旧不加。
 2. 停止应用与所有写入任务；在**真正复制或切换前立即再运行一次同样的验证命令**。不要把文件逐个覆盖进正在使用的 `data/`，也不要盲目恢复快照内的旧密钥配置。
 3. Compose 形态必须预建一个新的 external 候选卷，按快照在该卷重建 `app.db`、`audio/`和导出目录；原 live 卷保留不动，不做逐文件覆盖。先让候选镜像在无公网出口、无公开端口的隔离环境连接候选卷，显式执行 maintenance migrate，完成应用启动、健康检查、外键/核心行数和抽样录音 checksum 核对。
 4. 只有演练证据通过，才在服务保持停写时同时切换 `APP_IMAGE` 和 `APPDATA_VOLUME` 指针。启动后复核健康、账号、受试者/场次/录音聚合数和审计记录。任何检查失败立即停止所有写入，把两个指针一起切回保留的旧镜像+旧卷；不得 Alembic downgrade、删除失败候选卷或继续在半恢复状态写入。
@@ -367,6 +367,30 @@ export NMU_BACKUP_MAX_PULL_DIRECTORIES=50000
 ```
 
 远端账号应是只能读取备份目录的专用最小权限账号，不要复用系统管理员或应用运行账号；SSH 私钥路径和口令不得写入仓库。
+
+### 8.3 每日快照录音硬链接去重（开关默认关）
+
+**开关**：`nmu-backup.service` 用 `EnvironmentFile=-/opt/nmu/backup-dedup.env` 读一个可选文件，文件不在就跳过。只有其中写 `NMU_BACKUP_LINK_AUDIO=1`，`vps-backup-daily.sh` 才在发布前把与最新一份已发布快照同名、同长、同权限且逐字节相同的录音换成指向那一份的硬链接，并给 `verify-vps` / `publish-vps` 加 `--link-root /opt/nmu/backups/daily`。校验器只对快照顶层 `audio/` 放宽，且要数清楚每个共享 inode 的全部链接都在 `daily/` 下严格时间戳的兄弟快照里；库、清单、配置、导出仍必须 nlink=1。其他任何值都等于关，命令、快照内容和 ok 行与以前逐字节相同。打开后 ok 行末尾多三个字段：`linked=` 本份链接的录音数，`new_bytes=` 本份新占的逻辑字节，`cmp_mismatch=` 同名同长却字节不同、因而另存新副本的录音数。容量门照旧按整份暂存副本算，live 源仍要求 nlink=1，链接源从不取 `/opt/nmu/app/data`。
+
+**换来的空间**：按 2026-10-02 实测，现场一场录音 17.4 MB，库每场约增 1.2 MB，14 份全量保留时只够约 13 场。打开开关、不做清理约 82 场；加上 P0 清理约 106 场；P0 与 Tier B 全部清理约 151 场。算法和其他情景见 [录音容量演练与存储预算](docs/CAPACITY_REHEARSAL.md)。
+
+**代价**：
+
+- VPS 上同一段录音的 14 份变成一个 inode。坏块或 root 原地写坏一次，14 份 VPS 副本一起坏。下一次备份逐字节比对时会给新快照另存一份并计入 `cmp_mismatch`；旧快照要用 `verify-vps --link-root` 逐份验才看得出。恢复来源是 live 或 Mac，Mac 的 60 份仍是独立文件。`cmp_mismatch` 不为 0 就逐份验 `daily/`。
+- 单份快照的 `du -sh` 仍显示整份大小。看真实占用用 `du -sh /opt/nmu/backups/daily`（一次调用里同一 inode 只算一次），或看 `capacity.state`：容量检查按最后持有者抵扣，末尾标 `snapshot_model=linked_audio`。
+- 打开后留存某份 daily 快照只能复制（`cp -a`），不能 `mv` 到 `daily/` 之外，也不能 `cp -al`。共享 inode 一旦有链接落在 `daily/` 之外，之后每晚备份都会以 `snapshot_hardlink_outside_link_root` 失败。
+- 每周恢复演练已自动带 `--link-root`；演练撞上正在运行的备份（开机补跑时可能）会因暂存目录里多一个链接而失败，等备份结束重跑即可。迁移副本演练用的历史校验器不认这个参数，改用 Mac 上那份副本。
+- Mac 拉取不再每天整份重下已归档的快照，VPS 上旧快照被原地改坏且长度、清单都没变时，Mac 不会每天发现。
+
+**上线顺序，Mac 先**：
+
+1. Mac：`scripts/install-macos-offsite-pull.sh <ssh-user> <ssh-host>` 重装拉取脚本与校验器，它会重记 `verifier.sha256`。装完对还没链接的 VPS 跑一次，必须是 `ok`，已归档快照计入 `unchanged`。VPS 先打开而 Mac 没换，Mac 每次拉取都会报 `remote_snapshot_facts_invalid` 并整体退 2，异地副本就此中断。
+2. VPS：按正常发布带上本版代码，再把 `deploy/systemd/nmu-backup.service` `install -m 644` 到 `/etc/systemd/system/` 并 `systemctl daemon-reload`。开关文件不存在，下一次备份与以前相同。
+3. 打开：`install -m 600 /dev/null /opt/nmu/backup-dedup.env && printf 'NMU_BACKUP_LINK_AUDIO=1\n' > /opt/nmu/backup-dedup.env`，然后 `systemctl start nmu-backup.service`。第一份只会与上一份整份快照链接，旧的整份快照 14 天内轮换掉。
+4. 验收：`tail -1 /opt/nmu/backups/backup.log` 带 `linked=`；`find /opt/nmu/backups/daily -type f -links +1 | wc -l` 大于 0；`/opt/nmu/venv/bin/python -I /opt/nmu/app/scripts/verify_backup_snapshot.py verify-vps --link-root /opt/nmu/backups/daily /opt/nmu/backups/daily/<最新>` 输出 `OK`；下一次 Mac 拉取 `ok`；`capacity.state` 末尾有 `snapshot_model=linked_audio`；`systemctl start nmu-restore-drill.service` 后 `restore-drill.state` 为通过。
+5. 关掉：删掉 `/opt/nmu/backup-dedup.env`（或改成别的值）。之后又是整份副本；已链接的旧快照照样能验，14 天内轮换掉；Mac 两种都认。
+
+**还没定的**：Mac 端保留 60 份，105 场时整份约 122 GB，超过默认软配额 20,480 MB（`NMU_BACKUP_OFFSITE_QUOTA_MB`）。要么提高配额，要么另做 APFS 克隆去重，由负责人定。一次性清理用 `scripts/capacity_reclaim.py`，见运维交接 5.1。
 
 ## 9. 升级 / 改配置
 
