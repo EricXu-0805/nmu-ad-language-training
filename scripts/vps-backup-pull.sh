@@ -31,7 +31,7 @@ if [[ ! "$NMU_BACKUP_REMOTE_ROOT" =~ ^/[A-Za-z0-9._/-]+$ ]] \
   exit 64
 fi
 
-for required_cmd in rsync ssh find chmod mktemp sort tail mv rm rmdir wc df awk; do
+for required_cmd in rsync ssh find chmod mktemp sort tail mv rm rmdir wc df awk cmp; do
   command -v "$required_cmd" >/dev/null 2>&1 || {
     echo "拒绝执行:缺少命令 $required_cmd" >&2
     exit 69
@@ -213,6 +213,18 @@ REMOTE_ROOT="${NMU_BACKUP_REMOTE_ROOT%/}"
 SSH_ARGS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes)
 RSYNC_SSH="ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes"
 REMOTE_LIST_COMMAND="find '$REMOTE_ROOT/daily' -mindepth 1 -maxdepth 1 -name '$SNAP_GLOB' -printf '%y %f\\n'"
+# 远端只回四个数（文件、字节、目录、非法项），路径不出 VPS。多链接文件只有在快照顶层
+# audio/<安全文件名> 时才算合法：VPS 打开录音去重后，相邻快照共享这些 inode；其余任何
+# 硬链接（库、清单、配置、导出、子目录、名字带空白）仍是非法项。本地接收端照旧只认 nlink=1。
+SNAPSHOT_FACTS_AWK='BEGIN {files=0; bytes=0; dirs=0; invalid=0}
+$1=="f" && $3==1 {files++; bytes+=$2; next}
+$1=="f" && $3>1 && NF==4 && $2 ~ /^[0-9]+$/ && $4 ~ /^audio\/[A-Za-z0-9][A-Za-z0-9._-]*$/ {files++; bytes+=$2; next}
+$1=="d" {dirs++; next}
+{invalid++}
+END {printf "%d %.0f %d %d\n", files, bytes, dirs, invalid}'
+snapshot_facts_command() {
+  printf '%s' "set -o pipefail; NMU_SNAPSHOT_FACTS_CONTRACT=1; find '$REMOTE_ROOT/daily/$1' -xdev \\( -type f -links +1 -printf '%y %s %n %P\\n' \\) -o -printf '%y %s %n\\n' | awk '$SNAPSHOT_FACTS_AWK'"
+}
 
 if REMOTE_ENTRIES=$(ssh "${SSH_ARGS[@]}" "$REMOTE" "$REMOTE_LIST_COMMAND" 2>/dev/null); then
   :
@@ -273,7 +285,7 @@ REMOTE_SNAPSHOT_BYTE_COUNTS=()
 REMOTE_SNAPSHOT_DIRECTORY_COUNTS=()
 REMOTE_FACT_ROWS=()
 for remote_stamp in "${REMOTE_STAMP_ARGS[@]}"; do
-  REMOTE_FACTS_COMMAND="set -o pipefail; NMU_SNAPSHOT_FACTS_CONTRACT=1; find '$REMOTE_ROOT/daily/$remote_stamp' -xdev -printf '%y %s %n\\n' | awk 'BEGIN {files=0; bytes=0; dirs=0; invalid=0} \$1==\"f\" && \$3==1 {files++; bytes+=\$2; next} \$1==\"d\" {dirs++; next} {invalid++} END {printf \"%d %.0f %d %d\\n\", files, bytes, dirs, invalid}'"
+  REMOTE_FACTS_COMMAND=$(snapshot_facts_command "$remote_stamp")
   if REMOTE_FACTS=$(ssh "${SSH_ARGS[@]}" "$REMOTE" "$REMOTE_FACTS_COMMAND" 2>/dev/null); then
     :
   else
@@ -464,10 +476,32 @@ print(f"{files} {byte_count} {directory_count} {invalid}")
 PY
 }
 
+# 同名快照已经归档：远端 manifest 与本地这份逐字节相同、preflight 的文件/字节/目录事实
+# 与本地一致、本地这份仍过严格校验，就不再下载整份载荷。任一项不成立返回非零，调用方
+# 照旧走完整下载 + compare-vps，差异照旧进 conflicts/。代价：已归档的远端快照不再每天
+# 整份重验，远端事后原地改坏它只有改到长度或清单时才看得出来。
+archived_snapshot_matches() {
+  local stamp="$1" remote_manifest="$2" final="$3"
+  local expected_facts expected_files expected_bytes expected_dirs
+  local local_facts local_files local_bytes local_dirs local_invalid local_extra
+  [ -d "$final" ] && [ ! -L "$final" ] || return 1
+  [ -f "$final/MANIFEST.sha256" ] && [ ! -L "$final/MANIFEST.sha256" ] || return 1
+  cmp -s "$remote_manifest" "$final/MANIFEST.sha256" || return 1
+  expected_facts=$(expected_snapshot_facts "$stamp") || return 1
+  read -r expected_files expected_bytes expected_dirs <<< "$expected_facts"
+  local_facts=$(received_snapshot_facts "$final") || return 1
+  read -r local_files local_bytes local_dirs local_invalid local_extra <<< "$local_facts"
+  [ -z "${local_extra:-}" ] && [ "$local_invalid" -eq 0 ] \
+    && [ "$local_files" -eq "$expected_files" ] \
+    && [ "$local_bytes" -eq "$expected_bytes" ] \
+    && [ "$local_dirs" -eq "$expected_dirs" ] || return 1
+  "$PYTHON_BIN" -I "$GUARD" verify-vps "$final" >/dev/null 2>&1
+}
+
 pull_one_snapshot() {
   local stamp="$1"
   local final="$DAILY/$stamp"
-  local stage compare_rc conflict expected_facts expected_files expected_bytes expected_remote_dirs
+  local stage compare_rc conflict basis expected_facts expected_files expected_bytes expected_remote_dirs
   local received_facts received_files received_bytes received_dirs received_invalid received_extra
   local plan_facts plan_files plan_dirs plan_extra
   local post_facts post_files post_bytes post_dirs post_invalid post_extra post_command
@@ -529,6 +563,14 @@ pull_one_snapshot() {
     note "FAIL code=$FAIL_CODE snapshot=$stamp"
     return 2
   }
+  if { [ -e "$final" ] || [ -L "$final" ]; } \
+     && archived_snapshot_matches "$stamp" "$stage/MANIFEST.sha256" "$final"; then
+    rm -rf "$stage"
+    CURRENT_STAGE=""
+    CURRENT_STAMP=""
+    unchanged=$((unchanged + 1))
+    return 0
+  fi
   CURRENT_ALLOWLIST=$(mktemp "$INCOMING/.files-from.$stamp.XXXXXX")
   CURRENT_DATA_ALLOWLIST=$(mktemp "$INCOMING/.data-files-from.$stamp.XXXXXX")
   chmod 600 "$CURRENT_ALLOWLIST" "$CURRENT_DATA_ALLOWLIST"
@@ -585,9 +627,15 @@ PY
     return 2
   fi
 
+  # 本地最新一份已归档快照作复制基底：内容相同的文件在本机复制，只有变了的（库、新录音）
+  # 走网络。--checksum 按内容而不是长度+修改时间配对，基底在本机被改坏时照样从远端取正确
+  # 字节；落地的都是独立文件（nlink=1），接收端合同不变。
+  basis=$(find "$DAILY" -mindepth 1 -maxdepth 1 -type d -name "$SNAP_GLOB" -print \
+    | LC_ALL=C sort | tail -n 1)
   if [ -s "$CURRENT_DATA_ALLOWLIST" ]; then
     if rsync -a -x --no-links --no-devices --no-specials --no-implied-dirs \
          --max-size="$MAX_SNAPSHOT_BYTES" \
+         ${basis:+--checksum} ${basis:+"--copy-dest=$basis"} \
          --from0 --files-from="$CURRENT_DATA_ALLOWLIST" \
          --chmod=Du=rwx,Dgo=,Fu=rw,Fgo= --timeout=120 -e "$RSYNC_SSH" \
          "$REMOTE:$REMOTE_ROOT/daily/$stamp/" "$stage/" >/dev/null 2>&1; then
@@ -604,7 +652,7 @@ PY
   # second remote probe that same protection could silently sanitize a snapshot
   # changed after preflight. Re-read the exact bounded facts before publication
   # and reject any file/byte/directory/type drift.
-  post_command="set -o pipefail; NMU_SNAPSHOT_FACTS_CONTRACT=1; find '$REMOTE_ROOT/daily/$stamp' -xdev -printf '%y %s %n\\n' | awk 'BEGIN {files=0; bytes=0; dirs=0; invalid=0} \$1==\"f\" && \$3==1 {files++; bytes+=\$2; next} \$1==\"d\" {dirs++; next} {invalid++} END {printf \"%d %.0f %d %d\\n\", files, bytes, dirs, invalid}'"
+  post_command=$(snapshot_facts_command "$stamp")
   if post_facts=$(ssh "${SSH_ARGS[@]}" "$REMOTE" "$post_command" 2>/dev/null); then
     :
   else
