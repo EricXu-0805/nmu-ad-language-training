@@ -7,6 +7,8 @@ deploy/offbox/nmu_offbox_probe.py 文档串里的规则 1-8。
 """
 from __future__ import annotations
 
+import ast
+import builtins
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
@@ -14,7 +16,9 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -723,3 +727,236 @@ def test_the_probe_paths_live_under_the_openclaw_workspace():
     assert str(probe.KEYCHAIN_GET) == "/home/eric/.openclaw/bin/keychain-get"
     assert probe.WEBHOOK_SECRET == "OPENCLAW_DISCORD_DAILY_WEBHOOK"
     assert probe.DOWN_AFTER_RUNS == 2 and probe.SILENCE_MAX_S == 24 * 3600
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat 那一行：探针自己停了不会有任何消息，只有 22:00 CT 的 Heartbeat 看得见
+# ---------------------------------------------------------------------------
+
+SYNTHETIC_HEARTBEAT = '''#!/usr/bin/env python3
+"""与 OpenClaw heartbeat.py 同一副骨架：插入点、CHECKS 写法、名字都一样。"""
+import json
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HOME = Path("/home/eric/__nmu_probe_test_nowhere__")
+OK, WARN, ERROR, INFO = "OK", "WARN", "ERROR", "INFO"
+
+
+@dataclass
+class CheckResult:
+    status: str
+    label: str
+    detail: str
+
+
+def check_watchdog() -> CheckResult:
+    return CheckResult(OK, "Watchdog", "healthy")
+
+
+def check_maintenance() -> CheckResult:
+    return CheckResult(OK, "Maintenance", "none")
+
+
+CHECKS = [
+    check_watchdog,
+    check_maintenance,
+]
+
+
+def main():
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+@pytest.fixture
+def heartbeat(world, monkeypatch):
+    module = _load("heartbeat_check")
+    monkeypatch.setattr(module, "HOME", world.home)
+    # 让探针的假时钟贴着真时钟走：check_nmu_probe 用的是 heartbeat 进程自己的 now()。
+    world.now = int(time.time()) - 3 * RUN
+    return module
+
+
+def _check(heartbeat):
+    result = heartbeat.check_nmu_probe()
+    return result.status, result.label, result.detail
+
+
+def test_heartbeat_warns_when_the_probe_never_ran(heartbeat):
+    status, label, detail = _check(heartbeat)
+
+    assert (status, label) == ("WARN", "NMU 异地探针")
+    assert "state.json" in detail
+
+
+def test_heartbeat_reads_what_the_probe_writes(world, heartbeat):
+    for _ in range(3):
+        world.tick(HEALTHY)
+
+    status, _, detail = _check(heartbeat)
+
+    assert status == "OK"
+    assert detail.startswith("healthy · 24h 3 轮 · p95 240 ms")
+
+
+def test_heartbeat_calls_a_probe_that_stopped_25_minutes_ago_stale(world, heartbeat):
+    world.now = int(time.time()) - 26 * 60
+    world.tick(HEALTHY)
+
+    status, _, detail = _check(heartbeat)
+
+    assert status == "WARN" and detail.startswith("stale")
+
+
+def test_heartbeat_reports_an_ongoing_outage_as_error(world, heartbeat):
+    world.tick(TIMEOUT)
+    world.tick(TIMEOUT)
+
+    status, _, detail = _check(heartbeat)
+
+    assert status == "ERROR"
+    assert detail.startswith(f"DOWN since {world.state()['down_since']} · timeout")
+
+
+def test_heartbeat_warns_about_failures_that_stayed_under_the_threshold(world, heartbeat):
+    world.tick(HEALTHY)
+    world.tick(TIMEOUT)
+    world.tick(HEALTHY)
+
+    status, _, detail = _check(heartbeat)
+
+    assert status == "WARN" and "3 轮里 1 轮失败" in detail
+    assert world.outbox.tries == []
+
+
+def test_heartbeat_warns_about_messages_still_owed(world, heartbeat):
+    world.outbox = Outbox(True, False, False)       # DOWN 发出去了，RECOVERED 两次都没发出去
+    world.tick(TIMEOUT)
+    world.tick(TIMEOUT)
+    world.tick(HEALTHY)
+
+    status, _, detail = _check(heartbeat)
+
+    assert status == "WARN" and "1 条" in detail and "没发出去" in detail
+
+
+@pytest.mark.parametrize("text", ["{", '{"last_run": "昨天"}', "[]"])
+def test_a_broken_state_file_degrades_to_one_warn_line(world, heartbeat, text):
+    (world.base / "state.json").write_text(text, encoding="utf-8")
+
+    status, _, _ = _check(heartbeat)
+
+    assert status == "WARN"
+
+
+def test_the_inserted_function_only_uses_names_heartbeat_already_has():
+    module = _load("heartbeat_check")
+    snippet = module.block()
+    assert snippet.startswith(module.BEGIN) and snippet.endswith(module.END)
+    tree = ast.parse(snippet)
+    [function] = tree.body
+    assert isinstance(function, ast.FunctionDef) and function.name == "check_nmu_probe"
+    assigned = {node.id for node in ast.walk(function)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    assigned |= {node.name for node in ast.walk(function)
+                 if isinstance(node, ast.ExceptHandler) and node.name}
+    loaded = {node.id for node in ast.walk(function)
+              if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    free = loaded - assigned - set(dir(builtins))
+    # heartbeat.py 顶部：import json；from datetime import datetime, timedelta, timezone；
+    # HOME = Path("/home/eric")；OK/WARN/ERROR；@dataclass class CheckResult。
+    assert free <= {"json", "datetime", "timezone", "HOME", "CheckResult", "OK", "WARN", "ERROR"}
+    assert not any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(function))
+
+
+def test_insertion_hits_each_anchor_exactly_once_and_compiles():
+    module = _load("heartbeat_check")
+
+    updated = module.insert(SYNTHETIC_HEARTBEAT, module.block())
+
+    compile(updated, "heartbeat.py", "exec")
+    assert updated.count("def check_nmu_probe") == 1
+    assert updated.index("def check_nmu_probe") < updated.index("CHECKS = [")
+    assert "    check_watchdog,\n    check_nmu_probe,\n    check_maintenance,\n" in updated
+    # 原文一个字节都没丢：去掉插进去的两段就回到原样
+    restored = updated.replace("    check_nmu_probe,\n", "", 1)
+    restored = restored.replace("\n\n" + module.block() + "\n", "", 1)
+    assert restored == SYNTHETIC_HEARTBEAT
+
+
+@pytest.mark.parametrize("source", [
+    SYNTHETIC_HEARTBEAT.replace("    check_watchdog,\n", ""),
+    SYNTHETIC_HEARTBEAT.replace("CHECKS = [", "CHECKS = [  # 被人改过"),
+    SYNTHETIC_HEARTBEAT + "\n\nCHECKS = [\n    check_watchdog,\n]\n",
+], ids=["no-watchdog-entry", "checks-line-changed", "anchors-twice"])
+def test_insertion_refuses_when_an_anchor_does_not_hit_exactly_once(source):
+    module = _load("heartbeat_check")
+
+    with pytest.raises(module.InsertError):
+        module.insert(source, module.block())
+
+
+def test_insertion_refuses_to_run_twice():
+    module = _load("heartbeat_check")
+    once = module.insert(SYNTHETIC_HEARTBEAT, module.block())
+
+    with pytest.raises(module.InsertError):
+        module.insert(once, module.block())
+
+
+def _run_helper(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-B", str(OFFBOX / "heartbeat_check.py"), *argv],
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_the_insert_and_call_modes_work_on_a_real_file(tmp_path):
+    original = tmp_path / "heartbeat.py"
+    original.write_text(SYNTHETIC_HEARTBEAT, encoding="utf-8")
+    original.chmod(0o640)
+    staged = tmp_path / "heartbeat.py.nmu-probe.new"
+
+    inserted = _run_helper("--insert", str(original), "--out", str(staged))
+    assert inserted.returncode == 0, inserted.stderr
+    assert original.read_text(encoding="utf-8") == SYNTHETIC_HEARTBEAT
+    assert staged.stat().st_mode & 0o777 == 0o640
+    again = _run_helper("--insert", str(staged), "--out", str(tmp_path / "twice"))
+    assert again.returncode != 0 and not (tmp_path / "twice").exists()
+
+    called = _run_helper("--call", str(staged))
+    assert called.returncode == 0, called.stderr
+    assert called.stdout.strip().startswith("WARN NMU 异地探针: 无 state.json")
+    assert _run_helper("--call", str(original)).returncode != 0
+
+
+@pytest.mark.parametrize("entries", [
+    "    check_watchdog,\n    check_maintenance,\n    check_nmu_probe,\n",
+    "    check_watchdog,\n    check_nmu_probe,\n    check_nmu_probe,\n    check_maintenance,\n",
+], ids=["wrong-place", "twice"])
+def test_call_rejects_a_heartbeat_whose_checks_list_is_off(tmp_path, entries):
+    module = _load("heartbeat_check")
+    updated = module.insert(SYNTHETIC_HEARTBEAT, module.block())
+    good = "    check_watchdog,\n    check_nmu_probe,\n    check_maintenance,\n"
+    staged = tmp_path / "heartbeat.py"
+    staged.write_text(updated.replace(good, entries), encoding="utf-8")
+
+    result = _run_helper("--call", str(staged))
+
+    assert result.returncode == 1 and "CHECKS" in result.stderr
+    assert result.stdout == ""
+
+
+def test_the_insert_mode_never_overwrites_its_input(tmp_path):
+    original = tmp_path / "heartbeat.py"
+    original.write_text(SYNTHETIC_HEARTBEAT, encoding="utf-8")
+
+    result = _run_helper("--insert", str(original), "--out", str(original))
+
+    assert result.returncode != 0
+    assert original.read_text(encoding="utf-8") == SYNTHETIC_HEARTBEAT
