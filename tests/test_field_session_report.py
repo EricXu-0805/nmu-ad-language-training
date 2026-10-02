@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -552,3 +553,219 @@ def test_usage_docstring_carries_the_exact_production_command():
     text = SCRIPT.read_text(encoding="utf-8")
     assert ("'/opt/nmu/venv/bin/python /opt/nmu/app/scripts/field_session_report.py "
             "--db /opt/nmu/app/data/app.db --since 2026-10-01'") in text
+
+
+# ---------------------------------------------------------------------------
+# 七组指标（--since 2026-10-01 → ALPHA + BRAVO；期望值逐条手算）
+# ---------------------------------------------------------------------------
+
+def _stats(n: int, median: float, p90: float, maximum: float) -> dict:
+    return {"n": n, "median": pytest.approx(median), "p90": pytest.approx(p90),
+            "max": pytest.approx(maximum)}
+
+
+EMPTY_STATS = {"n": 0, "median": None, "p90": None, "max": None}
+
+
+@pytest.fixture
+def metrics(field_db) -> dict:
+    return _report(field_db, "--since", "2026-10-01")["metrics"]
+
+
+def test_question_end_to_recording_start(metrics):
+    assert metrics["question_end_to_recording_start"] == {
+        # 1.2 1.4 1.3 1.1 1.0 1.2
+        "tts_ended_to_record_started": _stats(6, 1.2, 1.35, 1.4),
+        # 打断后开麦：0.4（voice_activity）、0.6（answer_now）
+        "tts_interrupted_to_record_started": _stats(2, 0.5, 0.58, 0.6),
+        "records_unmeasured": 0,
+        "baseline_2026_09_17": {"median": 1.61, "p90": 2.01},
+    }
+
+
+def test_recording_length_by_stop_reason_and_vad_facts(metrics):
+    recording = metrics["recording"]
+    assert recording["record_stopped"] == 7
+    assert recording["stop_reasons"] == {
+        "silence": {"count": 3, "share": pytest.approx(0.429)},
+        "user_done": {"count": 3, "share": pytest.approx(0.429)},
+        "max_duration": {"count": 1, "share": pytest.approx(0.143)},
+        "stream_end": {"count": 0, "share": 0.0},
+    }
+    assert recording["wall_seconds"] == {
+        "all": _stats(7, 6.0, 11.68, 14.2),
+        "silence": _stats(3, 4.0, 5.6, 6.0),
+        "user_done": _stats(3, 6.0, 9.2, 10.0),
+        "max_duration": _stats(1, 14.2, 14.2, 14.2),
+        "stream_end": EMPTY_STATS,
+    }
+    assert recording["device_duration_seconds"] == {
+        "all": _stats(7, 5.7, 11.36, 14.0),
+        "silence": _stats(3, 3.7, 5.14, 5.5),
+        "user_done": _stats(3, 5.8, 8.84, 9.6),
+        "max_duration": _stats(1, 14.0, 14.0, 14.0),
+        "stream_end": EMPTY_STATS,
+    }
+    assert recording["stop_to_ack_overhead_seconds"] == _stats(7, 0.3, 0.44, 0.5)
+    # 旧平板只发 {"stop_reason"}：记作「缺」，照样参与其它统计。
+    assert recording["vad_armed"] == {"true": 4, "false": 2, "missing": 1}
+    assert recording["silence_vad_voiced_ms"] == _stats(3, 1800, 2280, 2400)
+    assert recording["baseline_2026_09_17"] == {
+        "stops": 149, "silence": 0, "user_done": 117, "max_duration": 32,
+        "stream_end": 0, "wall_median": 7.7, "wall_p90": 15.7}
+
+
+def test_elder_stops_to_robot_speaks_split(metrics):
+    split = metrics["elder_stops_to_robot_speaks"]
+    # 五段可配对：5.05 = 2.0+1.5+0.05+1.5，5.3，5.55，4.8，8.05。
+    assert split["total"] == _stats(5, 5.3, 7.05, 8.05)
+    assert split["upload_asr"] == _stats(5, 2.5, 2.8, 3.0)
+    assert split["judge"] == _stats(5, 1.2, 3.0, 4.0)
+    assert split["judge_by_mode"] == {
+        "rule": _stats(2, 0.2, 0.2, 0.2),
+        "rubric": _stats(1, 1.2, 1.2, 1.2),
+        "llm": _stats(2, 2.75, 3.75, 4.0),
+    }
+    assert split["issue"] == _stats(5, 0.05, 0.1, 0.1)
+    assert split["fetch_play"] == _stats(5, 1.8, 2.0, 2.0)
+    assert split["asr_plus_judge_without_asr_timestamp"] == EMPTY_STATS
+    assert split["excluded"] == {
+        "no_attempt": 0, "technical_failure": 1, "not_judged": 0,
+        "no_next_tts": 0, "crossed_pause": 1, "next_tts_not_started": 0}
+    assert split["baseline_2026_09_17"] == {
+        "total_median": 8.2, "total_p90": 10.51, "upload_asr_median": 2.94,
+        "judge_median": 3.37, "issue_median": 0.04, "fetch_play_median": 1.91}
+
+
+def test_llm_judge_reason_length_and_slow_rule_judging(metrics):
+    assert metrics["llm_judge"] == {
+        "llm_judged": 2,
+        # 20 与 45 个汉字：按字符数，不是 UTF-8 字节数。
+        "reason_chars": _stats(2, 32.5, 42.5, 45),
+        "reason_missing": 0,
+        "reason_over_40_chars": {"count": 1, "share": pytest.approx(0.5)},
+        # 规则/rubric 四次里 1.2 s（rubric）与 1.5 s（规则）超过 1 s。
+        "rule_rubric_judging": {"timed": 4, "over_1s": 2},
+    }
+
+
+def test_prompt_playback_outcomes(metrics):
+    assert metrics["prompt_playback"] == {
+        "by_purpose": {
+            "question": {"ended": 5, "interrupted": 1, "failed": 0, "no_terminal_ack": 0},
+            "cue": {"ended": 1, "interrupted": 1, "failed": 0, "no_terminal_ack": 0},
+            "feedback": {"ended": 3, "interrupted": 0, "failed": 1, "no_terminal_ack": 0},
+            "tell_answer": {"ended": 0, "interrupted": 0, "failed": 0,
+                            "no_terminal_ack": 0},
+        },
+        "interrupt_reasons": {"answer_now": 1, "voice_activity": 1},
+        "interrupted_played_seconds": _stats(2, 1.65, 1.93, 2.0),
+    }
+
+
+def test_researcher_controls(metrics):
+    assert metrics["researcher_controls"] == {
+        "adjudications": {"total": 1, "by_kind": {"confirmed_correct": 1},
+                          "by_reason": {"asr_misrecognized": 1}},
+        "resumes": {"total": 2, "by_to_status": {"waiting_tts": 2}},
+        "pauses_by_reason": {"patient_requested_pause": 1},
+        "patient_requested_pauses": 1,
+        "takeovers": 1,
+        "aborts": {"total": 1, "by_reason": {"participant_declined": 1}},
+    }
+
+
+def test_technical_failures(metrics):
+    assert metrics["technical_failures"] == {
+        "attempts": {"total": 1, "by_error_code": {"asr_exception": 1}},
+        "tts_failed": {"total": 1, "by_error_code": {"audio_playback_failed": 1}},
+        "record_failed": {"total": 1, "by_error_code": {"microphone_unavailable": 1}},
+    }
+
+
+def test_filters_change_the_aggregates(field_db):
+    # 模拟场多一个 9.0 s：p90 = 1.4 + 0.4 × 7.6。
+    simulation = _report(field_db, "--since", "2026-10-01", "--include-simulation")
+    assert simulation["metrics"]["question_end_to_recording_start"][
+        "tts_ended_to_record_started"] == _stats(7, 1.2, 4.44, 9.0)
+    # 不给 --since：9/20 那场多一个 3.0 s。
+    older = _report(field_db)
+    assert older["metrics"]["question_end_to_recording_start"][
+        "tts_ended_to_record_started"] == _stats(7, 1.2, 2.04, 3.0)
+    latest = _report(field_db, "--since", "2026-10-01", "--session-count", "1")
+    assert latest["metrics"]["question_end_to_recording_start"][
+        "tts_ended_to_record_started"] == _stats(3, 1.1, 1.18, 1.2)
+
+
+def test_markdown_prints_the_numbers_beside_the_baseline(field_db):
+    done = _run("--db", str(field_db), "--since", "2026-10-01")
+    assert done.returncode == 0, done.stderr
+    for row in (
+        "| tts_ended → record_started | 6 | 1.20 | 1.35 | 1.40 | 1.61 / 2.01 |",
+        "| silence | 3 | 42.9% | 0 / 149 |",
+        "| 墙钟 record_started → record_stopped | 7 | 6.00 | 11.68 | 14.20 | 7.70 / 15.70 |",
+        "| 合计 record_stopped → 下一条 tts_started | 5 | 5.30 | 7.05 | 8.05 | 8.20 / 10.51 |",
+        "| upload+ASR：record_stopped → ASR 落行 | 5 | 2.50 | 2.80 | 3.00 | 2.94 |",
+        "| └ LLM（LLM辅助） | 2 | 2.75 | 3.75 | 4.00 | — |",
+        "| question | 5 | 1 | 0 | 0 |",
+        "vad_armed：true 4 · false 2 · 缺（旧平板没上报）1",
+    ):
+        assert row in done.stdout, row
+
+
+def test_older_schema_reports_na_instead_of_guessing(tmp_path):
+    db = _build_db(tmp_path / "app.db")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DROP TABLE autopilotpositionadjudication")
+        conn.execute("DROP TABLE interactionevent")
+        conn.execute("ALTER TABLE attemptevent DROP COLUMN judge_reason")
+        conn.commit()
+    finally:
+        conn.close()
+    metrics = _report(db, "--since", "2026-10-01")["metrics"]
+    controls = metrics["researcher_controls"]
+    assert controls["adjudications"] == {
+        "na": "table autopilotpositionadjudication absent"}
+    assert controls["patient_requested_pauses"] == {
+        "na": "table interactionevent absent"}
+    assert controls["resumes"] == {"total": 2, "by_to_status": {"waiting_tts": 2}}
+    judge = metrics["llm_judge"]
+    assert judge["llm_judged"] == 2
+    assert judge["reason_chars"] == {"na": "column attemptevent.judge_reason absent"}
+    assert judge["rule_rubric_judging"] == {"na": "table interactionevent absent"}
+    split = metrics["elder_stops_to_robot_speaks"]
+    assert split["upload_asr"] == {"na": "table interactionevent absent"}
+    assert split["judge"] == {"na": "table interactionevent absent"}
+    # 没有 ASR 落行时刻只能量 record_stopped → 判完：3.5 3.2 3.7 2.7 6.5。
+    assert split["asr_plus_judge_without_asr_timestamp"] == _stats(5, 3.5, 5.38, 6.5)
+    assert split["total"] == _stats(5, 5.3, 7.05, 8.05)
+
+    done = _run("--db", str(db), "--since", "2026-10-01")
+    assert done.returncode == 0, done.stderr
+    assert "n/a: table autopilotpositionadjudication absent" in done.stdout
+    assert "n/a: column attemptevent.judge_reason absent" in done.stdout
+
+
+def test_without_the_ack_table_the_report_still_runs(tmp_path):
+    db = _build_db(tmp_path / "app.db")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DROP TABLE runtimecommandack")
+        conn.commit()
+    finally:
+        conn.close()
+    report = _report(db, "--since", "2026-10-01")
+    # 没有回执就没有配对：测不出偏移，用到回执的几项写 n/a，不拒绝、不猜。
+    assert report["clock"]["status"] == "not_detectable"
+    assert report["clock"]["pairs"] == 0
+    metrics = report["metrics"]
+    for key in ("question_end_to_recording_start", "recording",
+                "elder_stops_to_robot_speaks", "prompt_playback"):
+        assert metrics[key] == {"na": "table runtimecommandack absent"}, key
+    assert metrics["technical_failures"]["tts_failed"] == {
+        "na": "table runtimecommandack absent"}
+    assert metrics["technical_failures"]["attempts"] == {
+        "total": 1, "by_error_code": {"asr_exception": 1}}
+    assert [row["record_stopped"] for row in report["sessions"]] == [None, None]
+    assert _run("--db", str(db), "--since", "2026-10-01").returncode == 0
