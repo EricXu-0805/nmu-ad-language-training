@@ -2106,11 +2106,13 @@ def _seed_capture_chain(
         s, *, raw_audio_id: str, item_id: str, turn_seq: int, command_seq: int,
         session_id: str = "S9", response_role: str = "命名", attempt_seq: int = 1,
         playback_ack: str | None = "tts_ended",
-        stop_payload: str | None = '{"stop_reason":"silence"}') -> AttemptEvent:
+        stop_payload: str | None = '{"stop_reason":"silence"}',
+        playback_payload: str | None = None) -> AttemptEvent:
     """一次自动带练录音的回执链:提问 TTS → 播放回执 → 录音命令 → record_stopped → attempt。
 
     TTS 占 command_seq,录音命令占下一个;两条回执的设备序号与之相同,所以同一场次里
-    各条链的 command_seq 要隔 2。playback_ack / stop_payload 给 None 就不落那条回执。
+    各条链的 command_seq 要隔 2。playback_ack / stop_payload 给 None 就不落那条回执;
+    playback_payload 不给就用该回执类型的历史载荷。
     """
     voice = f"voice-{raw_audio_id}".encode("ascii")
     path, checksum = audio_store.save_blob(raw_audio_id, voice, "audio/wav")
@@ -2139,7 +2141,7 @@ def _seed_capture_chain(
         s.add(RuntimeCommandAck(
             command_id=tts.id, idempotency_key=trigger_key, ack_type=playback_ack,
             device_event_seq=command_seq, received_at=_T0,
-            payload_json=(
+            payload_json=playback_payload or (
                 '{"interrupt_reason":"answer_now","media_duration_ms":650,"media_stopped":true}'
                 if interrupted else '{"media_duration_ms":2100,"media_ended":true}'),
             **device))
@@ -2216,7 +2218,7 @@ def test_attempts_sheet_says_how_each_capture_was_closed(db, tmp_path):
     assert closed("a_tampered") == (None, None)
     assert closed("a_no_stop_ack") == (None, None)
     assert closed("a_plain") == (None, None)
-    assert export.SHEET_FIELDS["attempts"][-3:] == (
+    assert export.SHEET_FIELDS["attempts"][-5:-2] == (
         "prompt_exposure_needs_review", "capture_stop_reason", "capture_vad_armed")
     written = tmp_path / "research" / result["batch_id"] / "attempts.csv"
     with written.open(encoding="utf-8-sig", newline="") as handle:
@@ -2274,5 +2276,67 @@ def test_turns_say_how_the_source_capture_closed_and_whether_its_prompt_played_o
     assert turns[("DE_斧子+树", 2)] == ("max_duration", "unverified")
     # 没有关联录音的环节(人工录入)两列都空。
     assert turns[("DE_斧子+树", 3)] == (None, None)
-    assert export.SHEET_FIELDS["turns"][-3:] == (
+    assert export.SHEET_FIELDS["turns"][-4:-1] == (
         "adjudication_reason", "source_stop_reason", "source_prompt_playback_outcome")
+
+
+_ENDED_ARMED = ('{"barge_in_armed":true,"barge_in_listened_ms":1850,'
+                '"media_duration_ms":2100,"media_ended":true}')
+_STOPPED_NOT_LISTENING = ('{"barge_in_armed":false,"interrupt_reason":"answer_now",'
+                          '"media_duration_ms":650,"media_stopped":true}')
+
+
+def test_attempts_and_turns_say_whether_barge_in_detection_was_listening(
+        db, tmp_path, monkeypatch):
+    """声音停播率的分母:attempts 带触发回执里的 armed 与监听毫秒,turns 带 armed。
+    两张表同一个账本证明、同一个值;证明不了、旧平板、人工录音一律空。"""
+    monkeypatch.setattr(autopilot_ledger, "verify_tts_ended_prerequisite", _proof_by_trigger_ack)
+    _seed(db)
+    _link_source_attempt(db, "SE_锚", 1, _seed_capture_chain(
+        db, raw_audio_id="a_listening", item_id="SE_锚", turn_seq=1, command_seq=1,
+        playback_payload=_ENDED_ARMED))
+    # 部署关了声音停播(switch off)、或「现在回答」时检测还没听上:false。
+    _link_source_attempt(db, "DE_斧子+树", 1, _seed_capture_chain(
+        db, raw_audio_id="a_not_listening", item_id="DE_斧子+树", turn_seq=1,
+        response_role="左命名", command_seq=3, playback_ack="tts_interrupted",
+        playback_payload=_STOPPED_NOT_LISTENING))
+    # 有录音命令却证明不了触发回执:和播放结局一样不报。
+    _link_source_attempt(db, "DE_斧子+树", 2, _seed_capture_chain(
+        db, raw_audio_id="a_unverified", item_id="DE_斧子+树", turn_seq=2,
+        response_role="左作用", command_seq=5, playback_ack=None))
+    # 旧平板:历史载荷没有这两键。
+    _seed_capture_chain(
+        db, raw_audio_id="a_old_tablet", item_id="DE_斧子+树", turn_seq=4,
+        response_role="右作用", command_seq=7)
+    db.add(AttemptEvent(
+        session_id="S9", item_id="DE_斧子+树", turn_seq=5, response_role="关系识别",
+        attempt_seq=1, raw_audio_id="a_plain", prompt_level=0,
+        processing_status="completed"))
+    db.commit()
+
+    result = _export_bundle(db, "S9", write_dir=tmp_path)
+
+    attempts = {row["audio_code"]: row for row in result["sheets"]["attempts"]}
+
+    def exposure(raw_audio_id):
+        row = attempts[export_security.pseudonymize_audio(raw_audio_id)]
+        return row["prompt_barge_in_armed"], row["prompt_barge_in_listened_ms"]
+
+    assert exposure("a_listening") == (True, 1850)
+    assert exposure("a_not_listening") == (False, None)
+    assert exposure("a_unverified") == (None, None)
+    assert exposure("a_old_tablet") == (None, None)
+    assert exposure("a_plain") == (None, None)
+    turns = {(row["item_id"], row["turn_seq"]): row["source_prompt_barge_in_armed"]
+             for row in result["sheets"]["turns"]}
+    assert turns[("SE_锚", 1)] is True
+    assert turns[("DE_斧子+树", 1)] is False
+    assert turns[("DE_斧子+树", 2)] is None
+    assert turns[("DE_斧子+树", 3)] is None
+    assert export.SHEET_FIELDS["attempts"][-2:] == (
+        "prompt_barge_in_armed", "prompt_barge_in_listened_ms")
+    assert export.SHEET_FIELDS["turns"][-1:] == ("source_prompt_barge_in_armed",)
+    for name in ("attempts", "turns"):
+        written = tmp_path / "research" / result["batch_id"] / f"{name}.csv"
+        with written.open(encoding="utf-8-sig", newline="") as handle:
+            assert next(csv.reader(handle)) == list(export.SHEET_FIELDS[name])

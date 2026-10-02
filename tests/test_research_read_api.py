@@ -995,7 +995,9 @@ def test_turns_carry_how_the_source_capture_closed_and_whether_its_prompt_played
             session, session_id="S-REAL-1", raw_audio_id="AUDIO-VAD-1",
             item_id=item.item_id, turn_seq=1, command_seq=1,
             playback_ack="tts_interrupted",
-            stop_payload='{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":1200}')
+            stop_payload='{"stop_reason":"silence","vad_armed":true,"vad_voiced_ms":1200}',
+            playback_payload=('{"barge_in_armed":false,"interrupt_reason":"answer_now",'
+                              '"media_duration_ms":650,"media_stopped":true}'))
         turn = session.exec(select(TurnEvent).where(
             TurnEvent.item_event_id == item.id)).first()
         turn.source_attempt_id = attempt.id
@@ -1009,12 +1011,14 @@ def test_turns_carry_how_the_source_capture_closed_and_whether_its_prompt_played
 
     payload = _client("steward").get(
         "/research/v1/turns?data_classification=research").json()
-    assert payload["columns"][-2:] == [
-        "source_stop_reason", "source_prompt_playback_outcome"]
+    assert payload["columns"][-3:] == [
+        "source_stop_reason", "source_prompt_playback_outcome", "source_prompt_barge_in_armed"]
     closed = {row["turn_seq"]: (row["source_stop_reason"],
-                                row["source_prompt_playback_outcome"])
+                                row["source_prompt_playback_outcome"],
+                                row["source_prompt_barge_in_armed"])
               for row in payload["rows"]}
-    assert closed == {1: ("silence", "interrupted_answer_now"), 2: (None, None)}
+    # 检测没在听是 false,不是空;没有关联录音的环节三列都空。
+    assert closed == {1: ("silence", "interrupted_answer_now", False), 2: (None, None, None)}
 
 
 def test_the_schema_surface_stays_readable_without_a_key_but_carries_no_data(

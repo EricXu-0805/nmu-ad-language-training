@@ -108,7 +108,8 @@ def test_voice_interruption_preserves_score_review_and_distinct_export(api_clien
     monkeypatch.setenv("ENABLE_LLM_JUDGE", "0")
     monkeypatch.setattr(asr, "get_engine", lambda: _RepeatAsr("胡萝卜"))
     assert _authorization(api_clients, command).status_code == 200
-    facts = {"media_stopped": True, "interrupt_reason": "voice_activity", "media_duration_ms": 750}
+    facts = {"media_stopped": True, "interrupt_reason": "voice_activity", "media_duration_ms": 750,
+             "barge_in_armed": True, "barge_in_listened_ms": 640}
     response = _post(api_clients, command, "tts_interrupted", 2, **facts)
     assert response.status_code == 200, response.text
     record = response.json()["command"]
@@ -124,9 +125,11 @@ def test_voice_interruption_preserves_score_review_and_distinct_export(api_clien
         assert attempt.operational_needs_review is True
         assert export._prompt_playback_evidence(db, attempt) == {
             "prompt_playback_outcome": "interrupted_voice_activity", "prompt_played_ms": 750,
-            "prompt_exposure_needs_review": True}
-        assert export.capture_provenance(db, [attempt])[attempt.id][
-            "prompt_playback_outcome"] == "interrupted_voice_activity"
+            "prompt_exposure_needs_review": True,
+            "prompt_barge_in_armed": True, "prompt_barge_in_listened_ms": 640}
+        provenance = export.capture_provenance(db, [attempt])[attempt.id]
+        assert provenance["prompt_playback_outcome"] == "interrupted_voice_activity"
+        assert provenance["prompt_barge_in_armed"] is True
     feedback = _device_next(api_clients)
     started = _post(api_clients, feedback, "tts_started", 4)
     assert started.status_code == 200, started.text
