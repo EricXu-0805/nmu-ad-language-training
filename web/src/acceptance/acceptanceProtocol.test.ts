@@ -34,23 +34,68 @@ function allPass(draft: AcceptanceDraft): AcceptanceDraft {
   return draft;
 }
 
-test("八项与记录表逐条对应，且子场景一个不少", () => {
-  assert.equal(ACCEPTANCE_ITEMS.length, 8);
-  assert.deepEqual(ACCEPTANCE_ITEMS.map((item) => item.no), [1, 2, 3, 4, 5, 6, 7, 8]);
-  // 第 5 项五个失败场景、第 7 项四个中断场景，其余六项各一个——摊平后 15 个可勾项。
+const DOC = readFileSync(
+  new URL("../../../docs/handover/真机验收记录表.md", import.meta.url), "utf8");
+
+test("十三项与记录表逐条对应，且子场景一个不少", () => {
+  assert.equal(ACCEPTANCE_ITEMS.length, 13);
+  assert.deepEqual(ACCEPTANCE_ITEMS.map((item) => item.no),
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  // 第 5 项五个失败场景、第 7 项四个中断场景，第 10、12、13 项各两个，其余八项各一个
+  // ——摊平后 23 个可勾项。
   assert.equal(ACCEPTANCE_ITEMS[4]!.steps.length, 5);
   assert.equal(ACCEPTANCE_ITEMS[6]!.steps.length, 4);
-  assert.equal(ACCEPTANCE_STEP_KEYS.length, 15);
-  assert.equal(new Set(ACCEPTANCE_STEP_KEYS).size, 15, "勾选键不能重复");
+  for (const index of [9, 11, 12]) assert.equal(ACCEPTANCE_ITEMS[index]!.steps.length, 2);
+  assert.equal(ACCEPTANCE_STEP_KEYS.length, 23);
+  assert.equal(new Set(ACCEPTANCE_STEP_KEYS).size, 23, "勾选键不能重复");
 });
 
-test("八项标题与 docs 里那份记录表不会各说各话", () => {
-  const doc = readFileSync(
-    new URL("../../../docs/handover/真机验收记录表.md", import.meta.url), "utf8");
+test("十三项标题与 docs 里那份记录表不会各说各话", () => {
   for (const item of ACCEPTANCE_ITEMS) {
-    assert.ok(doc.includes(`### ${item.no}.`), `记录表缺第 ${item.no} 项`);
+    assert.ok(DOC.includes(`### ${item.no}.`), `记录表缺第 ${item.no} 项`);
   }
-  assert.equal((doc.match(/^### \d\./gm) ?? []).length, 8);
+  assert.equal((DOC.match(/^### \d+\./gm) ?? []).length, 13);
+  // 新增的五项,标题两边逐字一致。
+  for (const item of ACCEPTANCE_ITEMS.slice(8)) {
+    assert.ok(DOC.includes(`### ${item.no}. ${item.title}`), `记录表第 ${item.no} 项标题不一致`);
+  }
+});
+
+test("第 1 项不再要求「麦克风不开了又关又开」:提前回答检测在播报中可以开麦,但不保存声音", () => {
+  const first = ACCEPTANCE_ITEMS[0]!;
+  const text = [first.title, ...first.steps.flatMap((step) => [step.how, step.criterion])].join("\n");
+  assert.doesNotMatch(text, /开了又关又开/);
+  assert.match(text, /「正在听您说」只出现一次/);
+  assert.match(text, /播报中系统麦克风指示可以亮，但不保存声音/);
+  const section = DOC.slice(DOC.indexOf("### 1."), DOC.indexOf("### 2."));
+  assert.doesNotMatch(section, /开了又关又开/);
+  assert.match(section, /「正在听您说」只出现一次/);
+  assert.match(section, /播报中系统麦克风指示可以亮，但不保存声音/);
+});
+
+test("新增的现场项目:现在回答、停播误停与漏停、找词停顿、老人已答对/跳过本题、指定起点", () => {
+  assert.deepEqual(ACCEPTANCE_ITEMS.slice(8).map((item) => item.title), [
+    "现在回答",
+    "停播误停与漏停",
+    "找词停顿不被静音收麦截断",
+    "老人已答对 / 跳过本题",
+    "指定起点（含中止后同周第二场从第 N 题开始）",
+  ]);
+  for (const item of ACCEPTANCE_ITEMS.slice(8)) {
+    for (const step of item.steps) {
+      assert.ok(step.how.trim() && step.criterion.trim(), `第 ${item.no} 项 ${step.key} 缺做法或判据`);
+    }
+  }
+  // 中止后同周第二场从第 N 题开始,单独一个勾选项。
+  assert.ok(ACCEPTANCE_ITEMS[12]!.steps.some((step) => /中止/.test(step.title) && /第二场/.test(step.title)));
+});
+
+test("结论与免责小字说的是十三项,不再是八项", () => {
+  assert.equal(ACCEPTANCE_ITEMS.length, 13);
+  const receipt = buildAcceptanceReceipt(allPass(filledHeader(emptyDraft())), MACHINE);
+  assert.doesNotMatch(receipt.caveat, /八项/);
+  assert.match(receipt.caveat, /十三项全部通过/);
+  assert.match(formatAcceptanceText(receipt), /十三项全部勾了通过/);
 });
 
 test("空白记录是未完成，而且先报表头没填", () => {
@@ -107,7 +152,7 @@ test("回执带上机器说得出的事实，尤其是构建编号", () => {
   const receipt = buildAcceptanceReceipt(draft, MACHINE);
   assert.equal(receipt.schema, "nmu-device-acceptance.v1");
   assert.equal(receipt.machine.buildId, "1755100000000");
-  assert.equal(receipt.steps.length, 15);
+  assert.equal(receipt.steps.length, 23);
   assert.deepEqual(receipt.steps.map((step) => step.key), [...ACCEPTANCE_STEP_KEYS]);
 });
 

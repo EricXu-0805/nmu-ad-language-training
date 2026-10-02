@@ -27,6 +27,11 @@ import type { AudioDeviceLease } from "../audio/audioDeviceLease.ts";
 import type { RecordingAuthorization } from "./recordingAuthorization.ts";
 import type { AutopilotRecoverySnapshot } from "./autopilotRecordingRecovery.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
+import type { VoiceActivityObservation } from "./autopilotBrowserVoiceActivity.ts";
+import {
+  DEFAULT_VOICE_ACTIVITY_WINDOWS,
+  type VoiceActivityWindows,
+} from "./autopilotVoiceActivity.ts";
 
 const SESSION = "S-CAPTURE-01";
 const COMMAND = "cmd-record-persist-0001";
@@ -529,9 +534,11 @@ function bootstrapHarness(clock: Clock, overrides: {
   failClearForArm?: number;
   /**
    * 「说完没」旁听端口。省略 = 没有 VAD(2026-09-20 之前的行为);"throws" = 挂旁听
-   * 时同步抛错;函数 = 自定义(返回拆除函数)。
+   * 时同步抛错;函数 = 自定义(返回采样器把手)。
    */
-  observeVoiceActivity?: "throws" | ((stream: MediaStream, onTrailingSilence: () => void) => () => void);
+  observeVoiceActivity?: "throws" | ((
+    stream: MediaStream, onTrailingSilence: () => void, windows: VoiceActivityWindows,
+  ) => VoiceActivityObservation);
 } = {}) {
   const calls: string[] = [];
   const timers = new Map<number, { dueAt: number; callback: () => void }>();
@@ -589,10 +596,12 @@ function bootstrapHarness(clock: Clock, overrides: {
       return overrides.authorize?.(authorizeCalls, signal) ?? Promise.resolve(AUTHORIZED);
     },
     ...(overrides.observeVoiceActivity ? {
-      observeVoiceActivity: (stream: MediaStream, onTrailingSilence: () => void) => {
+      observeVoiceActivity: (
+        stream: MediaStream, onTrailingSilence: () => void, windows: VoiceActivityWindows,
+      ) => {
         calls.push("observeVoiceActivity");
         if (overrides.observeVoiceActivity === "throws") throw new Error("AudioContext 不可用");
-        return overrides.observeVoiceActivity!(stream, onTrailingSilence);
+        return overrides.observeVoiceActivity!(stream, onTrailingSilence, windows);
       },
     } : {}),
   };
@@ -921,6 +930,12 @@ async function captureAtRealOnstart(
     throwOnTimerCall?: number;
     failClearForArm?: number;
     observeVoiceActivity?: Parameters<typeof bootstrapHarness>[1]["observeVoiceActivity"];
+    /**
+     * 开麦那一刻语音设置缓存的样子。省略 = 读到过设置、服务器开着 VAD、默认 3000/4500;
+     * null = 还没成功读到过(或最近一次读失败);{ windows: null } = 读到了,服务器关了 VAD。
+     */
+    voiceSettings?: { windows: VoiceActivityWindows | null } | null;
+    afterVoiceInterruption?: boolean;
   } = {},
 ) {
   const clock = clockDouble();
@@ -935,15 +950,25 @@ async function captureAtRealOnstart(
     failClearForArm: options.failClearForArm,
     observeVoiceActivity: options.observeVoiceActivity,
   });
+  const settings = options.voiceSettings === undefined
+    ? { windows: DEFAULT_VOICE_ACTIVITY_WINDOWS } : options.voiceSettings;
   const executor = new BrowserAutopilotRecordingExecutor(SESSION, {
     ownerGeneration: options.ownerGeneration ?? 7,
     isForeground: () => true,
     observe: (event) => { events.push(event); },
     ports: uploadPorts(uploadCalls, options.uploadFailAt ?? null),
     bootstrap: harness.ports,
+    voiceSettings: {
+      hasSettings: () => settings !== null,
+      vadWindows: () => settings?.windows ?? null,
+    },
   });
 
-  const capture = executor.start(recordCommand() as never) as TestCapture;
+  const capture = executor.start(
+    recordCommand() as never,
+    options.afterVoiceInterruption === undefined
+      ? undefined : { afterVoiceInterruption: options.afterVoiceInterruption },
+  ) as TestCapture;
   capture.stopped.catch(() => {});
   for (let turn = 0; turn < 400 && (devices.devices[0]?.starts ?? 0) === 0; turn += 1) {
     await Promise.resolve();
@@ -1517,16 +1542,28 @@ test("对照：真实开录后的 cancel() 就是一次成功停止——半段�
 // (零第二次 getUserMedia);每条退出路径都把它拆一次。判到「说完」= 与「说完了」
 // 按钮同一条内部停止路,理由记成 silence,持久化链一步不少。
 
-/** 记下旁听回调与拆除次数的替身端口;测试自己决定什么时候「说完」。 */
+/**
+ * 记下旁听回调、窗口与拆除次数的替身端口;测试自己决定什么时候「说完」、
+ * 判定器此刻累计了多少有声毫秒(null = 一帧都没读到)。拆除之后读数变成垃圾,
+ * 用来证明 vad_voiced_ms 取的是停止那一刻、拆除之前的值。
+ */
 function voiceActivityDouble() {
   const row = {
     streams: [] as MediaStream[],
+    windows: [] as VoiceActivityWindows[],
     releases: 0,
+    voiced: 1_280 as number | null,
     decide: null as (() => void) | null,
-    observe(stream: MediaStream, onTrailingSilence: () => void): () => void {
+    observe(
+      stream: MediaStream, onTrailingSilence: () => void, windows: VoiceActivityWindows,
+    ): VoiceActivityObservation {
       row.streams.push(stream);
+      row.windows.push(windows);
       row.decide = onTrailingSilence;
-      return () => { row.releases += 1; };
+      return {
+        release: () => { row.releases += 1; row.voiced = 99_999; },
+        voicedMs: () => row.voiced,
+      };
     },
   };
   return row;
@@ -1546,6 +1583,7 @@ test("旁听判「说完」:与按钮同一条物理停止路,stop_reason=silenc
   assert.equal(vad.streams.length, 1);
   assert.equal(run.devices.userMediaCalls, 1);
   assert.deepEqual(vad.streams[0].getTracks(), run.devices.tracks);
+  assert.deepEqual(vad.windows, [DEFAULT_VOICE_ACTIVITY_WINDOWS]);
   // 旁听排在作答窗口之后:两个定时器都已武装,VAD 不判时 max_duration 仍兜底。
   assert.equal(run.harness.armedHandles.length, 2);
   assert.equal(run.harness.calls.at(-1), "observeVoiceActivity");
@@ -1566,6 +1604,9 @@ test("旁听判「说完」:与按钮同一条物理停止路,stop_reason=silenc
   assert.equal(facts.receipt_server_seq, 77);
   assert.equal(facts.byte_count, 4);
   assert.equal(facts.duration_seconds, 5);
+  // 停止那一刻(拆除之前)判定器累计的有声毫秒。
+  assert.equal(facts.vad_armed, true);
+  assert.equal(facts.vad_voiced_ms, 1_280);
   assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
   assert.deepEqual(
     run.events.filter((event) => event.phase === "persisting").map((event) => event.stopReason),
@@ -1638,6 +1679,9 @@ test("旁听端口同步抛错:与没有 VAD 时完全一样——listening 照�
   const facts = await run.capture.stopped;
   await run.capture.closed;
   assert.equal(facts.stop_reason, "user_done");
+  // 旁听根本没挂上:如实报没武装,也就没有有声毫秒。
+  assert.equal(facts.vad_armed, false);
+  assert.equal(Object.hasOwn(facts, "vad_voiced_ms"), false);
   assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
   assert.equal(run.device.stops, 1);
   for (const row of run.devices.tracks) assert.equal(row.stopped, 1);
@@ -1687,10 +1731,144 @@ test("attachAutopilotStopReason 收 silence,与 user_done/max_duration 同等持
   assert.throws(() => attachAutopilotStopReason(entry, "user_done"));
 });
 
+for (const row of [
+  {
+    // 读到了设置,只是服务器把 VAD 关了:服务器认得这两个事实,如实报没武装。
+    name: "服务器关了 VAD", voiceSettings: { windows: null }, facts: { vad_armed: false },
+  },
+  {
+    // 还没成功读到过设置(老服务器没有这个读面、网络失败、坏形状):说不准服务器认不认
+    // record_stopped 的 VAD 两键——老服务器的回执模型拒绝未知键,带上就整条回执被拒。
+    name: "没成功读到过语音设置", voiceSettings: null, facts: {},
+  },
+]) {
+  test(`${row.name}:不武装旁听,按钮与作答窗口照旧;record_stopped 的 VAD 事实 = ${JSON.stringify(row.facts)}`, async (context) => {
+    const vad = voiceActivityDouble();
+    const run = await captureAtRealOnstart(context, {
+      ownerGeneration: 55, observeVoiceActivity: vad.observe, voiceSettings: row.voiceSettings,
+    });
+    run.device.fireStart();
+    assert.deepEqual(await run.capture.started, { mime_type: "audio/webm" });
+    assert.equal(run.events.at(-1)?.phase, "listening");
+    assert.equal(vad.streams.length, 0);
+    assert.equal(run.harness.calls.includes("observeVoiceActivity"), false);
+    // 作答窗口照旧武装:按钮与到点收麦两条路都在。
+    assert.equal(run.harness.armedHandles.length, 2);
+
+    run.device.pushData(4);
+    run.clock.set(run.clock.now() + 3_000);
+    run.capture.requestStop("user_done");
+    await flushMicrotasks();
+    run.device.fireStop();
+    const facts = await run.capture.stopped;
+    await run.capture.closed;
+    assert.equal(facts.stop_reason, "user_done");
+    const { stop_reason: _reason, raw_audio_id: _raw, receipt_server_seq: _seq,
+      checksum: _checksum, byte_count: _bytes, duration_seconds: _duration, ...vadFacts } = facts;
+    assert.deepEqual(vadFacts, row.facts);
+    assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
+  });
+}
+
+test("服务器调过的两个尾静默窗口原样交给旁听端口", async (context) => {
+  const vad = voiceActivityDouble();
+  const tuned = { trailingSilenceMs: 5_000, shortTrailingSilenceMs: 7_000 };
+  const run = await captureAtRealOnstart(context, {
+    ownerGeneration: 56, observeVoiceActivity: vad.observe, voiceSettings: { windows: tuned },
+  });
+  run.device.fireStart();
+  await run.capture.started;
+  assert.deepEqual(vad.windows, [tuned]);
+  run.device.pushData(4);
+  run.clock.set(run.clock.now() + 3_000);
+  run.capture.requestStop("user_done");
+  await flushMicrotasks();
+  run.device.fireStop();
+  const facts = await run.capture.stopped;
+  await run.capture.closed;
+  assert.equal(facts.vad_armed, true);
+  assert.equal(facts.vad_voiced_ms, 1_280);
+});
+
+test("提问被老人开口打断之后的这一次录音:不武装旁听,重说前的停顿不会被读成「说完」", async (context) => {
+  // 模拟:提问尾 700 ms 被打断,老人停 5 s 才重说——旁听若在,5248 ms 就把麦收了,
+  // 5760 ms 开口的重说根本录不进去。这一次只靠按钮和作答窗口。
+  const vad = voiceActivityDouble();
+  const run = await captureAtRealOnstart(context, {
+    ownerGeneration: 57, observeVoiceActivity: vad.observe, afterVoiceInterruption: true,
+  });
+  run.device.fireStart();
+  await run.capture.started;
+  assert.equal(vad.streams.length, 0);
+  assert.equal(run.harness.calls.includes("observeVoiceActivity"), false);
+
+  run.device.pushData(4);
+  run.harness.advance(14_000);           // 15 s 上限 − 1 s 抖动容差
+  await flushMicrotasks();
+  assert.equal(run.device.stops, 1);
+  run.device.fireStop();
+  const facts = await run.capture.stopped;
+  await run.capture.closed;
+  assert.equal(facts.stop_reason, "max_duration");
+  assert.equal(facts.vad_armed, false);
+  assert.equal(Object.hasOwn(facts, "vad_voiced_ms"), false);
+});
+
+for (const row of [
+  { name: "一帧都没读到(null)", voiced: null as number | null, armed: false, voicedMs: undefined },
+  { name: "带小数", voiced: 1_234.6, armed: true, voicedMs: 1_235 },
+  { name: "零", voiced: 0, armed: true, voicedMs: 0 },
+  { name: "NaN", voiced: Number.NaN, armed: false, voicedMs: undefined },
+  { name: "超过十分钟封顶", voiced: 700_000, armed: true, voicedMs: 600_000 },
+]) {
+  test(`record_stopped 的 VAD 事实取停止那一刻的读数(${row.name})`, async (context) => {
+    const vad = voiceActivityDouble();
+    vad.voiced = row.voiced;
+    const run = await captureAtRealOnstart(context, {
+      ownerGeneration: 58, observeVoiceActivity: vad.observe,
+    });
+    run.device.fireStart();
+    await run.capture.started;
+    run.device.pushData(4);
+    run.clock.set(run.clock.now() + 3_000);
+    run.capture.requestStop("user_done");
+    await flushMicrotasks();
+    run.device.fireStop();
+    const facts = await run.capture.stopped;
+    await run.capture.closed;
+    assert.equal(facts.vad_armed, row.armed);
+    assert.equal(facts.vad_voiced_ms, row.voicedMs);
+    assert.equal(Object.hasOwn(facts, "vad_voiced_ms"), row.voicedMs !== undefined);
+  });
+}
+
+test("采样器读数抛错:当作没武装,作答照常保存", async (context) => {
+  const run = await captureAtRealOnstart(context, {
+    ownerGeneration: 59,
+    observeVoiceActivity: () => ({
+      release: () => {},
+      voicedMs: () => { throw new Error("analyser 已关闭"); },
+    }),
+  });
+  run.device.fireStart();
+  await run.capture.started;
+  run.device.pushData(4);
+  run.clock.set(run.clock.now() + 3_000);
+  run.capture.requestStop("user_done");
+  await flushMicrotasks();
+  run.device.fireStop();
+  const facts = await run.capture.stopped;
+  await run.capture.closed;
+  assert.equal(facts.stop_reason, "user_done");
+  assert.equal(facts.vad_armed, false);
+  assert.deepEqual(run.uploadCalls, [...UPLOAD_STAGES]);
+});
+
 test("辅助断言:生产旁听端口就是 observeTrailingSilence,挂在作答窗口之后、拆在每条退出路上", () => {
   const source = readFileSync(
     new URL("./autopilotRecordingExecutor.ts", import.meta.url), "utf8");
-  assert.match(source, /observeVoiceActivity: \(stream, onTrailingSilence\) => observeTrailingSilence\(/);
+  assert.match(source,
+    /observeVoiceActivity: \(stream, onTrailingSilence, windows\) =>\s*observeTrailingSilence\(stream, onTrailingSilence, windows\)/);
   const armAt = source.indexOf("this.armVoiceActivity()");
   const answerWindowAt = source.indexOf('this.signalStop("max_duration")');
   assert.ok(answerWindowAt >= 0 && armAt > answerWindowAt, "旁听必须排在作答窗口武装之后");

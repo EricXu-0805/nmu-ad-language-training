@@ -45,6 +45,21 @@ export const VAD_MIN_VOICED_MS = 450;
 export const VAD_FULL_UTTERANCE_MS = 900;
 export const VAD_SHORT_UTTERANCE_TRAILING_SILENCE_MS = 4_500;
 
+/**
+ * 两个尾静默窗口。服务器语音设置(NMU_AUTOPILOT_VAD_TRAILING_MS /
+ * NMU_AUTOPILOT_VAD_SHORT_TRAILING_MS)可以在现场调长,不必重新发版;
+ * 不传就是上面两个常量。
+ */
+export interface VoiceActivityWindows {
+  trailingSilenceMs: number;
+  shortTrailingSilenceMs: number;
+}
+
+export const DEFAULT_VOICE_ACTIVITY_WINDOWS: VoiceActivityWindows = Object.freeze({
+  trailingSilenceMs: VAD_TRAILING_SILENCE_MS,
+  shortTrailingSilenceMs: VAD_SHORT_UTTERANCE_TRAILING_SILENCE_MS,
+});
+
 /** 头这段时间标定噪声底,同时按临时底判语音。 */
 export const VAD_CALIBRATION_MS = 400;
 
@@ -110,7 +125,10 @@ function lowQuantile(values: number[], quantile: number): number {
   return sorted[index];
 }
 
-export function createVoiceActivityDetector(): VoiceActivityDetector {
+export function createVoiceActivityDetector(
+  windows: VoiceActivityWindows = DEFAULT_VOICE_ACTIVITY_WINDOWS,
+): VoiceActivityDetector {
+  const { trailingSilenceMs, shortTrailingSilenceMs } = windows;
   let state: VoiceActivityState = "idle";
   let firstAtMs: number | null = null;
   let lastAtMs: number | null = null;
@@ -128,7 +146,7 @@ export function createVoiceActivityDetector(): VoiceActivityDetector {
   const onsetThreshold = (): number | null => floor === null ? null : onsetOf(floor);
   const releaseThreshold = (): number | null => floor === null ? null : releaseOf(floor);
   const trailingWindowMs = (): number => voicedMs >= VAD_FULL_UTTERANCE_MS
-    ? VAD_TRAILING_SILENCE_MS : VAD_SHORT_UTTERANCE_TRAILING_SILENCE_MS;
+    ? trailingSilenceMs : shortTrailingSilenceMs;
 
   const trackFloor = (rms: number, deltaMs: number): void => {
     if (floor === null || deltaMs <= 0) return;

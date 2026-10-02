@@ -3,10 +3,13 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   captureIdentityIsNewer,
+  retainBargeInObservation,
   sameCaptureIdentity,
   type LocalAutopilotCaptureEvent,
   type LocalAutopilotCapturePhase,
 } from "./autopilotCapturePresentation.ts";
+import type { BargeInObservation } from "./autopilotBrowserBargeIn.ts";
+import type { NextCommandProjection } from "./autopilotProtocol.ts";
 
 const SOURCE = readFileSync(
   new URL("./usePatientAutopilot.ts", import.meta.url), "utf8");
@@ -146,4 +149,67 @@ test("pre-start 被生命周期中断之后本窗口停止 tick，重新可见�
 test("录音执行器拿到的是本次 owner 代际，屏显事件才可能被正确过滤", () => {
   assert.match(SOURCE, /ownerGeneration: context\.ownerGeneration/);
   assert.match(SOURCE, /observe: observeCapturePhase/);
+});
+
+const INTERRUPTED: BargeInObservation = {
+  sessionId: SESSION, commandKey: "cmd-question-hook-0001", itemRef: "itm-0001",
+  turnSeq: 1, attemptSeq: 1, controlGeneration: 3, runnerGeneration: 7,
+  phase: "interrupted",
+};
+
+function speech(commandKey: string, purpose: "question" | "feedback"): NextCommandProjection {
+  return {
+    schema_version: 1, command_key: commandKey, command_seq: 3, kind: "tts", state: "pending",
+    command_revision: 0, control_generation: 3, runner_generation: 7, item_ref: "itm-0001",
+    turn_seq: 1, attempt_seq: 1, prompt_level: 0,
+    payload: { speech_key: `wk2.01.${purpose}`, speech_text: "说得很好。", purpose },
+  };
+}
+
+function record(): NextCommandProjection {
+  return {
+    schema_version: 1, command_key: "cmd-record-hook-0002", command_seq: 2, kind: "record",
+    state: "pending", command_revision: 0, control_generation: 3, runner_generation: 7,
+    item_ref: "itm-0001", turn_seq: 1, attempt_seq: 1, prompt_level: 0,
+    payload: {
+      raw_audio_id: "raw-hook-0001", turn_ref: "itm-0001#1", max_duration_seconds: 15,
+      contains_direct_identifier: false, presentation_speech_key: "wk2.01.question",
+      presentation_speech_text: "请说出图片中的物品。", presentation_purpose: "question",
+    },
+  };
+}
+
+test("开口打断的观察留到它那条录音为止:换成别的朗读命令(反馈、重播)就清掉", () => {
+  // 被打断的那一句本身、紧接着的录音、命令暂时为空:都还要提醒从头说。
+  assert.equal(retainBargeInObservation(INTERRUPTED, speech(INTERRUPTED.commandKey, "question")),
+    INTERRUPTED);
+  assert.equal(retainBargeInObservation(INTERRUPTED, record()), INTERRUPTED);
+  assert.equal(retainBargeInObservation(INTERRUPTED, null), INTERRUPTED);
+  // 反馈句、重播的提问:这次打断已经翻篇。
+  assert.equal(retainBargeInObservation(INTERRUPTED, speech("cmd-feedback-hook-0003", "feedback")), null);
+  assert.equal(retainBargeInObservation(INTERRUPTED, speech("cmd-question-hook-0004", "question")), null);
+  // 其他相位的观察(检测中、不可用)由各自的 monitor 自己收尾,不在这里改。
+  const monitoring = { ...INTERRUPTED, phase: "monitoring" as const };
+  assert.equal(retainBargeInObservation(monitoring, speech("cmd-feedback-hook-0003", "feedback")), monitoring);
+  assert.equal(retainBargeInObservation(null, record()), null);
+});
+
+test("runner 每次状态推进都用同一个规则收拢打断观察", () => {
+  assert.match(SOURCE, /setBargeIn\(\(before\) => retainBargeInObservation\(before, runtime\.command\)\)/);
+});
+
+test("语音设置按场次缓存;开麦只读缓存,刷新在 runner 每一拍后台发起、从不 await", () => {
+  // 场次一换就换一份缓存,上一场的设置不进这一场。
+  assert.match(SOURCE, /voiceSettings\?\.sessionId !== sessionId/);
+  assert.match(SOURCE, /new AutopilotVoiceSettingsCache\(\s*sessionId,/);
+  assert.match(SOURCE, /fetchAutopilotVoiceSettings\(/);
+  // 执行器拿到的是这份缓存本身(开麦时只读它),不是一次网络请求。
+  assert.match(SOURCE, /new BrowserAutopilotRecordingExecutor\([^)]*?voiceSettings,\n/);
+  // tick 里先顺手发起刷新、再进 pollOnce;刷新的返回值不进任何 await。
+  const tick = SOURCE.slice(SOURCE.indexOf("const tick = async () => {"));
+  const refreshAt = tick.indexOf("voiceSettings.refreshInBackground();");
+  const pollAt = tick.indexOf(".pollOnce()");
+  assert.ok(refreshAt > 0 && pollAt > refreshAt, "刷新必须在 pollOnce 之前发起");
+  assert.doesNotMatch(SOURCE, /await\s+voiceSettings/);
+  assert.doesNotMatch(SOURCE, /await\s+[\w.]*refreshInBackground/);
 });

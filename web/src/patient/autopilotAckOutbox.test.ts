@@ -7,6 +7,8 @@ import {
   nextAutopilotAckCheckpoint,
   nextAutopilotAckLatch,
   parseAutopilotAckCheckpoint,
+  parseAutopilotAckEnvelope,
+  sameAutopilotAckEnvelope,
   type AutopilotAckEnvelope,
 } from "./autopilotAckOutbox.ts";
 import { buildAutopilotAck, type NextCommandProjection } from "./autopilotProtocol.ts";
@@ -138,4 +140,69 @@ test("nextAutopilotAckLatch：tts_failed/record_failed 落 latch，其余全部�
 
   const started = ttsStartedEnvelope();
   assert.equal(nextAutopilotAckLatch(started), null);
+});
+
+function startedRecord(): NextCommandProjection {
+  return {
+    schema_version: 1,
+    command_key: "cmd-outbox-record-0002",
+    command_seq: 2,
+    kind: "record",
+    state: "started",
+    command_revision: 1,
+    control_generation: 1,
+    runner_generation: 1,
+    item_ref: "itm-0001",
+    turn_seq: 1,
+    attempt_seq: 1,
+    prompt_level: 0,
+    payload: {
+      raw_audio_id: "raw-outbox-0001",
+      turn_ref: "itm-0001#1",
+      max_duration_seconds: 15,
+      contains_direct_identifier: false,
+      presentation_speech_key: "wk2.01.question",
+      presentation_speech_text: "请说出图片中的物品。",
+      presentation_purpose: "question",
+    },
+  };
+}
+
+test("IndexedDB 里升级前的 record_stopped envelope(无 VAD 两键)照样能重放;新 envelope 带上它们也合法", () => {
+  const command = startedRecord();
+  const receipt = {
+    ack_type: "record_stopped",
+    stop_reason: "user_done",
+    raw_audio_id: "raw-outbox-0001",
+    receipt_server_seq: 12,
+    checksum: "c".repeat(64),
+    byte_count: 4_096,
+    duration_seconds: 3.5,
+  } as const;
+  const historicalAck = {
+    idempotency_key: "ack:record_stopped:5:00000000-0000-4000-8000-000000000005",
+    control_generation: 1,
+    runner_generation: 1,
+    command_revision: 1,
+    device_event_seq: 5,
+    ...receipt,
+  };
+  // 结构化克隆读回来的就是这样一份 plain 对象,没有任何新键。
+  const stored = JSON.parse(JSON.stringify({
+    schemaVersion: 1, ownerKey: OWNER_KEY, sessionId: SESSION_ID,
+    commandKey: command.command_key, command, ack: historicalAck, createdAtMs: 7,
+  }));
+  const replayed = parseAutopilotAckEnvelope(stored);
+  assert.deepEqual(replayed.ack, historicalAck);
+  assert.equal(sameAutopilotAckEnvelope(stored, replayed), true);
+
+  const current = createAutopilotAckEnvelope({
+    ownerKey: OWNER_KEY, sessionId: SESSION_ID, command, nowMs: 7,
+    ack: buildAutopilotAck(command, 4, historicalAck.idempotency_key, {
+      ...receipt, vad_armed: true, vad_voiced_ms: 1_280,
+    }),
+  });
+  assert.deepEqual(parseAutopilotAckEnvelope(JSON.parse(JSON.stringify(current))), current);
+  // 多了两个事实就是另一份 envelope:同 key 重放时逐字对齐会把它们区分开。
+  assert.equal(sameAutopilotAckEnvelope(stored, current), false);
 });

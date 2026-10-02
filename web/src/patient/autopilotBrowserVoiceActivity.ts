@@ -1,4 +1,8 @@
-import { createVoiceActivityDetector } from "./autopilotVoiceActivity.ts";
+import {
+  DEFAULT_VOICE_ACTIVITY_WINDOWS,
+  createVoiceActivityDetector,
+  type VoiceActivityWindows,
+} from "./autopilotVoiceActivity.ts";
 
 /**
  * 浏览器侧的采样器:在录音器**已经拿到**的那条 MediaStream 上挂一个 AnalyserNode,
@@ -41,8 +45,18 @@ function timeDomainRms(samples: Float32Array): number {
   return samples.length === 0 ? 0 : Math.sqrt(sum / samples.length);
 }
 
+export interface VoiceActivityObservation {
+  /** 拆除;幂等,拆掉之后绝不再回调。 */
+  release(): void;
+  /**
+   * 判定器累计的有声毫秒。采样器一帧都没真读到(上下文一直没跑起来、刚挂上就
+   * 停了)时为 null——那不算「VAD 武装过」。拆除之后定格在拆除那一刻。
+   */
+  voicedMs(): number | null;
+}
+
 /**
- * 开始旁听;返回拆除函数。拆除幂等,拆掉之后绝不再回调。
+ * 开始旁听;返回采样器把手。
  *
  * `onTrailingSilence` 至多被调一次,而且一定在拆除之后——调用方拿到回调时
  * 采样器已经不存在了。
@@ -50,12 +64,15 @@ function timeDomainRms(samples: Float32Array): number {
 export function observeTrailingSilence(
   stream: MediaStream,
   onTrailingSilence: () => void,
+  windows: VoiceActivityWindows = DEFAULT_VOICE_ACTIVITY_WINDOWS,
   ports: VoiceActivitySamplerPorts = browserVoiceActivitySamplerPorts,
-): () => void {
+): VoiceActivityObservation {
   let context: AudioContext | null = null;
   let source: MediaStreamAudioSourceNode | null = null;
   let timer: number | null = null;
   let released = false;
+  let detector = createVoiceActivityDetector(windows);
+  let sampled = false;
 
   const release = (): void => {
     if (released) return;
@@ -89,7 +106,6 @@ export function observeTrailingSilence(
     if (context.state === "suspended") {
       void context.resume().catch(() => {});
     }
-    let detector = createVoiceActivityDetector();
     const frame = new Float32Array(analyser.fftSize);
     timer = ports.setInterval(() => {
       if (released) return;
@@ -98,11 +114,13 @@ export function observeTrailingSilence(
           // 系统中断也可能发生在老人已开口之后。丢弃先前的倒计时,恢复后
           // 重新观察开口,不能把音频图暂停误认为老人说完。录音器的按钮和
           // 原始作答上限继续生效,这里只降级 VAD。
-          detector = createVoiceActivityDetector();
+          detector = createVoiceActivityDetector(windows);
           return;
         }
         analyser.getFloatTimeDomainData(frame);
-        if (detector.push(timeDomainRms(frame), ports.now()) !== "stopped") return;
+        const state = detector.push(timeDomainRms(frame), ports.now());
+        sampled = true;
+        if (state !== "stopped") return;
       } catch {
         // 读数坏了就闭嘴:拆掉自己,余下的收麦路不受影响。
         release();
@@ -114,5 +132,8 @@ export function observeTrailingSilence(
   } catch {
     release();
   }
-  return release;
+  return {
+    release,
+    voicedMs: () => (sampled ? detector.voicedMs : null),
+  };
 }

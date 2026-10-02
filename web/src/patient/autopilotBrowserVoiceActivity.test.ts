@@ -7,7 +7,11 @@ import {
   observeTrailingSilence,
   type VoiceActivitySamplerPorts,
 } from "./autopilotBrowserVoiceActivity.ts";
-import { VAD_TRAILING_SILENCE_MS } from "./autopilotVoiceActivity.ts";
+import {
+  DEFAULT_VOICE_ACTIVITY_WINDOWS,
+  VAD_TRAILING_SILENCE_MS,
+  type VoiceActivityWindows,
+} from "./autopilotVoiceActivity.ts";
 
 class FakeSource {
   disconnects = 0;
@@ -88,15 +92,23 @@ function samplerHarness(options: { context?: FakeAudioContext | (() => never) } 
 
 const STREAM = { getTracks: () => [] } as unknown as MediaStream;
 
+function observe(
+  harness: ReturnType<typeof samplerHarness>,
+  onTrailingSilence: () => void,
+  windows: VoiceActivityWindows = DEFAULT_VOICE_ACTIVITY_WINDOWS,
+) {
+  return observeTrailingSilence(STREAM, onTrailingSilence, windows, harness.ports);
+}
+
 test("说完了:回调恰好一次,而且回调前 AudioContext 已经 close、源节点断开、定时器撤掉", async () => {
   const harness = samplerHarness();
   const context = harness.context as FakeAudioContext;
   let callbacks = 0;
   let closedWhenCalled = -1;
-  const release = observeTrailingSilence(STREAM, () => {
+  const sampler = observe(harness, () => {
     callbacks += 1;
     closedWhenCalled = context.closes;
-  }, harness.ports);
+  });
 
   // 只旁听 Recorder 交出的那条流,fftSize 按常量设,源节点接到 analyser 上。
   assert.equal(context.sources.length, 1);
@@ -117,8 +129,8 @@ test("说完了:回调恰好一次,而且回调前 AudioContext 已经 close、�
   assert.deepEqual(harness.cleared, [1]);
 
   // 之后再拆是幂等的:不二次 close。
-  release();
-  release();
+  sampler.release();
+  sampler.release();
   assert.equal(context.closes, 1);
   assert.equal(callbacks, 1);
 });
@@ -127,12 +139,12 @@ test("判定之前拆除:定时器撤掉、AudioContext close 一次,之后一�
   const harness = samplerHarness();
   const context = harness.context as FakeAudioContext;
   let callbacks = 0;
-  const release = observeTrailingSilence(STREAM, () => { callbacks += 1; }, harness.ports);
+  const sampler = observe(harness, () => { callbacks += 1; });
   harness.feed(1_000, 0.002);
   harness.feed(2_000, 0.2);
   harness.feed(2_000, 0.002);   // 静默还没满 3 s
 
-  release();
+  sampler.release();
   assert.equal(harness.pending, false);
   assert.equal(context.closes, 1);
   assert.equal(context.sources[0].disconnects, 1);
@@ -141,21 +153,22 @@ test("判定之前拆除:定时器撤掉、AudioContext close 一次,之后一�
   harness.feed(10_000, 0.002);
   assert.equal(context.analyser.reads, readsBefore);
   assert.equal(callbacks, 0);
-  release();
+  sampler.release();
   assert.equal(context.closes, 1);
 });
 
-test("没有 AudioContext(构造抛错):静默无为,返回的拆除函数可调、零回调、不外抛", () => {
+test("没有 AudioContext(构造抛错):静默无为,返回的拆除函数可调、零回调、不外抛,也不算武装过", () => {
   const harness = samplerHarness({
     context: () => { throw new Error("AudioContext is not defined"); },
   });
   let callbacks = 0;
-  let release: (() => void) | null = null;
+  let sampler: ReturnType<typeof observe> | null = null;
   assert.doesNotThrow(() => {
-    release = observeTrailingSilence(STREAM, () => { callbacks += 1; }, harness.ports);
+    sampler = observe(harness, () => { callbacks += 1; });
   });
   assert.equal(harness.pending, false);
-  assert.doesNotThrow(() => (release as unknown as () => void)());
+  assert.doesNotThrow(() => (sampler as unknown as ReturnType<typeof observe>).release());
+  assert.equal((sampler as unknown as ReturnType<typeof observe>).voicedMs(), null);
   assert.equal(callbacks, 0);
 });
 
@@ -163,12 +176,14 @@ test("上下文被自动播放策略挂在 suspended:试着 resume;读到的全�
   const context = new FakeAudioContext("suspended");
   const harness = samplerHarness({ context });
   let callbacks = 0;
-  const release = observeTrailingSilence(STREAM, () => { callbacks += 1; }, harness.ports);
+  const sampler = observe(harness, () => { callbacks += 1; });
   assert.equal(context.resumes, 1);
   harness.feed(30_000, 0);
   assert.equal(callbacks, 0);
   assert.equal(harness.pending, true);
-  release();
+  // 一帧都没真读到:采样器挂着但没在听,不能报成「VAD 武装过」。
+  assert.equal(sampler.voicedMs(), null);
+  sampler.release();
   assert.equal(context.closes, 1);
   assert.equal(harness.pending, false);
 });
@@ -177,7 +192,7 @@ test("说话后 AudioContext 暂停时的零值不是静音证据,恢复后也�
   const harness = samplerHarness();
   const context = harness.context as FakeAudioContext;
   let callbacks = 0;
-  const release = observeTrailingSilence(STREAM, () => { callbacks += 1; }, harness.ports);
+  const sampler = observe(harness, () => { callbacks += 1; });
   harness.feed(1_000, 0.002);
   harness.feed(2_000, 0.2);
   harness.feed(2_500, 0.002);
@@ -193,14 +208,14 @@ test("说话后 AudioContext 暂停时的零值不是静音证据,恢复后也�
   harness.feed(2_000, 0.2);
   harness.feed(VAD_TRAILING_SILENCE_MS + VAD_SAMPLE_INTERVAL_MS * 2, 0.002);
   assert.equal(callbacks, 1);
-  release();
+  sampler.release();
 });
 
 test("analyser 读数抛错:采样器自拆(close 一次、定时器撤掉),零回调,错误不从定时器里冒出来", () => {
   const harness = samplerHarness();
   const context = harness.context as FakeAudioContext;
   let callbacks = 0;
-  observeTrailingSilence(STREAM, () => { callbacks += 1; }, harness.ports);
+  observe(harness, () => { callbacks += 1; });
   harness.feed(1_000, 0.002);
   harness.feed(2_000, 0.2);
   assert.doesNotThrow(() => harness.feed(VAD_SAMPLE_INTERVAL_MS, null));
@@ -214,9 +229,41 @@ test("close() 本身拒绝或抛错也不影响拆除的其余步骤", () => {
   const context = new FakeAudioContext();
   context.close = () => { context.closes += 1; throw new Error("close 失败"); };
   const harness = samplerHarness({ context });
-  const release = observeTrailingSilence(STREAM, () => {}, harness.ports);
-  assert.doesNotThrow(() => release());
+  const sampler = observe(harness, () => {});
+  assert.doesNotThrow(() => sampler.release());
   assert.equal(context.closes, 1);
   assert.equal(context.sources[0].disconnects, 1);
   assert.equal(harness.pending, false);
+});
+
+test("服务器给的两个窗口交给判定器:5 s 窗口下静 3 s 不收麦,静满 5 s 才回调", () => {
+  const harness = samplerHarness();
+  let callbacks = 0;
+  const sampler = observe(harness, () => { callbacks += 1; },
+    { trailingSilenceMs: 5_000, shortTrailingSilenceMs: 7_000 });
+  harness.feed(1_000, 0.002);
+  harness.feed(2_000, 0.2);
+  harness.feed(VAD_TRAILING_SILENCE_MS + VAD_SAMPLE_INTERVAL_MS * 2, 0.002);
+  assert.equal(callbacks, 0);
+  harness.feed(2_000, 0.002);
+  assert.equal(callbacks, 1);
+  sampler.release();
+});
+
+test("voicedMs:读到帧之前是 null;之后是判定器累计的有声毫秒,拆除后定格", () => {
+  const harness = samplerHarness();
+  const sampler = observe(harness, () => {});
+  assert.equal(sampler.voicedMs(), null);
+  harness.feed(1_000, 0.002);
+  // 只读到安静帧也算真在听:武装过,有声 0。
+  assert.equal(sampler.voicedMs(), 0);
+  harness.feed(2_000, 0.2);
+  // 2000 ms 的话按 64 ms 一帧喂进 32 帧,每帧记 64 ms。
+  assert.equal(sampler.voicedMs(), 32 * VAD_SAMPLE_INTERVAL_MS);
+  harness.feed(1_000, 0.002);
+  sampler.release();
+  const frozen = sampler.voicedMs();
+  harness.feed(2_000, 0.2);
+  assert.equal(sampler.voicedMs(), frozen);
+  assert.equal(frozen, 32 * VAD_SAMPLE_INTERVAL_MS);
 });

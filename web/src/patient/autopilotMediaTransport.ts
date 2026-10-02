@@ -418,6 +418,90 @@ export function fetchExactAutopilotDrainTarget(
   });
 }
 
+/** 服务器语音开关(环境变量读面),平板按场次缓存。 */
+export interface AutopilotVoiceSettings {
+  vad_enabled: boolean;
+  vad_trailing_silence_ms: number;
+  vad_short_trailing_silence_ms: number;
+  barge_in_enabled: boolean;
+}
+
+/**
+ * 后台读,不在提问→开麦的路上:等不到就算失败,失败只是这一阵不武装 VAD,
+ * 不值得像收麦那样等满 12 s。
+ */
+const VOICE_SETTINGS_REQUEST_TIMEOUT_MS = 5_000;
+
+function windowMs(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+
+/**
+ * 四键闭集,范围与服务端取值规则一致(整句窗口 1500..8000,短话窗口不短于整句、
+ * 不超过 10000)。服务端对非法环境变量已经回退默认值,这里再收到越界值只能说明
+ * 两端契约对不上——按坏形状处理,调用方据此不武装 VAD。
+ */
+function parseAutopilotVoiceSettings(value: unknown): AutopilotVoiceSettings {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("自动驾驶语音设置不是对象");
+  }
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row).sort();
+  if (keys.join(",") !== "barge_in_enabled,vad_enabled,vad_short_trailing_silence_ms,vad_trailing_silence_ms"
+      || typeof row.vad_enabled !== "boolean"
+      || typeof row.barge_in_enabled !== "boolean"
+      || !windowMs(row.vad_trailing_silence_ms, 1_500, 8_000)
+      || !windowMs(row.vad_short_trailing_silence_ms, row.vad_trailing_silence_ms, 10_000)) {
+    throw new Error("自动驾驶语音设置不符合封闭契约");
+  }
+  return {
+    vad_enabled: row.vad_enabled,
+    vad_trailing_silence_ms: row.vad_trailing_silence_ms,
+    vad_short_trailing_silence_ms: row.vad_short_trailing_silence_ms,
+    barge_in_enabled: row.barge_in_enabled,
+  };
+}
+
+/**
+ * 设备读面:当前场次的 VAD / 提前回答开关。与收麦目标读面同一套设备凭据与期限
+ * 写法;只读 GET,没有正文,不带 CSRF,也绝不带账号 cookie。
+ */
+export function fetchAutopilotVoiceSettings(
+  sessionId: string,
+  signal: AbortSignal,
+  deps: AutopilotMediaTransportDependencies,
+): Promise<AutopilotVoiceSettings> {
+  return withRequestDeadline(
+    signal,
+    deps.requestTimeoutMs ?? VOICE_SETTINGS_REQUEST_TIMEOUT_MS,
+    "语音设置读取超时",
+    "语音设置读取已取消",
+    async (requestSignal) => {
+      const credential = exactActiveCredential(sessionId, deps);
+      const response = await deps.fetchImpl(
+        `/sessions/${encodeURIComponent(sessionId)}/autopilot/voice-settings`,
+        {
+          method: "GET",
+          signal: requestSignal,
+          credentials: "omit",
+          cache: "no-store",
+          headers: { ...credential.headers },
+        },
+      );
+      const text = await response.text();
+      if (!response.ok) {
+        deps.handleAuthorizationFailure(response.status, text, credential);
+      }
+      return parseAutopilotVoiceSettings(decodeJsonApiResponse({
+        status: response.status,
+        ok: response.ok,
+        statusText: response.statusText,
+        text,
+      }));
+    },
+  );
+}
+
 function parseExactRecordingAuthorization(value: unknown): RecordingAuthorization {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("自动驾驶录音授权响应不是对象");

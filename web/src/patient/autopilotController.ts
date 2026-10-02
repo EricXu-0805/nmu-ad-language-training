@@ -70,6 +70,10 @@ export interface AutopilotRecordingCapture {
     checksum: string;
     byte_count: number;
     duration_seconds: number;
+    /** 「说完没」采样器这次真在听;刷新恢复重建的回执不带。 */
+    vad_armed?: boolean;
+    /** 停止那一刻累计的有声毫秒,只在 vad_armed 为 true 时出现。 */
+    vad_voiced_ms?: number;
   }>;
   /**
    * Resolves only after pending getUserMedia, MediaRecorder, persistence and the
@@ -90,8 +94,16 @@ export interface AutopilotRecordingCapture {
   cancel(): void;
 }
 
+export interface AutopilotRecordingStartOptions {
+  /**
+   * 这条录音紧跟在同一题位的提问/线索被老人开口打断(tts_interrupted,
+   * interrupt_reason=voice_activity)之后:这一次不武装静音自动收麦。
+   */
+  afterVoiceInterruption?: boolean;
+}
+
 export interface AutopilotRecordingExecutor {
-  start(command: RecordCommand): AutopilotRecordingCapture;
+  start(command: RecordCommand, options?: AutopilotRecordingStartOptions): AutopilotRecordingCapture;
 }
 
 /** 一次 ACK 投递在持久化边界上卡住的那个阶段。 */
@@ -507,6 +519,9 @@ export class PatientAutopilotController {
   // 随 tts_ended 收据一起采纳的那条 pending 录音命令。下一拍据此跳过开头的
   // /next：服务器刚刚在同一条响应里签发了它，再读一次只是多一个往返。一次性。
   private receiptAdoptedRecordKey: string | null = null;
+  // 最近一次被老人开口打断(voice_activity)的提问/线索。同一题位紧接着的那条录音
+  // 不武装静音自动收麦;下一段朗读开始就作废。只在本控制器内存里,刷新即失。
+  private voiceInterruptedPrompt: TtsCommand | null = null;
 
   constructor(options: PatientAutopilotControllerOptions) {
     this.sessionId = options.sessionId;
@@ -949,6 +964,7 @@ export class PatientAutopilotController {
 
   private async runSpeech(): Promise<void> {
     const initial = this.currentCommand("tts");
+    this.voiceInterruptedPrompt = null;
     let playback: AutopilotSpeechPlayback;
     try { playback = this.speech.start(initial); }
     catch (error) {
@@ -1011,6 +1027,9 @@ export class PatientAutopilotController {
         : { ack_type: "tts_ended", media_ended: true,
             ...(observedEnd.value.media_duration_ms === undefined
               ? {} : { media_duration_ms: observedEnd.value.media_duration_ms }) });
+      if (endedAck.ack_type === "tts_interrupted" && endedAck.interrupt_reason === "voice_activity") {
+        this.voiceInterruptedPrompt = startedCommand;
+      }
       // 服务器在接受 tts_ended 的同一条响应里就签发了下一条录音命令(收据权威)。
       // 直接采纳它，省掉一个 /next 往返；证明不足或 reducer 不认，才照旧读 /next。
       if (!this.adoptReceiptRecordCommand(startedCommand, endedAck)) {
@@ -1023,12 +1042,16 @@ export class PatientAutopilotController {
   }
 
   private async runRecording(): Promise<void> {
-    // This method is the sole microphone admission point. The reducer guard in
-    // runOnce proves an exact, pending server record command exists first.
+    // 唯一的**录音**入口:runOnce 里的 reducer 闸先证明存在一条 exact、pending 的
+    // 服务器录音命令。麦克风的另一条路是 runSpeech 在提问/线索 started 之后武装
+    // 的提前回答检测(armBargeIn),只在本机分析、从不录音。
     const initial = this.currentCommand("record");
     let capture: AutopilotRecordingCapture;
-    try { capture = this.recording.start(initial); }
-    catch (error) {
+    try {
+      capture = this.recording.start(initial, {
+        afterVoiceInterruption: this.followsVoiceInterruption(initial),
+      });
+    } catch (error) {
       await this.mediaFailure(
         "record",
         autopilotMediaErrorCode(error, "recording_start_failed"),
@@ -1174,6 +1197,18 @@ export class PatientAutopilotController {
       if (this.activeMedia === capture) this.activeMedia = null;
       if (this.activeRecording === capture) this.activeRecording = null;
     }
+  }
+
+  /** 这条录音是否紧跟在同一题位、同一控制代际的那次开口打断之后。 */
+  private followsVoiceInterruption(record: RecordCommand): boolean {
+    const prompt = this.voiceInterruptedPrompt;
+    return prompt !== null
+      && prompt.control_generation === record.control_generation
+      && prompt.runner_generation === record.runner_generation
+      && prompt.item_ref === record.item_ref
+      && prompt.turn_seq === record.turn_seq
+      && prompt.attempt_seq === record.attempt_seq
+      && prompt.prompt_level === record.prompt_level;
   }
 
   /**

@@ -125,9 +125,18 @@ export function PatientAutopilotStage({
     && autopilot.bargeIn.controlGeneration === command.control_generation
     && autopilot.bargeIn.runnerGeneration === command.runner_generation
     ? autopilot.bargeIn : null;
-  const voiceInterrupted = bargeIn?.phase === "interrupted";
+  // 「从头回答」只对被打断的那一句提问/线索和紧接着的录音说;同一回答位置上的
+  // 反馈、报答案、重播的提问都是别的朗读命令,照常显示。
+  const voiceInterrupted = bargeIn?.phase === "interrupted"
+    && (command.kind === "record"
+      ? command.payload.presentation_purpose === "question"
+        || command.payload.presentation_purpose === "cue"
+      : command.command_key === bargeIn.commandKey);
+  // 检测只在这一句提问/线索真正播放时活着;残留的 monitoring 观察不算在听。
   const voiceMonitoring = bargeIn?.phase === "monitoring"
-    && bargeIn.commandKey === command.command_key;
+    && command.kind === "tts" && command.state === "started"
+    && bargeIn.commandKey === command.command_key
+    && runtime?.phase === "tts_playing";
   const persisting = localPhase?.phase === "persisting";
   const imageReady = autopilot.assetReadiness?.requestKey === stimulusKey
     && autopilot.assetReadiness.readiness === "ready";

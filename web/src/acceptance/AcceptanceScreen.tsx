@@ -102,7 +102,7 @@ export function AcceptanceScreen() {
     <div className="page-shell page-shell--wide">
       <header className="page-header-block">
         <div>
-          <p className="page-kicker">真机验收 · 八项</p>
+          <p className="page-kicker">真机验收 · 十三项</p>
           <h1 className="page-title">真机验收记录</h1>
           <p className="page-description">
             在<strong>正式使用的设备、浏览器和房间</strong>里填写，

@@ -192,6 +192,49 @@ test("record_stopped requires the complete exact server receipt tuple", () => {
   assert.throws(() => parseAutopilotAck({ ...stopped, stop_reason: "operator" }));
 });
 
+test("record_stopped 可选带 VAD 两个事实;只有 stop_reason 那种历史形状照样合法", () => {
+  const receipt = {
+    ack_type: "record_stopped",
+    stop_reason: "silence",
+    raw_audio_id: "raw-server-issued-0001",
+    receipt_server_seq: 27,
+    checksum: CHECKSUM,
+    byte_count: 8_192,
+    duration_seconds: 4.25,
+  } as const;
+  const armed = buildAutopilotAck(recordCommand(), 9, "evt-rec-stop-vad-0010", {
+    ...receipt, vad_armed: true, vad_voiced_ms: 1_536,
+  });
+  assert.deepEqual(parseAutopilotAck(armed), armed);
+  const unarmed = buildAutopilotAck(recordCommand(), 9, "evt-rec-stop-vad-0011", {
+    ...receipt, stop_reason: "user_done", vad_armed: false,
+  });
+  assert.deepEqual(parseAutopilotAck(unarmed), unarmed);
+  // 旧平板与 IndexedDB 里的旧 envelope:两个键都没有。
+  const historical = buildAutopilotAck(recordCommand(), 9, "evt-rec-stop-old-0012", receipt);
+  assert.equal(Object.hasOwn(historical, "vad_armed"), false);
+  assert.deepEqual(parseAutopilotAck(historical), historical);
+
+  // 有声毫秒只在采样器真跑过时才有:没武装或没说武装没武装,都不许带。
+  const { vad_armed: _armed, ...voicedOnly } = armed;
+  assert.throws(() => parseAutopilotAck(voicedOnly));
+  assert.throws(() => parseAutopilotAck({ ...armed, vad_armed: false }));
+  for (const voiced of [-1, 600_001, 12.5, "1536", null, Number.NaN]) {
+    assert.throws(() => parseAutopilotAck({ ...armed, vad_voiced_ms: voiced }), String(voiced));
+  }
+  assert.deepEqual(parseAutopilotAck({ ...armed, vad_voiced_ms: 600_000 }).ack_type, "record_stopped");
+  for (const flag of ["true", 1, null]) {
+    assert.throws(() => parseAutopilotAck({ ...unarmed, vad_armed: flag }), String(flag));
+  }
+  // 只属于 record_stopped:别的回执带上就是跨事件事实。
+  const started = buildAutopilotAck(recordCommand(), 8, "evt-rec-start-vad-0009",
+    { ack_type: "record_started", mime_type: "audio/webm" });
+  assert.throws(() => parseAutopilotAck({ ...started, vad_armed: false }));
+  const failed = buildAutopilotAck(recordCommand(), 9, "evt-rec-fail-vad-0010",
+    { ack_type: "record_failed", error_code: "recording_upload_failed" });
+  assert.throws(() => parseAutopilotAck({ ...failed, vad_armed: true, vad_voiced_ms: 10 }));
+});
+
 test("failure ACKs use a closed machine-code vocabulary", () => {
   const failure = buildAutopilotAck(
     questionCommand(), 0, "evt-tts-failed-0001",

@@ -1,3 +1,6 @@
+import type { BargeInObservation } from "./autopilotBrowserBargeIn.ts";
+import type { NextCommandProjection } from "./autopilotProtocol.ts";
+
 /**
  * Purely local presentation state for the window the server cannot see.
  *
@@ -85,6 +88,20 @@ export function captureIdentityIsNewer(
     return candidate.ownerGeneration > current.ownerGeneration;
   }
   return candidate.captureGeneration >= current.captureGeneration;
+}
+
+/**
+ * 「刚才的开头还没有录下，请从头完整说一次」只属于被开口打断的那一句提问/线索
+ * 和紧接着的那条录音。当前命令换成别的朗读(反馈、报答案、重播的提问)时,这次
+ * 打断就翻篇了,观察清掉——否则同一回答位置后面每一句都在叫老人从头回答。
+ * 其他相位(检测中、不可用、已关)由各自的检测器收尾,这里不碰。
+ */
+export function retainBargeInObservation(
+  observation: BargeInObservation | null,
+  command: NextCommandProjection | null,
+): BargeInObservation | null {
+  if (observation?.phase !== "interrupted" || command?.kind !== "tts") return observation;
+  return command.command_key === observation.commandKey ? observation : null;
 }
 
 /**
