@@ -1,7 +1,7 @@
 [Unit]
 Description=NMU public endpoint health probe (the only check that runs from outside)
 OnFailure=nmu-alert@%N.service
-After=network-online.target
+After=network-online.target nmu.service nmu-caddy.service
 
 [Service]
 Type=oneshot
@@ -11,7 +11,9 @@ Type=oneshot
 # ⚠️ 它仍然跑在同一台机器上——解析到本机公网 IP、走本机网卡，所以「机房到互联网
 # 那一跳断了」它探不出来；那一档只有异地那台 Mac 能发现。
 # --max-time 挡住卡死的连接；-f 让 4xx/5xx 变成非零退出。
-ExecStart=/usr/bin/curl -fsS --max-time 10 -o /dev/null https://89-208-253-119.sslip.io/health
+# 开机时 Persistent=true 会补跑错过的那次，定时器起得比 uvicorn/Caddy 早：拒连、超时、
+# 502/503 先重试，最多 90 秒，站点真起不来才告警。平时真宕机，告警最多晚 90 秒。
+ExecStart=/usr/bin/curl -fsS --max-time 10 --retry 5 --retry-delay 10 --retry-max-time 90 --retry-connrefused -o /dev/null https://89-208-253-119.sslip.io/health
 Nice=10
 
 [Install]

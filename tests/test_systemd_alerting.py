@@ -103,6 +103,18 @@ def test_a_timer_probes_the_public_endpoint():
     assert "nmu-alert@%N.service" in _directives(service).get("OnFailure", [])
 
 
+def test_the_boot_catch_up_probe_waits_for_the_site_instead_of_alerting():
+    """Persistent=true 让开机时补跑错过的那次探针,定时器起来得比 uvicorn/Caddy 早;
+    探针一次失败就告警等于每次重启都发一条「站点挂了」。要先排在站点之后,再给它几次重试。"""
+    service = UNITS / "nmu-health.service"
+    directives = _directives(service)
+    after = " ".join(directives.get("After", []))
+    assert "nmu.service" in after and "nmu-caddy.service" in after
+    command = " ".join(directives.get("ExecStart", []))
+    assert "--retry-connrefused" in command
+    assert "--retry " in command and "--retry-max-time " in command
+
+
 def _timers() -> list[Path]:
     return sorted(UNITS.glob("*.timer"))
 
