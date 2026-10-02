@@ -131,6 +131,7 @@ def _fixture(
     migrated_database: Path,
     *,
     controlled: bool = True,
+    sheets: frozenset[str] | set[str] = SHEETS,
 ) -> dict[str, Path]:
     data = _private_directory(tmp_path / "data")
     quarantine = _private_directory(tmp_path / "quarantine")
@@ -140,7 +141,7 @@ def _fixture(
     analysis = _private_directory(
         data / "exports" / "simulation" / BATCH_ID
     )
-    for sheet in SHEETS - {"audio_manifest"}:
+    for sheet in sheets - {"audio_manifest"}:
         _private_bytes(
             analysis / f"{sheet}.csv",
             b"synthetic\n",
@@ -329,6 +330,71 @@ def test_reconciles_only_real_preintent_layout_and_keeps_batch(
         fixture["data"],
         require_manifest=False,
     ) == fixture["data"].resolve()
+
+
+# 各版导出器实际写出的表集,独立抄录,不从两个脚本的常量推。
+_BASE_SHEETS = SHEETS - {"adjudications"}
+_QUESTIONNAIRE_SHEETS = _BASE_SHEETS | {
+    "repeat_audio_manifest", "questionnaire_records", "questionnaire_item_values"}
+
+
+@pytest.mark.parametrize("sheets", [
+    pytest.param(_BASE_SHEETS, id="base-9"),
+    pytest.param(_BASE_SHEETS | {"repeat_audio_manifest"}, id="repeat-10"),
+    pytest.param(SHEETS, id="prior-backup-10"),
+    pytest.param(_QUESTIONNAIRE_SHEETS, id="questionnaires-12"),
+    pytest.param(_QUESTIONNAIRE_SHEETS | {"adjudications"}, id="current-13"),
+])
+def test_preintent_staging_from_every_exporter_version_reconciles_and_resumes(
+    tmp_path: Path,
+    migrated_database: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sheets: frozenset[str],
+) -> None:
+    """崩在哪一版导出器的 pre-intent 残留都要能隔离;隔离到一半中断,续跑也要认得出那份清单。"""
+    fixture = _fixture(tmp_path, migrated_database, sheets=sheets)
+    real_write = reconcile._atomic_write_json
+
+    def fail_receipt(path, value):
+        if Path(path).name == "reconciliation-receipt.json":
+            raise reconcile.ReconciliationError("synthetic_receipt_failure")
+        return real_write(path, value)
+
+    monkeypatch.setattr(reconcile, "_atomic_write_json", fail_receipt)
+    with pytest.raises(
+        reconcile.ReconciliationError,
+        match="synthetic_receipt_failure",
+    ):
+        _run(fixture)
+    monkeypatch.setattr(reconcile, "_atomic_write_json", real_write)
+    resumed = _run(fixture)
+    assert resumed.status == "reconciled"
+    quarantined = fixture["quarantine"] / str(resumed.bundle_name) / "analysis"
+    assert {path.name for path in quarantined.iterdir()} == (
+        {f"{name}.csv" for name in sheets} | {".staging-receipt.json"})
+
+
+def test_unsupported_partial_sheet_set_is_left_in_place(
+    tmp_path: Path,
+    migrated_database: Path,
+) -> None:
+    sheets = _QUESTIONNAIRE_SHEETS - {"questionnaire_records"}
+    fixture = _fixture(tmp_path, migrated_database, sheets=sheets)
+    with pytest.raises(
+        reconcile.ReconciliationError,
+        match="analysis_layout_invalid",
+    ):
+        _run(fixture)
+    assert fixture["analysis"].is_dir()
+
+
+def test_reconciler_accepts_exactly_the_backup_verifier_sheet_sets() -> None:
+    """2026-09-25 只给备份校验器补了历史表集,对账脚本还停在 10 张表:两边必须一起走。"""
+    from app.export import SHEET_FIELDS
+    from scripts.verify_backup_snapshot import _SUPPORTED_EXPORT_SHEET_SETS
+
+    assert reconcile._SUPPORTED_SHEET_SETS == _SUPPORTED_EXPORT_SHEET_SETS
+    assert frozenset(SHEET_FIELDS) in reconcile._SUPPORTED_SHEET_SETS
 
 
 def test_dry_run_makes_no_change(
