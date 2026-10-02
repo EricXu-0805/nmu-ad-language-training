@@ -250,3 +250,5 @@ def test_technical_failure_exit_takeover_manual_completion_then_ai_resumes_next_
         assert (summary.total_attempts, summary.completed_attempts,
                 summary.technical_failure_attempts, summary.prompt_level_0_count,
                 summary.technical_pause_count) == (3, 2, 1, 3, 1)
+        # 接管只记在控制账本里;汇总改数账本之前这里恒为 0(收尾面板「人工接管」跟着显示 0)。
+        assert summary.researcher_takeover_count == 1
