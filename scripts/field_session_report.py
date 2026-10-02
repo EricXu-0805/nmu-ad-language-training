@@ -440,7 +440,8 @@ def _clock(snap: Snapshot) -> dict:
             "clock_offset_unexpected",
             f"第 {'、'.join(map(str, early))} 场有 attempt 落行按 +8 h 折算后比它的 "
             "record_stopped 回执早了 60 s 以上——attempt 只可能晚于收麦回执，说明这几场的"
-            "本地时间列不是 +8 h（TZ 变过）；拒绝出报告。先核对生产 .env 的 TZ。")
+            "本地时间列不是 +8 h（TZ 变过）；拒绝出报告。先核对生产 .env 的 TZ；"
+            "只看 TZ 改对之后的场次，可加 --since 把这几场排除在外。")
     clock.update(status="ok", median_offset_seconds=round(median, 3),
                  min_offset_seconds=round(min(offsets), 3))
     return clock
