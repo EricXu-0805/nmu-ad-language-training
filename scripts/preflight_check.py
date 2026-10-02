@@ -9,7 +9,7 @@ D2 走查那天真正只能靠人的，是麦克风、噪声、断网和老人�
   数据库   代码的 alembic 头与库里的头是否一致（只读，一条 SELECT）
   备份     检查备份脚本可执行，并复用 backup_health_check 的新鲜度判据
   依赖     已安装依赖与带哈希锁是否一致
-  操作系统 显式启用时核对安全更新和重启状态
+  操作系统 显式启用时核对安全更新和重启状态、nmu-*.timer 是否真排上了下一次
   公网     /health 200、四条红线 404、五个安全头齐、受保护路由 401
 
 不打任何供应商的云 API：那要花钱、要把文本发出去，得由人明确发起。
@@ -26,6 +26,7 @@ from pathlib import Path
 import sqlite3
 import ssl
 import stat
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -199,6 +200,60 @@ def check_os_security(max_age_days: int = 3) -> Check:
     return Check(name, True, detail)
 
 
+def _systemd_properties(text: str) -> dict[str, str]:
+    properties: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key.strip()] = value.strip()
+    return properties
+
+
+def check_timers_scheduled(run=subprocess.run) -> Check:
+    """每个装上的 nmu-*.timer 都真的排上了下一次触发。
+
+    2026-09-30 重启后 nmu-health.timer 停在 SubState=elapsed、下一次触发时间为空，
+    ActiveState 却一直是 active——看 status 的人和只认 active 的脚本都看不出来。
+    所以这里只认 SubState=waiting 且 NextElapseUSecRealtime 非空。
+    """
+    name = "定时器在排程"
+    try:
+        listed = run(
+            ["systemctl", "list-unit-files", "--no-legend", "--no-pager", "nmu-*.timer"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        return Check(name, False, f"查不动 systemctl：{error}")
+    if listed.returncode != 0:
+        return Check(name, False, f"systemctl list-unit-files 退出码 {listed.returncode}")
+    timers = sorted({
+        fields[0] for fields in (line.split() for line in listed.stdout.splitlines())
+        if fields and fields[0].startswith("nmu-") and fields[0].endswith(".timer")})
+    if not timers:
+        return Check(name, False, "一个 nmu-*.timer 都没装：备份、健康检查和公网探针都不会跑")
+
+    dead = []
+    for timer in timers:
+        try:
+            shown = run(
+                ["systemctl", "show", timer, "-p", "SubState", "-p", "NextElapseUSecRealtime"],
+                capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as error:
+            return Check(name, False, f"查不动 systemctl：{error}")
+        if shown.returncode != 0:
+            dead.append(f"{timer}(systemctl show 退出码 {shown.returncode})")
+            continue
+        properties = _systemd_properties(shown.stdout)
+        sub_state = properties.get("SubState", "")
+        next_elapse = properties.get("NextElapseUSecRealtime", "")
+        if sub_state != "waiting" or not next_elapse:
+            dead.append(f"{timer}(SubState={sub_state or '空'}, NEXT={next_elapse or '空'})")
+    if dead:
+        return Check(name, False,
+                     f"{len(dead)} 个定时器没在排程：{'；'.join(dead)}；"
+                     "ActiveState=active 不代表会触发，处置见 deploy/systemd/README.md")
+    return Check(name, True, f"{len(timers)} 个 nmu-*.timer 都是 waiting 且排上了下一次")
+
+
 def _default_fetch(url: str, timeout: float):
     context = ssl.create_default_context()
     request = urllib.request.Request(url, method="GET")
@@ -325,8 +380,11 @@ def main(argv: list[str] | None = None) -> int:
         checks.append(check_backup_execution(args.app_root))
     checks.append(check_supply_chain(args.lock, sys.executable) if args.lock
                   else Check("依赖与哈希锁一致", None, "未给 --lock"))
-    checks.append(check_os_security() if args.os
-                  else Check("OS 安全补丁", None, "未给 --os"))
+    if args.os:
+        checks.append(check_os_security())
+        checks.append(check_timers_scheduled())
+    else:
+        checks.append(Check("OS 安全补丁", None, "未给 --os"))
     if args.base_url:
         checks.extend(check_public_surface(args.base_url))
     else:

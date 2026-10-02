@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -201,6 +202,74 @@ def test_supply_chain_group_fails_loudly_when_it_cannot_look(tmp_path):
     assert check.ok is False and "对不成账" in check.detail
 
 
+WAITING = "NextElapseUSecRealtime=Fri 2026-10-02 10:10:00 UTC\nSubState=waiting\n"
+
+
+def _systemctl(show: dict[str, str], installed: list[str] | None = None):
+    """假 systemctl：list-unit-files 报出已装的定时器，show 按单元名回放属性。"""
+    names = list(show) if installed is None else installed
+
+    def run(argv, **_kwargs):
+        if argv[:2] == ["systemctl", "list-unit-files"]:
+            listing = "".join(f"{name} enabled enabled\n" for name in names)
+            return SimpleNamespace(returncode=0, stdout=listing, stderr="")
+        if argv[:2] == ["systemctl", "show"]:
+            return SimpleNamespace(returncode=0, stdout=show[argv[2]], stderr="")
+        raise AssertionError(f"没预料到的命令：{argv}")
+
+    return run
+
+
+def test_timer_check_passes_when_every_installed_timer_is_waiting():
+    check = preflight.check_timers_scheduled(run=_systemctl({
+        "nmu-backup.timer": WAITING, "nmu-health.timer": WAITING}))
+
+    assert check.ok is True, check.detail
+    assert "2 个" in check.detail
+
+
+def test_an_elapsed_timer_is_named_although_it_still_shows_active():
+    # 2026-09-30 重启后 nmu-health.timer 的原样：active，但再也不会触发。
+    check = preflight.check_timers_scheduled(run=_systemctl({
+        "nmu-backup.timer": WAITING,
+        "nmu-health.timer": ("ActiveState=active\nNextElapseUSecRealtime=\n"
+                             "SubState=elapsed\n"),
+    }))
+
+    assert check.ok is False
+    assert "nmu-health.timer" in check.detail and "elapsed" in check.detail
+    assert "nmu-backup.timer" not in check.detail
+
+
+@pytest.mark.parametrize("shown", [
+    "NextElapseUSecRealtime=\nSubState=waiting\n",
+    "SubState=waiting\n",  # 空属性有的 systemctl 版本干脆不打印
+])
+def test_a_waiting_timer_without_a_next_elapse_is_dead(shown):
+    check = preflight.check_timers_scheduled(run=_systemctl({
+        "nmu-backup.timer": WAITING, "nmu-health.timer": shown}))
+
+    assert check.ok is False
+    assert "nmu-health.timer" in check.detail
+    assert "nmu-backup.timer" not in check.detail
+
+
+def test_missing_systemctl_fails_the_timer_check():
+    def run(argv, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    check = preflight.check_timers_scheduled(run=run)
+
+    assert check.ok is False
+    assert "systemctl" in check.detail
+
+
+def test_no_installed_timer_at_all_is_a_failure_not_a_pass():
+    check = preflight.check_timers_scheduled(run=_systemctl({}, installed=[]))
+
+    assert check.ok is False
+
+
 def test_skipped_groups_do_not_fail_the_run(capsys):
     code = preflight.main([])
 
@@ -242,6 +311,9 @@ def _make_all_automatic_groups_pass(monkeypatch) -> None:
         preflight, "check_os_security",
         lambda: preflight.Check("OS 安全补丁", True, "current"))
     monkeypatch.setattr(
+        preflight, "check_timers_scheduled",
+        lambda: preflight.Check("定时器在排程", True, "waiting"))
+    monkeypatch.setattr(
         preflight, "check_public_surface",
         lambda _url: [preflight.Check("公网表面", True, "closed")])
 
@@ -250,6 +322,21 @@ def test_require_all_needs_no_release_evidence_index(tmp_path, monkeypatch):
     _make_all_automatic_groups_pass(monkeypatch)
 
     assert preflight.main([*_all_pass_args(tmp_path), "--require-all"]) == 0
+
+
+def test_os_flag_also_checks_that_the_timers_are_scheduled(monkeypatch, capsys):
+    _make_all_automatic_groups_pass(monkeypatch)
+    monkeypatch.setattr(
+        preflight, "check_timers_scheduled",
+        lambda: preflight.Check(
+            "定时器在排程", False, "nmu-health.timer(SubState=elapsed, NEXT=空)"))
+
+    code = preflight.main(["--os"])
+
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "[PASS] OS 安全补丁" in output
+    assert "[FAIL] 定时器在排程" in output
 
 
 @pytest.mark.parametrize("mode, expected", [(0o640, 1), (0o750, 0)])
