@@ -388,10 +388,50 @@ def test_caregiver_login_today_status_activation_and_logout(caregiver_clients):
         "resolved_position_count", "operational_demo_ready",
         "active_bedside_session", "patient_presence", "autopilot",
     }
+    assert set(status.json()["patient_presence"]) == {
+        "online", "screen", "last_seen_at", "page_build",
+    }
+    assert status.json()["patient_presence"]["page_build"] == "unknown"
 
     logout = owner.post("/auth/logout")
     assert logout.status_code == 200, logout.text
     assert owner.get("/caregiver/today").status_code == 401
+
+
+def test_caregiver_status_reports_an_old_patient_page(caregiver_clients, monkeypatch):
+    """照护员看到的老人画面版本与操作端同一个判定;别的场次永远是 unknown。"""
+    owner = caregiver_clients.owner
+    deployed = "4205954952" + "1" * 67
+    monkeypatch.setattr(main_module, "_PATIENT_PAGE_BUILD", None)
+    monkeypatch.setattr(main_module, "_PATIENT_PAGE_BUILD_REPORTED", set())
+    monkeypatch.setattr(main_module, "_deployed_page_build_id", lambda: deployed)
+    activated = owner.put(f"/caregiver/sessions/{OWNER_SESSION}/activation")
+    assert activated.status_code == 200, activated.text
+
+    device = TestClient(app)
+    paired = device.post("/device/pair", headers={"X-Console-Pin": "24681024"},
+                         json={"deviceId": "caregiver-page-build-0001"})
+    assert paired.status_code == 200, paired.text
+    capability = {"X-Device-Capability": paired.json()["capability"]}
+
+    def heartbeat(**extra):
+        response = device.post("/live/patient-heartbeat", headers=capability, json={
+            "session_id": OWNER_SESSION, "screen": "waiting", **extra,
+        })
+        assert response.status_code == 200, response.text
+
+    def presence(client, session_id=OWNER_SESSION):
+        response = client.get(f"/caregiver/sessions/{session_id}/status")
+        assert response.status_code == 200, response.text
+        return response.json()["patient_presence"]
+
+    heartbeat()
+    assert presence(owner)["online"] is True
+    assert presence(owner)["page_build"] == "stale"
+    heartbeat(page_build_id=deployed)
+    assert presence(owner)["page_build"] == "current"
+    assert presence(caregiver_clients.other, FOREIGN_SESSION)["page_build"] == "unknown"
+    device.close()
 
 
 def test_real_approved_plan_to_owned_caregiver_bedside_vertical(

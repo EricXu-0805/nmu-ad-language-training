@@ -4857,6 +4857,9 @@ class PatientHeartbeatIn(BaseModel):
     cursor_wseq: int | None = PydanticField(default=None, ge=0)
     # 仅为旧/弱网客户端诊断兼容；在线真值一律采用服务器收件时间，绝不信任客户端时钟。
     client_ts: datetime | None = None
+    # 老人端页面编译时的构建号(与 dist/build-id.txt 同一串数字)。旧页面不带，按旧版本算。
+    # 用 [0-9] 而不是 \d：后者会放过全角数字。
+    page_build_id: str | None = PydanticField(default=None, pattern=r"^[0-9]{10,80}$")
 
 
 class RuntimeCursorIn(BaseModel):
@@ -5364,6 +5367,52 @@ def _prime_live_wseq_from_runtime(row: LiveState, state: SessionRuntimeState | N
             row.command_wseq = max(row.command_wseq or 0, value)
 
 
+_PAGE_BUILD_ID_PATTERN = re.compile(r"[0-9]{10,80}")
+_PAGE_BUILD_ID_FILE_MAX_BYTES = 128
+_DEPLOYED_PAGE_BUILD_ID_PATH = (
+    Path(__file__).resolve().parent.parent / "web" / "dist" / "build-id.txt")
+# 本场最近一拍心跳报的老人端页面构建号，以及本场已记过审计的构建号。与 _SERVER_WSEQ
+# 一样依赖单 worker：重启后清空，最多 5 s 显示 unknown、多记一条重复审计。
+_PATIENT_PAGE_BUILD: tuple[str, str | None] | None = None
+_PATIENT_PAGE_BUILD_REPORTED: set[tuple[str, str | None]] = set()
+
+
+def _deployed_page_build_id(path: Path = _DEPLOYED_PAGE_BUILD_ID_PATH) -> str | None:
+    """每次现读当前 dist 的构建号：换 dist 不一定重启进程，所以不缓存。"""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_PAGE_BUILD_ID_FILE_MAX_BYTES + 1)
+        value = raw.decode("ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if len(raw) > _PAGE_BUILD_ID_FILE_MAX_BYTES or not _PAGE_BUILD_ID_PATTERN.fullmatch(value):
+        return None
+    return value
+
+
+def _remember_patient_page_build(session_id: str, build: str | None) -> bool:
+    """记下本场最近一拍的页面构建号；本场第一次出现的构建号返回 True。调用方须持 _LIVE_WRITE_LOCK。"""
+    global _PATIENT_PAGE_BUILD
+    if _PATIENT_PAGE_BUILD is None or _PATIENT_PAGE_BUILD[0] != session_id:
+        _PATIENT_PAGE_BUILD_REPORTED.clear()
+    _PATIENT_PAGE_BUILD = (session_id, build)
+    if (session_id, build) in _PATIENT_PAGE_BUILD_REPORTED:
+        return False
+    _PATIENT_PAGE_BUILD_REPORTED.add((session_id, build))
+    return True
+
+
+def _patient_page_build_state(row: LiveState | None) -> str:
+    slot = _PATIENT_PAGE_BUILD
+    # 换场会清掉 patient_ack_session_id：新场次第一拍心跳之前不沿用上一场的结论。
+    if row is None or slot is None or slot[0] != row.patient_ack_session_id:
+        return "unknown"
+    deployed = _deployed_page_build_id()
+    if deployed is None:
+        return "unknown"
+    return "current" if slot[1] == deployed else "stale"
+
+
 def _presence_payload(row: LiveState | None, now: datetime | None = None) -> dict:
     now = now or datetime.now()
     last_seen = row.patient_last_seen_at if row else None
@@ -5374,6 +5423,7 @@ def _presence_payload(row: LiveState | None, now: datetime | None = None) -> dic
         "last_seen_at": last_seen,
         "online": online,
         "cursor_wseq": row.patient_ack_seq if row else None,
+        "page_build": _patient_page_build_state(row),
     }
 
 
@@ -7500,6 +7550,7 @@ def caregiver_session_status(
             online=presence["online"],
             screen=presence["screen"],
             last_seen_at=presence["last_seen_at"],
+            page_build=presence.get("page_build", "unknown"),
         ),
         autopilot=autopilot,
     )
@@ -7754,8 +7805,10 @@ def patient_heartbeat(body: PatientHeartbeatIn, request: Request,
             request, s, "上报在场状态", live_row=row)
         if not row or _live_session_id(row) != body.session_id:
             raise HTTPException(409, "heartbeat 场次不是当前操作端场次")
-        if not s.get(TrainSession, body.session_id):
+        sess = s.get(TrainSession, body.session_id)
+        if not sess:
             raise HTTPException(404, "heartbeat 场次不存在")
+        patient_id = sess.patient_id
         # Middleware resolution is only an early rejection.  Revalidate inside
         # the live-row transaction so a queued old-token heartbeat cannot create
         # new presence facts after same-session re-pair has revoked it.
@@ -7773,6 +7826,15 @@ def patient_heartbeat(body: PatientHeartbeatIn, request: Request,
         s.add(row)
         s.commit()
         s.refresh(row)
+        first_report = _remember_patient_page_build(body.session_id, body.page_build_id)
+    if first_report:
+        deployed = _deployed_page_build_id()
+        match = ("unknown" if deployed is None
+                 else "yes" if body.page_build_id == deployed else "no")
+        _audit(s, request, "patient_page_build",
+               f"page_build={body.page_build_id or 'none'} "
+               f"deployed={deployed or 'unknown'} match={match}",
+               patient_id=patient_id, session_id=body.session_id)
     return {"ok": True, "server_time": now,
             "patientPresence": _presence_payload(row, now)}
 

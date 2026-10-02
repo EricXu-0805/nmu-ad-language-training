@@ -98,6 +98,7 @@ class CaregiverPresenceOut(BaseModel):
     online: bool
     screen: str | None
     last_seen_at: datetime | None
+    page_build: Literal["current", "stale", "unknown"] = "unknown"
 
 
 class CaregiverStatusOut(CaregiverSessionSummary):

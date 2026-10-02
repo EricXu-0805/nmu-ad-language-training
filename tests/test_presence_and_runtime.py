@@ -1304,6 +1304,153 @@ def test_patient_presence_cleared_on_session_switch(client):
     }).status_code == 409
 
 
+DEPLOYED_PAGE_BUILD = "4205954952" + "1" * 67
+OLD_PAGE_BUILD = "2202995401" + "2" * 67
+
+
+@pytest.fixture
+def page_build(monkeypatch):
+    """版本槽与审计去重是进程内全局:每例从空白开始;部署版本由用例直接改。"""
+    monkeypatch.setattr(main_mod, "_PATIENT_PAGE_BUILD", None)
+    monkeypatch.setattr(main_mod, "_PATIENT_PAGE_BUILD_REPORTED", set())
+    deployed = {"value": DEPLOYED_PAGE_BUILD}
+    monkeypatch.setattr(main_mod, "_deployed_page_build_id", lambda: deployed["value"])
+    return deployed
+
+
+def _page_build_heartbeat(client, session_id: str, build: str | None = None,
+                          screen: str = "waiting"):
+    body = {"session_id": session_id, "screen": screen}
+    if build is not None:
+        body["page_build_id"] = build
+    return client.post("/live/patient-heartbeat", json=body)
+
+
+def _console_page_build(client) -> str:
+    return client.get("/live/console-state").json()["patientPresence"]["page_build"]
+
+
+def _page_build_audits(client, session_id: str) -> list[tuple[str | None, str]]:
+    with Session(client.test_engine) as session:
+        rows = session.exec(select(models.AuditLog).where(
+            models.AuditLog.action == "patient_page_build",
+            models.AuditLog.session_id == session_id,
+        ).order_by(models.AuditLog.id)).all()
+    return [(row.patient_id, row.summary) for row in rows]
+
+
+def test_heartbeat_page_build_current_and_stale(client, page_build):
+    _patient(client, "P-PB")
+    _training_session(client, "S-PB", "P-PB")
+    assert _handshake(client, "S-PB", wseq=100).status_code == 200
+
+    current = _page_build_heartbeat(client, "S-PB", DEPLOYED_PAGE_BUILD)
+    assert current.status_code == 200, current.text
+    assert current.json()["patientPresence"]["page_build"] == "current"
+    assert _console_page_build(client) == "current"
+
+    # dist 热换、进程不重启:服务端每次现读 build-id.txt,同一张老页面立刻判旧。
+    page_build["value"] = "9" * 77
+    assert _console_page_build(client) == "stale"
+    page_build["value"] = DEPLOYED_PAGE_BUILD
+    assert _page_build_heartbeat(client, "S-PB", OLD_PAGE_BUILD).status_code == 200
+    presence = client.get("/live/console-state").json()["patientPresence"]
+    assert presence["online"] is True and presence["page_build"] == "stale"
+
+
+def test_heartbeat_without_page_build_accepted_and_flagged_stale(client, page_build):
+    """不认识这个字段的旧平板照常在线,但必须被标成旧页面;读不到部署版本时不下结论。"""
+    _patient(client, "P-PB-OLD")
+    _training_session(client, "S-PB-OLD", "P-PB-OLD")
+    assert _handshake(client, "S-PB-OLD", wseq=100).status_code == 200
+
+    response = _page_build_heartbeat(client, "S-PB-OLD")
+    assert response.status_code == 200, response.text
+    presence = client.get("/live/console-state").json()["patientPresence"]
+    assert presence["online"] is True and presence["page_build"] == "stale"
+
+    page_build["value"] = None
+    assert _console_page_build(client) == "unknown"
+
+
+def test_heartbeat_rejects_malformed_page_build(client, page_build):
+    _patient(client, "P-PB-BAD")
+    _training_session(client, "S-PB-BAD", "P-PB-BAD")
+    assert _handshake(client, "S-PB-BAD", wseq=100).status_code == 200
+
+    for bad in ("abc", "1" * 9, "1" * 81, "１２３４５６７８９０", "12345 67890",
+                "-123456789", "<!doctype html>", 1234567890):
+        response = _page_build_heartbeat(client, "S-PB-BAD", bad)
+        assert response.status_code == 422, bad
+    # 被拒的心跳不留下任何在场事实。
+    presence = client.get("/live/console-state").json()["patientPresence"]
+    assert presence["online"] is False and presence["page_build"] == "unknown"
+
+    for edge in ("1" * 10, "1" * 80):
+        assert _page_build_heartbeat(client, "S-PB-BAD", edge).status_code == 200, edge
+
+
+def test_page_build_not_carried_across_session_switch(client, page_build):
+    _patient(client, "P-PB-SW")
+    _training_session(client, "S-PB-SW-1", "P-PB-SW")
+    _training_session(client, "S-PB-SW-2", "P-PB-SW")
+    assert _handshake(client, "S-PB-SW-1", wseq=100).status_code == 200
+    assert _page_build_heartbeat(client, "S-PB-SW-1", DEPLOYED_PAGE_BUILD).status_code == 200
+    assert _console_page_build(client) == "current"
+
+    # 新场次还没收到心跳前,上一场的「已是新版本」绝不能顶替这一场的结论。
+    assert _handshake(client, "S-PB-SW-2", wseq=200).status_code == 200
+    assert _console_page_build(client) == "unknown"
+    assert _page_build_heartbeat(client, "S-PB-SW-2").status_code == 200
+    assert _console_page_build(client) == "stale"
+
+
+def test_page_build_audited_once_per_session_and_build(client, page_build):
+    _patient(client, "P-PB-AUD")
+    _training_session(client, "S-PB-AUD-1", "P-PB-AUD")
+    _training_session(client, "S-PB-AUD-2", "P-PB-AUD")
+    assert _handshake(client, "S-PB-AUD-1", wseq=100).status_code == 200
+
+    for build in (DEPLOYED_PAGE_BUILD, DEPLOYED_PAGE_BUILD, OLD_PAGE_BUILD, None,
+                  OLD_PAGE_BUILD, None):
+        assert _page_build_heartbeat(client, "S-PB-AUD-1", build).status_code == 200
+    # 摘要只有版本数字与固定代码,不含任何受试者信息或自由文本。
+    assert _page_build_audits(client, "S-PB-AUD-1") == [
+        ("P-PB-AUD",
+         f"page_build={DEPLOYED_PAGE_BUILD} deployed={DEPLOYED_PAGE_BUILD} match=yes"),
+        ("P-PB-AUD",
+         f"page_build={OLD_PAGE_BUILD} deployed={DEPLOYED_PAGE_BUILD} match=no"),
+        ("P-PB-AUD", f"page_build=none deployed={DEPLOYED_PAGE_BUILD} match=no"),
+    ]
+
+    assert _handshake(client, "S-PB-AUD-2", wseq=200).status_code == 200
+    page_build["value"] = None
+    for _ in range(2):
+        assert _page_build_heartbeat(
+            client, "S-PB-AUD-2", DEPLOYED_PAGE_BUILD).status_code == 200
+    assert _page_build_audits(client, "S-PB-AUD-2") == [
+        ("P-PB-AUD",
+         f"page_build={DEPLOYED_PAGE_BUILD} deployed=unknown match=unknown"),
+    ]
+
+
+def test_deployed_page_build_id_reader(tmp_path):
+    # 与 _mount_spa 托管的是同一份 dist。
+    assert main_mod._DEPLOYED_PAGE_BUILD_ID_PATH == (
+        Path(main_mod.__file__).resolve().parent.parent / "web" / "dist" / "build-id.txt")
+    path = tmp_path / "build-id.txt"
+    assert main_mod._deployed_page_build_id(path) is None
+    path.write_text(f"{DEPLOYED_PAGE_BUILD}\n", encoding="ascii")
+    assert main_mod._deployed_page_build_id(path) == DEPLOYED_PAGE_BUILD
+    for broken in (b"", b"<!doctype html><html></html>", "１２３４５６７８９０".encode(),
+                   b"1" * 81, b"1" * 4096, b"\xff\xfe1234567890"):
+        path.write_bytes(broken)
+        assert main_mod._deployed_page_build_id(path) is None, broken[:20]
+    path.unlink()
+    path.mkdir()
+    assert main_mod._deployed_page_build_id(path) is None
+
+
 def test_runtime_writes_for_non_live_session_do_not_touch_live_row(client):
     """非当前 live 场次的 runtime 写入/暂停只落自己的恢复行,不得污染老人端正在看的场次。"""
     _patient(client, "P-ISO")
