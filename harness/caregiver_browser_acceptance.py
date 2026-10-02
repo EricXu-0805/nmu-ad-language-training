@@ -628,6 +628,10 @@ def run_start_pause(config: BrowserAcceptanceConfig, *, answer_now: bool = False
 
     def observe_request_failure(request) -> None:
         parsed = urlsplit(request.url)
+        if (request.method == "POST" and parsed.path.endswith("/barge-in-authorization")
+                and "ERR_ABORTED" in str(request.failure or "")):
+            # 停播检测的授权由检测器自己的 AbortController 撤销(播完、暂停、换命令),不是断网。
+            return
         session_id = observations["session_id"]
         expected_abort = bool(observations["teardown_started"]) and (
             (request.method == "GET" and parsed.path == "/live/state")
