@@ -95,6 +95,20 @@ interface AckBase {
   client_observed_ms?: number;
 }
 
+/**
+ * tts_ended / tts_interrupted 上可选的停播检测事实。只在服务端语音设置读面声明认得
+ * (ack_facts)时才写:不认这些键的回执模型会 422,而 422 会让床旁卡在这条信封上。
+ */
+export const AUTOPILOT_OPTIONAL_ACK_FACTS = ["barge_in_armed", "barge_in_listened_ms"] as const;
+export type AutopilotOptionalAckFact = (typeof AUTOPILOT_OPTIONAL_ACK_FACTS)[number];
+
+export interface AutopilotBargeInFacts {
+  /** 判定器在这句里至少评估过一帧校准之后的声音:停播真有可能触发。 */
+  barge_in_armed?: boolean;
+  /** 从那一帧到检测关闭或判定器放弃的毫秒;只在 barge_in_armed 为 true 时出现。 */
+  barge_in_listened_ms?: number;
+}
+
 export type AutopilotAck =
   | (AckBase & {
     ack_type: "tts_started";
@@ -104,13 +118,13 @@ export type AutopilotAck =
     ack_type: "tts_ended";
     media_ended: true;
     media_duration_ms?: number;
-  })
+  } & AutopilotBargeInFacts)
   | (AckBase & {
     ack_type: "tts_interrupted";
     media_stopped: true;
     interrupt_reason: "answer_now" | "voice_activity";
     media_duration_ms: number;
-  })
+  } & AutopilotBargeInFacts)
   | (AckBase & {
     ack_type: "tts_failed";
     error_code: AutopilotErrorCode;
@@ -302,6 +316,13 @@ export function parseNextCommandProjection(value: unknown): NextCommandProjectio
   throw new Error("自动驾驶命令响应不符合当前命令类型");
 }
 
+/** 停播检测两键必须 optional:IndexedDB 存量 envelope 与旧平板都没有,required 会把历史 ACK 判非法。 */
+function bargeInFactsAreValid(row: UnknownRecord): boolean {
+  return (!Object.hasOwn(row, "barge_in_armed") || typeof row.barge_in_armed === "boolean")
+    && (!Object.hasOwn(row, "barge_in_listened_ms")
+      || (row.barge_in_armed === true && safeInteger(row.barge_in_listened_ms, 0, 600_000)));
+}
+
 function parseAckCommon(row: UnknownRecord): boolean {
   return COMMAND_KEY.test(typeof row.idempotency_key === "string" ? row.idempotency_key : "")
     && safeInteger(row.control_generation, 1)
@@ -331,17 +352,21 @@ export function parseAutopilotAck(value: unknown): AutopilotAck {
       }
       break;
     case "tts_ended":
-      if (exact(["media_ended"], ["media_duration_ms"])
+      if (exact(["media_ended"], ["media_duration_ms", ...AUTOPILOT_OPTIONAL_ACK_FACTS])
           && row.media_ended === true
           && (!Object.hasOwn(row, "media_duration_ms")
-            || safeInteger(row.media_duration_ms, 0, 21_600_000))) {
+            || safeInteger(row.media_duration_ms, 0, 21_600_000))
+          && bargeInFactsAreValid(row)) {
         return row as unknown as AutopilotAck;
       }
       break;
     case "tts_interrupted":
-      if (exact(["media_stopped", "interrupt_reason", "media_duration_ms"])
+      // 老人开口停播必然是检测在听时判的:与 barge_in_armed=false 同时出现就是自相矛盾。
+      if (exact(["media_stopped", "interrupt_reason", "media_duration_ms"], AUTOPILOT_OPTIONAL_ACK_FACTS)
           && row.media_stopped === true && oneOf(row.interrupt_reason, ["answer_now", "voice_activity"] as const)
-          && safeInteger(row.media_duration_ms, 0, 21_600_000)) {
+          && safeInteger(row.media_duration_ms, 0, 21_600_000)
+          && bargeInFactsAreValid(row)
+          && !(row.interrupt_reason === "voice_activity" && row.barge_in_armed === false)) {
         return row as unknown as AutopilotAck;
       }
       break;

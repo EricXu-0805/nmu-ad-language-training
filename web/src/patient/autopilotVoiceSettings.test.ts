@@ -143,6 +143,45 @@ test("hasSettings:只有缓存里有一份成功读到的设置才为真(服务�
   assert.equal(cache.hasSettings(), false);
 });
 
+test("acceptsAckFact:只有最近一次成功读面声明过的事实名才为真", async () => {
+  const run = harness();
+  const cache = new AutopilotVoiceSettingsCache("S-VOICE", run.ports);
+  // 还没读过、读取在途:一律不发,宁可这一句缺这两个键。
+  assert.equal(cache.acceptsAckFact("barge_in_armed"), false);
+  cache.refreshInBackground();
+  assert.equal(cache.acceptsAckFact("barge_in_armed"), false);
+  run.fetches[0].resolve({ ...SETTINGS, ack_facts: ["barge_in_armed", "barge_in_listened_ms"] });
+  await settle();
+  assert.equal(cache.acceptsAckFact("barge_in_armed"), true);
+  assert.equal(cache.acceptsAckFact("barge_in_listened_ms"), true);
+
+  // 读失败:不知道现在的服务端认不认,当不认。
+  run.advance(AUTOPILOT_VOICE_SETTINGS_REFRESH_MS);
+  cache.refreshInBackground();
+  run.fetches[1].reject(new Error("语音设置读取超时"));
+  await settle();
+  assert.equal(cache.acceptsAckFact("barge_in_armed"), false);
+
+  // 四键 = 不认这些键的服务端(含回滚后的 af59c28):设置照用,事实一个都不认。
+  run.advance(AUTOPILOT_VOICE_SETTINGS_REFRESH_MS);
+  cache.refreshInBackground();
+  run.fetches[2].resolve(SETTINGS);
+  await settle();
+  assert.equal(cache.hasSettings(), true);
+  assert.equal(cache.acceptsAckFact("barge_in_armed"), false);
+  assert.equal(cache.acceptsAckFact("barge_in_listened_ms"), false);
+
+  // 逐个名字认:只声明了 armed 就只报 armed。
+  run.advance(AUTOPILOT_VOICE_SETTINGS_REFRESH_MS);
+  cache.refreshInBackground();
+  run.fetches[3].resolve({ ...SETTINGS, ack_facts: ["barge_in_armed"] });
+  await settle();
+  assert.equal(cache.acceptsAckFact("barge_in_armed"), true);
+  assert.equal(cache.acceptsAckFact("barge_in_listened_ms"), false);
+  cache.dispose();
+  assert.equal(cache.acceptsAckFact("barge_in_armed"), false);
+});
+
 test("dispose:中止在途读取,迟到的结果不再生效,之后也不再刷新", async () => {
   const run = harness();
   const cache = new AutopilotVoiceSettingsCache("S-VOICE", run.ports);

@@ -206,3 +206,39 @@ test("IndexedDB 里升级前的 record_stopped envelope(无 VAD 两键)照样能
   // 多了两个事实就是另一份 envelope:同 key 重放时逐字对齐会把它们区分开。
   assert.equal(sameAutopilotAckEnvelope(stored, current), false);
 });
+
+test("IndexedDB 里升级前的 tts_ended / tts_interrupted envelope(无停播检测两键)照样能重放;新 envelope 带上它们也合法", () => {
+  const command = { ...question(), state: "started", command_revision: 1 } as NextCommandProjection;
+  for (const [ackType, facts] of [
+    ["tts_ended", { media_ended: true, media_duration_ms: 3_440 }],
+    ["tts_interrupted", { media_stopped: true, interrupt_reason: "answer_now", media_duration_ms: 700 }],
+  ] as const) {
+    const historicalAck = {
+      idempotency_key: `ack:${ackType}:2:00000000-0000-4000-8000-000000000002`,
+      control_generation: 1,
+      runner_generation: 1,
+      command_revision: 1,
+      device_event_seq: 2,
+      ack_type: ackType,
+      ...facts,
+    };
+    // 结构化克隆读回来的就是这样一份 plain 对象,没有任何新键。
+    const stored = JSON.parse(JSON.stringify({
+      schemaVersion: 1, ownerKey: OWNER_KEY, sessionId: SESSION_ID,
+      commandKey: command.command_key, command, ack: historicalAck, createdAtMs: 7,
+    }));
+    const replayed = parseAutopilotAckEnvelope(stored);
+    assert.deepEqual(replayed.ack, historicalAck);
+    assert.equal(sameAutopilotAckEnvelope(stored, replayed), true);
+    assert.equal(JSON.stringify(replayed.ack), JSON.stringify(historicalAck), "重放逐字节不变");
+
+    const current = createAutopilotAckEnvelope({
+      ownerKey: OWNER_KEY, sessionId: SESSION_ID, command, nowMs: 7,
+      ack: buildAutopilotAck(command, 1, historicalAck.idempotency_key, {
+        ack_type: ackType, ...facts, barge_in_armed: true, barge_in_listened_ms: 1_850,
+      } as Parameters<typeof buildAutopilotAck>[3]),
+    });
+    assert.deepEqual(parseAutopilotAckEnvelope(JSON.parse(JSON.stringify(current))), current);
+    assert.equal(sameAutopilotAckEnvelope(stored, current), false);
+  }
+});
