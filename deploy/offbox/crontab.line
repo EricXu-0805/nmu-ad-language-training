@@ -1,0 +1,1 @@
+4-59/10 * * * * /usr/bin/flock -n /home/eric/.openclaw/workspace/nmu-probe/.lock /usr/bin/python3 -B /home/eric/.openclaw/workspace/nmu-probe/nmu_offbox_probe.py >> /home/eric/.openclaw/workspace/nmu-probe/cron.log 2>&1
