@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -383,3 +384,57 @@ def test_source_verifier_executes_pinned_bytes_when_archival_path_changes(tmp_pa
     assert manifest == (snapshot / "MANIFEST.sha256").read_bytes()
     assert executions == [approved]
     assert hashlib.sha256(guard.read_bytes()).hexdigest() != digest
+
+
+def _linked_daily_snapshots(tmp_path):
+    """VPS 打开录音去重后的两份相邻快照：录音同一个 inode，其余文件各自独立。"""
+    from tests.test_backup_snapshot_integrity import _harden
+    snapshot, _, _ = _snapshot_with_audio(tmp_path, archived=False)
+    daily = tmp_path / "daily"
+    daily.mkdir(mode=0o700)
+    older = daily / "20261001-193419"
+    newer = daily / "20261002-193055"
+    snapshot.rename(older)
+    shutil.copytree(older, newer)
+    (newer / "audio" / "aud-normal.webm").unlink()
+    os.link(older / "audio" / "aud-normal.webm", newer / "audio" / "aud-normal.webm")
+    _harden(daily)
+    return daily, older, newer
+
+
+def test_drill_on_a_linked_snapshot_verifies_in_place_with_link_root_and_restores_strict(
+        tmp_path, monkeypatch):
+    daily, _older, newer = _linked_daily_snapshots(tmp_path)
+    original_run = drill.subprocess.run
+    verifier_calls = []
+
+    def record(command, **kwargs):
+        if len(command) > 4 and command[4] in {"verify", "verify-vps"}:
+            verifier_calls.append(command[4:])
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(drill.subprocess, "run", record)
+
+    facts = drill.drill(newer, tmp_path, keep=True, python=sys.executable)
+
+    assert "lifespan 完成" in facts["boot"]
+    in_place, materialized = verifier_calls
+    assert in_place == ["verify-vps", str(newer.resolve()), "--link-root", str(daily.resolve())]
+    assert materialized == ["verify", str(Path(facts["work_dir"]).resolve())]
+    restored = Path(facts["work_dir"]) / "audio" / "aud-normal.webm"
+    assert restored.stat().st_nlink == 1
+    assert (newer / "audio" / "aud-normal.webm").stat().st_nlink == 2
+
+
+def test_strict_and_historical_verification_still_reject_a_linked_snapshot(tmp_path):
+    _daily, _older, newer = _linked_daily_snapshots(tmp_path)
+    guard = tmp_path / "pinned-verifier.py"
+    guard.write_bytes((drill.ROOT / "scripts/verify_backup_snapshot.py").read_bytes())
+    digest = hashlib.sha256(guard.read_bytes()).hexdigest()
+
+    with pytest.raises(drill.DrillFailure, match="snapshot_hardlinked_file"):
+        drill._verify_snapshot(newer, sys.executable, in_place=False)
+    # 历史校验器不认 --link-root：迁移副本演练要用 Mac 上那份独立副本。
+    with pytest.raises(drill.DrillFailure, match="snapshot_hardlinked_file"):
+        drill._verify_snapshot(newer, sys.executable, source_verifier=guard,
+                               source_verifier_sha256=digest)
