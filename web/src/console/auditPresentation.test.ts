@@ -26,6 +26,10 @@ test("visit-plan audit presentation fails closed for malformed or future metadat
   assert.equal(auditActionLabel("visit_plan_reschedule"), "更新训练安排");
 });
 
+test("patient page build audit rows read as the patient page version", () => {
+  assert.equal(auditActionLabel("patient_page_build"), "老人端页面版本");
+});
+
 test("unrelated audit actions retain their canonical controlled summary", () => {
   assert.equal(
     auditDisplaySummary({ action: "score_lock", summary: "锡1 final=2" }),

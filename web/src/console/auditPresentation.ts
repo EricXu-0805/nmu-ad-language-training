@@ -11,6 +11,7 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   visit_plan_approve: "审批训练安排",
   visit_plan_start: "启动训练安排",
   visit_plan_cancel: "取消训练安排",
+  patient_page_build: "老人端页面版本",
 };
 
 const VISIT_PLAN_SUMMARIES: Record<string, string> = {
