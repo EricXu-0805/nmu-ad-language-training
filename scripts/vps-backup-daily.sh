@@ -394,7 +394,7 @@ chmod 600 "$LOG"
 # 打开时，与最新一份已发布快照同名、同长、同权限且逐字节相同（cmp 语义）的录音换成
 # 指向那一份的硬链接：先建点开头的临时名再原子 rename。链接源只取 daily/ 下严格
 # 时间戳快照，从不取 live data/。定稿录音从不改写，所以上一份同名文件只要类型、长度、
-# 权限、属主或任一字节不同，就保留这次的新副本并计入 cmp_mismatch。
+# 权限、属主或任一字节不同，或者读不出来（坏块），就保留这次的新副本并计入 cmp_mismatch。
 # 上一份那个文件只要还有校验器数不到的名字（daily/ 之外，或换了文件名），链上去的
 # 新快照就证不出来、每晚验失败，所以同样另存新副本并计入 outside_links。
 # 校验与发布随之带 --link-root，由校验器证明共享 inode 的每个链接都在相邻快照里。
@@ -442,14 +442,24 @@ def visible_links(name: str, kept: os.stat_result) -> int:
     return count
 
 
-def same_bytes(left: str, right: Path) -> bool:
-    with open(left, "rb") as fresh, open(right, "rb") as kept:
-        while True:
-            chunk = fresh.read(1024 * 1024)
-            if chunk != kept.read(1024 * 1024):
-                return False
-            if not chunk:
-                return True
+def kept_matches(fresh: str, kept: Path) -> bool:
+    """上一份读不出来（坏块 EIO 等）也算不一致；这次的新副本读不出来照旧让整份失败。"""
+    with open(fresh, "rb") as fresh_handle:
+        try:
+            kept_handle = open(kept, "rb")
+        except OSError:
+            return False
+        with kept_handle:
+            while True:
+                chunk = fresh_handle.read(1024 * 1024)
+                try:
+                    other = kept_handle.read(1024 * 1024)
+                except OSError:
+                    return False
+                if chunk != other:
+                    return False
+                if not chunk:
+                    return True
 
 
 linked = linked_bytes = mismatched = outside = 0
@@ -463,12 +473,15 @@ for entry in sorted(os.scandir(work_audio) if linkable else (), key=lambda item:
         kept = source.lstat()
     except FileNotFoundError:
         continue
+    except OSError:
+        mismatched += 1
+        continue
     if kept.st_dev != meta.st_dev:
         continue
     if (not stat.S_ISREG(kept.st_mode) or kept.st_size != meta.st_size
             or kept.st_uid != meta.st_uid
             or stat.S_IMODE(kept.st_mode) != stat.S_IMODE(meta.st_mode)
-            or not same_bytes(entry.path, source)):
+            or not kept_matches(entry.path, source)):
         mismatched += 1
         continue
     if kept.st_nlink != visible_links(entry.name, kept):

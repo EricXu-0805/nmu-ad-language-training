@@ -220,7 +220,7 @@ def test_link_anomaly_hidden_by_a_later_backup_inside_the_window_is_still_report
 
 
 def test_link_anomaly_older_than_the_window_is_no_longer_reported(tmp_path):
-    # 窗口 = --max-age-hours(30 h):每天一次的检查之间不留空档,一次事件最多报一天半。
+    # 窗口 = --max-age-hours(30 h):每天一次的检查之间不留空档;夜里那次的异常当晚和第二晚各报一次。
     root = _root(tmp_path, [
         _linked_ok("20260804-193000", cmp_mismatch=1),
         _linked_ok("20260805-193000"),

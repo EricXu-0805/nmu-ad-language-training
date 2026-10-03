@@ -280,7 +280,7 @@ qwen-plus；如切龙媛还需 cosyvoice-v2——`cosyvoice-v3-plus` 需单独�
 - 只能在空闲闸、没有待投递平板回执时做，回滚后刷新平板：旧网页包解析不了 IndexedDB 里带新键的待投递回执，会卡在那一条上。
 - 回滚前把本版上线后有过任何活动的场次全部收尾（含上线前开始、上线后续跑的；暂停的也收尾）。做过「技术失败后跳过本题」的场次，旧版本的汇总构建器见到跳过题位上的尝试会报 attempt outside expected plan，结束干预与最后一条回执都 409。
 - 服务端单独回滚本身不卡：旧服务端忽略 `?ack_facts=1` 只回四键，新平板见四键就不发这两键（2026-10-02 本机真 Chrome 走查实测，这两键零 422）。老人端心跳会先收一次 422（旧版不认 `page_build_id`），页面自动去掉该字段重发，在场判定不断档。
-- 回滚期间的读数：旧版本的回执编码器拒认这两键，本版跑过的场次里带了这两键的提问/提示播放证明都验不过——导出 attempts 的 `prompt_playback_outcome`、turns 的 `source_prompt_playback_outcome` 和研究读面都成 `unverified` 并标 `prompt_exposure_needs_review`，有「再说一遍」录音的场次整场拒绝导出（「重复请求证据链不成立」）。研究面还会把技术失败后跳过的题位说成「没有任何回答就跳过」；要区分，用导出包 attempts 表按 `item_id`/`turn_seq` 找 `processing_status=technical_failure`。
+- 回滚期间的读数：旧版本的回执编码器拒认这两键，本版跑过的场次里带了这两键的提问/提示播放证明都验不过——导出 attempts 的 `prompt_playback_outcome` 成 `unverified`、`prompt_exposure_needs_review` 为真；导出 turns 与研究读面的 `source_prompt_playback_outcome` 也成 `unverified`（这两处没有 needs_review 列）；有「再说一遍」录音的场次整场拒绝导出（「重复请求证据链不成立」）。研究面还会把技术失败后跳过的题位说成「没有任何回答就跳过」。要区分：回滚前已导出的场次看那份导出包 adjudications 表的 `position_had_technical_failure`；还没导出的场次只读查库里 `attemptevent` 同一 `item_id`/`turn_seq` 有没有 `processing_status='technical_failure'`，或等再部署。不要为了区分去导出。
 - 回滚窗口里不要导出本版跑过的场次：每场只有一个导出批次（`export_scope_hash` 唯一），这时导出的批次永久是上面那样，也没有停播与技术失败跳过那几列，再部署也改不回来。账本证明本身只追加不改，再部署本版或更新的版本就恢复。
 - 研究纪元按公开列冻结。本版给 turns、adjudications 各加一列，跨版本读对方切的纪元报 `research_release_snapshot_corrupt`（503），这不是库坏。回滚窗口里不切纪元；回滚或再部署后由数据管理员与管理员重新切一次。同理，上线本版前生产 `qualityreleaseepoch` 必须是 0 行，否则旧纪元上线后就读不了（上线脚本 270 第 3c 步核）。
 
@@ -381,7 +381,7 @@ export NMU_BACKUP_MAX_PULL_DIRECTORIES=50000
 
 ### 8.3 每日快照录音硬链接去重（开关默认关）
 
-**开关**：`nmu-backup.service` 用 `EnvironmentFile=-/opt/nmu/backup-dedup.env` 读一个可选文件，文件不在就跳过。只有其中写 `NMU_BACKUP_LINK_AUDIO=1`，`vps-backup-daily.sh` 才在发布前把与最新一份已发布快照同名、同长、同权限且逐字节相同的录音换成指向那一份的硬链接，并给 `verify-vps` / `publish-vps` 加 `--link-root /opt/nmu/backups/daily`。校验器只对快照顶层 `audio/` 放宽，且要数清楚每个共享 inode 的全部链接都在 `daily/` 下严格时间戳的兄弟快照里；库、清单、配置、导出仍必须 nlink=1。其他任何值都等于关，命令、快照内容和 ok 行与以前逐字节相同。打开后 ok 行末尾多四个字段：`linked=` 本份链接的录音数，`new_bytes=` 本份新占的逻辑字节，`cmp_mismatch=` 上一份同名文件的类型、长度、权限、属主或字节不同（定稿录音从不改写，只能是坏了）、因而另存新副本的录音数，`outside_links=` 上一份那个文件还有校验器数不到的名字（`daily/` 之外，或换了文件名）、因而另存新副本的录音数。备份健康检查看最近 30 小时（`--max-age-hours`）内的每一条成功：任一条这两个计数不为 0，就分别报 `audio_cmp_mismatch`、`audio_outside_links` 并带快照名。下一份（含手动补跑）会链到新副本、计数归零，所以同一事件最多报一天半，之后自动消失，不管处理没处理。容量门照旧按整份暂存副本算，live 源仍要求 nlink=1，链接源从不取 `/opt/nmu/app/data`。
+**开关**：`nmu-backup.service` 用 `EnvironmentFile=-/opt/nmu/backup-dedup.env` 读一个可选文件，文件不在就跳过。只有其中写 `NMU_BACKUP_LINK_AUDIO=1`，`vps-backup-daily.sh` 才在发布前把与最新一份已发布快照同名、同长、同权限且逐字节相同的录音换成指向那一份的硬链接，并给 `verify-vps` / `publish-vps` 加 `--link-root /opt/nmu/backups/daily`。校验器只对快照顶层 `audio/` 放宽，且要数清楚每个共享 inode 的全部链接都在 `daily/` 下严格时间戳的兄弟快照里；库、清单、配置、导出仍必须 nlink=1。其他任何值都等于关，命令、快照内容和 ok 行与以前逐字节相同。打开后 ok 行末尾多四个字段：`linked=` 本份链接的录音数，`new_bytes=` 本份新占的逻辑字节，`cmp_mismatch=` 上一份同名文件的类型、长度、权限、属主或字节不同（定稿录音从不改写，只能是坏了）、因而另存新副本的录音数，`outside_links=` 上一份那个文件还有校验器数不到的名字（`daily/` 之外，或换了文件名）、因而另存新副本的录音数。备份健康检查看最近 30 小时（`--max-age-hours`）内的每一条成功：任一条这两个计数不为 0，就分别报 `audio_cmp_mismatch`、`audio_outside_links` 并带快照名。下一份（含手动补跑）会链到新副本、计数归零：夜里那次备份出的异常在当晚和第二晚 20:40 UTC 的检查各报一次，第三晚才恢复 HEALTHY（约两天）；两次检查之间手动补跑出的异常可能只报一次。告警自己消失不代表处理了。容量门照旧按整份暂存副本算，live 源仍要求 nlink=1，链接源从不取 `/opt/nmu/app/data`。
 
 **换来的空间**：按 2026-10-02 实测，现场一场录音 17.4 MB，库每场约增 1.2 MB，14 份全量保留时只够约 13 场。打开开关、不做清理约 82 场；加上 P0 清理约 106 场；P0 与 Tier B 全部清理约 151 场。算法和其他情景见 [录音容量演练与存储预算](docs/CAPACITY_REHEARSAL.md)。
 

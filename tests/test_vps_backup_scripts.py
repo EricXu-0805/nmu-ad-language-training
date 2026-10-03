@@ -1465,6 +1465,99 @@ def test_daily_switch_on_counts_a_kept_recording_whose_size_or_mode_changed(dama
     assert (tail["linked"], tail["mismatch"], tail["outside"]) == ("0", "1", "0")
 
 
+def _link_step_source() -> str:
+    text = (ROOT / "scripts" / "vps-backup-daily.sh").read_text(encoding="utf-8")
+    start = text.index('if LINK_FACTS=$("$PYTHON_CMD" -I - "$DAILY" "$WORK" "$APP/data" <<\'PY\'')
+    body = text[text.index("\n", start) + 1:]
+    return body[:body.index("\nPY\n") + 1]
+
+
+_LINK_FAULT_DRIVER = """
+import builtins, errno, os, pathlib, sys
+fault, target, source_file = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.argv = ["-", *sys.argv[4:]]
+
+
+def eio():
+    raise OSError(errno.EIO, os.strerror(errno.EIO), target)
+
+
+class _Unreadable:
+    def __init__(self, handle):
+        self._handle = handle
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._handle.close()
+        return False
+
+    def read(self, *_args):
+        eio()
+
+
+real_open, real_lstat = builtins.open, pathlib.Path.lstat
+
+
+def faulty_open(path, *args, **kwargs):
+    if fault == "open" and os.fspath(path) == target:
+        eio()
+    handle = real_open(path, *args, **kwargs)
+    return _Unreadable(handle) if fault == "read" and os.fspath(path) == target else handle
+
+
+def faulty_lstat(self, *args, **kwargs):
+    if fault == "lstat" and os.fspath(self) == target:
+        eio()
+    return real_lstat(self, *args, **kwargs)
+
+
+builtins.open = faulty_open
+pathlib.Path.lstat = faulty_lstat
+exec(compile(open(source_file, encoding="utf-8").read(), "<link-step>", "exec"),
+     {"__name__": "__main__"})
+"""
+
+
+@pytest.mark.parametrize(("fault", "unreadable"), [
+    ("none", None), ("open", "kept"), ("read", "kept"), ("lstat", "kept"), ("read", "fresh")])
+def test_link_step_counts_an_unreadable_kept_recording_instead_of_failing(
+        fault, unreadable, tmp_path):
+    # 坏块让上一份那个录音读不出来(EIO):原来整份备份失败,链接源还是它,之后每晚都败在
+    # 同一处、库也不再备份。上一份读不出来只算不一致、另存新副本;这次的新副本读不出来照旧失败。
+    daily = tmp_path / "daily"
+    kept = daily / "20261001-193000" / "audio" / "aud-old.webm"
+    fresh = daily / ".20261002-193000.partial.4242" / "audio" / "aud-old.webm"
+    for path in (kept, fresh):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"unchanged-recording")
+        path.chmod(0o600)
+    (tmp_path / "app" / "data").mkdir(parents=True)
+    source = tmp_path / "link_step.py"
+    source.write_text(_link_step_source(), encoding="utf-8")
+    driver = tmp_path / "driver.py"
+    driver.write_text(_LINK_FAULT_DRIVER, encoding="utf-8")
+    target = {"kept": kept, "fresh": fresh, None: tmp_path / "nothing"}[unreadable]
+
+    completed = subprocess.run(
+        [sys.executable, "-I", str(driver), fault, str(target), str(source),
+         str(daily), str(fresh.parents[1]), str(tmp_path / "app" / "data")],
+        check=False, capture_output=True, text=True)
+
+    if unreadable == "fresh":
+        assert completed.returncode != 0
+        return
+    assert completed.returncode == 0, completed.stderr
+    size = len(b"unchanged-recording")
+    if unreadable is None:
+        assert completed.stdout.split() == ["1", "0", "0", "0"]
+        assert fresh.stat().st_ino == kept.stat().st_ino
+    else:
+        assert completed.stdout.split() == ["0", str(size), "1", "0"]
+        assert fresh.stat().st_nlink == 1 and fresh.read_bytes() == b"unchanged-recording"
+
+
 @pytest.mark.parametrize("stray_name", ["outside", "inside-other-name"])
 def test_daily_switch_on_copies_afresh_when_the_kept_file_has_a_link_the_verifier_cannot_see(
         stray_name, tmp_path):
