@@ -6,7 +6,19 @@ import ts from "typescript";
 // 换 dist 会删掉上一版的分块。页面在换版前没 import 过的懒加载分块,换版后第一次
 // import 就 404:开麦那一步会被记成「麦克风未能安全启动」。动态 import 可以写在老人端
 // 静态引入的任何模块里(audio/、sync/、api.ts 都算),所以从 PatientShell 沿依赖走全图,
-// 不只看 patient/ 目录。
+// 不只看 patient/ 目录。这里核不了的懒加载写法(包的动态 import、import.meta.glob、
+// new URL(…, import.meta.url)、?worker)一律判红,不放过。
+function isImportMetaMember(node: ts.Node, member: string): boolean {
+  return ts.isPropertyAccessExpression(node) && node.name.text === member
+    && ts.isMetaProperty(node.expression)
+    && node.expression.keywordToken === ts.SyntaxKind.ImportKeyword;
+}
+
+function assertNotWorkerEntry(specifier: string, file: URL): void {
+  assert.ok(!/\?(shared)?worker\b/.test(specifier),
+    `${file.pathname} 用 ${specifier} 起了 Worker:它单独成块,这里核不了预取`);
+}
+
 function resolveRelative(specifier: string, from: URL): URL | null {
   if (!specifier.startsWith(".")) return null;
   for (const suffix of ["", ".ts", ".tsx", "/index.ts", "/index.tsx"]) {
@@ -31,18 +43,28 @@ function moduleEdges(file: URL): { staticDeps: URL[]; dynamicDeps: URL[] } {
     // import type / export type 编译后不留;类型位置的 import("./x").T 是 ImportTypeNode,不是调用。
     if (ts.isImportDeclaration(node) && !node.importClause?.isTypeOnly
         && ts.isStringLiteral(node.moduleSpecifier)) {
+      assertNotWorkerEntry(node.moduleSpecifier.text, file);
       const target = resolveRelative(node.moduleSpecifier.text, file);
       if (target) staticDeps.push(target);
     } else if (ts.isExportDeclaration(node) && !node.isTypeOnly && node.moduleSpecifier
         && ts.isStringLiteral(node.moduleSpecifier)) {
+      assertNotWorkerEntry(node.moduleSpecifier.text, file);
       const target = resolveRelative(node.moduleSpecifier.text, file);
       if (target) staticDeps.push(target);
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const [specifier] = node.arguments;
       assert.ok(specifier && ts.isStringLiteralLike(specifier),
         `${file.pathname} 有不是字面量的动态 import,这里没法确认它的分块被预取`);
-      const target = resolveRelative(specifier.text, file);
-      if (target) dynamicDeps.push(target);
+      assert.ok(specifier.text.startsWith("."),
+        `${file.pathname} 动态 import 了包 ${specifier.text}:它会单独成块,改成静态引入或另想办法预取`);
+      assertNotWorkerEntry(specifier.text, file);
+      dynamicDeps.push(resolveRelative(specifier.text, file)!);
+    } else if (ts.isCallExpression(node) && isImportMetaMember(node.expression, "glob")) {
+      assert.fail(`${file.pathname} 用了 import.meta.glob:匹配到的模块各自成块,这里核不了预取`);
+    } else if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)
+        && node.expression.text === "URL" && node.arguments?.length === 2
+        && isImportMetaMember(node.arguments[1], "url")) {
+      assert.fail(`${file.pathname} 用 new URL(…, import.meta.url) 引了文件:它单独输出,这里核不了预取`);
     }
     ts.forEachChild(node, visit);
   };
@@ -76,6 +98,6 @@ test("PatientShell 挂载时预取老人端能走到的全部懒加载分块", (
   assert.ok(start >= 0, "PatientShell 缺少挂载时的预取 effect");
   const effect = shell.slice(start, shell.indexOf("}, []);", start));
   const prewarmed = [...effect.matchAll(/void import\("(\.[^"]+)"\)\.catch\(\(\) => \{[^}]*\}\);/g)]
-    .map((match) => new URL(match[1], shellUrl).pathname);
+    .map((match) => resolveRelative(match[1], shellUrl)!.pathname);
   assert.deepEqual(prewarmed.sort(), [...lazyTargets].sort());
 });
