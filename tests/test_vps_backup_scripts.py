@@ -1415,6 +1415,56 @@ def test_daily_switch_on_copies_afresh_when_previous_bytes_differ(tmp_path):
     assert _verify_vps(copied.parents[1]).returncode == 0
 
 
+def test_daily_switch_on_keeps_linking_a_recording_already_shared_by_older_snapshots(tmp_path):
+    # 稳态:第三晚起上一份那个 inode 已被两份快照共享,链接数要按全部兄弟快照数。
+    app, root, env, _trace = _traced_daily_harness(tmp_path)
+    env["NMU_BACKUP_LINK_AUDIO"] = "1"
+    daily = root / "daily"
+    _add_live_audio(app, "aud-old", b"unchanged-recording")
+    stamps = ("20261001-193000", "20261002-193000", "20261003-193000")
+
+    for stamp in stamps:
+        completed = _run_daily(app, env, stamp)
+        assert completed.returncode == 0, completed.stderr
+
+    copies = [daily / stamp / "audio" / "aud-old.webm" for stamp in stamps]
+    assert len({path.stat().st_ino for path in copies}) == 1
+    assert copies[0].stat().st_nlink == 3
+    tails = [_LINK_TAIL.fullmatch(match["tail"]) for match in _ok_lines(root)]
+    assert all(tails), tails
+    assert [(tail["linked"], tail["mismatch"], tail["outside"]) for tail in tails] == [
+        ("0", "0", "0"), ("1", "0", "0"), ("1", "0", "0")]
+    for stamp in stamps:
+        assert _verify_vps(daily / stamp, daily).returncode == 0
+
+
+@pytest.mark.parametrize("damage", ["truncate", "append", "chmod"])
+def test_daily_switch_on_counts_a_kept_recording_whose_size_or_mode_changed(damage, tmp_path):
+    # 定稿录音从不改写;上一份同名文件长度或权限变了只能是坏了,同样另存新副本并计数。
+    app, root, env, _trace = _traced_daily_harness(tmp_path)
+    env["NMU_BACKUP_LINK_AUDIO"] = "1"
+    live = _add_live_audio(app, "aud-old", b"unchanged-recording")
+    assert _run_daily(app, env, "20261001-193000").returncode == 0
+    older = root / "daily" / "20261001-193000" / "audio" / "aud-old.webm"
+    if damage == "truncate":
+        with older.open("r+b") as handle:
+            handle.truncate(len(b"unchanged-recording") - 1)
+    elif damage == "append":
+        with older.open("ab") as handle:
+            handle.write(b"!")
+    else:
+        older.chmod(0o640)
+
+    completed = _run_daily(app, env, "20261002-193000")
+
+    assert completed.returncode == 0, completed.stderr
+    copied = root / "daily" / "20261002-193000" / "audio" / "aud-old.webm"
+    assert copied.stat().st_nlink == 1
+    assert copied.read_bytes() == live.read_bytes()
+    tail = _LINK_TAIL.fullmatch(_ok_lines(root)[-1]["tail"])
+    assert (tail["linked"], tail["mismatch"], tail["outside"]) == ("0", "1", "0")
+
+
 @pytest.mark.parametrize("stray_name", ["outside", "inside-other-name"])
 def test_daily_switch_on_copies_afresh_when_the_kept_file_has_a_link_the_verifier_cannot_see(
         stray_name, tmp_path):

@@ -26,7 +26,7 @@ fi
 SSH_USER="$1"
 SSH_HOST="$2"
 REMOTE_ROOT="${3:-/opt/nmu/backups}"
-# 已归档快照不再整份重下（vps-backup-pull.sh 的同名开关）默认关。要打开就在安装时
+# 已归档快照不再每晚整份过一遍（vps-backup-pull.sh 的同名开关）默认关。要打开就在安装时
 # 显式给 NMU_BACKUP_PULL_SKIP_ARCHIVED=1；重装时不给就回到关。
 SKIP_ARCHIVED="${NMU_BACKUP_PULL_SKIP_ARCHIVED:-0}"
 case "$SKIP_ARCHIVED" in

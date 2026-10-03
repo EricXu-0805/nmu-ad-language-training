@@ -10,6 +10,8 @@
   - 最新 `ok` 之后累计的 FAIL 不超过 --max-consecutive-failures;
   - 精确的 `SKIP code=backup_lock_busy` 只是锁忙记录，不算成功或失败;
   - 最新 `ok` 声明的快照目录真的在盘上,且是目录不是软链接;
+  - 录音去重打开时,--max-age-hours 窗口内每一条 `ok` 的 cmp_mismatch 与 outside_links
+    都是 0(手动补跑或下一晚会链到新副本、计数归零,所以不能只看最后一条);
   - 备份根所在文件系统剩余空间不低于 --min-free-mb;
   - 给了 --probe-unit 时,那个探针单元最近一次成功距今不超过 --probe-max-age-minutes。
 
@@ -34,6 +36,8 @@ SNAPSHOT = re.compile(r"\bsnapshot=(?P<name>[0-9]{8}-[0-9]{6})\b")
 # 录音去重打开后 ok 行末尾的两个异常计数；开关关着时没有这两个字段。
 LINK_ANOMALIES = (("cmp_mismatch", "audio_cmp_mismatch"),
                   ("outside_links", "audio_outside_links"))
+LINK_ANOMALY_COUNTS = {
+    field: re.compile(rf"\b{field}=(?P<count>[0-9]+)\b") for field, _ in LINK_ANOMALIES}
 
 
 class Unevaluable(Exception):
@@ -103,11 +107,18 @@ def evaluate(log_path: Path, daily_dir: Path, now: datetime, *,
         if published.is_symlink() or not published.is_dir():
             problems.append(f"published_snapshot_missing name={snapshot['name']}")
 
-    # 只看最新一次成功：下一份快照已经另存了新副本，旧的那次由当时的告警交代。
-    for field, code in LINK_ANOMALIES:
-        count = re.search(rf"\b{field}=(?P<count>[0-9]+)\b", rest)
-        if count is not None and int(count["count"]) > 0:
-            problems.append(f"{code} count={int(count['count'])}")
+    # 窗口内每一次成功都看：下一份（含手动补跑）链到另存的新副本，计数就归零了。
+    # 窗口与「最新成功不能太老」同一个 --max-age-hours，每天一次的检查之间不留空档。
+    window_start = now - timedelta(hours=max_age_hours)
+    for entry_when, verdict, entry_rest in entries:
+        if verdict != "ok" or entry_when < window_start:
+            continue
+        stamp = SNAPSHOT.search(entry_rest)
+        for field, code in LINK_ANOMALIES:
+            count = LINK_ANOMALY_COUNTS[field].search(entry_rest)
+            if count is not None and int(count["count"]) > 0:
+                problems.append(f"{code} count={int(count['count'])} "
+                                f"snapshot={stamp['name'] if stamp else 'unknown'}")
 
     try:
         free_mb = shutil.disk_usage(daily_dir).free // (1024 * 1024)

@@ -189,21 +189,42 @@ def test_kept_recording_whose_bytes_changed_is_reported(tmp_path):
     line = LINKED_OK_LINE.replace("cmp_mismatch=0", "cmp_mismatch=2")
     root = _root(tmp_path, [line], ["20260806-023000"])
 
-    assert _evaluate(root) == ["audio_cmp_mismatch count=2"]
+    assert _evaluate(root) == ["audio_cmp_mismatch count=2 snapshot=20260806-023000"]
 
 
 def test_kept_recording_with_a_link_outside_daily_is_reported(tmp_path):
     line = LINKED_OK_LINE.replace("outside_links=0", "outside_links=1")
     root = _root(tmp_path, [line], ["20260806-023000"])
 
-    assert _evaluate(root) == ["audio_outside_links count=1"]
+    assert _evaluate(root) == ["audio_outside_links count=1 snapshot=20260806-023000"]
 
 
-def test_link_anomalies_are_read_from_the_latest_success_only(tmp_path):
-    earlier = LINKED_OK_LINE.replace("02:30:00", "02:20:00").replace(
-        "20260806-023000", "20260806-022000").replace("cmp_mismatch=0", "cmp_mismatch=1")
-    root = _root(tmp_path, [earlier, LINKED_OK_LINE],
-                 ["20260806-022000", "20260806-023000"])
+def _linked_ok(stamp: str, *, cmp_mismatch: int = 0, outside_links: int = 0) -> str:
+    when = datetime.strptime(stamp, "%Y%m%d-%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+    return (f"[{when}] ok snapshot={stamp} size=924K config=ok keep=14 source_bytes=4096 "
+            f"source_dirs=3 reserve_bytes=0 linked=3 new_bytes=2048 "
+            f"cmp_mismatch={cmp_mismatch} outside_links={outside_links}")
+
+
+def test_link_anomaly_hidden_by_a_later_backup_inside_the_window_is_still_reported(tmp_path):
+    # 手动补跑(或第二天那份)链到上一份另存的新副本,计数归零;只看最后一行就漏报。
+    root = _root(tmp_path, [
+        _linked_ok("20260806-010000", cmp_mismatch=1, outside_links=4),
+        _linked_ok("20260806-023000"),
+    ], ["20260806-010000", "20260806-023000"])
+
+    assert _evaluate(root) == [
+        "audio_cmp_mismatch count=1 snapshot=20260806-010000",
+        "audio_outside_links count=4 snapshot=20260806-010000",
+    ]
+
+
+def test_link_anomaly_older_than_the_window_is_no_longer_reported(tmp_path):
+    # 窗口 = --max-age-hours(30 h):每天一次的检查之间不留空档,一次事件最多报一天半。
+    root = _root(tmp_path, [
+        _linked_ok("20260804-193000", cmp_mismatch=1),
+        _linked_ok("20260805-193000"),
+    ], ["20260804-193000", "20260805-193000"])
 
     assert _evaluate(root) == []
 

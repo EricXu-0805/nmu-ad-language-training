@@ -477,10 +477,11 @@ PY
 }
 
 # 同名快照已经归档：远端 manifest 与本地这份逐字节相同、preflight 的文件/字节/目录事实
-# 与本地一致、本地这份仍过严格校验，就不再下载整份载荷。任一项不成立返回非零，调用方
-# 照旧走完整下载 + compare-vps，差异照旧进 conflicts/。代价：已归档的远端快照不再每天
+# 与本地一致、本地这份仍过严格校验，就连 rsync 这一轮也省掉。任一项不成立返回非零，调用方
+# 照旧走完整的一轮 + compare-vps，差异照旧进 conflicts/。代价：已归档的远端快照不再每天
 # 整份重验，远端事后原地改坏它只有改到长度或清单时才看得出来。所以默认关：只有
-# config.env 写了 NMU_BACKUP_PULL_SKIP_ARCHIVED=1 才走这条，其他值仍每晚整份重下比对。
+# config.env 写了 NMU_BACKUP_PULL_SKIP_ARCHIVED=1 才走这条，其他值仍每晚整份过一遍——
+# 远端按内容读完整份算校验和，与本机最新一份不同的文件才走网络，落地后逐字节比对。
 archived_snapshot_matches() {
   local stamp="$1" remote_manifest="$2" final="$3"
   local expected_facts expected_files expected_bytes expected_dirs

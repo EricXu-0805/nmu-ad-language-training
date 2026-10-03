@@ -273,7 +273,16 @@ qwen-plus；如切龙媛还需 cosyvoice-v2——`cosyvoice-v3-plus` 需单独�
 
 平板经 `GET /sessions/{id}/autopilot/voice-settings` 读前三项（取不到就不挂 VAD）。两项都会改变老人的作答窗口，研究场次用不用、阈值多少由课题组定，不是运维默认值说了算。
 
-声音停播的分母：平板读语音设置时带 `?ack_facts=1`，服务端多回一个 `ack_facts` 列出它认得的可选回执事实，平板才在提问/提示的 `tts_ended`/`tts_interrupted` 里报 `barge_in_armed`（这句播放时检测在不在听）与 `barge_in_listened_ms`；导出 attempts/turns 与研究读面据此给出分母。`NMU_AUTOPILOT_VOICE_BARGE_IN` 关着时这些行都是 `false`。**回滚到不认这两键的版本（如 `af59c28`）只能在空闲闸、没有待投递平板回执时做，回滚后刷新平板**：旧网页包解析不了 IndexedDB 里带新键的待投递回执，会卡在那一条上。服务端单独回滚本身不卡：旧服务端忽略 `?ack_facts=1` 只回四键，新平板见四键就不发这两键（2026-10-02 本机真 Chrome 走查实测，零 422）。**回滚有数据上的代价**：旧版本的回执编码器拒认这两键，所以本版跑过的场次回滚后，带了这两键的提问/提示播放证明都验不过——导出 attempts 的 `prompt_playback_outcome` 变成 `unverified`，有「再说一遍」录音的场次整场拒绝导出（「重复请求证据链不成立」）。回执只追加不改，再部署本版或更新的版本就都恢复。**回滚前先把本版开始的场次全部收尾（暂停的也收尾）**：除了上面这些回执，做过「技术失败后跳过本题」的场次，旧版本的汇总构建器见到跳过题位上的尝试会报 attempt outside expected plan，结束干预与最后一条回执都 409。
+声音停播的分母：平板读语音设置时带 `?ack_facts=1`，服务端多回一个 `ack_facts` 列出它认得的可选回执事实，平板才在提问/提示的 `tts_ended`/`tts_interrupted` 里报 `barge_in_armed`（这句播放时检测在不在听）与 `barge_in_listened_ms`；导出 attempts/turns 与研究读面据此给出分母。`NMU_AUTOPILOT_VOICE_BARGE_IN` 关着时这些行都是 `false`。
+
+**回滚到不认本版回执事实与研究列的版本（如 `af59c28`）**：
+
+- 只能在空闲闸、没有待投递平板回执时做，回滚后刷新平板：旧网页包解析不了 IndexedDB 里带新键的待投递回执，会卡在那一条上。
+- 回滚前把本版上线后有过任何活动的场次全部收尾（含上线前开始、上线后续跑的；暂停的也收尾）。做过「技术失败后跳过本题」的场次，旧版本的汇总构建器见到跳过题位上的尝试会报 attempt outside expected plan，结束干预与最后一条回执都 409。
+- 服务端单独回滚本身不卡：旧服务端忽略 `?ack_facts=1` 只回四键，新平板见四键就不发这两键（2026-10-02 本机真 Chrome 走查实测，这两键零 422）。老人端心跳会先收一次 422（旧版不认 `page_build_id`），页面自动去掉该字段重发，在场判定不断档。
+- 回滚期间的读数：旧版本的回执编码器拒认这两键，本版跑过的场次里带了这两键的提问/提示播放证明都验不过——导出 attempts 的 `prompt_playback_outcome`、turns 的 `source_prompt_playback_outcome` 和研究读面都成 `unverified` 并标 `prompt_exposure_needs_review`，有「再说一遍」录音的场次整场拒绝导出（「重复请求证据链不成立」）。研究面还会把技术失败后跳过的题位说成「没有任何回答就跳过」；要区分，用导出包 attempts 表按 `item_id`/`turn_seq` 找 `processing_status=technical_failure`。
+- 回滚窗口里不要导出本版跑过的场次：每场只有一个导出批次（`export_scope_hash` 唯一），这时导出的批次永久是上面那样，也没有停播与技术失败跳过那几列，再部署也改不回来。账本证明本身只追加不改，再部署本版或更新的版本就恢复。
+- 研究纪元按公开列冻结。本版给 turns、adjudications 各加一列，跨版本读对方切的纪元报 `research_release_snapshot_corrupt`（503），这不是库坏。回滚窗口里不切纪元；回滚或再部署后由数据管理员与管理员重新切一次。同理，上线本版前生产 `qualityreleaseepoch` 必须是 0 行，否则旧纪元上线后就读不了（上线脚本 270 第 3c 步核）。
 
 ### 7.2 去标识导出 HMAC 密钥
 
@@ -296,7 +305,7 @@ Compose 的 external `APPDATA_VOLUME`。在 Docker-aware 定时任务、单元�
 
 - **VPS 端**：systemd `nmu-backup.timer` 每日 03:30（上海）调用
   `scripts/vps-backup-daily.sh`。脚本先在隐藏 staging 中生成 SQLite 在线快照，复制已完成录音、导出与六份重建配置（`.env`、Caddyfile、应用/Caddy/备份 service 和备份 timer），再执行完整 manifest、SQLite `integrity_check`、外键检查、当前 Alembic head/恢复表列合同及 DB↔录音双向语义闭包。复制前按 SQLite 逻辑页、录音、两类导出与配置估算源逻辑字节、文件数和目录数，并加入文件/目录 metadata、至少 64MiB/10% 增长余量和 `NMU_BACKUP_RESERVE_BYTES` 硬保留空间（默认 512MiB）；源文件最多 99999 个、目录最多 10000 个，可分别用 `NMU_BACKUP_SOURCE_FILE_LIMIT` / `NMU_BACKUP_SOURCE_DIRECTORY_LIMIT` 向下收紧，不能调高 current snapshot 合同。空间不足、文件/目录超限或源目录不可扫描时 fail-closed。所有检查和落盘同步成功后才同文件系统原子发布 `/opt/nmu/backups/daily/<时间戳>/`；任何一步失败都删除未完成 payload，只在权限 `0600` 的 `backup.log` 保留固定原因码且不得写 `ok`。VPS 只保留最近 14 份；相邻快照之间是否硬链接共享未变录音由默认关的开关决定，见 8.3。解释器按显式 `PYTHON_BIN` → `/opt/nmu/app/.venv/bin/python` → `python3` 解析，并由同一个解释器完成预检、快照和发布；systemd 单元应显式设置 `Environment=PYTHON_BIN=/opt/nmu/app/.venv/bin/python`，且该环境须包含部署锁文件声明的 SQLAlchemy 等运行依赖。**运维真相看 `/opt/nmu/backups/backup.log` 审计行**，不要只看 systemd 状态。
-- **异地副本**：受控运维工作站定时调用 `scripts/vps-backup-pull.sh`。每份远端快照先进入私有 `.incoming`，用同一 current-only VPS 合同验证后原子发布；同名重放只有完整树逐字节一致才接受，差异进入 `conflicts/`，旧 Alembic head 进入 `legacy-unvalidated/`。已经归档的同名快照默认每晚仍整份下载并逐字节比对，一致即计入 `unchanged`；Mac 的 `config.env` 写了 `NMU_BACKUP_PULL_SKIP_ARCHIVED=1`（安装时带同名环境变量）才改为：远端 manifest 与本地逐字节相同、文件/字节/目录数一致且本地这份仍过 `verify-vps` 时只拉 manifest、计入 `unchanged`，任一项不符照旧整份下载比对。新快照以本地最新一份为 `--copy-dest` 基底并带 `--checksum`，相同内容在本机复制。远端顶层 `audio/` 的多链接文件（8.3 开关打开后）被接受，其余硬链接照拒；落地的都是独立文件，本地校验仍要求 nlink=1。传输前会聚合验证单快照/本轮的文件数、目录数与字节数并校验本地剩余空间；随后只先拉取固定名称且最大 64MiB 的 manifest，由严格解析器生成权限 `0600`、NUL 分隔的临时 allowlist，第二次 rsync 只接收 manifest 列出的精确文件路径。接收后先重新取得同一远端快照的文件/字节/目录/非法类型事实，必须与 preflight 完全一致，再核对本地接收事实并验证内容；临时 allowlist 无论成败都删除。任何未成为清单文件父级的空目录（包括 orphan/staging/classification）都按 current-only 合同拒绝并隔离，不能在拉取时静默净化；真正的历史版本必须由运维员按 8.1 SOP 做明确的 `legacy-unvalidated/` handoff，不得靠重命名伪装为当前合格快照。默认上限可通过六个 `NMU_BACKUP_MAX_*` 环境变量向下收紧或按经批准容量调整。该白名单会阻断探测后注入的未列名文件/目录洪泛，但受损远端仍可能在探测与传输之间放大已列名文件，所以异地根目录必须位于**独立、加密且有硬 quota/限容的卷**，代码门不能替代宿主配额。脚本不会根据可能已受损的远端目录名自动删除本地已完成存档；深历史容量、配额和修剪由受控本地存储/Time Machine 运维负责。这里描述的是**持久化备份副本**的流向；启用云 ASR/LLM 时，音频和回答文本仍会按本文开头的数据流发往第三方云，不能据此宣称“患者数据只在自有机器间流动”。
+- **异地副本**：受控运维工作站定时调用 `scripts/vps-backup-pull.sh`。每份远端快照先进入私有 `.incoming`，用同一 current-only VPS 合同验证后原子发布；同名重放只有完整树逐字节一致才接受，差异进入 `conflicts/`，旧 Alembic head 进入 `legacy-unvalidated/`。已经归档的同名快照默认每晚仍整份过一遍（远端按内容读完整份算校验和，与本机最新一份不同的文件才走网络），落地后逐字节比对，一致即计入 `unchanged`；Mac 的 `config.env` 写了 `NMU_BACKUP_PULL_SKIP_ARCHIVED=1`（安装时带同名环境变量）才改为：远端 manifest 与本地逐字节相同、文件/字节/目录数一致且本地这份仍过 `verify-vps` 时只拉 manifest、计入 `unchanged`，任一项不符照旧整份下载比对。新快照以本地最新一份为 `--copy-dest` 基底并带 `--checksum`，相同内容在本机复制。远端顶层 `audio/` 的多链接文件（8.3 开关打开后）被接受，其余硬链接照拒；落地的都是独立文件，本地校验仍要求 nlink=1。传输前会聚合验证单快照/本轮的文件数、目录数与字节数并校验本地剩余空间；随后只先拉取固定名称且最大 64MiB 的 manifest，由严格解析器生成权限 `0600`、NUL 分隔的临时 allowlist，第二次 rsync 只接收 manifest 列出的精确文件路径。接收后先重新取得同一远端快照的文件/字节/目录/非法类型事实，必须与 preflight 完全一致，再核对本地接收事实并验证内容；临时 allowlist 无论成败都删除。任何未成为清单文件父级的空目录（包括 orphan/staging/classification）都按 current-only 合同拒绝并隔离，不能在拉取时静默净化；真正的历史版本必须由运维员按 8.1 SOP 做明确的 `legacy-unvalidated/` handoff，不得靠重命名伪装为当前合格快照。默认上限可通过六个 `NMU_BACKUP_MAX_*` 环境变量向下收紧或按经批准容量调整。该白名单会阻断探测后注入的未列名文件/目录洪泛，但受损远端仍可能在探测与传输之间放大已列名文件，所以异地根目录必须位于**独立、加密且有硬 quota/限容的卷**，代码门不能替代宿主配额。脚本不会根据可能已受损的远端目录名自动删除本地已完成存档；深历史容量、配额和修剪由受控本地存储/Time Machine 运维负责。这里描述的是**持久化备份副本**的流向；启用云 ASR/LLM 时，音频和回答文本仍会按本文开头的数据流发往第三方云，不能据此宣称“患者数据只在自有机器间流动”。
 
 ### 8.1 恢复 SOP（必须做真实演练）
 
@@ -372,17 +381,17 @@ export NMU_BACKUP_MAX_PULL_DIRECTORIES=50000
 
 ### 8.3 每日快照录音硬链接去重（开关默认关）
 
-**开关**：`nmu-backup.service` 用 `EnvironmentFile=-/opt/nmu/backup-dedup.env` 读一个可选文件，文件不在就跳过。只有其中写 `NMU_BACKUP_LINK_AUDIO=1`，`vps-backup-daily.sh` 才在发布前把与最新一份已发布快照同名、同长、同权限且逐字节相同的录音换成指向那一份的硬链接，并给 `verify-vps` / `publish-vps` 加 `--link-root /opt/nmu/backups/daily`。校验器只对快照顶层 `audio/` 放宽，且要数清楚每个共享 inode 的全部链接都在 `daily/` 下严格时间戳的兄弟快照里；库、清单、配置、导出仍必须 nlink=1。其他任何值都等于关，命令、快照内容和 ok 行与以前逐字节相同。打开后 ok 行末尾多四个字段：`linked=` 本份链接的录音数，`new_bytes=` 本份新占的逻辑字节，`cmp_mismatch=` 同名同长却字节不同、因而另存新副本的录音数，`outside_links=` 上一份那个文件还有校验器数不到的名字（`daily/` 之外，或换了文件名）、因而另存新副本的录音数。备份健康检查看到最新一次成功里这两个计数不为 0，分别报 `audio_cmp_mismatch`、`audio_outside_links`。容量门照旧按整份暂存副本算，live 源仍要求 nlink=1，链接源从不取 `/opt/nmu/app/data`。
+**开关**：`nmu-backup.service` 用 `EnvironmentFile=-/opt/nmu/backup-dedup.env` 读一个可选文件，文件不在就跳过。只有其中写 `NMU_BACKUP_LINK_AUDIO=1`，`vps-backup-daily.sh` 才在发布前把与最新一份已发布快照同名、同长、同权限且逐字节相同的录音换成指向那一份的硬链接，并给 `verify-vps` / `publish-vps` 加 `--link-root /opt/nmu/backups/daily`。校验器只对快照顶层 `audio/` 放宽，且要数清楚每个共享 inode 的全部链接都在 `daily/` 下严格时间戳的兄弟快照里；库、清单、配置、导出仍必须 nlink=1。其他任何值都等于关，命令、快照内容和 ok 行与以前逐字节相同。打开后 ok 行末尾多四个字段：`linked=` 本份链接的录音数，`new_bytes=` 本份新占的逻辑字节，`cmp_mismatch=` 上一份同名文件的类型、长度、权限、属主或字节不同（定稿录音从不改写，只能是坏了）、因而另存新副本的录音数，`outside_links=` 上一份那个文件还有校验器数不到的名字（`daily/` 之外，或换了文件名）、因而另存新副本的录音数。备份健康检查看最近 30 小时（`--max-age-hours`）内的每一条成功：任一条这两个计数不为 0，就分别报 `audio_cmp_mismatch`、`audio_outside_links` 并带快照名。下一份（含手动补跑）会链到新副本、计数归零，所以同一事件最多报一天半，之后自动消失，不管处理没处理。容量门照旧按整份暂存副本算，live 源仍要求 nlink=1，链接源从不取 `/opt/nmu/app/data`。
 
 **换来的空间**：按 2026-10-02 实测，现场一场录音 17.4 MB，库每场约增 1.2 MB，14 份全量保留时只够约 13 场。打开开关、不做清理约 82 场；加上 P0 清理约 106 场；P0 与 Tier B 全部清理约 151 场。算法和其他情景见 [录音容量演练与存储预算](docs/CAPACITY_REHEARSAL.md)。
 
 **代价**：
 
-- VPS 上同一段录音的 14 份变成一个 inode。坏块或 root 原地写坏一次，14 份 VPS 副本一起坏。下一次备份逐字节比对时会给新快照另存一份并计入 `cmp_mismatch`；旧快照要用 `verify-vps --link-root` 逐份验才看得出。恢复来源是 live 或 Mac，Mac 的 60 份仍是独立文件。`cmp_mismatch` 不为 0 就逐份验 `daily/`。
+- VPS 上同一段录音的 14 份变成一个 inode。坏块或 root 原地写坏一次，14 份 VPS 副本一起坏。下一次备份比对时（长度、权限或任一字节不同）会给新快照另存一份并计入 `cmp_mismatch`；旧快照要用 `verify-vps --link-root` 逐份验才看得出。恢复来源是 live 或 Mac，Mac 的 60 份仍是独立文件。健康检查报 `audio_cmp_mismatch` 就逐份验 `daily/`。
 - 单份快照的 `du -sh` 仍显示整份大小。看真实占用用 `du -sh /opt/nmu/backups/daily`（一次调用里同一 inode 只算一次），或看 `capacity.state`：容量检查按最后持有者抵扣，末尾标 `snapshot_model=linked_audio`。
-- 打开后留存某份 daily 快照只能复制（`cp -a`），不能 `mv` 到 `daily/` 之外，也不能 `cp -al`。共享 inode 一旦有链接落在 `daily/` 之外，持有它的快照用 `--link-root` 就验不过（`snapshot_hardlink_outside_link_root`，恢复演练会失败）；下一次备份不再链接这些录音而是另存新副本、计入 `outside_links`，所以不会每晚失败，但要找到并删掉那个多出来的名字。
+- 打开后留存某份 daily 快照只能复制（`cp -a`），不能 `mv` 到 `daily/` 之外，也不能 `cp -al`。共享 inode 一旦有链接落在 `daily/` 之外，持有它的那几份旧快照用 `verify-vps --link-root` 逐份验就验不过（`snapshot_hardlink_outside_link_root`）。下一次备份不再链接这些录音、另存新副本并计入 `outside_links`，每周恢复演练只验最新一份，所以每晚备份和演练都照常通过，看不出来。健康检查报 `audio_outside_links` 时，对 `daily/` 下每一份跑 `verify-vps --link-root` 找出受影响的快照，再删掉那个多出来的名字。
 - 每周恢复演练已自动带 `--link-root`；演练撞上正在运行的备份（开机补跑时可能）会因暂存目录里多一个链接而失败，等备份结束重跑即可。迁移副本演练用的历史校验器不认这个参数，改用 Mac 上那份副本。
-- 如果在 Mac 上另开 `NMU_BACKUP_PULL_SKIP_ARCHIVED=1`，拉取不再每天整份重下已归档的快照，VPS 上旧快照被原地改坏且长度、清单都没变时，Mac 不会每天发现。默认不开。
+- 如果在 Mac 上另开 `NMU_BACKUP_PULL_SKIP_ARCHIVED=1`，拉取不再每晚把已归档的快照整份过一遍，VPS 上旧快照被原地改坏且长度、清单都没变时，Mac 不会每天发现。默认不开。
 
 **上线顺序，Mac 先**：
 
