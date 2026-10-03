@@ -1588,13 +1588,15 @@ def submit(session_id: str, worker: Callable[[str], object]) -> bool:
         future = _EXECUTOR.submit(worker, session_id)
         _INFLIGHT[session_id] = future
 
-        def _release(done: Future[object]) -> None:
-            with _INFLIGHT_LOCK:
-                if _INFLIGHT.get(session_id) is done:
-                    _INFLIGHT.pop(session_id, None)
+    def _release(done: Future[object]) -> None:
+        with _INFLIGHT_LOCK:
+            if _INFLIGHT.get(session_id) is done:
+                _INFLIGHT.pop(session_id, None)
 
-        future.add_done_callback(_release)
-        return True
+    # 出锁之后再挂:worker 已经跑完时 add_done_callback 当场在本线程回调,
+    # 回调要拿同一把不可重入的锁。期间被别的 submit 换掉的 future 由身份比对挡住。
+    future.add_done_callback(_release)
+    return True
 
 
 def submit_after_resume(session_id: str, worker: Callable[[str], object]) -> bool:

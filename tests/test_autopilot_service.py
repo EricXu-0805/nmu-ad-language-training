@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import copy
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta
 from itertools import count as _itertools_count
@@ -4888,3 +4888,31 @@ def test_attempt_worker_submit_gate_opens_for_either_channel(monkeypatch):
     assert autopilot_orchestration.submit(
         "S-SUBMIT-CHANNEL-REAL", _worker) is True
     assert ran.wait(timeout=5)
+
+
+def test_submit_survives_a_worker_that_finishes_before_its_callback_is_registered(monkeypatch):
+    # 线程池现起线程时 submit 要等线程起来,很快的 worker 在这段时间里就跑完了;
+    # add_done_callback 对已完成的 future 当场同步回调,回调要再拿同一把锁。
+    class _AlreadyDoneExecutor:
+        def submit(self, fn, *args):
+            future = Future()
+            future.set_result(fn(*args))
+            return future
+
+    # 换成一次性的锁和表:修复前这里会卡死,卡住的守护线程只占着这把临时锁。
+    monkeypatch.setattr(autopilot_orchestration, "_EXECUTOR", _AlreadyDoneExecutor())
+    monkeypatch.setattr(autopilot_orchestration, "_INFLIGHT_LOCK", threading.Lock())
+    monkeypatch.setattr(autopilot_orchestration, "_INFLIGHT", {})
+    _set_channels(monkeypatch, "real_only")
+    outcome: list[bool] = []
+    caller = threading.Thread(
+        target=lambda: outcome.append(
+            autopilot_orchestration.submit("S-SUBMIT-DONE-FIRST", lambda _session_id: None)),
+        daemon=True)
+
+    caller.start()
+    caller.join(timeout=5)
+
+    assert not caller.is_alive(), "submit() 卡在自己持有的 _INFLIGHT_LOCK 上"
+    assert outcome == [True]
+    assert "S-SUBMIT-DONE-FIRST" not in autopilot_orchestration._INFLIGHT

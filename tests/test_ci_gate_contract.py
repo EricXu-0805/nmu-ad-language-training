@@ -210,6 +210,13 @@ def test_main_push_and_schedule_skip_the_test_suites_but_still_scan_and_build() 
     assert jobs["image"].count("uses: aquasecurity/trivy-action@") == 2
 
 
+def test_backend_legs_have_a_timeout_so_a_hang_cannot_burn_the_minute_budget() -> None:
+    # 私有仓库按分钟计;不设 timeout-minutes 时卡住的一条腿要跑满 GitHub 默认 360 分钟,
+    # 两条腿一起卡就是 720 分钟。PR 上后端全量约 15–22 分钟。
+    backend = _jobs()["backend"]
+    assert re.search(r"^    timeout-minutes: 45$", backend, re.M), backend[:400]
+
+
 def test_release_artifact_is_uploaded_by_main_push_only() -> None:
     # 上线脚本只按 --event push 取 main 上该 SHA 的产物;PR run 构建的是合并预演提交,
     # 每周定时与手动 run 不是上线来源,传了只占私有仓库按量计费的存储。

@@ -45,6 +45,8 @@ jobs:
     # 要在 main 上完整重跑，用 workflow_dispatch。
     if: github.event_name != 'push' && github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    # 卡住的一条腿不设上限会跑满默认 360 分钟（私有仓库按分钟计）；PR 上全量约 15–22 分钟。
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
