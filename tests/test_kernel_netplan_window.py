@@ -20,7 +20,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import shlex
 import subprocess
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy" / "maintenance" / "kernel_netplan_window.sh"
@@ -219,6 +222,51 @@ def test_the_new_stanza_matches_by_mac_and_never_renames_the_card():
     assert "set-name" not in stanza
     # networkd 取按文件名排在前面的那份：by-mac 要排在 ens18 前面才会被用上。
     assert re.search(r"^\s+by-mac:$", stanza, re.M) and "by-mac" < "ens18"
+
+
+def _udev_rule_check() -> str:
+    """演练那段 REMOTE 里核 .link / udev 规则的那几行，原样取出来在本机跑。"""
+    [body] = [body for delimiter, body in _heredocs(_text())
+              if delimiter == "REMOTE" and "netplan generate --root-dir" in body]
+    lines = body.splitlines()
+    start = next(i for i, line in enumerate(lines) if "-name '*.link'" in line)
+    end = next(i for i in range(start, len(lines))
+               if lines[i].strip() == "fi" or lines[i].rstrip().endswith("; fi"))
+    return "\n".join(lines[start:end + 1]) + "\n"
+
+
+# netplan 0.107 生成的原样(MAC 换成假的)。生产机开机就有这个文件,只有 ens18 那一条。
+_NM_DENY_RULES = (
+    "# netplan: network.ethernets.ens18 (on NetworkManager deny-list)\n"
+    'SUBSYSTEM=="net", ACTION=="add|change|move", ENV{ID_NET_NAME}=="ens18", ENV{NM_UNMANAGED}="1"\n'
+    "# netplan: network.ethernets.by-mac (on NetworkManager deny-list)\n"
+    'SUBSYSTEM=="net", ACTION=="add|change|move", ATTR{address}=="52:54:00:12:34:56", '
+    'ENV{NM_UNMANAGED}="1"\n')
+
+
+@pytest.mark.parametrize(("case", "expected_bad"), [
+    ("nm_deny_list_only", 0), ("rename_rule", 1), ("link_file", 1)])
+def test_the_rehearsal_accepts_the_nm_deny_list_rule_but_not_a_rename(case, expected_bad, tmp_path):
+    # 2026-10-03 第一次跑 netplan 阶段就停在这里:netplan 给每块它管的网卡写一条 udev 规则,
+    # 只把网卡列进 NetworkManager 的不管名单,不改名。改名的规则和 .link 照旧要拦。
+    rules = tmp_path / "dry" / "run" / "udev" / "rules.d" / "90-netplan.rules"
+    rules.parent.mkdir(parents=True)
+    extra = ('SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="52:54:00:12:34:56", NAME="eth9"\n'
+             if case == "rename_rule" else "")
+    rules.write_text(_NM_DENY_RULES + extra, encoding="utf-8")
+    if case == "link_file":
+        link = tmp_path / "dry" / "run" / "systemd" / "network" / "10-netplan-by-mac.link"
+        link.parent.mkdir(parents=True)
+        link.write_text("[Match]\nMACAddress=52:54:00:12:34:56\n[Link]\nName=eth9\n",
+                        encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", "-c", f"set -u -o pipefail\nstage={shlex.quote(str(tmp_path))}\nbad=0\n"
+         + _udev_rule_check() + 'echo "bad=${bad}"\n'],
+        capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert f"bad={expected_bad}" in result.stdout, result.stdout
 
 
 def test_the_mac_is_never_printed():

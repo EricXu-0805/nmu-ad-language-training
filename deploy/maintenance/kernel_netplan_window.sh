@@ -479,8 +479,18 @@ if cmp -s "${stage}/dry/run/systemd/network/10-netplan-ens18.network" /run/syste
 else
   echo "  FAIL ens18 那份和现役不一样"; bad=1
 fi
-extra=$(find "${stage}/dry" \( -name '*.link' -o -path '*/udev/*' \) -type f | wc -l | tr -d ' ')
-if [ "${extra}" = "0" ]; then echo "  PASS 没有 .link、没有 udev 改名规则"; else echo "  FAIL 演练生成了 ${extra} 个 .link/udev 文件"; bad=1; fi
+# netplan 0.107 给它管的每块网卡都写一条 udev 规则,只把网卡列进 NetworkManager 的不管名单
+# (ENV{NM_UNMANAGED}="1"),生产机开机就有这个文件(10-03 第一次跑就因为它停在这里)。
+# 只放过这一种行;.link 和其他任何 udev 规则(改名用的 NAME= 之类)照旧判失败。
+links=$(find "${stage}/dry" -name '*.link' -type f | wc -l | tr -d ' ')
+other_rules=$(find "${stage}/dry" -path '*/udev/*' -type f -exec cat {} + </dev/null \
+  | grep -vE '^(#.*)?$' \
+  | grep -cvE '^SUBSYSTEM=="net", ACTION=="add\|change\|move", (ENV\{ID_NET_NAME\}|ATTR\{address\})=="[^"]+", ENV\{NM_UNMANAGED\}="1"$')
+if [ "${links}" = "0" ] && [ "${other_rules}" = "0" ]; then
+  echo "  PASS 没有 .link;udev 规则只把网卡列进 NetworkManager 不管名单,不改名"
+else
+  echo "  FAIL 演练生成了 ${links} 个 .link、${other_rules} 行不认识的 udev 规则"; bad=1
+fi
 matches=$(grep -cE '^(Permanent)?MACAddress=' "${stage}/dry/run/systemd/network/10-netplan-by-mac.network")
 if [ "${matches}" = "1" ] && grep -qx 'DHCP=ipv4' "${stage}/dry/run/systemd/network/10-netplan-by-mac.network"; then
   echo "  PASS by-mac 那份按 MAC 匹配、DHCP=ipv4(MAC 不打印)"
