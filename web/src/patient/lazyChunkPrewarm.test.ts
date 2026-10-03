@@ -6,17 +6,24 @@ import ts from "typescript";
 // 换 dist 会删掉上一版的分块。页面在换版前没 import 过的懒加载分块,换版后第一次
 // import 就 404:开麦那一步会被记成「麦克风未能安全启动」。动态 import 可以写在老人端
 // 静态引入的任何模块里(audio/、sync/、api.ts 都算),所以从 PatientShell 沿依赖走全图,
-// 不只看 patient/ 目录。这里核不了的懒加载写法(包的动态 import、import.meta.glob、
-// new URL(…, import.meta.url)、?worker)一律判红,不放过。
+// 不只看 patient/ 目录。这里核不了的写法一律判红,不放过:包的动态 import、import.meta.glob、
+// new URL(…, import.meta.url)、带查询串的引用(?worker、?url 等;只放过内联的 ?raw/?inline)、
+// 引到 .ts/.tsx/.json 以外的文件(资源单独输出,.mts/.js 等这里不解析)。
 function isImportMetaMember(node: ts.Node, member: string): boolean {
   return ts.isPropertyAccessExpression(node) && node.name.text === member
     && ts.isMetaProperty(node.expression)
     && node.expression.keywordToken === ts.SyntaxKind.ImportKeyword;
 }
 
-function assertNotWorkerEntry(specifier: string, file: URL): void {
-  assert.ok(!/\?(shared)?worker\b/.test(specifier),
-    `${file.pathname} 用 ${specifier} 起了 Worker:它单独成块,这里核不了预取`);
+// 能沿着走的相对引用返回目标;包、内联的 ?raw/?inline 返回 null(打进引用它的分块,不单独取)。
+function traceableTarget(specifier: string, file: URL): URL | null {
+  const target = resolveRelative(specifier, file);
+  if (target === null || /\?(raw|inline)$/.test(specifier)) return null;
+  assert.ok(!specifier.includes("?"),
+    `${file.pathname} 引 ${specifier} 带了查询串:Worker、?url 资源等单独输出,这里核不了预取`);
+  assert.ok(/\.(ts|tsx|json)$/.test(target.pathname),
+    `${file.pathname} 引了 ${specifier}:不是 .ts/.tsx/.json,资源单独输出、其他脚本这里不解析,核不了预取`);
+  return target;
 }
 
 function resolveRelative(specifier: string, from: URL): URL | null {
@@ -43,13 +50,11 @@ function moduleEdges(file: URL): { staticDeps: URL[]; dynamicDeps: URL[] } {
     // import type / export type 编译后不留;类型位置的 import("./x").T 是 ImportTypeNode,不是调用。
     if (ts.isImportDeclaration(node) && !node.importClause?.isTypeOnly
         && ts.isStringLiteral(node.moduleSpecifier)) {
-      assertNotWorkerEntry(node.moduleSpecifier.text, file);
-      const target = resolveRelative(node.moduleSpecifier.text, file);
+      const target = traceableTarget(node.moduleSpecifier.text, file);
       if (target) staticDeps.push(target);
     } else if (ts.isExportDeclaration(node) && !node.isTypeOnly && node.moduleSpecifier
         && ts.isStringLiteral(node.moduleSpecifier)) {
-      assertNotWorkerEntry(node.moduleSpecifier.text, file);
-      const target = resolveRelative(node.moduleSpecifier.text, file);
+      const target = traceableTarget(node.moduleSpecifier.text, file);
       if (target) staticDeps.push(target);
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const [specifier] = node.arguments;
@@ -57,8 +62,9 @@ function moduleEdges(file: URL): { staticDeps: URL[]; dynamicDeps: URL[] } {
         `${file.pathname} 有不是字面量的动态 import,这里没法确认它的分块被预取`);
       assert.ok(specifier.text.startsWith("."),
         `${file.pathname} 动态 import 了包 ${specifier.text}:它会单独成块,改成静态引入或另想办法预取`);
-      assertNotWorkerEntry(specifier.text, file);
-      dynamicDeps.push(resolveRelative(specifier.text, file)!);
+      const target = traceableTarget(specifier.text, file);
+      assert.ok(target, `${file.pathname} 动态 import 了内联资源 ${specifier.text}:这里核不了预取`);
+      dynamicDeps.push(target);
     } else if (ts.isCallExpression(node) && isImportMetaMember(node.expression, "glob")) {
       assert.fail(`${file.pathname} 用了 import.meta.glob:匹配到的模块各自成块,这里核不了预取`);
     } else if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)
