@@ -113,6 +113,14 @@ def test_python_source_fingerprint_matches_the_node_release_builder(tmp_path):
     assert verify_browser_dist._current_source_fingerprint(source) == result.stdout
 
 
+def test_warmup_content_change_invalidates_the_browser_release_identity(tmp_path):
+    source = _write_source(tmp_path / "source")
+    before = verify_browser_dist._current_source_fingerprint(source)
+    (source / "content" / "week1_warmup_v1.json").write_text(
+        '{"versionId":"changed"}\n', encoding="utf-8")
+    assert verify_browser_dist._current_source_fingerprint(source) != before
+
+
 @pytest.mark.parametrize("scope", ["source", "dist"])
 def test_browser_dist_verifier_fails_closed_when_a_tree_cannot_be_walked(
         tmp_path, monkeypatch, scope):

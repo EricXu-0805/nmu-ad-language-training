@@ -25,6 +25,7 @@ const REQUIRED_WEB_FILES = Object.freeze([
 const FROZEN_CONTENT_FILES = Object.freeze([
   "item_bank_v1.json",
   "week1_script.json",
+  "week1_warmup_v1.json",
   "autopilot_protocol_v1.json",
 ]);
 
@@ -82,7 +83,7 @@ export function collectBuildInputs({
   for (const path of REQUIRED_WEB_FILES) addFile(entries, webRoot, path, "web");
   addDirectory(entries, webRoot, "src", "web");
   // Vite publicDir is disabled: no mutable public/ tree participates.  These
-  // three authoritative release contracts are copied into the Docker build
+  // authoritative release contracts are copied into the Docker build
   // context and are deliberately bound to the browser release identity.
   for (const path of FROZEN_CONTENT_FILES) addFile(entries, contentRoot, path, "content");
   entries.sort((left, right) => bytewiseCompare(left.label, right.label));

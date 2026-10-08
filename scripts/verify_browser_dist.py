@@ -29,6 +29,7 @@ REQUIRED_WEB_FILES = (
 FROZEN_CONTENT_FILES = (
     "item_bank_v1.json",
     "week1_script.json",
+    "week1_warmup_v1.json",
     "autopilot_protocol_v1.json",
 )
 

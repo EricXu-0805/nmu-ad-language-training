@@ -118,7 +118,7 @@ fail_count=\$(printf '%s\\n' "\$this_run" | grep -c ' FAIL ' || true)
 # 和它取代的 tail -5 是同一个病。按 code 分组,每种各给一条样例,新 code 必然出现。
 by_code=\$(printf '%s\\n' "\$fail_lines" | awk '/ FAIL /{c="code=?"; for (i=1;i<=NF;i++) if (\$i ~ /^code=/) c=\$i; n[c]++} END {for (k in n) printf "  %s x%d\\n", k, n[k]}' | sort || true)
 examples=\$(printf '%s\\n' "\$fail_lines" | awk '/ FAIL /{c="code=?"; for (i=1;i<=NF;i++) if (\$i ~ /^code=/) c=\$i; if (!seen[c]++) print "  " \$0}' | head -6 || true)
-summary=\$(printf '%s\\n' "\$this_run" | grep -E ' (ok|partial) snapshots=' | tail -1 || true)
+summary=\$(printf '%s\\n' "\$this_run" | grep -E ' (ok|partial|failed) snapshots=' | tail -1 || true)
 detail="本轮 FAIL \${fail_count} 条,按 code 分:
 \${by_code:-  (无)}
 每种一条样例:

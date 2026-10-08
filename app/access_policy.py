@@ -74,7 +74,7 @@ _ROUTE_RULES = (
     # 不再复制进 SPA 静态目录；患者 capability 永远不能读取答案整包。
     _route(
         {"GET", "HEAD"},
-        r"/content/(?:item-bank-bundle|week1-script|week1-reply-bank"
+        r"/content/(?:item-bank-bundle|week1-script|week1-reply-bank|week1-warmup"
         r"|autopilot-protocol)",
         AccessKind.ACCOUNT,
         label="读取工作人员端冻结内容包",
@@ -182,6 +182,8 @@ _ROUTE_RULES = (
            roles=ADMIN_ROLES, label="执行 AI 服务合成检查"),
     _route({"POST"}, r"/sessions/[^/]+/rapport/replies", AccessKind.ACCOUNT,
            roles=TRAINING_OPERATION_ROLES, label="生成第1周回应句发声记录"),
+    _route({"POST"}, r"/sessions/[^/]+/warmup", AccessKind.ACCOUNT,
+           roles=TRAINING_OPERATION_ROLES, label="手动控制训练前互动"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/start", AccessKind.ACCOUNT,
            roles=CAREGIVER_SESSION_CONTROL_ROLES, label="启动限定自动驾驶范围"),
     _route({"POST"}, r"/sessions/[^/]+/autopilot/takeover", AccessKind.ACCOUNT,
@@ -380,12 +382,14 @@ STAFF_CONTENT_BUNDLE_PATHS = frozenset({
     "/content/item-bank-bundle",
     "/content/week1-script",
     "/content/week1-reply-bank",
+    "/content/week1-warmup",
     "/content/autopilot-protocol",
 })
 _LEGACY_ANSWER_BUNDLE_PATHS = frozenset({
     "/content/item_bank_v1.json",
     "/content/week1_script.json",
     "/content/week1_reply_bank_v1.json",
+    "/content/week1_warmup_v1.json",
     "/content/autopilot_protocol_v1.json",
 })
 

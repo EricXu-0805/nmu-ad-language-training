@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { buildIdFromFingerprint, hashBuildInputs } from "./build-fingerprint.mjs";
+import { buildIdFromFingerprint, collectBuildInputs, hashBuildInputs } from "./build-fingerprint.mjs";
 
 test("build fingerprint is stable for identical bytes and ignores mtime", () => {
   const root = mkdtempSync(join(tmpdir(), "nmu-build-fingerprint-"));
@@ -40,4 +40,16 @@ test("changing one build input changes the full SHA-256 identity", () => {
 
   assert.notEqual(after, before);
   assert.notEqual(buildIdFromFingerprint(after), buildIdFromFingerprint(before));
+});
+
+
+test("the optional warmup content is bound to the browser build identity", () => {
+  const inputs = collectBuildInputs();
+  const warmup = inputs.filter((row) => row.label === "content/week1_warmup_v1.json");
+  assert.equal(warmup.length, 1);
+  const root = mkdtempSync(join(tmpdir(), "nmu-warmup-fingerprint-"));
+  const changed = join(root, "week1_warmup_v1.json");
+  writeFileSync(changed, '{"changed":"warmup wording"}');
+  const patched = inputs.map((row) => row === warmup[0] ? { ...row, path: changed } : row);
+  assert.notEqual(hashBuildInputs(patched), hashBuildInputs(inputs));
 });

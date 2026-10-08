@@ -1,3 +1,5 @@
+import { parseWeek1WarmupContent, type WarmupRequest } from "./week1Warmup";
+import { parseWarmupReceipt } from "./sync/warmupRequest";
 import { parsePlaybackReceipt, type RapportPlaybackReceipt } from "./rapportPlayback";
 import { pickDeviceCredential } from "./security/deviceCredentialPolicy";
 // 强类型 API 客户端——逐个后端路由一个函数。相对路径:dev 走 Vite 代理、生产由 FastAPI 同源托管。
@@ -1006,6 +1008,9 @@ export const api = {
       `/sessions/${encodeURIComponent(sid)}/autopilot/adjudicate`,
       buildAutopilotAdjudicateRequest(sid, stateRevision, kind, reasonCode, note),
     )),
+  week1WarmupContent: async () => parseWeek1WarmupContent(await req<unknown>("GET", "/content/week1-warmup")),
+  week1Warmup: async (sid: string, request: WarmupRequest) => parseWarmupReceipt(
+    await req<unknown>("POST", `/sessions/${encodeURIComponent(sid)}/warmup`, request), sid, request),
   rapportPlayback: async (sid: string) => parsePlaybackReceipt(await req<unknown>(
     "GET", `/sessions/${encodeURIComponent(sid)}/rapport/playback`, undefined,
     DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true })),

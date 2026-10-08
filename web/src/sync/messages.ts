@@ -1,3 +1,4 @@
+import { parseWeek1Warmup, type Week1Warmup } from "../week1Warmup.ts";
 // 跨端同步消息 —— 操作端为【唯一写者】,消息只带索引/级别指针,绝不带题目文本。
 // 老人端凭 (itemIdx,turnIdx,cueLevel) 自己去版本锁定的 plan/bundle 查逐字文本,保证单一内容源。
 import type { SessionRuntimeStatus } from "../types";
@@ -56,7 +57,7 @@ export type SyncMsg =
   // "点这里,开始回答"自助开录按钮。缺省/false 一律不显示(fail-closed:合规闸门不被老人端绕过)。
   // fbKey/fbItemId/fbSeq:自动驾驶反馈——不载文本,只指向题库/协议固定话术,老人端本地查表回填(fbSeq 变化才重读)。
   | { type: "cursor"; sessionId: string; screen: PatientScreen; itemIdx: number; turnIdx: number; responseRole: string; cueLevel: CueLevel; recording: RecState; recSeq?: number; rawAudioId?: string; selfStart?: boolean; fbKey?: FeedbackKey; fbItemId?: string; fbSeq?: number; wseq?: number }
-  | { type: "rapportStep"; sessionId: string; sectionKey: string; questionIdx: number; beat?: RapportBeat; replyId?: string; utteranceId?: number; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; paused?: boolean; wseq?: number }
+  | { type: "rapportStep"; warmup?: Week1Warmup; sessionId: string; sectionKey: string; questionIdx: number; beat?: RapportBeat; replyId?: string; utteranceId?: number; recording: RecState; recSeq?: number; rawAudioId?: string; assentGate?: boolean; containsDirectIdentifier?: boolean; paused?: boolean; wseq?: number }
   // sessionId:操作端凭它丢弃跨场次的迟到/残留回报(live state 里 audioSaved 存到下次握手才清)。
   | { type: "audioSaved"; rawAudioId: string; durationSeconds: number; byteCount: number; checksum: string; turnKey: string; sessionId: string; containsDirectIdentifier: boolean; recordingWseq?: number }
   // 老人端麦克风真值上报(自助开录时操作端唯一的感知渠道;也用于示意录音的开麦确认)。
@@ -260,7 +261,7 @@ function parseRapport(value: unknown, withType: boolean): RapportMsg | null {
   const row = record(value);
   if (!row || !exactKeys(row,
     ["sessionId", "sectionKey", "questionIdx", "recording"],
-    ["beat", "replyId", "utteranceId", "recSeq", "rawAudioId", "assentGate", "containsDirectIdentifier", "paused", "wseq"], withType)
+    ["beat", "replyId", "utteranceId", "recSeq", "rawAudioId", "assentGate", "containsDirectIdentifier", "paused", "wseq", "warmup"], withType)
     || (withType && row.type !== "rapportStep")
     || !boundedText(row.sessionId, 128)
     || !boundedText(row.sectionKey, 100)
@@ -270,6 +271,13 @@ function parseRapport(value: unknown, withType: boolean): RapportMsg | null {
     type: "rapportStep", sessionId: row.sessionId, sectionKey: row.sectionKey,
     questionIdx: row.questionIdx, recording: row.recording,
   };
+  if (Object.hasOwn(row, "warmup")) {
+    const warmup = parseWeek1Warmup(row.warmup);
+    const safeStopped = row.recording === "stopped" && row.paused === true && warmup?.beat === "done";
+    if (!warmup || (row.recording !== "idle" && !safeStopped)
+      || !Number.isSafeInteger(row.wseq) || warmup.seq > Number(row.wseq)) return null;
+    result.warmup = warmup;
+  }
   if (Object.hasOwn(row, "beat")) {
     if (!oneOf(row.beat, RAPPORT_BEATS)) return null;
     result.beat = row.beat;
