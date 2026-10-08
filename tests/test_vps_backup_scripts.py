@@ -270,6 +270,167 @@ def _run_pull(project: Path, env: dict[str, str]) -> subprocess.CompletedProcess
     )
 
 
+def _inject_ssh_failure(env: dict[str, str], *, phase: str, failures: int,
+                        error: str, start: int = 1, rc: int = 255) -> Path:
+    """Fail selected read-only requests, including partial output, before real stubs."""
+    stubs = Path(env["PATH"].split(":", 1)[0])
+    (stubs / "ssh").rename(stubs / "ssh-success")
+    env.update({
+        "SSH_FAIL_PHASE": phase, "SSH_FAIL_COUNT": str(failures),
+        "SSH_FAIL_START": str(start), "SSH_FAIL_RC": str(rc),
+        "SSH_FAIL_ERROR": error, "SSH_TEST_STATE": str(stubs),
+    })
+    _make_executable(stubs / "sleep", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$SSH_TEST_STATE/sleeps.log"
+''')
+    _make_executable(stubs / "ssh", r'''#!/bin/bash
+set -euo pipefail
+command_arg="${!#}"
+if [[ "$command_arg" == *"NMU_SNAPSHOT_FACTS_CONTRACT=1"* ]]; then phase=facts
+elif [[ "$command_arg" == *"backup.log"* ]]; then phase=log
+else phase=list
+fi
+printf '%s\0' "$*" >> "$SSH_TEST_STATE/ssh-args.log"
+count_file="$SSH_TEST_STATE/$phase.count"
+count=0
+[ ! -f "$count_file" ] || read -r count < "$count_file"
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+if [ "$phase" = "$SSH_FAIL_PHASE" ] && [ "$count" -ge "$SSH_FAIL_START" ] \
+   && [ "$count" -lt $((SSH_FAIL_START + SSH_FAIL_COUNT)) ]; then
+  printf '%s\n' 'PARTIAL-UNTRUSTED-STDOUT'
+  printf '%s\n' "$SSH_FAIL_ERROR" >&2
+  exit "$SSH_FAIL_RC"
+fi
+exec "$SSH_TEST_STATE/ssh-success" "$@"
+''')
+    return stubs
+
+
+@pytest.mark.parametrize(("phase", "start", "code"), [
+    ("list", 1, "remote_snapshot_list_failed"),
+    ("facts", 1, "remote_snapshot_facts_failed"),
+    ("log", 1, "remote_log_probe_failed"),
+    ("facts", 2, "remote_snapshot_reprobe_failed"),
+])
+def test_pull_retries_transient_ssh_then_completes_verified_snapshot(
+        tmp_path, phase, start, code):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, stamp)
+    stubs = _inject_ssh_failure(env, phase=phase, start=start, failures=2,
+                               error="Connection reset by peer PRIVATE-ID")
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == 0, completed.stderr
+    assert (local / "daily" / stamp / "MANIFEST.sha256").is_file()
+    assert stamp in (local / "audit-anchors.log").read_text()
+    log = (local / "pull.log").read_text()
+    assert log.count(f"retry code={code}") == 2
+    assert f"recovered code={code}" in log
+    assert "attempts=3" in log
+    assert " FAIL " not in log
+    assert " ok snapshots=1 pulled=1 unchanged=0" in log.splitlines()[-1]
+    assert "PRIVATE-ID" not in log + completed.stdout + completed.stderr
+    assert "PARTIAL-UNTRUSTED" not in log + completed.stdout + completed.stderr
+    assert (stubs / "sleeps.log").read_text().splitlines() == ["2", "5"]
+    assert not (local / ".pull.lock").exists()
+    for call in (stubs / "ssh-args.log").read_text().split("\0")[:-1]:
+        assert "StrictHostKeyChecking=yes" in call
+        assert "ConnectTimeout=15" in call
+        assert "ServerAliveInterval=15" in call
+        assert "ServerAliveCountMax=2" in call
+
+
+@pytest.mark.parametrize("reprobe", [False, True])
+def test_pull_exhausted_ssh_retries_fail_with_footer_and_preserve_archives(tmp_path, reprobe):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, stamp)
+    assert _run_pull(project, env).returncode == 0
+    before = {p.relative_to(local / "daily"): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in (local / "daily").rglob("*") if p.is_file()}
+    anchors_before = (local / "audit-anchors.log").read_bytes()
+    log_before = (local / "pull.log").read_text()
+    stubs = _inject_ssh_failure(env, phase="facts", start=2 if reprobe else 1,
+                               failures=20, error="Connection timed out PRIVATE-ID")
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == 255
+    assert (stubs / "facts.count").read_text().strip() == ("4" if reprobe else "3")
+    assert (stubs / "sleeps.log").read_text().splitlines() == ["2", "5"]
+    log = (local / "pull.log").read_text()[len(log_before):]
+    assert log.count(" FAIL ") == 1
+    assert "reason=transport_timeout attempts=3" in log
+    assert "failed snapshots=unverified pulled=0 unchanged=0 rc=255" in log.splitlines()[-1]
+    assert "PRIVATE-ID" not in log + completed.stdout + completed.stderr
+    assert not (local / ".pull.lock").exists()
+    assert not list((local / ".incoming").iterdir())
+    assert bool(list((local / "quarantine").iterdir())) is reprobe
+    after = {p.relative_to(local / "daily"): hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in (local / "daily").rglob("*") if p.is_file()}
+    assert before == after
+    assert (local / "audit-anchors.log").read_bytes() == anchors_before
+
+
+@pytest.mark.parametrize(("error", "rc", "reason"), [
+    ("Host key verification failed. Connection closed PRIVATE-ID", 255, "host_key_verification"),
+    ("Permission denied (publickey). PRIVATE-ID", 255, "authentication"),
+    ("Bad configuration option: PRIVATE-ID", 255, "ssh_configuration"),
+    ("unrecognized PRIVATE-ID", 255, "ssh_error_unclassified"),
+    ("Connection timed out PRIVATE-ID", 2, "remote_command_failed"),
+])
+def test_pull_permanent_or_unknown_ssh_failure_does_not_retry_or_leak(
+        tmp_path, error, rc, reason):
+    project, _remote, local, env = _pull_harness(tmp_path)
+    stubs = _inject_ssh_failure(env, phase="list", failures=20, error=error, rc=rc)
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == rc
+    assert (stubs / "list.count").read_text().strip() == "1"
+    assert not (stubs / "sleeps.log").exists()
+    assert not (local / ".pull.lock").exists()
+    log = (local / "pull.log").read_text()
+    assert f"reason={reason} attempts=1" in log
+    assert "failed snapshots=unverified" in log.splitlines()[-1]
+    assert "PRIVATE-ID" not in log + completed.stdout + completed.stderr
+    assert not Path(env["TRANSFER_LOG"]).exists()
+
+
+def test_pull_transient_ssh_recovery_still_rejects_manifest_corruption(tmp_path):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    snapshot = _create_remote_snapshot(remote, stamp)
+    # Same file/byte facts pass; only the real manifest content verifier catches it.
+    (snapshot / "audio" / "aud-test.webm").write_bytes(b"wrong")
+    _inject_ssh_failure(env, phase="facts", start=2, failures=1,
+                        error="Broken pipe")
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode != 0
+    assert not (local / "daily" / stamp).exists()
+    assert any((local / "quarantine").iterdir())
+    log = (local / "pull.log").read_text()
+    assert "recovered code=remote_snapshot_reprobe_failed" in log
+    assert "FAIL code=snapshot_verify_failed" in log
+    assert "failed snapshots=unverified" in log.splitlines()[-1]
+
+
+def test_macos_offsite_wrapper_reports_failed_footer_without_sending(tmp_path):
+    installer = (ROOT / "scripts" / "install-macos-offsite-pull.sh").read_text()
+    match = re.search(r"grep -E '( [^']+ snapshots=)'", installer)
+    assert match is not None
+    failure = "[2026-10-08 12:57:17] failed snapshots=unverified pulled=0 unchanged=0 rc=255"
+    checked = subprocess.run(["grep", "-E", match.group(1)], input=failure + "\n",
+                             capture_output=True, text=True, check=False)
+    assert checked.returncode == 0
+    assert checked.stdout.strip() == failure
+
+
 def test_pull_new_replay_and_same_name_conflict_preserves_local(tmp_path):
     project, remote, local, env = _pull_harness(tmp_path)
     stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")

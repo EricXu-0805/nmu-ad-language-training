@@ -1,3 +1,4 @@
+import type { Week1Warmup } from "./week1Warmup";
 // 契约类型——逐字镜像后端共享数据契约(app/enums.py + app/models.py + API 响应)。
 // ★画像字段(preferred_appellation/zodiac/interests…)刻意不在任何判分/评分相关类型里出现。
 
@@ -305,6 +306,8 @@ export interface SessionRuntimeCursor {
 }
 
 export interface SessionRuntimeRapportStep {
+  beat?: "ask" | "reply";
+  warmup?: Week1Warmup;
   sessionId?: string;
   sectionKey: string;
   questionIdx: number;

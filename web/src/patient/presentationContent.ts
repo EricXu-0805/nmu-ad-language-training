@@ -1,3 +1,4 @@
+import { parseWeek1Warmup, warmupIdentity, type Week1Warmup } from "../week1Warmup.ts";
 // 老人端当前呈现的网络信任边界。严格拒绝多字段响应，防止后端日后
 // 误把整份题库/答案塞进这个过渡接口而前端无感接受。
 import type { RapportBeat } from "../sync/messages";
@@ -28,6 +29,7 @@ export interface PatientTaskPresentation {
 }
 
 export interface PatientRapportPresentation {
+  warmup?: Week1Warmup;
   schema_version: 1;
   mode: "rapport";
   session_id: string;
@@ -59,6 +61,7 @@ export interface TaskPresentationExpectation {
 }
 
 export interface RapportPresentationExpectation {
+  warmup?: Week1Warmup;
   mode: "rapport";
   sessionId: string;
   sectionKey: string;
@@ -142,7 +145,8 @@ function parseTask(value: unknown): PatientTaskPresentation | null {
 }
 
 function parseRapport(value: unknown): PatientRapportPresentation | null {
-  const row = exactRecord(value, RAPPORT_KEYS);
+  const hasWarmup = value !== null && typeof value === "object" && Object.hasOwn(value, "warmup");
+  const row = exactRecord(value, hasWarmup ? [...RAPPORT_KEYS, "warmup"] : RAPPORT_KEYS);
   if (!row || row.schema_version !== 1 || row.mode !== "rapport"
       || !boundedText(row.session_id, 128)
       || !boundedText(row.script_version_id, 128)
@@ -152,6 +156,11 @@ function parseRapport(value: unknown): PatientRapportPresentation | null {
       || !["机器人", "研究者"].includes(row.speaker as string)
       || !nullableText(row.text)
       || !nullableNonNegativeInteger(row.wseq)) return null;
+  if (hasWarmup) {
+    const warmup = parseWeek1Warmup(row.warmup);
+    if (!warmup || row.wseq === null || warmup.seq > Number(row.wseq)
+      || (warmup.beat === "done" ? row.speaker !== "研究者" || row.text !== null : row.speaker !== "机器人")) return null;
+  }
   if (row.speaker === "机器人" && row.text === null) return null;
   if (row.speaker !== "机器人" && row.text !== null) return null;
   return row as unknown as PatientRapportPresentation;
@@ -174,7 +183,8 @@ export function presentationMatches(
   if (presentation.mode === "rapport" && expected.mode === "rapport") {
     return presentation.section_key === expected.sectionKey
       && presentation.question_idx === expected.questionIdx
-      && presentation.beat === expected.beat;
+      && presentation.beat === expected.beat
+      && warmupIdentity(presentation.warmup) === warmupIdentity(expected.warmup);
   }
   if (presentation.mode !== "task" || expected.mode !== "task") return false;
   return presentation.item_bank_version_id === expected.itemBankVersionId

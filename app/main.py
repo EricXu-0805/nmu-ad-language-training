@@ -53,7 +53,7 @@ from . import (access_policy, assessment_bundles, assessment_contract,
                questionnaire_ai_draft, questionnaires,
                scale_protocol,
                session_admission, session_closeout, tts,
-               visit_plan_contract, visit_plan_service)
+               visit_plan_contract, visit_plan_service, warmup)
 from .autopilot_ledger import utc_now_naive
 from .auth import COOKIE_NAME, CSRF_COOKIE_NAME
 from .db import get_session, init_db
@@ -1482,7 +1482,7 @@ def _project_subject_withdrawal_to_live(
         live.cursor_json = None
     rapport = _json_load(live.rapport_json)
     if rapport is not None:
-        safe_rapport = _safe_rapport(rapport)
+        safe_rapport = warmup.quiesce(_safe_rapport(rapport))
         safe_rapport.update({
             "sessionId": session_id,
             "recording": "stopped",
@@ -4002,6 +4002,9 @@ def recording_authorization(session_id: str, request: Request,
         }
         if sess.week_no == 1 and live is not None:
             current = _json_load(live.rapport_json) or {}
+            if current.get("warmup") is not None:
+                result["allowed"] = False
+                return result
             recording_wseq = _wseq_from(current)
             if recording_wseq is not None and recording_wseq > 0:
                 result["recording_wseq"] = recording_wseq
@@ -4206,6 +4209,11 @@ def create_audio(a: AudioIn, request: Request, s: DBSession = Depends(get_sessio
             if state is not None and state.status == "paused":
                 raise HTTPException(
                     409, "场次暂停期间禁止登记新音频；仅可补传暂停前已登记的录音")
+            if (((_json_load(state.rapport_json) if state else None) or {}).get("warmup")
+                    is not None):
+                # Exact existing ACKs already returned above; older registered
+                # captures may still upload. Only a new capture is forbidden.
+                raise HTTPException(409, "训练前互动不录音，禁止登记新音频")
             linked_session = s.get(TrainSession, a.session_id)
             assert linked_session is not None
             _require_current_patient_turn_for_device(
@@ -5271,7 +5279,7 @@ _PUBLIC_LIVE_FIELDS = {
                "fbKey", "fbSeq", "wseq"},
     "rapportStep": {"sessionId", "sectionKey", "questionIdx", "beat", "replyId",
                     "utteranceId", "recording", "recSeq", "assentGate",
-                    "containsDirectIdentifier", "paused", "wseq"},
+                    "containsDirectIdentifier", "paused", "wseq", "warmup"},
 }
 
 
@@ -5281,7 +5289,13 @@ def _public_live_projection(kind: str, text: str | None) -> dict | None:
     if payload is None:
         return None
     allowed = _PUBLIC_LIVE_FIELDS[kind]
-    return {key: value for key, value in payload.items() if key in allowed}
+    projected = {key: value for key, value in payload.items() if key in allowed}
+    if kind == "rapportStep" and "warmup" in projected:
+        try:
+            projected["warmup"] = warmup.State.model_validate(projected["warmup"]).model_dump()
+        except ValueError as exc:
+            raise HTTPException(409, "训练前互动状态无效") from exc
+    return projected
 
 
 # 研究者端 console-state 的读边界白名单:与前端 messages.ts 各 parseSyncPayload
@@ -5304,7 +5318,13 @@ def _console_live_projection(kind: str, text: str | None) -> dict | None:
     if payload is None:
         return None
     allowed = _CONSOLE_LIVE_FIELDS[kind]
-    return {key: value for key, value in payload.items() if key in allowed}
+    projected = {key: value for key, value in payload.items() if key in allowed}
+    if kind == "rapportStep" and "warmup" in projected:
+        try:
+            projected["warmup"] = warmup.State.model_validate(projected["warmup"]).model_dump()
+        except ValueError as exc:
+            raise HTTPException(409, "训练前互动状态无效") from exc
+    return projected
 
 
 def _live_row_for_update(s: DBSession) -> LiveState | None:
@@ -5454,7 +5474,7 @@ def _runtime_payload(session_id: str, row: SessionRuntimeState | None) -> dict:
         "status": row.status if row else "active",
         "revision": row.revision if row else 0,
         "cursor": _json_load(row.cursor_json) if row else None,
-        "rapportStep": _json_load(row.rapport_json) if row else None,
+        "rapportStep": _console_live_projection("rapportStep", row.rapport_json) if row else None,
         "pausedAt": row.paused_at if row else None,
         "resumedAt": row.resumed_at if row else None,
         "interventionCompletedAt": row.intervention_completed_at if row else None,
@@ -5505,6 +5525,114 @@ def _safe_rapport(payload: dict) -> dict:
     safe.pop("rawAudioId", None)
     safe.pop("paused", None)
     return safe
+
+
+@app.get("/content/week1-warmup")
+def get_week1_warmup_bundle():
+    return warmup.load_bundle().model_dump()
+
+
+def _warmup_receipt(live: LiveState, state: SessionRuntimeState) -> dict:
+    return {
+        "seq": live.seq,
+        "wseq": _wseq_from(_json_load(live.rapport_json)),
+        "runtimeRevision": state.revision,
+        "rapportStep": _console_live_projection("rapportStep", live.rapport_json),
+    }
+
+
+@app.post("/sessions/{session_id}/warmup")
+def warmup_action(session_id: str, body: warmup.Action, request: Request,
+                  s: DBSession = Depends(get_session)):
+    """Manual optional overlay; the underlying formal position never moves.
+
+    The last exact operation is retained privately in the existing runtime JSON,
+    so an ambiguous HTTP result can be retried without a second playback. A new
+    position, pause or recovery invalidates its expected revision and generation.
+    """
+    patient_id = _preauthorize_session_subject_fence(
+        request, session_id, s, "控制训练前互动", audit_supervision_before_fence=True)
+    with (governance_lock.subject_fence(s, patient_id), _LIVE_WRITE_LOCK,
+          device_capability.serialized_mutation()):
+        governance_lock.begin_sqlite_write_fence(s)
+        sess = s.get(TrainSession, session_id)
+        if sess is None:
+            raise HTTPException(404, "场次不存在")
+        _require_session_operator(request, sess, s, "控制训练前互动",
+                                  mutation=True, audit_supervision=False)
+        _require_started_visit_plan_session(session_id, s, sess=sess)
+        if (sess.week_no != 1 or str(getattr(sess.event_line, "value", sess.event_line))
+                != "关系建立环节"):
+            raise HTTPException(409, "训练前互动仅适用于第1周关系建立场次")
+        _ensure_manual_plane_writable(session_id, s, "控制训练前互动")
+        state = _runtime_row(session_id, s)
+        if state.status != "active":
+            raise HTTPException(409, "场次已暂停或结束，不能启动或推进互动")
+        live = _live_row_for_update(s)
+        if live is None or _live_session_id(live) != session_id:
+            raise HTTPException(409, "场次不在当前床旁，请先恢复场次")
+        position = _json_load(live.rapport_json)
+        if position is None or _payload_session_id(position) != session_id:
+            raise HTTPException(409, "正式关系建立位置尚未确认")
+        previous = position.get("warmupOperation")
+        digest = warmup.action_digest(body)
+        if isinstance(previous, dict) and previous.get("key") == body.idempotencyKey:
+            if previous.get("digest") != digest:
+                raise HTTPException(409, "互动请求编号已被其他操作使用")
+            if (previous.get("wseq") == _wseq_from(position)
+                    and previous.get("revision") == state.revision):
+                return _warmup_receipt(live, state)
+            raise HTTPException(409, "互动请求的场次状态已变化，请重新核对")
+        if (body.expectedWseq != _wseq_from(position)
+                or body.expectedRevision != state.revision):
+            raise HTTPException(409, "互动位置或场次状态已变化，请刷新后重试")
+        # No microphone command or device truth may be active. This does not
+        # discard an earlier recording or invent a stop receipt.
+        _ensure_patient_capture_idle_for_autopilot(live)
+        try:
+            current = warmup.state(position)
+        except ValueError as exc:
+            raise HTTPException(409, "互动状态无效，请联系管理员") from exc
+        if body.action in {"start", "replay", "reply"}:
+            warmup.load_bundle()
+        if body.action == "start":
+            if current is not None and current.beat != "done":
+                raise HTTPException(409, "请先结束当前互动，再选择其他主题")
+        elif current is None:
+            raise HTTPException(409, "尚未开始训练前互动")
+        elif body.action == "continue":
+            if current.beat != "done":
+                raise HTTPException(409, "请先结束互动，再继续关系建立")
+        elif current.beat == "done":
+            raise HTTPException(409, "互动已结束，请重新选择主题开始")
+        updated = _safe_rapport(position)
+        generation = _allocate_live_wseq(live)
+        if body.action == "continue":
+            updated.pop("warmup", None)
+        else:
+            updated["warmup"] = warmup.State(
+                versionId=warmup.VERSION,
+                topic=body.topic if body.action == "start" else current.topic,
+                beat=("done" if body.action == "end" else "reply"
+                      if body.action == "reply" else current.beat
+                      if body.action == "replay" else "ask"),
+                seq=generation).model_dump()
+        state.revision += 1
+        updated["wseq"] = generation
+        updated["warmupFence"] = generation
+        updated["warmupOperation"] = {
+            "key": body.idempotencyKey, "digest": digest,
+            "wseq": generation, "revision": state.revision,
+        }
+        state.rapport_json = _json.dumps(updated, ensure_ascii=False)
+        state.updated_at = datetime.now()
+        live.rapport_json = state.rapport_json
+        live.seq += 1
+        live.updated_at = state.updated_at
+        s.add(state)
+        s.add(live)
+        s.commit()
+        return _warmup_receipt(live, state)
 
 
 def _session_plan_for_runtime(sess: TrainSession) -> runtime.SessionPlan:
@@ -6036,15 +6164,16 @@ def _rapport_validate_script_position(
     return questions[question_idx] if questions else {}
 
 
-def _rapport_fence_position(state: SessionRuntimeState | None) -> tuple[str | None, int | None]:
+def _rapport_fence_position(state: SessionRuntimeState | None) -> tuple:
     """第1周当前问位(节, 问):回应只许落在它被请求时的那一问。"""
     rapport = _json_load(state.rapport_json) if state is not None else None
     if not isinstance(rapport, dict):
-        return (None, None)
+        return (None, None, None)
     section = rapport.get("sectionKey")
     idx = rapport.get("questionIdx")
     return (section if isinstance(section, str) else None,
-            idx if isinstance(idx, int) and not isinstance(idx, bool) else None)
+            idx if isinstance(idx, int) and not isinstance(idx, bool) else None,
+            rapport.get("warmupFence"))
 
 
 @contextmanager
@@ -6068,6 +6197,8 @@ def _rapport_write_scope(
             SessionRuntimeState.session_id == session_id).with_for_update()).first()
         if state is not None and state.status != "active":
             raise HTTPException(409, "场次已暂停或结束，不能生成新的回应")
+        if ((_json_load(state.rapport_json) if state else None) or {}).get("warmup") is not None:
+            raise HTTPException(409, "请先结束训练前互动并继续关系建立，才能生成正式回应")
         patient = s.get(Patient, patient_id)
         if patient is None:
             raise HTTPException(409, "受试者档案不存在")
@@ -6434,6 +6565,8 @@ def _rapport_current_playback_position(
     if (not position or _payload_session_id(position) != session_id
             or not _wseq_from(position)):
         raise HTTPException(409, "当前没有可核对的关系建立呈现")
+    if position.get("warmup") is not None:
+        raise HTTPException(409, "训练前互动不接受正式关系建立播放回执")
     return position, state.revision if state else 0
 
 
@@ -6550,7 +6683,7 @@ def _restore_runtime_to_live(row: LiveState, state: SessionRuntimeState | None) 
 
     rapport = _json_load(state.rapport_json)
     if rapport:
-        rapport = _safe_rapport(rapport)
+        rapport = warmup.quiesce(_safe_rapport(rapport))
         rapport["sessionId"] = state.session_id
         rapport.pop("session_id", None)
         wseq = _allocate_live_wseq(row)
@@ -7045,7 +7178,12 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                 payload["paused"] = True
             # 新场次握手清瞬时回报，但从该场次自己的 runtime 行恢复安全位置，避免串场或覆盖。
             row.audio_json = None
-            row.patient_rec_json = None
+            # Reopening the same console does not prove a hot microphone has
+            # stopped. Preserve its positive device fact until an inactive
+            # receipt arrives; otherwise optional warmup could start over it.
+            if (previous_session_id != session_id
+                    or (_json_load(row.patient_rec_json) or {}).get("active") is not True):
+                row.patient_rec_json = None
             if previous_session_id != session_id:
                 device_capability.mark_session_recovery_only(s, previous_session_id)
                 row.patient_ack_session_id = None
@@ -7078,7 +7216,15 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
             if body.kind == "cursor":
                 _validate_cursor(sess, payload, s)
             else:
+                if (_json_load(row.rapport_json) or {}).get("warmup") is not None:
+                    raise HTTPException(409, "训练前互动尚未退出，请显式继续关系建立")
                 _validate_rapport(sess, payload, s)
+                # Keep the interruption generation after leaving the optional
+                # module: a provider call started beforehand stays fenced even
+                # when the researcher later revisits exactly the same question.
+                interrupted = (_json_load(state.rapport_json) or {}).get("warmupFence")
+                if interrupted is not None:
+                    payload["warmupFence"] = interrupted
             command_wseq = _allocate_live_wseq(row)
             payload["wseq"] = command_wseq
             if body.kind == "cursor":
@@ -7265,9 +7411,26 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                 )
                 payload["turnKey"] = canonical_turn_key
                 _validate_audio_turn_key(sess.session_id, canonical_turn_key, s)
+                if (body.kind == "patientRec" and payload.get("active") is True
+                        and (_json_load(row.rapport_json) or {}).get("warmup") is not None
+                        and state.status == "active"):
+                    # A delayed/old device opened a microphone despite the
+                    # optional module's no-recording contract. Stop all media;
+                    # never relabel this as a formal attempt or clinical error.
+                    _pause_runtime_in_transaction(sess.session_id, s)
+                    row.patient_rec_json = _json.dumps(payload, ensure_ascii=False)
+                    s.add(row)
+                    return row, command_wseq, capture_receipt, False
                 if body.kind == "patientRec" and state.status == "paused":
                     # 技术失败已暂停时，迟到的 active/stopped 回报均不覆盖故障投影。
-                    return row, command_wseq, capture_receipt, True
+                    previous_rec = _json_load(row.patient_rec_json) or {}
+                    warmup_stop_receipt = (
+                        (_json_load(row.rapport_json) or {}).get("warmup") is not None
+                        and previous_rec.get("active") is True
+                        and not previous_rec.get("failureCode")
+                        and payload.get("active") is False)
+                    if not warmup_stop_receipt:
+                        return row, command_wseq, capture_receipt, True
             setattr(row, slot, _json.dumps(payload, ensure_ascii=False))
         row.seq += 1
         row.updated_at = datetime.now()
@@ -7932,7 +8095,7 @@ def _pause_runtime_in_transaction(session_id: str, s: DBSession) -> SessionRunti
     rapport = _json_load(state.rapport_json) or (
         _json_load(live.rapport_json) if live_is_current and live else None)
     if rapport:
-        rapport = _safe_rapport(rapport)
+        rapport = warmup.quiesce(_safe_rapport(rapport))
         rapport["sessionId"] = session_id
         rapport.pop("session_id", None)
         wseq = (_allocate_live_wseq(live) if live_is_current and live
@@ -8026,6 +8189,9 @@ def resume_session(session_id: str, request: Request,
         if state.status == "paused":
             live = _live_row_for_update(s)
             live_is_current = bool(live and _live_session_id(live) == session_id)
+            if (live_is_current and live and (rapport or {}).get("warmup") is not None
+                    and (_json_load(live.patient_rec_json) or {}).get("active") is True):
+                raise HTTPException(409, "尚未收到老人端停麦确认，请先检查设备再恢复")
             if cursor:
                 cursor = _safe_cursor(cursor)
                 cursor["sessionId"] = session_id
@@ -8037,7 +8203,7 @@ def resume_session(session_id: str, request: Request,
                 if live_is_current and live:
                     live.cursor_json = state.cursor_json
             if rapport:
-                rapport = _safe_rapport(rapport)
+                rapport = warmup.quiesce(_safe_rapport(rapport))
                 rapport["sessionId"] = session_id
                 rapport.pop("session_id", None)
                 wseq = (_allocate_live_wseq(live) if live_is_current and live
@@ -8368,7 +8534,7 @@ def _project_terminal_to_live(live: LiveState | None, sess: TrainSession,
 
     rapport = _json_load(state.rapport_json) or _json_load(live.rapport_json)
     if rapport is not None:
-        projected_rapport = _safe_rapport(rapport)
+        projected_rapport = warmup.quiesce(_safe_rapport(rapport))
         projected_rapport.update({
             "sessionId": sess.session_id,
             "recording": "stopped",
@@ -9603,6 +9769,15 @@ def tts_speak(body: TtsSpeakIn, request: Request,
                 live=live,
                 manual_text=True,
             )
+            position = _json_load(live.rapport_json) if live is not None else None
+            if (position or {}).get("warmup") is not None:
+                try:
+                    overlay = warmup.state(position)
+                    expected_text = warmup.text_for(overlay) if overlay else None
+                except ValueError:
+                    _raise_tts_authorization_changed()
+                if expected_text is None or body.text.strip() != expected_text:
+                    _raise_tts_authorization_changed()
         authorization_snapshot = _tts_authorization_snapshot(live, s)
         # No DB snapshot/row lock may survive provider/cache I/O.
         s.rollback()
@@ -9747,6 +9922,7 @@ def rapport_utterance_tts(
         current = _json_load(live.rapport_json) if live is not None else None
         if (utterance is None or utterance.session_id != session_id
                 or not isinstance(current, dict)
+                or current.get("warmup") is not None
                 or current.get("utteranceId") != utterance_id
                 or current.get("beat") != "reply"):
             # discard 封套:老人端按它静默丢弃,不把指针漂移计入引擎连败。
@@ -11151,9 +11327,13 @@ class PatientRapportPresentationOut(BaseModel):
     wseq: int | None
 
 
+class PatientWarmupPresentationOut(PatientRapportPresentationOut):
+    warmup: warmup.State
+
+
 @app.get(
     "/sessions/{session_id}/patient-presentation",
-    response_model=PatientTaskPresentationOut | PatientRapportPresentationOut,
+    response_model=PatientWarmupPresentationOut | PatientTaskPresentationOut | PatientRapportPresentationOut,
 )
 def patient_presentation_get(
         session_id: str, request: Request, s: DBSession = Depends(get_session)):
@@ -11195,6 +11375,19 @@ def patient_presentation_get(
                 raise HTTPException(409, "当前关系建立游标损坏，拒绝呈现")
             script = content.load_week1_script(
                 content.CONTENT_DIR / "week1_script.json")
+            if rapport.get("warmup") is not None:
+                try:
+                    overlay = warmup.state(rapport)
+                    assert overlay is not None
+                    text = warmup.text_for(overlay)
+                except (ValueError, AssertionError) as exc:
+                    raise HTTPException(409, "当前训练前互动状态无效") from exc
+                return PatientWarmupPresentationOut(
+                    schema_version=1, mode="rapport", session_id=session_id,
+                    script_version_id=str(script["script_version_id"]),
+                    section_key=section_key, question_idx=question_idx, beat=beat,
+                    speaker="机器人" if text is not None else "研究者", text=text,
+                    wseq=_wseq_from(rapport), warmup=overlay)
             if utterance_ref is not None and beat == "reply":
                 # 回应文本以持久发声行为准:屏显与朗读同源,含 LLM 现编句。
                 utterance = s.get(RapportUtteranceEvent, utterance_ref)
@@ -11214,6 +11407,7 @@ def patient_presentation_get(
                 except ValueError as exc:
                     raise HTTPException(409, str(exc)) from exc
             return PatientRapportPresentationOut(
+                schema_version=1, mode="rapport",
                 session_id=session_id,
                 script_version_id=str(script["script_version_id"]),
                 section_key=section_key,

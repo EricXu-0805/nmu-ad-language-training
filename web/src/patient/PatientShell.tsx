@@ -1,3 +1,6 @@
+import { WarmupStage } from "./WarmupStage";
+import { observeWarmupPlayback, type WarmupPlaybackFence } from "./warmupPlaybackFence";
+import { warmupTtsContext } from "../week1Warmup";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   api, DEVICE_CAPABILITY_UPDATED_EVENT, devicePairingOrAttachInFlight, getDeviceCapability,
@@ -471,6 +474,14 @@ export function PatientShell({ allowPageReload = false }: { allowPageReload?: bo
     : autopilot.mode !== "legacy" ? autopilot.current?.command_seq : cursor?.wseq;
   usePatientHeartbeat(session?.sessionId, currentScreen, commandSeq ?? session?.wseq, __BUILD_ID__);
 
+  const warmupFence = useRef<WarmupPlaybackFence | null>(null);
+  const warmupPlayback = observeWarmupPlayback(warmupFence.current, {
+    sessionId: session?.sessionId, hasStep: rapportStep !== undefined,
+    warmup: rapportStep?.warmup, connectionReady,
+    paused: effectivePaused || rapportStep?.paused === true, terminal,
+  });
+  warmupFence.current = warmupPlayback.state;
+
   // Generic/legacy TTS gets an exact replay namespace.  It is deliberately
   // absent while a new item is loading, during pause/disconnect/terminal views,
   // and whenever the server-owned command runner controls media.
@@ -479,7 +490,9 @@ export function PatientShell({ allowPageReload = false }: { allowPageReload?: bo
     ? null
     : session.mode === "rapport" && currentScreen === "rapport"
       && rapportStep?.sectionKey !== undefined
-      ? `session:${session.sessionId}|plane:rapport|section:${rapportStep.sectionKey}|question:${rapportStep.questionIdx}`
+      ? rapportStep.warmup
+        ? warmupTtsContext(session.sessionId, rapportStep.warmup)
+        : `session:${session.sessionId}|plane:rapport|section:${rapportStep.sectionKey}|question:${rapportStep.questionIdx}`
       : session.mode !== "rapport" && autopilot.mode === "legacy"
         && plan && cursor && (currentScreen === "present" || currentScreen === "record")
         ? `session:${session.sessionId}|plane:legacy|item:${cursor.itemIdx}|turn:${cursor.turnIdx}`
@@ -568,7 +581,11 @@ export function PatientShell({ allowPageReload = false }: { allowPageReload?: bo
   } else if (session.mode === "rapport") {
     // 暂停不卸载舞台:卸载会丢掉保存失败的 pendingSave 与重试入口,恢复后该段回答
     // 从流程里无声消失。舞台保持挂载,休息屏由舞台自己渲染,录音经 suspended 立即停麦。
-    body = <RapportStage key={session.sessionId} rapportStep={rapportStep} sessionId={session.sessionId}
+    body = rapportStep?.warmup ? <WarmupStage key={`warmup:${session.sessionId}`}
+      sessionId={session.sessionId} rapportStep={rapportStep} ttsContextKey={ttsContextKey}
+      allowedIdentity={warmupPlayback.allowedIdentity} connectionReady={connectionReady}
+      sessionPaused={effectivePaused} registerImmediateDiscard={registerImmediateDiscard} />
+      : <RapportStage key={session.sessionId} rapportStep={rapportStep} sessionId={session.sessionId}
       ttsContextKey={ttsContextKey}
       connectionReady={connectionReady} sessionPaused={effectivePaused} sessionTerminal={terminal}
       registerImmediateDiscard={registerImmediateDiscard} />;
@@ -649,7 +666,7 @@ export function PatientShell({ allowPageReload = false }: { allowPageReload?: bo
       <TapToStart tapped={false} label="点一下，接着听" sub="小语的话还没放出来"
         onTap={() => { unlockAutopilotPlayback(); unlockTtsPlayback(); }} />
     )}
-    <TtsToggle on={ttsOn} onChange={setTtsOn} sampleContextKey={ttsContextKey}
+    <TtsToggle on={ttsOn} onChange={setTtsOn} sampleContextKey={rapportStep?.warmup ? null : ttsContextKey}
       mode={autopilot.mode} />
     <PinPrompt />
   </>;

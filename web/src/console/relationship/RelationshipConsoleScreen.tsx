@@ -1,3 +1,6 @@
+import { Week1WarmupCard } from "./Week1WarmupCard";
+import { useWeek1Warmup } from "./useWeek1Warmup";
+import type { WarmupAction, WarmupTopic } from "../../week1Warmup";
 import { receiptMatchesRapportArm } from "./rapportRecordingAuthority";
 import { pollFailed, pollSucceeded, RUNTIME_ERROR_GRACE_MS } from "../../hooks/runtimePollPolicy";
 import { useEffect, useRef, useState } from "react";
@@ -40,6 +43,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   } = useCursorWriter(session.session_id);
   const { journal, upsertAudio, hydrateFromServer } = useSessionJournal(session.session_id);
   const runtimeControl = useSessionRuntime(session.session_id);
+  const warmupControl = useWeek1Warmup(session.session_id, runtimeControl.runtime);
   const paused = runtimeControl.paused;
   const [pausePending, setPausePending] = useState(false);
   const [wrapupPending, setWrapupPending] = useState(false);
@@ -184,8 +188,9 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const runtimeReady = runtimeControl.runtime?.sessionId === session.session_id;
   const recoveryPending = recoveryLoading || (!recoveryError && (!runtimeReady || !recoveryApplied));
   const terminal = runtimeControl.terminal;
-  const interactionBlocked = terminal || paused || pausePending || wrapupPending || recoveryPending
+  const baseInteractionBlocked = terminal || paused || pausePending || wrapupPending || recoveryPending
     || Boolean(recoveryError) || Boolean(patientDeviceFailure);
+  const interactionBlocked = baseInteractionBlocked || warmupControl.blocking;
   // 暂停/设备失败/终态/收尾一旦生效,待定的续麦或换问必须立刻作废:定时器回调
   // 持有的是旧闭包,里面的 interactionBlocked 永远是排定那一帧的值。
   useEffect(() => { if (interactionBlocked) cancelAfterReply(); }, [interactionBlocked]);
@@ -253,6 +258,8 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
 
   useEffect(() => {
     if (!script || interactionBlocked || handshakeSent.current) return;
+    // A recovered warmup (including done) can only be left by the dedicated continue action.
+    if (runtimeControl.runtime?.rapportStep?.warmup) { handshakeSent.current = true; return; }
     postSession({ sessionId: session.session_id, weekNo: session.week_no, eventLine: session.event_line, mode: "rapport", itemBankVersionId: session.item_bank_version_id });
     postRapport({
       sectionKey: script.sections[sectionIdx]?.key ?? "",
@@ -262,7 +269,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       ...rapportFlags,
     });
     handshakeSent.current = true;
-  }, [interactionBlocked, postRapport, postSession, qIdx, rapportFlags, script, sectionIdx, session]);
+  }, [interactionBlocked, postRapport, postSession, qIdx, rapportFlags, script, sectionIdx, session, runtimeControl.runtime?.rapportStep?.warmup]);
 
   useEffect(() => {
     if (!script || interactionBlocked || recordingEligible) return;
@@ -304,6 +311,10 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   const withdrawRef = useRef<() => void>(() => {});
   withdrawRef.current = () => {
     watchdog.clear();
+    if (warmupControl.blocking) {
+      try { beginSafetyPause(); } finally { void api.pauseSession(session.session_id).catch(() => {}); }
+      return;
+    }
     postRapport({
       sectionKey: section?.key ?? "",
       questionIdx: qIdx,
@@ -620,6 +631,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
   }
 
   async function pauseRapport() {
+    warmupControl.cancel();
     cancelAfterReply();
     if (pausePending || paused) return;
     beginSafetyPause();
@@ -645,6 +657,35 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
       toast(result.message, "danger");
     }
   }
+
+  const invalidateFormalActions = () => {
+    cancelAfterReply();
+    latest.current.interactionBlocked = true;
+    lastArmedPosRef.current = null;
+    armedWseq.current = null;
+    watchdog.clear();
+    watchdogFor.current = null;
+    setAutoReply(false);
+  };
+  const runWarmup = async (action: WarmupAction, topic?: WarmupTopic) => {
+    if (baseInteractionBlocked || recState !== "idle" || replyPending || replyBusyRef.current) return;
+    const accepted = await warmupControl.act(action, topic, invalidateFormalActions);
+    if (accepted) {
+      // The continue receipt has already published the original position; no handshake replay.
+      handshakeSent.current = true;
+      runtimeControl.reportRevision(session.session_id, accepted.runtimeRevision);
+    }
+    await runtimeControl.refresh();
+  };
+  const retryWarmup = async () => {
+    if (baseInteractionBlocked) return;
+    const accepted = await warmupControl.retry(invalidateFormalActions);
+    if (accepted) {
+      handshakeSent.current = true;
+      runtimeControl.reportRevision(session.session_id, accepted.runtimeRevision);
+    }
+    await runtimeControl.refresh();
+  };
 
   async function enterWrapup() {
     cancelAfterReply();
@@ -694,6 +735,12 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
           onAborted={() => onWrapup()} />
       </div>
 
+      <Week1WarmupCard content={warmupControl.content} contentError={warmupControl.contentError}
+        reloadContent={warmupControl.reloadContent} warmup={warmupControl.warmup}
+        disabled={baseInteractionBlocked || recState !== "idle" || replyPending}
+        busy={warmupControl.busy} uncertain={warmupControl.uncertain} problem={warmupControl.problem}
+        act={(action, topic) => { void runWarmup(action, topic); }} retry={() => { void retryWarmup(); }} />
+
       <section className={`form-section rapport-console-card${interactionBlocked ? " session-paused-surface" : ""}`}>
         <div className="form-section-header">
           <div>
@@ -737,7 +784,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
             </div>
             {autoModeHere && (
               <label className="row rapport-auto-toggle">
-                <input type="checkbox" checked={autoReply}
+                <input type="checkbox" checked={autoReply} disabled={interactionBlocked}
                   onChange={(e) => { setAutoReply(e.target.checked); if (!e.target.checked) cancelAfterReply(); }} />
                 <span>{autoOpenHere
                   ? "自动带练：问完自动开麦，老人说完 AI 听完现编接着聊，每问最多聊几轮后自动问下一问；听不清或 AI 不可用时改用句库"
@@ -784,7 +831,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
           </Alert>
         )}
 
-        {recStatus === "denied" && (
+        {recStatus === "denied" && !warmupControl.warmup && (
           <Alert tone="danger" title="本场录音已禁用">服务器当前未授权录音（可能是同意、撤回、准入或场次状态变化）。麦克风已收回。</Alert>
         )}
         {recStatus === "loading" && <StatusPill tone="muted">正在核对录音资格…</StatusPill>}

@@ -31,7 +31,7 @@ if [[ ! "$NMU_BACKUP_REMOTE_ROOT" =~ ^/[A-Za-z0-9._/-]+$ ]] \
   exit 64
 fi
 
-for required_cmd in rsync ssh find chmod mktemp sort tail mv rm rmdir wc df awk cmp; do
+for required_cmd in rsync ssh find chmod mktemp sort tail mv rm rmdir wc df awk cmp grep sleep; do
   command -v "$required_cmd" >/dev/null 2>&1 || {
     echo "拒绝执行:缺少命令 $required_cmd" >&2
     exit 69
@@ -141,6 +141,7 @@ CURRENT_STAMP=""
 CURRENT_ALLOWLIST=""
 CURRENT_DATA_ALLOWLIST=""
 FAIL_CODE="pull_failed"
+SUMMARY_WRITTEN=0
 cleanup() {
   local rc="$1"
   local rejected
@@ -160,6 +161,12 @@ cleanup() {
       find "$CURRENT_STAGE" -type f -exec chmod 600 {} + 2>/dev/null
       mv "$CURRENT_STAGE" "$rejected/payload" 2>/dev/null
     fi
+  fi
+  rm -f -- "$LOCK_DIR/ssh-stderr"
+  if [ "$rc" -ne 0 ] && [ "$SUMMARY_WRITTEN" -eq 0 ]; then
+    # 预检/连接阶段也必须有终态，不能伪装成 ok/partial。尚未完成全轮校验时
+    # snapshots 不报一个貌似已核实的数量；pulled 只计已完整验证并发布的快照。
+    note "failed snapshots=unverified pulled=${pulled:-0} unchanged=${unchanged:-0} rc=$rc"
   fi
   rmdir "$LOCK_DIR" 2>/dev/null
   exit "$rc"
@@ -210,8 +217,62 @@ DISK_RESERVE_BYTES=$((512 * 1024 * 1024))
 
 REMOTE="${NMU_BACKUP_SSH_USER}@${NMU_BACKUP_SSH_HOST}"
 REMOTE_ROOT="${NMU_BACKUP_REMOTE_ROOT%/}"
-SSH_ARGS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes)
-RSYNC_SSH="ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes"
+SSH_ARGS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=2)
+RSYNC_SSH="ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
+
+# 只重试已识别的 SSH 传输中断；认证、主机密钥、远端命令失败和未知错误
+# 仍直接失败。输出先隔离，失败尝试的半截 stdout 不得混进事实校验输入。
+# stderr 只在持锁私有临时文件中分类，不写原文到日志或通知，避免泄露路径/标识。
+remote_ssh() {
+  local code="$1" stamp="$2" command="$3"
+  local attempt=1 max_attempts=3 rc output reason retryable delay
+  local error_file="$LOCK_DIR/ssh-stderr" snapshot_suffix=""
+  [ -z "$stamp" ] || snapshot_suffix=" snapshot=$stamp"
+  while :; do
+    if output=$(LC_ALL=C ssh "${SSH_ARGS[@]}" "$REMOTE" "$command" 2>"$error_file"); then
+      rm -f -- "$error_file"
+      if [ "$attempt" -gt 1 ]; then
+        note "recovered code=$code$snapshot_suffix attempts=$attempt"
+      fi
+      printf '%s' "$output"
+      return 0
+    else
+      rc=$?
+    fi
+    reason=remote_command_failed
+    retryable=0
+    if [ "$rc" -eq 255 ]; then
+      reason=ssh_error_unclassified
+      if LC_ALL=C grep -Eqi 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|No .* host key is known' "$error_file"; then
+        reason=host_key_verification
+      elif LC_ALL=C grep -Eqi 'Permission denied|Too many authentication failures|No supported authentication methods' "$error_file"; then
+        reason=authentication
+      elif LC_ALL=C grep -Eqi 'Bad configuration option|Bad owner or permissions|no matching (host key type|key exchange method)|Identity file .* not accessible' "$error_file"; then
+        reason=ssh_configuration
+      elif LC_ALL=C grep -Eqi '(Connection|Operation) timed out|Timeout, server .* not responding|Connection to .* timed out' "$error_file"; then
+        reason=transport_timeout
+        retryable=1
+      elif LC_ALL=C grep -Eqi 'Connection (reset|closed|refused)|Broken pipe' "$error_file"; then
+        reason=transport_disconnected
+        retryable=1
+      elif LC_ALL=C grep -Eqi 'No route to host|Network is (unreachable|down)|Temporary failure in name resolution' "$error_file"; then
+        reason=network_unavailable
+        retryable=1
+      fi
+    fi
+    rm -f -- "$error_file"
+    if [ "$retryable" -ne 1 ] || [ "$attempt" -ge "$max_attempts" ]; then
+      note "FAIL code=$code$snapshot_suffix rc=$rc reason=$reason attempts=$attempt"
+      return "$rc"
+    fi
+    delay=2
+    [ "$attempt" -eq 1 ] || delay=5
+    note "retry code=$code$snapshot_suffix rc=$rc reason=$reason attempt=$attempt max_attempts=$max_attempts delay_seconds=$delay"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+}
 REMOTE_LIST_COMMAND="find '$REMOTE_ROOT/daily' -mindepth 1 -maxdepth 1 -name '$SNAP_GLOB' -printf '%y %f\\n'"
 # 远端只回四个数（文件、字节、目录、非法项），路径不出 VPS。多链接文件只有在快照顶层
 # audio/<安全文件名> 时才算合法：VPS 打开录音去重后，相邻快照共享这些 inode；其余任何
@@ -226,11 +287,10 @@ snapshot_facts_command() {
   printf '%s' "set -o pipefail; NMU_SNAPSHOT_FACTS_CONTRACT=1; find '$REMOTE_ROOT/daily/$1' -xdev \\( -type f -links +1 -printf '%y %s %n %P\\n' \\) -o -printf '%y %s %n\\n' | awk '$SNAPSHOT_FACTS_AWK'"
 }
 
-if REMOTE_ENTRIES=$(ssh "${SSH_ARGS[@]}" "$REMOTE" "$REMOTE_LIST_COMMAND" 2>/dev/null); then
+if REMOTE_ENTRIES=$(remote_ssh remote_snapshot_list_failed "" "$REMOTE_LIST_COMMAND"); then
   :
 else
   rc=$?
-  note "FAIL code=remote_snapshot_list_failed rc=$rc"
   exit "$rc"
 fi
 REMOTE_SNAPSHOTS=""
@@ -286,11 +346,10 @@ REMOTE_SNAPSHOT_DIRECTORY_COUNTS=()
 REMOTE_FACT_ROWS=()
 for remote_stamp in "${REMOTE_STAMP_ARGS[@]}"; do
   REMOTE_FACTS_COMMAND=$(snapshot_facts_command "$remote_stamp")
-  if REMOTE_FACTS=$(ssh "${SSH_ARGS[@]}" "$REMOTE" "$REMOTE_FACTS_COMMAND" 2>/dev/null); then
+  if REMOTE_FACTS=$(remote_ssh remote_snapshot_facts_failed "$remote_stamp" "$REMOTE_FACTS_COMMAND"); then
     :
   else
     rc=$?
-    note "FAIL code=remote_snapshot_facts_failed snapshot=$remote_stamp rc=$rc"
     exit "$rc"
   fi
   if [[ "$REMOTE_FACTS" == *$'\n'* ]]; then
@@ -397,11 +456,10 @@ for remote_stamp in "${REMOTE_STAMP_ARGS[@]}"; do
 done
 
 REMOTE_LOG_FACTS_COMMAND="find '$REMOTE_ROOT/backup.log' -maxdepth 0 -printf '%y %s\\n'"
-if REMOTE_LOG_FACTS=$(ssh "${SSH_ARGS[@]}" "$REMOTE" "$REMOTE_LOG_FACTS_COMMAND" 2>/dev/null); then
+if REMOTE_LOG_FACTS=$(remote_ssh remote_log_probe_failed "" "$REMOTE_LOG_FACTS_COMMAND"); then
   :
 else
   rc=$?
-  note "FAIL code=remote_log_probe_failed rc=$rc"
   exit "$rc"
 fi
 read -r REMOTE_LOG_TYPE REMOTE_LOG_SIZE REMOTE_LOG_EXTRA <<< "$REMOTE_LOG_FACTS"
@@ -656,12 +714,11 @@ PY
   # changed after preflight. Re-read the exact bounded facts before publication
   # and reject any file/byte/directory/type drift.
   post_command=$(snapshot_facts_command "$stamp")
-  if post_facts=$(ssh "${SSH_ARGS[@]}" "$REMOTE" "$post_command" 2>/dev/null); then
+  if post_facts=$(remote_ssh remote_snapshot_reprobe_failed "$stamp" "$post_command"); then
     :
   else
     compare_rc=$?
     FAIL_CODE="remote_snapshot_reprobe_failed"
-    note "FAIL code=$FAIL_CODE snapshot=$stamp rc=$compare_rc"
     return "$compare_rc"
   fi
   if [[ "$post_facts" == *$'\n'* ]]; then
@@ -875,10 +932,13 @@ HELD_SUFFIX=""
 if [ "$pull_skipped" -gt 0 ]; then
   # 本轮有新证据入 legacy/conflicts:其余快照照常归档了,但要人看一眼。
   note "partial snapshots=$count pulled=$pulled unchanged=$unchanged skipped=$pull_skipped$HELD_SUFFIX used_mb=$USED_MB"
+  SUMMARY_WRITTEN=1
   exit 4
 fi
 if [ "$USED_MB" -gt "$QUOTA_MB" ]; then
   note "ok snapshots=$count pulled=$pulled unchanged=$unchanged$HELD_SUFFIX used_mb=$USED_MB quota_mb=$QUOTA_MB verdict=quota_exceeded"
+  SUMMARY_WRITTEN=1
   exit 3
 fi
 note "ok snapshots=$count pulled=$pulled unchanged=$unchanged$HELD_SUFFIX used_mb=$USED_MB"
+SUMMARY_WRITTEN=1

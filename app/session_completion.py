@@ -216,6 +216,11 @@ def assess_rapport_completion(
         row for row in audio_rows
         if row.byte_count is not None or (row.checksum or "").strip()
     ]
+    if (rapport_position or {}).get("warmup") is not None:
+        issues.append(CompletionIssue(
+            code="rapport_warmup_pending",
+            detail="请先结束训练前互动并显式继续关系建立，再结束本场",
+        ))
 
     sections = [row for row in script.get("sections", [])
                 if isinstance(row, dict) and row.get("key")]

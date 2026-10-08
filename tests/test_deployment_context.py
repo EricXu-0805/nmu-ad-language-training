@@ -302,6 +302,7 @@ def _isolated_local_launcher(tmp_path: Path, *, with_ui: bool) -> tuple[Path, Pa
         for relative in (
             "item_bank_v1.json",
             "week1_script.json",
+            "week1_warmup_v1.json",
             "autopilot_protocol_v1.json",
         ):
             path = root / "content" / relative

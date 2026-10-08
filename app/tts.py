@@ -614,7 +614,7 @@ _allow_lock = threading.Lock()
 def cloud_text_allowed(text: str) -> bool:
     """红线守卫:白名单加载失败/文本不在集合 → False(fail-closed,云端一个字都不发)。"""
     global _allow_cache
-    from . import content
+    from . import content, warmup
     try:
         with _allow_lock:
             week_files = content.load_item_bank_index()
@@ -622,6 +622,7 @@ def cloud_text_allowed(text: str) -> bool:
                      content.CONTENT_DIR / "week1_script.json",
                      content.CONTENT_DIR / "autopilot_protocol_v1.json",
                      content.CONTENT_DIR / "week1_reply_bank_v1.json"]
+            paths.append(content.CONTENT_DIR / warmup.FILE)
             paths += [content.CONTENT_DIR / week_files[week]
                       for week in sorted(week_files)]
             proto = json.loads(paths[2].read_text(encoding="utf-8"))
@@ -644,6 +645,12 @@ def cloud_text_allowed(text: str) -> bool:
                 except Exception:
                     replies = None
                 allowed: frozenset[str] = frozenset()
+                try:
+                    module = warmup.load_bundle()
+                    allowed |= frozenset(line for topic in module.topics
+                                         for line in (topic.ask, topic.reply))
+                except content.FrozenContentUnavailable:
+                    pass  # Only the optional module loses cloud TTS admission.
                 # 白名单=全部已结构化训练周的并集:同一云引擎服务所有周。
                 # 单周坏档只让该周文本落回本地引擎(正集合缩小=fail-closed),
                 # 不把索引里一条坏登记放大成全项目云语音静默瘫痪。
