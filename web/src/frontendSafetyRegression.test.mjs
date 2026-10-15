@@ -202,17 +202,19 @@ test('a late successful playback read loses authority when a safety action inter
 });
 
 function ttsHarness() {
-  let fetchResolve; const audios = [], storage = new Map();
+  let fetchResolve, timerSeq = 0; const audios = [], storage = new Map(), timers = new Map();
   class FakeAudio {
     constructor() { this.paused = true; audios.push(this); }
     play() { this.paused = false; return Promise.resolve(); }
     pause() { this.paused = true; }
   }
   const globals = {
+    AbortController, setTimeout: fn => { timers.set(++timerSeq, fn); return timerSeq; }, clearTimeout: id => timers.delete(id),
     Audio: FakeAudio, URL: { createObjectURL: () => 'blob:fake', revokeObjectURL() {} }, DOMException,
     localStorage: { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, v) },
     CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init.detail; } },
-    window: { dispatchEvent() {} }, fetch: () => new Promise(resolve => { fetchResolve = resolve; }),
+    window: { dispatchEvent() {} }, document: { addEventListener() {} },
+    fetch: () => new Promise(resolve => { fetchResolve = resolve; }),
   };
   const cache = new Map();
   function load(p) {
@@ -225,13 +227,15 @@ function ttsHarness() {
     vm.runInContext(compile(read(p)), ctx); cache.set(p, exports); return exports;
   }
   const tts = load('./patient/tts.ts'); tts.setTtsContext('SIM-REGRESSION:rapport:0');
-  return { tts, audios, serve: async () => { fetchResolve({ ok: true, status: 200, headers: { get: () => 'fake-engine' }, blob: async () => ({}) }); await tick(); } };
+  return { tts, audios, expire: () => { for (const [id, fn] of [...timers]) { timers.delete(id); fn(); } },
+    serve: async () => { fetchResolve({ ok: true, status: 200, headers: { get: () => 'fake-engine' }, blob: async () => ({}) }); await tick(); } };
 }
 function gated(gate) {
   const source = read('./patient/RapportStage.tsx');
   const start = source.indexOf('  const speechInFlight =');
   const code = source.slice(start, source.indexOf('  const {\n    stopAndSave', start));
-  const ctx = vm.createContext({ confirmedRobot: true, speechGate: gate, speechIdentity: 'current', rapportStep: { recording: 'armed' } });
+  const ctx = vm.createContext({ confirmedRobot: true, speechGate: gate, speechIdentity: 'current', rapportStep: { recording: 'armed' },
+    initialRemote: { current: { recording: 'idle' } } });
   vm.runInContext(compile(code + '\nglobalThis.result = gatedRecording;'), ctx); return ctx.result;
 }
 test('actual TTS begun before a delayed arm cannot open the microphone until ended', async () => {
@@ -243,16 +247,11 @@ test('actual TTS begun before a delayed arm cannot open the microphone until end
   h.audios[0].onended(); assert.equal(gated(gate), 'armed');
 });
 test('actual timeout closes media, keeps microphone closed, and ignores a late ended event', async () => {
-  const h = ttsHarness(); let gate = { identity: 'current', outcome: 'pending' }, expire;
+  const h = ttsHarness(); let gate = { identity: 'current', outcome: 'pending' };
   h.tts.onSpeechSettled((_tag, outcome) => { if (gate.outcome === 'pending') gate = { identity: 'current', outcome }; });
   h.tts.speak('迟迟没有结束的朗读', { contextKey: 'SIM-REGRESSION:rapport:0', tag: 'run-22' }); await h.serve();
   const oldEnded = h.audios[0].onended;
-  executable(callback('./patient/RapportStage.tsx', 'useEffect', n => n.getText().includes('SPEECH_SETTLE_TIMEOUT_MS')), {
-    speechGate: gate, SPEECH_SETTLE_TIMEOUT_MS: 45000, stopSpeaking: h.tts.stopSpeaking,
-    finishSpeechRef: { current: outcome => { gate = { identity: 'current', outcome }; } },
-    window: { setTimeout: cb => { expire = cb; return 1; }, clearTimeout() {} },
-  })();
-  expire(); assert.equal(h.audios[0].paused, true); assert.equal(gated(gate), 'idle');
+  h.expire(); assert.equal(h.audios[0].paused, true); assert.equal(gated(gate), 'idle');
   oldEnded(); assert.equal(gate.outcome, 'failed'); assert.equal(gated(gate), 'idle');
 });
 test('old same-content speech tag cannot settle a new playback run', () => {
@@ -351,8 +350,31 @@ function hooksFrame() {
   hooks.useLayoutEffect = hooks.useEffect;
   return { hooks, render(fn) { cursor = 0; return fn(); }, flush() { const work = pending; pending = []; work.forEach(fn => fn()); } };
 }
+test('resume-listening overlay click preserves prepared speech instead of replacing it with a silent unlock', () => {
+  const sf = ast('./patient/PatientShell.tsx');
+  const overlay = findNode(sf, n => ts.isJsxSelfClosingElement(n) && n.tagName.getText(sf) === 'TapToStart'
+    && n.attributes.properties.some(p => ts.isJsxAttribute(p) && p.name.getText(sf) === 'label'
+      && p.initializer?.text === '点一下，接着听'));
+  const handler = overlay.attributes.properties.find(p => ts.isJsxAttribute(p) && p.name.getText(sf) === 'onTap').initializer.expression;
+  const playback = { src: 'blob:question', callbacks: 'question-handlers' };
+  const overwrite = () => { playback.src = 'blob:silent'; playback.callbacks = null; };
+  executable(handler.getText(sf), { unlockAutopilotPlayback: overwrite, unlockTtsPlayback: overwrite })();
+  assert.deepEqual(playback, { src: 'blob:question', callbacks: 'question-handlers' });
+});
+test('turning speech on does not bypass a stage microphone gate by playing a standalone sample', () => {
+  const sf = ast('./patient/PatientShell.tsx');
+  const toggle = findNode(sf, n => ts.isFunctionDeclaration(n) && n.name?.text === 'TtsToggle');
+  const handler = findNode(toggle, n => ts.isJsxAttribute(n) && n.name.getText(sf) === 'onClick').initializer.expression;
+  const settings = []; let samples = 0;
+  executable(handler.getText(sf), { on: false, sampleContextKey: 'SIM-REGRESSION:rapport:0',
+    setTtsEnabled: value => settings.push(value), onChange: value => settings.push(value),
+    speakSample: () => { samples++; },
+  })();
+  assert.deepEqual(settings, [true, true]);
+  assert.equal(samples, 0, 'a currently open recorder must not pick up untracked sample speech');
+});
 function presentationGapHarness() {
-  const frame = hooksFrame(), requests = []; let recorderOptions, speechTag, speechSettled;
+  const frame = hooksFrame(), requests = [], spoken = []; let recorderOptions, speechTag, speechSettled, stopped = 0;
   const api = { patientPresentation: () => { const d = deferred(); requests.push(d); return d.promise; }, reportRapportPlayback: async () => null };
   const globals = { ...frame.hooks, api, ...presentationContract,
     window: { setTimeout: () => 1, clearTimeout() {} } };
@@ -362,22 +384,84 @@ function presentationGapHarness() {
   const stage = executable(findNode(stageSf, n => ts.isFunctionDeclaration(n) && n.name?.text === 'RapportStage').getText(stageSf).replace(/^export /, ''), {
     ...globals, usePatientPresentation, observeRapportSpeech, playbackIdentity,
     SPEECH_SETTLE_TIMEOUT_MS: 45000, RAPPORT_MAX_RECORDING_MS: 30000,
-    stopSpeaking() {}, speak: (_text, opts) => { speechTag = opts.tag; }, ttsEnabled: () => true,
+    stopSpeaking() { stopped++; }, speak: (text, opts) => { speechTag = opts.tag; spoken.push(text); }, ttsEnabled: () => true,
     onSpeechSettled: listener => { speechSettled = listener; return () => {}; },
-    rapportTurnKey: (s, q) => `rapport:${s}:${q}`, Centered() {}, MicButton() {},
+    rapportTurnKey: (s, q) => `rapport:${s}:${q}`, Centered() {}, MicButton() {}, MicButtonSpace() {},
     audioRecorderBlockCopy: () => null,
     useVoxRecorder: opts => { recorderOptions = opts; return { blockReason: null }; },
-    require: () => ({ jsx: () => null, jsxs: () => null }),
+    require: () => ({ jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) }),
   });
   const props = { sessionId: 'SIM-REGRESSION', ttsContextKey: 'SIM-REGRESSION:rapport:0',
     rapportStep: { sectionKey: '认识机器人', questionIdx: 0, beat: 'ask', recording: 'idle', recSeq: 1, wseq: 10 } };
   return {
-    props, requests, render: () => frame.render(() => stage(props)), flush: frame.flush,
+    props, requests, spoken, stopped: () => stopped, render: () => frame.render(() => stage(props)), flush: frame.flush,
     options: () => recorderOptions, ended: () => speechSettled(speechTag, 'played'),
     presentation: { schema_version: 1, mode: 'rapport', session_id: 'SIM-REGRESSION', script_version_id: 'week1-v1',
       section_key: '认识机器人', question_idx: 0, beat: 'ask', speaker: '机器人', text: '我们一起聊聊天', wseq: 10 },
   };
 }
+function visibleText(node) {
+  if (typeof node === 'string') return node;
+  if (Array.isArray(node)) return node.map(visibleText).join(' ');
+  return node && typeof node === 'object' ? visibleText(node.props?.children) : '';
+}
+test('rapport keeps verified current text and recording controls visible while an arm receipt refreshes presentation', async () => {
+  const h = presentationGapHarness();
+  h.render(); h.flush(); h.requests[0].resolve(h.presentation); await tick();
+  h.render(); h.flush(); h.ended(); h.render(); h.flush();
+  h.props.rapportStep = { ...h.props.rapportStep, recording: 'armed', recSeq: 2, wseq: 11 };
+  const tree = h.render(); h.flush();
+  assert.equal(h.requests.length, 2);
+  assert.match(visibleText(tree), /我们一起聊聊天/);
+  assert.equal(tree.type, 'div', 'do not replace the whole screen with loading while the microphone can open');
+  assert.equal(h.options().recording, 'armed');
+  assert.equal(h.spoken.length, 1, 'retained display cannot replay speech');
+
+  h.props.rapportStep = { ...h.props.rapportStep, questionIdx: 1, wseq: 12 };
+  assert.doesNotMatch(visibleText(h.render()), /我们一起聊聊天/, 'new question cannot reuse old text');
+  assert.equal(h.options().suspended, true);
+});
+test('rapport presentation failure stops speech and hides cached content until a fresh exact response', async () => {
+  const h = presentationGapHarness();
+  h.render(); h.flush(); h.requests[0].resolve(h.presentation); await tick();
+  h.render(); h.flush();
+  h.props.rapportStep = { ...h.props.rapportStep, recording: 'armed', recSeq: 2, wseq: 11 };
+  h.render(); h.flush();
+  const stops = h.stopped();
+  h.requests[1].resolve({}); await tick();
+  const tree = h.render(); h.flush();
+  assert.doesNotMatch(visibleText(tree), /我们一起聊聊天/);
+  assert.equal(h.options().suspended, true);
+  assert.ok(h.stopped() > stops, 'a failed current presentation must silence speech as well as close the microphone');
+});
+for (const field of ['recSeq', 'wseq']) test(`rapport speech completion cannot revive an initial historical arm; a new ${field} can authorize it`, async () => {
+  const h = presentationGapHarness();
+  h.props.rapportStep.recording = 'armed';
+  h.render(); h.flush(); h.requests[0].resolve(h.presentation); await tick();
+  h.render(); h.flush(); h.ended(); h.render(); h.flush();
+  assert.equal(h.options().recording, 'idle');
+  assert.equal((await runActualRecorderStart(h.options())).starts, 0, 'speech completion is not a fresh researcher arm');
+  h.props.rapportStep = { ...h.props.rapportStep, [field]: h.props.rapportStep[field] + 1 };
+  h.render(); h.flush();
+  assert.equal(h.options().recording, 'armed');
+  assert.equal((await runActualRecorderStart(h.options())).starts, 1);
+});
+test('rapport waits for the first actual command before remembering a historical arm', async () => {
+  const h = presentationGapHarness();
+  const firstCommand = { ...h.props.rapportStep, recording: 'armed' };
+  h.props.rapportStep = undefined;
+  h.props.ttsContextKey = null;
+  h.render(); h.flush();
+  h.props.rapportStep = firstCommand;
+  h.props.ttsContextKey = 'SIM-REGRESSION:rapport:0';
+  h.render(); h.flush(); h.requests[0].resolve(h.presentation); await tick();
+  h.render(); h.flush(); h.ended(); h.render(); h.flush();
+  assert.equal(h.options().recording, 'idle');
+  assert.equal((await runActualRecorderStart(h.options())).starts, 0);
+  h.props.rapportStep = { ...firstCommand, recSeq: firstCommand.recSeq + 1, wseq: firstCommand.wseq + 1 };
+  h.render(); h.flush();
+  assert.equal(h.options().recording, 'armed');
+});
 async function runActualRecorderStart(options, hiddenAt = null) {
   let starts = 0, prepares = 0, authorizations = 0, discards = 0;
   const ref = current => ({ current }), noop = () => {};

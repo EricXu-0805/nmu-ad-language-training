@@ -156,13 +156,15 @@ test("物理收麦之后立刻改说正在保存，并收起可选按钮与提�
   assert.doesNotMatch(markup, /不点也可以，我们会自动继续/);
 });
 
-test("服务器 runtime 还没追上时也不许闪回监听态", async (context) => {
+test("录音终态已确认后显示理解回答，不再停在保存或开麦提示", async (context) => {
   const markup = await stageMarkup(context, (view) => {
     view.localCapturePhase = PERSISTING;
     view.runtime = { ...view.runtime, phase: "waiting_server_after_record" };
   });
 
-  assert.match(markup, /录好了，正在保存/);
+  assert.match(markup, /正在理解刚才的回答，请稍候/);
+  assert.doesNotMatch(markup, /录好了，正在保存/);
+  assert.doesNotMatch(markup, /正在准备麦克风/);
   assert.doesNotMatch(markup, /正在听您说/);
   assert.doesNotMatch(markup, /说完了可以点这里/);
 });
@@ -360,20 +362,65 @@ test("提问在播：提示与提前回答入口可见，实际状态仍是朗�
   assert.doesNotMatch(markup, /说完了可以点这里/);
 });
 
+test("朗读准备到保存共用三行控制区，空阶段没有可聚焦的占位按钮", async (context) => {
+  const preparingSpeech = questionPlayingView();
+  preparingSpeech.current = { ...preparingSpeech.current, state: "pending", command_revision: 0 };
+  preparingSpeech.runtime = { ...preparingSpeech.runtime, phase: "tts_ready", command: preparingSpeech.current };
+  const preparingRecording = recordingView();
+  preparingRecording.current = { ...preparingRecording.current, state: "pending", command_revision: 0 };
+  preparingRecording.runtime = { ...preparingRecording.runtime, phase: "record_ready", command: preparingRecording.current };
+  preparingRecording.localCapturePhase = null;
+  const saving = recordingView();
+  saving.localCapturePhase = PERSISTING;
+  for (const [view, buttonText] of [
+    [preparingSpeech, null],
+    [questionPlayingView(), "现在回答"],
+    [preparingRecording, null],
+    [recordingView(), "说完了可以点这里"],
+    [saving, null],
+  ]) {
+    const markup = await renderView(context, view);
+    for (const row of ["status", "action", "hint"]) {
+      assert.match(markup, new RegExp(`class="patient-control-row patient-control-${row}-row"`));
+    }
+    // 占位 span 永远只有不可见的排版空格：没有操作名称、role 或 tabIndex，
+    // 不能被误读成另一个按钮，也不能在等待状态接收键盘/辅助设备的点击。
+    const reserves = [...markup.matchAll(/<span class="[^"]*patient-layout-reserve" aria-hidden="true">(.*?)<\/span>/g)];
+    assert.equal(reserves.length, 3);
+    for (const reserve of reserves) assert.match(reserve[1], /^\u3000+$/u);
+    const buttons = [...markup.matchAll(/<button\b[^>]*>(.*?)<\/button>/g)];
+    assert.equal(buttons.length, buttonText === null ? 0 : 1);
+    if (buttonText !== null) assert.equal(buttons[0][1], buttonText);
+    assert.doesNotMatch(markup, /<button[^>]*(?:disabled|aria-hidden|tabindex="-1")/);
+  }
+});
+
 test("线索句在播同样提示；反馈句/报答案句不是在等回答，不提示", async (context) => {
   assert.match(await renderView(context, questionPlayingView("cue")), /请听完再回答/);
   assert.doesNotMatch(await renderView(context, questionPlayingView("feedback")), /请听完再回答/);
   assert.doesNotMatch(await renderView(context, questionPlayingView("tell_answer")), /请听完再回答/);
 });
 
-test("提问播完到真实开麦之前(record_ready，正在准备麦克风)提示不闪掉", async (context) => {
+test("提问播完到真实开麦之前，明确等到正在听您说后再回答", async (context) => {
   const markup = await stageMarkup(context, (view) => {
     view.current = { ...view.current, state: "pending", command_revision: 0 };
     view.runtime = { ...view.runtime, phase: "record_ready", command: view.current };
     view.localCapturePhase = null;
   });
   assert.match(markup, /正在准备麦克风/);
-  assert.match(markup, /请听完再回答/);
+  assert.match(markup, /看到「正在听您说」后再回答/);
+  assert.doesNotMatch(markup, /请听完再回答/);
+});
+
+test("朗读结束后的服务器等待期不再假装准备重播，也没有回答按钮", async (context) => {
+  for (const purpose of ["question", "cue", "feedback", "tell_answer"]) {
+    const view = questionPlayingView(purpose);
+    view.runtime = { ...view.runtime, phase: "waiting_server_after_tts" };
+    const markup = await renderView(context, view);
+    assert.match(markup, purpose === "question" || purpose === "cue"
+      ? /正在准备麦克风/ : /请稍候，马上继续/);
+    assert.doesNotMatch(markup, /正在准备朗读|正在为您朗读|>现在回答<\/button>/);
+  }
 });
 
 test("真实 onstart 一到就换成正在听您说：提示消失；收麦保存中也不提示", async (context) => {
@@ -496,7 +543,7 @@ test("残留的 monitoring 不算在听:朗读还没开始、已经播完、或�
   });
   for (const view of [notStarted, ended]) {
     const markup = await renderView(context, view);
-    assert.match(markup, /请听完再回答/);
+    assert.match(markup, view === notStarted ? /请听完再回答/ : /看到「正在听您说」后再回答/);
     assert.doesNotMatch(markup, /想回答时可以开口/);
   }
   const recordReady = await stageMarkup(context, (view) => {
@@ -505,7 +552,7 @@ test("残留的 monitoring 不算在听:朗读还没开始、已经播完、或�
     view.localCapturePhase = null;
     view.bargeIn = { ...INTERRUPTED_QUESTION, phase: "monitoring" };
   });
-  assert.match(recordReady, /请听完再回答/);
+  assert.match(recordReady, /看到「正在听您说」后再回答/);
   assert.doesNotMatch(recordReady, /想回答时可以开口/);
 });
 

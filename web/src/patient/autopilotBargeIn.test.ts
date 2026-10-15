@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createBargeInDetector } from "./autopilotBargeIn.ts";
 import {
-  startBargeInMonitor, type BargeInExposure, type BargeInHandle, type BargeInPorts,
+  startBargeInMonitor, supportsConcurrentBargeIn, type BargeInExposure, type BargeInHandle, type BargeInPorts,
 } from "./autopilotBrowserBargeIn.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
 
@@ -84,7 +84,7 @@ const command = { schema_version: 1, command_key: "cmd-monitor-test-0001", comma
   payload: { speech_key: "test.question", speech_text: "请回答", purpose: "question" },
 } as Extract<NextCommandProjection, {kind: "tts"}>;
 async function flush() { for (let i = 0; i < 20; i++) await Promise.resolve(); }
-function setup(options: { permission?: boolean; aec?: boolean; media?: Promise<MediaStream>; authFails?: number } = {}) {
+function setup(options: { concurrentCapture?: boolean; permission?: boolean; aec?: boolean; media?: Promise<MediaStream>; authFails?: number } = {}) {
   let callback: (() => void) | null = null;
   let clock = 0;
   let level = 0.002;
@@ -96,6 +96,9 @@ function setup(options: { permission?: boolean; aec?: boolean; media?: Promise<M
   let confirms = 0;
   let resumeCalls = 0;
   let closedContext = 0;
+  let permissionChecks = 0;
+  let leaseAcquisitions = 0;
+  let contextCreations = 0;
   const phases: string[] = [];
   const stream = { getTracks: () => [{stop: () => { stopped++; }}],
     getAudioTracks: () => [{readyState: "live", getSettings: () => ({echoCancellation: options.aec ?? true})}],
@@ -106,16 +109,17 @@ function setup(options: { permission?: boolean; aec?: boolean; media?: Promise<M
     getFloatTimeDomainData(values: Float32Array) { values.fill(level); },
     getFloatFrequencyData(values: Float32Array) { values.fill(-100); values[30] = -5; } };
   const ports: BargeInPorts = {
-    permissionGranted: async () => options.permission ?? true,
+    supportsConcurrentCapture: () => options.concurrentCapture ?? true,
+    permissionGranted: async () => { permissionChecks++; return options.permission ?? true; },
     foreground: () => foreground,
     authorize: async () => { auth++; if (auth === options.authFails) throw new Error("revoked"); },
-    acquireLease: async () => ({release() { released++; }, released: Promise.resolve()}),
+    acquireLease: async () => { leaseAcquisitions++; return {release() { released++; }, released: Promise.resolve()}; },
     getUserMedia: async () => { mediaCalls++; return options.media ?? stream; },
-    createContext: () => ({ state: "running", sampleRate: 48000,
+    createContext: () => { contextCreations++; return { state: "running", sampleRate: 48000,
       createMediaStreamSource: () => ({connect() {}, disconnect() {}}),
       createAnalyser: () => analyser,
       close: async () => { closedContext++; },
-    }) as unknown as AudioContext,
+    } as unknown as AudioContext; },
     now: () => clock, setInterval: (cb) => { callback = cb; return 1; },
     clearInterval: () => { callback = null; },
   };
@@ -126,11 +130,46 @@ function setup(options: { permission?: boolean; aec?: boolean; media?: Promise<M
     observe: (o) => phases.push(o.phase),
   }, ports);
   return {handle, stream, phases, audio, facts: () => ({stopped,released,auth,mediaCalls,confirms,resumeCalls,closedContext}),
+    setupFacts: () => ({permissionChecks,leaseAcquisitions,contextCreations}),
     exposureAtConfirm: () => exposureAtConfirm,
     hide() { foreground = false; },
     feed(ms: number, value: number) { level = value; for (let i = 0; i < ms; i += 64) {clock += 64; callback?.();} },
   };
 }
+
+test("iOS browsers and desktop-mode iPads use sequential speaker and microphone", () => {
+  for (const device of [
+    {userAgent: "Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 Version/18.6 Mobile/15E148 Safari/604.1", platform: "iPad", maxTouchPoints: 5},
+    {userAgent: "Mozilla/5.0 (iPad; CPU OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 MicroMessenger/8.0.63", platform: "iPad", maxTouchPoints: 5},
+    {userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 CriOS/140.0 Mobile/15E148 Safari/604.1", platform: "iPhone", maxTouchPoints: 5},
+    {userAgent: "Mozilla/5.0 (iPod touch; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148", platform: "iPod", maxTouchPoints: 5},
+    {userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 Version/18.6 Safari/605.1.15", platform: "MacIntel", maxTouchPoints: 5},
+    {userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 Safari/605.1.15", platform: "", maxTouchPoints: 5},
+  ]) assert.equal(supportsConcurrentBargeIn(device), false, device.userAgent);
+});
+
+test("Android tablets and desktop browsers retain optional voice interruption", () => {
+  for (const device of [
+    {userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel Tablet) AppleWebKit/537.36 Chrome/140.0 Safari/537.36", platform: "Linux armv8l", maxTouchPoints: 10},
+    {userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.6 Safari/605.1.15", platform: "MacIntel", maxTouchPoints: 0},
+    {userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36", platform: "Win32", maxTouchPoints: 10},
+  ]) assert.equal(supportsConcurrentBargeIn(device), true, device.userAgent);
+});
+
+test("incompatible device does not open a microphone or alter current playback", async () => {
+  const h = setup({concurrentCapture:false});
+  await h.handle.closed;
+  h.feed(8000, .2);
+  assert.deepEqual(h.setupFacts(), {permissionChecks:0,leaseAcquisitions:0,contextCreations:0});
+  assert.deepEqual(h.facts(), {stopped:0,released:0,auth:0,mediaCalls:0,confirms:0,resumeCalls:0,closedContext:0});
+  assert.equal(h.audio.paused, false);
+  assert.equal(h.audio.ended, false);
+  assert.deepEqual(h.handle.exposure(), {armed:false,listenedMs:null});
+  assert.equal(h.phases.at(-1), "unavailable");
+  h.handle.close();
+  await h.handle.closed;
+});
+
 test("monitor authorizes twice, physically stops before interrupt, then releases lease", async () => {
   const h = setup(); await flush();
   assert.equal(h.facts().auth, 2);

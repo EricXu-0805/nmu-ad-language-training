@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { observeRapportSpeech, type RapportSpeechCycle } from "./rapportSpeechCycle";
 import { api } from "../api";
 import { playbackIdentity, type RapportPlaybackReceipt } from "../rapportPlayback";
-import { MicButton } from "../components/MicButton";
+import { MicButton, MicButtonSpace } from "../components/MicButton";
 import { rapportTurnKey, type RapportMsg } from "../sync/messages";
 import { Centered } from "./Centered";
 import { audioRecorderBlockCopy } from "./audioRecorderBlock";
@@ -11,8 +11,6 @@ import { speak, stopSpeaking } from "./tts";
 import { usePatientPresentation } from "./usePatientPresentation";
 import { onSpeechSettled, ttsEnabled } from "./tts";
 
-// 失败上限只会停止播放并保持关麦，绝不伪装播放完成。
-const SPEECH_SETTLE_TIMEOUT_MS = 45_000;
 // 第1周单段回答上限。自动带练要靠「说完了就往下走」:老人不按「我说好了」时,
 // 到点自动停麦保存,机器人照常接话。第2-8周的作答窗是 15 秒;第1周是聊天,给宽些。
 // 研究者随时能在控制台点「停止受试者端录音」提前收麦。
@@ -74,12 +72,16 @@ export function RapportStage({
   const utteranceId = rapportStep?.utteranceId;
   const contentIdentity =
     `${rapportStep?.sectionKey ?? ""}#${qIdx}#${beat}#${utteranceId ?? ""}`;
-  const confirmedPresentation = useRef<{ identity: string; isRobot: boolean } | null>(null);
-  if (contentReady) confirmedPresentation.current = { identity: contentIdentity, isRobot };
+  const confirmedPresentation = useRef<{ identity: string; isRobot: boolean; text: string } | null>(null);
+  if (contentReady) confirmedPresentation.current = { identity: contentIdentity, isRobot, text };
   const positionConfirmed = confirmedPresentation.current?.identity === contentIdentity;
   // A wseq refresh masks the old presentation while its replacement loads.
   // Keep the verified speaker for this content: "not loaded" never means "not a robot".
   const confirmedRobot = positionConfirmed ? confirmedPresentation.current?.isRobot : undefined;
+  // An arm/stop acknowledgement refreshes wseq without changing this sentence.
+  // Keep its verified display and stop control visible while that GET is pending.
+  // This display cache never authorizes speech; changed content/errors stay closed.
+  const displayText = positionConfirmed ? confirmedPresentation.current?.text : text;
   const speechCycle = useRef<RapportSpeechCycle>(null);
   speechCycle.current = observeRapportSpeech(speechCycle.current, {
     content: contentIdentity, recSeq: rapportStep?.recSeq,
@@ -87,6 +89,12 @@ export function RapportStage({
   });
   const speechIdentity = speechCycle.current.key;
   const speechRunCounter = useRef(0);
+  // Keep the original command before the temporary speech gate masks it as idle.
+  // Finishing speech after a refresh must not revive a historical microphone arm.
+  const initialRemote = useRef<Pick<RapportMsg, "recording" | "recSeq" | "wseq"> | null>(null);
+  if (initialRemote.current === null && rapportStep) {
+    initialRemote.current = { recording: rapportStep.recording, recSeq: rapportStep.recSeq, wseq: rapportStep.wseq };
+  }
   // Arm/stop rewrites retain this identity; an explicit idle replay receives a new one.
   const spokenIdentityRef = useRef<string | null>(null);
   // ★开麦闭环:小语这句还没播完就不放行麦克风。
@@ -118,26 +126,20 @@ export function RapportStage({
   useEffect(() => onSpeechSettled((tag, outcome) => {
     if (tag && tag === speakingTagRef.current) finishSpeechRef.current(outcome === "played" ? "played" : "failed");
   }), []);
-  useEffect(() => {
-    if (!speechGate || speechGate.outcome !== "pending") return;
-    const timer = window.setTimeout(() => {
-      finishSpeechRef.current("failed");
-      stopSpeaking();
-    }, SPEECH_SETTLE_TIMEOUT_MS);
-    return () => window.clearTimeout(timer);
-  }, [speechGate]);
+  // tts owns bounded startup/playback failure separately. A second 45s timer
+  // here would spend the speaking budget on download and cut a valid long line.
   useEffect(() => () => { speechRun.current = null; }, []);
   // 小语开口:机器人节话术变了就读;研究者节/脚本未就绪/校验失败一律不读。
   useLayoutEffect(() => {
     // 断线/暂停/这一拍本就不该出声时必须立刻收声;此外只有「内容真的换了」
     // 才打断——仅 wseq 重签造成的呈现闪断不算换内容。
-    const mustSilence = !connectionReady || isPaused
+    const mustSilence = !connectionReady || isPaused || Boolean(error)
       || (contentReady && (!isRobot || !text || !ttsContextKey));
     if (mustSilence || speechIdentity !== spokenIdentityRef.current) {
       stopSpeaking();
     }
     if (!connectionReady || isPaused) spokenIdentityRef.current = null;
-  }, [connectionReady, isPaused, contentReady, isRobot, text, ttsContextKey, speechIdentity]);
+  }, [connectionReady, isPaused, error, contentReady, isRobot, text, ttsContextKey, speechIdentity]);
   useEffect(() => {
     if (!(connectionReady && !isPaused && contentReady && isRobot && text && ttsContextKey)) return;
     if (spokenIdentityRef.current === speechIdentity) return;   // 同一句不重念
@@ -167,7 +169,9 @@ export function RapportStage({
   // recording 的 idle→armed 边沿会正常触发开麦。
   const speechInFlight = confirmedRobot !== false && (speechGate?.identity !== speechIdentity || speechGate.outcome !== "played");
   const recording = rapportStep?.recording ?? "idle";
-  const gatedRecording = speechInFlight && (recording === "armed" || recording === "recording") ? "idle" : recording;
+  const staleInitialArm = initialRemote.current !== null && recording === initialRemote.current.recording
+    && rapportStep?.recSeq === initialRemote.current.recSeq && rapportStep?.wseq === initialRemote.current.wseq;
+  const gatedRecording = (speechInFlight || staleInitialArm) && (recording === "armed" || recording === "recording") ? "idle" : recording;
   const {
     stopAndSave, discardForPatientPause, retrySave, saving, canRetry, recActive, micError, saveError,
     starting, remoteCommandBlocked, blockReason,
@@ -206,7 +210,7 @@ export function RapportStage({
     );
   }
 
-  if (error || !contentReady) {
+  if (error || !positionConfirmed) {
     // fail-closed:最小投影未就绪/校验失败，拒绝凭本地整包脚本或旧问句开场。
     return (
       <Centered className="patient-rapport">
@@ -215,7 +219,7 @@ export function RapportStage({
     );
   }
 
-  const effectiveRecording = remoteCommandBlocked ? "idle" : recording;
+  const effectiveRecording = remoteCommandBlocked || staleInitialArm ? "idle" : recording;
   const recordingRequested = effectiveRecording === "armed" || effectiveRecording === "recording";
   const showRecorder = recordingRequested || recActive || saving || saveError || micError || blockCopy !== null;
 
@@ -223,14 +227,16 @@ export function RapportStage({
     <div className="patient-stage patient-rapport" style={{ background: "#F3ECD9" }}>
       <div className="patient-stage-body rapport-body">
         <div className="rapport-brand" aria-hidden="true">语</div>
-        <p className="question" aria-live="polite" aria-atomic="true" style={{ maxWidth: "80vw" }}>{text}</p>
+        <p className="question" aria-live="polite" aria-atomic="true" style={{ maxWidth: "80vw" }}>{displayText}</p>
         {speechGate?.identity === speechIdentity && speechGate.outcome === "failed" && <p className="cue" role="status">请稍等，工作人员会检查声音并重新播放</p>}
         {rapportStep?.assentGate && (
           <p className="cue" role="status" aria-live="polite" style={{ color: "var(--c-primary)" }}>等您点头同意，我们再开始</p>
         )}
       </div>
-      {showRecorder && (
-        <div className="stage-mic" aria-busy={saving}>
+      <div className="stage-mic patient-recorder-region" aria-busy={saving}>
+        <MicButtonSpace />
+        {showRecorder && (
+        <div className="patient-recorder-content">
           {saving
             ? <p className="patient-status" role="status" aria-live="polite">正在保存，请稍候</p>
             : blockCopy
@@ -264,7 +270,8 @@ export function RapportStage({
               </>
             )}
         </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }

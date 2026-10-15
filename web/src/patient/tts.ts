@@ -58,8 +58,29 @@ const audioEl = typeof Audio !== "undefined" ? new Audio() : null;
 let queue: Line[] = [];
 let activeLine: Line | null = null;
 let busy = false;   // 取队即置位:fetch/play 在途都算忙,同帧第二句只能排队
-let gen = 0;        // 世代:打断/停止即 +1,旧世代的一切异步续体自弃
+let gen = 0;        // 每次取队/打断/停止即 +1,旧播放的一切异步续体自弃
 let curUrl: string | null = null; // 正在播的 blobURL:打断路径也要回收,不靠 onended
+// 网络/启动等待与实际播放分开计时；慢下载不能吃掉正常朗读的时间。
+// 所有截止都是失败出口，绝不是估时“读完”。
+const SPEECH_START_TIMEOUT_MS = 45_000;
+const MAX_SPEECH_PLAYBACK_MS = 180_000;
+let speechDeadline: ReturnType<typeof setTimeout> | null = null;
+let speechRequest: AbortController | null = null;
+
+function clearSpeechWait(): void {
+  if (speechDeadline !== null) clearTimeout(speechDeadline);
+  speechDeadline = null;
+  speechRequest?.abort();
+  speechRequest = null;
+}
+
+function forgetLine(item: Line): void {
+  // 已报告终态的播放不能被 voiceschanged/任意点击自动复活。
+  // 下一句可能正文相同但 tag 不同，只清理这一次取队的对象。
+  if (pending === item) pending = null;
+  queue = queue.filter((queued) => queued !== item);
+  ttsGesture(false);
+}
 
 // 「这一句的播放已经收口」——播完、失败或被打断。第1周多轮对话据此决定什么时候
 // 才放行麦克风:开麦时机不能开环估时(云合成冷启没有上界),抢话时机器人自己的
@@ -81,10 +102,11 @@ function notifySettled(tag: string, outcome: SpeechOutcome): void {
 }
 
 function interrupt(): void {
-  const wasBusy = busy;
+  const wasBusy = busy || speechDeadline !== null; // 等手势也尚未终结，停止时要通知等待方
   const interruptedTag = activeLine?.tag ?? "";
   activeLine = null;
   gen += 1;
+  clearSpeechWait();
   busy = false;
   ttsGesture(false);   // 被打断/换话的句子不再等手势
   if (audioEl && !audioEl.paused) audioEl.pause();
@@ -99,7 +121,41 @@ function driveQueue(): void {
   if (!next) return;
   busy = true;
   activeLine = next;
-  void playItem(next, gen);
+  // 同一上下文的下一句也必须换代；上一句迟到的媒体事件不能收口/回退新一句。
+  const g = ++gen;
+  clearSpeechWait();
+  armSpeechDeadline(next, g, SPEECH_START_TIMEOUT_MS);
+  void playItem(next, g);
+}
+
+function playbackBudget(text: string, durationSeconds?: number): number {
+  const contentMs = durationSeconds !== undefined && Number.isFinite(durationSeconds) && durationSeconds > 0
+    ? durationSeconds * 1000
+    : text.length * 450; // 本机语音不报告时长；只据字数留失败余量，不据此宣布播完
+  return Math.min(MAX_SPEECH_PLAYBACK_MS, Math.max(SPEECH_START_TIMEOUT_MS, contentMs + 15_000));
+}
+
+function armSpeechDeadline(item: Line, g: number, timeoutMs: number): void {
+  if (speechDeadline !== null) clearTimeout(speechDeadline);
+  speechDeadline = setTimeout(() => {
+    if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
+    gen += 1; // abort/cancel 也会派发媒体事件，先撤销这些回调的权限
+    clearSpeechWait();
+    forgetLine(item);
+    activeLine = null;
+    busy = false;
+    if (audioEl) {
+      audioEl.onended = null;
+      audioEl.onerror = null;
+      audioEl.pause();
+    }
+    if (curUrl) { URL.revokeObjectURL(curUrl); curUrl = null; }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
+    ttsGesture(false);
+    audit("error:timeout", item.tag, item.text);
+    notifySettled(item.tag, "failed");
+    driveQueue();
+  }, timeoutMs);
 }
 
 async function playItem(item: Line, g: number): Promise<void> {
@@ -107,7 +163,10 @@ async function playItem(item: Line, g: number): Promise<void> {
   // ① 神经路径
   if (audioEl && neural !== "off") {
     let url: string | null = null;
+    let audioSettled = false;
     try {
+      const request = new AbortController();
+      speechRequest = request;
       const credential = selectDeviceCredential();
       // fetchPath=按行取音(第1周回应句):文本只在服务端持久行里,请求不携带正文。
       const res = item.fetchPath
@@ -115,12 +174,14 @@ async function playItem(item: Line, g: number): Promise<void> {
           method: "POST",
           credentials: "omit",
           cache: "no-store",
+          signal: request.signal,
           headers: { ...credential.headers, ...csrfHeader("POST") },
         })
         : await fetch("/tts/speak", {
           method: "POST",
           credentials: "omit",
           cache: "no-store",
+          signal: request.signal,
           headers: {
             "Content-Type": "application/json",
             ...credential.headers,
@@ -133,6 +194,7 @@ async function playItem(item: Line, g: number): Promise<void> {
       const engineTag = res.headers.get("X-Tts-Engine") ?? "";
       if (!res.ok) {
         const errorText = await res.text();
+        if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
         if (mustDiscardSynthesizedSpeech(res.status, errorText)) {
           // The request was authorized when synthesis began but lost its exact
           // bedside authority before bytes returned.  Neither those bytes nor
@@ -168,9 +230,11 @@ async function playItem(item: Line, g: number): Promise<void> {
         audioEl.onended = () => {
           URL.revokeObjectURL(u);
           if (curUrl === u) curUrl = null;
-          if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
+          if (audioSettled || g !== gen || item.contextKey !== contextState.activeContextKey) return;
+          audioSettled = true;
+          clearSpeechWait();
           audit("end", item.tag, item.text);
-          if (pending?.text === item.text && pending.contextKey === item.contextKey) pending = null;
+          forgetLine(item);
           busy = false;
           notifySettled(item.tag, "played");
           driveQueue();
@@ -178,7 +242,11 @@ async function playItem(item: Line, g: number): Promise<void> {
         audioEl.onerror = () => {
           URL.revokeObjectURL(u);
           if (curUrl === u) curUrl = null;
-          if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
+          if (audioSettled || g !== gen || item.contextKey !== contextState.activeContextKey) return;
+          // error 事件和 play() rejection 可能同时到达，同一句只能回退一次。
+          audioSettled = true;
+          audioEl.onended = null;
+          audioEl.onerror = null;
           audit("error:audio", item.tag, item.text);
           // 浏览器无法解码/播放本地 WAV 时，本会话直接降级到系统语音。
           // 若仍保留 neural=on，voiceschanged/pointerdown 的补读会不断重取同一句，
@@ -188,6 +256,8 @@ async function playItem(item: Line, g: number): Promise<void> {
           utterItem(item, g);
         };
         await audioEl.play();
+        if (audioSettled || g !== gen || item.contextKey !== contextState.activeContextKey) return;
+        armSpeechDeadline(item, g, playbackBudget(item.text, audioEl.duration));
         audit(`start@${engineTag || "neural"}`, item.tag, item.text);
         ttsGesture(false);
         return;                                     // 播放中,后续由 onended 续驱
@@ -199,7 +269,12 @@ async function playItem(item: Line, g: number): Promise<void> {
       // !res.ok(非 204):这一句落到 ② 回退
     } catch (e) {
       if (url) { URL.revokeObjectURL(url); if (curUrl === url) curUrl = null; }
-      if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
+      if (audioSettled || g !== gen || item.contextKey !== contextState.activeContextKey) return;
+      // play() 也可能先 reject、随后才派发 error/ended；先撤销媒体回调再回退。
+      audioSettled = true;
+      audioEl.onended = null;
+      audioEl.onerror = null;
+      audioEl.pause();
       if (e instanceof DOMException && e.name === "NotAllowedError") {
         // 无用户激活:句子退回队首,触屏后按原顺序补读(问句仍在线索前面)。
         // 同时把「点一下，接着听」亮出来——否则老人对着一句没放出来的话干等,
@@ -214,7 +289,13 @@ async function playItem(item: Line, g: number): Promise<void> {
         // 被打断(pause/换 src):新句已接管,旧句静默退场,绝不回退系统语音还魂。
         // 同世代 Abort 理论不可达,防御性放掉忙位以免队列停摆。
         audit("error:aborted", item.tag, item.text);
-        if (g === gen) { busy = false; driveQueue(); }
+        if (g === gen) {
+          clearSpeechWait();
+          busy = false;
+          forgetLine(item);
+          notifySettled(item.tag, "failed");
+          driveQueue();
+        }
         return;
       }
       // 网络/后端异常:单句回退系统语音;只有连续多次失败才整场停用神经路径
@@ -269,39 +350,59 @@ export function currentVoiceName(): string | null {
 function utterItem(item: Line, g: number): void {
   if (item.contextKey !== contextState.activeContextKey) { busy = false; return; }
   if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+    clearSpeechWait();
     busy = false;
+    forgetLine(item);
     notifySettled(item.tag, "failed");   // 这台设备根本不会出声,等它没有意义
+    driveQueue();
     return;
   }
   const voice = pickLocalZhVoice();
   if (!voice) {
-    // 语音表未就绪/本机无中文语音:退回队首等 voiceschanged/触屏补读,绝不落到联网语音。
-    // 但要立刻收口:等待方(第1周多轮的开麦闸)不能为一句可能永远不会响的话
-    // 一直挂着麦克风——屏上的字已经在了,流程该往下走。
-    queue.unshift(item);
+    // 本机中文语音不可用，明确失败；终态后不能在无关点击时复活旧话术。
+    // 用户可用当前上下文的显式重播重试，不回退到联网语音。
+    clearSpeechWait();
     busy = false;
+    forgetLine(item);
     notifySettled(item.tag, "failed");
+    driveQueue();
     return;
   }
   const u = new SpeechSynthesisUtterance(item.text);
+  let settled = false;
   u.voice = voice;
   u.lang = voice.lang;
   u.rate = 0.85;   // 老人节奏:略慢(神经引擎在服务端用 length_scale 达成同一意图)
   u.volume = 1;
-  u.onstart = () => audit(`start@${voice.name}`, item.tag, item.text);
+  u.onstart = () => {
+    if (settled || g !== gen || item.contextKey !== contextState.activeContextKey) return;
+    armSpeechDeadline(item, g, playbackBudget(item.text));
+    audit(`start@${voice.name}`, item.tag, item.text);
+    ttsGesture(false);
+  };
   u.onend = () => {
-    if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
+    if (settled || g !== gen || item.contextKey !== contextState.activeContextKey) return;
+    settled = true;
+    clearSpeechWait();
     audit("end", item.tag, item.text);
-    if (pending?.text === item.text && pending.contextKey === item.contextKey) pending = null;
+    forgetLine(item);
     busy = false;
     notifySettled(item.tag, "played");
     driveQueue();
   };
   u.onerror = (e) => {
+    if (settled || g !== gen || item.contextKey !== contextState.activeContextKey) return;
+    settled = true;
     audit(`error:${e.error}`, item.tag, item.text);
-    if (g !== gen || item.contextKey !== contextState.activeContextKey) return;
-    if (e.error === "not-allowed") { queue.unshift(item); busy = false; return; } // 触屏后补读
+    if (e.error === "not-allowed") {
+      queue.unshift(item);
+      busy = false;
+      ttsGesture(true);
+      return;
+    } // 触屏后补读，和音频播放被拒一样给出明确入口
+    clearSpeechWait();
     busy = false;
+    forgetLine(item);
     notifySettled(item.tag, "failed");
     driveQueue();                                   // 其他错误:跳过这句,队列不停摆
   };
@@ -439,15 +540,20 @@ function retryPending(): void {
   driveQueue();
 }
 
-if (typeof window !== "undefined" && "speechSynthesis" in window) {
-  window.speechSynthesis.getVoices(); // 触发 Chrome 异步加载
-  window.speechSynthesis.onvoiceschanged = retryPending;
+if (typeof window !== "undefined") {
+  if ("speechSynthesis" in window) {
+    window.speechSynthesis.getVoices(); // 触发 Chrome 异步加载
+    window.speechSynthesis.onvoiceschanged = retryPending;
+  }
   // 先解锁再补读:补读的神经路径是「fetch 之后才 play()」,play() 那一刻早已不在
   // 手势里;只认「手势里放过声的元素」的浏览器会再拒一次→再退回队首→再亮覆层,
   // 老人点多少次都出不了声。把静音那一下放在同一个 pointerdown 里,元素解锁后
   // 迟到的 play() 才被放行。unlockTtsPlayback 在忙/正在出声时自己让开。
-  document.addEventListener("pointerdown", () => {
+  const retryFromGesture = () => {
     unlockTtsPlayback();
     retryPending();
-  });
+  };
+  document.addEventListener("pointerdown", retryFromGesture);
+  // 键盘/辅助功能激活按钮只发 click；同一次触摸的后续 click 由 busy 去重。
+  document.addEventListener("click", retryFromGesture);
 }

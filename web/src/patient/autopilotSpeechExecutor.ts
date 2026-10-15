@@ -126,6 +126,12 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
   }
 
   private finishClose(): void {
+    // Every terminal outcome revokes pending gesture retries, including decode
+    // failure (cancel() is then already a no-op). A later tap must never replay
+    // this sentence through the shared audio element after its owner has closed.
+    if (!this.abortController.signal.aborted) {
+      this.abortController.abort(new DOMException("语音播放已结束", "AbortError"));
+    }
     const monitor = this.bargeIn;
     this.bargeIn = null;
     if (monitor) {

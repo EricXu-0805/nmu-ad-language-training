@@ -8,15 +8,15 @@ import pytest
 from scripts.verify_caddy_release_scan import ScanError, verify, verify_build_binding
 
 
-PINS = {"golang.org/x/crypto": "v0.55.0", "golang.org/x/net": "v0.58.0",
-        "golang.org/x/text": "v0.41.0", "google.golang.org/grpc": "v1.83.2"}
+PINS = {"golang.org/x/crypto": "v0.57.0", "golang.org/x/net": "v0.60.0",
+        "golang.org/x/text": "v0.42.0", "google.golang.org/grpc": "v1.83.2"}
 BUILD_INFO = (
-    "/private/build/caddy: go1.26.8\n\tpath\tgithub.com/caddyserver/caddy/v2/cmd/caddy\n"
+    "/private/build/caddy: go1.26.9\n\tpath\tgithub.com/caddyserver/caddy/v2/cmd/caddy\n"
     "\tmod\tgithub.com/caddyserver/caddy/v2\tv2.11.4\th1:source-checksum\n"
 ) + "".join(f"\tdep\t{name}\t{version}\th1:fixture\n" for name, version in PINS.items())
 REPORT = {"Results": [{
     "Target": "caddy", "Class": "lang-pkgs", "Type": "gobinary",
-    "Packages": [{"Name": "stdlib", "Version": "v1.26.8"},
+    "Packages": [{"Name": "stdlib", "Version": "v1.26.9"},
                  {"Name": "github.com/caddyserver/certmagic", "Version": "v0.25.3"},
                  {"Name": "github.com/caddyserver/caddy/v2", "Version": "v2.11.4"}]
                 + [{"Name": name, "Version": version} for name, version in PINS.items()],
@@ -101,7 +101,7 @@ def _artifact(tmp_path):
     (root / "deploy/caddy").mkdir(parents=True)
     (root / "scripts").mkdir()
     artifact.mkdir()
-    recipe = json.dumps({"go": {"version": "1.26.8"}, "dependency_pins": PINS}).encode()
+    recipe = json.dumps({"go": {"version": "1.26.9"}, "dependency_pins": PINS}).encode()
     sources = {f"deploy/caddy/{name}": f"reviewed {name}".encode() for name in ("main.go", "go.mod", "go.sum")}
     for name, value in sources.items():
         (root / name).write_bytes(value)
@@ -117,7 +117,7 @@ def _artifact(tmp_path):
         (artifact / name).write_bytes(value)
     receipt = {
         "schema_version": "nmu.caddy-build-receipt.v1", "repository_commit": "a" * 40,
-        "repository_clean": True, "go_version": "go1.26.8",
+        "repository_clean": True, "go_version": "go1.26.9",
         "licenses_sha256": {name: hashlib.sha256(value).hexdigest() for name, value in licenses.items()},
         "controlled_sources_sha256": {name: hashlib.sha256(value).hexdigest() for name, value in sources.items()},
         **{name: hashlib.sha256(value).hexdigest() for name, value in {
@@ -146,7 +146,7 @@ def test_changed_controlled_dependency_lock_cannot_match_old_build(tmp_path):
 
 def test_old_dependency_binary_cannot_match_fixed_recipe(tmp_path):
     root, artifact, receipt = _artifact(tmp_path)
-    info = BUILD_INFO.replace("v0.55.0", "v0.52.0").encode()
+    info = BUILD_INFO.replace("v0.57.0", "v0.52.0").encode()
     (artifact / "go-build-info.txt").write_bytes(info)
     receipt["go_build_info_sha256"] = hashlib.sha256(info).hexdigest()
     (artifact / "build-receipt.json").write_text(json.dumps(receipt))

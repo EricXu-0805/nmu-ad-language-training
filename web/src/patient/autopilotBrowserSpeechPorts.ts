@@ -1,6 +1,7 @@
 import { startBargeInMonitor } from "./autopilotBrowserBargeIn.ts";
 import { fetchExactAutopilotTts } from "./autopilotMediaTransport.ts";
 import { browserAutopilotMediaDependencies } from "./autopilotBrowserMediaDependencies.ts";
+import { playAutopilotOnNextGesture } from "./autopilotGesturePlayback.ts";
 import type { AutopilotSpeechBrowserPorts } from "./autopilotSpeechExecutor.ts";
 import {
   announceGestureNeeded, silentWavObjectUrl, stopSpeaking, ttsEnabled,
@@ -44,20 +45,6 @@ export const browserAutopilotSpeechPorts: AutopilotSpeechBrowserPorts = {
   createObjectUrl: (blob) => URL.createObjectURL(blob),
   revokeObjectUrl: (url) => URL.revokeObjectURL(url),
   now: () => performance.now(),
-  playOnNextGesture: (audio, signal) => new Promise<void>((resolve, reject) => {
-    if (signal.aborted) { reject(signal.reason); return; }
-    const onGesture = () => {
-      cleanup();
-      // play() 必须在手势处理器里**同步**发起——挪到 await 之后就不算手势了。
-      resolve(audio.play());
-    };
-    const onAbort = () => { cleanup(); reject(signal.reason); };
-    const cleanup = () => {
-      document.removeEventListener("pointerdown", onGesture, true);
-      signal.removeEventListener("abort", onAbort);
-    };
-    document.addEventListener("pointerdown", onGesture, { capture: true, once: true });
-    signal.addEventListener("abort", onAbort, { once: true });
-  }),
+  playOnNextGesture: (audio, signal) => playAutopilotOnNextGesture(audio, signal, document),
   announceGestureNeeded,
 };

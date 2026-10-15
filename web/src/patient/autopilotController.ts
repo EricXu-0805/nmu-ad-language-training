@@ -1044,6 +1044,12 @@ export class PatientAutopilotController {
       if (!this.adoptReceiptRecordCommand(startedCommand, endedAck)) {
         await this.refreshCommand();
       }
+    } catch (error) {
+      // ACK/命令刷新也可能在声音仍播放时失败。必须先物理停播，再在 finally
+      // 等待关麦收口；先等 closed 会挡住外层 catch 的 cancel，浏览器若不再
+      // 发 ended，就永远不能进入安全暂停。取消不伪造任何播完/失败回执。
+      playback.cancel();
+      throw error;
     } finally {
       await playback.closed;
       if (this.activeMedia === playback) this.activeMedia = null;

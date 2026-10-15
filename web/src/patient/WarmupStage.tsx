@@ -73,11 +73,9 @@ export function WarmupStage({ sessionId, rapportStep, ttsContextKey, allowedIden
     activeTag.current = tag;
     setFailed(null);
     speak(content.text, { contextKey: ttsContextKey, tag });
-    const timer = window.setTimeout(() => {
-      if (activeTag.current !== tag) return;
-      stopSpeaking();
-    }, 45_000);
-    return () => { window.clearTimeout(timer); activeTag.current = null; stopSpeaking(); };
+    // The shared player bounds startup and playback separately. Do not count
+    // slow synthesis/download against a second fixed speaking deadline here.
+    return () => { activeTag.current = null; stopSpeaking(); };
   }, [ready, identity, content?.text, sessionId, ttsContextKey]);
   if (paused) return <Centered className="patient-rapport"><div className="target">我们先休息一下</div><p className="question">休息好了，工作人员会继续</p></Centered>;
   if (!connectionReady || error || !content) return <Centered className="patient-rapport"><p className="question">请稍等一下，马上就好。</p></Centered>;

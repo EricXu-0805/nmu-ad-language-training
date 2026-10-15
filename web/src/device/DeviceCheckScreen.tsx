@@ -42,6 +42,7 @@ export function DeviceCheckScreen() {
   const running = useRef(false);
 
   useEffect(() => {
+    deps.activate();
     const up = () => setOnline(true);
     const down = () => setOnline(false);
     window.addEventListener("online", up);
@@ -85,6 +86,8 @@ export function DeviceCheckScreen() {
         push({ id: "noise-floor", title: "环境噪声", status: "fail", detail: "麦克风不可用，未采样。" });
         push({ id: "speech-level", title: "人声拾取", status: "fail", detail: "麦克风不可用，未采样。" });
       }
+      // iPad 开麦会切换声音通路；先结束采样，再验证实际训练使用的扬声器通路。
+      deps.releaseMicrophone();
       setStage("beep");
       setBeepPlayed(deps.playBeep());
     } finally {

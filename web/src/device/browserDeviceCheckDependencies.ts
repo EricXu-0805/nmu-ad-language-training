@@ -5,6 +5,8 @@
 import type { DeviceCheckDependencies, MicrophoneInfo, NoiseSample } from "./deviceCheck.ts";
 
 export interface BrowserDeviceCheckDependencies extends DeviceCheckDependencies {
+  /** 绑定当前页面生命周期；可用于 React 开发模式的 effect 重放。 */
+  activate(): void;
   /**
    * 必须在用户手势回调里**同步**调用:Safari 只允许手势栈内 resume AudioContext,
    * 等 getUserMedia 的 await 回来激活窗口就关了。
@@ -18,6 +20,8 @@ export interface BrowserDeviceCheckDependencies extends DeviceCheckDependencies 
 export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDependencies {
   let stream: MediaStream | null = null;
   let context: AudioContext | null = null;
+  let disposed = false;
+  let microphoneGeneration = 0;
 
   // Chrome 的 getVoices() 首次调用常是空的,列表经 voiceschanged 异步到——
   // 页面打开就预热,等研究者点"开始"时缓存基本已就位。
@@ -33,12 +37,9 @@ export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDepend
       voices = null;
     }
   };
-  readVoices();
-  try {
-    window.speechSynthesis?.addEventListener("voiceschanged", readVoices);
-  } catch { /* 没有 speechSynthesis */ }
 
   const ensureContext = (): AudioContext | null => {
+    if (disposed) return null;
     if (context !== null) return context;
     const Ctor = window.AudioContext
       ?? (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -48,6 +49,13 @@ export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDepend
   };
 
   return {
+    activate() {
+      disposed = false;
+      readVoices();
+      try {
+        window.speechSynthesis?.addEventListener("voiceschanged", readVoices);
+      } catch { /* 没有 speechSynthesis */ }
+    },
     secureContext: window.isSecureContext,
     userAgent: navigator.userAgent,
     screen: {
@@ -73,8 +81,16 @@ export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDepend
     isTypeSupported: (mime) => window.MediaRecorder?.isTypeSupported?.(mime) ?? false,
 
     async acquireMicrophone(): Promise<MicrophoneInfo> {
+      if (disposed) throw new DOMException("设备检查已结束", "AbortError");
+      const generation = ++microphoneGeneration;
       stream?.getTracks().forEach((track) => track.stop());
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = null;
+      const acquired = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (disposed || generation !== microphoneGeneration) {
+        acquired.getTracks().forEach((track) => track.stop());
+        throw new DOMException("设备检查已结束", "AbortError");
+      }
+      stream = acquired;
       const track = stream.getAudioTracks()[0];
       const settings: MediaTrackSettings = track?.getSettings?.() ?? {};
       return {
@@ -126,6 +142,7 @@ export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDepend
     },
 
     releaseMicrophone() {
+      microphoneGeneration += 1;
       stream?.getTracks().forEach((track) => track.stop());
       stream = null;
     },
@@ -183,6 +200,8 @@ export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDepend
     },
 
     dispose() {
+      disposed = true;
+      microphoneGeneration += 1;
       stream?.getTracks().forEach((track) => track.stop());
       stream = null;
       try {

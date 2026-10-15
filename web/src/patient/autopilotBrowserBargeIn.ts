@@ -20,7 +20,21 @@ export interface BargeInObservation {
   phase: BargeInPhase;
 }
 type TtsCommand = Extract<NextCommandProjection, { kind: "tts" }>;
+
+/** iOS can change the speaker route/volume as soon as getUserMedia opens, even
+ * when the detector never interrupts. Keep listening and speaking sequential
+ * there; the explicit answer-now button and subsequent recording still work.
+ * Desktop-mode iPad Safari identifies itself as a touch-capable Mac.
+ * See https://bugs.webkit.org/show_bug.cgi?id=243897 and bug 326286.
+ */
+export function supportsConcurrentBargeIn(device: Pick<Navigator, "userAgent" | "platform" | "maxTouchPoints">): boolean {
+  const ios = /iPad|iPhone|iPod/i.test(device.userAgent)
+    || (/Mac/i.test(`${device.platform} ${device.userAgent}`) && device.maxTouchPoints > 1);
+  return !ios;
+}
+
 export interface BargeInPorts {
+  supportsConcurrentCapture(): boolean;
   permissionGranted(): Promise<boolean>;
   foreground(): boolean;
   authorize(sessionId: string, command: TtsCommand, signal: AbortSignal): Promise<void>;
@@ -33,6 +47,7 @@ export interface BargeInPorts {
 }
 
 export const browserBargeInPorts: BargeInPorts = {
+  supportsConcurrentCapture: () => typeof navigator !== "undefined" && supportsConcurrentBargeIn(navigator),
   permissionGranted: async () => {
     // Never introduce a new permission dialog while an elderly participant is listening.
     try { return (await navigator.permissions.query({ name: "microphone" as PermissionName })).state === "granted"; }
@@ -134,6 +149,9 @@ export function startBargeInMonitor(input: {
     try {
       if (input.command.state !== "started"
           || !["question", "cue"].includes(input.command.payload.purpose)
+          // Check before permission, lease, authorization or opening the mic:
+          // closing it after acquisition cannot undo an audible route change.
+          || !ports.supportsConcurrentCapture()
           || !valid() || !await ports.permissionGranted() || !valid()) { unavailable(); return; }
       const grantedLease = await ports.acquireLease(abort.signal);
       if (!valid()) { grantedLease.release(); close(); return; }
