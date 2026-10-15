@@ -11,30 +11,32 @@
     "source_url": "https://github.com/caddyserver/caddy/tree/e2eee6a7fce366321294c9c2a79f3146891dcbdf"
   },
   "go": {
-    "version": "1.26.8",
+    "version": "1.26.9",
     "release_metadata_url": "https://go.dev/dl/?mode=json",
     "archives": {
       "linux-amd64": {
-        "url": "https://go.dev/dl/go1.26.8.linux-amd64.tar.gz",
-        "sha256": "d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b"
+        "url": "https://go.dev/dl/go1.26.9.linux-amd64.tar.gz",
+        "sha256": "42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d"
       },
       "darwin-arm64": {
-        "url": "https://go.dev/dl/go1.26.8.darwin-arm64.tar.gz",
-        "sha256": "a012b25b571bd0138a03dcd25375ceba866fe5ca822f426d2c66a4de56fd3f4b"
+        "url": "https://go.dev/dl/go1.26.9.darwin-arm64.tar.gz",
+        "sha256": "f9bb7c0a02506c5d9bf0d1eb1f7ee6c7684f844ae49558308a0427b830e022cc"
       }
     }
   },
   "target": {"goos": "linux", "goarch": "amd64", "cgo_enabled": "0"},
   "build_module": {"path": "deploy/caddy", "module": "nmu.local/caddy-release"},
   "dependency_pins": {
-    "golang.org/x/crypto": "v0.55.0",
-    "golang.org/x/net": "v0.58.0",
-    "golang.org/x/text": "v0.41.0",
+    "golang.org/x/crypto": "v0.57.0",
+    "golang.org/x/net": "v0.60.0",
+    "golang.org/x/text": "v0.42.0",
     "google.golang.org/grpc": "v1.83.2"
   },
   "security_fix": {
-    "id": "CVE-2026-56862",
-    "advisory": "https://pkg.go.dev/vuln/GO-2026-6090",
-    "minimum_fixed_go_1_26": "1.26.6"
+    "id": "CVE-2026-78669",
+    "advisory": "https://pkg.go.dev/vuln/GO-2026-6611",
+    "minimum_fixed_go_1_26": "1.26.9",
+    "minimum_fixed_x_net": "v0.60.0",
+    "related_advisories": ["https://pkg.go.dev/vuln/GO-2026-6609", "https://pkg.go.dev/vuln/GO-2026-6607"]
   }
 }

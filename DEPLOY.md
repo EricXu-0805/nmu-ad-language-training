@@ -104,7 +104,7 @@ vi .env
 
 `.env` 至少改这几项：
 - `APP_IMAGE=`：只接受已审查镜像的完整 `registry/name@sha256:<64 位小写 hex>`。只写 `latest` 或版本 tag 会在 Uvicorn 监听前 fail-closed。
-- `CADDY_IMAGE=`：内置反代另需已构建、扫描和批准的不可变镜像。原 Caddy 2.11.4 官方镜像所含 Go 已确认受影响，已移除默认值；当前只提供 `deploy/caddy-build.json` 的固定 Go 重建合同，**没有宣称新容器已发布**。空值、浮动引用或已知受影响 digest 会被启动合同拒绝；代理自身还在监听 TLS 前核对实际 Caddy 2.11.4 / Go 1.26.8。使用宿主 Caddy 覆盖文件时无需此镜像，宿主二进制及其扫描证据另验。
+- `CADDY_IMAGE=`：内置反代另需已构建、扫描和批准的不可变镜像。原 Caddy 2.11.4 官方镜像所含 Go 已确认受影响，已移除默认值；当前只提供 `deploy/caddy-build.json` 的固定 Go 重建合同，**没有宣称新容器已发布**。空值、浮动引用或已知受影响 digest 会被启动合同拒绝；代理自身还在监听 TLS 前核对实际 Caddy 2.11.4 / Go 1.26.9。使用宿主 Caddy 覆盖文件时无需此镜像，宿主二进制及其扫描证据另验。
 - `APPDATA_VOLUME=`：已由具名运维员创建并验收的应用数据卷精确名。升级时它指向“从已验证快照恢复的候选卷”，不是原 live 卷。
 - `CADDY_DATA_VOLUME=` + `CADDY_CONFIG_VOLUME=`：已预建的 Caddy 状态卷精确名；特别是使用内部 CA 时不得丢失原 `caddydata`。
 - `APP_ENV_FILE=.env`：应用容器要读取的权限 `0600` 配置文件。候选卷预演时用独立 `.env.candidate`，不覆盖当前运行容器的环境。

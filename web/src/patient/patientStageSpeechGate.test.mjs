@@ -71,6 +71,34 @@ test('new feedback cannot release a still-playing question or cue early', () => 
   assert.equal(h.spoken.length, 2); h.settle(h.spoken[1]); h.render(); assert.equal(h.options().recording, 'idle');
   h.settle(h.spoken[0]); h.render(); assert.equal(h.options().recording, 'armed');
 });
+test('the first connected snapshot does not replay historical feedback', () => {
+  const h = harness(); h.props.connectionReady = false;
+  h.props.cursor.fbSeq = 7; h.props.cursor.fbKey = 'correct'; h.presentation.feedback_text = '历史反馈。';
+  h.render(); assert.equal(h.spoken.length, 0);
+  h.props.connectionReady = true; h.render();
+  assert.deepEqual(h.spoken.map(line => line.text), ['请看这张图片，这是什么？']);
+  h.settle(h.spoken[0]); h.render(); h.props.cursor.wseq++; h.render();
+  assert.equal(h.spoken.length, 1);
+});
+test('the first feedback after a connected baseline without feedback plays and holds capture until its receipt', () => {
+  const h = harness(); h.props.cursor.fbSeq = undefined; ready(h);
+  h.props.cursor.fbSeq = 1; h.props.cursor.fbKey = 'correct'; h.presentation.feedback_text = '第一次新反馈。'; h.render();
+  assert.deepEqual(h.spoken.map(line => line.text), ['请看这张图片，这是什么？', '第一次新反馈。']);
+  assert.equal(h.options().recording, 'idle'); assert.equal(h.options().stopRequested, true);
+  h.settle(h.spoken[1]); h.render(); assert.equal(h.options().recording, 'armed');
+});
+test('duplicate feedback projections do not replay, but the next sequence plays the same text again', () => {
+  const h = harness(); h.props.cursor.fbSeq = undefined; ready(h);
+  h.props.cursor.fbSeq = 1; h.props.cursor.fbKey = 'correct'; h.presentation.feedback_text = '很好。'; h.render();
+  h.settle(h.spoken[1]); h.render();
+  h.props.cursor = { ...h.props.cursor, wseq: h.props.cursor.wseq + 1 };
+  h.presentation = { ...h.presentation }; h.render();
+  assert.equal(h.spoken.length, 2); assert.equal(h.options().recording, 'armed');
+  h.props.cursor.fbSeq = 2; h.render();
+  assert.deepEqual(h.spoken.slice(1).map(line => line.text), ['很好。', '很好。']);
+  assert.notEqual(h.spoken[1].tag, h.spoken[2].tag); assert.equal(h.options().recording, 'idle');
+  h.settle(h.spoken[2]); h.render(); assert.equal(h.options().recording, 'armed');
+});
 test('failure stays closed and replays the full authorized question plus cue with fresh tags', () => {
   const h = harness(); h.props.cursor.cueLevel = 1; h.presentation.cue_text = '用来装水。'; arm(h); const old = [...h.spoken];
   h.settle(old[0], 'failed'); h.settle(old[1]); h.render(); assert.equal(h.options().recording, 'idle');

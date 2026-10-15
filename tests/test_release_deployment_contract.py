@@ -19,9 +19,9 @@ from scripts import check_database_head, check_release_contract
 ROOT = Path(__file__).resolve().parents[1]
 VALID_IMAGE = "registry.invalid/nmu/app@sha256:" + "a" * 64
 EDGE_DEPENDENCIES = {
-    "golang.org/x/crypto": "v0.55.0",
-    "golang.org/x/net": "v0.58.0",
-    "golang.org/x/text": "v0.41.0",
+    "golang.org/x/crypto": "v0.57.0",
+    "golang.org/x/net": "v0.60.0",
+    "golang.org/x/text": "v0.42.0",
     "google.golang.org/grpc": "v1.83.2",
 }
 EDGE_DEPENDENCY_LINES = "".join(
@@ -155,12 +155,13 @@ def _run_edge_stub(tmp_path, build_info, version="v2.11.4"):
 
 
 @pytest.mark.parametrize("go_lines,version,accepted", (
-    ("go\tgo1.26.8\n", "v2.11.4", True),
+    ("go\tgo1.26.9\n", "v2.11.4", True),
+    ("go\tgo1.26.8\n", "v2.11.4", False),
     ("go\tgo1.26.3\n", "v2.11.4", False),
-    ("go\tgo1.26.8\ngo\tgo1.26.3\n", "v2.11.4", False),
-    ("go\tgo1.26.8\n", "v2.11.3", False),
+    ("go\tgo1.26.9\ngo\tgo1.26.3\n", "v2.11.4", False),
+    ("go\tgo1.26.9\n", "v2.11.3", False),
     ("mod\tprivate-provider\n", "v2.11.4", False),
-    ("go\tgo1.26.8 extra\n", "v2.11.4", False),
+    ("go\tgo1.26.9 extra\n", "v2.11.4", False),
 ))
 def test_edge_process_never_runs_listener_before_actual_build_check(tmp_path, go_lines, version, accepted):
     result, marker = _run_edge_stub(tmp_path, go_lines + EDGE_DEPENDENCY_LINES, version)
@@ -185,7 +186,7 @@ def test_edge_process_rejects_unapproved_actual_dependency_before_listener(tmp_p
         "replacement": line + "\t=>\tprivate.invalid/unapproved\tv1.0.0\th1:AAAA=\n",
         "no_checksum": "\t".join(line.strip().split("\t")[:3]) + "\n",
     }[mutation]
-    build_info = "go\tgo1.26.8\n" + EDGE_DEPENDENCY_LINES.replace(line, replacement)
+    build_info = "go\tgo1.26.9\n" + EDGE_DEPENDENCY_LINES.replace(line, replacement)
     result, marker = _run_edge_stub(tmp_path, build_info)
     assert result.returncode == 78
     assert not marker.exists()
