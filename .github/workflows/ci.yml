@@ -160,35 +160,6 @@ jobs:
           exit-code: "1"
           severity: HIGH,CRITICAL
           ignore-unfixed: false
-      - name: 失败时显示网关漏洞摘要
-        if: failure()
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          report = Path(os.environ["RUNNER_TEMP"]) / "nmu-edge-scan.json"
-          if report.is_file():
-              for result in json.loads(report.read_text()).get("Results", []):
-                  for finding in result.get("Vulnerabilities") or []:
-                      print(json.dumps({key: finding.get(key) for key in (
-                          "VulnerabilityID", "PkgName", "InstalledVersion",
-                          "FixedVersion", "Severity")}, ensure_ascii=True))
-          else:
-              print("No gateway scan report was produced.")
-          PY
-      - name: 失败时保留网关扫描诊断
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
-        with:
-          name: nmu-edge-scan-diagnostics
-          path: |
-            ${{ runner.temp }}/nmu-edge-scan.json
-            ${{ runner.temp }}/nmu-edge-release/go-build-info.txt
-            ${{ runner.temp }}/nmu-edge-release/build-receipt.json
-            ${{ runner.temp }}/nmu-edge-release/caddy-build.json
-          if-no-files-found: ignore
-          retention-days: 7
       - name: 确认扫描确实识别了网关和实际 Go 版本
         run: >-
           python scripts/verify_caddy_release_scan.py "$RUNNER_TEMP/nmu-edge-scan.json"
