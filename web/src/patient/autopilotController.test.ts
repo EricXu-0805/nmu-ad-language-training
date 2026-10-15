@@ -2663,7 +2663,7 @@ test("record_stopped 已接受后 legacy 刷新撞 runtime_inactive：安静暂�
   assert.equal(state.pause_reason, "runtime_released");
 });
 
-test("tts started 刷新(中段)撞 runtime_inactive：播放由 closed 自然收口，暂停原因保持 runtime_released", async () => {
+test("tts started 刷新(中段)撞 runtime_inactive：先停止播放再收口，暂停原因保持 runtime_released", async () => {
   const events: string[] = [];
   const acks: AutopilotAck[] = [];
   const controller = new PatientAutopilotController({
@@ -2679,12 +2679,10 @@ test("tts started 刷新(中段)撞 runtime_inactive：播放由 closed 自然�
 
   const state = await controller.pollOnce();
 
-  // started 权威未确认→抛「TTS started revision 未确认」;runSpeech 的 finally
-  // 先 `await playback.closed`(真实音频自然收口的边界)并把 activeMedia 置空,
-  // 所以外层 catch 不会、也不需要再 cancel。关键在:pause_reason 不得被外层
-  // catch 改写成 technical_failure,终态 ACK 一条不发。
+  // started 权威未确认→先取消再等 closed，不能等着仍在播放的音频自行结束。
+  // pause_reason 不得被外层 catch 改写成 technical_failure，终态 ACK 一条不发。
   assert.deepEqual(acks.map((ack) => ack.ack_type), ["tts_started"]);
-  assert.equal(events.includes("speech:cancel"), false);
+  assert.equal(events.filter((event) => event === "speech:cancel").length, 1);
   assert.equal(state.phase, "paused");
   assert.equal(state.pause_reason, "runtime_released");
 });

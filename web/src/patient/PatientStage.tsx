@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { MicButton } from "../components/MicButton";
+import { MicButton, MicButtonSpace } from "../components/MicButton";
 import { ImagePane, type Spotlight } from "../components/ImagePane";
 import { turnKey } from "../lib/ids";
 import type { CursorMsg } from "../sync/messages";
 import { Centered } from "./Centered";
-import { advanceFeedbackPlayback, initialFeedbackPlaybackState } from "./feedbackState";
 import type { TaskPresentationExpectation } from "./presentationContent";
-import { speak, stopSpeaking } from "./tts";
+import { onSpeechSettled, speak, stopSpeaking, ttsEnabled } from "./tts";
+import { TaskSpeechGate } from "./taskSpeechGate";
 import { usePatientPresentation } from "./usePatientPresentation";
 import { useVoxRecorder } from "./useVoxRecorder";
 import { audioRecorderBlockCopy } from "./audioRecorderBlock";
@@ -24,6 +24,7 @@ export function PatientStage({
   cursor,
   sessionId,
   ttsContextKey,
+  ttsOn = ttsEnabled(),
   connectionReady = true,
   sessionPaused = false,
   sessionTerminal = false,
@@ -33,6 +34,7 @@ export function PatientStage({
   cursor?: CursorMsg;
   sessionId: string;
   ttsContextKey: TtsPlaybackContextKey | null;
+  ttsOn?: boolean;
   connectionReady?: boolean;
   sessionPaused?: boolean;
   sessionTerminal?: boolean;
@@ -63,7 +65,7 @@ export function PatientStage({
           // item/turn/cue/feedback 字段逐项精确匹配兜底,旧转位响应照样被拒。
         }
       : null;
-  const { presentation } = usePatientPresentation(presentationExpected);
+  const { presentation, error: presentationError } = usePatientPresentation(presentationExpected);
   const taskPresentation = presentation?.mode === "task" ? presentation : null;
   const contentReady = taskPresentation !== null;
   const assetRequired = cursor?.screen === "present" || cursor?.screen === "record";
@@ -79,16 +81,49 @@ export function PatientStage({
   );
   const mediaReady = contentReady && assetReady;
   const isPaused = sessionPaused || cursor?.screen === "paused";
-  const suspended = !connectionReady || isPaused || sessionTerminal || !mediaReady;
+  const speechAllowed = !presentationError && assetReady && connectionReady && !isPaused && !sessionTerminal
+    && cursor?.screen !== "thanks" && cursor?.screen !== "done" && !!ttsContextKey && !!tk;
+  const question = role.includes("作用") ? "它是做什么用的呢？" : role === "关系识别" ? "它们之间有什么关系呢？" : "请看这张图片，这是什么？";
+  const cueText = taskPresentation?.cue_text ?? null;
+  const fbLine = taskPresentation?.feedback_text ?? null;
+  const speechScope = JSON.stringify([sessionId, plan?.item_bank_version_id, tk, ttsContextKey]);
+  // Keep only the already verified picture/question shell across same-position cue refreshes.
+  // This does not preserve old cue text, or grant playback/recording before the exact projection arrives.
+  const displayedScope = useRef<string | null>(null);
+  const positionConfirmed = contentReady || displayedScope.current === speechScope;
+  useLayoutEffect(() => {
+    if (contentReady && !presentationError) displayedScope.current = speechScope;
+  }, [contentReady, presentationError, speechScope]);
+  const compactImage = !!cueText || (!contentReady && (cursor?.cueLevel ?? 0) > 0);
+  const speechKey = JSON.stringify([speechScope, cursor?.cueLevel, cursor?.fbKey, cursor?.fbSeq]);
+  const [speechGate] = useState(() => new TaskSpeechGate());
+  const [speechRevision, setSpeechRevision] = useState(0);
+  const [replayEpoch, setReplayEpoch] = useState(0);
+  const replayAuthorization = useRef<string | null>(null);
+  replayAuthorization.current = speechAllowed && mediaReady ? speechKey : null;
+  const lastReplayEpoch = useRef(0);
+  const speechStatus = speechGate.status(speechKey, ttsOn);
+  const speechWaiting = !speechAllowed || !mediaReady || (speechStatus !== "played" && speechStatus !== "muted");
+  // A pending prompt temporarily masks the arm; it must not permanently revoke recSeq.
+  const initialRemote = useRef<{ recording: CursorMsg["recording"]; recSeq: CursorMsg["recSeq"]; commandSeq: CursorMsg["wseq"] } | null>(null);
+  // The first real snapshot may arrive after mount; it is still historical authority.
+  if (cursor && initialRemote.current === null) {
+    initialRemote.current = { recording: cursor.recording, recSeq: cursor.recSeq, commandSeq: cursor.wseq };
+  }
+  const staleInitialArm = initialRemote.current !== null
+    && cursor?.recording === initialRemote.current.recording
+    && cursor?.recSeq === initialRemote.current.recSeq && cursor?.wseq === initialRemote.current.commandSeq;
+  const gatedRecording = (speechWaiting || staleInitialArm)
+    && (cursor?.recording === "armed" || cursor?.recording === "recording") ? "idle" : cursor?.recording;
 
   const {
     stopAndSave, discardForPatientPause, startNow, retrySave, saving, canRetry, recActive, micError,
     saveError, starting, remoteCommandBlocked, blockReason,
   } = useVoxRecorder({
-    sessionId, recording: cursor?.recording, recSeq: cursor?.recSeq, commandSeq: cursor?.wseq,
-    turnKey: tk, connectionReady, suspended: sessionPaused || !mediaReady,
-    selfStartAllowed: mediaReady && cursor?.selfStart === true && !isPaused && !sessionTerminal && cursor?.screen !== "thanks" && cursor?.screen !== "done",
-    stopRequested: sessionTerminal || isPaused || !mediaReady || cursor?.screen === "thanks" || cursor?.screen === "done",
+    sessionId, recording: gatedRecording, recSeq: cursor?.recSeq, commandSeq: cursor?.wseq,
+    turnKey: tk, connectionReady, suspended: isPaused || !assetReady,
+    selfStartAllowed: !speechWaiting && cursor?.selfStart === true && !isPaused && !sessionTerminal && cursor?.screen !== "thanks" && cursor?.screen !== "done",
+    stopRequested: sessionTerminal || isPaused || speechWaiting || cursor?.screen === "thanks" || cursor?.screen === "done",
   });
   useLayoutEffect(() => {
     registerImmediateDiscard?.(discardForPatientPause);
@@ -97,59 +132,32 @@ export function PatientStage({
   const blockCopy = blockReason ? audioRecorderBlockCopy(blockReason) : null;
 
   const spotlight: Spotlight = role.startsWith("左") ? "left" : role.startsWith("右") ? "right" : role === "关系识别" ? "both" : "none";
-  const question = role.includes("作用") ? "它是做什么用的呢？" : role === "关系识别" ? "它们之间有什么关系呢？" : "请看这张图片，这是什么？";
-  // 线索/反馈不再从浏览器整包题库查找；只接受服务端当前游标的最小投影。
-  const cueText = taskPresentation?.cue_text ?? null;
-  const fbLine = taskPresentation?.feedback_text ?? null;
-  const feedbackPlayback = useRef(initialFeedbackPlaybackState());
-
-  // 换题时图片门禁会在同一 render 立即失效；paint 前停止上一题语音，
-  // 绝不让旧题朗读跨进新图的加载窗口。
+  useLayoutEffect(() => onSpeechSettled((tag, outcome) => {
+    if (speechGate.settle(tag, outcome)) setSpeechRevision(n => n + 1);
+  }), [speechGate]);
   useLayoutEffect(() => {
-    if (!assetReady) stopSpeaking();
-  }, [assetReady, assetRequestKey]);
-
-  // 小语开口:换环节读问句;线索到达/升级读线索(读的都是屏上原文)。
-  // 线索用 enqueue:恢复/跳题时问句与线索同帧到达,排队读而不是让线索的 cancel 掐掉问句。
-  // ★依赖只挂 tk/question/cueText + 恢复纪元,绝不挂 cursor.screen 全值——示意录音/收音回写
-  // 都会翻转 screen,挂上它每次都把问句整句重读一遍,还会读进已示意的热麦克风(复审确证)。
-  const [resumeEpoch, setResumeEpoch] = useState(0);
-  const prevSuspended = useRef(false);
+    const replay = replayEpoch !== lastReplayEpoch.current;
+    lastReplayEpoch.current = replayEpoch;
+    const stopOld = speechGate.update(speechAllowed ? {
+      scope: speechScope, key: speechKey, enabled: ttsOn, ready: mediaReady,
+      question, cue: cueText, cueLevel: cursor?.cueLevel ?? 0,
+      feedback: fbLine, feedbackSeq: cursor?.fbSeq,
+    } : null, replay);
+    // Revoke the receipt set before stopSpeaking emits an interruption callback.
+    if (stopOld) stopSpeaking();
+    setSpeechRevision(n => n + 1);
+  }, [speechGate, speechAllowed, speechScope, speechKey, ttsOn, mediaReady, question, cueText, fbLine, cursor?.cueLevel, cursor?.fbSeq, replayEpoch]);
   useEffect(() => {
-    if (prevSuspended.current && !suspended) setResumeEpoch((n) => n + 1); // 暂停/断线解除:补读当前句
-    prevSuspended.current = suspended;
-  }, [suspended]);
-  useEffect(() => {
-    if (!suspended && cursor?.screen !== "thanks" && tk && ttsContextKey) {
-      speak(question, { contextKey: ttsContextKey, tag: tk });
+    // stopAndSave closes tracks asynchronously; saving must also finish before audio starts.
+    if (!speechAllowed || !mediaReady || !ttsOn || !ttsContextKey || recActive || starting || saving) return;
+    for (const line of speechGate.takePending()) {
+      speak(line.text, { contextKey: ttsContextKey, tag: line.tag, enqueue: true });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tk, question, resumeEpoch, contentReady, ttsContextKey]);
-  // 自动驾驶反馈:独立一拍(位置还停在当前题、图片未换),fbSeq 变化才读。
-  // 首次连接成功时的游标是历史基线,不重读；基线之后到达的第一个新 fbSeq 必须朗读。
-  useEffect(() => {
-    if (!contentReady) return;
-    const transition = advanceFeedbackPlayback(feedbackPlayback.current, connectionReady, cursor?.fbSeq);
-    feedbackPlayback.current = transition.state;
-    if (transition.shouldSpeak && !suspended && cursor?.screen !== "thanks"
-        && fbLine && ttsContextKey) {
-      speak(fbLine, {
-        contextKey: ttsContextKey,
-        tag: `fb:${item?.item_ref ?? ""}:${cursor?.fbSeq ?? ""}`,
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionReady, cursor?.fbSeq, suspended, contentReady, ttsContextKey]);
-  useEffect(() => {
-    if (!suspended && cursor?.screen !== "thanks" && cueText && ttsContextKey) {
-      speak(cueText, { contextKey: ttsContextKey, tag: tk, enqueue: true });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cueText, tk, resumeEpoch, ttsContextKey]);
-  // 收尾过渡屏:屏上是"今天辛苦了",小语不能同时还在念题(屏幕与语音互相矛盾的跳变)
-  useEffect(() => {
-    if (cursor?.screen === "thanks") stopSpeaking();
-  }, [cursor?.screen]);
+  }, [speechGate, speechAllowed, mediaReady, ttsOn, ttsContextKey, recActive, starting, saving, speechRevision]);
+  useLayoutEffect(() => () => {
+    speechGate.clear();
+    stopSpeaking();
+  }, [speechGate]);
 
   if (sessionTerminal) {
     return <Centered><div className="target">今天辛苦了</div><p className="question">今天的练习已经结束</p></Centered>;
@@ -171,20 +179,20 @@ export function PatientStage({
   if (!item || !planTurn) {
     return <Centered><p className="question">请稍候…</p></Centered>;
   }
-  if (!contentReady) {
+  if (presentationError || !positionConfirmed) {
     return <Centered><p className="question">请稍等一下，马上就好。</p></Centered>;
   }
 
   return (
     <div className="patient-stage">
       <div className="patient-stage-body">
-        <div className="stage-image" data-compact={cueText ? "true" : "false"}>
+        <div className="stage-image" data-compact={compactImage ? "true" : "false"}>
           <ImagePane
             sessionId={sessionId}
             requestKey={assetRequestKey}
             required={assetRequired}
             spotlight={spotlight}
-            compact={!!cueText}
+            compact={compactImage}
             alt="题目图片"
             onReadinessChange={onAssetReadinessChange}
           />
@@ -195,9 +203,24 @@ export function PatientStage({
           {cueText && <p className="cue" style={{ maxWidth: "84vw", margin: 0 }}>{cueText}</p>}
         </div>
       </div>
-      <div className="stage-mic" aria-busy={saving}>
+      <div className="stage-mic patient-recorder-region" aria-busy={saving}>
+        <MicButtonSpace />
         {saving
           ? <p className="patient-status" role="status" aria-live="polite">正在保存，请稍候</p>
+          : speechWaiting && !recActive && !starting && !saveError
+            ? (
+              <div className="col" style={{ alignItems: "center", gap: "var(--sp-3)" }} role="status" aria-live="polite">
+                <p className="patient-status">{speechStatus === "failed" ? "声音没播完，请重新听一遍" : "请先听小语说完，再回答"}</p>
+                {speechStatus === "failed" && speechAllowed && mediaReady && (
+                  <button type="button" className="patient-primary-action patient-primary-action--secondary"
+                    onClick={() => {
+                      if (replayAuthorization.current === speechKey && speechGate.status(speechKey, ttsOn) === "failed") {
+                        setReplayEpoch(n => n + 1);
+                      }
+                    }}>重新听一遍</button>
+                )}
+              </div>
+            )
           : blockCopy
             ? (
               <div className="col" style={{ alignItems: "center", gap: "var(--sp-3)" }} role="alert">
@@ -211,8 +234,8 @@ export function PatientStage({
           : (
             <>
               {!saveError && (
-                <MicButton state={!mediaReady || remoteCommandBlocked ? "idle" : (cursor?.recording ?? "idle")} localActive={recActive}
-                  selfStart={mediaReady && !remoteCommandBlocked && cursor?.selfStart === true} micError={micError} starting={mediaReady && starting}
+                <MicButton state={remoteCommandBlocked ? "idle" : (gatedRecording ?? "idle")} localActive={recActive}
+                  selfStart={!speechWaiting && !remoteCommandBlocked && cursor?.selfStart === true} micError={micError} starting={mediaReady && starting}
                   onStart={() => void startNow()} onStop={stopAndSave} />
               )}
               {saveError && (

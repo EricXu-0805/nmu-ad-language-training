@@ -958,7 +958,33 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   background: var(--c-bg);
   z-index: 1;
 }
-.rapport-body { justify-content: center; }
+/* 自动带练的状态/按钮/说明始终占相同的三行。静态 span 只负责排版，
+   真实按钮仅在可操作阶段出现；换相位不再推拉正文或改变其滚动位置。 */
+.patient-control-row {
+  display: grid;
+  width: 100%;
+  justify-items: center;
+  align-items: center;
+}
+.patient-control-row > * { grid-area: 1 / 1; margin: 0; }
+.patient-control-status-row > * { width: min(84vw, 920px); }
+.patient-control-action-row > *,
+.patient-control-hint-row > * { width: min(76vw, 420px); }
+.patient-control-row > .patient-layout-reserve {
+  visibility: hidden;
+  pointer-events: none;
+  user-select: none;
+  white-space: break-spaces;
+  overflow-wrap: anywhere;
+}
+.patient-recorder-region,
+.patient-stage .patient-recorder-region { display: grid; width: 100%; justify-items: center; align-items: end; }
+.patient-recorder-region > * { grid-area: 1 / 1; }
+.patient-recorder-space { width: 100%; display: flex; justify-content: center; visibility: hidden; pointer-events: none; }
+/* Auto margins center short conversations without pushing long first lines above scrollTop=0. */
+.rapport-body { justify-content: flex-start; }
+.rapport-body > :first-child { margin-top: auto; }
+.rapport-body > :last-child { margin-bottom: auto; }
 .rapport-brand,
 .tap-overlay-mark {
   display: inline-flex;

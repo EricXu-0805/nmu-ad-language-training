@@ -715,7 +715,13 @@ export function useVoxRecorder(opts: {
   const invalidateStart = useCallback(() => {
     startGeneration.current += 1;
     activePermit.current = null;
-    recRef.current.cancelPendingStart();
+    const recorder = recRef.current;
+    recorder.cancelPendingStart();
+    // MediaRecorder.start() can already own a live stream before its onstart
+    // event makes active true. Close that uncommitted capture synchronously
+    // before clearing starting, which now also releases the prompt audio gate.
+    // Real answers and their pending stop/save chain retain their sole owner.
+    if (!recorder.active && !recorder.stopping) recorder.discardActive();
     if (startTimeout.current != null) {
       clearTimeout(startTimeout.current);
       startTimeout.current = null;

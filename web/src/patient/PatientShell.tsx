@@ -55,7 +55,6 @@ import {
   setTtsContext,
   setTtsEnabled,
   PLAYBACK_NEEDS_GESTURE_EVENT,
-  speakSample,
   stopSpeaking,
   ttsEnabled,
   unlockTtsPlayback,
@@ -592,7 +591,7 @@ export function PatientShell({ allowPageReload = false }: { allowPageReload?: bo
   } else {
     body = autopilot.mode === "legacy"
       ? <PatientStage key={session.sessionId} plan={plan} cursor={cursor} sessionId={session.sessionId}
-          ttsContextKey={ttsContextKey}
+          ttsContextKey={ttsContextKey} ttsOn={ttsOn}
           connectionReady={connectionReady} sessionPaused={effectivePaused} sessionTerminal={terminal}
           registerImmediateDiscard={registerImmediateDiscard} />
       : <PatientAutopilotStage
@@ -661,13 +660,13 @@ export function PatientShell({ allowPageReload = false }: { allowPageReload?: bo
       }
     }} />
     {patientActivated && playbackNeedsTap && (
-      // 自动带练的话术在等手势:document 上的 pointerdown 监听(捕获阶段)先在这一下
-      // 里把它放出来,这里只顺手解锁。覆层由执行器的 announceGestureNeeded(false) 收走。
+      // 捕获阶段的 pointerdown/click 监听会重放已经准备好的真实话术。
+      // 此处不能再换成静音解锁：键盘只有 click，或起播仍在等待时会覆盖原音频。
+      // 覆层由播放链的 announceGestureNeeded(false) 收走。
       <TapToStart tapped={false} label="点一下，接着听" sub="小语的话还没放出来"
-        onTap={() => { unlockAutopilotPlayback(); unlockTtsPlayback(); }} />
+        onTap={() => {}} />
     )}
-    <TtsToggle on={ttsOn} onChange={setTtsOn} sampleContextKey={rapportStep?.warmup ? null : ttsContextKey}
-      mode={autopilot.mode} />
+    <TtsToggle on={ttsOn} onChange={setTtsOn} mode={autopilot.mode} />
     <PinPrompt />
   </>;
 }
@@ -709,11 +708,10 @@ function TapToStart({ tapped, onTap, label = "点一下，开始", sub = "开始
 }
 
 // 语音开关(设备本地设置,研究者代点):角落小钮,不进老人的视觉主线。
-// 点开即试读当前屏显文本——既给浏览器用户激活,也当场听到用的是哪个音色。
-function TtsToggle({ on, onChange, sampleContextKey, mode }: {
+// 播放由各舞台的录音/话术闸门安排，开关本身不能在热麦旁直接插播试听。
+function TtsToggle({ on, onChange, mode }: {
   on: boolean;
   onChange(on: boolean): void;
-  sampleContextKey: TtsPlaybackContextKey | null;
   mode: PatientAutopilotView["mode"];
 }) {
   return (
@@ -728,9 +726,6 @@ function TtsToggle({ on, onChange, sampleContextKey, mode }: {
         const next = !on;
         setTtsEnabled(next);
         onChange(next);
-        // P0a owns its own receipt-bearing player. A legacy sample here would
-        // overlap the server command and create an unacknowledged second voice.
-        if (next && sampleContextKey) speakSample(sampleContextKey);
       }}
     >
       <span className="tts-toggle-label" aria-hidden="true">朗读</span>

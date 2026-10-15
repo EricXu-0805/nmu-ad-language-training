@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { DeviceCredentialSelection } from "../api.ts";
-import type { BargeInExposure } from "./autopilotBrowserBargeIn.ts";
+import { browserBargeInPorts, startBargeInMonitor, type BargeInExposure } from "./autopilotBrowserBargeIn.ts";
 import { AutopilotMediaError } from "./autopilotMediaError.ts";
 import { PatientAutopilotController } from "./autopilotController.ts";
 import { fetchAutopilotVoiceSettings } from "./autopilotMediaTransport.ts";
 import { AutopilotPageLifecycle } from "./autopilotPageLifecycle.ts";
+import { playAutopilotOnNextGesture } from "./autopilotGesturePlayback.ts";
 import type {
   AutopilotAck,
   AutopilotOptionalAckFact,
@@ -89,7 +90,11 @@ function observe<T>(promise: Promise<T>): { settled: boolean; value?: T; error?:
   return result;
 }
 
-function harness(options: { playResult?: Promise<void>; fetch?: Promise<Blob | null> } = {}) {
+function harness(options: {
+  playResult?: Promise<void>;
+  fetch?: Promise<Blob | null>;
+  startBargeIn?: AutopilotSpeechBrowserPorts["startBargeIn"];
+} = {}) {
   const audio = new AudioDouble();
   if (options.playResult) audio.playResult = options.playResult;
   let now = 100;
@@ -114,6 +119,7 @@ function harness(options: { playResult?: Promise<void>; fetch?: Promise<Blob | n
     },
     revokeObjectUrl: (url) => { revoked.push(url); },
     now: () => now,
+    startBargeIn: options.startBargeIn,
   };
   const executor = new BrowserAutopilotSpeechExecutor("S-SPEECH", ports);
   return {
@@ -237,6 +243,46 @@ test("production playback settles only on playing then ended, and ended is exact
   assert.equal(run.stopped(), 1);
 });
 
+for (const failureAt of ["started_ack", "started_refresh"] as const) {
+  test(`起播后 ${failureAt} 失败先停声音再等待收口，不等浏览器补发 ended`, async () => {
+    const run = harness();
+    const acks: string[] = [];
+    let reads = 0;
+    const controller = new PatientAutopilotController({
+      sessionId: "S-SPEECH-TRANSPORT-FAILURE",
+      speech: { start: () => run.start() },
+      recording: { start: () => { throw new Error("失败后不得开麦"); } },
+      transport: {
+        next: async () => {
+          reads += 1;
+          if (reads > 1) throw new Error("started revision rejected");
+          return question();
+        },
+        ack: async (_sessionId, _commandKey, ack) => {
+          acks.push(ack.ack_type);
+          if (failureAt === "started_ack") throw new Error("started ACK rejected");
+          return { accepted: true };
+        },
+      },
+      idempotencyKey: (_command, type, seq) => `speech-failure:${type}:${seq}:0001`,
+    });
+    const outcome = observe(controller.pollOnce());
+    try {
+      await flush();
+      run.audio.playing();
+      for (let turn = 0; turn < 5; turn += 1) await flush();
+      assert.equal(run.audio.paused, true);
+      assert.equal(run.audio.pauseCalls, 1);
+      assert.equal(outcome.settled, true, "transport failure must not wait forever for native ended");
+      assert.equal(outcome.value?.phase, "paused");
+      assert.deepEqual(acks, ["tts_started"]);
+      assert.deepEqual(run.revoked, ["blob:test-1"]);
+    } finally {
+      await controller.stopAndWait();
+    }
+  });
+}
+
 test("现在回答先物理停播,只给 interrupted 事实;自然结束先赢时不能再打断", async () => {
   const run = harness();
   const playback = run.start();
@@ -261,6 +307,40 @@ test("现在回答先物理停播,只给 interrupted 事实;自然结束先赢�
   natural.audio.ended();
   assert.equal(completed.answerNow?.(), false);
   assert.equal((await completed.ended).interrupted, undefined);
+});
+
+test("iPad compatibility leaves natural playback pending and manual answer-now available", async () => {
+  for (const manual of [false, true]) {
+    let monitorClosed: Promise<void> | undefined;
+    const run = harness({ startBargeIn: (input) => {
+      const blocked = () => { throw new Error("incompatible device must not open capture"); };
+      const monitor = startBargeInMonitor(input, {
+        ...browserBargeInPorts,
+        supportsConcurrentCapture: () => false,
+        permissionGranted: blocked, authorize: blocked, acquireLease: blocked,
+        getUserMedia: blocked, createContext: blocked, foreground: () => true,
+      });
+      monitorClosed = monitor.closed;
+      return monitor;
+    }});
+    const playback = run.start();
+    await flush();
+    run.audio.playing();
+    await playback.started;
+    playback.armBargeIn?.({ ...question(), state: "started", command_revision: 1 });
+    assert.ok(monitorClosed);
+    await monitorClosed;
+    const ended = observe(playback.ended);
+    await flush();
+    assert.equal(ended.settled, false, "disabling detection must not finish the question");
+    assert.equal(run.audio.paused, false);
+    assert.equal(run.audio.pauseCalls, 0);
+    if (manual) assert.equal(playback.answerNow?.(), true);
+    else run.audio.ended();
+    await playback.closed;
+    assert.equal((await playback.ended).interrupted, manual ? true : undefined);
+    assert.equal(playback.answerNow?.(), false);
+  }
 });
 
 test("ended before playing is ignored and cannot fabricate successful playback", async () => {
@@ -373,7 +453,8 @@ function gestureHarness(playResults: Promise<void>[]) {
   const audio = new GestureAudioDouble();
   audio.playResults = playResults;
   const announced: boolean[] = [];
-  let waiting: { fire(): void } | null = null;
+  const gestureHost = new EventTarget();
+  let waiting = false;
   const revoked: string[] = [];
   const ports: AutopilotSpeechBrowserPorts = {
     enabled: () => true,
@@ -383,18 +464,20 @@ function gestureHarness(playResults: Promise<void>[]) {
     createObjectUrl: () => "blob:test-1",
     revokeObjectUrl: (url) => { revoked.push(url); },
     now: () => 100,
-    playOnNextGesture: (element, signal) => new Promise<void>((resolve, reject) => {
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-      waiting = { fire: () => resolve(element.play()) };
-    }),
+    playOnNextGesture: (element, signal) => {
+      waiting = true;
+      const retried = playAutopilotOnNextGesture(element, signal, gestureHost);
+      void retried.then(() => { waiting = false; }, () => { waiting = false; });
+      return retried;
+    },
     announceGestureNeeded: (needed) => { announced.push(needed); },
   };
   const executor = new BrowserAutopilotSpeechExecutor("S-SPEECH", ports);
   return {
     audio, announced, revoked,
     start: () => executor.start(question()),
-    tap: () => { waiting?.fire(); waiting = null; },
-    waiting: () => waiting !== null,
+    tap: (type: "pointerdown" | "click" = "pointerdown") => { gestureHost.dispatchEvent(new Event(type)); },
+    waiting: () => waiting,
   };
 }
 
@@ -419,6 +502,92 @@ test("NotAllowedError 不算设备故障:亮出「点一下」,在那一下里�
   run.audio.ended();
   await playback.ended;
   await playback.closed;
+});
+
+for (const firstGesture of ["click", "pointerdown"] as const) {
+  test(`手势重试支持 ${firstGesture}，保留真实音源和回调且不被后续 click 重放两遍`, async () => {
+    const run = gestureHarness([Promise.reject(notAllowed())]);
+    const playback = run.start();
+    observe(playback.started);
+    observe(playback.ended);
+    try {
+      await flush();
+      const src = run.audio.src;
+      const handlers = [run.audio.onplaying, run.audio.onended, run.audio.onerror];
+      run.tap(firstGesture);
+      assert.equal(run.audio.playCalls, 2, "keyboard/assistive click must retry synchronously");
+      run.tap("click");
+      run.tap("pointerdown");
+      assert.equal(run.audio.playCalls, 2, "pointerdown and its subsequent click represent one retry");
+      assert.equal(run.audio.src, src);
+      assert.deepEqual([run.audio.onplaying, run.audio.onended, run.audio.onerror], handlers);
+      await flush();
+      assert.deepEqual(run.announced, [true, false]);
+      run.audio.playing();
+      run.audio.ended();
+      await playback.ended;
+    } finally {
+      playback.cancel();
+      await playback.closed;
+    }
+  });
+}
+
+for (const lateResult of ["resolve", "reject"] as const) {
+  test(`点击后原生 play 挂起仍可取消；迟到 ${lateResult} 不再变更手势提示`, async () => {
+    const nativePlay = deferred<void>();
+    const run = gestureHarness([Promise.reject(notAllowed()), nativePlay.promise]);
+    const playback = run.start();
+    const started = observe(playback.started);
+    const ended = observe(playback.ended);
+    await flush();
+    run.tap();
+    assert.equal(run.audio.playCalls, 2, "retry must begin synchronously inside the gesture");
+    await flush();
+    assert.deepEqual(run.announced, [true]);
+    playback.cancel();
+    await playback.closed;
+    await flush();
+    try {
+      assert.deepEqual(run.announced, [true, false], "cancel must clear the gesture overlay without waiting for play");
+      assert.equal(started.settled, true);
+      assert.equal(ended.settled, true);
+      assert.equal(run.audio.paused, true);
+      run.tap();
+      run.tap("click");
+      assert.equal(run.audio.playCalls, 2, "cancelled retry must not react to another tap");
+    } finally {
+      if (lateResult === "resolve") nativePlay.resolve();
+      else nativePlay.reject(new Error("late native rejection"));
+      await flush();
+    }
+    assert.deepEqual(run.announced, [true, false]);
+  });
+}
+
+test("等待点屏时解码失败必须撤销手势重放，后续触碰不能复活失败话术", async () => {
+  const run = gestureHarness([Promise.reject(notAllowed())]);
+  const playback = run.start();
+  const started = observe(playback.started);
+  const ended = observe(playback.ended);
+  await flush();
+  assert.deepEqual(run.announced, [true]);
+  run.audio.error();
+  await playback.closed;
+  await flush();
+  try {
+    assert.deepEqual(run.announced, [true, false]);
+    assert.equal(started.settled, true);
+    assert.equal(ended.settled, true);
+    assert.equal((started.error as AutopilotMediaError).failureStage, "media_decode_error");
+    run.tap();
+    run.tap("click");
+    assert.equal(run.audio.playCalls, 1);
+    assert.equal(run.audio.paused, true);
+  } finally {
+    run.tap();
+    await flush();
+  }
 });
 
 test("点屏后仍被拒才是 play_rejected", async () => {

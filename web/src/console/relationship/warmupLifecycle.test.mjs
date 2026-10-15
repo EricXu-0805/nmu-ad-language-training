@@ -109,6 +109,13 @@ test('production warmup stage displays restored content silently and consumes ex
   h.setResult({ presentation: { mode: 'rapport', speaker: '机器人', text: '今天天气怎么样？', warmup: next }, error: null }); h.render();
   assert.equal(h.spoken.length, 1); h.render(); assert.equal(h.spoken.length, 1);
 });
+test('warmup does not impose a second fixed cutoff over the shared player startup and speaking budgets', () => {
+  const h = stageHarness(); h.render();
+  assert.equal(h.spoken.length, 1);
+  assert.equal(h.timers.size, 0, 'slow synthesis must not cause a parent timer to cut a healthy playing line');
+  h.settle('failed');
+  assert.match(JSON.stringify(h.render()), /请稍等，工作人员会继续/);
+});
 for (const boundary of ['pause', 'disconnect', 'local-stop', 'pagehide', 'unmount']) test(`production warmup speech stops at ${boundary}`, () => {
   const h = stageHarness(); h.render(); assert.equal(h.spoken.length, 1); const prior = h.stopped;
   if (boundary === 'pause') { h.props.sessionPaused = true; h.render(); }

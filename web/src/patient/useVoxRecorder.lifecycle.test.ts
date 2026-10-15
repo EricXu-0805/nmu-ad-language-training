@@ -14,14 +14,14 @@ function deferred<T>() {
 
 // Execute the complete production hook, Recorder and persistence validators.
 // React scheduling, browser devices, storage and HTTP are controlled ports.
-function harness() {
+function harness(options: { manualStart?: boolean } = {}) {
   const slots: Array<{ value?: unknown; deps?: unknown[]; cleanup?: () => void }> = [];
   let cursor = 0, scheduled = false, mounted = true;
   let effects: Array<() => void> = [];
-  type View = { startNow(): Promise<void>; stopAndSave(): Promise<void>; retrySave(): Promise<void> };
+  type View = { startNow(): Promise<void>; stopAndSave(): Promise<void>; retrySave(): Promise<void>; starting: boolean; recActive: boolean };
   let output: View, hook: (input: object) => View;
   const input = { sessionId: "SIM-LIFECYCLE", turnKey: "itm-0001#1", recording: "idle",
-    recSeq: 1, commandSeq: 1, selfStartAllowed: true, connectionReady: true, containsDirectIdentifier: true };
+    recSeq: 1, commandSeq: 1, selfStartAllowed: true, connectionReady: true, containsDirectIdentifier: true, stopRequested: false };
   const sameDeps = (a?: unknown[], b?: unknown[]) => !!a && !!b
     && a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
   const schedule = () => {
@@ -61,11 +61,17 @@ function harness() {
   const stream = { getTracks: () => [{ stop: () => { trackStops += 1; } }] };
   const blobs = new Map<string, Blob>(), entries = new Map<string, unknown>();
   const staged: Array<Record<string, unknown>> = [], saved: Array<Record<string, unknown>> = [];
+  const startEvents: Array<() => void> = [];
   class MediaDouble {
     static isTypeSupported() { return true; }
     state = "inactive"; mimeType = "audio/webm";
     onstart?: () => void; ondataavailable?: (event: { data: Blob }) => void; onstop?: () => void;
-    start() { mediaStarts += 1; this.state = "recording"; queueMicrotask(() => this.onstart?.()); }
+    start() {
+      mediaStarts += 1; this.state = "recording";
+      const onstart = this.onstart;
+      if (options.manualStart) startEvents.push(() => onstart?.());
+      else queueMicrotask(() => this.onstart?.());
+    }
     stop() {
       mediaStops += 1; this.state = "inactive";
       queueMicrotask(() => { this.ondataavailable?.({ data: new Blob(["synthetic-before-hide"], { type: this.mimeType }) }); this.onstop?.(); });
@@ -126,6 +132,7 @@ function harness() {
   return {
     get view() { return output; }, counters: () => ({ microphoneRequests, mediaStarts, mediaStops, trackStops }),
     entries, blobs, staged, saved, stream,
+    deliverStart: (index: number) => startEvents[index]?.(),
     setAuthorization: (value: () => Promise<unknown>) => { auth = value; },
     setStream: (value: () => Promise<unknown>) => { acquireStream = value; },
     holdUpload: (value: Promise<void>) => { uploadBarrier = value; },
@@ -187,6 +194,49 @@ test("浏览器已隐藏但事件尚未送达，准备好的权限流也不得�
   const pendingStream = deferred<unknown>(); h.setStream(() => pendingStream.promise);
   const starting = h.view.startNow(); await h.flush(); h.setHiddenWithoutEvent(); pendingStream.resolve(h.stream); await starting; await h.flush();
   try { assert.equal(h.counters().mediaStarts, 0); assert(h.counters().trackStops > 0); assert.equal(h.staged.length, 0); } finally { await h.close(); }
+});
+
+test("新提示在原生开录回执前撤销启动，先关真实音轨再解除 starting，迟到回执不能复活旧流", async () => {
+  const h = harness({ manualStart: true }); await h.flush();
+  try {
+    const starting = h.view.startNow(); await h.flush();
+    assert.equal(h.counters().mediaStarts, 1);
+    assert.equal(h.view.starting, true); assert.equal(h.view.recActive, false);
+
+    h.update({ stopRequested: true, selfStartAllowed: false });
+    assert.equal(h.counters().mediaStops, 1, "撤销启动的同一调用栈必须停止原生采集");
+    assert.equal(h.counters().trackStops, 1, "不能仅清 starting 就放行新提示音");
+    await starting; await h.flush();
+    assert.equal(h.view.starting, false); assert.equal(h.staged.length, 0);
+
+    h.update({ stopRequested: false, selfStartAllowed: true }); await h.flush();
+    const fresh = h.view.startNow(); await h.flush();
+    assert.equal(h.counters().mediaStarts, 2);
+    h.deliverStart(0); await h.flush();
+    assert.equal(h.view.starting, true); assert.equal(h.view.recActive, false);
+    assert.equal(h.counters().mediaStops, 1, "旧 onstart 不得收掉新许可的流");
+    h.deliverStart(1); await fresh; await h.flush();
+    assert.equal(h.view.recActive, true);
+    await h.view.stopAndSave(); await h.flush();
+    assert.equal(h.saved.length, 1, "只保存新许可实际完成的作答");
+  } finally { await h.close(); }
+});
+
+test("新提示撤销已开录的回答仍走唯一保存链，后续撤销不丢弃正在保存的内容", async () => {
+  const h = harness(); await h.flush();
+  const upload = deferred<void>(); h.holdUpload(upload.promise);
+  try {
+    await h.view.startNow(); await h.flush();
+    h.update({ stopRequested: true, selfStartAllowed: false }); await h.flush();
+    assert.equal(h.counters().mediaStops, 1); assert.equal(h.staged.length, 1);
+    assert.equal(h.saved.length, 0);
+    const rawAudioId = h.staged[0].rawAudioId;
+    h.update({ turnKey: "itm-0002#1" }); await h.flush();
+    assert.equal(h.staged.length, 1); assert.equal(h.entries.size, 1);
+    upload.resolve(); await h.flush();
+    assert.equal(h.saved.length, 1); assert.equal(h.saved[0].rawAudioId, rawAudioId);
+    assert.equal(h.saved[0].turnKey, "itm-0001#1");
+  } finally { upload.resolve(); await h.close(); }
 });
 
 test("后台收到远程 arm，回前台不能自动执行它；新的明确 arm 才能开录", async () => {

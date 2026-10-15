@@ -138,12 +138,19 @@ export function PatientAutopilotStage({
     && bargeIn.commandKey === command.command_key
     && runtime?.phase === "tts_playing";
   const persisting = localPhase?.phase === "persisting";
+  const awaitingAnswerProcessing = runtime?.phase === "waiting_server_after_record";
+  const awaitingAfterSpeech = runtime?.phase === "waiting_server_after_tts";
+  const purpose = command.kind === "tts"
+    ? command.payload.purpose : command.payload.presentation_purpose;
+  const answerPrompt = purpose === "question" || purpose === "cue";
   const imageReady = autopilot.assetReadiness?.requestKey === stimulusKey
     && autopilot.assetReadiness.readiness === "ready";
   const status = !activated
     ? "点一下屏幕后开始"
     : !imageReady
       ? "正在准备题目图片"
+    : awaitingAnswerProcessing
+      ? "正在理解刚才的回答，请稍候"
     : persisting
       ? "录好了，正在保存"
     : listening
@@ -152,14 +159,14 @@ export function PatientAutopilotStage({
       ? "朗读已停止，看到「正在听您说」后从头回答"
     : answerNowKey === command.command_key
       ? "朗读已停止，正在准备麦克风"
+    : awaitingAfterSpeech
+      ? answerPrompt ? "正在准备麦克风" : "请稍候，马上继续"
     : runtime?.phase === "tts_playing"
       ? "正在为您朗读"
       : command.kind === "record" ? "正在准备麦克风" : "正在准备朗读";
   // 提问/线索在播、以及播完到真实开麦之间那一小段，老人常常已经开口，那句话录不
   // 进去(2026-09-17 养老院实测)。屏上给一句平静的提示；真实 onstart 一到，
   // listening 接管，换成"正在听您说"。反馈/报答案句不是在等回答，不提示。
-  const purpose = command.kind === "tts"
-    ? command.payload.purpose : command.payload.presentation_purpose;
   const listenFirstCue = activated && imageReady && !listening && !persisting
     && (purpose === "question" || purpose === "cue")
     && (command.kind === "record"
@@ -170,6 +177,10 @@ export function PatientAutopilotStage({
   // V2:线索级(prompt_level>0)话术比首问长得多——题图收紧一档(与 legacy
   // PatientStage 的 cueText 规则同义),长文本与贴底收音区互不遮挡。
   const compactImage = (displayRef.current?.promptLevel ?? command.prompt_level) > 0;
+  const canAnswerNow = activated && imageReady && command.kind === "tts"
+    && command.state === "started" && answerNowKey !== command.command_key
+    && !voiceInterrupted && runtime?.phase === "tts_playing"
+    && (purpose === "question" || purpose === "cue");
   return (
     <div className="patient-stage">
       <div className="patient-stage-body">
@@ -189,34 +200,36 @@ export function PatientAutopilotStage({
           {listenFirstCue && (
             <p className="patient-optional-hint" data-cue="listen-first" style={{ margin: 0 }}>
               {voiceInterrupted ? "刚才的开头还没有录下，请稍候再完整说一次"
-                : voiceMonitoring ? "想回答时可以开口，或点「现在回答」" : "请听完再回答"}
+                : voiceMonitoring ? "想回答时可以开口，或点「现在回答」"
+                : awaitingAfterSpeech || command.kind === "record"
+                  ? "看到「正在听您说」后再回答" : "请听完再回答"}
             </p>
           )}
         </div>
       </div>
-      <div className="stage-mic" aria-live="polite">
-        <p className="patient-status" role="status">{status}</p>
-        {activated && imageReady && command.kind === "tts" && command.state === "started"
-          && answerNowKey !== command.command_key && !voiceInterrupted
-          && runtime?.phase === "tts_playing"
-          && (purpose === "question" || purpose === "cue") && (
-          <>
+      <div className="stage-mic patient-autopilot-controls" aria-live="polite">
+        {/* 每个阶段都保留状态、按钮和说明三行的空间。占位只有不可见的排版空格，
+            不包含按钮、不进读屏或焦点序列；按最长现有文案预留，窄屏换行也一致。 */}
+        <div className="patient-control-row patient-control-status-row">
+          <span className="patient-status patient-layout-reserve" aria-hidden="true">
+            {"\u3000".repeat(24)}
+          </span>
+          <p className="patient-status" role="status">{status}</p>
+        </div>
+        <div className="patient-control-row patient-control-action-row">
+          <span className="patient-primary-action patient-layout-reserve" aria-hidden="true">
+            {"\u3000".repeat(9)}
+          </span>
+          {canAnswerNow && (
             <button type="button" className="patient-primary-action patient-primary-action--secondary"
               onClick={() => {
                 if (autopilot.answerNow?.()) setAnswerNowKey(command.command_key);
               }} aria-describedby="autopilot-answer-now-hint">
               现在回答
             </button>
-            <p className="patient-optional-hint" id="autopilot-answer-now-hint">
-              点这里停止朗读，看到「正在听您说」后回答
-            </p>
-          </>
-        )}
-        {listening && (
-          <>
-            {/* 服务器托管的自动流程里这个按钮只是提前结束，不是完成链路的必要条件：
-                不点，到作答窗口尽头也会自动收麦并继续。文案必须把这点说清楚，
-                否则老人会以为不点就卡住。人工/legacy 平面的麦克风按钮不受影响。 */}
+          )}
+          {/* 不点也会在作答窗口尽头自动收麦；这个按钮仅供提前结束。 */}
+          {listening && (
             <button
               type="button"
               className="patient-primary-action patient-primary-action--secondary"
@@ -225,11 +238,23 @@ export function PatientAutopilotStage({
             >
               说完了可以点这里
             </button>
+          )}
+        </div>
+        <div className="patient-control-row patient-control-hint-row">
+          <span className="patient-optional-hint patient-layout-reserve" aria-hidden="true">
+            {"\u3000".repeat(24)}
+          </span>
+          {canAnswerNow && (
+            <p className="patient-optional-hint" id="autopilot-answer-now-hint">
+              点这里停止朗读，看到「正在听您说」后回答
+            </p>
+          )}
+          {listening && (
             <p className="patient-optional-hint" id="autopilot-stop-optional">
               不点也可以，我们会自动继续
             </p>
-          </>
-        )}
+          )}
+        </div>
       </div>
     </div>
   );
