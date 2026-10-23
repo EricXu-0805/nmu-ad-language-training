@@ -8,15 +8,15 @@ import pytest
 from scripts.verify_caddy_release_scan import ScanError, verify, verify_build_binding
 
 
-PINS = {"golang.org/x/crypto": "v0.57.0", "golang.org/x/net": "v0.60.0",
+PINS = {"github.com/klauspost/compress": "v1.18.7", "golang.org/x/crypto": "v0.57.0", "golang.org/x/net": "v0.60.0",
         "golang.org/x/text": "v0.42.0", "google.golang.org/grpc": "v1.83.2"}
 BUILD_INFO = (
-    "/private/build/caddy: go1.26.9\n\tpath\tgithub.com/caddyserver/caddy/v2/cmd/caddy\n"
+    "/private/build/caddy: go1.26.10\n\tpath\tgithub.com/caddyserver/caddy/v2/cmd/caddy\n"
     "\tmod\tgithub.com/caddyserver/caddy/v2\tv2.11.4\th1:source-checksum\n"
 ) + "".join(f"\tdep\t{name}\t{version}\th1:fixture\n" for name, version in PINS.items())
 REPORT = {"Results": [{
     "Target": "caddy", "Class": "lang-pkgs", "Type": "gobinary",
-    "Packages": [{"Name": "stdlib", "Version": "v1.26.9"},
+    "Packages": [{"Name": "stdlib", "Version": "v1.26.10"},
                  {"Name": "github.com/caddyserver/certmagic", "Version": "v0.25.3"},
                  {"Name": "github.com/caddyserver/caddy/v2", "Version": "v2.11.4"}]
                 + [{"Name": name, "Version": version} for name, version in PINS.items()],
@@ -24,11 +24,11 @@ REPORT = {"Results": [{
 
 
 def test_accepts_actual_binary_and_dependency_inventory():
-    assert verify(REPORT, BUILD_INFO) == 7
+    assert verify(REPORT, BUILD_INFO) == 8
 
 
 def test_caddy_as_versioned_wrapper_dependency_is_scanned():
-    assert verify(REPORT, BUILD_INFO.replace("\tmod\t", "\tdep\t")) == 7
+    assert verify(REPORT, BUILD_INFO.replace("\tmod\t", "\tdep\t")) == 8
 
 
 def test_an_unscanned_compiled_dependency_is_not_a_clean_report():
@@ -101,7 +101,7 @@ def _artifact(tmp_path):
     (root / "deploy/caddy").mkdir(parents=True)
     (root / "scripts").mkdir()
     artifact.mkdir()
-    recipe = json.dumps({"go": {"version": "1.26.9"}, "dependency_pins": PINS}).encode()
+    recipe = json.dumps({"go": {"version": "1.26.10"}, "dependency_pins": PINS}).encode()
     sources = {f"deploy/caddy/{name}": f"reviewed {name}".encode() for name in ("main.go", "go.mod", "go.sum")}
     for name, value in sources.items():
         (root / name).write_bytes(value)
@@ -117,7 +117,7 @@ def _artifact(tmp_path):
         (artifact / name).write_bytes(value)
     receipt = {
         "schema_version": "nmu.caddy-build-receipt.v1", "repository_commit": "a" * 40,
-        "repository_clean": True, "go_version": "go1.26.9",
+        "repository_clean": True, "go_version": "go1.26.10",
         "licenses_sha256": {name: hashlib.sha256(value).hexdigest() for name, value in licenses.items()},
         "controlled_sources_sha256": {name: hashlib.sha256(value).hexdigest() for name, value in sources.items()},
         **{name: hashlib.sha256(value).hexdigest() for name, value in {

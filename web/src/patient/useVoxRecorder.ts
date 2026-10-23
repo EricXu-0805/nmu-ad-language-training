@@ -108,7 +108,7 @@ export function useVoxRecorder(opts: {
   const armedMeta = useRef<ArmedMeta | null>(null);
   // 上传失败时保留同一份 blob/id 重试，不能先报 audioSaved 再让操作端自动推进。
   const pendingSave = useRef<PendingSave | null>(null);
-  // 恢复扫描完成前一律不许开新麦；否则旧 outbox 尚未接管，新回答就会覆盖现场注意力。
+  // 恢复扫描完成前不许开新麦；有效旧场次副本独立保留，当前场次待保存录音继续阻断。
   const outboxReady = useRef(false);
   const outboxRecovery = useRef<Promise<void> | null>(null);
   // Web Locks is the only cross-tab ownership primitive. A JS-only fallback
@@ -372,8 +372,8 @@ export function useVoxRecorder(opts: {
       return outcome;
     };
 
-    const probeTerminalMetadataAfterConflict = async (): Promise<AudioSavedFinalizationOutcome> => {
-      // Exactly one metadata outcome call per 409. There is no recursion or
+    const probeTerminalMetadataAfterRefusal = async (): Promise<AudioSavedFinalizationOutcome> => {
+      // Exactly one metadata outcome call per eligible refusal. There is no recursion or
       // status-poll loop; any non-2xx other than exact 410 preserves the bytes.
       const checksum = await sha256Blob(pending.blob as Blob);
       return finalize(checksum);
@@ -402,7 +402,7 @@ export function useVoxRecorder(opts: {
         });
       } catch (error) {
         if (error instanceof ApiError && error.status === 409) {
-          return probeTerminalMetadataAfterConflict();
+          return probeTerminalMetadataAfterRefusal();
         }
         throw error;
       }
@@ -420,8 +420,10 @@ export function useVoxRecorder(opts: {
         receipt = await api.uploadAudioBlob(
           pending.rawAudioId, pending.blob, pending.meta.sessionId);
       } catch (error) {
-        if (error instanceof ApiError && error.status === 409) {
-          return probeTerminalMetadataAfterConflict();
+        // The upload route conceals assets bound to an older session with 404.
+        // Only the exact metadata disposition may authorize local disposal.
+        if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
+          return probeTerminalMetadataAfterRefusal();
         }
         // Authentication, network, 422, 429 and 5xx all preserve this exact
         // registered outbox. They are never reinterpreted as deletion consent.
@@ -506,7 +508,9 @@ export function useVoxRecorder(opts: {
               return;
             }
             const pending = pendingFromOutbox(entry, blob);
-            pendingSave.current = pending;
+            // The active retry slot belongs only to this session. A refused
+            // older session remains durable in IndexedDB, never in this slot.
+            if (!isForeign) pendingSave.current = pending;
             if (mountedRef.current && recoveryMayMutateActiveUi(
               recoveryUiFence, sessionUiFence.current, lockedSessionId)) {
               setCanRetry(!isForeign);
@@ -536,14 +540,15 @@ export function useVoxRecorder(opts: {
                 }
               }
             } catch {
-              // Unknown/network/auth/integrity failures keep both stores intact.
-              // A foreign item has no retry button in the current session: the
-              // copy tells the researcher to re-pair/switch to its origin.
+              // Refusal never authorizes deletion. A structurally verified
+              // foreign copy can stay in IndexedDB without blocking a distinct
+              // session; only its own session may retry it through the UI.
+              if (isForeign) continue;
               if (mountedRef.current && recoveryMayMutateActiveUi(
                 recoveryUiFence, sessionUiFence.current, lockedSessionId)) {
-                setCanRetry(!isForeign);
-                setSaveError(!isForeign);
-                setBlockReason(isForeign ? "pending-other-session" : null);
+                setCanRetry(true);
+                setSaveError(true);
+                setBlockReason(null);
               }
               return;
             }
@@ -567,7 +572,19 @@ export function useVoxRecorder(opts: {
               removeRecoveryDeviceCapabilityIfMatches(credential);
             }
           }
-          if (after.entries.length > 0) {
+          // A failed transport may have advanced the durable phase. Verify the
+          // retained bytes again before allowing an unrelated capture.
+          for (const entry of after.entries) {
+            const blob = await blobStore.get(entry.rawAudioId);
+            if (!blob || blob.size !== entry.blobBytes
+                || (blob.type || "audio/webm") !== entry.mimeType
+                || (entry.phase === "uploaded" && await sha256Blob(blob) !== entry.checksum)) {
+              if (mountedRef.current && recoveryMayMutateActiveUi(
+                recoveryUiFence, sessionUiFence.current, lockedSessionId)) setBlockReason("storage-invalid");
+              return;
+            }
+          }
+          if (after.entries.some((entry) => entry.sessionId === lockedSessionId)) {
             if (mountedRef.current && recoveryMayMutateActiveUi(
               recoveryUiFence, sessionUiFence.current, lockedSessionId)) setBlockReason("pending-other-session");
             return;

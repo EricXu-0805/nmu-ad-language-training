@@ -30,7 +30,7 @@ function terminal410(saved: Record<string, unknown>): ApiError {
 
 function deps(
   log: string[],
-  behaviour: { upload?: "ok" | "409" | "401"; saved?: "ok" | "410" | "409" | "2xx-no-receipt"; savedGate?: Promise<void> },
+  behaviour: { upload?: "ok" | "409" | "401" | "404"; saved?: "ok" | "410" | "409" | "2xx-no-receipt"; savedGate?: Promise<void> },
 ): ForeignOutboxDrainDeps {
   return {
     readBlob: async () => blob,
@@ -39,6 +39,7 @@ function deps(
       log.push("upload");
       if (behaviour.upload === "409") throw conflict();
       if (behaviour.upload === "401") throw new ApiError(401, "device_pair_required");
+      if (behaviour.upload === "404") throw new ApiError(404, "音频不存在");
       // 真服务器回执带的是它算出的校验值;这里照本机字节算,验证器才会认。
       return { raw_audio_id: "raw-old-000001", bytes: bytes.length, checksum: await sha256Blob(uploaded) };
     },
@@ -62,6 +63,75 @@ test("a foreign entry refused on upload still probes audioSaved and is discarded
   const results = await drainForeignOutboxEntries([entry()], "S-NEW", deps(log, { upload: "409", saved: "410" }));
   assert.deepEqual(results.map((r) => r.outcome), ["terminal-discarded"]);
   assert.deepEqual(log, ["upload", "audioSaved", "discard", "reportDisposal"]);
+});
+
+test("a concealed foreign upload 404 reaches the exact server-governed 410 before local disposal", async () => {
+  const log: string[] = [];
+  const results = await drainForeignOutboxEntries(
+    [entry()], "S-NEW", deps(log, { upload: "404", saved: "410" }));
+  assert.deepEqual(results.map((r) => r.outcome), ["terminal-discarded"]);
+  assert.deepEqual(log, ["upload", "audioSaved", "discard", "reportDisposal"]);
+});
+
+test("a concealed upload 404 may complete only after a valid server capture receipt", async () => {
+  const log: string[] = [];
+  const results = await drainForeignOutboxEntries(
+    [entry()], "S-NEW", deps(log, { upload: "404" }));
+  assert.deepEqual(results.map((r) => r.outcome), ["server-saved"]);
+  assert.deepEqual(log, ["upload", "audioSaved", "completeOutbox"]);
+});
+
+test("404 is only a metadata probe: refused, malformed or unreceipted outcomes preserve the local recording", async () => {
+  const responses = [
+    ...[401, 403, 404, 409, 422, 429, 500].map((status) => ({
+      name: `http-${status}`,
+      saved: async (_saved: object) => { throw new ApiError(status, "synthetic refusal"); },
+    })),
+    {
+      name: "network-error",
+      saved: async (_saved: object) => { throw new TypeError("synthetic offline"); },
+    },
+    {
+      name: "mismatched-410",
+      saved: async (saved: object) => { throw terminal410({ ...saved, rawAudioId: "another-recording" }); },
+    },
+    {
+      name: "unstructured-410",
+      saved: async (_saved: object) => { throw new ApiError(410, "gone"); },
+    },
+    { name: "2xx-without-receipt", saved: async (_saved: object) => ({ seq: 1 }) },
+  ];
+  for (const response of responses) {
+    const log: string[] = [];
+    const d = deps(log, { upload: "404" });
+    d.putAudioSaved = async (saved) => { log.push("audioSaved"); return response.saved(saved); };
+    const results = await drainForeignOutboxEntries([entry()], "S-NEW", d);
+    assert.equal(results[0].outcome, "kept", response.name);
+    assert.deepEqual(log, ["upload", "audioSaved"], response.name);
+  }
+});
+
+test("the upload recovery probe does not expand to auth, validation, rate limit, server or network errors", async () => {
+  for (const error of [
+    ...[401, 403, 422, 429, 500, 503].map((status) => new ApiError(status, "synthetic refusal")),
+    new TypeError("synthetic offline"),
+  ]) {
+    const log: string[] = [];
+    const d = deps(log, {});
+    d.uploadAudioBlob = async () => { log.push("upload"); throw error; };
+    const results = await drainForeignOutboxEntries([entry()], "S-NEW", d);
+    assert.deepEqual(results.map((r) => [r.outcome, r.reason]), [["kept", "upload-failed"]]);
+    assert.deepEqual(log, ["upload"]);
+  }
+});
+
+test("a registration 404 still preserves captured bytes without a metadata probe", async () => {
+  const log: string[] = [];
+  const d = deps(log, {});
+  d.createAudio = async () => { log.push("createAudio"); throw new ApiError(404, "not found"); };
+  const results = await drainForeignOutboxEntries([entry({ phase: "captured" })], "S-NEW", d);
+  assert.deepEqual(results.map((r) => [r.outcome, r.reason]), [["kept", "register-failed"]]);
+  assert.deepEqual(log, ["createAudio"]);
 });
 
 test("entries of the current session are never touched here", async () => {

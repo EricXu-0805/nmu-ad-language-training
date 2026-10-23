@@ -9,5 +9,9 @@ alembic==1.18.5
 psycopg[binary]==3.3.4
 dashscope==1.26.3
 
+# 传递依赖安全修复：保留 SDK 版本，独立钉住已修复的 HTTP/TLS 依赖。
+aiohttp==3.14.4
+certifi==2026.10.19
+
 # 本地神经兜底音色(可选;体积较大)。要在容器里也有 piper 兜底,取消注释重建:
 # piper-tts>=1.4

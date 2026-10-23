@@ -29,6 +29,7 @@ import {
 } from "./autopilotProtocol.ts";
 import {
   assertEntryMatchesCommand,
+  assertForeignRecordingSnapshot,
   settleCaptureCleanup,
   type AutopilotRecoveryDependencies,
   type AutopilotRecoverySnapshot,
@@ -114,6 +115,7 @@ export interface AutopilotCaptureBootstrapPorts {
   clearTimer(handle: number): void;
   acquireLease(signal: AbortSignal): Promise<AudioDeviceLease>;
   recoverySnapshot(): Promise<AutopilotRecoverySnapshot>;
+  readBlob(rawAudioId: string): Promise<Blob | null | undefined>;
   /** 开麦前先把**别的场次**留下的录音按录音器同一条链清一遍(2xx 完成 / 410 作废)。 */
   drainForeignOutbox?(currentSessionId: string, entries: AudioOutboxEntry[]): Promise<void>;
   authorize(
@@ -144,6 +146,7 @@ export const browserAutopilotCaptureBootstrapPorts: AutopilotCaptureBootstrapPor
     observeTrailingSilence(stream, onTrailingSilence, windows),
   acquireLease: (signal) => acquireAudioDeviceLease(undefined, signal),
   recoverySnapshot: () => blobStore.recoverySnapshot(),
+  readBlob: (rawAudioId) => blobStore.get(rawAudioId),
   drainForeignOutbox: async (currentSessionId, entries) => {
     const { api } = await import("../api.ts");
     const { drainForeignOutboxEntries } = await import("../audio/foreignOutboxDrain.ts");
@@ -693,16 +696,22 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
           () => this.bootstrap.recoverySnapshot(),
           isolateLateSettlement,
         );
-        // 别的场次留下的录音先按录音器那条链清一遍(2xx 完成 / 410 作废),清完再看快照;
-        // 清不掉的照旧拒开麦。2026-09-13 演示:9/6 那场的一段录音把整台平板卡死。
+        // Only intact, distinct foreign entries may coexist with a new recording.
+        // Validate before recovery can mutate an entry, then validate what remains.
+        await this.stage(
+          deadline,
+          () => assertForeignRecordingSnapshot(snapshot, this.sessionId,
+            this.command.payload.raw_audio_id, (rawId) => this.bootstrap.readBlob(rawId)),
+          isolateLateSettlement,
+        );
         const foreign = snapshot.entries.filter((entry) => entry.sessionId !== this.sessionId);
-        if (foreign.length > 0 && this.bootstrap.drainForeignOutbox
-            && snapshot.invalidBlobKeyCount === 0 && snapshot.legacyOrphans.length === 0) {
+        if (foreign.length > 0 && this.bootstrap.drainForeignOutbox) {
           // 清理有自己的软预算,不吃满整段 pre-start 预算:一段大录音在慢网上传超过
           // 预算时,判死码会是 device_command_timeout(固定码),控制台会把它讲成
-          // 「老人还在等点屏」。到点就不再等,重拍快照——条目还在就按下面那条规则
-          // 拒开麦(recording_start_failed,说的是真话);清理在后台继续,下次开麦接上。
-          const drain = this.bootstrap.drainForeignOutbox!(this.sessionId, foreign);
+          // 「老人还在等点屏」。到点就不再等，重拍快照并确认留下的证据仍完整。
+          // 未恢复的外场录音完整保留，不因旧场权限或网络错误阻断另一场次。
+          const drain = Promise.resolve().then(() =>
+            this.bootstrap.drainForeignOutbox!(this.sessionId, foreign));
           isolateLateSettlement(drain);
           await this.stage(
             deadline,
@@ -714,10 +723,12 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
             () => this.bootstrap.recoverySnapshot(),
             isolateLateSettlement,
           );
-        }
-        if (snapshot.invalidBlobKeyCount > 0 || snapshot.legacyOrphans.length > 0
-            || snapshot.entries.length > 0) {
-          throw new Error("本机存在待恢复录音，禁止覆盖开新麦克风");
+          await this.stage(
+            deadline,
+            () => assertForeignRecordingSnapshot(snapshot, this.sessionId,
+              this.command.payload.raw_audio_id, (rawId) => this.bootstrap.readBlob(rawId)),
+            isolateLateSettlement,
+          );
         }
         this.assertForeground();
         // 3/5 只取流、只造 recorder。到这里为止一个录音字节都没有产生。

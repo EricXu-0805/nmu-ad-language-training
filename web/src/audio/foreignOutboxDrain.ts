@@ -1,9 +1,6 @@
-// 自动带练开麦前的「清旧账」:outbox 里若还留着**别的场次**没传完的录音,老人端会
-// 拒绝开新麦(fail-closed,7 月的规则)。2026-09-13 演示就卡在这里:9/6 那场的录音
-// 永远清不掉。服务端已对「同一受试者、同一台平板、没字节事实」的旧场次录音槽给
-// 410 作废(收据 255),但自动带练模式本来不会去碰这些条目——这里把它们按录音器
-// 同一条链(登记 → 上传 → audioSaved → 2xx 完成 / 410 作废)走一遍,能清多少清多少;
-// 清不掉的照旧留着让执行器拒绝开麦,绝不猜、绝不删。
+// 开麦前尝试恢复其他场次的持久录音，沿用登记 → 上传 → audioSaved 的精确回执链。
+// 恢复失败的副本继续保留；执行器核对本机字节与归属后，可允许不同场次使用新 ID。
+// 删除仍须权威保存收据或精确 410 处置，上传拒绝本身从不授权清理。
 import { ApiError } from "../apiResponse.ts";
 import type { AudioOutboxEntry } from "./audioOutbox.ts";
 import { advanceAudioOutbox } from "./audioOutbox.ts";
@@ -58,7 +55,7 @@ async function drainOne(
   const rawAudioId = entry.rawAudioId;
   let current = entry;
   let checksum = current.checksum ?? null;
-  let probeAfterConflict = false;
+  let probeMetadata = false;
   try {
     const blob = await deps.readBlob(rawAudioId);
     if (!blob) return { rawAudioId, outcome: "kept", reason: "missing-blob" };
@@ -72,10 +69,10 @@ async function drainOne(
         await deps.putOutbox(current);
       } catch (error) {
         if (!isConflict(error)) return { rawAudioId, outcome: "kept", reason: "register-failed" };
-        probeAfterConflict = true;
+        probeMetadata = true;
       }
     }
-    if (!probeAfterConflict && current.phase === "registered") {
+    if (!probeMetadata && current.phase === "registered") {
       const localChecksum = await sha256Blob(blob);
       try {
         const receipt = await deps.uploadAudioBlob(rawAudioId, blob, current.sessionId);
@@ -84,8 +81,13 @@ async function drainOne(
         await deps.putOutbox(current);
         checksum = localChecksum;
       } catch (error) {
-        if (!isConflict(error)) return { rawAudioId, outcome: "kept", reason: "upload-failed" };
-        probeAfterConflict = true;
+        // The upload endpoint conceals assets bound to an older session with 404.
+        // Ask the existing metadata endpoint for an exact outcome; neither 404
+        // nor 409 authorizes local deletion without its validated receipt/410.
+        if (!isConflict(error) && !(error instanceof ApiError && error.status === 404)) {
+          return { rawAudioId, outcome: "kept", reason: "upload-failed" };
+        }
+        probeMetadata = true;
         checksum = localChecksum;
       }
     }
