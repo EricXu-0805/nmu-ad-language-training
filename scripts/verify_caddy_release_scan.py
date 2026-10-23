@@ -67,6 +67,7 @@ def verify_build_binding(artifact: Path, revision: str, root: Path) -> str:
         raise ScanError("build_go_version_differs_from_recipe")
     pins = recipe.get("dependency_pins")
     if not isinstance(pins, dict) or set(pins) != {
+        "github.com/klauspost/compress",
         "golang.org/x/crypto", "golang.org/x/net", "golang.org/x/text", "google.golang.org/grpc",
     }:
         raise ScanError("dependency_security_pins_missing")
