@@ -58,7 +58,7 @@ async function drainOne(
   const rawAudioId = entry.rawAudioId;
   let current = entry;
   let checksum = current.checksum ?? null;
-  let probeAfterConflict = false;
+  let probeMetadata = false;
   try {
     const blob = await deps.readBlob(rawAudioId);
     if (!blob) return { rawAudioId, outcome: "kept", reason: "missing-blob" };
@@ -72,10 +72,10 @@ async function drainOne(
         await deps.putOutbox(current);
       } catch (error) {
         if (!isConflict(error)) return { rawAudioId, outcome: "kept", reason: "register-failed" };
-        probeAfterConflict = true;
+        probeMetadata = true;
       }
     }
-    if (!probeAfterConflict && current.phase === "registered") {
+    if (!probeMetadata && current.phase === "registered") {
       const localChecksum = await sha256Blob(blob);
       try {
         const receipt = await deps.uploadAudioBlob(rawAudioId, blob, current.sessionId);
@@ -84,8 +84,13 @@ async function drainOne(
         await deps.putOutbox(current);
         checksum = localChecksum;
       } catch (error) {
-        if (!isConflict(error)) return { rawAudioId, outcome: "kept", reason: "upload-failed" };
-        probeAfterConflict = true;
+        // The upload endpoint conceals assets bound to an older session with 404.
+        // Ask the existing metadata endpoint for an exact outcome; neither 404
+        // nor 409 authorizes local deletion without its validated receipt/410.
+        if (!isConflict(error) && !(error instanceof ApiError && error.status === 404)) {
+          return { rawAudioId, outcome: "kept", reason: "upload-failed" };
+        }
+        probeMetadata = true;
         checksum = localChecksum;
       }
     }

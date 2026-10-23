@@ -372,8 +372,8 @@ export function useVoxRecorder(opts: {
       return outcome;
     };
 
-    const probeTerminalMetadataAfterConflict = async (): Promise<AudioSavedFinalizationOutcome> => {
-      // Exactly one metadata outcome call per 409. There is no recursion or
+    const probeTerminalMetadataAfterRefusal = async (): Promise<AudioSavedFinalizationOutcome> => {
+      // Exactly one metadata outcome call per eligible refusal. There is no recursion or
       // status-poll loop; any non-2xx other than exact 410 preserves the bytes.
       const checksum = await sha256Blob(pending.blob as Blob);
       return finalize(checksum);
@@ -402,7 +402,7 @@ export function useVoxRecorder(opts: {
         });
       } catch (error) {
         if (error instanceof ApiError && error.status === 409) {
-          return probeTerminalMetadataAfterConflict();
+          return probeTerminalMetadataAfterRefusal();
         }
         throw error;
       }
@@ -420,8 +420,10 @@ export function useVoxRecorder(opts: {
         receipt = await api.uploadAudioBlob(
           pending.rawAudioId, pending.blob, pending.meta.sessionId);
       } catch (error) {
-        if (error instanceof ApiError && error.status === 409) {
-          return probeTerminalMetadataAfterConflict();
+        // The upload route conceals assets bound to an older session with 404.
+        // Only the exact metadata disposition may authorize local disposal.
+        if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
+          return probeTerminalMetadataAfterRefusal();
         }
         // Authentication, network, 422, 429 and 5xx all preserve this exact
         // registered outbox. They are never reinterpreted as deletion consent.

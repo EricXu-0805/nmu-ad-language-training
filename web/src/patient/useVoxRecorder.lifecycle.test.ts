@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
+import { ApiError } from "../apiResponse.ts";
+import { advanceAudioOutbox, createAudioOutboxEntry } from "../audio/audioOutbox.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -14,7 +16,13 @@ function deferred<T>() {
 
 // Execute the complete production hook, Recorder and persistence validators.
 // React scheduling, browser devices, storage and HTTP are controlled ports.
-function harness(options: { manualStart?: boolean } = {}) {
+function harness(options: {
+  manualStart?: boolean;
+  foreignRecovery?: {
+    upload: number | "network";
+    saved: number | "exact-410" | "mismatched-410";
+  };
+} = {}) {
   const slots: Array<{ value?: unknown; deps?: unknown[]; cleanup?: () => void }> = [];
   let cursor = 0, scheduled = false, mounted = true;
   let effects: Array<() => void> = [];
@@ -61,6 +69,15 @@ function harness(options: { manualStart?: boolean } = {}) {
   const stream = { getTracks: () => [{ stop: () => { trackStops += 1; } }] };
   const blobs = new Map<string, Blob>(), entries = new Map<string, unknown>();
   const staged: Array<Record<string, unknown>> = [], saved: Array<Record<string, unknown>> = [];
+  const uploads: string[] = [], discarded: string[] = [], disposalReports: unknown[] = [], broadcasts: unknown[] = [];
+  if (options.foreignRecovery) {
+    const blob = new Blob(["synthetic-old-answer"], { type: "audio/webm" });
+    const entry = advanceAudioOutbox(createAudioOutboxEntry({
+      rawAudioId: "raw-foreign-recovery-0001", sessionId: "SIM-PREVIOUS", turnKey: "itm-0001#1",
+      containsDirectIdentifier: false, durationSeconds: 2.5, blob, nowMs: 100,
+    }), "registered", { nowMs: 200 });
+    blobs.set(entry.rawAudioId, blob); entries.set(entry.rawAudioId, entry);
+  }
   const startEvents: Array<() => void> = [];
   class MediaDouble {
     static isTypeSupported() { return true; }
@@ -81,6 +98,11 @@ function harness(options: { manualStart?: boolean } = {}) {
     recordingAuthorization: () => auth(), putLiveState: async (_kind: string, payload: object) => payload,
     createAudio: async () => {},
     uploadAudioBlob: async (id: string, blob: Blob) => {
+      uploads.push(id);
+      if (options.foreignRecovery && id === "raw-foreign-recovery-0001") {
+        if (options.foreignRecovery.upload === "network") throw new Error("synthetic offline");
+        throw new ApiError(options.foreignRecovery.upload, "synthetic upload refusal");
+      }
       if (failUpload) throw new Error("synthetic offline");
       if (uploadBarrier) await uploadBarrier;
       const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
@@ -88,8 +110,19 @@ function harness(options: { manualStart?: boolean } = {}) {
     },
     putAudioSaved: async (payload: Record<string, unknown>) => {
       saved.push(payload);
+      if (options.foreignRecovery && payload.rawAudioId === "raw-foreign-recovery-0001") {
+        const status = options.foreignRecovery.saved;
+        if (typeof status === "number") throw new ApiError(status, "synthetic metadata refusal");
+        throw new ApiError(410, "terminal", {
+          code: "audio_terminal_disposition", schemaVersion: 1, action: "discard_local_copy", reason: "deleted",
+          rawAudioId: payload.rawAudioId, sessionId: payload.sessionId, turnKey: payload.turnKey,
+          byteCount: payload.byteCount, containsDirectIdentifier: payload.containsDirectIdentifier,
+          checksum: status === "mismatched-410" ? "00".repeat(32) : payload.checksum,
+        }, "nested-detail");
+      }
       return { audioReceipt: { rawAudioId: payload.rawAudioId, serverSeq: saved.length, idempotent: false } };
     },
+    putAudioDisposalConfirmed: async (disposition: unknown) => { disposalReports.push(disposition); },
   };
   const blobStore = {
     recoverySnapshot: async () => ({ invalidBlobKeyCount: 0, legacyOrphans: [], entries: [...entries.values()] }),
@@ -100,12 +133,16 @@ function harness(options: { manualStart?: boolean } = {}) {
     putOutbox: async (entry: Record<string, unknown>) => entries.set(String(entry.rawAudioId), entry),
     outboxEntries: async () => [...entries.values()],
     completeOutbox: async (id: string) => { entries.delete(id); blobs.delete(id); },
+    discardTerminalOutbox: async (entry: { rawAudioId: string }) => {
+      discarded.push(entry.rawAudioId); entries.delete(entry.rawAudioId); blobs.delete(entry.rawAudioId);
+    },
   };
   const modules: Record<string, unknown> = {
     react: hooks,
+    "../apiResponse": { ApiError }, "../apiResponse.ts": { ApiError },
     "../api": { api, getRecoveryDeviceCapability: () => null, removeRecoveryDeviceCapabilityIfMatches: () => false },
     "../audio/audioDeviceLease": { acquireAudioDeviceLease: async () => ({ release() {}, released: Promise.resolve() }), AudioDeviceLeaseUnavailableError: class extends Error {} },
-    "../audio/blobStore": { blobStore }, "../sync/bus": { bus: { post() {} } },
+    "../audio/blobStore": { blobStore }, "../sync/bus": { bus: { post(value: unknown) { broadcasts.push(value); } } },
     "../lib/ids": { newAudioId: () => `raw-synthetic-${staged.length + 1}` },
   };
   const context = vm.createContext({
@@ -131,7 +168,7 @@ function harness(options: { manualStart?: boolean } = {}) {
   render();
   return {
     get view() { return output; }, counters: () => ({ microphoneRequests, mediaStarts, mediaStops, trackStops }),
-    entries, blobs, staged, saved, stream,
+    entries, blobs, staged, saved, stream, uploads, discarded, disposalReports, broadcasts,
     deliverStart: (index: number) => startEvents[index]?.(),
     setAuthorization: (value: () => Promise<unknown>) => { auth = value; },
     setStream: (value: () => Promise<unknown>) => { acquireStream = value; },
@@ -151,6 +188,49 @@ function harness(options: { manualStart?: boolean } = {}) {
     async flush() { for (let i = 0; i < 25; i += 1) await new Promise<void>((done) => setImmediate(done)); },
     async close() { mounted = false; for (const slot of slots) slot.cleanup?.(); for (let i = 0; i < 30; i += 1) await Promise.resolve(); },
   };
+}
+
+for (const upload of [404, 409]) {
+  test(`人工恢复旧场次上传 ${upload} 后核对精确 410，清理旧副本并允许新场次录音`, async () => {
+    const h = harness({ foreignRecovery: { upload, saved: "exact-410" } }); await h.flush();
+    try {
+      assert.deepEqual(h.uploads, ["raw-foreign-recovery-0001"]);
+      assert.equal(h.saved.length, 1, "上传隐藏 404 或冲突只能触发一次权威元数据核对");
+      assert.equal(h.saved[0].sessionId, "SIM-PREVIOUS");
+      assert.deepEqual(h.discarded, ["raw-foreign-recovery-0001"]);
+      assert.equal(h.entries.size, 0); assert.equal(h.blobs.size, 0);
+      assert.equal(h.disposalReports.length, 1);
+      assert.equal(h.broadcasts.length, 0, "终态处置不能向新场次广播保存成功");
+      await h.view.startNow(); await h.flush();
+      assert.equal(h.counters().mediaStarts, 1, "旧场次精确处置完毕后解除恢复阻断");
+    } finally { await h.close(); }
+  });
+}
+
+for (const upload of [401, 403, 422, 429, 500, "network"] as const) {
+  test(`人工恢复旧场次上传 ${upload} 保留副本，不探测或删除`, async () => {
+    const h = harness({ foreignRecovery: { upload, saved: "exact-410" } }); await h.flush();
+    try {
+      assert.equal(h.saved.length, 0); assert.equal(h.discarded.length, 0);
+      assert.equal(h.entries.size, 1); assert.equal(h.blobs.size, 1);
+      assert.equal(h.disposalReports.length, 0); assert.equal(h.broadcasts.length, 0);
+      await h.view.startNow(); await h.flush();
+      assert.equal(h.counters().microphoneRequests, 0);
+    } finally { await h.close(); }
+  });
+}
+
+for (const saved of [401, 403, 404, 409, 410, 500, "mismatched-410"] as const) {
+  test(`人工恢复上传隐藏 404 后元数据 ${saved} 不是精确终态，仍保留副本`, async () => {
+    const h = harness({ foreignRecovery: { upload: 404, saved } }); await h.flush();
+    try {
+      assert.equal(h.saved.length, 1);
+      assert.equal(h.discarded.length, 0); assert.equal(h.entries.size, 1); assert.equal(h.blobs.size, 1);
+      assert.equal(h.disposalReports.length, 0); assert.equal(h.broadcasts.length, 0);
+      await h.view.startNow(); await h.flush();
+      assert.equal(h.counters().microphoneRequests, 0);
+    } finally { await h.close(); }
+  });
 }
 
 for (const trigger of ["visibilitychange", "pagehide", "freeze"]) {
