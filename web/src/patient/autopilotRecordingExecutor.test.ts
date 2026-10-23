@@ -521,6 +521,7 @@ const AUTHORIZED: RecordingAuthorization = {
 function bootstrapHarness(clock: Clock, overrides: {
   acquireLease?: (signal: AbortSignal) => Promise<AudioDeviceLease>;
   recoverySnapshot?: () => Promise<AutopilotRecoverySnapshot>;
+  readBlob?: (rawAudioId: string) => Promise<Blob | null | undefined>;
   drainForeignOutbox?: (currentSessionId: string, entries: AudioOutboxEntry[]) => Promise<void>;
   authorize?: (call: number, signal: AbortSignal) => Promise<RecordingAuthorization>;
   /** 第 N 次 setTimer 同步抛错。作答窗口那次是第 2 次（第 1 次是 pre-start 预算）。 */
@@ -584,6 +585,7 @@ function bootstrapHarness(clock: Clock, overrides: {
       calls.push("recoverySnapshot");
       return overrides.recoverySnapshot?.() ?? Promise.resolve(EMPTY_SNAPSHOT);
     },
+    readBlob: (rawAudioId) => overrides.readBlob?.(rawAudioId) ?? Promise.resolve(recordingBlob()),
     ...(overrides.drainForeignOutbox ? {
       drainForeignOutbox: (currentSessionId: string, entries: AudioOutboxEntry[]) => {
         calls.push(`drainForeignOutbox:${entries.length}`);
@@ -1922,7 +1924,7 @@ test("开麦前清旧账：别的场次的条目先清、再重拍快照，清�
   await capture.closed;
 });
 
-test("开麦前清旧账有软预算：清理悬挂到点就重拍快照，条目还在则按「待恢复录音」拒开麦而不是超时码", async (context) => {
+test("开麦前清旧账有软预算：完整外场条目保留，清理悬挂到点后允许当前场次开麦", async (context) => {
   const clock = clockDouble();
   const devices = installDeviceDoubles(clock);
   context.after(() => devices.restore());
@@ -1936,16 +1938,94 @@ test("开麦前清旧账有软预算：清理悬挂到点就重拍快照，条�
     ownerGeneration: 8, isForeground: () => true, bootstrap: harness.ports,
   });
   const capture = executor.start(recordCommand() as never);
+  capture.started.catch(() => {});
   capture.stopped.catch(() => {});
   await flushMicrotasks();
   assert.deepEqual(harness.calls, ["acquireLease", "recoverySnapshot", "drainForeignOutbox:1"]);
   // 软预算比整段预算短:到点放行,不是判死。
   assert.ok(FOREIGN_DRAIN_SOFT_BUDGET_MS < PRE_START_BUDGET_MS);
   harness.advance(FOREIGN_DRAIN_SOFT_BUDGET_MS);
-  const error = await capture.started.then(() => null, (reason: unknown) => reason);
-  assert.equal((error as AutopilotMediaError).errorCode, "recording_start_failed");
-  assert.match(String((error as Error).cause), /待恢复录音/);
-  assert.deepEqual(harness.calls,
+  await pumpUntil(() => (devices.devices[0]?.starts ?? 0) > 0);
+  assert.equal(devices.devices[0]?.starts, 1);
+  assert.deepEqual(harness.calls.slice(0, 4),
     ["acquireLease", "recoverySnapshot", "drainForeignOutbox:1", "recoverySnapshot"]);
-  assert.equal(devices.userMediaCalls, 0);
+  assert.ok(harness.calls.includes("authorize:1"));
+  harness.advance(PRE_START_BUDGET_MS);
+  await capture.closed;
 });
+
+for (const drain of ["rejects", "keeps", "unavailable"] as const) {
+  test(`有效外场录音恢复 ${drain}：保留完整旧证据并允许独立新录音`, async (context) => {
+    const clock = clockDouble();
+    const devices = installDeviceDoubles(clock);
+    context.after(() => devices.restore());
+    const entry = foreignOutboxEntry();
+    const original = structuredClone(entry);
+    const blob = recordingBlob();
+    let reads = 0;
+    const harness = bootstrapHarness(clock, {
+      recoverySnapshot: async () => ({ ...EMPTY_SNAPSHOT, entries: [entry] }),
+      readBlob: async (rawId) => {
+        assert.equal(rawId, entry.rawAudioId);
+        reads += 1;
+        return blob;
+      },
+      ...(drain === "unavailable" ? {} : { drainForeignOutbox: async () => {
+        if (drain === "rejects") throw new ApiError(404, "not found");
+      } }),
+    });
+    const capture = new BrowserAutopilotRecordingExecutor(SESSION, {
+      ownerGeneration: 9, isForeground: () => true, bootstrap: harness.ports,
+    }).start(recordCommand() as never);
+    capture.started.catch(() => {});
+    capture.stopped.catch(() => {});
+    await pumpUntil(() => (devices.devices[0]?.starts ?? 0) > 0);
+    assert.equal(devices.devices[0]?.starts, 1);
+    assert.ok(reads >= 1);
+    assert.deepEqual(entry, original);
+    assert.equal(blob.size, original.blobBytes);
+    harness.advance(PRE_START_BUDGET_MS);
+    await capture.closed;
+  });
+}
+
+for (const boundary of [
+  "current", "invalid-metadata", "legacy", "invalid-key", "missing-blob",
+  "wrong-size", "wrong-type", "wrong-checksum", "raw-collision", "duplicate-id", "corrupt-after-drain",
+] as const) {
+  test(`开麦保留旧证据的边界 ${boundary} 仍禁止开麦及覆盖`, async (context) => {
+    const clock = clockDouble();
+    const devices = installDeviceDoubles(clock);
+    context.after(() => devices.restore());
+    let entry = foreignOutboxEntry();
+    if (boundary === "current") entry = { ...entry, sessionId: SESSION };
+    if (boundary === "invalid-metadata") entry = { ...entry, sessionId: "" };
+    if (boundary === "raw-collision") entry = { ...entry, rawAudioId: recordCommand().payload.raw_audio_id };
+    if (boundary === "wrong-checksum") entry = { ...entry, phase: "uploaded", checksum: "0".repeat(64) };
+    let drained = false;
+    const harness = bootstrapHarness(clock, {
+      recoverySnapshot: async () => ({
+        entries: boundary === "duplicate-id" ? [entry, { ...entry, sessionId: "S-ANOTHER" }] : [entry],
+        legacyOrphans: boundary === "legacy" ? [{}] : [],
+        invalidBlobKeyCount: boundary === "invalid-key" ? 1 : 0,
+      }),
+      readBlob: async () => {
+        if (boundary === "missing-blob" || (boundary === "corrupt-after-drain" && drained)) return null;
+        if (boundary === "wrong-size") return new Blob(["short"], { type: entry.mimeType });
+        if (boundary === "wrong-type") return new Blob([recordingBlob()], { type: "audio/ogg" });
+        return recordingBlob();
+      },
+      drainForeignOutbox: async () => { drained = true; },
+    });
+    const capture = new BrowserAutopilotRecordingExecutor(SESSION, {
+      ownerGeneration: 10, isForeground: () => true, bootstrap: harness.ports,
+    }).start(recordCommand() as never);
+    capture.stopped.catch(() => {});
+    const error = await capture.started.then(() => null, (reason: unknown) => reason);
+    assert.equal((error as AutopilotMediaError).errorCode, "recording_start_failed");
+    assert.equal(devices.userMediaCalls, 0);
+    assert.ok(!harness.calls.includes("authorize:1"));
+    if (boundary !== "corrupt-after-drain") assert.equal(drained, false);
+    await capture.closed;
+  });
+}

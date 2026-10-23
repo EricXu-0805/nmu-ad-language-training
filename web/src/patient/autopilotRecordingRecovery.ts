@@ -4,7 +4,8 @@
  * 的情况下被完整驱动一遍。生产实现在 autopilotRecordingExecutor.ts。
  */
 import type { AudioDeviceLease } from "../audio/audioDeviceLease.ts";
-import type { AudioOutboxEntry } from "../audio/audioOutbox.ts";
+import { parseAudioOutboxEntry, type AudioOutboxEntry } from "../audio/audioOutbox.ts";
+import { sha256Blob } from "../audio/audioUploadReceipt.ts";
 import type { AutopilotTerminalFailureLatch } from "./autopilotAckOutbox.ts";
 import { assertCaptureDurationWithinCommandLimit } from "./autopilotCaptureWindow.ts";
 import { AutopilotMediaError } from "./autopilotMediaError.ts";
@@ -47,6 +48,52 @@ export interface AutopilotRecoveryDependencies {
   /** 唯一会 register / upload / putAudioSaved 的一步。 */
   finish(command: RecordCommand, entry: AudioOutboxEntry, blob: Blob):
     Promise<RecordStoppedFacts>;
+}
+
+/** A foreign session is separable only when the local identities are unambiguous. */
+export function assertRecoverySnapshotUnambiguous(snapshot: AutopilotRecoverySnapshot): void {
+  if (snapshot.invalidBlobKeyCount > 0 || snapshot.legacyOrphans.length > 0) {
+    throw new Error("本机录音恢复存储状态非法");
+  }
+  const rawIds = new Set<string>();
+  for (const entry of snapshot.entries) {
+    if (rawIds.has(entry.rawAudioId)) throw new Error("本机录音 outbox 标识冲突");
+    rawIds.add(entry.rawAudioId);
+  }
+}
+
+/** Read-only integrity check; it never deletes bytes or manufactures server receipts. */
+export async function assertRecoverableOutboxBlob(
+  entry: AudioOutboxEntry,
+  readBlob: AutopilotRecoveryDependencies["readBlob"],
+): Promise<Blob> {
+  parseAudioOutboxEntry(entry);
+  const blob = await readBlob(entry.rawAudioId);
+  if (!blob) throw new Error("恢复录音缺少本机原始字节");
+  if (blob.size !== entry.blobBytes || (blob.type || "audio/webm") !== entry.mimeType) {
+    throw new Error("恢复录音本机字节与 outbox 元数据不一致");
+  }
+  if (entry.phase === "uploaded" && await sha256Blob(blob) !== entry.checksum) {
+    throw new Error("恢复录音本机字节与上传 checksum 不一致");
+  }
+  return blob;
+}
+
+/** Complete foreign evidence can coexist with a fresh command using a different ID. */
+export async function assertForeignRecordingSnapshot(
+  snapshot: AutopilotRecoverySnapshot,
+  sessionId: string,
+  newRawAudioId: string,
+  readBlob: AutopilotRecoveryDependencies["readBlob"],
+): Promise<void> {
+  assertRecoverySnapshotUnambiguous(snapshot);
+  for (const entry of snapshot.entries) {
+    parseAudioOutboxEntry(entry);
+    if (entry.sessionId === sessionId || entry.rawAudioId === newRawAudioId) {
+      throw new Error("本机存在待恢复录音，禁止覆盖开新麦克风");
+    }
+  }
+  for (const entry of snapshot.entries) await assertRecoverableOutboxBlob(entry, readBlob);
 }
 
 export interface AutopilotRecoveryAckDelivery {
@@ -112,22 +159,30 @@ async function recoverAutopilotRecording(
   const lease = await deps.acquireLease();
   try {
     const snapshot = await deps.recoverySnapshot();
-    if (snapshot.invalidBlobKeyCount > 0 || snapshot.legacyOrphans.length > 0) {
-      throw new Error("本机录音恢复存储状态非法");
-    }
-    if (snapshot.entries.length === 0) return null;
-    if (snapshot.entries.length !== 1) {
+    assertRecoverySnapshotUnambiguous(snapshot);
+    const current = snapshot.entries.filter((entry) => entry.sessionId === sessionId);
+    const foreign = snapshot.entries.filter((entry) => entry.sessionId !== sessionId);
+    if (current.length > 1) {
       throw new Error("自动驾驶恢复期存在多份待处置录音");
     }
-    const entry = snapshot.entries[0];
-    assertEntryMatchesCommand(entry, command);
-    if (entry.sessionId !== sessionId) throw new Error("恢复录音属于其他场次");
-    // 时长闸必须排在读字节 / register / upload / audioSaved 之前。刷新恢复走的
-    // 是同一条上限判据：这段录音服务器一定会拒，那就一个字节都不要送上去。
-    assertCaptureDurationWithinCommandLimit(
-      entry.durationSeconds, command.payload.max_duration_seconds);
-    const blob = await deps.readBlob(entry.rawAudioId);
-    if (!blob) throw new Error("恢复录音缺少本机原始字节");
+    // A foreign entry with this command's ID is a collision, even without a current entry.
+    for (const entry of foreign) {
+      parseAudioOutboxEntry(entry);
+      if (entry.rawAudioId === command.payload.raw_audio_id) {
+        throw new Error("本机录音 outbox 标识冲突");
+      }
+    }
+    const entry = current[0];
+    if (entry) {
+      assertEntryMatchesCommand(entry, command);
+      // Preserve the existing stable record_failed path before any byte reads.
+      assertCaptureDurationWithinCommandLimit(
+        entry.durationSeconds, command.payload.max_duration_seconds);
+      parseAudioOutboxEntry(entry);
+    }
+    for (const other of foreign) await assertRecoverableOutboxBlob(other, deps.readBlob);
+    if (!entry) return null;
+    const blob = await assertRecoverableOutboxBlob(entry, deps.readBlob);
     return await deps.finish(command, entry, blob);
   } finally {
     // 租约释放同样 best-effort：清理异常绝不能盖掉上面那个 recording_runtime_failed，

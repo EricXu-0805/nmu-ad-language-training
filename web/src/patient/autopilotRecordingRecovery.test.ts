@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AudioOutboxEntry } from "../audio/audioOutbox.ts";
+import { sha256Blob } from "../audio/audioUploadReceipt.ts";
 import type { AutopilotTerminalFailureLatch } from "./autopilotAckOutbox.ts";
 import type { AutopilotAck, NextCommandProjection } from "./autopilotProtocol.ts";
 import {
@@ -57,6 +58,8 @@ function outboxEntry(durationSeconds: number): AudioOutboxEntry {
     mimeType: "audio/webm",
     phase: "captured",
     autopilotStopReason: "max_duration",
+    createdAtMs: 1_000,
+    updatedAtMs: 1_000,
   } as unknown as AudioOutboxEntry;
 }
 
@@ -65,6 +68,8 @@ function recoveryHarness(entry: AudioOutboxEntry | null, options: {
   snapshotThrows?: boolean;
   invalidBlobKeyCount?: number;
   leaseReleaseThrows?: boolean;
+  entries?: AudioOutboxEntry[];
+  legacyOrphans?: unknown[];
   terminalFailureLatch?: AutopilotTerminalFailureLatch | null;
 } = {}) {
   const calls: string[] = [];
@@ -89,9 +94,9 @@ function recoveryHarness(entry: AudioOutboxEntry | null, options: {
       calls.push("snapshot");
       if (options.snapshotThrows) throw new Error("本机恢复快照读不出来");
       return {
-        entries: entry ? [entry] : [],
+        entries: options.entries ?? (entry ? [entry] : []),
         invalidBlobKeyCount: options.invalidBlobKeyCount ?? 0,
-        legacyOrphans: [],
+        legacyOrphans: options.legacyOrphans ?? [],
       };
     },
     readBlob: async (rawAudioId) => {
@@ -228,6 +233,103 @@ test("恢复期的其它硬错误照旧上抛，不被当成时长超限吞掉",
     /恢复录音缺少本机原始字节/);
   assert.deepEqual(harness.sent, []);
 });
+
+function foreignRecoveryEntry(): AudioOutboxEntry {
+  return { ...outboxEntry(3), rawAudioId: "raw-foreign-recovery-0001", sessionId: "S-OTHER" };
+}
+
+test("started 恢复只提交精确当前场次和命令，完整外场录音保留", async () => {
+  const current = outboxEntry(14.2);
+  const foreign = foreignRecoveryEntry();
+  const before = structuredClone(foreign);
+  const harness = recoveryHarness(null, { entries: [foreign, current] });
+  const finish = harness.deps.finish;
+  harness.deps.finish = async (command, entry, blob) => {
+    assert.equal(entry, current);
+    assert.equal(entry.rawAudioId, command.payload.raw_audio_id);
+    return finish(command, entry, blob);
+  };
+  const settled = await settleAutopilotRecordingRecovery(
+    SESSION_ID, startedRecordCommand(), harness.delivery, harness.deps);
+  assert.equal(settled.outcome, "stopped");
+  assert.equal(harness.sent.length, 1);
+  assert.equal(harness.sent[0].facts.raw_audio_id, RAW_AUDIO_ID);
+  assert.deepEqual(foreign, before);
+});
+
+test("started 命令只有完整外场录音时返回 none，不伪造该命令 ACK", async () => {
+  const foreign = foreignRecoveryEntry();
+  const before = structuredClone(foreign);
+  const harness = recoveryHarness(foreign);
+  const settled = await settleAutopilotRecordingRecovery(
+    SESSION_ID, startedRecordCommand(), harness.delivery, harness.deps);
+  assert.equal(settled.outcome, "none");
+  assert.deepEqual(harness.sent, []);
+  assert.ok(!harness.calls.includes("finish:register-upload-audioSaved"));
+  assert.deepEqual(foreign, before);
+});
+
+test("外场 uploaded 条目 checksum 精确匹配时仅保留，不为当前 started 命令造收据", async () => {
+  const blob = new Blob([new Uint8Array(4_096)], { type: "audio/webm" });
+  const foreign: AudioOutboxEntry = {
+    ...foreignRecoveryEntry(), phase: "uploaded", checksum: await sha256Blob(blob),
+  };
+  const before = structuredClone(foreign);
+  const harness = recoveryHarness(foreign);
+  harness.deps.readBlob = async () => blob;
+  const settled = await settleAutopilotRecordingRecovery(
+    SESSION_ID, startedRecordCommand(), harness.delivery, harness.deps);
+  assert.equal(settled.outcome, "none");
+  assert.deepEqual(harness.sent, []);
+  assert.deepEqual(foreign, before);
+  assert.ok(!harness.calls.includes("finish:register-upload-audioSaved"));
+});
+
+for (const boundary of [
+  "multiple-current", "wrong-command", "raw-collision", "duplicate-id", "invalid-metadata",
+  "legacy", "invalid-key", "missing-foreign-blob", "wrong-foreign-size", "wrong-foreign-checksum",
+  "wrong-current-size", "wrong-current-type", "invalid-current-metadata",
+] as const) {
+  test(`started 恢复 ${boundary} 不上传、不造 ACK、不删除旧证据`, async () => {
+    const current = outboxEntry(14.2);
+    let foreign = foreignRecoveryEntry();
+    let entries = [foreign, current];
+    if (boundary === "multiple-current") entries = [current, { ...current, rawAudioId: "raw-second-current" }];
+    if (boundary === "wrong-command") entries = [{ ...current, turnKey: "itm-other#1" }];
+    if (boundary === "invalid-current-metadata") entries = [foreign, { ...current, createdAtMs: 0 }];
+    if (boundary === "raw-collision") entries = [{ ...foreign, rawAudioId: RAW_AUDIO_ID }];
+    if (boundary === "duplicate-id") entries = [foreign, { ...foreign, sessionId: "S-THIRD" }, current];
+    if (boundary === "invalid-metadata") entries = [{ ...foreign, sessionId: "" }, current];
+    if (boundary === "wrong-foreign-checksum") {
+      foreign = { ...foreign, phase: "uploaded", checksum: "0".repeat(64) };
+      entries = [foreign, current];
+    }
+    const before = structuredClone(entries);
+    const harness = recoveryHarness(null, {
+      entries,
+      legacyOrphans: boundary === "legacy" ? [{}] : [],
+      invalidBlobKeyCount: boundary === "invalid-key" ? 1 : 0,
+    });
+    const read = harness.deps.readBlob;
+    harness.deps.readBlob = async (rawId) => {
+      if (rawId === RAW_AUDIO_ID) {
+        if (boundary === "wrong-current-size") return new Blob(["short"], { type: "audio/webm" });
+        if (boundary === "wrong-current-type") return new Blob([new Uint8Array(4_096)], { type: "audio/ogg" });
+      }
+      if (rawId === foreign.rawAudioId) {
+        if (boundary === "missing-foreign-blob") return null;
+        if (boundary === "wrong-foreign-size") return new Blob(["short"], { type: "audio/webm" });
+        return new Blob([new Uint8Array(4_096)], { type: "audio/webm" });
+      }
+      return read(rawId);
+    };
+    await assert.rejects(settleAutopilotRecordingRecovery(
+      SESSION_ID, startedRecordCommand(), harness.delivery, harness.deps));
+    assert.deepEqual(harness.sent, []);
+    assert.ok(!harness.calls.includes("finish:register-upload-audioSaved"));
+    assert.deepEqual(entries, before);
+  });
+}
 
 // ---------------- 刷新后的 runtime 合成 ----------------
 
