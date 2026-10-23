@@ -14,21 +14,47 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function sharedAudioLease() {
+  let held = false, releases = 0;
+  const waiting: Array<() => void> = [];
+  return {
+    get held() { return held; }, get releases() { return releases; },
+    acquire: () => new Promise<unknown>((resolve) => {
+      const grant = () => {
+        held = true;
+        const released = deferred<void>();
+        resolve({ released: released.promise, release() {
+          assert(held); held = false; releases += 1; released.resolve(); waiting.shift()?.();
+        } });
+      };
+      if (held) waiting.push(grant); else grant();
+    }),
+  };
+}
+
 // Execute the complete production hook, Recorder and persistence validators.
 // React scheduling, browser devices, storage and HTTP are controlled ports.
 function harness(options: {
   manualStart?: boolean;
+  lease?: ReturnType<typeof sharedAudioLease>;
   foreignRecovery?: {
     upload: number | "network";
-    saved: number | "exact-410" | "mismatched-410";
+    saved: number | "exact-410" | "mismatched-410" | "receipt";
     sessionId?: string;
+    uploadBarrier?: Promise<void>;
+    savedBarrier?: Promise<void>;
+    discardBarrier?: Promise<void>;
+    completionBarrier?: Promise<void>;
+    disposalBarrier?: Promise<void>;
+    abortSettlement?: Promise<void>;
+    ignoreAbort?: boolean;
     corrupt?: "missing" | "size" | "checksum" | "legacy" | "invalid";
   };
 } = {}) {
   const slots: Array<{ value?: unknown; deps?: unknown[]; cleanup?: () => void }> = [];
   let cursor = 0, scheduled = false, mounted = true;
   let effects: Array<() => void> = [];
-  type View = { startNow(): Promise<void>; stopAndSave(): Promise<void>; retrySave(): Promise<void>; starting: boolean; recActive: boolean };
+  type View = { startNow(): Promise<void>; stopAndSave(): Promise<void>; retrySave(): Promise<void>; starting: boolean; recActive: boolean; blockReason: string | null };
   let output: View, hook: (input: object) => View;
   const input = { sessionId: "SIM-LIFECYCLE", turnKey: "itm-0001#1", recording: "idle",
     recSeq: 1, commandSeq: 1, selfStartAllowed: true, connectionReady: true, containsDirectIdentifier: true, stopRequested: false };
@@ -76,6 +102,9 @@ function harness(options: {
   let auth: (() => Promise<unknown>) = async () => ({ allowed: true, runtime_status: "active", is_simulation: true });
   let acquireStream: (() => Promise<unknown>) = async () => stream;
   let uploadBarrier: Promise<void> | null = null;
+  let stageBarrier: Promise<void> | null = null;
+  const recoverySignals: Array<AbortSignal | undefined> = [];
+  let recoveryAborted = false;
   let microphoneRequests = 0, mediaStarts = 0, mediaStops = 0, trackStops = 0, failUpload = false;
   const stream = { getTracks: () => [{ stop: () => { trackStops += 1; } }] };
   const blobs = new Map<string, Blob>(), entries = new Map<string, unknown>();
@@ -112,9 +141,22 @@ function harness(options: {
   const api = {
     recordingAuthorization: () => auth(), putLiveState: async (_kind: string, payload: object) => payload,
     createAudio: async () => {},
-    uploadAudioBlob: async (id: string, blob: Blob) => {
+    uploadAudioBlob: async (id: string, blob: Blob, _session: string, signal?: AbortSignal) => {
       uploads.push(id);
       if (options.foreignRecovery && id === "raw-foreign-recovery-0001") {
+        recoverySignals.push(signal);
+        if (options.foreignRecovery.uploadBarrier) {
+          await new Promise<void>((resolve, reject) => {
+            options.foreignRecovery!.uploadBarrier!.then(resolve, reject);
+            const abort = () => {
+              recoveryAborted = true;
+              if (options.foreignRecovery!.ignoreAbort) return;
+              void (options.foreignRecovery!.abortSettlement ?? Promise.resolve()).then(() =>
+                reject(new DOMException("synthetic cancelled upload", "AbortError")));
+            };
+            if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
+          });
+        }
         if (options.foreignRecovery.upload === "network") throw new Error("synthetic offline");
         throw new ApiError(options.foreignRecovery.upload, "synthetic upload refusal");
       }
@@ -123,10 +165,16 @@ function harness(options: {
       const digest = await trackedCrypto.subtle.digest("SHA-256", await blob.arrayBuffer());
       return { raw_audio_id: id, bytes: blob.size, checksum: Buffer.from(digest).toString("hex") };
     },
-    putAudioSaved: async (payload: Record<string, unknown>) => {
+    putAudioSaved: async (payload: Record<string, unknown>, signal?: AbortSignal) => {
       saved.push(payload);
       if (options.foreignRecovery && payload.rawAudioId === "raw-foreign-recovery-0001") {
+        if (options.foreignRecovery.savedBarrier) await new Promise<void>((resolve, reject) => {
+          options.foreignRecovery!.savedBarrier!.then(resolve, reject);
+          const abort = () => reject(new DOMException("synthetic cancelled metadata", "AbortError"));
+          if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
+        });
         const status = options.foreignRecovery.saved;
+        if (status === "receipt") return { audioReceipt: { rawAudioId: payload.rawAudioId, serverSeq: saved.length, idempotent: false } };
         if (typeof status === "number") throw new ApiError(status, "synthetic metadata refusal");
         throw new ApiError(410, "terminal", {
           code: "audio_terminal_disposition", schemaVersion: 1, action: "discard_local_copy", reason: "deleted",
@@ -137,7 +185,14 @@ function harness(options: {
       }
       return { audioReceipt: { rawAudioId: payload.rawAudioId, serverSeq: saved.length, idempotent: false } };
     },
-    putAudioDisposalConfirmed: async (disposition: unknown) => { disposalReports.push(disposition); },
+    putAudioDisposalConfirmed: async (disposition: unknown, signal?: AbortSignal) => {
+      disposalReports.push(disposition);
+      if (options.foreignRecovery?.disposalBarrier) await new Promise<void>((resolve, reject) => {
+        options.foreignRecovery!.disposalBarrier!.then(resolve, reject);
+        const abort = () => reject(new DOMException("synthetic cancelled disposal", "AbortError"));
+        if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
+      });
+    },
   };
   const blobStore = {
     recoverySnapshot: async () => ({
@@ -146,13 +201,18 @@ function harness(options: {
       entries: [...entries.values()],
     }),
     stageOutbox: async (entry: Record<string, unknown>, blob: Blob) => {
+      if (stageBarrier) await stageBarrier;
       staged.push({ ...entry }); entries.set(String(entry.rawAudioId), entry); blobs.set(String(entry.rawAudioId), blob);
     },
     get: async (id: string) => blobs.get(id), getOutbox: async (id: string) => entries.get(id),
     putOutbox: async (entry: Record<string, unknown>) => entries.set(String(entry.rawAudioId), entry),
     outboxEntries: async () => [...entries.values()],
-    completeOutbox: async (id: string) => { entries.delete(id); blobs.delete(id); },
+    completeOutbox: async (id: string) => {
+      if (options.foreignRecovery?.completionBarrier) await options.foreignRecovery.completionBarrier;
+      entries.delete(id); blobs.delete(id);
+    },
     discardTerminalOutbox: async (entry: { rawAudioId: string }) => {
+      if (options.foreignRecovery?.discardBarrier) await options.foreignRecovery.discardBarrier;
       discarded.push(entry.rawAudioId); entries.delete(entry.rawAudioId); blobs.delete(entry.rawAudioId);
     },
   };
@@ -160,7 +220,7 @@ function harness(options: {
     react: hooks,
     "../apiResponse": { ApiError }, "../apiResponse.ts": { ApiError },
     "../api": { api, getRecoveryDeviceCapability: () => null, removeRecoveryDeviceCapabilityIfMatches: () => false },
-    "../audio/audioDeviceLease": { acquireAudioDeviceLease: async () => ({ release() {}, released: Promise.resolve() }), AudioDeviceLeaseUnavailableError: class extends Error {} },
+    "../audio/audioDeviceLease": { acquireAudioDeviceLease: options.lease?.acquire ?? (async () => ({ release() {}, released: Promise.resolve() })), AudioDeviceLeaseUnavailableError: class extends Error {} },
     "../audio/blobStore": { blobStore }, "../sync/bus": { bus: { post(value: unknown) { broadcasts.push(value); } } },
     "../lib/ids": { newAudioId: () => `raw-synthetic-${staged.length + 1}` },
   };
@@ -187,11 +247,13 @@ function harness(options: {
   render();
   return {
     get view() { return output; }, counters: () => ({ microphoneRequests, mediaStarts, mediaStops, trackStops }),
-    entries, blobs, staged, saved, stream, uploads, discarded, disposalReports, broadcasts,
+    entries, blobs, staged, saved, stream, uploads, discarded, disposalReports, broadcasts, recoverySignals,
+    get recoveryAborted() { return recoveryAborted; },
     deliverStart: (index: number) => startEvents[index]?.(),
     setAuthorization: (value: () => Promise<unknown>) => { auth = value; },
     setStream: (value: () => Promise<unknown>) => { acquireStream = value; },
     holdUpload: (value: Promise<void>) => { uploadBarrier = value; },
+    holdStage: (value: Promise<void>) => { stageBarrier = value; },
     offline: (value: boolean) => { failUpload = value; },
     update: (values: Partial<typeof input>) => { Object.assign(input, values); render(); },
     hide(type = "visibilitychange") {
@@ -212,9 +274,138 @@ function harness(options: {
         await Promise.all([...pendingDigests]);
       }
     },
-    async close() { mounted = false; for (const slot of slots) slot.cleanup?.(); for (let i = 0; i < 30; i += 1) await Promise.resolve(); },
+    remount() {
+      mounted = true;
+      for (const slot of slots) slot.deps = undefined;
+      render();
+    },
+    async close() {
+      mounted = false;
+      for (const slot of slots) { const cleanup = slot.cleanup; slot.cleanup = undefined; cleanup?.(); }
+      for (let i = 0; i < 30; i += 1) await Promise.resolve();
+    },
   };
 }
+
+test("准备页退出会取消慢旧录音恢复，待请求真正结束后交锁给后续录音", async () => {
+  const lease = sharedAudioLease(), upload = deferred<void>(), settled = deferred<void>();
+  const h = harness({ lease, foreignRecovery: {
+    upload: 404, saved: 409, uploadBarrier: upload.promise, abortSettlement: settled.promise,
+  } });
+  await h.flush();
+  const before = JSON.stringify([...h.entries]);
+  await h.close();
+  const next = harness({ lease });
+  try {
+    assert.equal(h.recoveryAborted, true, "退出准备页应主动取消旧恢复请求");
+    await next.flush();
+    assert.equal(lease.releases, 0, "AbortSignal 发出不等于请求已结束，仍须持锁");
+    assert.equal(next.counters().microphoneRequests, 0);
+    settled.resolve(); await h.flush(); await next.flush();
+    assert.equal(lease.releases, 1, "不等待 60 秒上传超时即可完成锁交接");
+    await next.view.startNow(); await next.flush();
+    assert.equal(next.counters().mediaStarts, 1);
+    assert.equal(h.saved.length, 0, "取消后不得继续发起 audioSaved 探测");
+    assert.equal(JSON.stringify([...h.entries]), before);
+    assert.equal(await h.blobs.get("raw-foreign-recovery-0001")?.text(), "synthetic-old-answer");
+  } finally { upload.resolve(); settled.resolve(); await h.flush(); await next.close(); }
+});
+
+test("不响应取消的迟到上传拒绝结束前不交锁，结束后不继续旧恢复链", async () => {
+  const lease = sharedAudioLease(), upload = deferred<void>();
+  const h = harness({ lease, foreignRecovery: {
+    upload: 404, saved: "exact-410", uploadBarrier: upload.promise, ignoreAbort: true,
+  } });
+  await h.flush(); await h.close();
+  try {
+    assert.equal(lease.releases, 0);
+    upload.resolve(); await h.flush();
+    assert.equal(lease.releases, 1);
+    assert.equal(h.saved.length, 0, "迟到 404 不得越过取消围栏继续请求或删除");
+    assert.equal(h.discarded.length, 0); assert.equal(h.entries.size, 1); assert.equal(h.blobs.size, 1);
+  } finally { upload.resolve(); await h.flush(); }
+});
+
+test("退出准备页会取消旧录音元数据核对，保留字节且不继续终态删除", async () => {
+  const lease = sharedAudioLease(), metadata = deferred<void>();
+  const h = harness({ lease, foreignRecovery: { upload: 404, saved: "exact-410", savedBarrier: metadata.promise } });
+  await h.flush(); assert.equal(h.saved.length, 1);
+  await h.close(); await h.flush();
+  try {
+    assert.equal(lease.releases, 1); assert.equal(h.discarded.length, 0);
+    assert.equal(h.entries.size, 1); assert.equal(h.blobs.size, 1);
+  } finally { metadata.resolve(); await h.flush(); }
+});
+
+test("精确终态清理已进入本地事务时，取消后仍等待该事务结束才交锁", async () => {
+  const lease = sharedAudioLease(), discard = deferred<void>();
+  const h = harness({ lease, foreignRecovery: { upload: 404, saved: "exact-410", discardBarrier: discard.promise } });
+  await h.flush(); assert.equal(h.saved.length, 1);
+  await h.close(); await h.flush();
+  try {
+    assert.equal(lease.releases, 0); assert.equal(h.blobs.size, 1);
+    discard.resolve(); await h.flush();
+    assert.equal(lease.releases, 1); assert.equal(h.discarded.length, 1);
+    assert.equal(h.entries.size, 0); assert.equal(h.blobs.size, 0);
+    assert.equal(h.disposalReports.length, 0, "取消后不发起新的 best-effort 治理上报");
+  } finally { discard.resolve(); await h.flush(); }
+});
+
+test("旧副本已精确清理后的治理上报可取消，不能继续占用麦克风锁", async () => {
+  const lease = sharedAudioLease(), report = deferred<void>();
+  const h = harness({ lease, foreignRecovery: { upload: 404, saved: "exact-410", disposalBarrier: report.promise } });
+  await h.flush(); assert.equal(h.disposalReports.length, 1); assert.equal(h.blobs.size, 0);
+  await h.close(); await h.flush();
+  try { assert.equal(lease.releases, 1); assert.equal(h.discarded.length, 1); }
+  finally { report.resolve(); await h.flush(); }
+});
+
+for (const saved of ["receipt", "exact-410"] as const) {
+  test(`StrictMode 取消当前恢复的 ${saved} 本地事务后不留下已删除的重试指针`, async () => {
+    const lease = sharedAudioLease(), completion = deferred<void>();
+    const h = harness({ lease, foreignRecovery: {
+      upload: 404, saved, sessionId: "SIM-LIFECYCLE",
+      ...(saved === "receipt" ? { completionBarrier: completion.promise } : { discardBarrier: completion.promise }),
+    } });
+    await h.flush(); assert.equal(h.saved.length, 1); assert.equal(h.entries.size, 1);
+    await h.close(); h.remount();
+    try {
+      assert.equal(lease.releases, 0);
+      completion.resolve(); await h.flush();
+      assert.equal(h.entries.size, 0); assert.equal(h.blobs.size, 0); assert.equal(lease.releases, 1);
+      if (saved === "receipt") {
+        await h.view.startNow(); await h.flush();
+        assert.equal(h.counters().mediaStarts, 1, "空恢复扫描不能被已删除条目的旧 pendingSave 指针阻断");
+      } else {
+        await h.view.retrySave(); await h.flush();
+        assert.equal(h.saved.length, 1, "精确终态已清理的副本不能从陈旧 pendingSave 再次上传或探测");
+        assert.equal(h.view.blockReason, "terminal-discarded");
+        await h.view.startNow(); await h.flush();
+        assert.equal(h.counters().mediaStarts, 0, "当前场次精确终态不能因空扫描重新开麦");
+        h.update({ sessionId: "SIM-AFTER-TERMINAL" }); await h.flush();
+        await h.view.startNow(); await h.flush();
+        assert.equal(h.counters().mediaStarts, 1, "旧场次终态事实不能阻断独立新场次");
+      }
+    } finally { completion.resolve(); await h.close(); await h.flush(); }
+  });
+}
+
+test("退出时当前录音必须完成本地封存与正在保存的链，不能因取消恢复提前交锁", async () => {
+  const lease = sharedAudioLease(), stage = deferred<void>(), upload = deferred<void>();
+  const h = harness({ lease }); await h.flush();
+  await h.view.startNow(); await h.flush();
+  h.holdStage(stage.promise); h.holdUpload(upload.promise);
+  const saving = h.view.stopAndSave(); await h.flush(); await h.close();
+  try {
+    assert.equal(lease.releases, 0); assert.equal(h.staged.length, 0);
+    stage.resolve(); await h.flush();
+    assert.equal(h.staged.length, 1); assert.equal(h.blobs.size, 1);
+    assert.equal(lease.releases, 0, "当前保存不能被恢复取消策略中断");
+    upload.resolve(); await saving; await h.flush();
+    assert.equal(h.saved.length, 1); assert.equal(h.entries.size, 0); assert.equal(h.blobs.size, 0);
+    assert.equal(lease.releases, 1);
+  } finally { stage.resolve(); upload.resolve(); await h.flush(); }
+});
 
 for (const upload of [404, 409]) {
   test(`人工恢复旧场次上传 ${upload} 后核对精确 410，清理旧副本并允许新场次录音`, async () => {

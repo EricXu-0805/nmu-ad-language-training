@@ -306,6 +306,13 @@ test("failure_stage 闭集成员逐条钉死（与服务端 _ACK_FAILURE_STAGES 
     "media_timeout",
     "fetch_failed",
     "executor_start_failed",
+    "recording_lease",
+    "recording_recovery_snapshot",
+    "recording_recovery_validation",
+    "recording_foreign_drain",
+    "recording_microphone_prepare",
+    "recording_authorization",
+    "recording_native_start",
   ]);
 });
 
@@ -346,6 +353,15 @@ test("failure_stage 非法值被拒、缺省合法、非失败 ACK 不得携带"
   );
   assert.throws(() => parseAutopilotAck({ ...ended, failure_stage: "media_timeout" }));
 });
+
+for (const failureStage of AUTOPILOT_FAILURE_STAGES.filter((stage) => stage.startsWith("recording_"))) {
+  test(`录音准备阶段 ${failureStage} 按封闭失败回执往返`, () => {
+    const ack = buildAutopilotAck(recordCommand(), 2, "evt-rec-failed-stage-0001", {
+      ack_type: "record_failed", error_code: "device_command_timeout", failure_stage: failureStage,
+    });
+    assert.deepEqual(parseAutopilotAck(ack), ack);
+  });
+}
 
 test("JSON response can hydrate a pending current command after refresh", () => {
   const decoded = decodeJsonApiResponse({

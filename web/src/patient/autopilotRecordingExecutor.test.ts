@@ -770,6 +770,7 @@ test("绝对预算在第一项 async bootstrap 之前武装：租约悬挂即判
   harness.advance(PRE_START_BUDGET_MS);
   const error = await capture.started.then(() => null, (reason: unknown) => reason);
   assert.equal((error as AutopilotMediaError).errorCode, "device_command_timeout");
+  assert.equal((error as AutopilotMediaError).failureStage, "recording_lease");
   // 快照、授权、getUserMedia、stage/upload 一次都没发生。
   assert.deepEqual(harness.calls, ["acquireLease"]);
   assert.equal(devices.userMediaCalls, 0);
@@ -1013,6 +1014,7 @@ for (const denial of [
     capture.stopped.catch(() => {});
     const error = await capture.started.then(() => null, (e: unknown) => e);
     assert.equal((error as AutopilotMediaError).errorCode, "recording_start_failed");
+    assert.equal((error as AutopilotMediaError).failureStage, "recording_authorization");
     await capture.closed;
     assert.equal(devices.userMediaCalls, 1);
     assert.deepEqual(harness.calls, ["acquireLease", "recoverySnapshot", "authorize:1"]);
@@ -1022,6 +1024,47 @@ for (const denial of [
     assert.equal(held.releases, 1);
   });
 }
+
+test("已有精确失败阶段与错误原因保留，不被录音阶段覆盖", async (context) => {
+  const clock = clockDouble();
+  const devices = installDeviceDoubles(clock);
+  context.after(() => devices.restore());
+  const cause = new Error("credential changed");
+  const original = new AutopilotMediaError("microphone_denied", "既有授权失败", {
+    cause, failureStage: "credential_rotated",
+  });
+  const harness = bootstrapHarness(clock, { authorize: async () => { throw original; } });
+  const capture = new BrowserAutopilotRecordingExecutor(SESSION, {
+    ownerGeneration: 12, isForeground: () => true, bootstrap: harness.ports,
+  }).start(recordCommand() as never);
+  capture.stopped.catch(() => {});
+  const reported = await capture.started.then(() => null, (reason: unknown) => reason);
+  assert.equal(reported, original);
+  assert.equal((reported as AutopilotMediaError).errorCode, "microphone_denied");
+  assert.equal((reported as AutopilotMediaError).failureStage, "credential_rotated");
+  assert.equal((reported as AutopilotMediaError).cause, cause);
+  await capture.closed;
+});
+
+test("补录音阶段只包装既有错误，错误码、文字及原始原因保持可追溯", async (context) => {
+  const clock = clockDouble();
+  const devices = installDeviceDoubles(clock);
+  context.after(() => devices.restore());
+  const cause = new Error("authorization unavailable");
+  const original = new AutopilotMediaError("device_runtime_failed", "原始错误文字", { cause });
+  const harness = bootstrapHarness(clock, { authorize: async () => { throw original; } });
+  const capture = new BrowserAutopilotRecordingExecutor(SESSION, {
+    ownerGeneration: 13, isForeground: () => true, bootstrap: harness.ports,
+  }).start(recordCommand() as never);
+  capture.stopped.catch(() => {});
+  const reported = await capture.started.then(() => null, (reason: unknown) => reason) as AutopilotMediaError;
+  assert.equal(reported.errorCode, original.errorCode);
+  assert.equal(reported.message, original.message);
+  assert.equal(reported.failureStage, "recording_authorization");
+  assert.equal(reported.cause, original);
+  assert.equal((reported.cause as Error).cause, cause);
+  await capture.closed;
+});
 
 test("真实 onstart 之后、续延恢复之前中断：after_start + exact started，零 listening、零上传", async (context) => {
   const run = await captureAtRealOnstart(context);
@@ -1188,6 +1231,34 @@ function pendingStageHarness(
 }
 
 // 五段全覆盖：第一条 lifecycle 拒绝必须当场挡住下一段。
+for (const [hangAt, failureStage] of [
+  ["lease", "recording_lease"],
+  ["snapshot", "recording_recovery_snapshot"],
+  ["prepare", "recording_microphone_prepare"],
+  ["authorize", "recording_authorization"],
+  ["onstart", "recording_native_start"],
+] as const) {
+  test(`pre-start ${hangAt} 超时冻结实际阶段，迟到结束不改写`, async (context) => {
+    const run = pendingStageHarness(context, hangAt);
+    await run.settleAt();
+    run.harness.advance(PRE_START_BUDGET_MS);
+    const error = await run.capture.started.then(() => null, (reason: unknown) => reason);
+    assert.equal((error as AutopilotMediaError).errorCode, "device_command_timeout");
+    assert.equal((error as AutopilotMediaError).failureStage, failureStage);
+    const stopError = await run.capture.stopped.then(() => null, (reason: unknown) => reason);
+    assert.equal(stopError, error);
+    if (hangAt === "lease") run.late.lease.resolve(run.held.lease);
+    if (hangAt === "snapshot") run.late.snapshot.resolve(EMPTY_SNAPSHOT);
+    if (hangAt === "prepare") run.devices.openUserMedia();
+    if (hangAt === "authorize") run.late.authorize.resolve(AUTHORIZED);
+    await flushMicrotasks();
+    run.held.settleReleased();
+    await run.capture.closed;
+    assert.equal((error as AutopilotMediaError).failureStage, failureStage);
+    assert.deepEqual(run.uploadCalls, []);
+  });
+}
+
 for (const hangAt of [
   "lease", "snapshot", "prepare", "authorize", "onstart",
 ] as const) {
@@ -1889,6 +1960,59 @@ function foreignOutboxEntry(): AudioOutboxEntry {
   }), "user_done");
 }
 
+for (const blockedAt of ["validation", "foreign-drain", "post-drain-snapshot", "post-drain-validation"] as const) {
+  test(`旧录音恢复 ${blockedAt} 超时报告当时阶段，迟到操作不推进开麦`, async (context) => {
+    const clock = clockDouble();
+    const devices = installDeviceDoubles(clock);
+    context.after(() => devices.restore());
+    const entry = foreignOutboxEntry();
+    const snapshot = { ...EMPTY_SNAPSHOT, entries: [entry] };
+    const lateBlob = deferred<Blob>();
+    const lateSnapshot = deferred<AutopilotRecoverySnapshot>();
+    const lateDrain = deferred<void>();
+    let snapshots = 0, reads = 0, drainCalls = 0;
+    const harness = bootstrapHarness(clock, {
+      recoverySnapshot: async () => {
+        snapshots += 1;
+        // Leave less than the soft drain budget, so the shared deadline wins.
+        if (blockedAt === "foreign-drain") clock.set(clock.now() + PRE_START_BUDGET_MS - 1_000);
+        if (blockedAt === "post-drain-snapshot" && snapshots === 2) return lateSnapshot.promise;
+        return snapshot;
+      },
+      readBlob: async () => {
+        reads += 1;
+        if (blockedAt === "validation" || (blockedAt === "post-drain-validation" && reads === 2)) {
+          return lateBlob.promise;
+        }
+        return recordingBlob();
+      },
+      drainForeignOutbox: async () => {
+        drainCalls += 1;
+        if (blockedAt === "foreign-drain") await lateDrain.promise;
+      },
+    });
+    const capture = new BrowserAutopilotRecordingExecutor(SESSION, {
+      ownerGeneration: 20, isForeground: () => true, bootstrap: harness.ports,
+    }).start(recordCommand() as never);
+    capture.stopped.catch(() => {});
+    await pumpUntil(() => blockedAt === "validation" ? reads === 1
+      : blockedAt === "foreign-drain" ? drainCalls === 1
+        : blockedAt === "post-drain-snapshot" ? snapshots === 2 : reads === 2);
+    harness.advance(blockedAt === "foreign-drain" ? 1_000 : PRE_START_BUDGET_MS);
+    const reported = await capture.started.then(() => null, (reason: unknown) => reason) as AutopilotMediaError;
+    assert.equal(reported.errorCode, "device_command_timeout");
+    assert.equal(reported.failureStage, blockedAt === "foreign-drain" ? "recording_foreign_drain"
+      : blockedAt === "post-drain-snapshot" ? "recording_recovery_snapshot" : "recording_recovery_validation");
+    await capture.closed;
+    lateBlob.resolve(recordingBlob());
+    lateSnapshot.resolve(snapshot);
+    lateDrain.resolve();
+    await flushMicrotasks();
+    assert.equal(devices.userMediaCalls, 0);
+    assert.ok(!harness.calls.includes("authorize:1"));
+  });
+}
+
 test("开麦前清旧账：别的场次的条目先清、再重拍快照，清干净后照常授权开麦", async (context) => {
   const clock = clockDouble();
   const devices = installDeviceDoubles(clock);
@@ -2023,6 +2147,7 @@ for (const boundary of [
     capture.stopped.catch(() => {});
     const error = await capture.started.then(() => null, (reason: unknown) => reason);
     assert.equal((error as AutopilotMediaError).errorCode, "recording_start_failed");
+    assert.equal((error as AutopilotMediaError).failureStage, "recording_recovery_validation");
     assert.equal(devices.userMediaCalls, 0);
     assert.ok(!harness.calls.includes("authorize:1"));
     if (boundary !== "corrupt-after-drain") assert.equal(drained, false);

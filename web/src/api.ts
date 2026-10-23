@@ -527,6 +527,7 @@ async function req<T>(method: string, path: string, body?: unknown,
   if (opts?.signal?.aborted) abortFromCaller();
   else opts?.signal?.addEventListener("abort", abortFromCaller, { once: true });
   const timeout = window.setTimeout(() => {
+    if (controller.signal.aborted) return;
     timedOut = true;
     controller.abort();
   }, timeoutMs);
@@ -552,6 +553,7 @@ async function req<T>(method: string, path: string, body?: unknown,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     const text = await res.text();
+    if (opts?.signal?.aborted) throw new DOMException("请求已取消", "AbortError");
     if (!res.ok && opts?.device && !opts?.silentDeviceAuthFailure) {
       handleDeviceAuthorizationFailure(res.status, text, credential ?? undefined);
     }
@@ -1331,19 +1333,19 @@ export const api = {
         activeFallback: kind === "audioSaved",
         signal,
       }),
-  putAudioSaved: (payload: object) => req<{
+  putAudioSaved: (payload: object, signal?: AbortSignal) => req<{
     seq: number;
     audioReceipt: { serverSeq: number; rawAudioId: string; idempotent: boolean };
   }>("PUT", "/live/state", { kind: "audioSaved", payload }, DEFAULT_REQUEST_TIMEOUT_MS,
-    { device: true, deviceSessionId: payloadSessionId(payload), allowRecovery: true, activeFallback: true }),
+    { device: true, deviceSessionId: payloadSessionId(payload), allowRecovery: true, activeFallback: true, signal }),
   // 本地副本删除回执(收据 144):payload=410 detail 原样回显。best-effort,
   // 调用方吞错;与 audioSaved 同走 allowRecovery(410 常到达于场次离开 LiveState 后)。
-  putAudioDisposalConfirmed: (payload: object) => req<{
+  putAudioDisposalConfirmed: (payload: object, signal?: AbortSignal) => req<{
     code: string; rawAudioId: string; duplicate: boolean;
   }>("PUT", "/live/state", { kind: "audioDisposalConfirmed", payload },
     3_500,
     { device: true, deviceSessionId: payloadSessionId(payload),
-      allowRecovery: true, activeFallback: true, silentDeviceAuthFailure: true }),
+      allowRecovery: true, activeFallback: true, silentDeviceAuthFailure: true, signal }),
   // 老人端最小在场上报；服务端校验 session 与 screen，且只用服务器时间判在线。
   patientHeartbeat: (body: PatientHeartbeatRequest) =>
     req<PatientHeartbeatResponse>("POST", "/live/patient-heartbeat", body,
@@ -1365,7 +1367,7 @@ export const api = {
     req<ExportResult>("GET", `/exports/${encodeURIComponent(batchId)}`),
 
   // 音频闸门
-  createAudio: (body: { raw_audio_id: string; turn_key: string; session_id?: string | null; is_reliability_sample?: boolean; contains_direct_identifier?: boolean; recording_wseq?: number }) =>
+  createAudio: (body: { raw_audio_id: string; turn_key: string; session_id?: string | null; is_reliability_sample?: boolean; contains_direct_identifier?: boolean; recording_wseq?: number }, signal?: AbortSignal) =>
     req<{ raw_audio_id: string; registered: true }>("POST", "/audio", body, DEFAULT_REQUEST_TIMEOUT_MS, {
       device: true,
       deviceSessionId: body.session_id ?? undefined,
@@ -1374,6 +1376,7 @@ export const api = {
       // 有效凭据可用;登记撞 409 device_session_mismatch 后走 audioSaved 探测,服务端
       // 才有机会按收据 255 给 410 作废。否则 captured 阶段的旧账无凭据可发,永远清不掉。
       activeFallback: true,
+      signal,
     }),
   audioExport: (id: string) => req<AudioAsset>("POST", `/audio/${encodeURIComponent(id)}/export`),
   audioChecksum: (id: string) => req<AudioAsset>("POST", `/audio/${encodeURIComponent(id)}/checksum`),
@@ -1381,9 +1384,17 @@ export const api = {
   getAudio: (id: string) => req<AudioAsset>("GET", `/audio/${encodeURIComponent(id)}`),
   // 音频原件先落自有服务器；老人端录完即传，checksum 闸门据此真校验。
   // 若随后调用云 ASR，后端会把该音频另行交第三方处理。
-  uploadAudioBlob: async (id: string, blob: Blob, sessionId: string) => {
+  uploadAudioBlob: async (id: string, blob: Blob, sessionId: string, signal?: AbortSignal) => {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 60_000);
+    let timedOut = false;
+    const abortFromCaller = () => controller.abort(signal?.reason);
+    if (signal?.aborted) abortFromCaller();
+    else signal?.addEventListener("abort", abortFromCaller, { once: true });
+    const timeout = window.setTimeout(() => {
+      if (controller.signal.aborted) return;
+      timedOut = true;
+      controller.abort();
+    }, 60_000);
     try {
       // 旧场次孤儿录音也要能走到 409 → audioSaved 探测那一步,不能在 401 上就断掉。
       const credential = selectDeviceCredential(sessionId, true, true);
@@ -1398,15 +1409,19 @@ export const api = {
         },
       });
       const text = await res.text();
+      if (signal?.aborted) throw new DOMException("音频上传已取消", "AbortError");
       if (!res.ok) handleDeviceAuthorizationFailure(res.status, text, credential);
       return decodeJsonApiResponse({ status: res.status, ok: res.ok, statusText: res.statusText, text }) as {
         raw_audio_id: string; bytes: number; checksum: string; format: string;
       };
     } catch (error) {
-      if (controller.signal.aborted) throw new ApiError(408, "音频上传超时，本机副本已保留，请检查连接后重试");
+      if (timedOut) throw new ApiError(408, "音频上传超时，本机副本已保留，请检查连接后重试");
+      if (signal?.aborted) throw signal.reason instanceof Error
+        ? signal.reason : new DOMException("音频上传已取消", "AbortError");
       throw apiNetworkError(error);
     } finally {
       window.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abortFromCaller);
     }
   },
   // 原始声纹 GET 在启用 PIN 时受保护；原生 <audio src> 无法携带自定义请求头，
