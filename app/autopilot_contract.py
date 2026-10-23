@@ -43,6 +43,13 @@ _ACK_FAILURE_STAGES = frozenset({
     "media_timeout",
     "fetch_failed",
     "executor_start_failed",
+    "recording_lease",
+    "recording_recovery_snapshot",
+    "recording_recovery_validation",
+    "recording_foreign_drain",
+    "recording_microphone_prepare",
+    "recording_authorization",
+    "recording_native_start",
 })
 
 VAD_VOICED_MS_MAX = 600_000

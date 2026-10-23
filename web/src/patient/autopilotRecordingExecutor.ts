@@ -23,6 +23,7 @@ import {
 } from "./autopilotCaptureWindow.ts";
 import {
   AUTOPILOT_MIME_TYPES,
+  type AutopilotFailureStage,
   type AutopilotMimeType,
   type AutopilotStopReason,
   type NextCommandProjection,
@@ -58,6 +59,7 @@ import {
 import type { VoiceActivityWindows } from "./autopilotVoiceActivity.ts";
 
 type RecordCommand = Extract<NextCommandProjection, { kind: "record" }>;
+type RecordingPreStartFailureStage = Extract<AutopilotFailureStage, `recording_${string}`>;
 type RecordStoppedFacts = Awaited<AutopilotRecordingCapture["stopped"]>;
 
 function exactAutopilotMime(value: string | null): AutopilotMimeType {
@@ -353,6 +355,9 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
   private voiceActivity: VoiceActivityObservation | null = null;
   private readonly voiceActivityPlan: CaptureVoiceActivityPlan;
   private preStartDeadline: CaptureDeadline | null = null;
+  private preStartStage: RecordingPreStartFailureStage = "recording_lease";
+  // Freeze the winning stage before abort/cleanup can deliver another rejection.
+  private preStartFailureStage: RecordingPreStartFailureStage | null = null;
   // prepare() 底下的 getUserMedia 可能在判死之后才交出 MediaStream。留住这条
   // Promise，cleanup 才能在 dispose() 之后等它落地——不等就等于在那条流还在
   // 路上时就宣布"麦克风不可能再出声"。
@@ -454,8 +459,9 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
     this.outcome = "lifecycle_failure";
     // 阶段判据取 Recorder 自己的单调事实，并且在丢弃之前就把它冻结下来。
     const started = this.freezeStartFact();
-    const error = new AutopilotMediaError(
+    const lifecycleError = new AutopilotMediaError(
       "device_runtime_failed", "页面已离开前台，本次录音已被丢弃");
+    const error = started ? lifecycleError : this.withPreStartFailureStage(lifecycleError);
     this.lifecycleError = error;
     this.abortController.abort(error);
     // 先取快照、先交出所有权，再去碰两个可能抛错的定时器端口。
@@ -638,19 +644,35 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
 
   private async stage<T>(
     deadline: CaptureDeadline,
+    failureStage: RecordingPreStartFailureStage,
     open: () => Promise<T>,
     observe: (operation: Promise<T>) => void,
   ): Promise<T> {
     this.assertStageAdmissible(deadline);
-    const operation = open();
-    // 观察者必须先于 race 挂上：迟到的 resolve/reject 都要有人接。
-    observe(operation);
-    const value = await Promise.race([
-      deadline.race(operation),
-      this.lifecycleDeferred.promise,
-    ]);
-    this.assertStageAdmissible(deadline);
-    return value;
+    this.preStartStage = failureStage;
+    try {
+      const operation = open();
+      // 观察者必须先于 race 挂上：迟到的 resolve/reject 都要有人接。
+      observe(operation);
+      const value = await Promise.race([
+        deadline.race(operation),
+        this.lifecycleDeferred.promise,
+      ]);
+      this.assertStageAdmissible(deadline);
+      return value;
+    } catch (error) {
+      this.preStartFailureStage ??= failureStage;
+      throw error;
+    }
+  }
+
+  private withPreStartFailureStage(error: AutopilotMediaError): AutopilotMediaError {
+    this.preStartFailureStage ??= this.preStartStage;
+    if (error.failureStage !== undefined) return error;
+    return new AutopilotMediaError(error.errorCode, error.message, {
+      cause: error,
+      failureStage: this.preStartFailureStage,
+    });
   }
 
   private async run(): Promise<void> {
@@ -670,6 +692,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         setTimer: (callback, delayMs) => this.bootstrap.setTimer(callback, delayMs),
         clearTimer: (handle) => this.bootstrap.clearTimer(handle),
         failClosed: (reason) => {
+          this.preStartFailureStage ??= this.preStartStage;
           this.abortController.abort(reason);
           this.recorder.cancelPendingStart();
           this.recorder.discardActive();
@@ -682,6 +705,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         // 的锁永远没人释放，下一个页面再也开不了麦。
         this.lease = await this.stage(
           deadline,
+          "recording_lease",
           () => this.bootstrap.acquireLease(this.abortController.signal),
           (acquisition) => {
             leaseDelivery = acquisition.then(
@@ -693,6 +717,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         // 2/5 恢复快照。不交付任何本地设备资源：迟到只需隔离，closed 不必等它。
         let snapshot = await this.stage(
           deadline,
+          "recording_recovery_snapshot",
           () => this.bootstrap.recoverySnapshot(),
           isolateLateSettlement,
         );
@@ -700,6 +725,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         // Validate before recovery can mutate an entry, then validate what remains.
         await this.stage(
           deadline,
+          "recording_recovery_validation",
           () => assertForeignRecordingSnapshot(snapshot, this.sessionId,
             this.command.payload.raw_audio_id, (rawId) => this.bootstrap.readBlob(rawId)),
           isolateLateSettlement,
@@ -715,16 +741,19 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
           isolateLateSettlement(drain);
           await this.stage(
             deadline,
+            "recording_foreign_drain",
             () => this.withSoftBudget(drain, FOREIGN_DRAIN_SOFT_BUDGET_MS),
             isolateLateSettlement,
           );
           snapshot = await this.stage(
             deadline,
+            "recording_recovery_snapshot",
             () => this.bootstrap.recoverySnapshot(),
             isolateLateSettlement,
           );
           await this.stage(
             deadline,
+            "recording_recovery_validation",
             () => assertForeignRecordingSnapshot(snapshot, this.sessionId,
               this.command.payload.raw_audio_id, (rawId) => this.bootstrap.readBlob(rawId)),
             isolateLateSettlement,
@@ -741,6 +770,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         // 不需要服务器授权:prepare() 绝不调 MediaRecorder.start()。
         const prepared = await this.stage(
           deadline,
+          "recording_microphone_prepare",
           () => this.recorder.prepare(),
           (operation) => {
             this.preparePromise = operation;
@@ -760,6 +790,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         // 不再从老人的 14 秒作答窗口里扣，也不会留下一段没人知道的隐性录音。
         const postPermissionAuthorization = await this.stage(
           deadline,
+          "recording_authorization",
           () => admitCaptureBeforeDeadline(
             this.bootstrap.authorize(
               this.sessionId,
@@ -781,6 +812,7 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
         // 只是真实 onstart 事件。
         const startedReal = await this.stage(
           deadline,
+          "recording_native_start",
           () => this.recorder.startPrepared(),
           isolateLateSettlement,
         );
@@ -898,8 +930,9 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
               "录音过程未正常结束",
               { cause: error },
             ));
-      if (!this.didStart) this.rejectStarted(mapped);
-      this.stoppedDeferred.reject(mapped);
+      const reported = phase === "starting" ? this.withPreStartFailureStage(mapped) : mapped;
+      if (!this.didStart) this.rejectStarted(reported);
+      this.stoppedDeferred.reject(reported);
       try {
         if (this.recorder.active) this.recorder.discardActive();
       } catch { /* 设备层已不可用；dispose 与 Recorder 内部的断引用仍会跑 */ }

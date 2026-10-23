@@ -111,6 +111,7 @@ export function useVoxRecorder(opts: {
   // 恢复扫描完成前不许开新麦；有效旧场次副本独立保留，当前场次待保存录音继续阻断。
   const outboxReady = useRef(false);
   const outboxRecovery = useRef<Promise<void> | null>(null);
+  const outboxRecoveryController = useRef<AbortController | null>(null);
   // Web Locks is the only cross-tab ownership primitive. A JS-only fallback
   // would recreate the exact split-brain race this lease is meant to prevent.
   const deviceLease = useRef<AudioDeviceLease | null>(null);
@@ -151,6 +152,7 @@ export function useVoxRecorder(opts: {
     maxRecordingMs, requireRecordingWseq = false,
   } = opts;
   const sessionUiFence = useRef<AudioRecoveryUiFence>({ sessionId, generation: 0 });
+  const terminalDiscardFence = useRef<AudioRecoveryUiFence | null>(null);
   if (sessionUiFence.current.sessionId !== sessionId) {
     sessionUiFence.current = {
       sessionId,
@@ -264,9 +266,18 @@ export function useVoxRecorder(opts: {
 
   const commitPending = useCallback(async (
     pending: PendingSave,
-    options: { broadcastSaved?: boolean } = {},
+    options: { broadcastSaved?: boolean; signal?: AbortSignal } = {},
   ): Promise<AudioSavedFinalizationOutcome> => {
     const operationUiFence = { ...sessionUiFence.current };
+    // Recovery may hand ownership to the automatic recorder. Cancellation must
+    // settle its current await before releasing the lease, and no later request
+    // or local mutation may begin after that cancellation. Active saves have no
+    // signal: stop → durable stage → commit still drains in full on unmount.
+    const assertActive = () => {
+      if (options.signal?.aborted) throw options.signal.reason instanceof Error
+        ? options.signal.reason : new DOMException("录音恢复已取消", "AbortError");
+    };
+    assertActive();
     if (!deviceLease.current) throw new Error("未持有录音设备锁，拒绝保存");
     if (!pending.blob || pending.blob.size !== pending.entry.blobBytes
         || (pending.blob.type || "audio/webm") !== pending.entry.mimeType) {
@@ -277,7 +288,9 @@ export function useVoxRecorder(opts: {
       // blob + 恢复元数据同事务封存；刷新后仍能从相同阶段继续。
       try {
         await blobStore.stageOutbox(pending.entry, pending.blob);
+        assertActive();
       } catch (stageError) {
+        assertActive();
         // IndexedDB 事务已提交但页面在收到 oncomplete 前关闭时，重试会撞 add。
         // 只有元数据和实际 blob 哈希都完全相同才认作幂等恢复。
         const existingEntry = await blobStore.getOutbox(pending.rawAudioId);
@@ -290,10 +303,12 @@ export function useVoxRecorder(opts: {
         pending.entry = existingEntry;
         pending.blob = existingBlob;
       }
+      assertActive();
       pending.localSaved = true;
     }
 
     const finalize = async (checksum: string): Promise<AudioSavedFinalizationOutcome> => {
+      assertActive();
       const blob = pending.blob;
       if (!blob) throw new Error("录音终态核对缺少本机字节");
       const saved = buildAudioSavedPayload(pending.entry, checksum);
@@ -304,7 +319,7 @@ export function useVoxRecorder(opts: {
           saved,
           // Evaluate after the network/IndexedDB awaits, not before them: a late
           // S2 receipt must not emit into a newly active S3 generation.
-          broadcastSaved: () => mountedRef.current
+          broadcastSaved: () => !options.signal?.aborted && mountedRef.current
             && (options.broadcastSaved ?? true)
             && recoveryMayMutateActiveUi(
               operationUiFence,
@@ -313,13 +328,17 @@ export function useVoxRecorder(opts: {
             ),
         },
         {
-          putAudioSaved: (payload) => api.putAudioSaved(payload),
-          completeServerSaved: (response) => completeAudioOutboxAfterServerAck(
-            response,
-            pending.rawAudioId,
-            () => blobStore.completeOutbox(pending.rawAudioId),
-          ).then(() => undefined),
+          putAudioSaved: (payload) => { assertActive(); return api.putAudioSaved(payload, options.signal); },
+          completeServerSaved: (response) => {
+            assertActive();
+            return completeAudioOutboxAfterServerAck(
+              response,
+              pending.rawAudioId,
+              () => { assertActive(); return blobStore.completeOutbox(pending.rawAudioId); },
+            ).then(() => undefined);
+          },
           discardTerminalOutbox: async (disposition) => {
+            assertActive();
             // The component owns the origin-wide Web Lock until shutdown drains
             // this operation. Re-check immediately before the destructive call.
             if (!deviceLease.current) throw new Error("录音锁已释放，拒绝终态本机清理");
@@ -332,13 +351,22 @@ export function useVoxRecorder(opts: {
             catch { /* BroadcastChannel/localStorage hint is best effort */ }
           },
           // 治理回执:本地删除已完成后如实上报;finalize 内部吞错,永不阻断终态。
-          reportLocalCopyDisposal: (disposition) =>
-            api.putAudioDisposalConfirmed(disposition).then(() => undefined),
+          reportLocalCopyDisposal: (disposition) => {
+            assertActive();
+            return api.putAudioDisposalConfirmed(disposition, options.signal).then(() => undefined);
+          },
         },
       );
+      // A local completion transaction begun before cancellation still owns
+      // the lease until it settles. Finish its in-memory bookkeeping as well,
+      // so StrictMode cannot retain a retry pointer to bytes already removed.
       pending.blob = null;
       pending.localSaved = false;
       if (pendingSave.current === pending) pendingSave.current = null;
+      if (outcome.kind === "terminal-discarded" && recoveryMayMutateActiveUi(
+        operationUiFence, sessionUiFence.current, pending.meta.sessionId,
+      )) terminalDiscardFence.current = operationUiFence;
+      assertActive();
       if (pending.meta.sessionId !== sessionUiFence.current.sessionId) {
         // The session may have changed while the request was in flight. If this
         // was the last local item for that old session, prune only its exact
@@ -347,6 +375,7 @@ export function useVoxRecorder(opts: {
         if (recoveryCredential) {
           try {
             const remainingEntries = await blobStore.outboxEntries();
+            assertActive();
             if (pending.meta.sessionId !== sessionUiFence.current.sessionId
                 && !remainingEntries.some((entry) => entry.sessionId === pending.meta.sessionId)) {
               removeRecoveryDeviceCapabilityIfMatches(recoveryCredential);
@@ -354,6 +383,7 @@ export function useVoxRecorder(opts: {
           } catch { /* stale recovery credential expires naturally; active UI stays isolated */ }
         }
       }
+      assertActive();
       const mayAffectActiveUi = recoveryMayMutateActiveUi(
         operationUiFence,
         sessionUiFence.current,
@@ -375,7 +405,9 @@ export function useVoxRecorder(opts: {
     const probeTerminalMetadataAfterRefusal = async (): Promise<AudioSavedFinalizationOutcome> => {
       // Exactly one metadata outcome call per eligible refusal. There is no recursion or
       // status-poll loop; any non-2xx other than exact 410 preserves the bytes.
+      assertActive();
       const checksum = await sha256Blob(pending.blob as Blob);
+      assertActive();
       return finalize(checksum);
     };
 
@@ -383,7 +415,9 @@ export function useVoxRecorder(opts: {
     // Re-uploading first would turn a lost ACK + later withdrawal into a loop.
     if (pending.entry.phase === "uploaded") {
       if (!pending.entry.checksum) throw new Error("已上传录音缺少本机 checksum 收据");
-      if (await sha256Blob(pending.blob) !== pending.entry.checksum) {
+      const checksum = await sha256Blob(pending.blob);
+      assertActive();
+      if (checksum !== pending.entry.checksum) {
         throw new Error("已上传录音的本机字节与 outbox checksum 不一致");
       }
       return finalize(pending.entry.checksum);
@@ -393,21 +427,26 @@ export function useVoxRecorder(opts: {
       // POST /audio 对完全相同的登记是服务端幂等的；409 只代表字段冲突，绝不由 PIN
       // 旁路读取元数据后自行猜测成功。
       try {
+        assertActive();
         await api.createAudio({
           raw_audio_id: pending.rawAudioId,
           session_id: pending.meta.sessionId,
           turn_key: pending.meta.turnKey,
           contains_direct_identifier: pending.meta.containsDirectIdentifier,
           ...(pending.meta.recordingWseq === undefined ? {} : { recording_wseq: pending.meta.recordingWseq }),
-        });
+        }, options.signal);
+        assertActive();
       } catch (error) {
+        assertActive();
         if (error instanceof ApiError && error.status === 409) {
           return probeTerminalMetadataAfterRefusal();
         }
         throw error;
       }
+      assertActive();
       pending.entry = advanceAudioOutbox(pending.entry, "registered");
       await blobStore.putOutbox(pending.entry);
+      assertActive();
       pending.registered = true;
     }
 
@@ -415,11 +454,14 @@ export function useVoxRecorder(opts: {
       if (!pending.blob) throw new Error("待上传录音缺少本机字节");
       // 这里必须 await 且不得吞错。receipt 必须证明服务端保存的是同一份字节。
       const localChecksum = await sha256Blob(pending.blob);
+      assertActive();
       let receipt: unknown;
       try {
         receipt = await api.uploadAudioBlob(
-          pending.rawAudioId, pending.blob, pending.meta.sessionId);
+          pending.rawAudioId, pending.blob, pending.meta.sessionId, options.signal);
+        assertActive();
       } catch (error) {
+        assertActive();
         // The upload route conceals assets bound to an older session with 404.
         // Only the exact metadata disposition may authorize local disposal.
         if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
@@ -438,6 +480,7 @@ export function useVoxRecorder(opts: {
       pending.entry = advanceAudioOutbox(
         pending.entry, "uploaded", { checksum: localChecksum });
       await blobStore.putOutbox(pending.entry);
+      assertActive();
       pending.uploaded = true;
     }
     if (!pending.entry.checksum) throw new Error("已上传录音缺少本机 checksum 收据");
@@ -451,11 +494,19 @@ export function useVoxRecorder(opts: {
     outboxReady.current = false;
     const lockedSessionId = sessionId;
     const recoveryUiFence = { ...sessionUiFence.current };
+    const hasTerminalDisposition = () => terminalDiscardFence.current !== null
+      && recoveryMayMutateActiveUi(terminalDiscardFence.current, sessionUiFence.current, lockedSessionId);
+    const controller = new AbortController();
+    outboxRecoveryController.current = controller;
+    const assertActive = () => {
+      if (controller.signal.aborted) throw new DOMException("录音恢复已取消", "AbortError");
+    };
     const recovery = (async () => {
       let terminalDiscarded = false;
       const usedRecoveryCredentials = new Map<string, NonNullable<ReturnType<typeof getRecoveryDeviceCapability>>>();
       try {
         const snapshot = await blobStore.recoverySnapshot();
+        assertActive();
         if (snapshot.invalidBlobKeyCount > 0) {
           if (mountedRef.current && recoveryMayMutateActiveUi(
             recoveryUiFence, sessionUiFence.current, lockedSessionId)) setBlockReason("storage-invalid");
@@ -475,8 +526,8 @@ export function useVoxRecorder(opts: {
         if (entries.length === 0) {
           if (recoveryMayMutateActiveUi(
             recoveryUiFence, sessionUiFence.current, lockedSessionId)) {
-            outboxReady.current = true;
-            if (mountedRef.current) setBlockReason(null);
+            outboxReady.current = !hasTerminalDisposition();
+            if (mountedRef.current) setBlockReason(hasTerminalDisposition() ? "terminal-discarded" : null);
           }
           return;
         }
@@ -492,6 +543,7 @@ export function useVoxRecorder(opts: {
         savingRef.current = true;
         try {
           for (const entry of entries) {
+            assertActive();
             const isForeign = entry.sessionId !== lockedSessionId;
             if (isForeign) {
               const recoveryCredential = getRecoveryDeviceCapability(entry.sessionId);
@@ -500,6 +552,7 @@ export function useVoxRecorder(opts: {
               }
             }
             const blob = await blobStore.get(entry.rawAudioId);
+            assertActive();
             if (!blob || blob.size !== entry.blobBytes
                 || (blob.type || "audio/webm") !== entry.mimeType
                 || (entry.phase === "uploaded" && await sha256Blob(blob) !== entry.checksum)) {
@@ -507,6 +560,7 @@ export function useVoxRecorder(opts: {
                 recoveryUiFence, sessionUiFence.current, lockedSessionId)) setBlockReason("storage-invalid");
               return;
             }
+            assertActive();
             const pending = pendingFromOutbox(entry, blob);
             // The active retry slot belongs only to this session. A refused
             // older session remains durable in IndexedDB, never in this slot.
@@ -519,7 +573,9 @@ export function useVoxRecorder(opts: {
             try {
               const outcome = await commitPending(pending, {
                 broadcastSaved: shouldBroadcastRecoveredAudio(entry, lockedSessionId),
+                signal: controller.signal,
               });
+              assertActive();
               if (outcome.kind === "terminal-discarded" && recoveryMayMutateActiveUi(
                 recoveryUiFence, sessionUiFence.current, entry.sessionId)) terminalDiscarded = true;
               const remaining = (remainingBySession.get(entry.sessionId) ?? 1) - 1;
@@ -532,6 +588,7 @@ export function useVoxRecorder(opts: {
                 if (credential) {
                   try {
                     const remainingEntries = await blobStore.outboxEntries();
+                    assertActive();
                     if (!remainingEntries.some((candidate) => candidate.sessionId === entry.sessionId)) {
                       removeRecoveryDeviceCapabilityIfMatches(credential);
                       usedRecoveryCredentials.delete(entry.sessionId);
@@ -540,6 +597,7 @@ export function useVoxRecorder(opts: {
                 }
               }
             } catch {
+              if (controller.signal.aborted) return;
               // Refusal never authorizes deletion. A structurally verified
               // foreign copy can stay in IndexedDB without blocking a distinct
               // session; only its own session may retry it through the UI.
@@ -557,6 +615,7 @@ export function useVoxRecorder(opts: {
           // Re-read under the same origin lease before pruning old credentials.
           // Exact-token removal is silent and cannot blank the active session.
           const after = await blobStore.recoverySnapshot();
+          assertActive();
           if (after.invalidBlobKeyCount > 0) {
             if (mountedRef.current && recoveryMayMutateActiveUi(
               recoveryUiFence, sessionUiFence.current, lockedSessionId)) setBlockReason("storage-invalid");
@@ -576,6 +635,7 @@ export function useVoxRecorder(opts: {
           // retained bytes again before allowing an unrelated capture.
           for (const entry of after.entries) {
             const blob = await blobStore.get(entry.rawAudioId);
+            assertActive();
             if (!blob || blob.size !== entry.blobBytes
                 || (blob.type || "audio/webm") !== entry.mimeType
                 || (entry.phase === "uploaded" && await sha256Blob(blob) !== entry.checksum)) {
@@ -584,6 +644,7 @@ export function useVoxRecorder(opts: {
               return;
             }
           }
+          assertActive();
           if (after.entries.some((entry) => entry.sessionId === lockedSessionId)) {
             if (mountedRef.current && recoveryMayMutateActiveUi(
               recoveryUiFence, sessionUiFence.current, lockedSessionId)) setBlockReason("pending-other-session");
@@ -591,7 +652,7 @@ export function useVoxRecorder(opts: {
           }
           if (recoveryMayMutateActiveUi(
             recoveryUiFence, sessionUiFence.current, lockedSessionId)) {
-            if (terminalDiscarded) {
+            if (terminalDiscarded || hasTerminalDisposition()) {
               outboxReady.current = false;
               if (mountedRef.current) setBlockReason("terminal-discarded");
             } else {
@@ -604,6 +665,7 @@ export function useVoxRecorder(opts: {
           if (mountedRef.current) setSaving(false);
         }
       } catch {
+        if (controller.signal.aborted) return;
         // IndexedDB 不可用、条目被篡改或网络失败都保持 fail-closed；pending 若已恢复可人工重试。
         if (mountedRef.current && recoveryMayMutateActiveUi(
           recoveryUiFence, sessionUiFence.current, lockedSessionId)) {
@@ -620,6 +682,7 @@ export function useVoxRecorder(opts: {
     })();
     const tracked = recovery.finally(() => {
       if (outboxRecovery.current === tracked) outboxRecovery.current = null;
+      if (outboxRecoveryController.current === controller) outboxRecoveryController.current = null;
       // 极少数情况下切场发生在旧场次恢复未完成时；旧任务退场后主动唤醒新场次扫描。
       if (mountedRef.current && latest.current.sessionId !== lockedSessionId) {
         setOutboxRecoveryEpoch((value) => value + 1);
@@ -1071,13 +1134,15 @@ export function useVoxRecorder(opts: {
     };
   }, [invalidateStart]);
   shutdownRef.current = async () => {
+    const recorder = recRef.current;
+    outboxRecoveryController.current?.abort();
     outboxReady.current = false;
     startGeneration.current += 1;
     activePermit.current = null;
     activeKind.current = null;
-    recRef.current.cancelPendingStart();
+    recorder.cancelPendingStart();
     clearRecordingLimit();
-    if (recRef.current.active) await stopRef.current();
+    if (recorder.active) await stopRef.current();
     while (saveOperation.current || outboxRecovery.current) {
       const save = saveOperation.current;
       const recovery = outboxRecovery.current;
@@ -1085,7 +1150,7 @@ export function useVoxRecorder(opts: {
       if (saveOperation.current === save) saveOperation.current = null;
       if (outboxRecovery.current === recovery) outboxRecovery.current = null;
     }
-    recRef.current.dispose();
+    recorder.dispose();
   };
   useEffect(() => {
     const rec = recRef.current;

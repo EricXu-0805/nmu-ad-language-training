@@ -144,6 +144,13 @@ def test_failure_stage_membership_is_pinned():
         "media_timeout",
         "fetch_failed",
         "executor_start_failed",
+        "recording_lease",
+        "recording_recovery_snapshot",
+        "recording_recovery_validation",
+        "recording_foreign_drain",
+        "recording_microphone_prepare",
+        "recording_authorization",
+        "recording_native_start",
     })
 
 
@@ -188,6 +195,31 @@ def test_failure_stage_outside_closed_set_is_rejected():
             error_code="audio_playback_failed",
             failure_stage="invented_stage",
         )
+
+
+@pytest.mark.parametrize("failure_stage", [
+    "recording_lease",
+    "recording_recovery_snapshot",
+    "recording_recovery_validation",
+    "recording_foreign_drain",
+    "recording_microphone_prepare",
+    "recording_authorization",
+    "recording_native_start",
+])
+def test_recording_prestart_stage_is_retained_in_failure_payload(failure_stage):
+    staged = AutopilotAckIn(
+        idempotency_key="ack-rec-failed-stage-1",
+        ack_type="record_failed",
+        control_generation=1,
+        runner_generation=1,
+        command_revision=0,
+        device_event_seq=1,
+        error_code="device_command_timeout",
+        failure_stage=failure_stage,
+    )
+    assert staged.event_payload() == {
+        "error_code": "device_command_timeout", "failure_stage": failure_stage,
+    }
 
 
 def test_non_failure_ack_cannot_carry_failure_stage():
