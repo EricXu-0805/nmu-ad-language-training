@@ -18,7 +18,8 @@ set -euo pipefail
 HOST="eric@147.182.176.237"
 REMOTE_DIR="/home/eric/.openclaw/workspace/nmu-probe"
 CRONTAB_BASE_SHA="31d8f685282856fe53ec4688d344aadc9dd9a564e313347a0c74b5af7c26b4d7"
-HEARTBEAT_BASE_SHA="8d478629ba2bc0bc0d3ab26df85c6b6ee1ceb674d414b1507f34b8a6ca2ca9be"
+# heartbeat.py 不进版本库、好几个会话直接在 VPS 上改;基线换成 10-09 那一版(10-27 核过插入干净)。
+HEARTBEAT_BASE_SHA="11973860deeff36636497ca5bbb77222c040bcf961db66ceed9ac636358a2f0a"
 DAILY_CHANNEL_ID="1490232840397389894"
 GOOD_URL="https://89-208-253-119.sslip.io/health"
 # 不存在的 /health* 路径:SPA 外壳回 200 + HTML,探针判 body_mismatch。上线脚本的
@@ -285,7 +286,7 @@ if [ "$have" != "$want" ]; then
     echo "  heartbeat.py 里已经有 check_nmu_probe"
     exit 3
   fi
-  echo "  ✗ heartbeat.py 不是基线(基线 ${want:0:16}…,现在 ${have:0:16}…):09-22 之后被改过,先对一下改了什么,停"
+  echo "  ✗ heartbeat.py 不是基线(基线 ${want:0:16}…,现在 ${have:0:16}…):基线之后又被改过,先对一下改了什么、换基线再来,停"
   exit 1
 fi
 staged="${hb}.nmu-probe.new"

@@ -1277,7 +1277,7 @@ def test_the_installer_pins_the_baselines_the_brief_measured():
     assert _constant("CRONTAB_BASE_SHA") == (
         "31d8f685282856fe53ec4688d344aadc9dd9a564e313347a0c74b5af7c26b4d7")
     assert _constant("HEARTBEAT_BASE_SHA") == (
-        "8d478629ba2bc0bc0d3ab26df85c6b6ee1ceb674d414b1507f34b8a6ca2ca9be")
+        "11973860deeff36636497ca5bbb77222c040bcf961db66ceed9ac636358a2f0a")
     assert _constant("DAILY_CHANNEL_ID") == "1490232840397389894"
     assert _constant("HOST") == "eric@147.182.176.237"
     assert _constant("REMOTE_DIR") == str(probe.DIR)
