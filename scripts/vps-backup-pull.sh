@@ -162,7 +162,7 @@ cleanup() {
       mv "$CURRENT_STAGE" "$rejected/payload" 2>/dev/null
     fi
   fi
-  rm -f -- "$LOCK_DIR/ssh-stderr"
+  rm -f -- "$LOCK_DIR/ssh-stderr" "$LOCK_DIR/rsync-stderr"
   if [ "$rc" -ne 0 ] && [ "$SUMMARY_WRITTEN" -eq 0 ]; then
     # 预检/连接阶段也必须有终态，不能伪装成 ok/partial。尚未完成全轮校验时
     # snapshots 不报一个貌似已核实的数量；pulled 只计已完整验证并发布的快照。
@@ -221,9 +221,50 @@ SSH_ARGS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes
   -o ServerAliveInterval=15 -o ServerAliveCountMax=2)
 RSYNC_SSH="ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
 
-# 只重试已识别的 SSH 传输中断；认证、主机密钥、远端命令失败和未知错误
-# 仍直接失败。输出先隔离，失败尝试的半截 stdout 不得混进事实校验输入。
-# stderr 只在持锁私有临时文件中分类，不写原文到日志或通知，避免泄露路径/标识。
+# SSH 探测和 rsync 共用脱敏分类。10/12 只说明 socket/protocol 失败，必须再有
+# 明确的暂时网络错误；30/35 本身就是 rsync 的数据/连接超时。所有类别都先拒绝
+# 认证、密钥、配置、文件/完整性错误，绝不因同时出现 "connection closed" 而放行。
+# 只返回固定标签；原始 stderr 只能留在持锁私有临时文件，不能进入日志/通知。
+classify_transport_failure() {
+  local transport="$1" rc="$2" error_file="$3"
+  local reason retryable=0
+  if [ "$transport" = ssh ]; then
+    reason=remote_command_failed
+    if [ "$rc" -ne 255 ]; then
+      printf '%s 0\n' "$reason"
+      return
+    fi
+    reason=ssh_error_unclassified
+  else
+    reason=rsync_error_unclassified
+    case "$rc" in
+      10|12|30|35|255) : ;;
+      *) printf '%s 0\n' "$reason"; return ;;
+    esac
+  fi
+  if LC_ALL=C grep -Eqi 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|No .* host key is known' "$error_file"; then
+    reason=host_key_verification
+  elif LC_ALL=C grep -Eqi 'Permission denied|Too many authentication failures|No supported authentication methods' "$error_file"; then
+    reason=authentication
+  elif LC_ALL=C grep -Eqi 'Bad configuration option|Bad owner or permissions|no matching (host key type|key exchange method)|Identity file .* not accessible' "$error_file"; then
+    reason=ssh_configuration
+  elif [ "$transport" = rsync ] && LC_ALL=C grep -Eqi 'command not found|rsync: not found|protocol version mismatch|protocol incompatibility|unknown option|unrecognized option|invalid (option|argument)|No such file or directory|No space left on device|Read-only file system|Input/output error|verification failed|checksum mismatch|corrupt' "$error_file"; then
+    reason=rsync_nontransport_failure
+  elif { [ "$transport" = rsync ] && { [ "$rc" -eq 30 ] || [ "$rc" -eq 35 ]; }; } \
+       || LC_ALL=C grep -Eqi '(Connection|Operation) timed out|Timeout, server .* not responding|Connection to .* timed out' "$error_file"; then
+    reason=transport_timeout
+    retryable=1
+  elif LC_ALL=C grep -Eqi 'Connection (reset|closed|refused)|Broken pipe' "$error_file"; then
+    reason=transport_disconnected
+    retryable=1
+  elif LC_ALL=C grep -Eqi 'No route to host|Network is (unreachable|down)|Temporary failure in name resolution' "$error_file"; then
+    reason=network_unavailable
+    retryable=1
+  fi
+  printf '%s %s\n' "$reason" "$retryable"
+}
+
+# 输出先隔离，失败尝试的半截 stdout 不得混进事实校验输入。
 remote_ssh() {
   local code="$1" stamp="$2" command="$3"
   local attempt=1 max_attempts=3 rc output reason retryable delay
@@ -240,30 +281,45 @@ remote_ssh() {
     else
       rc=$?
     fi
-    reason=remote_command_failed
-    retryable=0
-    if [ "$rc" -eq 255 ]; then
-      reason=ssh_error_unclassified
-      if LC_ALL=C grep -Eqi 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|No .* host key is known' "$error_file"; then
-        reason=host_key_verification
-      elif LC_ALL=C grep -Eqi 'Permission denied|Too many authentication failures|No supported authentication methods' "$error_file"; then
-        reason=authentication
-      elif LC_ALL=C grep -Eqi 'Bad configuration option|Bad owner or permissions|no matching (host key type|key exchange method)|Identity file .* not accessible' "$error_file"; then
-        reason=ssh_configuration
-      elif LC_ALL=C grep -Eqi '(Connection|Operation) timed out|Timeout, server .* not responding|Connection to .* timed out' "$error_file"; then
-        reason=transport_timeout
-        retryable=1
-      elif LC_ALL=C grep -Eqi 'Connection (reset|closed|refused)|Broken pipe' "$error_file"; then
-        reason=transport_disconnected
-        retryable=1
-      elif LC_ALL=C grep -Eqi 'No route to host|Network is (unreachable|down)|Temporary failure in name resolution' "$error_file"; then
-        reason=network_unavailable
-        retryable=1
-      fi
-    fi
+    read -r reason retryable <<< "$(classify_transport_failure ssh "$rc" "$error_file")"
     rm -f -- "$error_file"
     if [ "$retryable" -ne 1 ] || [ "$attempt" -ge "$max_attempts" ]; then
       note "FAIL code=$code$snapshot_suffix rc=$rc reason=$reason attempts=$attempt"
+      return "$rc"
+    fi
+    delay=2
+    [ "$attempt" -eq 1 ] || delay=5
+    note "retry code=$code$snapshot_suffix rc=$rc reason=$reason attempt=$attempt max_attempts=$max_attempts delay_seconds=$delay"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+}
+
+remote_rsync() {
+  local code="$1" stamp="$2"
+  shift 2
+  local attempt=1 max_attempts=3 rc reason retryable delay
+  local error_file="$LOCK_DIR/rsync-stderr" snapshot_suffix=""
+  [ -z "$stamp" ] || snapshot_suffix=" snapshot=$stamp"
+  while :; do
+    # 重试可能留下已完成文件，不能用 size+mtime 快检信任它们；每次都按内容比较。
+    # 后续 manifest/结构/语义/锚点校验与不可变发布仍全部执行。
+    if LC_ALL=C rsync --checksum "$@" >/dev/null 2>"$error_file"; then
+      rm -f -- "$error_file"
+      if [ "$attempt" -gt 1 ]; then
+        note "recovered code=$code$snapshot_suffix attempts=$attempt"
+      fi
+      return 0
+    else
+      rc=$?
+    fi
+    read -r reason retryable <<< "$(classify_transport_failure rsync "$rc" "$error_file")"
+    rm -f -- "$error_file"
+    if [ "$retryable" -ne 1 ] || [ "$attempt" -ge "$max_attempts" ]; then
+      note "FAIL code=$code$snapshot_suffix rc=$rc reason=$reason attempts=$attempt"
+      # 3/4/5 是备份自身的配额/partial/held 状态，不能把 rsync 的同值
+      # 文件选择/不支持操作/协议启动错误误当成已处理；日志保留原码，整体硬失败。
+      case "$rc" in 3|4|5) return 2 ;; esac
       return "$rc"
     fi
     delay=2
@@ -601,16 +657,16 @@ pull_one_snapshot() {
   # 只先拉固定名称、硬上限的 manifest。严格解析器生成 0600 allowlist；
   # 第二次 rsync 只读取 manifest 覆盖的精确路径，不递归接收 probe 后注入的
   # file/dir flood。预取 manifest 保留在 staging，不允许第二次被远端替换。
-  if rsync -a -x --no-links --no-devices --no-specials \
+  if remote_rsync manifest_transfer_failed "$stamp" \
+       -a -x --no-links --no-devices --no-specials \
        --max-size="$MAX_MANIFEST_BYTES" \
        --timeout=60 -e "$RSYNC_SSH" \
        "$REMOTE:$REMOTE_ROOT/daily/$stamp/MANIFEST.sha256" \
-       "$stage/MANIFEST.sha256" >/dev/null 2>&1; then
+       "$stage/MANIFEST.sha256"; then
     :
   else
     compare_rc=$?
     FAIL_CODE="manifest_transfer_failed"
-    note "FAIL code=$FAIL_CODE snapshot=$stamp rc=$compare_rc"
     return "$compare_rc"
   fi
   if [ ! -f "$stage/MANIFEST.sha256" ] || [ -L "$stage/MANIFEST.sha256" ]; then
@@ -694,17 +750,17 @@ PY
   basis=$(find "$DAILY" -mindepth 1 -maxdepth 1 -type d -name "$SNAP_GLOB" -print \
     | LC_ALL=C sort | tail -n 1)
   if [ -s "$CURRENT_DATA_ALLOWLIST" ]; then
-    if rsync -a -x --no-links --no-devices --no-specials --no-implied-dirs \
+    if remote_rsync snapshot_transfer_failed "$stamp" \
+         -a -x --no-links --no-devices --no-specials --no-implied-dirs \
          --max-size="$MAX_SNAPSHOT_BYTES" \
-         ${basis:+--checksum} ${basis:+"--copy-dest=$basis"} \
+         ${basis:+"--copy-dest=$basis"} \
          --from0 --files-from="$CURRENT_DATA_ALLOWLIST" \
          --chmod=Du=rwx,Dgo=,Fu=rw,Fgo= --timeout=120 -e "$RSYNC_SSH" \
-         "$REMOTE:$REMOTE_ROOT/daily/$stamp/" "$stage/" >/dev/null 2>&1; then
+         "$REMOTE:$REMOTE_ROOT/daily/$stamp/" "$stage/"; then
       :
     else
       compare_rc=$?
       FAIL_CODE="snapshot_transfer_failed"
-      note "FAIL code=$FAIL_CODE snapshot=$stamp rc=$compare_rc"
       return "$compare_rc"
     fi
   fi
@@ -867,14 +923,14 @@ done < <(printf '%s\n' "$REMOTE_SNAPSHOTS" | LC_ALL=C sort -ru)
 REMOTE_LOG_STAGE=$(mktemp "$INCOMING/backup.log.XXXXXX")
 CURRENT_STAGE="$REMOTE_LOG_STAGE"
 CURRENT_STAMP="backup-log"
-if rsync -a --no-links --no-devices --no-specials --max-size=10485760 \
+if remote_rsync remote_log_transfer_failed "" \
+     -a --no-links --no-devices --no-specials --max-size=10485760 \
      --timeout=60 -e "$RSYNC_SSH" \
-     "$REMOTE:$REMOTE_ROOT/backup.log" "$REMOTE_LOG_STAGE" >/dev/null 2>&1; then
+     "$REMOTE:$REMOTE_ROOT/backup.log" "$REMOTE_LOG_STAGE"; then
   :
 else
   rc=$?
   FAIL_CODE="remote_log_transfer_failed"
-  note "FAIL code=$FAIL_CODE rc=$rc"
   exit "$rc"
 fi
 [ -f "$REMOTE_LOG_STAGE" ] && [ ! -L "$REMOTE_LOG_STAGE" ] || {

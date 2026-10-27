@@ -105,12 +105,74 @@ set -a
 . '$ROOT/config.env'
 set +a
 cd '$ROOT/runtime'
-# 只报**本轮**写的行。2026-08-26 链断那次,tail -5 端出来的全是 8-22 起每晚一模一样的
-# 稳态 held 项,真因(audit_anchor_check_failed)排在第 1 行、被挤出了消息。
-log_before=\$(wc -l < '$ROOT/offsite/pull.log' 2>/dev/null || echo 0)
-rc=0
-./scripts/vps-backup-pull.sh || rc=\$?
-this_run=\$(sed -n "\$((log_before + 1)),\\\$p" '$ROOT/offsite/pull.log' 2>/dev/null || true)
+# wrapper 锁覆盖等待补跑的间隙，避免两份通知读取混杂的尝试日志。
+# 异常杀死留下的锁仍须人工核实，不猜测删除。
+runner_lock='$ROOT/.run-pull.lock'
+if ! mkdir "\$runner_lock" 2>/dev/null; then
+  echo '异地拉取入口已在运行或遗留锁待核实' >&2
+  # SIGKILL/重启可能留下锁；不能每次都静默退出而让定时备份永久停摆。
+  # 不往正在运行者的 pull.log 插行，不猜测破锁，沿用原运维失败通知。
+  if [ -f '$ROOT/ops-webhook.env' ]; then
+    '$ROOT/venv/bin/python' ./scripts/notify_ops.py \\
+      --env-file '$ROOT/ops-webhook.env' \\
+      --message '异地备份入口锁占用：任务可能仍在运行，或有遗留锁。请核实进程及 .run-pull.lock；本次未拉取、未自动删除锁。' || true
+  fi
+  exit 75
+fi
+trap 'rmdir "\$runner_lock" 2>/dev/null || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# 空闲时保持本次任务运行；不会阻止合盖休眠或主动唤醒电脑。
+# 等待/进程在休眠期间可能暂停，恢复后继续。最多额外补跑一次，绝不无限循环。
+round=1
+while :; do
+  attempt_before=\$(wc -l < '$ROOT/offsite/pull.log' 2>/dev/null || echo 0)
+  rc=0
+  if command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -i ./scripts/vps-backup-pull.sh || rc=\$?
+  else
+    ./scripts/vps-backup-pull.sh || rc=\$?
+  fi
+  attempt_log=\$(sed -n "\$((attempt_before + 1)),\\\$p" '$ROOT/offsite/pull.log' 2>/dev/null || true)
+  if [ "\$rc" -eq 0 ]; then
+    if [ "\$round" -gt 1 ]; then
+      printf '[%s] wrapper_recovered attempts=%s\\n' "\$(date '+%F %T')" "\$round" >> '$ROOT/offsite/pull.log'
+    fi
+    break
+  fi
+  [ "\$round" -lt 2 ] || break
+  case "\$rc" in
+    10|12|30|35|255) : ;;
+    *) break ;;
+  esac
+  # 本次的每一条 FAIL 都必须是已分类的暂时传输故障；早先出现的 legacy、
+  # conflict、校验失败不能因后来网络失败而被第二轮的成功掩盖。
+  if ! printf '%s\\n' "\$attempt_log" | awk -v expected_rc="\$rc" '
+    / FAIL / {
+      count++; code=""; reason=""; fail_rc="";
+      for (i=1;i<=NF;i++) {
+        if (\$i ~ /^code=/) code=\$i;
+        if (\$i ~ /^reason=/) reason=\$i;
+        if (\$i ~ /^rc=/) fail_rc=\$i;
+      }
+      if (code !~ /^code=(remote_snapshot_list_failed|remote_snapshot_facts_failed|remote_snapshot_reprobe_failed|remote_log_probe_failed|manifest_transfer_failed|snapshot_transfer_failed|remote_log_transfer_failed)\$/ ||
+          reason !~ /^reason=(transport_timeout|transport_disconnected|network_unavailable)\$/ ||
+          fail_rc !~ /^rc=(10|12|30|35|255)\$/) invalid=1;
+    }
+    / failed snapshots=unverified / {
+      footer=0;
+      for (i=1;i<=NF;i++) if (\$i == "rc=" expected_rc) footer=1;
+    }
+    END {exit(count == 0 || invalid || !footer)}'; then
+    break
+  fi
+  printf '[%s] wrapper_retry reason=transient_transport attempt=%s max_attempts=2 delay_seconds=60\\n' "\$(date '+%F %T')" "\$round" >> '$ROOT/offsite/pull.log'
+  sleep 60
+  round=\$((round + 1))
+done
+# 两轮原始失败都保留在日志里；通知只汇总最后一次，防同code的新原因被旧样例遮住。
+this_run="\$attempt_log"
 fail_lines=\$(printf '%s\\n' "\$this_run" | grep ' FAIL ' || true)
 fail_count=\$(printf '%s\\n' "\$this_run" | grep -c ' FAIL ' || true)
 # 只端「第一条 FAIL」不行:盘上常驻若干份等人工处置的 legacy 快照,每轮都各写一行
@@ -119,7 +181,8 @@ fail_count=\$(printf '%s\\n' "\$this_run" | grep -c ' FAIL ' || true)
 by_code=\$(printf '%s\\n' "\$fail_lines" | awk '/ FAIL /{c="code=?"; for (i=1;i<=NF;i++) if (\$i ~ /^code=/) c=\$i; n[c]++} END {for (k in n) printf "  %s x%d\\n", k, n[k]}' | sort || true)
 examples=\$(printf '%s\\n' "\$fail_lines" | awk '/ FAIL /{c="code=?"; for (i=1;i<=NF;i++) if (\$i ~ /^code=/) c=\$i; if (!seen[c]++) print "  " \$0}' | head -6 || true)
 summary=\$(printf '%s\\n' "\$this_run" | grep -E ' (ok|partial|failed) snapshots=' | tail -1 || true)
-detail="本轮 FAIL \${fail_count} 条,按 code 分:
+detail="整轮尝试 \${round} 次（最多 2 次）。
+本轮 FAIL \${fail_count} 条,按 code 分:
 \${by_code:-  (无)}
 每种一条样例:
 \${examples:-  (无)}

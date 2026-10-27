@@ -307,6 +307,268 @@ exec "$SSH_TEST_STATE/ssh-success" "$@"
     return stubs
 
 
+def _inject_rsync_failure(env: dict[str, str], *, phase: str, failures: int,
+                          error: str, rc: int = 255, after_copy: bool = False) -> Path:
+    stubs = Path(env["PATH"].split(":", 1)[0])
+    (stubs / "rsync").rename(stubs / "rsync-success")
+    env.update({
+        "RSYNC_FAIL_PHASE": phase, "RSYNC_FAIL_COUNT": str(failures),
+        "RSYNC_FAIL_RC": str(rc), "RSYNC_FAIL_ERROR": error,
+        "RSYNC_FAIL_AFTER_COPY": "1" if after_copy else "0",
+        "RSYNC_TEST_STATE": str(stubs),
+    })
+    _make_executable(stubs / "sleep", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$RSYNC_TEST_STATE/sleeps.log"
+''')
+    _make_executable(stubs / "rsync", r'''#!/bin/bash
+set -euo pipefail
+src_index=$(($# - 1))
+src=${!src_index}
+dst=${!#}
+case "$src" in
+  */MANIFEST.sha256) phase=manifest ;;
+  */backup.log) phase=log ;;
+  */) phase=payload ;;
+  *) exit 96 ;;
+esac
+printf '%s\n' "$*" >> "$RSYNC_TEST_STATE/rsync-attempts.log"
+count_file="$RSYNC_TEST_STATE/$phase.count"
+count=0
+[ ! -f "$count_file" ] || read -r count < "$count_file"
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+if [ "$phase" = "$RSYNC_FAIL_PHASE" ] && [ "$count" -le "$RSYNC_FAIL_COUNT" ]; then
+  if [ "$RSYNC_FAIL_AFTER_COPY" = 1 ]; then
+    "$RSYNC_TEST_STATE/rsync-success" "$@"
+    if [ "${RSYNC_POISON_RESIDUE:-}" = 1 ] && [ "$phase" = payload ]; then
+      "$PYTHON_BIN" -I - "$dst/audio/aud-test.webm" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+target = Path(sys.argv[1])
+meta = target.stat()
+target.write_bytes(b"x" * meta.st_size)
+os.utime(target, ns=(meta.st_atime_ns, meta.st_mtime_ns))
+PY
+    fi
+  fi
+  printf '%s\n' 'PARTIAL-UNTRUSTED-RSYNC-STDOUT'
+  printf '%s\n' "$RSYNC_FAIL_ERROR" >&2
+  exit "$RSYNC_FAIL_RC"
+fi
+exec "$RSYNC_TEST_STATE/rsync-success" "$@"
+''')
+    return stubs
+
+
+_RSYNC_PHASE_CODES = [
+    ("manifest", "manifest_transfer_failed"),
+    ("payload", "snapshot_transfer_failed"),
+    ("log", "remote_log_transfer_failed"),
+]
+
+
+@pytest.mark.parametrize(("phase", "code"), _RSYNC_PHASE_CODES)
+def test_pull_retries_rsync_transport_then_completes_verified_snapshot(tmp_path, phase, code):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, stamp)
+    stubs = _inject_rsync_failure(env, phase=phase, failures=2,
+                                 error="Connection reset by peer PRIVATE-ID", after_copy=True)
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == 0, completed.stderr
+    assert (stubs / f"{phase}.count").read_text().strip() == "3"
+    assert (stubs / "sleeps.log").read_text().splitlines() == ["2", "5"]
+    log = (local / "pull.log").read_text()
+    assert log.count(f"retry code={code}") == 2
+    assert f"recovered code={code}" in log and "attempts=3" in log
+    assert " FAIL " not in log
+    assert " ok snapshots=1 pulled=1 unchanged=0" in log.splitlines()[-1]
+    assert "PRIVATE-ID" not in log + completed.stdout + completed.stderr
+    assert "PARTIAL-UNTRUSTED" not in log + completed.stdout + completed.stderr
+    assert stamp in (local / "audit-anchors.log").read_text()
+    assert (local / "daily" / stamp / "MANIFEST.sha256").is_file()
+    assert (local / "backup.log").read_bytes() == (remote / "backup.log").read_bytes()
+    assert not (local / ".pull.lock").exists()
+    assert not list((local / ".incoming").iterdir())
+    assert not list((local / "quarantine").iterdir())
+    for arguments in (stubs / "rsync-attempts.log").read_text().splitlines():
+        assert "--checksum" in arguments.split()
+        assert "StrictHostKeyChecking=yes" in arguments
+
+
+@pytest.mark.parametrize(("phase", "code"), _RSYNC_PHASE_CODES)
+def test_pull_exhausted_rsync_retries_preserve_archives_and_report_progress(tmp_path, phase, code):
+    project, remote, local, env = _pull_harness(tmp_path)
+    older = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d-%H%M%S")
+    newer = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, older, b"retained-recording")
+    assert _run_pull(project, env).returncode == 0
+    old_archive = local / "daily" / older
+    before = {p.relative_to(old_archive): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in old_archive.rglob("*") if p.is_file()}
+    anchors_before = (local / "audit-anchors.log").read_bytes()
+    old_log = (local / "backup.log").read_bytes()
+    log_before = (local / "pull.log").read_text()
+    _create_remote_snapshot(remote, newer)
+    (remote / "backup.log").write_text("new remote log\n")
+    stubs = _inject_rsync_failure(env, phase=phase, failures=20,
+                                 error="Connection timed out PRIVATE-ID", after_copy=True)
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == 255
+    assert (stubs / f"{phase}.count").read_text().strip() == "3"
+    assert (stubs / "sleeps.log").read_text().splitlines() == ["2", "5"]
+    log = (local / "pull.log").read_text()[len(log_before):]
+    assert log.count(" FAIL ") == 1
+    assert f"FAIL code={code}" in log
+    assert "reason=transport_timeout attempts=3" in log
+    progress = "pulled=1 unchanged=1" if phase == "log" else "pulled=0 unchanged=0"
+    assert f"failed snapshots=unverified {progress} rc=255" in log.splitlines()[-1]
+    assert "PRIVATE-ID" not in log + completed.stdout + completed.stderr
+    assert "PARTIAL-UNTRUSTED" not in log + completed.stdout + completed.stderr
+    assert not (local / ".pull.lock").exists()
+    assert not list((local / ".incoming").iterdir())
+    assert list((local / "quarantine").iterdir())
+    after = {p.relative_to(old_archive): hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in old_archive.rglob("*") if p.is_file()}
+    assert before == after
+    assert (local / "backup.log").read_bytes() == old_log
+    if phase == "log":
+        assert (local / "daily" / newer).is_dir()
+        assert (local / "audit-anchors.log").read_bytes().startswith(anchors_before)
+    else:
+        assert not (local / "daily" / newer).exists()
+        assert (local / "audit-anchors.log").read_bytes() == anchors_before
+
+
+@pytest.mark.parametrize(("phase", "code"), _RSYNC_PHASE_CODES)
+@pytest.mark.parametrize(("error", "reason"), [
+    ("Permission denied (publickey). Connection closed PRIVATE-ID", "authentication"),
+    ("Host key verification failed. Connection closed PRIVATE-ID", "host_key_verification"),
+    ("Bad configuration option: PRIVATE-ID", "ssh_configuration"),
+    ("unrecognized PRIVATE-ID", "rsync_error_unclassified"),
+])
+def test_pull_permanent_or_unknown_rsync_failure_does_not_retry_or_leak(
+        tmp_path, phase, code, error, reason):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, stamp)
+    stubs = _inject_rsync_failure(env, phase=phase, failures=20, error=error)
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == 255
+    assert (stubs / f"{phase}.count").read_text().strip() == "1"
+    assert not (stubs / "sleeps.log").exists()
+    log = (local / "pull.log").read_text()
+    assert log.count(" FAIL ") == 1 and f"FAIL code={code}" in log
+    assert f"reason={reason} attempts=1" in log
+    assert "failed snapshots=unverified" in log.splitlines()[-1]
+    assert "PRIVATE-ID" not in log + completed.stdout + completed.stderr
+    assert "PARTIAL-UNTRUSTED" not in log + completed.stdout + completed.stderr
+    assert not (local / ".pull.lock").exists()
+    assert not list((local / ".incoming").iterdir())
+    assert (local / "daily" / stamp).exists() is (phase == "log")
+
+
+@pytest.mark.parametrize(("rc", "error", "reason", "retry"), [
+    (10, "Connection refused PRIVATE-ID", "transport_disconnected", True),
+    (12, "Broken pipe PRIVATE-ID", "transport_disconnected", True),
+    (30, "PRIVATE-ID", "transport_timeout", True),
+    (35, "PRIVATE-ID", "transport_timeout", True),
+    (255, "Network is unreachable PRIVATE-ID", "network_unavailable", True),
+    (10, "unrecognized PRIVATE-ID", "rsync_error_unclassified", False),
+    (12, "connection unexpectedly closed PRIVATE-ID", "rsync_error_unclassified", False),
+    (12, "rsync: command not found; Broken pipe PRIVATE-ID", "rsync_nontransport_failure", False),
+    (12, "protocol version mismatch; Connection closed PRIVATE-ID", "rsync_nontransport_failure", False),
+    (30, "Permission denied; Connection timed out PRIVATE-ID", "authentication", False),
+    (35, "Host key verification failed PRIVATE-ID", "host_key_verification", False),
+    (255, "checksum mismatch; Broken pipe PRIVATE-ID", "rsync_nontransport_failure", False),
+    (23, "Connection timed out PRIVATE-ID", "rsync_error_unclassified", False),
+    (3, "Error selecting input/output file PRIVATE-ID", "rsync_error_unclassified", False),
+    (4, "Requested action not supported PRIVATE-ID", "rsync_error_unclassified", False),
+    (5, "Error starting client-server protocol PRIVATE-ID", "rsync_error_unclassified", False),
+])
+def test_pull_rsync_exit_codes_require_confirmed_transport_failure(
+        tmp_path, rc, error, reason, retry):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, stamp)
+    stubs = _inject_rsync_failure(env, phase="manifest", failures=1, error=error, rc=rc)
+
+    completed = _run_pull(project, env)
+
+    expected_rc = 0 if retry else 2 if rc in (3, 4, 5) else rc
+    assert completed.returncode == expected_rc, completed.stderr
+    assert (stubs / "manifest.count").read_text().strip() == ("2" if retry else "1")
+    log = (local / "pull.log").read_text()
+    assert f"reason={reason}" in log
+    assert ("recovered code=manifest_transfer_failed" in log) is retry
+    if not retry:
+        assert f"rc={rc} reason={reason}" in log
+        assert "failed snapshots=unverified" in log.splitlines()[-1]
+    assert "PRIVATE-ID" not in log + completed.stdout + completed.stderr
+    assert not (local / ".pull.lock").exists()
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+def test_pull_rsync_retry_rechecks_same_size_mtime_residue_with_real_rsync(tmp_path):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    _create_remote_snapshot(remote, stamp, b"good-audio")
+    stubs = _inject_rsync_failure(env, phase="payload", failures=1,
+                                 error="Broken pipe", after_copy=True)
+    # Use the actual rsync engine with local paths; no SSH/network is involved.
+    env["REAL_RSYNC"] = shutil.which("rsync") or "rsync"
+    env["REAL_RSYNC_PATH"] = os.environ.get("PATH", "/usr/bin:/bin")
+    env["RSYNC_POISON_RESIDUE"] = "1"
+    _make_executable(stubs / "rsync-success", r'''#!/bin/bash
+set -euo pipefail
+args=()
+while [ "$#" -gt 2 ]; do
+  if [ "$1" = -e ]; then shift 2
+  else args+=("$1"); shift
+  fi
+done
+remote_path=${1#*:}
+relative=${remote_path#"$NMU_BACKUP_REMOTE_ROOT"}
+# The local rsync receiver also resolves rsync via PATH; keep it out of the shim.
+exec env PATH="$REAL_RSYNC_PATH" "$REAL_RSYNC" "${args[@]}" "$FAKE_REMOTE_ROOT$relative" "$2"
+''')
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode == 0, completed.stderr
+    assert (local / "daily" / stamp / "audio" / "aud-test.webm").read_bytes() == b"good-audio"
+    assert (stubs / "payload.count").read_text().strip() == "2"
+    assert "recovered code=snapshot_transfer_failed" in (local / "pull.log").read_text()
+    assert not (local / ".pull.lock").exists()
+
+
+@pytest.mark.parametrize(("phase", "code"), _RSYNC_PHASE_CODES[:2])
+def test_pull_rsync_recovery_does_not_bypass_manifest_integrity(tmp_path, phase, code):
+    project, remote, local, env = _pull_harness(tmp_path)
+    stamp = (datetime.now() - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    snapshot = _create_remote_snapshot(remote, stamp)
+    (snapshot / "audio" / "aud-test.webm").write_bytes(b"wrong")
+    _inject_rsync_failure(env, phase=phase, failures=1, error="Broken pipe")
+
+    completed = _run_pull(project, env)
+
+    assert completed.returncode != 0
+    log = (local / "pull.log").read_text()
+    assert f"recovered code={code}" in log
+    assert "FAIL code=snapshot_verify_failed" in log
+    assert "retry code=snapshot_verify_failed" not in log
+    assert not (local / "daily" / stamp).exists()
+    assert list((local / "quarantine").iterdir())
+
+
 @pytest.mark.parametrize(("phase", "start", "code"), [
     ("list", 1, "remote_snapshot_list_failed"),
     ("facts", 1, "remote_snapshot_facts_failed"),
