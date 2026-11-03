@@ -1992,10 +1992,6 @@ def _projection_for_state(
         db, command, selected, expected_capability=expected_capability)
 
 
-def _default_bank() -> content.ItemBank:
-    return content.load_item_bank_for_week(2)
-
-
 def _session_week_bank(db: Session, session_id: str) -> content.ItemBank:
     """Default bank resolution follows the session's own training week.
 

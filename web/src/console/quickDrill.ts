@@ -8,11 +8,11 @@ import { WEEK2_SINGLE20_DEMO_PROFILE_VERSION } from "../autopilot/demoProfile.ts
 
 // 快速演练:把研究规范流程的「建档 → 创建安排 → 审核 → 原子开场」四步,对**模拟档案**折叠成一键。
 // ★关键不变量:不新增、不绕过任何服务端门禁——依旧逐步调用 /visit-plans 的 create/approve/start,
-// 每个场次照样进计划账本、照样受数据分区与「当前仅第2周正式训练可开场」约束
-// (server: visit_plan_operational_issues 只放行这一档)。与规范多步流程的唯一区别是把
+// 每个场次照样进计划账本、照样受数据分区与服务端开场准入约束
+// (server: visit_plan_operational_issues 放行第 2–8 周正式训练与第 1 周关系建立)。与规范多步流程的唯一区别是把
 // 给操作端做流程测试的点击折叠成一次。仅供模拟演练;真实受试者永远走规范多步流程。
 
-// 当前唯一具备可执行床旁协议合同、可被审核并原子开场的垂直。
+// 准入放行 2–8 周,演练有意固定第 2 周:唯一的模拟演练档案(week2-single20-demo)只为第 2 周定版。
 const QUICK_DRILL_WEEK = 2;
 const QUICK_DRILL_PHASE: VisitPlanCreateRequest["phase_type"] = "正式训练";
 const QUICK_DRILL_EVENT: VisitPlanCreateRequest["event_line"] = "正式训练";
