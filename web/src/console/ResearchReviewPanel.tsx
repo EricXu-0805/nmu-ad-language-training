@@ -25,6 +25,7 @@ export function ResearchReviewPanel({
   rawAudioIdsByTurnKey = {},
   onUpsertTurn,
   onChanged,
+  onJournalStale,
 }: {
   plan: SessionPlan;
   turns: Record<string, JournalTurn>;
@@ -37,6 +38,7 @@ export function ResearchReviewPanel({
     patch: Partial<JournalTurn> & Pick<JournalTurn, "turnId" | "responseRole">,
   ) => void;
   onChanged?: () => void;
+  onJournalStale?: () => void;
 }) {
   return (
     <section className="form-section">
@@ -82,6 +84,7 @@ export function ResearchReviewPanel({
                     rawAudioId={rawAudioIdsByTurnKey[turnKey(item.item_id, planned.turn_seq)]}
                     onUpsertTurn={onUpsertTurn}
                     onChanged={onChanged}
+                    onJournalStale={onJournalStale}
                   />
                 ))}
               </div>
@@ -107,6 +110,7 @@ function ReviewTurnRow({
   rawAudioId,
   onUpsertTurn,
   onChanged,
+  onJournalStale,
 }: {
   itemId: string;
   taskType: string;
@@ -125,6 +129,7 @@ function ReviewTurnRow({
     patch: Partial<JournalTurn> & Pick<JournalTurn, "turnId" | "responseRole">,
   ) => void;
   onChanged?: () => void;
+  onJournalStale?: () => void;
 }) {
   const toast = useToast();
   const [confirmed, setConfirmed] = useState(row?.confirmedText ?? row?.asrText ?? "");
@@ -227,7 +232,7 @@ function ReviewTurnRow({
         // 服务端已明确拒绝这一版：丢弃待决键并刷新权威 journal，
         // 绝不在前端猜测“可能已保存”。网络模糊失败则保留键供精确重试。
         confirmationRequestRef.current = null;
-        onChanged?.();
+        onJournalStale?.();
       }
       throw error;
     }
@@ -326,7 +331,15 @@ function ReviewTurnRow({
         element_value: Number(scoreOption.value),
       };
       assertPortraitFree(payload as unknown as Record<string, unknown>);
-      const updated = await api.lockTurn(turn.turnId, payload);
+      const updated = await api.lockTurn(turn.turnId, payload).catch((error: unknown) => {
+        // 409 是服务端的明确拒绝（如另一处已锁分）：收起确认框并刷新权威 journal，
+        // 否则界面停在旧的“待人工复核”，每次重试都再撞 409。
+        if (error instanceof ApiError && error.status === 409) {
+          setConfirmLock(false);
+          onJournalStale?.();
+        }
+        throw error;
+      });
       onUpsertTurn(itemId, turnSeq, {
         turnId: turn.turnId,
         responseRole: role,

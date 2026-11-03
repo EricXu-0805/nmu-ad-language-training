@@ -597,6 +597,10 @@ export function SessionWrapupScreen({
           rawAudioIdsByTurnKey={rawAudioIdsByTurnKey}
           onUpsertTurn={upsertTurn}
           onChanged={() => setScoresRetryNonce((value) => value + 1)}
+          onJournalStale={() => {
+            setJournalRetry((value) => value + 1);
+            setScoresRetryNonce((value) => value + 1);
+          }}
         />
       )}
 
