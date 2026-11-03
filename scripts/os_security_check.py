@@ -56,6 +56,9 @@ PROC = Path("/proc")
 BOOT = Path("/boot")
 # 跑在旧库上就要人去重启的单元：nmu 直接服务受试者，nginx 直面公网，重启都只要几秒。
 APP_UNITS = ("nmu.service", "nginx.service")
+# 与 deploy/apt/52nmu-unattended-upgrades 的 Package-Blacklist 同一份：夜里不装，只在维护窗口装。
+# 告警里照这个分修法，2026-11-02 那条把内核也写成了 full-upgrade。
+WINDOW_ONLY_PREFIXES = ("linux-", "netplan", "libnetplan", "grub", "shim")
 
 # apt-get -s upgrade 的行形如：
 #   Inst tar [1.34+dfsg-1ubuntu0.1.22.04.2] (1.34+dfsg-1ubuntu0.1.22.04.6
@@ -248,9 +251,17 @@ def evaluate(pending: list[PendingUpgrade], age: timedelta | None,
 
     if security:
         sample = "、".join(p.name for p in security[:6])
+        windowed = [p.name for p in security if p.name.startswith(WINDOW_ONLY_PREFIXES)]
+        manual = [p.name for p in security if not p.name.startswith(WINDOW_ONLY_PREFIXES)]
+        fixes = []
+        if windowed:
+            fixes.append(f"内核/网络/引导类 {len(windowed)} 个走维护窗口 "
+                         "deploy/maintenance/kernel_netplan_window.sh（先改 ABI 常量、跑 check）")
+        if manual:
+            fixes.append(f"其余 {len(manual)} 个夜间补丁没装上，手装 apt-get install "
+                         + " ".join(manual[:6]))
         failures.append(
-            f"{len(security)} 个安全更新待安装（{sample}…）；"
-            "修法：apt-get full-upgrade（内核类更新装完记得挑时间重启）")
+            f"{len(security)} 个安全更新待安装（{sample}…）；修法：" + "；".join(fixes))
     if other:
         notes.append(f"另有 {len(other)} 个非安全更新待装（不算失败）")
     if reboot_required:

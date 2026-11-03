@@ -4,18 +4,20 @@
 # 开着、看得到 GRUB 菜单;控制台 root 登录(或 KiwiVM 的 root shell)试过能进。
 #
 # 一次只换一个变量,每次重启单独一轮:先换内核(netplan 不动),再加按 MAC 匹配的 netplan
-# 段(内核不动),最后清掉旧内核 191。194 一直留作回退。
+# 段(内核不动),最后清掉更旧的那个内核,上一个一直留作回退。
+# 10-03 做完 194→198 与 netplan,网络从此走 by-mac 那份;之后每出一个新内核只走
+# check → kernel →(观察一天)purge,netplan 阶段不用再跑。
 #
 # 在 Eric 的 Mac 上跑(/bin/bash 3.2 也行),用绝对路径,整屏输出发 Claude:
 #   bash /Users/xiaogangxu/Downloads/南医大语言沟通训练阿尔茨海默病项目/platform/deploy/maintenance/kernel_netplan_window.sh <阶段>
 # 阶段:
 #   check           只读演练:门槛、基线、装包模拟都走一遍,不改生产上的任何东西,也不问问题
-#   kernel          只装预期的 9 个内核包 → 重启前核对 → 重启 → 重启后核对(网络仍走 ens18 那份)
+#   kernel          只装预期的 9 个内核包 → 重启前核对 → 重启 → 重启后核对(网络照旧走原来那份)
 #   verify-kernel   只读:按 kernel 阶段的预期再核一遍(等待超时、从控制台救回来之后用)
 #   netplan         演练生成 → 装死人开关 → 放上按 MAC 匹配的段并 apply → 新连接验证 → 拆开关
 #                   → 再重启 → 重启后核对(网络改走 by-mac 那份)
 #   verify-netplan  只读:按 netplan 阶段的预期再核一遍
-#   purge           模拟后只清掉内核 191 的包
+#   purge           模拟后只清掉 PURGE_ABI 那个内核的包
 # 任何一步打印「停」就停下,不要接着跑别的阶段。kernel、netplan 在「现在重启?」答了 no 的,
 # 之后原样重跑同一阶段即可:已经装好的包、已经接管的新段会被认出来,直接走到重启。
 #
@@ -24,7 +26,7 @@
 # netplan 里给网卡改名;打印 MAC(它和 KiwiVM 的 VM 编号挂钩)。
 #
 # 起不来时:KiwiVM 控制台 → GRUB 菜单(只亮 2 秒,失败重启后 30 秒)→ Advanced options →
-#   5.15.0-194-generic。开了机但没网:控制台 root 登录,把 /etc/netplan/50-nmu-by-mac.yaml
+#   FALLBACK_ABI 那个内核。开了机但没网:控制台 root 登录,把 /etc/netplan/50-nmu-by-mac.yaml
 #   挪到 /root/,再 netplan apply;nmu 与定时器都不用动。
 # 换目标内核时改下面三个 *_ABI 常量,重新评审后再跑。
 set -u
@@ -32,9 +34,9 @@ KEY="$HOME/.ssh/id_ed25519"
 HOST="root@89.208.253.119"
 SITE="https://89-208-253-119.sslip.io"
 KIWIVM="https://kiwivm.64clouds.com/"
-TARGET_ABI="5.15.0-198"
-FALLBACK_ABI="5.15.0-194"
-PURGE_ABI="5.15.0-191"
+TARGET_ABI="5.15.0-202"
+FALLBACK_ABI="5.15.0-198"
+PURGE_ABI="5.15.0-194"
 # 只点名这四个元包;apt 按依赖带进来的必须正好是 EXPECTED_INSTALL 这 9 个,多一个都停。
 META_PACKAGES="linux-generic linux-image-generic linux-headers-generic linux-libc-dev"
 EXPECTED_INSTALL="linux-generic linux-headers-${TARGET_ABI} linux-headers-${TARGET_ABI}-generic linux-headers-generic linux-image-${TARGET_ABI}-generic linux-image-generic linux-libc-dev linux-modules-${TARGET_ABI}-generic linux-modules-extra-${TARGET_ABI}-generic"
@@ -226,10 +228,17 @@ set -u
 bad=0
 pass() { echo "  PASS $*"; }
 fail() { echo "  FAIL $*"; bad=1; }
-for unit in nmu nmu-caddy sing-box nginx ssh systemd-networkd systemd-resolved qemu-guest-agent; do
+for unit in nmu nmu-caddy nginx ssh systemd-networkd systemd-resolved qemu-guest-agent; do
   state=$(systemctl --no-pager is-active "${unit}")
   if [ "${state}" = "active" ]; then pass "${unit} active"; else fail "${unit} ${state}"; fi
 done
+# 代理跟着机器上的配置走:10-28 整个 IP 被墙后 sing-box 停用,改跑 sing-box-hy2。开机自启的必须在跑。
+proxies=$(systemctl --no-pager list-unit-files --no-legend --state=enabled 'sing-box*.service' | awk '{print $1}' | tr '\n' ' ')
+for unit in ${proxies}; do
+  state=$(systemctl --no-pager is-active "${unit}")
+  if [ "${state}" = "active" ]; then pass "${unit} active"; else fail "${unit} ${state}(开机自启却没在跑)"; fi
+done
+echo "  注 开机自启的代理:${proxies:-无}"
 failed_units=$(systemctl --no-pager list-units --no-legend --state=failed | sed 's/^[^[:alnum:]]*//' | awk '{print $1}' | tr '\n' ' ')
 if [ -z "${failed_units}" ]; then
   pass "没有 failed 单元"
@@ -347,7 +356,7 @@ REMOTE
 }
 
 reboot_and_wait() {   # $1 = 重启前的 boot_id
-  confirm "现在重启?整机约 16 秒,sing-box、nginx、ssh 一起断;控制台盯着 GRUB 菜单"
+  confirm "现在重启?整机约 16 秒,代理、nginx、ssh 一起断;控制台盯着 GRUB 菜单"
   echo "== 重启 =="
   RSH 'systemctl --no-pager reboot'
   echo "  等新的一次开机,最多 5 分钟(ssh 通了不算,boot_id 换了才算)…"
@@ -389,8 +398,10 @@ if [ "${altnames}" = "2" ]; then pass "altname 2 个(ens18 那条后路还在)";
 links=$(find /run/systemd/network -name '*.link' | wc -l | tr -d ' ')
 if [ "${links}" = "0" ]; then pass "没有生成 .link"; else fail "/run/systemd/network 里有 ${links} 个 .link"; fi
 if resolvectl --no-pager query ubuntu.com >/dev/null 2>&1; then pass "DNS 解析正常"; else fail "resolvectl 解析 ubuntu.com 失败"; fi
-restarts=$(systemctl --no-pager show -p NRestarts --value sing-box)
-if [ "${restarts}" = "0" ]; then pass "sing-box 开机后没重启过"; else fail "sing-box NRestarts=${restarts}"; fi
+for unit in $(systemctl --no-pager list-unit-files --no-legend --state=enabled 'sing-box*.service' | awk '{print $1}'); do
+  restarts=$(systemctl --no-pager show -p NRestarts --value "${unit}")
+  if [ "${restarts}" = "0" ]; then pass "${unit} 开机后没重启过"; else fail "${unit} NRestarts=${restarts}"; fi
+done
 if systemctl --no-pager start nmu-health.service; then
   result=$(systemctl --no-pager show -p Result --value nmu-health.service)
   if [ "${result}" = "success" ]; then pass "公网探针手动跑一次:success"; else fail "公网探针 Result=${result}"; fi
@@ -572,27 +583,47 @@ phase_check() {
   fi
 }
 
+# 内核这一轮网络不动:按 MAC 匹配的段在,eth0 就该走 by-mac 那份(10-03 起);不在就该走
+# ens18 那份。两样对不上说明 netplan 改到一半,输出空串。
+current_network() {
+  local stanza netfile
+  stanza=$(RSH 'if [ -e /etc/netplan/50-nmu-by-mac.yaml ]; then echo present; else echo absent; fi')
+  netfile=$(RSH 'networkctl --no-pager status eth0 | sed -nE "s/^ *Network File: *//p"')
+  case "${stanza}:${netfile}" in
+    "present:${NET_BY_MAC}") echo "${NET_BY_MAC}" ;;
+    "absent:${NET_ENS18}") echo "${NET_ENS18}" ;;
+    *) echo "" ;;
+  esac
+}
+
 phase_kernel() {
-  local running netfile
+  local running network
   gate "Mac 侧路由与 KiwiVM 直连" mac_route_ok
   operator_ready
   common_gates 45
   running=$(RSH 'uname -r')
   [ "${running}" != "${TARGET_ABI}-generic" ] || bail "已经在跑 ${TARGET_ABI}-generic,这一阶段做过了;要复核就跑 verify-kernel"
   [ "${running}" = "${FALLBACK_ABI}-generic" ] || bail "正在跑的是 ${running:-查不到},不是预期的 ${FALLBACK_ABI}-generic:常量过时了,先重新评审"
-  netfile=$(RSH 'networkctl --no-pager status eth0 | sed -nE "s/^ *Network File: *//p"')
-  [ "${netfile}" = "${NET_ENS18}" ] || bail "网络现在走的是 ${netfile:-查不到},不是 ${NET_ENS18}:内核这一轮不该和 netplan 改动叠在一起"
+  network=$(current_network)
+  [ -n "${network}" ] || bail "按 MAC 匹配的段在不在,和 eth0 正在用的 Network File 对不上:netplan 改到一半,内核这一轮不该和它叠在一起"
   record_baseline || bail "基线取不全(生产没有任何改动)"
   install_kernel
   pre_reboot_asserts || bail "重启前核对没过,没有重启。注意 ${TARGET_ABI} 已装、GRUB 默认项已经指向它:查清之前别让这台机器重启"
   reboot_and_wait "${BOOT_BEFORE}"
-  post_reboot_asserts "${NET_ENS18}" "${BOOT_BEFORE}" || bail "重启后核对有 FAIL(看上面)"
-  echo "== kernel 阶段完成:内核 ${TARGET_ABI},网络照旧。netplan 阶段另找一轮 =="
+  post_reboot_asserts "${network}" "${BOOT_BEFORE}" || bail "重启后核对有 FAIL(看上面)"
+  echo "== kernel 阶段完成:内核 ${TARGET_ABI},网络照旧走 ${network}。观察一天没问题再跑 purge =="
 }
 
 phase_verify() {   # $1 = 期望的 Network File
   post_reboot_asserts "${1}" "" || bail "核对有 FAIL(看上面)"
   echo "== 核对全过 =="
+}
+
+phase_verify_kernel() {
+  local network
+  network=$(current_network)
+  [ -n "${network}" ] || bail "按 MAC 匹配的段在不在,和 eth0 正在用的 Network File 对不上:先查网络,再核内核"
+  phase_verify "${network}"
 }
 
 phase_netplan() {
@@ -663,7 +694,7 @@ REMOTE
 case "${PHASE}" in
   check) banner; phase_check ;;
   kernel) banner; phase_kernel ;;
-  verify-kernel) banner; phase_verify "${NET_ENS18}" ;;
+  verify-kernel) banner; phase_verify_kernel ;;
   netplan) banner; phase_netplan ;;
   verify-netplan) banner; phase_verify "${NET_BY_MAC}" ;;
   purge) banner; phase_purge ;;

@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import os
 from pathlib import Path
+import re
 import sys
 
 import pytest
@@ -227,6 +228,30 @@ def test_full_upgrade_simulation_counts_the_kernel_as_security_backlog():
     failures, notes = osc.evaluate(pending, FRESH, MAX_AGE, False, [])
     assert len(failures) == 1 and "3 个安全更新待安装" in failures[0]
     assert any("2 个非安全更新" in n for n in notes)
+
+
+def test_the_fix_sends_kernel_packages_to_the_window_and_never_says_full_upgrade():
+    """2026-11-02 的告警把内核也写成 apt-get full-upgrade,而内核按规矩只在维护窗口里装。"""
+    kernel = [p for p in osc.parse_simulation(FULL_UPGRADE_OUTPUT) if p.security]
+    [only_kernel], _ = osc.evaluate(kernel, FRESH, MAX_AGE, False, [])
+    assert "kernel_netplan_window.sh" in only_kernel and "内核/网络/引导类 3 个" in only_kernel
+    assert "full-upgrade" not in only_kernel and "apt-get install" not in only_kernel
+
+    [mixed], _ = osc.evaluate(kernel + osc.parse_simulation(REAL_OUTPUT), FRESH, MAX_AGE, False, [])
+    assert "内核/网络/引导类 3 个" in mixed
+    assert "其余 3 个夜间补丁没装上，手装 apt-get install bsdutils gzip tar" in mixed
+
+    [plain], _ = osc.evaluate(osc.parse_simulation(REAL_OUTPUT), FRESH, MAX_AGE, False, [])
+    assert "kernel_netplan_window.sh" not in plain and "full-upgrade" not in plain
+
+
+def test_the_window_only_prefixes_match_the_unattended_blacklist():
+    """告警按哪些包分去维护窗口,必须和夜里拉黑不装的是同一份。"""
+    snippet = (Path(__file__).resolve().parents[1] / "deploy" / "apt"
+               / "52nmu-unattended-upgrades").read_text(encoding="utf-8")
+    block = snippet[snippet.index("Unattended-Upgrade::Package-Blacklist {"):]
+    block = block[:block.index("};")]
+    assert tuple(re.findall(r'"([^"]+)"', block)) == osc.WINDOW_ONLY_PREFIXES
 
 
 def test_run_simulation_asks_apt_for_a_full_upgrade_in_the_c_locale(monkeypatch):
