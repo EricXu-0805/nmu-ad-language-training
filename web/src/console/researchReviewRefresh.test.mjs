@@ -180,8 +180,16 @@ test("an ambiguous network failure keeps the exact confirmation retry and does n
   assert.equal(h.props.turns[KEY].confirmationRevision, 4);
 });
 
-test("the wrapup screen wires a stale journal to a journal reload plus a scores reload", () => {
+test("the wrapup screen refreshes a stale journal in place, so other rows keep unsaved review work", () => {
+  // 整页重拉会先把 journalRecovery 切回 loading,复核面板随之卸载,别的环节没保存的确认文本、
+  // 所选分值和「录音已核对」全丢。409 之后只能走不切 loading 的原地重拉。
   const source = readFileSync(new URL("./SessionWrapupScreen.tsx", import.meta.url), "utf8");
   const panel = source.slice(source.indexOf("<ResearchReviewPanel"), source.indexOf("/>", source.indexOf("<ResearchReviewPanel")));
-  assert.match(panel, /onJournalStale=\{\(\) => \{\s*setJournalRetry\(\(value\) => value \+ 1\);\s*setScoresRetryNonce\(\(value\) => value \+ 1\);\s*\}\}/);
+  assert.match(panel, /onJournalStale=\{\(\) => \{\s*setJournalRefresh\(\(value\) => value \+ 1\);\s*setScoresRetryNonce\(\(value\) => value \+ 1\);\s*\}\}/);
+  assert.doesNotMatch(panel, /setJournalRetry/);
+  const effectStart = source.indexOf("if (journalRefresh === 0) return;");
+  assert(effectStart > 0, "原地重拉的 effect 不见了");
+  const effect = source.slice(effectStart, source.indexOf("}, [hydrateFromServer, journalRefresh", effectStart));
+  assert.match(effect, /hydrateFromServer\(remote\)/);
+  assert.doesNotMatch(effect, /setJournalRecovery/);
 });

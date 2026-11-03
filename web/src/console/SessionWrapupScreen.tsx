@@ -72,6 +72,7 @@ export function SessionWrapupScreen({
   const [journalRecovery, setJournalRecovery] = useState<"loading" | "ready" | "error">("loading");
   const [journalRecoveryError, setJournalRecoveryError] = useState<string | null>(null);
   const [journalRetry, setJournalRetry] = useState(0);
+  const [journalRefresh, setJournalRefresh] = useState(0);
   const [scores, setScores] = useState<ScoreReconstruction | null>(null);
   const [scoresErr, setScoresErr] = useState<string | null>(null);
   const [plan, setPlan] = useState<SessionPlan | null>(null);
@@ -165,6 +166,26 @@ export function SessionWrapupScreen({
       });
     return () => { cancelled = true; };
   }, [hydrateFromServer, journalRetry, session.session_id]);
+
+  // 复核撞 409 后原地重拉:不切回 loading,复核面板不卸载,别的环节没保存的确认文本、所选分值、
+  // 录音已核对都还在;撞冲突的那一行跟着服务器的值改。重拉失败只提示,下次再撞 409 会再拉。
+  useEffect(() => {
+    if (journalRefresh === 0) return;
+    let cancelled = false;
+    api.sessionJournal(session.session_id)
+      .then((remote) => {
+        if (cancelled) return;
+        if (remote.session.session_id !== session.session_id) {
+          throw new Error("服务器返回了其他场次的记录，已拒绝恢复");
+        }
+        hydrateFromServer(remote);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        toast(`没能刷新本场记录：${error instanceof ApiError ? error.detail : String(error)}`, "danger");
+      });
+    return () => { cancelled = true; };
+  }, [hydrateFromServer, journalRefresh, session.session_id, toast]);
 
   useEffect(() => {
     setScores(null);
@@ -598,7 +619,7 @@ export function SessionWrapupScreen({
           onUpsertTurn={upsertTurn}
           onChanged={() => setScoresRetryNonce((value) => value + 1)}
           onJournalStale={() => {
-            setJournalRetry((value) => value + 1);
+            setJournalRefresh((value) => value + 1);
             setScoresRetryNonce((value) => value + 1);
           }}
         />
