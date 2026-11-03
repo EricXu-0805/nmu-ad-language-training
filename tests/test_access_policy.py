@@ -110,6 +110,8 @@ def _logged_in_client(eng, username: str) -> TestClient:
 
 @pytest.mark.parametrize(("method", "path", "kind", "roles"), [
     ("GET", "/health", access_policy.AccessKind.PUBLIC, None),
+    ("GET", "/health/ready", access_policy.AccessKind.PUBLIC, None),
+    ("HEAD", "/health/ready", access_policy.AccessKind.PUBLIC, None),
     ("POST", "/tts/speak", access_policy.AccessKind.DEVICE,
      access_policy.TRAINING_OPERATION_ROLES),
     ("GET", "/live/state", access_policy.AccessKind.DEVICE, None),
@@ -267,6 +269,12 @@ def test_central_route_policy(method, path, kind, roles):
     assert rule.kind == kind
     if roles is not None:
         assert rule.roles == roles
+
+
+def test_the_readiness_probe_is_public_by_an_explicit_rule_not_by_the_static_fallback():
+    # 未知 GET 也会落成 PUBLIC(给 SPA 外壳用);就绪口必须是登记过的那一条。
+    assert access_policy.read_route_is_classified("GET", "/health/ready")
+    assert access_policy.access_rule("HEAD", "/health/ready").label == "读取就绪状态"
 
 
 @pytest.mark.parametrize("path", [
@@ -1805,6 +1813,7 @@ def test_every_read_route_is_classified_and_not_public_by_accident():
     """
     deliberately_public = {
         "GET /health", "HEAD /health",            # 存活探测，不含任何数据
+        "GET /health/ready", "HEAD /health/ready",  # 就绪探测，正文只有 status
         "GET /auth/me", "HEAD /auth/me",          # 只回"你登录了没"，未登录返回空身份
         "GET /auth/config", "HEAD /auth/config",  # 登录页要知道该显示账号还是 PIN
         "GET /{full_path:path}", "HEAD /{full_path:path}",  # SPA 静态外壳兜底

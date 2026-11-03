@@ -1,6 +1,7 @@
 # 生产 systemd 单元（裸机形态，2026-08-06 起入库）
 
-这四个文件是 `89.208.253.119` 上 `/etc/systemd/system/` 的版本化真相。在此之前
+这个目录里的 `.service`、`.timer` 和两个 `apt-daily*.timer.d/` 片段是 `89.208.253.119` 上
+`/etc/systemd/system/` 的版本化真相。在此之前
 仓库里没有生产单元，只能靠备份快照里的副本反推裸机配置——审计 §11.5 第 7 条
 「部署可证明性」说的就是这件事。
 
@@ -21,11 +22,11 @@ systemctl enable --now nmu-backup.timer nmu-backup-health.timer \
 | 单元 | 何时 | 干什么 | 结论落在哪 |
 | --- | --- | --- | --- |
 | `nmu-backup` | 每天 19:30（03:30） | 快照 + 校验 + 原子发布 | `backup.log` |
-| `nmu-backup-health` | 每天 20:40（04:40） | 判备份链健不健康，并核对公网探针 30 分钟内成功过 | `health.state` |
+| `nmu-backup-health` | 每天 20:40（04:40） | 判备份链健不健康，并核对公网探针 30 分钟内成功过、机外探针 30 分钟内来过 | `health.state` |
 | `nmu-capacity` | 每天 21:10（05:10） | 占用率、备份增长、还能撑几天 | `capacity.state` |
 | `nmu-restore-drill` | 每周日 21:30（周一 05:30） | 把最新快照真恢复出来并启动应用 | `restore-drill.state` |
 | `nmu-os-security` | 每周一 21:50（周二 05:50） | 数 OS 安全补丁积压 | `os-security.state` |
-| `nmu-health` | 每 10 分钟，整十分（`OnCalendar=*:0/10`） | 从外面打一次公网 `/health` | 只在失败时告警 |
+| `nmu-health` | 每 10 分钟，整十分（`OnCalendar=*:0/10`） | 从外面打一次公网 `/health/ready` | 只在失败时告警 |
 
 改完单元必须现场核对，别只看 `systemctl status`：
 
@@ -34,6 +35,11 @@ systemctl start nmu-backup.service
 tail -3 /opt/nmu/backups/backup.log     # 运维真相在这里，不在 status 字段
 systemctl list-timers --all 'nmu-*' --no-pager   # 定时器看 NEXT 列，不看 active，见文末
 ```
+
+改了 `/opt/nmu/caddy/Caddyfile` 用 `systemctl reload nmu-caddy`（2026-11 入库的这版单元装上之后）：
+`ExecReload` 跑 `caddy reload --config` 同一份文件，走 Caddy 的 admin 接口，进程不重启
+（`MainPID` 不变），新配置载入失败时旧配置照常服务。2026-10-08 窗口里单元还没有这一行，
+reload 失败，只好直接调 admin 接口。
 
 ## 与本机布局绑定的两个事实
 
@@ -151,6 +157,12 @@ journal 推到 Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,�
   `backup.log` 最后一行,`nmu-health` 取这一轮 curl 自己的输出。2026-09-28 那次
   os-security 告警里一个待装的包都没有:结论整份重定向进了 state 文件,journal 里只剩
   systemd 自己那几行。state 文件不是这一轮写的(脚本在写结论之前就挂了),消息里会标出来。
+- 原因之后跟一行「下一步」,按单元写死在 `notify_ops.py` 的 `NEXT_STEPS`:os-security 那行写明
+  内核/netplan/grub/shim 类只走 `deploy/maintenance/kernel_netplan_window.sh`(先跑 `check`),
+  绝不 `apt-get full-upgrade`;capacity 指 `capacity_reclaim.py` 只读盘点;备份类指交接文档 5.1。
+  没登记的单元(`nmu`、`nmu-caddy`)没有这一行。
+- 标头里的主机名取 `NMU_OPS_HOST_LABEL`(`nmu-alert@.service` 里设成「NMU 生产机 box A」),
+  没设才用 hostname(这台是 `green-fiber-1.localdomain`)。Mac 侧的告警不设,仍是 Mac 的 hostname。
 - 日志只取失败的这一轮(`systemctl show -p InvocationID` → `journalctl
   _SYSTEMD_INVOCATION_ID=…`);拿不到 InvocationID 才退回 `-n 12`,并注明可能混有上一轮。
 - 发送失败隔 30 秒再试一次;两次都失败,`nmu-alert@` 自己退非零进 failed,
@@ -178,10 +190,12 @@ journal 推到 Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,�
 3. **「进程活着但站点不服务」这一整档没有任何检查。** 备份脚本直接 sqlite3 打开磁盘上
    的 app.db,服务死没死它照写 ok。新增 `nmu-health.timer`,每 10 分钟从应用进程外面打一次
    公网 `/health`,覆盖「进程不应答、返 5xx」「Caddy 死了」「证书过期」。
-   **「磁盘满转只读」它看不出来**:`/health` 返回一个常量(`app/main.py` 的 `health()`),
-   不碰库也不碰盘,只证明进程还在应答;库和盘的毛病要等每天一次的 `nmu-backup-health`
-   与 `nmu-capacity`。它也跑在这台机器上,机器宕了或出口断了它和它的告警一起没了,
-   那一档归文末的异地探针。
+   **「磁盘满转只读」原来看不出来**:`/health` 返回一个常量(`app/main.py` 的 `health()`),
+   不碰库也不碰盘,只证明进程还在应答。2026-11 入库的单元改打 `/health/ready`:查一次库,
+   看库目录和录音目录所在文件系统是不是只读、剩余空间低不低于 `READINESS_MIN_FREE_MB`
+   (默认 2048,与 `nmu-capacity` 的 `--min-free-mb` 一致),任何一样不对返 503,正文只有
+   `{"status": …}`,不说是哪一样;结论缓存 5 秒,公网打不出磁盘负载。它也跑在这台机器上,
+   机器宕了或出口断了它和它的告警一起没了,那一档归文末的异地探针。
 
 `tests/test_systemd_alerting.py` 把这三条钉住:每个单元必须有 OnFailure、
 `Restart=always` 必须配得上 burst、单元里不许出现 `|| true`、必须存在公网探针单元。
@@ -215,7 +229,9 @@ done    # 每个都要 SubState=waiting、NextElapseUSecRealtime 非空、UnitFi
 对应的自动检查:`preflight_check.py --os` 的「无 nmu-* cron 条目」查第一条;
 「定时器在排程」就是上面第二段命令,被停用、被停止或停在 elapsed 的定时器都会被点名;
 `nmu-backup-health` 每天带 `--probe-unit nmu-health.service` 问一次公网探针最近一次
-成功是什么时候,超过 30 分钟即不健康。所有定时器只用 `OnCalendar`:单调触发晚启动一次
+成功是什么时候,超过 30 分钟即不健康;带 `--offbox-source 147.182.176.237` 数一次 nmu 访问日志里
+30 分钟内有没有机外探针的 `GET /health`,一条都没有报 `offbox_probe_silent`。
+六个定时器不多不少,这一项不另开定时器。所有定时器只用 `OnCalendar`:单调触发晚启动一次
 就再也不触发,`Persistent=true` 对它也不起作用。`tests/test_systemd_alerting.py` 钉住这两条。
 
 ## 异地探针(2026-10 起,跑在 OpenClaw VPS 上)
@@ -262,9 +278,10 @@ ssh eric@147.182.176.237 'date -u -d "+90 min" +%s > ~/.openclaw/workspace/nmu-p
 它的边界:
 
 - 只从纽约一个点看。美国这侧的线路问题可能误报;国内用户到南京那一段(GFW、CN2)出问题它看不到。
-- 与 `openclaw-prod` 同生共死:那台机器挂了,探针和 Heartbeat 一起没了,只能靠 22:00 CT 那条
-  Heartbeat 没来发现。反过来让 NMU 数「30 分钟没收到 147.182.176.237 的 /health」是第二期的事。
-- `/health` 只证明进程在应答,库和盘的毛病两个探针都看不见。
+- 与 `openclaw-prod` 同生共死:那台机器挂了,探针和 Heartbeat 一起没了。2026-11 入库的
+  `nmu-backup-health` 每天 20:40 UTC 数一次「30 分钟内有没有 147.182.176.237 的 GET /health」,
+  没有就告警;一天只查一次,最晚晚一天发现,其余时间仍只能靠 22:00 CT 那条 Heartbeat 没来。
+- 它打的是 `/health`,只证明进程在应答;库和盘归本机 `nmu-health` 打的 `/health/ready`。
 - x-feed 在 14:00、17:30 UTC 把那台单核机器占满约 7 分钟;三次重试加两轮门槛应能吸收,
   饿死超过 10 分钟仍可能误报一次 DOWN。
 - 四条告警共用一个 webhook(Heartbeat、watchdog、本机告警的副本、这个探针):轮换

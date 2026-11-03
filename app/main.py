@@ -14,6 +14,7 @@ import json as _json
 import math
 import secrets
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, NoReturn
 from urllib.parse import unquote
@@ -922,6 +923,55 @@ def audit_verify(s: DBSession = Depends(get_session)):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "language-training-platform"}
+
+
+# /health 是常量，库连不上、盘满、盘转只读它照样 200；nmu-health 每 10 分钟打的是下面这个。
+# 公网可打，所以只读不写、结论缓存几秒，正文也不说是哪一样坏了。
+_READY_CACHE_SECONDS = 5.0
+_ready_cache: tuple[float, bool] | None = None
+
+
+def _ready_min_free_bytes() -> int:
+    # 默认与 nmu-capacity 的 --min-free-mb 2048 一致。
+    try:
+        value = int(os.environ.get("READINESS_MIN_FREE_MB", "") or 2048)
+    except ValueError:
+        value = 2048
+    return max(value, 0) * 1024 * 1024
+
+
+def _storage_ready() -> bool:
+    try:
+        with db.engine.connect() as connection:
+            connection.exec_driver_sql("SELECT 1")
+        directories = [audio_store.AUDIO_DIR]
+        database = db._sqlite_file_path(db.engine.url)
+        if database is not None:
+            directories.append(database.parent)
+        floor = _ready_min_free_bytes()
+        for directory in directories:
+            facts = os.statvfs(directory)
+            if facts.f_flag & os.ST_RDONLY or facts.f_bavail * facts.f_frsize < floor:
+                return False
+    except Exception:
+        # 就绪口的全部意义是 fail-closed：任何一样查不了都不能报 200。
+        return False
+    return True
+
+
+@app.api_route("/health/ready", methods=["GET", "HEAD"])
+def health_ready(request: Request):
+    global _ready_cache
+    now = time.monotonic()
+    if _ready_cache is None or now - _ready_cache[0] >= _READY_CACHE_SECONDS:
+        _ready_cache = (now, _storage_ready())
+    ready = _ready_cache[1]
+    status_code = 200 if ready else 503
+    headers = {"Cache-Control": "no-store"}
+    if request.method.upper() == "HEAD":
+        return PlainResponse(status_code=status_code, headers=headers)
+    return JSONResponse(status_code=status_code, headers=headers,
+                        content={"status": "ok" if ready else "unavailable"})
 
 
 # ---------------- 患者 / 场次 ----------------

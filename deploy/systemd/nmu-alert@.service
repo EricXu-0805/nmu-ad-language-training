@@ -5,6 +5,8 @@ Description=NMU ops alert relay for %i (Discord, failure-only)
 Type=oneshot
 # webhook 只放在这个 0600 文件里,不进仓库、不进任何单元文件正文。
 EnvironmentFile=/opt/nmu/ops-alert.env
+# 告警标头里的主机名;不给就用 hostname(green-fiber-1.localdomain),认不出是哪台。
+Environment="NMU_OPS_HOST_LABEL=NMU 生产机 box A"
 # 只用标准库,系统 python3 足够——告警通道不能依赖可能坏掉的 venv。
 ExecStart=/usr/bin/python3 /opt/nmu/app/scripts/notify_ops.py --unit %i
 Nice=10

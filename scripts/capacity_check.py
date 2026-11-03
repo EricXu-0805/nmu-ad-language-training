@@ -5,15 +5,17 @@
 不会把所有全量快照的写入量当成永久净增长，也不会把同日发布备份当成每日频率。
 快照尺寸趋势取每天最大一份；所有实际快照仍计入当前队列与原始写入速率。
 
-默认门槛保持 85% 占用、2048 MiB 可用、未来 30 天备份写入空间。预测只涵盖
-按合同成功轮转的每日备份；live 数据、其他日志与文件、未归属到快照块量的元数据
-增长没有测量。days_left 仅报告预测期内备份写入空间不足的时点；None 不代表
+默认门槛保持 85% 占用、2048 MiB 可用、未来 30 天备份写入空间。预测涵盖
+按合同成功轮转的每日备份（链接模型下另加 live 录音与库的增长，见下）；其他日志与文件、
+未归属到快照块量的元数据增长没有测量。days_left 仅报告预测期内空间不足的时点；None 不代表
 无限寿命或整个服务器安全。发布时的额外副本、临时保留目录须另做一次性预算。
 
 备份打开录音硬链接去重（NMU_BACKUP_LINK_AUDIO=1）后，相邻快照共享未变录音的 inode：
 共享 inode 只计一次，块量记在最后一个持有它的快照上。最新一份与更早快照共享录音时
 改用链接模型：下一份仍先整份暂存（峰值照旧按整份），留下来的只是库等非录音部分加一天
-的新录音；未变录音会被链进以后每一份，轮转只抵扣非录音块量。
+的新录音；未变录音会被链进以后每一份，轮转只抵扣非录音块量。链接模型下 days_left 另计
+live 数据的增长：data/audio 是快照之外的另一份，新录音在那里也多一份，库也跟着长，按
+快照里录音与非录音两部分的尺寸趋势之和计（live_growth_mb_per_day）；不链接时仍不计。
 
 只用标准库。快照不足两个不同日期时不猜测尺寸趋势。
 """
@@ -222,6 +224,7 @@ def retention_projection(series: list[tuple[datetime, int]], *, keep: int,
     给了 linked_audio（逐份顶层 audio/ 的复制预算，与 series 对齐）就按录音链接模型：
     每天仍先整份暂存（峰值按整份），链接后留下非录音部分加一天的新录音；未变录音会被
     链进以后每一份，轮转只抵扣非录音部分，existing_allocated 此时应是各份非录音块量。
+    这时 days_left 还要加上 live 数据的增长，peak 与 net_change 仍只算备份。
     """
     if linked_audio is not None and len(linked_audio) != len(series):
         raise ValueError("linked audio measurements must match the copy series")
@@ -237,6 +240,7 @@ def retention_projection(series: list[tuple[datetime, int]], *, keep: int,
         _, audio_slope = daily_size_trend(
             [(when, audio) for (when, _), audio in zip(series, linked_audio)])
         latest_nonaudio = max(size for when, size in nonaudio if when.date() == latest_day)
+    live_growth = None
     if slope is None:
         net_growth = None
     elif linked_audio is None:
@@ -244,6 +248,7 @@ def retention_projection(series: list[tuple[datetime, int]], *, keep: int,
     else:
         # 新录音只留一份；库等非录音部分每份各存一份，跟着保留份数放大。
         net_growth = audio_slope + nonaudio_slope * keep
+        live_growth = audio_slope + nonaudio_slope
     result: dict[str, object] = {
         "next_snapshot_baseline_mb": round(latest_size / MIB, 4) if latest_size is not None else None,
         "next_snapshot_copy_fits": latest_size < free_bytes if latest_size is not None else None,
@@ -251,6 +256,8 @@ def retention_projection(series: list[tuple[datetime, int]], *, keep: int,
         "snapshot_size_growth_mb_per_day": round(slope / MIB, 4) if slope is not None else None,
         "backup_net_retained_growth_mb_per_day": (
             round(net_growth / MIB, 4) if net_growth is not None else None),
+        "live_growth_mb_per_day": (
+            round(live_growth / MIB, 4) if live_growth is not None else None),
         "backup_peak_additional_mb": None,
         "backup_net_change_mb": None,
         "days_left": None,
@@ -282,7 +289,9 @@ def retention_projection(series: list[tuple[datetime, int]], *, keep: int,
             retained += next_nonaudio + audio_slope
             queue.append(next_nonaudio)
         peak = max(peak, additional)
-        if days_left is None and additional >= free_bytes:
+        # 容量检查紧跟在备份之后跑：第 day 次备份时 live 已比现在又长了 day+1 天。
+        live = live_growth * (day + 1) if live_growth is not None else 0.0
+        if days_left is None and additional + live >= free_bytes:
             days_left = day
         # vps-backup-daily.sh publishes before rotating; never subtract first.
         while len(queue) > keep:
@@ -348,7 +357,7 @@ def evaluate(backup_root: Path, data_dir: Path | None, *, max_used_pct: float,
     if days_left is not None:
         problems.append(
             f"projected_full_soon days_left={days_left} limit={min_days_left} "
-            "scope=daily_backup_retention")
+            f"scope=daily_backup_retention{'_plus_live' if linked else ''}")
 
     gross_mb = round(gross_per_day / MIB, 2) if gross_per_day is not None else None
     facts: dict[str, object] = {
@@ -381,6 +390,8 @@ def evaluate(backup_root: Path, data_dir: Path | None, *, max_used_pct: float,
     if linked:
         facts["snapshot_model"] = "linked_audio"
         facts["assumptions"].append("unchanged_audio_relinked_into_every_new_snapshot")
+        facts["projection_scope"] = "scheduled_daily_backup_retention_plus_live_audio_and_db"
+        facts["unmeasured_growth"].remove("live_data")
     if data_dir is not None and data_dir.is_dir():
         facts["data_dir_mb"] = directory_bytes(data_dir) // MIB
     return facts
@@ -423,11 +434,13 @@ def main(argv: list[str] | None = None) -> int:
             f"gross_write={growth if growth is not None else '未知'}MB/d "
             f"net_retained_growth={facts['backup_net_retained_growth_mb_per_day']}MB/d "
             f"days_left={facts['days_left'] if facts['days_left'] is not None else '未知'} "
-            f"scope=daily_backups_only horizon={args.min_days_left}d "
+            f"scope={'daily_backups_plus_live' if 'snapshot_model' in facts else 'daily_backups_only'} "
+            f"horizon={args.min_days_left}d "
             f"projection={facts['projection_status']} "
             f"retention_contract={facts['retention_contract_status']} total_days_left=未知")
     if "snapshot_model" in facts:
-        line += f" snapshot_model={facts['snapshot_model']}"
+        line += (f" live_growth={facts['live_growth_mb_per_day']}MB/d"
+                 f" snapshot_model={facts['snapshot_model']}")
 
     print(json.dumps(facts, ensure_ascii=False, indent=2) if args.json else line)
     if args.state_file is not None:

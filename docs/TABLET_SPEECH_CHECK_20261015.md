@@ -78,3 +78,9 @@
 OpenClaw 每日心跳接入本轮未改，仍未完成。
 
 最终私有回执：`/opt/nmu/maintenance-20261015/final-release.json`；本机核验材料：项目根 `审核报告_20261015/`。
+
+## 2026-11-03 更正
+
+上面「OpenClaw 每日心跳接入本轮未改，仍未完成」在 10-15 成立，现已过时：2026-10-27 04:45 UTC
+`check_nmu_probe` 已插进 OpenClaw 的 heartbeat.py（插入前备份 `heartbeat.py.before-nmu-probe-20261027T044532Z`），
+机外探针停摆会出现在 22:00 CT 的 Heartbeat 里。原文不改，记录见 [RELEASE_STATE.md](RELEASE_STATE.md) 同日更正。

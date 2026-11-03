@@ -103,6 +103,15 @@ def test_a_timer_probes_the_public_endpoint():
     assert "nmu-alert@%N.service" in _directives(service).get("OnFailure", [])
 
 
+def test_the_public_probe_asks_the_readiness_route_not_the_constant_health():
+    """/health 返回常量,库打不开、盘满、盘转只读它照样 200;/health/ready 才查库和盘。"""
+    [command] = _directives(UNITS / "nmu-health.service")["ExecStart"]
+    url = command.split()[-1]
+
+    assert url.startswith("https://") and url.endswith("/health/ready")
+    assert " -f" in command  # 503 才会变成非零退出、触发 OnFailure
+
+
 def test_the_boot_catch_up_probe_waits_for_the_site_instead_of_alerting():
     """Persistent=true 让开机时补跑错过的那次探针,定时器起来得比 uvicorn/Caddy 早;
     探针一次失败就告警等于每次重启都发一条「站点挂了」。要先排在站点之后,再给它几次重试。"""
@@ -182,3 +191,24 @@ def test_the_daily_health_verdict_asks_when_the_public_probe_last_succeeded():
     service = (UNITS / "nmu-backup-health.service").read_text(encoding="utf-8")
 
     assert "--probe-unit nmu-health.service" in service
+
+
+def test_caddy_reloads_the_same_config_it_runs_without_a_restart():
+    """2026-10-08 窗口里 `systemctl reload nmu-caddy` 因为单元没有 ExecReload 失败,
+    只好绕去 admin 接口。reload 读的文件必须就是 run 的那份,否则载入的是另一份配置。"""
+    directives = _directives(UNITS / "nmu-caddy.service")
+    [start] = directives["ExecStart"]
+    [reload] = directives.get("ExecReload", [""])
+
+    config = start.split("--config ", 1)[1].split()[0]
+    assert start.startswith("/usr/local/bin/caddy run ")
+    assert reload == f"/usr/local/bin/caddy reload --config {config} --force"
+
+
+def test_the_offbox_probe_dead_man_rides_the_daily_health_verdict_not_a_seventh_timer():
+    """OpenClaw 那台死了,机外探针和它的 Heartbeat 一起没了;由每天的健康判定数它来没来过。
+    维护窗口脚本与上线脚本都钉死六个 nmu 定时器,所以不另开定时器。"""
+    service = (UNITS / "nmu-backup-health.service").read_text(encoding="utf-8")
+
+    assert "--offbox-source 147.182.176.237" in service
+    assert {path.name for path in UNITS.glob("nmu-*.timer")} == _EXPECTED_TIMERS
