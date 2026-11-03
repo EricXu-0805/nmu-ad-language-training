@@ -5,9 +5,11 @@
 # CVE-2026-116587 / GHSA-mgcc-cww5-fp2q,go-jose v3 v3.0.5,HIGH:解析含 RSA 公钥的 JWK 可被拖垮。
 #   登记 2026-11-03。v3 没有修复版(只在 v4 4.1.6 修了;v4 已升并进了安全钉版)。v3 只经
 #   caddypki → smallstep/certificates/authority → go.step.sm/crypto/jose 进到二进制,Caddy v2.11.7、
-#   go.step.sm/crypto v0.91.1 也还依赖它,换版本去不掉。这条路径只在网关自己当 ACME 服务器或开内部
-#   CA 时才解析外来 JWK:仓库 Caddyfile 与生产 /opt/nmu/caddy/Caddyfile(11-03 只读核过)都没有
-#   acme_server、pki、tls internal、local_certs。打开其中任何一样,这条豁免就不成立。
+#   go.step.sm/crypto v0.91.1 也还依赖它,换版本去不掉。外来 JWK 只经 smallstep 的 acme 包、也就是
+#   网关自己当 ACME 服务器(acme_server)时才进到 v3;内部 CA 建的 authority 不带 provisioner,
+#   不解析外来 JWK。仓库 Caddyfile 与生产 /opt/nmu/caddy/Caddyfile(11-03 只读核过)都没开
+#   acme_server。生产那份不在仓库里,测试管不到:改它时回来看这条。这次构建的
+#   deploy/caddy-build.json 里 security_fix.not_fixed_in_this_build 记着同一件事,随发布产物走。
 #   到期前先看 go-jose 有没有出 v3 修复、上游有没有换掉 v3。
 CVE-2026-116587 exp:2026-12-03
 GHSA-mgcc-cww5-fp2q exp:2026-12-03

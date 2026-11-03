@@ -41,6 +41,7 @@
     "minimum_fixed_compress": "v1.18.7",
     "minimum_fixed_go_jose_v4": "v4.1.6",
     "minimum_fixed_x_net": "v0.62.0",
+    "not_fixed_in_this_build": {"module": "github.com/go-jose/go-jose/v3", "version": "v3.0.5", "advisory": "CVE-2026-116587", "reason": "v3 没有修复版", "waiver": "security/trivy-gateway.trivyignore", "waiver_expires": "2026-12-03"},
     "related_advisories": ["https://pkg.go.dev/vuln/GO-2026-6860", "https://pkg.go.dev/vuln/GO-2026-6866", "https://github.com/advisories/GHSA-j6qf-3m9c-vwj3", "https://pkg.go.dev/vuln/GO-2026-6809", "https://pkg.go.dev/vuln/GO-2026-5841", "https://pkg.go.dev/vuln/GO-2026-6611", "https://pkg.go.dev/vuln/GO-2026-6609", "https://pkg.go.dev/vuln/GO-2026-6607"]
   }
 }

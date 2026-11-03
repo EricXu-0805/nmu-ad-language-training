@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -217,6 +218,9 @@ def test_the_gateway_scan_stays_strict_and_only_waives_dated_entries() -> None:
     container_scan, gateway_scan = [step for step in image.split("\n      - ")
                                     if "uses: aquasecurity/trivy-action@" in step]
     assert "trivyignores" not in container_scan
+    # Trivy 默认还会读工作目录的这几份;放在仓库根上,镜像那一步会被悄悄放行。
+    for default in (".trivyignore", ".trivyignore.yaml", "trivy.yaml"):
+        assert not (ROOT / default).exists(), default
     for setting in ("severity: HIGH,CRITICAL", "ignore-unfixed: false",
                     "trivyignores: security/trivy-gateway.trivyignore"):
         assert f"\n          {setting}\n" in gateway_scan + "\n", setting
@@ -234,10 +238,15 @@ def test_the_gateway_scan_stays_strict_and_only_waives_dated_entries() -> None:
         from datetime import date
         span = date.fromisoformat(expires) - date.fromisoformat(registered.group(1))
         assert 0 < span.days <= 45, f"{identifier} 的豁免期 {span.days} 天,上限 45 天"
+    recipe = json.loads((ROOT / "deploy/caddy-build.json").read_text(encoding="utf-8"))
+    unfixed = recipe["security_fix"]["not_fixed_in_this_build"]
+    assert f"\n{unfixed['advisory']} exp:{unfixed['waiver_expires']}" in "\n" + text, \
+        "配方里记的未修条目要和豁免文件里的编号、到期日一致(它随发布产物走)"
 
 
 def test_the_go_jose_waiver_holds_only_while_the_gateway_runs_no_acme_server_or_internal_ca() -> None:
-    """那条豁免的前提:网关不当 ACME 服务器、不开内部 CA,外来 JWK 就到不了 go-jose v3。"""
+    """那条豁免的前提:网关不当 ACME 服务器,外来 JWK 就到不了 go-jose v3。内部 CA 本身不解析外来
+    JWK,这里也一并拦,宽一点不吃亏。生产 /opt/nmu/caddy/Caddyfile 不在仓库里,管不到。"""
     waivers = (ROOT / "security/trivy-gateway.trivyignore").read_text(encoding="utf-8")
     if "\nCVE-2026-116587 exp:" not in waivers:
         return
