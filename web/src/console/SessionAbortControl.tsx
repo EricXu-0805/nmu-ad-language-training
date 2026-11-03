@@ -46,6 +46,13 @@ export function SessionAbortControl({ sessionId, expectedRevision, disabled = fa
       setIntent(null);
       onAborted(runtime);
     } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 409
+          && (cause.detailData as { code?: unknown } | null)?.code === "session_abort_revision_conflict") {
+        // 服务端明确没有执行这次中止：丢掉冻结的旧修订，保留所选原因，下次确认按最新修订重发。
+        setIntent(null);
+        setError("场次状态刚刚变化（例如刚点了继续），请再点一次确认中止");
+        return;
+      }
       // Keep the selected closed reason and dialog open: an ambiguous response
       // can be retried with the same exact request without losing bedside state.
       setError(errorText(cause));

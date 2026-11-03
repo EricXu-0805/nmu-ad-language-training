@@ -10,6 +10,12 @@ import {
 } from "./autopilotCapturePresentation.ts";
 import type { BargeInObservation } from "./autopilotBrowserBargeIn.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
+import type { PatientAssetReadinessEvent } from "./currentPatientAsset.ts";
+import {
+  PatientAssetGateError,
+  PatientAssetMediaGate,
+  patientStimulusKey,
+} from "./patientAssetMediaGate.ts";
 
 const SOURCE = readFileSync(
   new URL("./usePatientAutopilot.ts", import.meta.url), "utf8");
@@ -219,4 +225,93 @@ test("停播检测事实报不报,朗读执行器每次组装回执时现问同�
     SOURCE.indexOf("new BrowserAutopilotRecordingExecutor("));
   // 现问(箭头函数),不是开播那一刻拍下的布尔值:读面晚到也能赶上这一句的回执。
   assert.match(speech, /acceptsAckFact: \(name\) => voiceSettings\.acceptsAckFact\(name\)/);
+});
+
+/**
+ * 复刻 hook 里 `reportAssetReadiness` 的过滤与收尾。
+ *
+ * 门禁与键函数都是生产那两个（`PatientAssetMediaGate` / `patientStimulusKey`），
+ * 停语音、停控制器、进 blocked 只记成动作名；hook 里真接的是这几个调用，
+ * 由下面的 wiring anchor 钉住。
+ */
+function reportAssetReadiness(
+  gate: PatientAssetMediaGate,
+  onScreen: NextCommandProjection | null,
+  event: PatientAssetReadinessEvent,
+  actions: string[],
+): void {
+  if (onScreen === null || patientStimulusKey(onScreen) !== event.requestKey) return;
+  gate.report(event.requestKey, event.readiness);
+  if (event.readiness !== "failed") return;
+  actions.push("stopSpeaking", "controller.stop", "mode:blocked");
+}
+
+function settledState(promise: Promise<void>): Promise<"ready" | "failed" | "pending"> {
+  const observed = promise.then(() => "ready" as const, (error: unknown) => {
+    assert.ok(error instanceof PatientAssetGateError);
+    return "failed" as const;
+  });
+  return Promise.race([observed, new Promise<"pending">((resolve) => setImmediate(() => resolve("pending")))]);
+}
+
+test("提问报 ready 之后,同一题同一轮的录音命令进门禁即就绪", async () => {
+  const gate = new PatientAssetMediaGate();
+  const question = speech("cmd-question-hook-0001", "question");
+  const actions: string[] = [];
+  const waiting = gate.waitFor(question, new AbortController().signal);
+  reportAssetReadiness(gate, question, { requestKey: patientStimulusKey(question), readiness: "ready" }, actions);
+  assert.equal(await settledState(waiting), "ready");
+  assert.equal(await settledState(gate.waitFor(record(), new AbortController().signal)), "ready");
+  assert.deepEqual(actions, []);
+});
+
+test("屏幕已翻到下一题时,上一题迟到的 ready 不得放行新题的门禁", async () => {
+  const gate = new PatientAssetMediaGate();
+  const previous = speech("cmd-question-hook-0001", "question");
+  const next = { ...speech("cmd-question-hook-0005", "question"), item_ref: "itm-0002" };
+  const actions: string[] = [];
+  const waiting = gate.waitFor(next, new AbortController().signal);
+  reportAssetReadiness(gate, next, { requestKey: patientStimulusKey(previous), readiness: "ready" }, actions);
+  reportAssetReadiness(gate, next, { requestKey: patientStimulusKey(previous), readiness: "failed" }, actions);
+  assert.equal(await settledState(waiting), "pending");
+  assert.deepEqual(actions, [], "旧题的失败也不得停掉新题");
+  reportAssetReadiness(gate, next, { requestKey: patientStimulusKey(next), readiness: "ready" }, actions);
+  assert.equal(await settledState(waiting), "ready");
+});
+
+test("屏上没有命令时,任何题图回报都不进门禁", async () => {
+  const gate = new PatientAssetMediaGate();
+  const question = speech("cmd-question-hook-0001", "question");
+  const actions: string[] = [];
+  const waiting = gate.waitFor(question, new AbortController().signal);
+  for (const readiness of ["ready", "failed"] as const) {
+    reportAssetReadiness(gate, null, { requestKey: patientStimulusKey(question), readiness }, actions);
+  }
+  assert.equal(await settledState(waiting), "pending");
+  assert.deepEqual(actions, []);
+});
+
+test("当前题图报 failed:门禁失败,并停语音、停控制器、进 blocked", async () => {
+  const gate = new PatientAssetMediaGate();
+  const question = speech("cmd-question-hook-0001", "question");
+  const actions: string[] = [];
+  const waiting = gate.waitFor(question, new AbortController().signal);
+  reportAssetReadiness(gate, question, { requestKey: patientStimulusKey(question), readiness: "failed" }, actions);
+  assert.equal(await settledState(waiting), "failed");
+  assert.equal(await settledState(gate.waitFor(record(), new AbortController().signal)), "failed",
+    "同一题的录音命令不得绕过已失败的题图");
+  assert.deepEqual(actions, ["stopSpeaking", "controller.stop", "mode:blocked"]);
+});
+
+test("hook 的题图回报先按 item/turn 键过滤再进门禁,失败分支接的是停语音、停控制器、blocked", () => {
+  const body = SOURCE.slice(SOURCE.indexOf("const reportAssetReadiness = useCallback("),
+    SOURCE.indexOf("const releaseServerToLegacy = useCallback("));
+  const guardAt = body.indexOf("if (current === null || patientStimulusKey(current) !== event.requestKey) return;");
+  const reportAt = body.indexOf("assetGateRef.current?.report(event.requestKey, event.readiness);");
+  assert.ok(guardAt > 0 && reportAt > guardAt, "键过滤必须在 report 之前");
+  assert.match(body, /const current = serverContextRef\.current\?\.current \?\? null;/);
+  const failed = body.slice(body.indexOf('if (event.readiness !== "failed") return;'));
+  assert.match(failed, /stopSpeaking\(\);/);
+  assert.match(failed, /controllerRef\.current\?\.stop\(\);/);
+  assert.match(failed, /setMode\("blocked"\);/);
 });

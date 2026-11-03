@@ -7,6 +7,8 @@
          connect-src 的 ws 仅限本机(dev HMR),不放行任意外部主机 → 杜绝声纹/PII 经 WebSocket 外泄。 -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'self'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ws://localhost:* wss://localhost:* ws://127.0.0.1:* wss://127.0.0.1:*" />
     <title>语言沟通训练系统 · 南医大</title>
+    <!-- 空图标:浏览器就不再去请求并不存在的 /favicon.ico -->
+    <link rel="icon" href="data:," />
   </head>
   <body>
     <div id="root"></div>

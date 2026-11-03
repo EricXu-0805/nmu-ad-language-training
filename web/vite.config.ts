@@ -49,6 +49,13 @@ const proxy = Object.fromEntries(
   ],
 )
 
+// 这两个模块的动态 import 是有意的(PatientShell 挂载即预取防旧分块 404;录音执行器/打断检测在两次中止检查之间 await),
+// 改成静态会挪动生命周期测试钉住的微任务时序。只滤这两条同一路径的告警,别处新出的 INEFFECTIVE_DYNAMIC_IMPORT 照常报。
+const knownIneffectiveDynamicImports = new Set([
+  resolve('src/patient/autopilotBrowserMediaDependencies.ts'),
+  resolve('src/patient/autopilotMediaTransport.ts'),
+])
+
 const forbiddenStaticBundleNames = new Set([
   'item_bank_v1.json',
   'week1_script.json',
@@ -96,5 +103,14 @@ export default defineConfig({
   server: { proxy },
   // Never base64-inline imported assets: every emitted byte must remain a
   // separately inspectable file for the final raw-byte DLP pass.
-  build: { outDir: 'dist', assetsInlineLimit: 0 },
+  build: {
+    outDir: 'dist',
+    assetsInlineLimit: 0,
+    rolldownOptions: {
+      onLog(level, log, handler) {
+        if (log.code === 'INEFFECTIVE_DYNAMIC_IMPORT' && knownIneffectiveDynamicImports.has(log.id ?? '')) return
+        handler(level, log)
+      },
+    },
+  },
 })

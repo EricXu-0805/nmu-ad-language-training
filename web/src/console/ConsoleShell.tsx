@@ -139,7 +139,8 @@ function ConsoleWorkspace({ identity, onLogout }: {
   }, []);
   // 开关状态广播给 App 层宿主。不做卸载时兜底关闭:同路由内操作端只在崩溃(Boundary
   // 接管)时卸载,那一刻恰恰要让叠层留着——受试者继续看平和画面,而不是红色报错屏。
-  useEffect(() => {
+  // layout effect:宿主在同一次提交、paint 之前收起叠层,不会有一帧叠层配着操作端字号。
+  useLayoutEffect(() => {
     window.dispatchEvent(new CustomEvent(PATIENT_VIEW_EVENT, { detail: { open: patientView } }));
   }, [patientView]);
   // 场次结束/离开训练即收起叠层;叠层收起后把 PatientShell 清理掉的字号尺度接回来。
