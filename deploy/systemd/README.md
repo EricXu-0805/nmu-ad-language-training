@@ -292,3 +292,49 @@ ssh eric@147.182.176.237 'date -u -d "+90 min" +%s > ~/.openclaw/workspace/nmu-p
 - 四条告警共用一个 webhook(Heartbeat、watchdog、本机告警的副本、这个探针):轮换
   `OPENCLAW_DISCORD_DAILY_WEBHOOK` 时,`/opt/nmu/ops-alert.env` 与 Mac 的
   `~/Library/nmu-backup/ops-webhook.env` 要一起换,否则会一起哑掉。
+
+## 国内探针(2026-11 入库,还没装)
+
+10-28 起国内到 box A 整个 IP 的 TCP 都被封了。`nmu-health`、上面的纽约探针、Heartbeat 的
+`check_bwg_nodes_live` 都从美国看,一直是绿的,是代理坏了才发现。`deploy/offbox/nmu_china_probe.py`
+从国内看:每小时请 Globalping 的 6 个国内探针连一次 TCP 443,状态变了才发 Discord。
+**现在只有代码和测试(`tests/test_china_probe.py`),哪台机器上都没装。**
+
+| 项 | 取值 |
+| --- | --- |
+| 一轮怎么判 | 一次 Globalping 测量(ping、TCP 443、3 个包、country=CN、6 个探针),只送 `--target`;算数的探针 ≥4 个、分属 ≥2 个 ASN 才下结论:全通 up,全不通 down,其余 partial |
+| 何时报 | 新结论连续 2 轮(1-2 小时)才改状态;改到 down 或 partial 报一次,比上次报的更坏才 @Eric;回到 up 报一次,带中断时长;中间不重复 |
+| 不算数的 | Globalping 回 429/4xx/5xx、连不上、90 秒没测完、算数的探针不够:记 `unevaluable`,不改状态,不据此报新状态;之前已确认、因静默没报的那条照样补报 |
+| 额度 | 匿名每个出口 IP 每小时 250 个测试(出处写在文件头);一轮 6 个,不到 3%。文档的数没在 droplet 上量过,每轮把 `X-RateLimit-Remaining/Limit` 记进 `china.log` 的 `quota=` |
+| 静默与文件 | 与纽约探针同一个目录,共用 `silence-until`,上面那条静默命令两边一起管;自己的是 `china-state.json`、`china.log`(0600) |
+
+不联网看它会发什么,以及 Eric 批了之后从 Mac 真测一次(用掉 6 个测试额度,不发 Discord、
+不写状态;10-29 复测时还封着,应当得到 `result=down`):
+
+```bash
+python3 -B deploy/offbox/nmu_china_probe.py --plan --target 89.208.253.119
+python3 -B deploy/offbox/nmu_china_probe.py --check --target 89.208.253.119
+```
+
+目标用 IP,跟 10-26 到 10-29 的手动测法一致,直接回答「这个 IP 解封了没有」;国内解析
+sslip.io 那一段不在它的范围里。
+
+装的话还差这几步,做不做、什么时候做由 Eric 定:
+
+1. 把 `nmu_china_probe.py` 推到 `openclaw-prod` 的 `~/.openclaw/workspace/nmu-probe/`。它 import
+   同目录的 `nmu_offbox_probe.py`(发 Discord、落盘、静默都用那一份),所以要用 `python3 -B` 起,
+   不能加 `-I`。
+2. user crontab 加一行(UTC 每小时 :17,避开纽约探针的 :x4 和 watchdog 的 :00/:05):
+   `17 * * * * /usr/bin/flock -n /home/eric/.openclaw/workspace/nmu-probe/.china.lock /usr/bin/python3 -B /home/eric/.openclaw/workspace/nmu-probe/nmu_china_probe.py --target 89.208.253.119 >> /home/eric/.openclaw/workspace/nmu-probe/china-cron.log 2>&1`。
+   `install_offbox_probe.sh` 不认这一行,它的 crontab 基线预检之后会对不上,要一起改。
+3. 目标写在这行 crontab 里,不在仓库文件里:IP 切换脚本的清单要加上它。
+4. Heartbeat 还没有对应的一行。要的话照 `check_nmu_probe` 写一个读 `china-state.json` 的;
+   没有它,探针自己停了不会有任何消息。装上之后共用 `OPENCLAW_DISCORD_DAILY_WEBHOOK` 的就是五条。
+
+它的边界:
+
+- Globalping 的国内探针多在阿里、腾讯这类机房,家宽和手机网络只有少数几个;机房连得上不等于
+  江苏电信家宽连得上。
+- 只测 TCP 握手,不测 TLS,也不打 `/health`。
+- 靠 Globalping 这个外部服务。它挂了或改了额度,这边只会一直 `unevaluable`,不会报警;
+  `--status` 里的 `unevaluable_streak` 看得见。
