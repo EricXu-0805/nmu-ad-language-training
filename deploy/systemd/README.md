@@ -282,7 +282,7 @@ ssh eric@147.182.176.237 'date -u -d "+90 min" +%s > ~/.openclaw/workspace/nmu-p
 | --- | --- |
 | 一轮怎么判 | 一次 Globalping 测量(ping、TCP 443、3 个包、country=CN、6 个探针),只送 `--target`;算数的探针 ≥4 个、分属 ≥2 个 ASN 才下结论:全通 up,全不通 down,其余 partial |
 | 何时报 | 新结论连续 2 轮(1-2 小时)才改状态;改到 down 或 partial 报一次,比上次报的更坏才 @Eric;回到 up 报一次,带中断时长;中间不重复 |
-| 不算数的 | Globalping 回 429/4xx/5xx、连不上、90 秒没测完、算数的探针不够:记 `unevaluable`,不改状态,不发消息 |
+| 不算数的 | Globalping 回 429/4xx/5xx、连不上、90 秒没测完、算数的探针不够:记 `unevaluable`,不改状态,不据此报新状态;之前已确认、因静默没报的那条照样补报 |
 | 额度 | 匿名每个出口 IP 每小时 250 个测试(出处写在文件头);一轮 6 个,不到 3%。文档的数没在 droplet 上量过,每轮把 `X-RateLimit-Remaining/Limit` 记进 `china.log` 的 `quota=` |
 | 静默与文件 | 与纽约探针同一个目录,共用 `silence-until`,上面那条静默命令两边一起管;自己的是 `china-state.json`、`china.log`(0600) |
 

@@ -491,6 +491,45 @@ def test_an_undelivered_down_then_recovery_becomes_one_combined_message(world):
     assert state["owed"] == [] and state["status"] == "up"
 
 
+def test_a_combined_recovery_names_the_worst_of_several_unsent_states(world):
+    working = world.keychain.reply
+    world.keychain.reply = SimpleNamespace(returncode=1, stderr="no such item", stdout="")
+    world.tick(HALF)
+    world.tick(HALF)                    # 判 partial,发不出去
+    world.tick(BLOCKED)
+    state = world.tick(BLOCKED)         # 再判 down,也发不出去
+    assert [m["kind"] for m in state["owed"]] == ["partial", "down"]
+    world.tick(OPEN)
+    world.keychain.reply = working
+    state = world.tick(OPEN)            # 判 up:合成一条,报最坏的那一档
+
+    assert world.kinds() == ["combined"]
+    assert "最坏时全部连不上" in world.content(0)
+    assert state["owed"] == [] and state["status"] == "up"
+
+
+def test_a_recovery_after_an_announced_partial_is_a_plain_up_not_a_combined_message(world):
+    working = world.keychain.reply
+    world.tick(HALF)
+    world.tick(HALF)                    # 判 partial,发出去了
+    world.keychain.reply = SimpleNamespace(returncode=1, stderr="no such item", stdout="")
+    world.tick(BLOCKED)
+    world.tick(BLOCKED)                 # 判 down,没发出去(它的 from 是 partial)
+    world.tick(OPEN)
+    world.keychain.reply = working
+    state = world.tick(OPEN)
+
+    assert world.kinds() == ["partial", "up"]
+    assert state["owed"] == [] and state["status"] == "up"
+
+
+def test_a_corrupt_gzip_body_is_unparseable_not_a_crash():
+    body = gzip.compress(b'{"id": "m1"}')
+    corrupt = body[:10] + bytes([0xFF]) * 12 + body[-8:]
+    reply = china._reply(200, {"Content-Encoding": "gzip"}, corrupt)
+    assert reply.code == 200 and reply.doc is None
+
+
 def test_a_missing_webhook_keeps_the_message_owed(world):
     world.keychain.reply = SimpleNamespace(returncode=1, stderr="no such item", stdout="")
     world.tick(BLOCKED)

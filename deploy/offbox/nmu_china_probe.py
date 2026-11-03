@@ -29,7 +29,8 @@ GET 单个测量每秒最多 2 次。出处:https://api.globalping.io/v1/spec.ya
 状态规则(tests/test_china_probe.py 逐条钉住):
   1. 新结论连续 CONFIRM_RUNS 轮才改状态,since 记这一串的第一轮;判 down 要 1-2 小时,
      一个探针抽风一轮翻不了状态。
-  2. unevaluable 不改状态、不动确认中的连胜,只把 unevaluable_streak 加一。
+  2. unevaluable 不改状态、不动确认中的连胜,只把 unevaluable_streak 加一;之前已确认、因静默还没
+     报的那条照样补报(不等下一次评得了)。
   3. 改到 down 或 partial 欠一条消息;比上次告诉 Eric 的更坏才 @Eric。
   4. 回到 up 欠一条带中断时长的「已恢复」;坏消息一直没发出去就恢复了 → 合成一条补报。
   5. 发送失败的继续欠着,下一轮再发;发出去的不会再发第二次。
@@ -60,6 +61,7 @@ import time
 from typing import NamedTuple
 import urllib.error
 import urllib.request
+import zlib
 
 import nmu_offbox_probe as offbox
 
@@ -140,7 +142,7 @@ def _reply(code: int, headers, raw: bytes) -> Reply:
         if (headers.get("Content-Encoding") or "").lower() == "gzip":
             raw = gzip.decompress(raw)
         doc = json.loads(raw.decode("utf-8"))
-    except (OSError, EOFError, ValueError):
+    except (OSError, EOFError, ValueError, zlib.error):
         doc = None
     return Reply(code, doc, quota, None)
 
