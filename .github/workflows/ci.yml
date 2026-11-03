@@ -160,6 +160,8 @@ jobs:
           exit-code: "1"
           severity: HIGH,CRITICAL
           ignore-unfixed: false
+          # 只放行逐条登记、带到期日的条目;理由与到期规矩写在文件里。
+          trivyignores: security/trivy-gateway.trivyignore
       - name: 确认扫描确实识别了网关和实际 Go 版本
         run: >-
           python scripts/verify_caddy_release_scan.py "$RUNNER_TEMP/nmu-edge-scan.json"

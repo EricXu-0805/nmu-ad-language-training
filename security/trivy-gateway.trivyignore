@@ -1,0 +1,13 @@
+# 网关(实际编出来的 Caddy 二进制)Trivy 扫描的限期豁免,只给 ci.yml 里扫网关那一步用。
+# 规矩同 security/vuln-waivers.json:每条带 exp:,到期 Trivy 自己就不再放行、image 检查转红,
+# 逼人重看一次;理由要写成可证伪的技术判断。形状由 tests/test_ci_gate_contract.py 钉住。
+#
+# CVE-2026-116587 / GHSA-mgcc-cww5-fp2q,go-jose v3 v3.0.5,HIGH:解析含 RSA 公钥的 JWK 可被拖垮。
+#   登记 2026-11-03。v3 没有修复版(只在 v4 4.1.6 修了;v4 已升并进了安全钉版)。v3 只经
+#   caddypki → smallstep/certificates/authority → go.step.sm/crypto/jose 进到二进制,Caddy v2.11.7、
+#   go.step.sm/crypto v0.91.1 也还依赖它,换版本去不掉。这条路径只在网关自己当 ACME 服务器或开内部
+#   CA 时才解析外来 JWK:仓库 Caddyfile 与生产 /opt/nmu/caddy/Caddyfile(11-03 只读核过)都没有
+#   acme_server、pki、tls internal、local_certs。打开其中任何一样,这条豁免就不成立。
+#   到期前先看 go-jose 有没有出 v3 修复、上游有没有换掉 v3。
+CVE-2026-116587 exp:2026-12-03
+GHSA-mgcc-cww5-fp2q exp:2026-12-03
