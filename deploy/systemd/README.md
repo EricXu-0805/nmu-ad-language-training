@@ -158,8 +158,11 @@ journal 推到 Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,�
   os-security 告警里一个待装的包都没有:结论整份重定向进了 state 文件,journal 里只剩
   systemd 自己那几行。state 文件不是这一轮写的(脚本在写结论之前就挂了),消息里会标出来。
 - 原因之后跟一行「下一步」,按单元写死在 `notify_ops.py` 的 `NEXT_STEPS`:os-security 那行写明
-  内核/netplan/grub/shim 类只走 `deploy/maintenance/kernel_netplan_window.sh`(先跑 `check`),
-  绝不 `apt-get full-upgrade`;capacity 指 `capacity_reclaim.py` 只读盘点;备份类指交接文档 5.1。
+  内核元包走 `deploy/maintenance/kernel_netplan_window.sh`(先跑 `check`);netplan/grub/shim 等
+  窗口脚本装不了,挑维护窗口手装、重启后跑它的 `verify-kernel`;其余先 `apt-get -s install`
+  看会不会带进前两类;绝不 `apt-get full-upgrade`。health 那行分开「站点死了」与
+  「`/health` 200 而 `/health/ready` 503」(库或盘);capacity 指 `capacity_reclaim.py` 只读盘点;
+  备份类指交接文档 5.1。
   没登记的单元(`nmu`、`nmu-caddy`)没有这一行。
 - 标头里的主机名取 `NMU_OPS_HOST_LABEL`(`nmu-alert@.service` 里设成「NMU 生产机 box A」),
   没设才用 hostname(这台是 `green-fiber-1.localdomain`)。Mac 侧的告警不设,仍是 Mac 的 hostname。
@@ -191,11 +194,13 @@ journal 推到 Discord(`Eric Hub > #daily`,Heartbeat 同频道)。失败才响,�
    的 app.db,服务死没死它照写 ok。新增 `nmu-health.timer`,每 10 分钟从应用进程外面打一次
    公网 `/health`,覆盖「进程不应答、返 5xx」「Caddy 死了」「证书过期」。
    **「磁盘满转只读」原来看不出来**:`/health` 返回一个常量(`app/main.py` 的 `health()`),
-   不碰库也不碰盘,只证明进程还在应答。2026-11 入库的单元改打 `/health/ready`:查一次库,
+   不碰库也不碰盘,只证明进程还在应答。2026-11 入库的单元改打 `/health/ready`:读一次库
+   (SQLite 读 `sqlite_master`;`SELECT 1` 不读库文件,库写坏了照样过),
    看库目录和录音目录所在文件系统是不是只读、剩余空间低不低于 `READINESS_MIN_FREE_MB`
    (默认 2048,与 `nmu-capacity` 的 `--min-free-mb` 一致),任何一样不对返 503,正文只有
-   `{"status": …}`,不说是哪一样;结论缓存 5 秒,公网打不出磁盘负载。它也跑在这台机器上,
-   机器宕了或出口断了它和它的告警一起没了,那一档归文末的异地探针。
+   `{"status": …}`,不说是哪一样;结论缓存 5 秒,公网打不出磁盘负载。空间低于门槛期间
+   `nmu-health` 每 10 分钟失败一次、每次都告警,比 `nmu-capacity` 每天一条密得多。
+   它也跑在这台机器上,机器宕了或出口断了它和它的告警一起没了,那一档归文末的异地探针。
 
 `tests/test_systemd_alerting.py` 把这三条钉住:每个单元必须有 OnFailure、
 `Restart=always` 必须配得上 burst、单元里不许出现 `|| true`、必须存在公网探针单元。

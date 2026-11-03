@@ -942,10 +942,12 @@ def _ready_min_free_bytes() -> int:
 
 def _storage_ready() -> bool:
     try:
-        with db.engine.connect() as connection:
-            connection.exec_driver_sql("SELECT 1")
-        directories = [audio_store.AUDIO_DIR]
         database = db._sqlite_file_path(db.engine.url)
+        with db.engine.connect() as connection:
+            # SQLite 的 SELECT 1 不开读事务、不读库文件，库写坏了照样过；读 sqlite_master 才读页头。
+            connection.exec_driver_sql(
+                "SELECT 1 FROM sqlite_master LIMIT 1" if database is not None else "SELECT 1")
+        directories = [audio_store.AUDIO_DIR]
         if database is not None:
             directories.append(database.parent)
         floor = _ready_min_free_bytes()

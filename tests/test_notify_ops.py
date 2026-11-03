@@ -301,8 +301,25 @@ def test_no_next_step_ever_recommends_a_full_upgrade():
     os_step = notify.NEXT_STEPS["nmu-os-security"]
     assert "绝不 apt-get full-upgrade" in os_step
     assert "kernel_netplan_window.sh" in os_step and "跑 check" in os_step
-    assert (ROOT / "deploy" / "maintenance" / "kernel_netplan_window.sh").is_file()
+    # 窗口脚本只装四个内核元包:网络/引导类另手装再 verify-kernel,其余先 -s 模拟。
+    assert "窗口脚本装不了" in os_step and "verify-kernel" in os_step
+    assert "先 apt-get -s install" in os_step
+    window = (ROOT / "deploy" / "maintenance" / "kernel_netplan_window.sh").read_text(encoding="utf-8")
+    assert ('META_PACKAGES="linux-generic linux-image-generic linux-headers-generic '
+            'linux-libc-dev"') in window
+    assert "  verify-kernel)" in window
     assert (ROOT / "scripts" / "capacity_reclaim.py").is_file()
+
+
+def test_the_health_next_step_tells_a_disk_or_db_503_from_a_dead_site():
+    """/health/ready 503 而 /health 200 时,5.2 和机外探针都是绿的。"""
+    step = notify.NEXT_STEPS["nmu-health"]
+    assert "/health/ready 503" in step
+    assert "df -h /" in step and "findmnt -no OPTIONS /" in step and "capacity.state" in step
+    handover = (ROOT / "docs" / "handover" / "运维交接_值班与故障处置.md").read_text(encoding="utf-8")
+    section = handover.split("### 5.2 网站打不开", 1)[1].split("### 5.3", 1)[0]
+    assert "/health/ready   # 期望 200" in section
+    assert "findmnt -no OPTIONS /" in section
 
 
 def test_the_host_label_replaces_the_machine_hostname(backups, monkeypatch):

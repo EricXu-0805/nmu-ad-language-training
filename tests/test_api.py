@@ -128,6 +128,19 @@ def test_a_database_that_cannot_be_queried_is_not_ready(ready_client, monkeypatc
     assert response.json() == {"status": "unavailable"}
 
 
+def test_a_corrupted_database_file_is_not_ready_even_on_a_pooled_connection(
+        ready_client, monkeypatch, tmp_path):
+    # SQLite 的 SELECT 1 不开读事务、不读库文件，库写坏了它照样 200。
+    assert ready_client.get("/health/ready").status_code == 200
+    (tmp_path / "app.db").write_bytes(b"not a sqlite database" * 64)
+    _refresh_ready(monkeypatch)
+
+    response = ready_client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+
+
 def test_readiness_is_cached_briefly_so_the_public_route_cannot_hammer_the_disk(
         ready_client, monkeypatch):
     statvfs = _fake_statvfs()

@@ -657,7 +657,8 @@ def test_evaluate_switches_to_the_linked_model_only_when_the_newest_snapshot_is_
     assert stopped["rotation_credit_measurement"] == "last_link_allocated_bytes_only"
     # 链接时 days_left 已把 live 录音与库算进去；整份模型仍只算备份。
     assert linked["projection_scope"] == "scheduled_daily_backup_retention_plus_live_audio_and_db"
-    assert "live_data" not in linked["unmeasured_growth"]
+    assert linked["unmeasured_growth"] == ["live_tts_cache_and_scratch", "other_logs_and_files",
+                                           "unattributed_filesystem_metadata"]
     assert stopped["projection_scope"] == "scheduled_daily_backup_retention_only"
     assert "live_data" in stopped["unmeasured_growth"]
 

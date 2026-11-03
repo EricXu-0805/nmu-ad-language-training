@@ -49,11 +49,13 @@ REASON_SOURCES = {
 # 只有原因,原因里写着 full-upgrade,而内核类按规矩只在维护窗口里装。
 NEXT_STEPS = {
     "nmu-os-security": (
-        "内核/netplan/grub/shim 类只走维护窗口:在 Mac 上先改 "
-        "deploy/maintenance/kernel_netplan_window.sh 的 ABI 常量、跑 check,"
-        "绝不 apt-get full-upgrade;其余安全包 apt-get install 点名装;原因点名 nmu/nginx "
-        "跑在旧库上的,挑没人练的时候 systemctl restart nmu(或 nginx),再重跑 "
-        "os_security_check.py"),
+        "内核元包(linux-generic 等四个)走维护窗口:在 Mac 上先改 "
+        "deploy/maintenance/kernel_netplan_window.sh 的 ABI 常量、跑 check;"
+        "netplan/grub/shim 等网络/引导类窗口脚本装不了,挑维护窗口手装 apt-get install 点名装,"
+        "装完重启再跑窗口脚本的 verify-kernel;其余安全包先 apt-get -s install 看会不会带进"
+        "内核/网络/引导类,不带再 apt-get install 点名装;绝不 apt-get full-upgrade;"
+        "原因点名 nmu/nginx 跑在旧库上的,挑没人练的时候 systemctl restart nmu(或 nginx),"
+        "再重跑 os_security_check.py"),
     "nmu-restore-drill": (
         "看 /opt/nmu/backups/restore-drill.state 全文,找负责人;别在 nmu 运行时手动补跑演练"
         "(交接文档第 6 节第 2 条:内存只有 1 GiB)"),
@@ -65,7 +67,9 @@ NEXT_STEPS = {
         "probe_last_run_failed 按 5.2,offbox_probe_silent 是机外探针 30 分钟没来,查 OpenClaw 那台"),
     "nmu-backup": "按交接文档 5.1:tail -20 /opt/nmu/backups/backup.log 看失败码;别手工造快照",
     "nmu-health": (
-        "按交接文档 5.2「网站打不开」;机外探针 nmu_offbox_probe.py --status 看纽约那头是不是也判 DOWN"),
+        "按交接文档 5.2「网站打不开」;/health 200 而 /health/ready 503 是库或盘:df -h /、"
+        "findmnt -no OPTIONS /、cat /opt/nmu/backups/capacity.state,再按 5.1 第 2 条;"
+        "机外探针 nmu_offbox_probe.py --status 看纽约那头是不是也判 DOWN(它只打 /health)"),
 }
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}")
 _WEBHOOK_URL = re.compile(r"https://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/\S+")

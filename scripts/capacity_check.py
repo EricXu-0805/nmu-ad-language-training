@@ -6,9 +6,10 @@
 快照尺寸趋势取每天最大一份；所有实际快照仍计入当前队列与原始写入速率。
 
 默认门槛保持 85% 占用、2048 MiB 可用、未来 30 天备份写入空间。预测涵盖
-按合同成功轮转的每日备份（链接模型下另加 live 录音与库的增长，见下）；其他日志与文件、
-未归属到快照块量的元数据增长没有测量。days_left 仅报告预测期内空间不足的时点；None 不代表
-无限寿命或整个服务器安全。发布时的额外副本、临时保留目录须另做一次性预算。
+按合同成功轮转的每日备份（链接模型下另加 live 录音与库的增长，见下）；live 的 TTS 缓存
+与 ASR 临时目录、其他日志与文件、未归属到快照块量的元数据增长没有测量。
+days_left 仅报告预测期内空间不足的时点；None 不代表无限寿命或整个服务器安全。
+发布时的额外副本、临时保留目录须另做一次性预算。
 
 备份打开录音硬链接去重（NMU_BACKUP_LINK_AUDIO=1）后，相邻快照共享未变录音的 inode：
 共享 inode 只计一次，块量记在最后一个持有它的快照上。最新一份与更早快照共享录音时
@@ -391,7 +392,9 @@ def evaluate(backup_root: Path, data_dir: Path | None, *, max_used_pct: float,
         facts["snapshot_model"] = "linked_audio"
         facts["assumptions"].append("unchanged_audio_relinked_into_every_new_snapshot")
         facts["projection_scope"] = "scheduled_daily_backup_retention_plus_live_audio_and_db"
-        facts["unmeasured_growth"].remove("live_data")
+        # 只建模了 live 录音与库；TTS 永久缓存（每句寒暄一个 WAV）和 ASR 临时目录仍没测。
+        unmeasured = facts["unmeasured_growth"]
+        unmeasured[unmeasured.index("live_data")] = "live_tts_cache_and_scratch"
     if data_dir is not None and data_dir.is_dir():
         facts["data_dir_mb"] = directory_bytes(data_dir) // MIB
     return facts
