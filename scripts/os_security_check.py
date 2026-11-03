@@ -59,6 +59,9 @@ APP_UNITS = ("nmu.service", "nginx.service")
 # 与 deploy/apt/52nmu-unattended-upgrades 的 Package-Blacklist 同一份：夜里不装，只在维护窗口装。
 # 告警里照这个分修法，2026-11-02 那条把内核也写成了 full-upgrade。
 WINDOW_ONLY_PREFIXES = ("linux-", "netplan", "libnetplan", "grub", "shim")
+# 维护窗口脚本只会装这四个元包（与它的 META_PACKAGES 同一份）；拉黑的其余包它装不了。
+KERNEL_WINDOW_PACKAGES = ("linux-generic", "linux-image-generic", "linux-headers-generic",
+                          "linux-libc-dev")
 
 # apt-get -s upgrade 的行形如：
 #   Inst tar [1.34+dfsg-1ubuntu0.1.22.04.2] (1.34+dfsg-1ubuntu0.1.22.04.6
@@ -251,15 +254,24 @@ def evaluate(pending: list[PendingUpgrade], age: timedelta | None,
 
     if security:
         sample = "、".join(p.name for p in security[:6])
-        windowed = [p.name for p in security if p.name.startswith(WINDOW_ONLY_PREFIXES)]
+        kernel = [p.name for p in security if p.name in KERNEL_WINDOW_PACKAGES]
+        windowed = [p.name for p in security
+                    if p.name.startswith(WINDOW_ONLY_PREFIXES) and p.name not in KERNEL_WINDOW_PACKAGES]
         manual = [p.name for p in security if not p.name.startswith(WINDOW_ONLY_PREFIXES)]
+
+        def names(group: list[str]) -> str:
+            return " ".join(group[:6]) + ("…" if len(group) > 6 else "")
+
         fixes = []
-        if windowed:
-            fixes.append(f"内核/网络/引导类 {len(windowed)} 个走维护窗口 "
+        if kernel:
+            fixes.append(f"内核 {len(kernel)} 个走维护窗口 "
                          "deploy/maintenance/kernel_netplan_window.sh（先改 ABI 常量、跑 check）")
+        if windowed:
+            fixes.append(f"网络/引导类 {len(windowed)} 个窗口脚本装不了，挑维护窗口手装 apt-get install "
+                         f"{names(windowed)}，装完重启再跑窗口脚本的 verify-kernel")
         if manual:
-            fixes.append(f"其余 {len(manual)} 个夜间补丁没装上，手装 apt-get install "
-                         + " ".join(manual[:6]))
+            fixes.append(f"其余 {len(manual)} 个夜间补丁没装上，先 apt-get -s install 看会不会带进"
+                         f"内核/网络/引导类，不带再手装 apt-get install {names(manual)}")
         failures.append(
             f"{len(security)} 个安全更新待安装（{sample}…）；修法：" + "；".join(fixes))
     if other:

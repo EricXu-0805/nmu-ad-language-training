@@ -25,9 +25,11 @@
 # 定时器」;它们开机随 timers.target 自己起来);full-upgrade;改 00-installer-config.yaml;
 # netplan 里给网卡改名;打印 MAC(它和 KiwiVM 的 VM 编号挂钩)。
 #
-# 起不来时:KiwiVM 控制台 → GRUB 菜单(只亮 2 秒,失败重启后 30 秒)→ Advanced options →
-#   FALLBACK_ABI 那个内核。开了机但没网:控制台 root 登录,把 /etc/netplan/50-nmu-by-mac.yaml
-#   挪到 /root/,再 netplan apply;nmu 与定时器都不用动。
+# kernel 阶段起不来、或开了机却没网:多半是新内核的事,KiwiVM 控制台 → GRUB 菜单(只亮 2 秒,
+#   失败重启后 30 秒)→ Advanced options → 回退内核(这一轮是 5.15.0-198-generic)。by-mac 段
+#   是现役网络,别动它。
+# netplan 阶段开了机但没网:控制台 root 登录,把 /etc/netplan/50-nmu-by-mac.yaml 挪到 /root/,
+#   再 netplan apply;nmu 与定时器都不用动。
 # 换目标内核时改下面三个 *_ABI 常量,重新评审后再跑。
 set -u
 KEY="$HOME/.ssh/id_ed25519"
@@ -48,6 +50,8 @@ PHASE="${1:-}"
 GATE_FAILURES=0
 BOOT_BEFORE=""
 DEPLOY_BEFORE=""
+# 重启前开机自启的 sing-box* 单元;"-" 表示没记过(只读核对时)。
+PROXIES_BEFORE="-"
 # 这台 Mac 的代理环境变量会劫持直连的 curl,六个大小写都要清。
 for v in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do unset "$v"; done
 
@@ -223,7 +227,7 @@ REMOTE
 # 服务、failed 单元、六个定时器。只读:定时器不 start、不 restart、不 enable。
 remote_health() {   # $1 = before|after:开窗前的 failed 单元只报告,重启后一条都不许有
   echo "== 服务与定时器(${1}) =="
-  RBASH "TIMERS='${TIMERS}' WHEN=${1} bash -s" <<'REMOTE'
+  RBASH "TIMERS='${TIMERS}' WHEN=${1} PROXIES_BEFORE='${PROXIES_BEFORE}' bash -s" <<'REMOTE'
 set -u
 bad=0
 pass() { echo "  PASS $*"; }
@@ -239,6 +243,10 @@ for unit in ${proxies}; do
   if [ "${state}" = "active" ]; then pass "${unit} active"; else fail "${unit} ${state}(开机自启却没在跑)"; fi
 done
 echo "  注 开机自启的代理:${proxies:-无}"
+# 列不到时 systemctl 也退 1,分不清「真没有」和「出错」,所以重启后拿重启前的清单对。
+if [ "${WHEN}" = "after" ] && [ "${PROXIES_BEFORE}" != "-" ] && [ "${proxies}" != "${PROXIES_BEFORE}" ]; then
+  fail "开机自启的代理变了:重启前 ${PROXIES_BEFORE:-无},现在 ${proxies:-无}"
+fi
 failed_units=$(systemctl --no-pager list-units --no-legend --state=failed | sed 's/^[^[:alnum:]]*//' | awk '{print $1}' | tr '\n' ' ')
 if [ -z "${failed_units}" ]; then
   pass "没有 failed 单元"
@@ -265,8 +273,10 @@ record_baseline() {
   echo "== 基线(改动之前) =="
   BOOT_BEFORE=$(RSH 'cat /proc/sys/kernel/random/boot_id') || return 1
   DEPLOY_BEFORE=$(RSH 'head -1 /opt/nmu/last-deploy.state') || return 1
+  PROXIES_BEFORE=$(RSH "systemctl --no-pager list-unit-files --no-legend --state=enabled 'sing-box*.service' | awk '{print \$1}' | tr '\n' ' '") || return 1
   echo "  boot_id ${BOOT_BEFORE}"
   echo "  last-deploy.state 首行:${DEPLOY_BEFORE}"
+  echo "  开机自启的代理:${PROXIES_BEFORE:-无}"
   RBASH 'bash -s' <<'REMOTE'
 set -u -o pipefail
 echo "  内核 $(uname -r),$(uptime -p)"
@@ -573,6 +583,7 @@ phase_check() {
   echo "(只读演练:不改生产上的任何东西,也不问问题)"
   gate "Mac 侧路由与 KiwiVM 直连" mac_route_ok
   common_gates 45
+  gate "按 MAC 匹配的段与 eth0 的 Network File 一致" network_consistent
   gate "基线" record_baseline
   gate "装包模拟只带进预期的 9 个包" simulation_matches
   if [ "${GATE_FAILURES}" = "0" ]; then
@@ -594,6 +605,14 @@ current_network() {
     "absent:${NET_ENS18}") echo "${NET_ENS18}" ;;
     *) echo "" ;;
   esac
+}
+
+network_consistent() {
+  local network
+  echo "== 网络:按 MAC 匹配的段在不在,和 eth0 正在用的 Network File 对得上 =="
+  network=$(current_network)
+  echo "  ${network:-对不上}"
+  [ -n "${network}" ]
 }
 
 phase_kernel() {

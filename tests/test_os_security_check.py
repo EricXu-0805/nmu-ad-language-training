@@ -234,15 +234,39 @@ def test_the_fix_sends_kernel_packages_to_the_window_and_never_says_full_upgrade
     """2026-11-02 的告警把内核也写成 apt-get full-upgrade,而内核按规矩只在维护窗口里装。"""
     kernel = [p for p in osc.parse_simulation(FULL_UPGRADE_OUTPUT) if p.security]
     [only_kernel], _ = osc.evaluate(kernel, FRESH, MAX_AGE, False, [])
-    assert "kernel_netplan_window.sh" in only_kernel and "内核/网络/引导类 3 个" in only_kernel
+    assert "kernel_netplan_window.sh" in only_kernel and "内核 3 个" in only_kernel
     assert "full-upgrade" not in only_kernel and "apt-get install" not in only_kernel
 
     [mixed], _ = osc.evaluate(kernel + osc.parse_simulation(REAL_OUTPUT), FRESH, MAX_AGE, False, [])
-    assert "内核/网络/引导类 3 个" in mixed
-    assert "其余 3 个夜间补丁没装上，手装 apt-get install bsdutils gzip tar" in mixed
+    assert "内核 3 个" in mixed
+    assert "其余 3 个夜间补丁没装上" in mixed and "apt-get -s install" in mixed
+    assert mixed.endswith("apt-get install bsdutils gzip tar")
 
     [plain], _ = osc.evaluate(osc.parse_simulation(REAL_OUTPUT), FRESH, MAX_AGE, False, [])
     assert "kernel_netplan_window.sh" not in plain and "full-upgrade" not in plain
+
+
+def test_blacklisted_packages_the_window_cannot_install_are_hand_installed_in_a_window():
+    """窗口脚本只装四个内核元包;grub、shim、netplan、linux-firmware 照告警跑 check 会对不上包。"""
+    pending = [osc.PendingUpgrade(name, "1", "2", security=True)
+               for name in ("grub-common", "shim-signed", "linux-firmware", "linux-generic")]
+    [failure], _ = osc.evaluate(pending, FRESH, MAX_AGE, False, [])
+    assert "内核 1 个走维护窗口" in failure
+    assert "网络/引导类 3 个窗口脚本装不了" in failure
+    assert "apt-get install grub-common shim-signed linux-firmware，装完重启" in failure
+
+
+def test_a_long_hand_install_list_says_it_is_cut_short():
+    pending = [osc.PendingUpgrade(f"lib{i}", "1", "2", security=True) for i in range(8)]
+    [failure], _ = osc.evaluate(pending, FRESH, MAX_AGE, False, [])
+    assert failure.endswith("apt-get install lib0 lib1 lib2 lib3 lib4 lib5…")
+
+
+def test_the_kernel_group_is_what_the_window_script_installs():
+    script = (Path(__file__).resolve().parents[1] / "deploy" / "maintenance"
+              / "kernel_netplan_window.sh").read_text(encoding="utf-8")
+    metas = re.search(r'^META_PACKAGES="([^"]+)"$', script, re.M).group(1).split()
+    assert tuple(metas) == osc.KERNEL_WINDOW_PACKAGES
 
 
 def test_the_window_only_prefixes_match_the_unattended_blacklist():

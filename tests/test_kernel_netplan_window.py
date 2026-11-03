@@ -381,6 +381,8 @@ if "boot_id" in command:
     reply(state["boot"] + "\\n")
 if "last-deploy.state" in command:
     reply("commit = af59c28\\n")
+if "list-unit-files" in command:
+    reply(state.get("proxies", "sing-box-hy2.service "))
 if command == "uname -r":
     reply(state["kernel"] + "\\n")
 if "networkctl" in command:
@@ -529,6 +531,27 @@ def test_verify_kernel_reads_the_expected_network_from_the_host(tmp_path):
     assert [c for c in commands
             if "EXPECT_NETWORK=/run/systemd/network/10-netplan-by-mac.network" in c]
     assert not [c for c in commands if re.search(r"systemd-run|reboot|apt-get", c)]
+
+
+def test_the_proxies_enabled_before_the_reboot_are_what_the_post_reboot_check_expects(tmp_path):
+    """列不到单元时 systemctl 也退 1:重启后拿重启前记下的清单对,才分得清「真没有」与「出错」。"""
+    result, commands = _run_phase(tmp_path, "kernel", answers="yes\n" * 4)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "开机自启的代理:sing-box-hy2.service" in result.stdout
+    [before] = [c for c in commands if "WHEN=before" in c]
+    [after] = [c for c in commands if "WHEN=after" in c]
+    assert "PROXIES_BEFORE='-'" in before
+    assert "PROXIES_BEFORE='sing-box-hy2.service '" in after
+
+
+def test_the_check_phase_flags_a_half_done_netplan_change(tmp_path):
+    result, commands = _run_phase(tmp_path, "check", host={
+        **_FRESH_HOST, "netfile": "/run/systemd/network/10-netplan-ens18.network"})
+
+    assert result.returncode == 1
+    assert "这一项不过:按 MAC 匹配的段与 eth0 的 Network File 一致" in result.stdout
+    assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
 
 
 def test_a_declined_reboot_leaves_the_kernel_installed_and_the_rerun_skips_the_install(tmp_path):
