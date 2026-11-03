@@ -208,7 +208,7 @@ test("buildRapportReplaySection: 定稿与语音返回合看,三种说出状态�
   assert.equal(section.rows[0]!.spokenLabel, "已返回语音");
   assert.equal(section.rows[1]!.spokenLabel, "已改用本机语音(服务器未返回音频)");
   assert.equal(section.rows[2]!.spokenLabel, "只有定稿，没有语音返回记录");
-  assert.equal(section.rows[1]!.degradedLabel, "AI 没给出可用回应（服务不可用或生成越界被拒），已退回固定句");
+  assert.equal(section.rows[1]!.degradedLabel, "AI 服务没给出回应（较早的记录里也含生成越界被拒），已退回固定句");
   assert.equal(section.rows[0]!.positionLabel, "介绍机构环境 · 第 1 问");
   assert.equal(section.rows[0]!.originLabel, "老人说完自动回应");
 });
@@ -218,12 +218,15 @@ test("buildAiUsageSection: 第1周 rapport 使 hasAnyRecords=true 且转写/现�
     rapport: {
       asrEngines: [{ engineVersion: "qwen3-asr", utterances: 4 }],
       replyEngines: [{ engineVersion: "qwen-plus", utterances: 3 }],
-      degraded: [{ reason: "llm_unavailable", count: 1 }],
+      degraded: [{ reason: "llm_unavailable", count: 1 }, { reason: "llm_rejected", count: 2 }],
     },
   }));
   assert.equal(model.hasAnyRecords, true);
-  assert.equal(model.rapportRows.length, 3);
+  assert.equal(model.rapportRows.length, 4);
   assert.match(model.rapportRows[0]!.label, /转写/);
   assert.match(model.rapportRows[1]!.label, /现编回应/);
   assert.match(model.rapportRows[2]!.label, /退回固定句/);
+  // 守卫拦截与服务不可用各成一行,研究侧数得出拦截率。
+  assert.equal(model.rapportRows[3]!.label, "退回固定句 · AI 生成越界被拒，已退回固定句");
+  assert.equal(model.rapportRows[3]!.detail, "2 次");
 });

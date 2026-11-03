@@ -18,7 +18,7 @@ import json
 import os
 import re
 import unicodedata
-from typing import Optional, Protocol
+from typing import Literal, Optional, Protocol
 
 
 # 一句给老人听的话的硬边界:太长听不住,含槽位符/换行说明生成器没守规矩。
@@ -98,6 +98,31 @@ def validate_reply_text(raw: object, *, final: bool = False) -> Optional[str]:
 
 
 History = tuple[tuple[Optional[str], str], ...]   # ((老人说, 机器人说), ...) 按轮次
+# ok=过了守卫;rejected=模型交回了一句话但被守卫拒(研究侧数拦截率用);
+# unavailable=没调成、空回或形状不对。
+Outcome = Literal["ok", "rejected", "unavailable"]
+
+
+def _guard_outcome(raw: object, *, final: bool) -> tuple[Optional[str], Outcome]:
+    text = validate_reply_text(raw, final=final)
+    if text is not None:
+        return text, "ok"
+    if isinstance(raw, str) and raw.strip():
+        return None, "rejected"
+    return None, "unavailable"
+
+
+def generate_with_outcome(engine: "RapportReplyProvider", ask: str, asr_text: str,
+                          history: History = (), round_no: int = 1,
+                          max_rounds_value: int = 1) -> tuple[Optional[str], Outcome]:
+    """调用方用这个,不直接调 generate():引擎能报结局就用引擎的;只实现 generate()
+    的引擎(stub/将来的本地模型)按它交回的原文再过一遍守卫来判。"""
+    own = getattr(engine, "generate_with_outcome", None)
+    if own is not None:
+        return own(ask, asr_text, history, round_no, max_rounds_value)
+    return _guard_outcome(
+        engine.generate(ask, asr_text, history, round_no, max_rounds_value),
+        final=round_no >= max_rounds_value)
 
 
 def build_reply_prompt(ask: str, asr_text: str, history: History = (),
@@ -173,13 +198,19 @@ class QwenReplyEngine:
 
     def generate(self, ask: str, asr_text: str, history: History = (),
                  round_no: int = 1, max_rounds_value: int = 1) -> Optional[str]:
+        return self.generate_with_outcome(
+            ask, asr_text, history, round_no, max_rounds_value)[0]
+
+    def generate_with_outcome(self, ask: str, asr_text: str, history: History = (),
+                              round_no: int = 1, max_rounds_value: int = 1
+                              ) -> tuple[Optional[str], Outcome]:
         if not self.available():
-            return None
+            return None, "unavailable"
         try:
             raw = self._call(build_reply_prompt(
                 ask, asr_text, history, round_no, max_rounds_value))
         except Exception:
-            return None
+            return None, "unavailable"
         return self._parse(raw, final=round_no >= max_rounds_value)
 
     def _call(self, prompt: str) -> str | None:
@@ -196,19 +227,19 @@ class QwenReplyEngine:
             return None
         return choices[0].message.content
 
-    def _parse(self, raw, *, final: bool = False) -> Optional[str]:
+    def _parse(self, raw, *, final: bool = False) -> tuple[Optional[str], Outcome]:
         if not raw or not isinstance(raw, str):
-            return None
+            return None, "unavailable"
         text = raw.strip()
         if text.startswith("```"):
             text = text.strip("`").removeprefix("json").strip()
         try:
             data = json.loads(text)
         except ValueError:
-            return None
+            return None, "unavailable"
         if not isinstance(data, dict) or set(data) != _REPLY_KEYS:
-            return None
-        return validate_reply_text(data["reply"], final=final)
+            return None, "unavailable"
+        return _guard_outcome(data["reply"], final=final)
 
 
 _ENGINES: dict[str, RapportReplyProvider] = {"off": OffReplyEngine()}

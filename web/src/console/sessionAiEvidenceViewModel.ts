@@ -258,7 +258,8 @@ const RAPPORT_SOURCE_LABELS: Record<RapportUtteranceRecord["source"], string> = 
 const RAPPORT_DEGRADED_LABELS: Record<string, string> = {
   asr_failed: "录音没听清，已退回固定句",
   asr_empty: "老人没说话，已退回固定句",
-  llm_unavailable: "AI 没给出可用回应（服务不可用或生成越界被拒），已退回固定句",
+  // 后端拆出 llm_rejected 之前落的行,越界被拒也记在这一项下。
+  llm_unavailable: "AI 服务没给出回应（较早的记录里也含生成越界被拒），已退回固定句",
   llm_rejected: "AI 生成越界被拒，已退回固定句",
   cloud_not_authorized: "该受试者未授权云处理，全程本机",
   round_limit: "本问已聊满设定轮数，说收束句换下一问",

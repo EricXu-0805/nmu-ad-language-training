@@ -6418,6 +6418,7 @@ def rapport_reply_create(
                 asr_text = asr_result.asr_text.strip()
                 engine = rapport_reply.get_engine()
                 generated: str | None = None
+                outcome: rapport_reply.Outcome = "unavailable"
                 boundary = cloud_processing.provider_boundary(engine)
                 _rapport_recheck_before_provider(
                     request, session_id, patient_id, s, processing_snapshot)
@@ -6426,11 +6427,13 @@ def rapport_reply_create(
                         with _serialized_cloud_provider_call(
                                 session_id=session_id, patient_id=patient_id,
                                 provider=engine, bind=s.get_bind()):
-                            generated = engine.generate(
-                                ask_line, asr_text, history, round_no, round_limit)
+                            generated, outcome = rapport_reply.generate_with_outcome(
+                                engine, ask_line, asr_text, history, round_no,
+                                round_limit)
                     elif boundary is cloud_processing.DataBoundary.LOCAL:
-                        generated = engine.generate(
-                            ask_line, asr_text, history, round_no, round_limit)
+                        generated, outcome = rapport_reply.generate_with_outcome(
+                            engine, ask_line, asr_text, history, round_no,
+                            round_limit)
                 except _CloudEgressNotAuthorized:
                     source, reply_id, text, degraded = (
                         _rapport_bank_or_frozen_fallback(
@@ -6438,9 +6441,10 @@ def rapport_reply_create(
                             "cloud_not_authorized"))
                     generated = None
                 except Exception:
-                    generated = None
-                # 末轮守卫必须由端点兜底复核:它长在 QwenReplyEngine._parse 里,
-                # 换个注册引擎(stub/将来的本地模型)就绕过去了。
+                    generated, outcome = None, "unavailable"
+                # 末轮守卫必须由端点兜底复核:引擎自报的 ok 不算数(自带
+                # generate_with_outcome 的引擎可以不过守卫就交回)。被这里拒的
+                # 也是「模型交回了话但越界」,和引擎自己拒的一样记 llm_rejected。
                 generated = rapport_reply.validate_reply_text(
                     generated, final=round_no >= round_limit)
                 if degraded is None:
@@ -6448,7 +6452,8 @@ def rapport_reply_create(
                         source, reply_id, text, degraded = (
                             _rapport_bank_or_frozen_fallback(
                                 bank, "k1", body.sectionKey, body.questionIdx,
-                                "llm_unavailable"))
+                                "llm_unavailable" if outcome == "unavailable"
+                                else "llm_rejected"))
                     else:
                         source, text = "llm", generated
                         reply_engine_version = engine.version

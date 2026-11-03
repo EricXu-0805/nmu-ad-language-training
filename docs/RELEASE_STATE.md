@@ -561,6 +561,10 @@ scripts/verify_deployed_tree.py --manifest manifest.txt --revision 167273f
   核实；30 人队列里四列组合是强准标识符，接线时要过披露审查）；2 条记录不改
   （journal 读转写不逐次审计与 attempts.asr_text 既有口径一致，逐页写审计会
   与床旁锁分抢锁；llm_rejected 死枝保留待后端将来区分，标签已并写两种可能）。
+- 2026-11-03 补记（代码已改，**尚未上线**）：后端开始区分两种原因——模型交回了话但被
+  守卫拒（引擎自带守卫或端点复核）记 `llm_rejected`，没调成、空回、形状不对记
+  `llm_unavailable`；QwenReplyEngine 自带的身份/末轮守卫保留。旧行不改写、无迁移，
+  上线前落的 `llm_unavailable` 里仍混着越界被拒，回放屏标签照此注明。
 
 ## 2026-08-31 晚上线记录（`eb6dcd1`：第1周互动态 + 发声账本 + failure_stage，含迁移 `c8e5a1f3b209` → `d0c22a6dae2a`）
 
