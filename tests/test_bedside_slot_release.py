@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,10 +24,15 @@ from app.models import (
 
 
 @pytest.fixture
-def slot_client(monkeypatch):
-    eng = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False},
-        poolclass=StaticPool)
+def slot_client(monkeypatch, request, tmp_path):
+    if getattr(request, "param", "memory") == "file":
+        # 与生产同一个引擎工厂与 pragma(busy_timeout=5000):StaticPool 内存库
+        # 所有会话共用一条连接,看不出「事务内另开会话写审计」会不会被自己的写锁挡住。
+        eng = db.make_engine(f"sqlite:///{tmp_path / 'slot.sqlite'}")
+    else:
+        eng = create_engine(
+            "sqlite://", connect_args={"check_same_thread": False},
+            poolclass=StaticPool)
     monkeypatch.setattr(db, "engine", eng)
     SQLModel.metadata.create_all(eng)
     client = TestClient(app)
@@ -145,6 +151,33 @@ def test_stale_active_is_safety_paused_and_released_with_audit(occupied):
         assert s.get(SessionRuntimeState, "S-PREV").status == "paused"
         actions = [r.action for r in s.exec(select(AuditLog))]
     assert "bedside_slot_stale_takeover" in actions
+
+
+@pytest.mark.parametrize("slot_client", ["file"], indirect=True)
+@pytest.mark.parametrize("prev_status", ["active", "aborted"])
+def test_takeover_audit_lands_promptly_on_a_file_backed_db(occupied, capsys, prev_status):
+    """让位审计在握手事务里另开会话写:文件库上若被本请求自己的写锁挡住,会卡满
+    busy_timeout(5 秒)再丢审计,只剩一行 audit_append_failed。"""
+    client, other, mine = occupied
+    if prev_status == "active":
+        _age_console(client.test_engine, minutes=16)
+    else:
+        _set_runtime(client.test_engine, "S-PREV", prev_status)
+    capsys.readouterr()
+    started = time.monotonic()
+    granted = _claim(mine, "S-NEXT")
+    elapsed = time.monotonic() - started
+    assert granted.status_code == 200, granted.text
+    # 界放在 busy_timeout 之下但留足并行负载余量;真正判红的是下面两条确定性断言。
+    assert elapsed < 4, f"握手用了 {elapsed:.1f} 秒"
+    assert "audit_append_failed" not in capsys.readouterr().out
+    with Session(client.test_engine) as s:
+        expected_status = "paused" if prev_status == "active" else prev_status
+        assert s.get(SessionRuntimeState, "S-PREV").status == expected_status
+        actions = [r.action for r in s.exec(select(AuditLog))]
+    expected = ("bedside_slot_stale_takeover" if prev_status == "active"
+                else "bedside_slot_terminal_takeover")
+    assert actions.count(expected) == 1
 
 
 def test_patient_heartbeat_fresh_does_not_keep_abandoned_slot(occupied):
