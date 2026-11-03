@@ -13,7 +13,9 @@
   - 录音去重打开时,--max-age-hours 窗口内每一条 `ok` 的 cmp_mismatch 与 outside_links
     都是 0(手动补跑或下一晚会链到新副本、计数归零,所以不能只看最后一条);
   - 备份根所在文件系统剩余空间不低于 --min-free-mb;
-  - 给了 --probe-unit 时,那个探针单元最近一次成功距今不超过 --probe-max-age-minutes。
+  - 给了 --probe-unit 时,那个探针单元最近一次成功距今不超过 --probe-max-age-minutes;
+  - 给了 --offbox-source 时,nmu 的访问日志里最近 --offbox-max-age-minutes 分钟有那个
+    来源的 `GET /health`(机外探针还活着)。
 
 只用标准库:VPS 上跑这个脚本的解释器不保证有 SQLAlchemy(这正是十四夜失败的
 起因),不能再给它加依赖。
@@ -169,6 +171,29 @@ def probe_staleness(unit: str, *, max_age_minutes: float, run=subprocess.run,
     return []
 
 
+def offbox_silence(source: str, *, max_age_minutes: float,
+                   run=subprocess.run) -> list[str]:
+    """机外探针最近有没有从 source 打到本机的 /health。返回问题码列表,空 = 来过。
+
+    探针跑在 OpenClaw 那台机器上:那台机器死了,探针和它的 Heartbeat 一起没了,
+    只剩「22:00 CT 那条 Heartbeat 没来」能看出来。这里反过来数 nmu 的访问日志,
+    只数行数,一行都不往外带。读不到日志按不健康报。
+    """
+    try:
+        done = run(["journalctl", "-u", "nmu", f"--since=-{round(max_age_minutes * 60)}s",
+                    "-o", "cat", "--no-pager"],
+                   capture_output=True, encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        return [f"offbox_probe_unevaluable source={source} err={error.__class__.__name__}"]
+    if done.returncode != 0:
+        return [f"offbox_probe_unevaluable source={source} rc={done.returncode}"]
+    # uvicorn 访问日志:`INFO:     147.182.176.237:0 - "GET /health HTTP/1.1" 200 OK`。
+    hit = re.compile(rf"(?<![\d.]){re.escape(source)}:\d+ - \"GET /health HTTP/")
+    if any(hit.search(line) for line in done.stdout.splitlines()):
+        return []
+    return [f"offbox_probe_silent source={source} window_minutes={max_age_minutes}"]
+
+
 def main(argv: list[str] | None = None, *, run=subprocess.run,
          monotonic=time.monotonic) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -184,6 +209,11 @@ def main(argv: list[str] | None = None, *, run=subprocess.run,
                         help="顺带核对这个探针单元最近一次成功的时间(生产给 nmu-health.service)")
     # 探针每 10 分钟一次:30 分钟 = 连着错过两次以上。
     parser.add_argument("--probe-max-age-minutes", default=30.0, type=float)
+    parser.add_argument("--offbox-source", default=None,
+                        help="顺带核对从这个 IP 来的机外探针最近打到过本机 /health"
+                             "(生产给 OpenClaw 那台)")
+    # 机外探针每 10 分钟一次:30 分钟一条都没有 = 连着三轮没来。
+    parser.add_argument("--offbox-max-age-minutes", default=30.0, type=float)
     args = parser.parse_args(argv)
 
     root = args.backup_root
@@ -204,6 +234,11 @@ def main(argv: list[str] | None = None, *, run=subprocess.run,
                                 run=run, monotonic=monotonic)
         problems.extend(stale)
         code = code or (1 if stale else 0)
+    if args.offbox_source:
+        silent = offbox_silence(args.offbox_source,
+                                max_age_minutes=args.offbox_max_age_minutes, run=run)
+        problems.extend(silent)
+        code = code or (1 if silent else 0)
     verdict = "HEALTHY" if not problems else "UNHEALTHY " + "; ".join(problems)
 
     line = f"[{now:%F %T}] {verdict}"

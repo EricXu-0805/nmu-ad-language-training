@@ -385,3 +385,81 @@ def test_cli_without_probe_unit_never_asks_systemd(tmp_path):
 
     assert health.main(["--backup-root", str(root), "--min-free-mb", "0",
                         "--max-age-hours", "1000000"], run=run) == 0
+
+
+OFFBOX = "147.182.176.237"
+OFFBOX_HIT = f'INFO:     {OFFBOX}:0 - "GET /health HTTP/1.1" 200 OK\n'
+
+
+def _journal(stdout: str = "", *, returncode: int = 0):
+    """假 `journalctl -u nmu --since=… -o cat`:uvicorn 访问日志的原样。"""
+    calls: list[list[str]] = []
+
+    def run(argv, **_kwargs):
+        calls.append(list(argv))
+        assert argv[:3] == ["journalctl", "-u", "nmu"], argv
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+    run.calls = calls
+    return run
+
+
+def test_one_offbox_probe_request_in_the_window_means_it_is_alive():
+    run = _journal('INFO:     127.0.0.1:0 - "GET /live/state HTTP/1.1" 200 OK\n' + OFFBOX_HIT)
+
+    assert health.offbox_silence(OFFBOX, max_age_minutes=30, run=run) == []
+    assert run.calls == [
+        ["journalctl", "-u", "nmu", "--since=-1800s", "-o", "cat", "--no-pager"]]
+
+
+def test_other_sources_and_other_paths_are_not_the_offbox_probe():
+    run = _journal(
+        'INFO:     203.0.113.9:0 - "GET /health HTTP/1.1" 200 OK\n'
+        f'INFO:     {OFFBOX}:0 - "GET /health-selftest HTTP/1.1" 404 Not Found\n'
+        f'INFO:     {OFFBOX}:0 - "GET /health/ready HTTP/1.1" 200 OK\n'
+        f'INFO:     {OFFBOX}:0 - "HEAD /health HTTP/1.1" 200 OK\n'
+        f'INFO:     127.0.0.1:0 - "GET /health?from={OFFBOX} HTTP/1.1" 200 OK\n')
+
+    assert health.offbox_silence(OFFBOX, max_age_minutes=30, run=run) == [
+        f"offbox_probe_silent source={OFFBOX} window_minutes=30"]
+    # 来源只认整段 IP:47.182.176.237 不是 147.182.176.237 的一截。
+    assert health.offbox_silence("47.182.176.237", max_age_minutes=30,
+                                 run=_journal(OFFBOX_HIT)) == [
+        "offbox_probe_silent source=47.182.176.237 window_minutes=30"]
+
+
+def test_an_unreadable_journal_is_a_problem_not_a_live_probe():
+    failed = health.offbox_silence(OFFBOX, max_age_minutes=30, run=_journal(returncode=1))
+
+    def missing(argv, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "journalctl")
+
+    absent = health.offbox_silence(OFFBOX, max_age_minutes=30, run=missing)
+
+    assert failed == [f"offbox_probe_unevaluable source={OFFBOX} rc=1"]
+    assert absent == [f"offbox_probe_unevaluable source={OFFBOX} err=FileNotFoundError"]
+
+
+def test_cli_reports_a_silent_offbox_probe_even_when_backup_and_local_probe_are_fine(
+        tmp_path, capsys):
+    root = _root(tmp_path, [OK_LINE], ["20260806-023000"])
+    state = tmp_path / "health.state"
+    local = _probe(ExecMainExitTimestampMonotonic=_exited(9))
+
+    def run(argv, **kwargs):
+        if argv[0] == "journalctl":
+            return _journal('INFO:     127.0.0.1:0 - "GET /health HTTP/1.1" 200 OK\n')(argv)
+        return local(argv, **kwargs)
+
+    code = health.main(
+        ["--backup-root", str(root), "--min-free-mb", "0", "--max-age-hours", "1000000",
+         "--probe-unit", "nmu-health.service", "--offbox-source", OFFBOX,
+         "--state-file", str(state)],
+        run=run, monotonic=lambda: BOOT_CLOCK)
+
+    assert code == 1
+    assert f"UNHEALTHY offbox_probe_silent source={OFFBOX}" in capsys.readouterr().out
+    assert "offbox_probe_silent" in state.read_text(encoding="utf-8")
+    assert health.main(
+        ["--backup-root", str(root), "--min-free-mb", "0", "--max-age-hours", "1000000",
+         "--offbox-source", OFFBOX], run=_journal(OFFBOX_HIT)) == 0

@@ -69,6 +69,7 @@ _ROUTE_RULES = (
     _route({"POST"}, r"/auth/login", AccessKind.PUBLIC, label="登录研究账号"),
     _route({"GET", "HEAD"}, r"/auth/(?:config|me)", AccessKind.PUBLIC, label="读取认证状态"),
     _route({"GET", "HEAD"}, r"/health", AccessKind.PUBLIC, label="读取健康状态"),
+    _route({"GET", "HEAD"}, r"/health/ready", AccessKind.PUBLIC, label="读取就绪状态"),
 
     # 完整题库/脚本只供具名工作人员端使用。它们由服务器固定路由返回，
     # 不再复制进 SPA 静态目录；患者 capability 永远不能读取答案整包。

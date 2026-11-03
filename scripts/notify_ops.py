@@ -14,7 +14,7 @@ state 文件,六个待装的包一个都没出现在消息里。日志也只取�
   - 只用标准库(certifi 有则用,没有不挂)——它必须能在"venv 坏了"的那种
     夜里工作,不能依赖任何可能坏掉的东西。
   - webhook URL 只从环境变量/--env-file 读,校验形状,绝不打印。
-  - 消息只含单元名、主机名、时间、失败原因和日志;调用方保证日志里没有秘密。
+  - 消息只含单元名、主机标签、时间、失败原因、下一步和日志;调用方保证日志里没有秘密。
 """
 from __future__ import annotations
 
@@ -44,6 +44,32 @@ REASON_SOURCES = {
     "nmu-backup-health": ("state", "health.state"),
     "nmu-backup": ("last_line", "backup.log"),
     "nmu-health": ("journal", None),
+}
+# 单元 -> 读告警的人下一步做什么,放在原因之后、日志之前。2026-11-02 os-security 那条
+# 只有原因,原因里写着 full-upgrade,而内核类按规矩只在维护窗口里装。
+NEXT_STEPS = {
+    "nmu-os-security": (
+        "内核元包(linux-generic 等四个)走维护窗口:在 Mac 上先改 "
+        "deploy/maintenance/kernel_netplan_window.sh 的 ABI 常量、跑 check;"
+        "netplan/grub/shim 等网络/引导类窗口脚本装不了,挑维护窗口手装 apt-get install 点名装,"
+        "装完重启再跑窗口脚本的 verify-kernel;其余安全包先 apt-get -s install 看会不会带进"
+        "内核/网络/引导类,不带再 apt-get install 点名装;绝不 apt-get full-upgrade;"
+        "原因点名 nmu/nginx 跑在旧库上的,挑没人练的时候 systemctl restart nmu(或 nginx),"
+        "再重跑 os_security_check.py"),
+    "nmu-restore-drill": (
+        "看 /opt/nmu/backups/restore-drill.state 全文,找负责人;别在 nmu 运行时手动补跑演练"
+        "(交接文档第 6 节第 2 条:内存只有 1 GiB)"),
+    "nmu-capacity": (
+        "python3 /opt/nmu/app/scripts/capacity_reclaim.py 只读列出可清理项,负责人点名后才 "
+        "--delete;别手工删 /opt/nmu/backups/daily/(交接文档 5.1 第 2 条)"),
+    "nmu-backup-health": (
+        "按交接文档 5.1;probe_stale/probe_never_ran_since_boot 看 nmu-health.timer 的 NEXT 列,"
+        "probe_last_run_failed 按 5.2,offbox_probe_silent 是机外探针 30 分钟没来,查 OpenClaw 那台"),
+    "nmu-backup": "按交接文档 5.1:tail -20 /opt/nmu/backups/backup.log 看失败码;别手工造快照",
+    "nmu-health": (
+        "按交接文档 5.2「网站打不开」;/health 200 而 /health/ready 503 是库或盘:df -h /、"
+        "findmnt -no OPTIONS /、cat /opt/nmu/backups/capacity.state,再按 5.1 第 2 条;"
+        "机外探针 nmu_offbox_probe.py --status 看纽约那头是不是也判 DOWN(它只打 /health)"),
 }
 _INVOCATION_ID = re.compile(r"[0-9a-f]{32}")
 _WEBHOOK_URL = re.compile(r"https://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/\S+")
@@ -206,7 +232,8 @@ def main(argv: list[str] | None = None, *, run=subprocess.run, send=_send,
         print("webhook_missing_or_bad_shape", file=sys.stderr)
         return 78
 
-    host = socket.gethostname()
+    # 生产机的 hostname 是 green-fiber-1.localdomain,读告警的人认不出是哪台。
+    host = os.environ.get("NMU_OPS_HOST_LABEL", "").strip() or socket.gethostname()
     stamp = datetime.now().strftime("%F %T")
     parts = [f"🔴 NMU 运维告警 · {host} · {stamp}"]
     invocation = started_at = None
@@ -219,6 +246,9 @@ def main(argv: list[str] | None = None, *, run=subprocess.run, send=_send,
             source, text = reason
             parts.append(f"原因({source}):")
             parts.append(text[:REASON_CHARS])
+        step = NEXT_STEPS.get(args.unit.removesuffix(".service"))
+        if step is not None:
+            parts.append(f"下一步:{step}")
     if args.message:
         parts.append(args.message)
     if args.unit:

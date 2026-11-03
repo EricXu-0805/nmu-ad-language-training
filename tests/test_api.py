@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta
 import json
+import os
+from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +13,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app import (  # noqa: F401  register tables
     audio_store, auth, content, db as app_db, export, export_security, models,
 )
+import app.main as app_main
 from app.db import get_session
 from app.enums import AudioStatus
 from app.main import app
@@ -46,6 +50,123 @@ def client(monkeypatch):
 
 def test_health(client):
     assert client.get("/health").json()["status"] == "ok"
+
+
+@pytest.fixture
+def ready_client(client, monkeypatch, tmp_path):
+    """就绪口查的库目录与录音目录都放进 tmp；每条测试从空缓存现算。"""
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    monkeypatch.setattr(audio_store, "AUDIO_DIR", audio)
+    monkeypatch.setattr(app_db, "engine", create_engine(f"sqlite:///{tmp_path / 'app.db'}"))
+    monkeypatch.setattr(app_main, "_ready_cache", None)
+    monkeypatch.setenv("READINESS_MIN_FREE_MB", "1")
+    client.ready_dirs = {"db": tmp_path, "audio": audio}
+    return client
+
+
+def _fake_statvfs(*, readonly: Path | None = None, free_mb: int = 100_000):
+    calls: list[Path] = []
+
+    def statvfs(path):
+        calls.append(Path(path))
+        flag = os.ST_RDONLY if readonly is not None and Path(path) == readonly else 0
+        return SimpleNamespace(f_flag=flag, f_frsize=4096, f_bavail=free_mb * 256)
+
+    statvfs.calls = calls
+    return statvfs
+
+
+def _refresh_ready(monkeypatch):
+    monkeypatch.setattr(app_main, "_ready_cache", None)
+
+
+def test_readiness_is_ok_when_the_database_answers_and_both_directories_have_room(
+        ready_client):
+    response = ready_client.get("/health/ready")
+    head = ready_client.head("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert response.headers["cache-control"] == "no-store"
+    assert head.status_code == 200 and head.content == b""
+
+
+@pytest.mark.parametrize("which", ["db", "audio"])
+def test_a_read_only_database_or_audio_directory_is_not_ready(
+        ready_client, monkeypatch, which):
+    monkeypatch.setattr(app_main.os, "statvfs",
+                        _fake_statvfs(readonly=ready_client.ready_dirs[which]))
+
+    response = ready_client.get("/health/ready")
+
+    assert response.status_code == 503
+    # 公网可读：不说是哪一样、不带任何路径。
+    assert response.json() == {"status": "unavailable"}
+    assert ready_client.head("/health/ready").status_code == 503
+
+
+def test_free_space_below_the_capacity_floor_is_not_ready(ready_client, monkeypatch):
+    monkeypatch.delenv("READINESS_MIN_FREE_MB")
+    monkeypatch.setattr(app_main.os, "statvfs", _fake_statvfs(free_mb=2047))
+    low = ready_client.get("/health/ready")
+    _refresh_ready(monkeypatch)
+    monkeypatch.setattr(app_main.os, "statvfs", _fake_statvfs(free_mb=2048))
+    enough = ready_client.get("/health/ready")
+
+    assert low.status_code == 503 and low.json() == {"status": "unavailable"}
+    assert enough.status_code == 200
+
+
+def test_a_database_that_cannot_be_queried_is_not_ready(ready_client, monkeypatch, tmp_path):
+    monkeypatch.setattr(app_db, "engine",
+                        create_engine(f"sqlite:///{tmp_path / 'missing' / 'app.db'}"))
+
+    response = ready_client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+
+
+def test_a_corrupted_database_file_is_not_ready_even_on_a_pooled_connection(
+        ready_client, monkeypatch, tmp_path):
+    # SQLite 的 SELECT 1 不开读事务、不读库文件，库写坏了它照样 200。
+    assert ready_client.get("/health/ready").status_code == 200
+    (tmp_path / "app.db").write_bytes(b"not a sqlite database" * 64)
+    _refresh_ready(monkeypatch)
+
+    response = ready_client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+
+
+def test_readiness_is_cached_briefly_so_the_public_route_cannot_hammer_the_disk(
+        ready_client, monkeypatch):
+    statvfs = _fake_statvfs()
+    monkeypatch.setattr(app_main.os, "statvfs", statvfs)
+
+    assert ready_client.get("/health/ready").status_code == 200
+    measured = len(statvfs.calls)
+    for _ in range(5):
+        assert ready_client.get("/health/ready").status_code == 200
+
+    assert measured == 2 and len(statvfs.calls) == measured
+    monkeypatch.setattr(app_main, "_ready_cache",
+                        (app_main.time.monotonic() - app_main._READY_CACHE_SECONDS, True))
+    ready_client.get("/health/ready")
+    assert len(statvfs.calls) == 2 * measured
+
+
+def test_readiness_is_public_but_still_behind_the_host_allowlist(ready_client, monkeypatch):
+    monkeypatch.setenv("REQUIRE_AUTH", "1")
+    monkeypatch.setenv("TRUSTED_HOSTS", "testserver")
+
+    allowed = ready_client.get("/health/ready")
+    denied = ready_client.get("/health/ready", headers={"Host": "evil.invalid"})
+
+    assert allowed.status_code == 200
+    assert denied.status_code == 400 and denied.json()["code"] == "untrusted_host"
 
 
 def test_staff_content_bundles_are_server_routes_not_static_files(client):

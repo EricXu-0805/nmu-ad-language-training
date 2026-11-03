@@ -274,3 +274,72 @@ def test_a_webhook_that_leaked_into_a_log_is_not_forwarded(backups):
     content = _alert(backups, "nmu-health", system, Outbox())
 
     assert "sentinel-webhook-token" not in content
+
+
+@pytest.mark.parametrize("unit", sorted(notify.REASON_SOURCES))
+def test_every_alerting_unit_gets_its_next_step_before_the_journal(backups, unit):
+    system = FakeSystem(manager=f"{unit}.service: Main process exited, status=1/FAILURE\n")
+
+    content = _alert(backups, unit, system, Outbox())
+
+    step = f"下一步:{notify.NEXT_STEPS[unit]}"
+    assert step in content
+    assert content.index(step) < content.index("本轮日志:")
+
+
+def test_a_unit_without_a_registered_next_step_gets_no_next_step_line(backups):
+    content = _alert(backups, "nmu-caddy", FakeSystem(output="caddy exited 1\n"), Outbox())
+
+    assert "caddy exited 1" in content
+    assert "下一步" not in content
+
+
+def test_no_next_step_ever_recommends_a_full_upgrade():
+    """2026-11-02 那条 os-security 告警的原因写着 apt-get full-upgrade;内核类只在维护窗口里装。"""
+    for unit, step in notify.NEXT_STEPS.items():
+        assert step.replace("绝不 apt-get full-upgrade", "").count("full-upgrade") == 0, unit
+    os_step = notify.NEXT_STEPS["nmu-os-security"]
+    assert "绝不 apt-get full-upgrade" in os_step
+    assert "kernel_netplan_window.sh" in os_step and "跑 check" in os_step
+    # 窗口脚本只装四个内核元包:网络/引导类另手装再 verify-kernel,其余先 -s 模拟。
+    assert "窗口脚本装不了" in os_step and "verify-kernel" in os_step
+    assert "先 apt-get -s install" in os_step
+    window = (ROOT / "deploy" / "maintenance" / "kernel_netplan_window.sh").read_text(encoding="utf-8")
+    assert ('META_PACKAGES="linux-generic linux-image-generic linux-headers-generic '
+            'linux-libc-dev"') in window
+    assert "  verify-kernel)" in window
+    assert (ROOT / "scripts" / "capacity_reclaim.py").is_file()
+
+
+def test_the_health_next_step_tells_a_disk_or_db_503_from_a_dead_site():
+    """/health/ready 503 而 /health 200 时,5.2 和机外探针都是绿的。"""
+    step = notify.NEXT_STEPS["nmu-health"]
+    assert "/health/ready 503" in step
+    assert "df -h /" in step and "findmnt -no OPTIONS /" in step and "capacity.state" in step
+    handover = (ROOT / "docs" / "handover" / "运维交接_值班与故障处置.md").read_text(encoding="utf-8")
+    section = handover.split("### 5.2 网站打不开", 1)[1].split("### 5.3", 1)[0]
+    assert "/health/ready   # 期望 200" in section
+    assert "findmnt -no OPTIONS /" in section
+
+
+def test_the_host_label_replaces_the_machine_hostname(backups, monkeypatch):
+    monkeypatch.setattr(notify.socket, "gethostname", lambda: "green-fiber-1.localdomain")
+    monkeypatch.setenv("NMU_OPS_HOST_LABEL", "NMU 生产机 box A")
+    labelled = _alert(backups, "nmu-backup", FakeSystem(), Outbox())
+    monkeypatch.delenv("NMU_OPS_HOST_LABEL")
+    plain = _alert(backups, "nmu-backup", FakeSystem(), Outbox())
+
+    assert labelled.startswith("🔴 NMU 运维告警 · NMU 生产机 box A · ")
+    assert "green-fiber-1" not in labelled
+    assert plain.startswith("🔴 NMU 运维告警 · green-fiber-1.localdomain · ")
+    unit = (ROOT / "deploy" / "systemd" / "nmu-alert@.service").read_text(encoding="utf-8")
+    assert 'Environment="NMU_OPS_HOST_LABEL=NMU 生产机 box A"' in unit
+
+
+def test_a_long_journal_is_still_truncated_and_the_next_step_survives(backups):
+    system = FakeSystem(manager="甲" * 5000 + "\n")
+
+    content = _alert(backups, "nmu-os-security", system, Outbox())
+
+    assert len(content) == notify.MAX_CONTENT + len("\n…(截断)")
+    assert f"下一步:{notify.NEXT_STEPS['nmu-os-security']}" in content

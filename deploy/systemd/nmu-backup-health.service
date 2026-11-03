@@ -7,8 +7,11 @@ Type=oneshot
 # 只用标准库,系统 python3 足够——不能依赖 /opt/nmu/venv,那正是备份链断过的地方。
 # --probe-unit:公网探针的定时器死掉时它自己什么都不会失败(9/30 重启后停在 elapsed),
 # 由这里每天问一次它最近一次成功是什么时候,超过 30 分钟即判不健康。
+# --offbox-source:OpenClaw 那台机器死了,机外探针和它的 Heartbeat 一起没了;这里数 nmu
+# 访问日志里 30 分钟内有没有它的 GET /health。每天只查这一次,最晚晚一天才发现。
 ExecStart=/usr/bin/python3 /opt/nmu/app/scripts/backup_health_check.py \
     --backup-root /opt/nmu/backups \
     --state-file /opt/nmu/backups/health.state \
-    --probe-unit nmu-health.service
+    --probe-unit nmu-health.service \
+    --offbox-source 147.182.176.237
 Nice=10

@@ -10,6 +10,11 @@
 > `docs/handover/七道门现状表.md`。
 
 
+## 2026-11-03 记账更正（只改文档，不涉及部署）
+
+- 10-15、10-08 两条末尾的「OpenClaw 每日心跳接入本轮未改」和 10-03 补记里的「接入 OpenClaw 每日心跳仍未完成」在各自当时成立，现已过时：2026-10-27 04:45 UTC `check_nmu_probe` 已插进 OpenClaw 的 heartbeat.py（插入前备份 `heartbeat.py.before-nmu-probe-20261027T044532Z`），机外探针停摆会出现在 22:00 CT 的 Heartbeat 里。原条目不改。
+- 更早条目里「`networking.service` failed 旧账」的说法同样只到当时为止：10-27 整机重启后 `verify-netplan` 的「没有 failed 单元」通过，10-29 拍整机快照那次重启后也没有失败单元；交接文档 §1.1 已改成「`systemctl --failed` 应该是空表」。
+
 ## 2026-10-27 04:05 UTC 系统维护（应用仍为 `1d57962`，不换版）
 
 - 起因：10-26 21:50 UTC 每周 OS 检查 `nmu-os-security` 判失败。10-20 夜间自动安全补丁换了 `liblzma5`/`xz-utils`，10-14 换了 systemd、openssh 等；按设计只装不重启，nginx（只管 80 端口的 http→https 跳转）仍映射旧 `liblzma.so.5.2.5`，另有 15 个系统单元同样映射旧库（不算失败）。

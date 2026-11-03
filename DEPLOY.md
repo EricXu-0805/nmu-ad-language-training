@@ -598,9 +598,12 @@ Python 环境，本机缓存不足时仍可能访问包源。脚本本身不会�
 
 ## 13. 迁往医院内网（收真实数据前必做）
 
-代码里零硬编码公网 IP/域名（`89.208.253.119`/`sslip.io` 只出现在文档），前端同源
-相对路径、无 CDN、CSP `connect-src 'self'`——迁移的全部工作量在配置、数据搬运和
-出网依赖的替代上。以下清单来自 2026-08-07 的逐文件可移植性盘点。
+应用代码（`app/`、`web/`）里零硬编码公网 IP/域名，前端同源相对路径、无 CDN、
+CSP `connect-src 'self'`——应用本身的迁移工作量在配置、数据搬运和出网依赖的替代上。
+运维文件不在此列：`89.208.253.119`/`sslip.io` 写死在 `deploy/systemd/nmu-health.service`（公网探针
+URL）、`deploy/offbox/nmu_offbox_probe.py`、`deploy/offbox/install_offbox_probe.sh`、
+`deploy/maintenance/kernel_netplan_window.sh` 和测试 `tests/test_offbox_probe.py` 里，另有文档；
+换地址时这几份要跟着改。以下清单来自 2026-08-07 的逐文件可移植性盘点。
 
 ### 13.1 出网白名单
 

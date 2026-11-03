@@ -579,6 +579,49 @@ def test_linked_projection_charges_new_audio_once_instead_of_once_per_kept_copy(
     assert linked["projection_status"] == "no_exhaustion_within_horizon"
 
 
+def test_linked_projection_runs_out_earlier_by_exactly_the_live_growth():
+    # 同上一组：库 10 MiB 不变、录音每天新增 20 MiB。data/audio 那份 live 录音也每天多 20 MiB。
+    series = _series([10 + 20 * day for day in range(14)])
+    linked_audio = [20 * day * capacity.MIB for day in range(14)]
+    credits = [10 * capacity.MIB] * 14
+
+    result = capacity.retention_projection(
+        series, keep=14, horizon_days=30, free_bytes=1000 * capacity.MIB,
+        existing_allocated=credits, linked_audio=linked_audio)
+
+    assert result["live_growth_mb_per_day"] == 20
+    # 备份第 d 天要 290 + 40d（峰值与上一条相同，仍只算备份）；live 再加 20(d+1)。
+    # 只算备份要到第 18 天（1010）才不够，加上 live 第 12 天（770 + 260 = 1030）就不够了。
+    assert result["backup_peak_additional_mb"] == 1450
+    assert result["days_left"] == 12
+
+
+def test_a_flat_linked_series_adds_no_live_growth():
+    result = capacity.retention_projection(
+        _series([100] * 3), keep=14, horizon_days=30, free_bytes=150 * capacity.MIB,
+        existing_allocated=[10 * capacity.MIB] * 3, linked_audio=[90 * capacity.MIB] * 3)
+
+    assert result["live_growth_mb_per_day"] == 0
+    assert result["days_left"] == 5  # 补足保留窗口：100 + 10d，与不计 live 时相同。
+
+
+def test_live_growth_is_never_guessed_without_history_or_without_links():
+    start = datetime(2026, 8, 1, 3, 30)
+    one_day = [(start + timedelta(minutes=n), 100 * capacity.MIB) for n in range(3)]
+    unknown = capacity.retention_projection(
+        one_day, keep=14, horizon_days=30, free_bytes=200 * capacity.MIB,
+        existing_allocated=[10 * capacity.MIB] * 3, linked_audio=[90 * capacity.MIB] * 3)
+    unlinked = capacity.retention_projection(
+        _series(list(range(100, 240, 10))), keep=14, horizon_days=30,
+        free_bytes=4400 * capacity.MIB)
+
+    assert unknown["live_growth_mb_per_day"] is None
+    assert unknown["days_left"] is None
+    assert unknown["projection_status"] == "insufficient_history"
+    assert unlinked["live_growth_mb_per_day"] is None
+    assert unlinked["days_left"] == 28  # 不链接时与以前相同：只算备份。
+
+
 def test_unlinked_projection_output_is_unchanged_when_no_audio_link_is_given():
     series = _series(list(range(100, 240, 10)))
     plain = capacity.retention_projection(
@@ -612,8 +655,19 @@ def test_evaluate_switches_to_the_linked_model_only_when_the_newest_snapshot_is_
     # 开关关掉后最新一份是整份副本：按整份模型预测，但旧快照共享的 inode 仍只算一次。
     assert "snapshot_model" not in stopped
     assert stopped["rotation_credit_measurement"] == "last_link_allocated_bytes_only"
+    # 链接时 days_left 已把 live 录音与库算进去；整份模型仍只算备份。
+    assert linked["projection_scope"] == "scheduled_daily_backup_retention_plus_live_audio_and_db"
+    assert linked["unmeasured_growth"] == ["live_tts_cache_and_scratch", "other_logs_and_files",
+                                           "unattributed_filesystem_metadata"]
+    assert stopped["projection_scope"] == "scheduled_daily_backup_retention_only"
+    assert "live_data" in stopped["unmeasured_growth"]
 
     assert capacity.main(["--backup-root", str(linked_root), "--min-free-mb", "1"]) == 0
-    assert capsys.readouterr().out.rstrip().endswith(" snapshot_model=linked_audio")
+    output = capsys.readouterr().out.rstrip()
+    assert output.endswith(
+        f" live_growth={linked['live_growth_mb_per_day']}MB/d snapshot_model=linked_audio")
+    assert " scope=daily_backups_plus_live " in output
     assert capacity.main(["--backup-root", str(stopped_root), "--min-free-mb", "1"]) == 0
-    assert "snapshot_model" not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "snapshot_model" not in output and "live_growth" not in output
+    assert " scope=daily_backups_only " in output
