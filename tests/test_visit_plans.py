@@ -14,6 +14,7 @@ from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 from threading import Barrier
 
 import pytest
@@ -3242,6 +3243,82 @@ def test_different_actor_cannot_restart_patient_before_safe_closeout(
     listed = {row["session_id"]: row for row in
               visit_clients.researcher.get("/patients/P-VISIT-04/sessions").json()}
     assert listed[first_started["session_id"]]["closeout_saved"] is True
+
+
+_WEB_VISIT_PLANS = Path(__file__).resolve().parents[1] / "web" / "src" / "visitPlans.ts"
+
+
+def _web_exact_keys(name: str) -> set[str]:
+    source = _WEB_VISIT_PLANS.read_text(encoding="utf-8")
+    match = re.search(rf"const {name} = \[(.*?)\] as const;", source, re.S)
+    assert match, f"web/src/visitPlans.ts 里找不到 {name} 字面量"
+    body = match.group(1)
+    keys = set(re.findall(r'"([^"]+)"', body))
+    for spread in re.findall(r"\.\.\.([A-Z_]+)", body):
+        keys |= _web_exact_keys(spread)
+    return keys
+
+
+def _assert_web_exact_keys(row: dict, name: str, where: str) -> None:
+    expected = _web_exact_keys(name)
+    extra, missing = sorted(set(row) - expected), sorted(expected - set(row))
+    assert not extra and not missing, (
+        f"{where} 的键与 web/src/visitPlans.ts 的 {name} 不一致:后端多 {extra}、少 {missing}。"
+        "前端按 exactRecord 逐键比对,差一个键整张列表都会被拒收,两边要一起改。")
+
+
+def test_backend_rows_match_the_web_exact_key_whitelists(visit_clients):
+    """跨端键集对齐:后端投影加一个键而 web 白名单没跟上,浏览器里场次列表整屏
+    拒收(closeout_saved 那次只靠对抗复核才抓到)。两边各自的测试都自洽,只有这条
+    同时读两边。"""
+    created, session_id = _started_canonical_session(
+        visit_clients, "P-VISIT-11", "web-keys")
+    with Session(visit_clients.engine) as session:
+        assert session.get(SessionRuntimeState, session_id) is not None
+        session.add(SessionCloseoutReport(
+            session_id=session_id,
+            schema_version="session-closeout.v1",
+            status="no_additional_observation",
+            revision=1,
+            last_idempotency_key="visit-web-keys-closeout-0001",
+            last_request_hash="d" * 64,
+            created_by="ACTOR-visit-researcher",
+            updated_by="ACTOR-visit-researcher",
+        ))
+        session.commit()
+    queued = _create(visit_clients.researcher, "P-VISIT-12", "create-web-keys-0002")
+    approved = _command(
+        visit_clients.researcher, queued["plan_id"], "approve",
+        key="approve-web-keys-0002", expected_revision=queued["revision"])
+    assert approved.status_code == 200, approved.text
+    _assert_web_exact_keys(created, "RECEIPT_KEYS", "POST /visit-plans")
+    _assert_web_exact_keys(approved.json(), "RECEIPT_KEYS", "POST /visit-plans/{id}/approve")
+
+    sessions = visit_clients.researcher.get("/patients/P-VISIT-11/sessions")
+    assert sessions.status_code == 200, sessions.text
+    assert [row["session_id"] for row in sessions.json()] == [session_id]
+    assert sessions.json()[0]["closeout_saved"] is True
+    for row in sessions.json():
+        _assert_web_exact_keys(
+            row, "RECOVERY_SESSION_KEYS", "GET /patients/{id}/sessions")
+
+    started = visit_clients.researcher.get(f"/sessions/{session_id}")
+    assert started.status_code == 200, started.text
+    _assert_web_exact_keys(started.json(), "SESSION_KEYS", "GET /sessions/{id}")
+
+    plans = visit_clients.researcher.get(
+        "/visit-plans", params={"patient_id": "P-VISIT-11"})
+    assert plans.status_code == 200, plans.text
+    assert [row["status"] for row in plans.json()] == ["started"]
+    for row in plans.json():
+        _assert_web_exact_keys(row, "RECEIPT_KEYS", "GET /visit-plans")
+
+    today = visit_clients.researcher.get("/visit-plans/today")
+    assert today.status_code == 200, today.text
+    _assert_web_exact_keys(today.json(), "TODAY_KEYS", "GET /visit-plans/today")
+    assert [row["plan_id"] for row in today.json()["plans"]] == [queued["plan_id"]]
+    for row in today.json()["plans"]:
+        _assert_web_exact_keys(row, "RECEIPT_KEYS", "GET /visit-plans/today 的 plans")
 
 
 def test_concurrent_start_for_same_actor_creates_only_one_active_session(

@@ -263,7 +263,8 @@ def _run_backend_gate_with_fake_python(tmp_path: Path, *, xdist_importable: bool
 
 def test_backend_gate_runs_pytest_in_parallel_only_when_xdist_is_installed(tmp_path: Path) -> None:
     # 仓库转私有后 CI 按分钟计费;CI 装了 pytest-xdist 就按核数并行,本机没装照旧串行。
+    # -rs:跳过原因必须进 CI 日志,否则看不出 GNU find 那条在 Linux 上有没有真跑。
     assert _run_backend_gate_with_fake_python(tmp_path / "with", xdist_importable=True) == (
-        "-m pytest -q -n auto\n")
+        "-m pytest -q -rs -n auto\n")
     assert _run_backend_gate_with_fake_python(tmp_path / "without", xdist_importable=False) == (
-        "-m pytest -q\n")
+        "-m pytest -q -rs\n")

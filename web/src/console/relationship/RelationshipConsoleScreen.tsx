@@ -337,6 +337,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
     const why = reason === "asr_failed" ? "，没听清录音"
       : reason === "asr_empty" ? "，老人没说话"
         : reason === "llm_unavailable" ? "，AI 暂不可用"
+        : reason === "llm_rejected" ? "，AI 生成越界被拒"
           : reason === "cloud_not_authorized" ? "，受试者未授权云处理"
         : reason === "round_limit" ? "，本问已聊满，这段没有转写" : "";
     return `${base}${why}`;

@@ -831,6 +831,133 @@ def test_cross_session_controlled_audio_substitution_is_rejected(
         _run(fixture)
 
 
+REPEAT_RAW_AUDIO_ID = "aud-synthetic-repeat"
+REPEAT_CODE = "AUDIO-v1-test-2026-" + hmac.new(
+    TEST_KEY,
+    b"nmu-audio-pseudonym:v1\x00" + REPEAT_RAW_AUDIO_ID.encode("utf-8"),
+    hashlib.sha256,
+).hexdigest()[:20]
+REPEAT_PAYLOAD = b"synthetic-explicit-repeat-audio"
+
+
+def _repeat_manifest(path: Path, codes: list[str]) -> None:
+    # 导出器写的就是这四列(REPEAT_AUDIO_MANIFEST_FIELDS),不带格式/状态/分类。
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[
+            "capture_kind", "repeat_ordinal", "outcome", "opaque_audio_code"])
+        writer.writeheader()
+        for code in codes:
+            writer.writerow({
+                "capture_kind": "explicit_repeat",
+                "repeat_ordinal": 1,
+                "outcome": "replayed",
+                "opaque_audio_code": code,
+            })
+    os.chmod(path, 0o600)
+
+
+def _repeat_fixture(
+    tmp_path: Path,
+    migrated_database: Path,
+    *,
+    controlled: bool = True,
+    listed: list[str] | None = None,
+    in_database: bool = True,
+    copy_payload: bytes = REPEAT_PAYLOAD,
+) -> dict[str, Path]:
+    """同一场次多一段显式重复录音:受控副本照写,清单只登在 repeat_audio_manifest。"""
+    fixture = _fixture(
+        tmp_path, migrated_database, controlled=controlled,
+        sheets=_QUESTIONNAIRE_SHEETS | {"adjudications"})
+    _repeat_manifest(
+        fixture["analysis"] / "repeat_audio_manifest.csv",
+        [REPEAT_CODE] if listed is None else listed)
+    if in_database:
+        checksum = hashlib.sha256(REPEAT_PAYLOAD).hexdigest()
+        engine = create_engine(f"sqlite:///{fixture['database']}")
+        with Session(engine) as session:
+            session.add(AudioAssetRow(
+                raw_audio_id=REPEAT_RAW_AUDIO_ID,
+                session_id=SESSION_ID,
+                is_simulation=True,
+                data_classification="simulation",
+                turn_key="item-1:turn-1",
+                audio_format="webm",
+                status=AudioStatus.recorded,
+                checksum=checksum,
+                byte_count=len(REPEAT_PAYLOAD),
+            ))
+            session.add(AudioCaptureReceipt(
+                server_seq=3,
+                raw_audio_id=REPEAT_RAW_AUDIO_ID,
+                session_id=SESSION_ID,
+                turn_key="item-1:turn-1",
+                duration_seconds=1.0,
+                byte_count=len(REPEAT_PAYLOAD),
+                checksum=checksum,
+                data_classification="simulation",
+                is_simulation=True,
+                contains_direct_identifier=False,
+            ))
+            session.commit()
+        engine.dispose()
+        os.chmod(fixture["database"], 0o600)
+    audio_root = fixture["data"] / "audio"
+    if not audio_root.exists():
+        _private_directory(audio_root)
+    _private_bytes(audio_root / f"{REPEAT_RAW_AUDIO_ID}.webm", REPEAT_PAYLOAD)
+    controlled_audio = fixture["controlled"] / "audio"
+    if not controlled_audio.exists():
+        _private_directory(controlled_audio)
+    _private_bytes(controlled_audio / f"{REPEAT_CODE}.webm", copy_payload)
+    return fixture
+
+
+@pytest.mark.parametrize("controlled", [False, True])
+def test_explicit_repeat_controlled_copy_is_quarantined(
+    tmp_path: Path,
+    migrated_database: Path,
+    controlled: bool,
+) -> None:
+    """2026-10-02 记下的缺口:重复录音副本只登在 repeat_audio_manifest,过去
+    闭包只认 audio_manifest,这种残留永远报 controlled_audio_closure_invalid。"""
+    fixture = _repeat_fixture(tmp_path, migrated_database, controlled=controlled)
+    result = _run(fixture)
+    assert result.status == "reconciled"
+    moved = fixture["quarantine"] / str(result.bundle_name) / "controlled-audio" / "audio"
+    expected = {f"{REPEAT_CODE}.webm"} | ({f"{CODE}.webm"} if controlled else set())
+    assert {path.name for path in moved.iterdir()} == expected
+    assert not fixture["controlled"].exists()
+    assert (fixture["data"] / "audio" / f"{REPEAT_RAW_AUDIO_ID}.webm").read_bytes() == (
+        REPEAT_PAYLOAD)
+
+
+@pytest.mark.parametrize(("variant", "code"), [
+    ("unlisted_copy", "controlled_audio_closure_invalid"),
+    ("no_database_proof", "raw_audio_receipt_invalid"),
+    ("checksum_mismatch", "raw_audio_receipt_invalid"),
+    ("listed_in_both_manifests", "repeat_audio_manifest_invalid"),
+])
+def test_explicit_repeat_copy_still_needs_listing_and_database_proof(
+    tmp_path: Path,
+    migrated_database: Path,
+    variant: str,
+    code: str,
+) -> None:
+    fixture = _repeat_fixture(
+        tmp_path, migrated_database,
+        listed=([] if variant == "unlisted_copy"
+                else [CODE] if variant == "listed_in_both_manifests" else None),
+        in_database=variant != "no_database_proof",
+        copy_payload=(b"tampered-repeat-copy" if variant == "checksum_mismatch"
+                      else REPEAT_PAYLOAD),
+    )
+    with pytest.raises(reconcile.ReconciliationError, match=code):
+        _run(fixture)
+    assert fixture["analysis"].is_dir()
+    assert (fixture["controlled"] / "audio" / f"{REPEAT_CODE}.webm").is_file()
+
+
 def test_controlled_audio_aggregate_limit_is_fail_closed(
     tmp_path: Path,
     migrated_database: Path,

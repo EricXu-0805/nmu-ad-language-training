@@ -71,25 +71,73 @@ def _qwen() -> rapport_reply.QwenReplyEngine:
 
 
 def test_parse_accepts_exact_shape_and_fenced_json():
-    assert _qwen()._parse('{"reply": "谢谢您跟我讲这些。"}') == "谢谢您跟我讲这些。"
+    assert _qwen()._parse('{"reply": "谢谢您跟我讲这些。"}') == ("谢谢您跟我讲这些。", "ok")
     fenced = '```json\n{"reply": "谢谢您跟我讲这些。"}\n```'
-    assert _qwen()._parse(fenced) == "谢谢您跟我讲这些。"
+    assert _qwen()._parse(fenced) == ("谢谢您跟我讲这些。", "ok")
 
 
 def test_parse_rejects_wrong_shapes():
+    """形状不对/空回是「没给出回应」,不算守卫拦截。"""
     q = _qwen()
-    assert q._parse(None) is None
-    assert q._parse("") is None
-    assert q._parse("不是 JSON") is None
-    assert q._parse(json.dumps(["谢谢您"])) is None
-    assert q._parse(json.dumps({"reply": "好的。", "extra": 1})) is None
-    assert q._parse(json.dumps({"answer": "好的。"})) is None
-    assert q._parse(json.dumps({"reply": "第一句\n第二句"})) is None
+    assert q._parse(None) == (None, "unavailable")
+    assert q._parse("") == (None, "unavailable")
+    assert q._parse("不是 JSON") == (None, "unavailable")
+    assert q._parse(json.dumps(["谢谢您"])) == (None, "unavailable")
+    assert q._parse(json.dumps({"reply": "好的。", "extra": 1})) == (None, "unavailable")
+    assert q._parse(json.dumps({"answer": "好的。"})) == (None, "unavailable")
+    assert q._parse(json.dumps({"reply": "  "})) == (None, "unavailable")
+    assert q._parse(json.dumps({"reply": 3})) == (None, "unavailable")
+
+
+def test_parse_reports_guard_rejections_distinctly():
+    """形状对、内容越界:交回 None 的同时报 rejected,研究侧才数得出拦截率。"""
+    q = _qwen()
+    assert q._parse(json.dumps({"reply": "第一句\n第二句"})) == (None, "rejected")
+    assert q._parse(json.dumps({"reply": "您今年多大年纪啦？"})) == (None, "rejected")
+    assert q._parse(json.dumps({"reply": "那您常去吗？"}), final=True) == (None, "rejected")
+    assert q._parse(json.dumps({"reply": "那您常去吗？"})) == ("那您常去吗？", "ok")
+
+
+def test_engine_keeps_its_own_identity_guard(monkeypatch):
+    """引擎自带守卫不因端点也守而拆掉:直接调引擎,身份追问照样回不来。"""
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-not-a-real-key")
+    q = _qwen()
+    monkeypatch.setattr(q, "_call", lambda prompt: json.dumps({"reply": "您属牛啊，那您是哪一年的？"}))
+    assert q.generate("您属什么呀？", "属牛") is None
+    assert q.generate_with_outcome("您属什么呀？", "属牛") == (None, "rejected")
 
 
 def test_generate_without_api_key_returns_none(monkeypatch):
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     assert _qwen().generate("问句", "回答") is None
+    assert _qwen().generate_with_outcome("问句", "回答") == (None, "unavailable")
+
+
+def test_engine_call_failure_is_unavailable(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-not-a-real-key")
+    q = _qwen()
+
+    def boom(prompt):
+        raise TimeoutError("dashscope")
+
+    monkeypatch.setattr(q, "_call", boom)
+    assert q.generate_with_outcome("问句", "回答") == (None, "unavailable")
+
+
+def test_outcome_for_engines_that_only_implement_generate():
+    """只有 generate() 的引擎(stub/将来的本地模型):按交回的原文过同一道守卫来判。"""
+    class Plain:
+        def __init__(self, reply):
+            self.reply = reply
+
+        def generate(self, ask, asr_text, history=(), round_no=1, max_rounds_value=1):
+            return self.reply
+
+    assert rapport_reply.generate_with_outcome(Plain("听着真好。"), "问", "答") == ("听着真好。", "ok")
+    assert rapport_reply.generate_with_outcome(Plain(None), "问", "答") == (None, "unavailable")
+    assert rapport_reply.generate_with_outcome(Plain(""), "问", "答") == (None, "unavailable")
+    assert rapport_reply.generate_with_outcome(
+        Plain("您常去吗？"), "问", "答", (), 1, 1) == (None, "rejected")
 
 
 # ---------------- 引擎注册与选择:未知配置必须保留 unknown 边界 ----------------

@@ -581,7 +581,7 @@ def _analysis_files(
     *,
     batch_id: str,
     owner_hash: str,
-) -> tuple[TreeSummary, list[dict[str, str]]]:
+) -> tuple[TreeSummary, list[dict[str, str]], frozenset[str]]:
     resolved = _secure_directory(batch_dir, "analysis_staging_invalid")
     try:
         entries = tuple(os.scandir(resolved))
@@ -607,7 +607,22 @@ def _analysis_files(
         owner_hash=owner_hash,
     )
     rows = _read_audio_manifest(resolved / "audio_manifest.csv")
-    return _tree_summary(files), rows
+    repeat_codes: set[str] = set()
+    if "repeat_audio_manifest.csv" in names:
+        # 显式重复的录音只登在这张表(四列白名单,不带格式/状态),受控副本却照样
+        # 写进受控目录;不认这张表,含重复录音的残留永远隔离不了。码的语法借受控
+        # 文件名那条正则验(后缀任取一种)。
+        for row in _read_audio_manifest(resolved / "repeat_audio_manifest.csv"):
+            code = row.get("opaque_audio_code")
+            if (
+                row.get("capture_kind") != "explicit_repeat"
+                or code is None
+                or code in repeat_codes
+                or not _CONTROLLED_AUDIO_NAME.fullmatch(f"{code}.webm")
+            ):
+                raise ReconciliationError("repeat_audio_manifest_invalid")
+            repeat_codes.add(code)
+    return _tree_summary(files), rows, frozenset(repeat_codes)
 
 
 def _read_audio_manifest(path: Path) -> list[dict[str, str]]:
@@ -737,6 +752,7 @@ def _validate_controlled_closure(
     export_scope_hash: str,
     manifest_rows: list[dict[str, str]],
     controlled_dir: Path | None,
+    repeat_codes: frozenset[str] = frozenset(),
 ) -> TreeSummary | None:
     expected_rows: dict[str, dict[str, str]] = {}
     for row in manifest_rows:
@@ -768,6 +784,8 @@ def _validate_controlled_closure(
         ):
             raise ReconciliationError("audio_manifest_invalid")
         expected_rows[code] = row
+    if repeat_codes & {row.get("audio_code") for row in manifest_rows}:
+        raise ReconciliationError("repeat_audio_manifest_invalid")
 
     if controlled_dir is None:
         if expected_rows:
@@ -775,7 +793,12 @@ def _validate_controlled_closure(
         return None
 
     summary, files = _controlled_files(controlled_dir)
-    if set(files) != set(expected_rows):
+    # 重复录音有没有受控副本取决于导出时源字节在不在,那张表里推不出来;只要求
+    # 多出来的副本都登在重复清单上,身份照样逐个过下面同一套库内证明。
+    if (
+        not set(expected_rows) <= set(files)
+        or set(files) - set(expected_rows) - repeat_codes
+    ):
         raise ReconciliationError("controlled_audio_closure_invalid")
     matched_raw_ids: set[str] = set()
     config = _deidentification_config()
@@ -784,7 +807,7 @@ def _validate_controlled_closure(
         if match is None:
             raise ReconciliationError("controlled_audio_name_invalid")
         audio_format = match.group(2)
-        if expected_rows[code]["audio_format"] != audio_format:
+        if code in expected_rows and expected_rows[code]["audio_format"] != audio_format:
             raise ReconciliationError("controlled_audio_closure_invalid")
         checksum, byte_count = _sha256(path)
         try:
@@ -1357,7 +1380,7 @@ def _resume_postcommit_completion(
     ):
         raise ReconciliationError("released_staging_evidence_incomplete")
 
-    analysis_summary, manifest_rows = _analysis_files(
+    analysis_summary, manifest_rows, repeat_codes = _analysis_files(
         analysis_destination,
         batch_id=batch_id,
         owner_hash=owner_hash,
@@ -1371,6 +1394,7 @@ def _resume_postcommit_completion(
         controlled_dir=(
             controlled_destination if expected_controlled is not None else None
         ),
+        repeat_codes=repeat_codes,
     )
     if (
         analysis_summary != expected_analysis
@@ -1546,7 +1570,7 @@ def reconcile_preintent_staging(
         analysis_dir = (
             analysis_source if analysis_state == "source" else analysis_destination
         )
-        analysis_summary, manifest_rows = _analysis_files(
+        analysis_summary, manifest_rows, repeat_codes = _analysis_files(
             analysis_dir,
             batch_id=batch_id,
             owner_hash=owner_hash,
@@ -1567,6 +1591,7 @@ def reconcile_preintent_staging(
             export_scope_hash=str(batch["export_scope_hash"]),
             manifest_rows=manifest_rows,
             controlled_dir=controlled_dir,
+            repeat_codes=repeat_codes,
         )
         if controlled_summary is None and controlled_state != "missing":
             raise ReconciliationError("controlled_orphan_structure")
@@ -1601,7 +1626,7 @@ def reconcile_preintent_staging(
             elif _path_state(controlled_source, controlled_destination) != "missing":
                 raise ReconciliationError("controlled_orphan_structure")
 
-            moved_analysis, moved_rows = _analysis_files(
+            moved_analysis, moved_rows, moved_repeat_codes = _analysis_files(
                 analysis_destination,
                 batch_id=batch_id,
                 owner_hash=owner_hash,
@@ -1617,6 +1642,7 @@ def reconcile_preintent_staging(
                     if controlled_summary is not None
                     else None
                 ),
+                repeat_codes=moved_repeat_codes,
             )
             if (
                 moved_analysis != analysis_summary

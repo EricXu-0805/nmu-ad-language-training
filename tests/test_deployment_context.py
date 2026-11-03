@@ -450,6 +450,7 @@ def test_local_launcher_rejects_partial_ui_and_terminates_child_on_timeout(tmp_p
     root, script = _isolated_local_launcher(tmp_path, with_ui=True)
     fake_bin = tmp_path / "not-ready-bin"
     terminated = tmp_path / "uvicorn-terminated"
+    probes = tmp_path / "readiness-probes"
     _write_executable(
         fake_bin / "curl",
         "#!/bin/sh\n"
@@ -460,6 +461,7 @@ def test_local_launcher_rejects_partial_ui_and_terminates_child_on_timeout(tmp_p
         "  last=$arg\n"
         "done\n"
         "[ \"$writeout\" -eq 1 ] || exit 7\n"
+        "printf '%s\\n' \"$last\" >> \"$NMU_TEST_PROBES\"\n"
         "sleep 1\n"
         "case \"$last\" in\n"
         "  */health) printf '200 application/json' ;;\n"
@@ -484,11 +486,12 @@ def test_local_launcher_rejects_partial_ui_and_terminates_child_on_timeout(tmp_p
             fake_bin,
             NMU_STARTUP_TIMEOUT_SECONDS="2",
             NMU_TEST_TERMINATED=str(terminated),
+            NMU_TEST_PROBES=str(probes),
         ),
         text=True,
         capture_output=True,
         check=False,
-        timeout=10,
+        timeout=30,
     )
     elapsed = time.monotonic() - started_at
 
@@ -497,9 +500,14 @@ def test_local_launcher_rejects_partial_ui_and_terminates_child_on_timeout(tmp_p
     assert "必须同时通过 /health、/console 和 /patient" in result.stderr
     assert terminated.is_file()
     # Three one-second probes used to multiply every nominal loop.  The real
-    # two-second wall-clock deadline must win before another probe can begin;
-    # leave generous process scheduling headroom without accepting the old loop.
-    assert elapsed < 6, f"startup timeout took {elapsed:.2f}s"
+    # two-second wall-clock deadline must win before another probe can begin:
+    # each fake probe takes at least one second and none may start once the
+    # deadline has passed, so at most two ever run.  Counting probes instead of
+    # timing the whole launcher keeps verify_browser_dist/process start-up under
+    # parallel load out of the verdict; the elapsed bound only catches a hang.
+    started = probes.read_text(encoding="utf-8").splitlines()
+    assert 1 <= len(started) <= 2, started
+    assert elapsed < 15, f"startup timeout took {elapsed:.2f}s"
 
 
 def test_local_demo20_launcher_is_explicit_and_loopback_only():

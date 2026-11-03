@@ -151,8 +151,21 @@ class _StubReply:
         return reply(round_no) if callable(reply) else reply
 
 
-def _use_reply_stub(monkeypatch, reply):
-    engine = _StubReply(reply)
+class _OutcomeStubReply(_StubReply):
+    """自报结局的引擎(同 QwenReplyEngine.generate_with_outcome 的形状)。"""
+
+    def __init__(self, reply, outcome):
+        super().__init__(reply)
+        self._outcome = outcome
+
+    def generate_with_outcome(self, ask, asr_text, history=(), round_no=1,
+                              max_rounds_value=1):
+        return (self.generate(ask, asr_text, history, round_no, max_rounds_value),
+                self._outcome)
+
+
+def _use_reply_stub(monkeypatch, reply, outcome=None):
+    engine = _StubReply(reply) if outcome is None else _OutcomeStubReply(reply, outcome)
     rapport_reply.register_engine("pipeline-stub", engine)
     monkeypatch.setenv("RAPPORT_REPLY", "pipeline-stub")
     return engine
@@ -344,16 +357,15 @@ def test_final_round_question_from_llm_falls_back_to_closing_line(
     monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "1")
     _seed_audio(client, session_id="S-PIPE", raw_id="aud-f1", section="介绍机构环境")
     monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我常去花园"))
-    # 直接返回带问号的句子:管线里 QwenReplyEngine 会经 validate(final=True) 拒掉;
-    # stub 绕过引擎自带守卫,所以这里模拟"引擎已拒绝"= 返回 None。
-    _use_reply_stub(monkeypatch, None)
+    # 模拟 QwenReplyEngine 经 validate(final=True) 拒掉带问号的句子后自报的结局。
+    _use_reply_stub(monkeypatch, None, outcome="rejected")
     created = _create_reply(client, "S-PIPE", {
         "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
         "rawAudioId": "aud-f1"})
     assert created.status_code == 200, created.text
     body = created.json()
     assert body["final"] is True
-    assert body["degradedReason"] == "llm_unavailable"
+    assert body["degradedReason"] == "llm_rejected"
     assert "？" not in body["text"] and "?" not in body["text"]
 
 
@@ -428,8 +440,66 @@ def test_endpoint_revalidates_generated_text_on_final_round(
     assert created.status_code == 200, created.text
     body = created.json()
     assert body["source"] != "llm"                     # 被端点拒了
-    assert body["degradedReason"] == "llm_unavailable"
+    assert body["degradedReason"] == "llm_rejected"
     assert "？" not in body["text"] and body["invitesMore"] is False
+
+
+def test_endpoint_guard_overrides_an_engine_that_reports_ok(pipeline_client, monkeypatch):
+    """自报结局的引擎说 ok 也不算数:交回的原文仍要过端点守卫,拒了记 llm_rejected。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "1")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-lie", section="介绍机构环境")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我常去花园"))
+    _use_reply_stub(monkeypatch, "花园好呀，您常去吗？", outcome="ok")
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-lie"})
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["source"] != "llm"
+    assert body["degradedReason"] == "llm_rejected"
+    assert "？" not in body["text"] and body["invitesMore"] is False
+
+
+def test_engine_failure_is_unavailable_not_rejected(pipeline_client, monkeypatch):
+    """引擎抛异常/交回 None 是「没给出回应」,不能算进守卫拦截。"""
+    client = pipeline_client
+    _seed_scene(client)
+
+    class _Raising(_StubReply):
+        def generate(self, *args, **kwargs):
+            raise RuntimeError("provider down")
+
+    rapport_reply.register_engine("pipeline-stub", _Raising(None))
+    monkeypatch.setenv("RAPPORT_REPLY", "pipeline-stub")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我常去花园"))
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-raise", section="介绍机构环境")
+    raised = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-raise"})
+    assert raised.status_code == 200, raised.text
+    assert raised.json()["degradedReason"] == "llm_unavailable"
+    assert raised.json()["replyId"] == "k1"
+
+
+def test_ai_usage_summary_counts_guard_rejections_separately(pipeline_client, monkeypatch):
+    """守卫拦截单独计数:研究侧要的是拦截率,不能和服务不可用混成一个数。"""
+    client = pipeline_client
+    _seed_scene(client)
+    monkeypatch.setenv("RAPPORT_MAX_ROUNDS", "1")
+    monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("我常去花园"))
+    _use_reply_stub(monkeypatch, "您是哪一年出生的呀？")
+    _seed_audio(client, session_id="S-PIPE", raw_id="aud-probe", section="介绍机构环境")
+    created = _create_reply(client, "S-PIPE", {
+        "sectionKey": "介绍机构环境", "questionIdx": 0, "mode": "auto",
+        "rawAudioId": "aud-probe"})
+    assert created.status_code == 200, created.text
+    assert created.json()["degradedReason"] == "llm_rejected"
+
+    rapport = client.get("/sessions/S-PIPE/ai-usage").json()["rapport"]
+    assert rapport["degraded"] == [{"reason": "llm_rejected", "count": 1}]
+    assert rapport["reply_engines"] == []
 
 
 def test_generated_closing_line_does_not_invite_more(pipeline_client, monkeypatch):
@@ -994,13 +1064,13 @@ def test_zodiac_first_round_is_guarded_like_a_final_round(pipeline_client, monke
     monkeypatch.delenv("RAPPORT_MAX_ROUNDS", raising=False)
     _seed_audio(client, session_id="S-PIPE", raw_id="aud-z-q", section="自我介绍", question=2)
     monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("属牛"))
-    _use_reply_stub(monkeypatch, None)   # 引擎守卫(final=True)已拒掉带问号的句子
+    _use_reply_stub(monkeypatch, "您常去吗？")   # 引擎自报 ok,端点的末轮守卫照样拦
     refused = _create_reply(client, "S-PIPE", {
         "sectionKey": "自我介绍", "questionIdx": 2, "mode": "auto", "rawAudioId": "aud-z-q"})
     assert refused.status_code == 200, refused.text
     body = refused.json()
     assert body["final"] is True and body["invitesMore"] is False
-    assert body["degradedReason"] == "llm_unavailable"
+    assert body["degradedReason"] == "llm_rejected"
     assert "？" not in body["text"] and "?" not in body["text"]
 
     _seed_scene(client, patient="P-PIPE-2", session="S-PIPE-2")
