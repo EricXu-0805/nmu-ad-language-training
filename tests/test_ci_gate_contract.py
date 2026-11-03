@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -208,6 +209,51 @@ def test_main_push_and_schedule_skip_the_test_suites_but_still_scan_and_build() 
     jobs = _jobs()
     assert "scripts/ci_gate.sh --only supply-chain" in jobs["supply-chain"]
     assert jobs["image"].count("uses: aquasecurity/trivy-action@") == 2
+
+
+def test_the_gateway_scan_stays_strict_and_only_waives_dated_entries() -> None:
+    """11-02 起 go-jose v3 的 HIGH 没有修复版(见 security/trivy-gateway.trivyignore)。放行只能
+    逐条登记、带到期日、写明理由;扫描本身照旧不忽略无修复版的漏洞,镜像那一步不带豁免。"""
+    image = _jobs()["image"]
+    container_scan, gateway_scan = [step for step in image.split("\n      - ")
+                                    if "uses: aquasecurity/trivy-action@" in step]
+    assert "trivyignores" not in container_scan
+    # Trivy 默认还会读工作目录的这几份;放在仓库根上,镜像那一步会被悄悄放行。
+    for default in (".trivyignore", ".trivyignore.yaml", "trivy.yaml"):
+        assert not (ROOT / default).exists(), default
+    for setting in ("severity: HIGH,CRITICAL", "ignore-unfixed: false",
+                    "trivyignores: security/trivy-gateway.trivyignore"):
+        assert f"\n          {setting}\n" in gateway_scan + "\n", setting
+    text = (ROOT / "security/trivy-gateway.trivyignore").read_text(encoding="utf-8")
+    comments = "\n".join(line for line in text.splitlines() if line.startswith("#"))
+    entries = [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+    assert entries
+    for line in entries:
+        matched = re.fullmatch(r"(CVE-\d{4}-\d+|GHSA(?:-[0-9a-z]{4}){3}) exp:(\d{4}-\d{2}-\d{2})", line)
+        assert matched, f"每条都要是「编号 exp:日期」:{line}"
+        identifier, expires = matched.groups()
+        block = next(b for b in comments.split("\n#\n") if identifier in b)
+        registered = re.search(r"登记 (\d{4}-\d{2}-\d{2})", block)
+        assert registered, f"{identifier} 的说明里没写登记日期"
+        from datetime import date
+        span = date.fromisoformat(expires) - date.fromisoformat(registered.group(1))
+        assert 0 < span.days <= 45, f"{identifier} 的豁免期 {span.days} 天,上限 45 天"
+    recipe = json.loads((ROOT / "deploy/caddy-build.json").read_text(encoding="utf-8"))
+    unfixed = recipe["security_fix"]["not_fixed_in_this_build"]
+    assert f"\n{unfixed['advisory']} exp:{unfixed['waiver_expires']}" in "\n" + text, \
+        "配方里记的未修条目要和豁免文件里的编号、到期日一致(它随发布产物走)"
+
+
+def test_the_go_jose_waiver_holds_only_while_the_gateway_runs_no_acme_server_or_internal_ca() -> None:
+    """那条豁免的前提:网关不当 ACME 服务器,外来 JWK 就到不了 go-jose v3。内部 CA 本身不解析外来
+    JWK,这里也一并拦,宽一点不吃亏。生产 /opt/nmu/caddy/Caddyfile 不在仓库里,管不到。"""
+    waivers = (ROOT / "security/trivy-gateway.trivyignore").read_text(encoding="utf-8")
+    if "\nCVE-2026-116587 exp:" not in waivers:
+        return
+    live = [line.split("#", 1)[0] for line in (ROOT / "Caddyfile").read_text(encoding="utf-8").splitlines()]
+    offenders = [line.strip() for line in live
+                 if re.search(r"\bacme_server\b|^\s*pki\b|\btls\s+internal\b|\blocal_certs\b", line)]
+    assert not offenders, f"Caddyfile 打开了 ACME 服务器或内部 CA,go-jose v3 的豁免不再成立:{offenders}"
 
 
 def test_backend_legs_have_a_timeout_so_a_hang_cannot_burn_the_minute_budget() -> None:

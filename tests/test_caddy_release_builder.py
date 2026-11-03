@@ -116,7 +116,7 @@ def test_recipe_cannot_select_a_go_patch_before_the_security_fix(tmp_path, versi
     assert "security floor" in result.stderr
 
 
-def _source_response(*, caddy_version=None, missing_license="", old_crypto=False, old_compress=False, replacement=False, mutate_lock=False):
+def _source_response(*, caddy_version=None, missing_license="", old_crypto=False, old_compress=False, old_jose=False, replacement=False, mutate_lock=False):
     recipe = json.loads((ROOT / "deploy/caddy-build.json").read_text())
     caddy = recipe["caddy"]
     module_config = {
@@ -131,6 +131,8 @@ def _source_response(*, caddy_version=None, missing_license="", old_crypto=False
         dependencies["golang.org/x/crypto"] = "v0.52.0"
     if old_compress:
         dependencies["github.com/klauspost/compress"] = "v1.18.6"
+    if old_jose:
+        dependencies["github.com/go-jose/go-jose/v4"] = "v4.1.4"
     dep_lines = "".join(f"\\tdep\\t{name}\\t{version}\\th1:fixture\\n" for name, version in dependencies.items())
     return f'''
 case "$1 $2" in
@@ -181,6 +183,7 @@ def test_missing_redistribution_license_cannot_publish_a_release(tmp_path, missi
 
 @pytest.mark.parametrize(("kwargs", "error"), [
     ({"old_compress": True}, "wrong controlled dependency: github.com/klauspost/compress"),
+    ({"old_jose": True}, "wrong controlled dependency: github.com/go-jose/go-jose/v4"),
     ({"old_crypto": True}, "wrong controlled dependency: golang.org/x/crypto"),
     ({"replacement": True}, "dependency pins or module configuration mismatch"),
     ({"mutate_lock": True}, "source changed before compilation"),
