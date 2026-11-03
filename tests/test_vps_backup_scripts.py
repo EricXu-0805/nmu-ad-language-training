@@ -1251,8 +1251,14 @@ def _gnu_find() -> str | None:
     return None
 
 
-@pytest.mark.skipif(_gnu_find() is None, reason="needs GNU find -printf, as on the VPS")
 def test_real_remote_facts_command_accepts_linked_audio_and_rejects_other_links(tmp_path):
+    if _gnu_find() is None:
+        # 本机(macOS 自带的不是 GNU find)可以跳过;CI 跑在 Linux 上,那里也跳过
+        # 就等于这条从来没跑过,换镜像丢了 findutils 也没人知道。
+        if os.environ.get("CI", "").strip().lower() not in ("", "0", "false"):
+            pytest.fail("CI 上找不到 GNU find(远端事实命令要 -printf,同 VPS):"
+                        "先给 CI 环境装 findutils,不许跳过")
+        pytest.skip("needs GNU find -printf, as on the VPS")
     project, remote, local, env = _pull_harness(tmp_path)
     finder = tmp_path / "gnu-find"
     finder.mkdir()

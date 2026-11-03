@@ -179,12 +179,13 @@ locked_environment() {
 }
 
 # 装了 pytest-xdist 就按核数并行（CI 装了它；仓库私有后按分钟计费，并行能省四成以上）；
-# 本机没装照旧串行，判据不变。
+# 本机没装照旧串行，判据不变。-rs 把每条跳过的原因打进日志：-q 只给个数，
+# 哪条该在 Linux 上跑却被跳过了，过去从 CI 日志里看不出来。
 backend_pytest() {
   if "$PYTHON" -c "import xdist" >/dev/null 2>&1; then
-    "$PYTHON" -m pytest -q -n auto
+    "$PYTHON" -m pytest -q -rs -n auto
   else
-    "$PYTHON" -m pytest -q
+    "$PYTHON" -m pytest -q -rs
   fi
 }
 
