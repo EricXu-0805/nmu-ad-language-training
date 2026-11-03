@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 import threading
@@ -363,6 +364,18 @@ def test_revocation_during_asr_stops_cloud_llm_and_pauses_without_study_withdraw
     monkeypatch.setattr("app.main.asr.get_engine", lambda: blocking_asr)
     llm_judge.register_engine("consent-race-cloud", cloud_judge)
     monkeypatch.setenv("LLM_JUDGE", "consent-race-cloud")
+    real_egress = cloud_processing.serialized_subject_egress
+    revoke_waiting = threading.Event()
+
+    @contextmanager
+    def egress_spy(patient_id, *, bind):
+        # 处理线程这时卡在 ASR 里、占着这道围栏;此刻再进来的只能是撤回请求。
+        if blocking_asr.started.is_set() and not blocking_asr.release.is_set():
+            revoke_waiting.set()
+        with real_egress(patient_id, bind=bind):
+            yield
+
+    monkeypatch.setattr(cloud_processing, "serialized_subject_egress", egress_spy)
     try:
         session_id = _seed_admitted_attempt(
             client, patient_id="P-RACE", audio_id="A-RACE")
@@ -378,6 +391,11 @@ def test_revocation_during_asr_stops_cloud_llm_and_pauses_without_study_withdraw
                 "/patients/P-RACE/cloud-processing",
                 json=revoke_body,
             )
+            # 「撤回发生在 ASR 期间」要等撤回请求真排到围栏上再放行 ASR;只看
+            # future 未完成,负载下撤回可能还没出发,处理整条先跑完拿 200
+            # (2026-11-03 复现 7/50,失败的几次处理都早于撤回落库)。
+            # 4 秒:BlockingSpyAsr 自己最多等 5 秒。
+            assert revoke_waiting.wait(timeout=4)
             # A successful revocation response is the privacy boundary.  It may
             # not overtake a provider call that already owns the subject egress
             # fence, otherwise the old request could begin/continue egress after
