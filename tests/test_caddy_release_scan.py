@@ -8,8 +8,9 @@ import pytest
 from scripts.verify_caddy_release_scan import ScanError, verify, verify_build_binding
 
 
-PINS = {"github.com/klauspost/compress": "v1.18.7", "golang.org/x/crypto": "v0.57.0", "golang.org/x/net": "v0.60.0",
-        "golang.org/x/text": "v0.42.0", "google.golang.org/grpc": "v1.83.2"}
+PINS = {"github.com/go-jose/go-jose/v4": "v4.1.6", "github.com/klauspost/compress": "v1.18.7",
+        "golang.org/x/crypto": "v0.58.0", "golang.org/x/net": "v0.62.0",
+        "golang.org/x/text": "v0.43.0", "google.golang.org/grpc": "v1.83.2"}
 BUILD_INFO = (
     "/private/build/caddy: go1.26.10\n\tpath\tgithub.com/caddyserver/caddy/v2/cmd/caddy\n"
     "\tmod\tgithub.com/caddyserver/caddy/v2\tv2.11.4\th1:source-checksum\n"
@@ -24,11 +25,11 @@ REPORT = {"Results": [{
 
 
 def test_accepts_actual_binary_and_dependency_inventory():
-    assert verify(REPORT, BUILD_INFO) == 8
+    assert verify(REPORT, BUILD_INFO) == 9
 
 
 def test_caddy_as_versioned_wrapper_dependency_is_scanned():
-    assert verify(REPORT, BUILD_INFO.replace("\tmod\t", "\tdep\t")) == 8
+    assert verify(REPORT, BUILD_INFO.replace("\tmod\t", "\tdep\t")) == 9
 
 
 def test_an_unscanned_compiled_dependency_is_not_a_clean_report():
@@ -146,7 +147,7 @@ def test_changed_controlled_dependency_lock_cannot_match_old_build(tmp_path):
 
 def test_old_dependency_binary_cannot_match_fixed_recipe(tmp_path):
     root, artifact, receipt = _artifact(tmp_path)
-    info = BUILD_INFO.replace("v0.57.0", "v0.52.0").encode()
+    info = BUILD_INFO.replace("v0.58.0", "v0.52.0").encode()
     (artifact / "go-build-info.txt").write_bytes(info)
     receipt["go_build_info_sha256"] = hashlib.sha256(info).hexdigest()
     (artifact / "build-receipt.json").write_text(json.dumps(receipt))

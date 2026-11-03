@@ -47,7 +47,7 @@ def build(root, args):
             or int(toolchain["version"].split(".")[-1]) < 10):
         raise ValueError("unsafe Caddy source, target, or Go security floor")
     if (build_module != {"path": "deploy/caddy", "module": "nmu.local/caddy-release"}
-            or set(dependency_pins) != {"github.com/klauspost/compress", "golang.org/x/crypto", "golang.org/x/net", "golang.org/x/text", "google.golang.org/grpc"}
+            or set(dependency_pins) != {"github.com/go-jose/go-jose/v4", "github.com/klauspost/compress", "golang.org/x/crypto", "golang.org/x/net", "golang.org/x/text", "google.golang.org/grpc"}
             or any(not re.fullmatch(r"v\d+\.\d+\.\d+", version) for version in dependency_pins.values())):
         raise ValueError("invalid controlled Caddy build module")
     controlled_paths = {"deploy/caddy/" + name: root / "deploy/caddy" / name for name in ("main.go", "go.mod", "go.sum")}
