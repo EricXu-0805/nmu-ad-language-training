@@ -19,10 +19,11 @@ from scripts import check_database_head, check_release_contract
 ROOT = Path(__file__).resolve().parents[1]
 VALID_IMAGE = "registry.invalid/nmu/app@sha256:" + "a" * 64
 EDGE_DEPENDENCIES = {
+    "github.com/go-jose/go-jose/v4": "v4.1.6",
     "github.com/klauspost/compress": "v1.18.7",
-    "golang.org/x/crypto": "v0.57.0",
-    "golang.org/x/net": "v0.60.0",
-    "golang.org/x/text": "v0.42.0",
+    "golang.org/x/crypto": "v0.58.0",
+    "golang.org/x/net": "v0.62.0",
+    "golang.org/x/text": "v0.43.0",
     "google.golang.org/grpc": "v1.83.2",
 }
 EDGE_DEPENDENCY_LINES = "".join(

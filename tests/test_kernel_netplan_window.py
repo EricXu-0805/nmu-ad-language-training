@@ -168,6 +168,19 @@ def test_the_post_reboot_check_reads_all_six_timers():
         assert prop in health
 
 
+def test_the_proxy_units_follow_what_is_enabled_on_the_host():
+    """10-28 整个 IP 被墙后 sing-box 停用、改跑 sing-box-hy2:写死 sing-box 的核对会让窗口
+    在开窗前就停下(2026-11-03 演练就停在这里)。开机自启的 sing-box* 都要在跑、开机后没重启过。"""
+    bodies = [body for delimiter, body in _heredocs(_text()) if delimiter == "REMOTE"]
+    lister = "list-unit-files --no-legend --state=enabled 'sing-box*.service'"
+    health = next(body for body in bodies if "for t in ${TIMERS}" in body)
+    after = next(body for body in bodies if "NRestarts" in body)
+    assert lister in health and lister in after
+    for body in bodies:
+        for line in body.splitlines():
+            assert not re.search(r"\bsing-box\b(?![-*])", line) or line.lstrip().startswith("#"), line
+
+
 # ---------------- apt：等锁、只装点名的包 ----------------
 
 def test_every_real_apt_get_waits_for_the_lock_and_never_upgrades_everything():
@@ -307,21 +320,21 @@ def test_a_reboot_waits_for_a_new_boot_id_not_just_for_ssh():
 # bash 3.2 和 CI 的 bash 5 上各走一遍。假机器只认识脚本该发的命令，远端正文一律答 PASS：
 # 这里验的是本地这一侧的次序与收口，不是远端核对的内容。
 
-_SIMULATION_198 = "".join(
+_SIMULATION_202 = "".join(
     f"Inst {name} {old}({new} Ubuntu:22.04/jammy-updates [amd64])\n" for name, old, new in (
-        ("linux-headers-5.15.0-198", "", "5.15.0-198.208"),
-        ("linux-headers-5.15.0-198-generic", "", "5.15.0-198.208"),
-        ("linux-headers-generic", "[5.15.0.194.184] ", "5.15.0.198.171"),
-        ("linux-modules-5.15.0-198-generic", "", "5.15.0-198.208"),
-        ("linux-image-5.15.0-198-generic", "", "5.15.0-198.208"),
-        ("linux-modules-extra-5.15.0-198-generic", "", "5.15.0-198.208"),
-        ("linux-image-generic", "[5.15.0.194.184] ", "5.15.0.198.171"),
-        ("linux-generic", "[5.15.0.194.184] ", "5.15.0.198.171"),
-        ("linux-libc-dev", "[5.15.0-194.205] ", "5.15.0-198.208"),
+        ("linux-headers-5.15.0-202", "", "5.15.0-202.212"),
+        ("linux-headers-5.15.0-202-generic", "", "5.15.0-202.212"),
+        ("linux-headers-generic", "[5.15.0.198.171] ", "5.15.0.202.174"),
+        ("linux-modules-5.15.0-202-generic", "", "5.15.0-202.212"),
+        ("linux-image-5.15.0-202-generic", "", "5.15.0-202.212"),
+        ("linux-modules-extra-5.15.0-202-generic", "", "5.15.0-202.212"),
+        ("linux-image-generic", "[5.15.0.198.171] ", "5.15.0.202.174"),
+        ("linux-generic", "[5.15.0.198.171] ", "5.15.0.202.174"),
+        ("linux-libc-dev", "[5.15.0-198.208] ", "5.15.0-202.212"),
     ))
 
 # 一台会随脚本的动作变化的假机器：装包后内核包在、重启换 boot_id 并起到新内核、
-# 装死人开关的那段正文执行后新段就位、清包后 191 的包消失。日志一行一条命令，
+# 装死人开关的那段正文执行后新段就位、清包后 194 的包消失。日志一行一条命令，
 # 远端正文按里面的关键动作打标签，方便核对先后次序。
 _FAKE_SSH = '''\
 import json
@@ -351,8 +364,9 @@ def reply(text="", code=0):
     sys.exit(code)
 
 
-netfile = "/run/systemd/network/10-netplan-%s.network" % ("by-mac" if state["stanza"] else "ens18")
-old_kernel = "linux-image-5.15.0-191-generic ii \\nlinux-modules-5.15.0-191-generic ii \\n"
+netfile = state.get("netfile") or (
+    "/run/systemd/network/10-netplan-%s.network" % ("by-mac" if state["stanza"] else "ens18"))
+old_kernel = "linux-image-5.15.0-194-generic ii \\nlinux-modules-5.15.0-194-generic ii \\n"
 if command == "true":
     reply()
 if command.startswith("date -u"):
@@ -367,6 +381,8 @@ if "boot_id" in command:
     reply(state["boot"] + "\\n")
 if "last-deploy.state" in command:
     reply("commit = af59c28\\n")
+if "list-unit-files" in command:
+    reply(state.get("proxies", "sing-box-hy2.service "))
 if command == "uname -r":
     reply(state["kernel"] + "\\n")
 if "networkctl" in command:
@@ -380,8 +396,8 @@ if "dpkg-query -W -f='${Package}" in command:
 if "apt-get -s install" in command:
     reply("" if state["installed"] else os.environ["FAKE_SIMULATION"])
 if "apt-get -s purge" in command:
-    reply("Purg linux-image-5.15.0-191-generic [5.15.0-191.201]\\n"
-          "Purg linux-modules-5.15.0-191-generic [5.15.0-191.201]\\n")
+    reply("Purg linux-image-5.15.0-194-generic [5.15.0-194.205]\\n"
+          "Purg linux-modules-5.15.0-194-generic [5.15.0-194.205]\\n")
 if "systemd-run --wait" in command and "apt-get install" in command:
     state["installed"] = True
     reply()
@@ -397,7 +413,7 @@ if "preflight_check.py" in command:
 if "systemctl --no-pager reboot" in command:
     state["boot"] += "-next"
     if state["installed"]:
-        state["kernel"] = "5.15.0-198-generic"
+        state["kernel"] = "5.15.0-202-generic"
     reply("", 255)
 if command.endswith("bash -s"):
     if "nmu-netplan-revert --on-active" in body:
@@ -407,12 +423,13 @@ sys.stderr.write("没预料到的远端命令：" + command + "\\n")
 sys.exit(97)
 '''
 
-_FRESH_HOST = {"boot": "boot-a", "kernel": "5.15.0-194-generic", "installed": False,
-               "stanza": False, "purged": False}
+# 10-03 之后的生产机:跑 198,按 MAC 匹配的段已在、网络走 by-mac 那份。
+_FRESH_HOST = {"boot": "boot-a", "kernel": "5.15.0-198-generic", "installed": False,
+               "stanza": True, "purged": False}
 
 
 def _run_phase(tmp_path: Path, phase: str, answers: str = "", clock: str = "5 03 10",
-               simulation: str = _SIMULATION_198,
+               simulation: str = _SIMULATION_202,
                host: dict | None = None) -> tuple[subprocess.CompletedProcess, list[str]]:
     import json
     import os
@@ -468,7 +485,7 @@ def test_the_check_phase_flags_the_nightly_window_and_an_unexpected_package(tmp_
     extra = ("Inst linux-firmware [20220329] "
              "(20220329.git681281e4-0ubuntu3.40 Ubuntu:22.04/jammy-updates [all])\n")
     # 周五 18:10 UTC：正在夜间补丁的窗口里；模拟又多带进一个包。
-    result, _ = _run_phase(tmp_path, "check", clock="5 18 10", simulation=_SIMULATION_198 + extra)
+    result, _ = _run_phase(tmp_path, "check", clock="5 18 10", simulation=_SIMULATION_202 + extra)
 
     assert result.returncode == 1
     assert "这一项不过:时间窗" in result.stdout
@@ -487,6 +504,56 @@ def test_the_kernel_phase_installs_checks_reboots_and_checks_again_in_that_order
     assert not [c for c in commands if re.search(r"netplan (apply|generate)|nmu-netplan-revert", c)]
 
 
+@pytest.mark.parametrize(("stanza", "network"), [(True, "by-mac"), (False, "ens18")])
+def test_the_kernel_phase_expects_the_network_it_found(stanza, network, tmp_path):
+    """内核这一轮网络不动:重启后核对用的期望 Network File 跟着按 MAC 匹配的段在不在走。"""
+    result, commands = _run_phase(tmp_path, "kernel", answers="yes\n" * 4,
+                                  host={**_FRESH_HOST, "stanza": stanza})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    [after] = [c for c in commands if "EXPECT_NETWORK=" in c and "BOOT_BEFORE=boot-a" in c]
+    assert f"EXPECT_NETWORK=/run/systemd/network/10-netplan-{network}.network" in after
+
+
+def test_the_kernel_phase_stops_when_the_stanza_and_the_live_network_disagree(tmp_path):
+    result, commands = _run_phase(tmp_path, "kernel", answers="yes\n" * 4, host={
+        **_FRESH_HOST, "netfile": "/run/systemd/network/10-netplan-ens18.network"})
+
+    assert result.returncode == 1 and "netplan 改到一半" in result.stdout
+    assert not [c for c in commands if "apt-get install" in c or REBOOT in c]
+
+
+def test_verify_kernel_reads_the_expected_network_from_the_host(tmp_path):
+    result, commands = _run_phase(tmp_path, "verify-kernel", host={
+        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [c for c in commands
+            if "EXPECT_NETWORK=/run/systemd/network/10-netplan-by-mac.network" in c]
+    assert not [c for c in commands if re.search(r"systemd-run|reboot|apt-get", c)]
+
+
+def test_the_proxies_enabled_before_the_reboot_are_what_the_post_reboot_check_expects(tmp_path):
+    """列不到单元时 systemctl 也退 1:重启后拿重启前记下的清单对,才分得清「真没有」与「出错」。"""
+    result, commands = _run_phase(tmp_path, "kernel", answers="yes\n" * 4)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "开机自启的代理:sing-box-hy2.service" in result.stdout
+    [before] = [c for c in commands if "WHEN=before" in c]
+    [after] = [c for c in commands if "WHEN=after" in c]
+    assert "PROXIES_BEFORE='-'" in before
+    assert "PROXIES_BEFORE='sing-box-hy2.service '" in after
+
+
+def test_the_check_phase_flags_a_half_done_netplan_change(tmp_path):
+    result, commands = _run_phase(tmp_path, "check", host={
+        **_FRESH_HOST, "netfile": "/run/systemd/network/10-netplan-ens18.network"})
+
+    assert result.returncode == 1
+    assert "这一项不过:按 MAC 匹配的段与 eth0 的 Network File 一致" in result.stdout
+    assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
+
+
 def test_a_declined_reboot_leaves_the_kernel_installed_and_the_rerun_skips_the_install(tmp_path):
     result, commands = _run_phase(tmp_path, "kernel", answers="yes\nyes\nyes\nno\n")
     assert result.returncode == 1 and "没有确认" in result.stdout
@@ -502,7 +569,7 @@ def test_a_declined_reboot_leaves_the_kernel_installed_and_the_rerun_skips_the_i
 
 def test_the_kernel_phase_refuses_to_run_twice(tmp_path):
     result, commands = _run_phase(tmp_path, "kernel", answers="yes\n" * 4, host={
-        **_FRESH_HOST, "kernel": "5.15.0-198-generic", "installed": True})
+        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True})
 
     assert result.returncode == 1 and "这一阶段做过了" in result.stdout
     assert not [c for c in commands if "apt-get install" in c or REBOOT in c]
@@ -510,7 +577,7 @@ def test_the_kernel_phase_refuses_to_run_twice(tmp_path):
 
 def test_the_netplan_phase_arms_the_dead_man_before_applying_and_disarms_before_rebooting(tmp_path):
     result, commands = _run_phase(tmp_path, "netplan", answers="yes\n" * 4, host={
-        **_FRESH_HOST, "kernel": "5.15.0-198-generic", "installed": True})
+        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True, "stanza": False})
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "netplan 阶段完成" in result.stdout
@@ -525,7 +592,7 @@ def test_the_netplan_phase_arms_the_dead_man_before_applying_and_disarms_before_
 
 def test_the_purge_phase_simulates_first_and_never_reboots(tmp_path):
     result, commands = _run_phase(tmp_path, "purge", answers="yes\n", host={
-        **_FRESH_HOST, "kernel": "5.15.0-198-generic", "installed": True, "stanza": True})
+        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True})
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "purge 阶段完成" in result.stdout

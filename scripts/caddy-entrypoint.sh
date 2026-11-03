@@ -18,10 +18,11 @@ esac
 edge_build_info=$(caddy build-info 2>/dev/null) || reject
 printf '%s\n' "$edge_build_info" | awk '
   BEGIN {
+    expected["github.com/go-jose/go-jose/v4"] = "v4.1.6"
     expected["github.com/klauspost/compress"] = "v1.18.7"
-    expected["golang.org/x/crypto"] = "v0.57.0"
-    expected["golang.org/x/net"] = "v0.60.0"
-    expected["golang.org/x/text"] = "v0.42.0"
+    expected["golang.org/x/crypto"] = "v0.58.0"
+    expected["golang.org/x/net"] = "v0.62.0"
+    expected["golang.org/x/text"] = "v0.43.0"
     expected["google.golang.org/grpc"] = "v1.83.2"
   }
   $1 == "go" {
