@@ -1064,13 +1064,13 @@ def test_zodiac_first_round_is_guarded_like_a_final_round(pipeline_client, monke
     monkeypatch.delenv("RAPPORT_MAX_ROUNDS", raising=False)
     _seed_audio(client, session_id="S-PIPE", raw_id="aud-z-q", section="自我介绍", question=2)
     monkeypatch.setattr(asr, "get_engine", lambda: _StubAsr("属牛"))
-    _use_reply_stub(monkeypatch, None)   # 引擎只交回 None、不报结局:按不可用计
+    _use_reply_stub(monkeypatch, "您常去吗？")   # 引擎自报 ok,端点的末轮守卫照样拦
     refused = _create_reply(client, "S-PIPE", {
         "sectionKey": "自我介绍", "questionIdx": 2, "mode": "auto", "rawAudioId": "aud-z-q"})
     assert refused.status_code == 200, refused.text
     body = refused.json()
     assert body["final"] is True and body["invitesMore"] is False
-    assert body["degradedReason"] == "llm_unavailable"
+    assert body["degradedReason"] == "llm_rejected"
     assert "？" not in body["text"] and "?" not in body["text"]
 
     _seed_scene(client, patient="P-PIPE-2", session="S-PIPE-2")

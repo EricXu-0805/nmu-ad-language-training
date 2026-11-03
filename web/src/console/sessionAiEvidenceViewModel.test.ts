@@ -208,7 +208,7 @@ test("buildRapportReplaySection: 定稿与语音返回合看,三种说出状态�
   assert.equal(section.rows[0]!.spokenLabel, "已返回语音");
   assert.equal(section.rows[1]!.spokenLabel, "已改用本机语音(服务器未返回音频)");
   assert.equal(section.rows[2]!.spokenLabel, "只有定稿，没有语音返回记录");
-  assert.equal(section.rows[1]!.degradedLabel, "AI 服务没给出回应（较早的记录里也含生成越界被拒），已退回固定句");
+  assert.equal(section.rows[1]!.degradedLabel, "AI 没给出可用回应（服务不可用或返回格式不对；较早的记录里也含生成越界被拒），已退回固定句");
   assert.equal(section.rows[0]!.positionLabel, "介绍机构环境 · 第 1 问");
   assert.equal(section.rows[0]!.originLabel, "老人说完自动回应");
 });
