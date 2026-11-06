@@ -172,15 +172,19 @@ def test_the_post_reboot_check_reads_all_six_timers():
 
 
 def test_the_post_reboot_check_waits_for_activating_units_instead_of_failing_them():
-    """11-06 重启后约 15 秒就来核对,nmu 还在 activating,窗口当场判 FAIL;它几秒后就起来了。"""
+    """11-06 重启后约 15 秒就来核对,nmu 的 ExecStartPre 还没跑完(activating),窗口当场判 FAIL;它几秒后就起来了。"""
     health = next(body for delimiter, body in _heredocs(_text())
                   if delimiter == "REMOTE" and "for t in ${TIMERS}" in body)
-    loops = re.findall(r"^for unit in (.*); do\n(.*)\n(.*)\n", health, re.M)
-    assert [units.split()[0] for units, _first, _second in loops] == ["nmu", "${proxies}"], loops
-    for _units, first, second in loops:
-        assert first.strip() == 'state=$(systemctl --no-pager is-active "${unit}"); waited=0'
+    loops = re.findall(r"^for unit in (.*); do\n(.*)\n(.*)\n(.*)\n", health, re.M)
+    assert [units.split()[0] for units, *_lines in loops] == ["nmu", "${proxies}"], loops
+    for _units, first, second, third in loops:
+        assert first.strip() == ('state=$(systemctl --no-pager is-active "${unit}"); waited=0; '
+                                 'restarts=$(systemctl --no-pager show -p NRestarts --value "${unit}")')
         assert second.strip().startswith(
             'while [ "${state}" = "activating" ] && [ "${waited}" -lt 90 ]; do sleep 3;'), second
+        # Restart=always 的单元起来就崩时也在 activating 与 active 之间跳:重启次数涨了不许判 PASS。
+        assert third.strip().startswith(
+            '[ "$(systemctl --no-pager show -p NRestarts --value "${unit}")" = "${restarts}" ] || state='), third
 
 
 def test_the_proxy_units_follow_what_is_enabled_on_the_host():
