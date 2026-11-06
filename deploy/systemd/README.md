@@ -293,48 +293,61 @@ ssh eric@147.182.176.237 'date -u -d "+90 min" +%s > ~/.openclaw/workspace/nmu-p
   `OPENCLAW_DISCORD_DAILY_WEBHOOK` 时,`/opt/nmu/ops-alert.env` 与 Mac 的
   `~/Library/nmu-backup/ops-webhook.env` 要一起换,否则会一起哑掉。
 
-## 国内探针(2026-11 入库,还没装)
+## 国内探针(2026-11 入库,11-03 装在 openclaw-prod)
 
 10-28 起国内到 box A 整个 IP 的 TCP 都被封了。`nmu-health`、上面的纽约探针、Heartbeat 的
 `check_bwg_nodes_live` 都从美国看,一直是绿的,是代理坏了才发现。`deploy/offbox/nmu_china_probe.py`
 从国内看:每小时请 Globalping 的 6 个国内探针连一次 TCP 443,状态变了才发 Discord。
-**现在只有代码和测试(`tests/test_china_probe.py`),哪台机器上都没装。**
+11-03 装进 `openclaw-prod` 的 user crontab(:17),目标是国内入口 droplet 的 IP
+`147.182.176.237`(haproxy 把 443 原样转给 box A)。加 `--https-host` 之后每轮再用同一批探针
+GET 一次 `https://<域名>/build-id.txt`,报「TCP 通但 HTTPS 不通」;这个参数 2026-11 入库,
+crontab 里加不加由 Eric 定。
 
 | 项 | 取值 |
 | --- | --- |
 | 一轮怎么判 | 一次 Globalping 测量(ping、TCP 443、3 个包、country=CN、6 个探针),只送 `--target`;算数的探针 ≥4 个、分属 ≥2 个 ASN 才下结论:全通 up,全不通 down,其余 partial |
-| 何时报 | 新结论连续 2 轮(1-2 小时)才改状态;改到 down 或 partial 报一次,比上次报的更坏才 @Eric;回到 up 报一次,带中断时长;中间不重复 |
-| 不算数的 | Globalping 回 429/4xx/5xx、连不上、90 秒没测完、算数的探针不够:记 `unevaluable`,不改状态,不据此报新状态;之前已确认、因静默没报的那条照样补报 |
-| 额度 | 匿名每个出口 IP 每小时 250 个测试(出处写在文件头);一轮 6 个,不到 3%。文档的数没在 droplet 上量过,每轮把 `X-RateLimit-Remaining/Limit` 记进 `china.log` 的 `quota=` |
+| HTTPS(`--https-host`) | TCP 那次建成就再测一次 http:protocol=HTTPS、GET `/build-id.txt`,`locations` 填 TCP 那次的测量 id(同一批探针);每个探针要 HTTP 200 且 `tls.authorized=true`。这一轮 TCP 是 up 才算数:全通 up,有不通的就是「TCP 通但 HTTPS 不通」,消息里写每个探针不通的原因(连接或 TLS 断了 / DNS 解析失败 / 证书没验过 / HTTP 4xx·5xx)和对应的可能原因 |
+| 为什么不打 `/health` | PROXY protocol 上线前,经 droplet 来的请求在 box A 上都是 `147.182.176.237`;`nmu-backup-health` 的机外死人开关数的正是这个 IP 的 `GET /health`,国内探针打它会把开关喂绿。`/build-id.txt` 是静态文件,发布的空闲闸本来就不数它 |
+| 何时报 | 新结论连续 2 轮(1-2 小时)才改状态;改到 down 或 partial 报一次,比上次报的更坏才 @Eric;回到 up 报一次,带中断时长;中间不重复。HTTPS 那条线同样规则、自己一份状态(`china-state.json` 的 `https`),同一轮 TCP 的消息先发 |
+| 不算数的 | Globalping 回 429/4xx/5xx、连不上、90 秒没测完、算数的探针不够:记 `unevaluable`,不改状态,不据此报新状态;之前已确认、因静默没报的那条照样补报。HTTPS 那次也一样,TCP 那一轮不是 up 时 HTTPS 那条线也记 `unevaluable` |
+| 额度 | 匿名每个出口 IP 每小时 250 个测试(出处写在文件头);一轮 6 个,不到 3%;加 `--https-host` 一轮 12 个,不到 5%,仍留十倍余量。文档的数没在 droplet 上量过,每轮把 `X-RateLimit-Remaining/Limit` 记进 `china.log` 的 `quota=`(HTTPS 那次是 `https_quota=`) |
 | 静默与文件 | 与纽约探针同一个目录,共用 `silence-until`,上面那条静默命令两边一起管;自己的是 `china-state.json`、`china.log`(0600) |
+| 升级 | 不加 `--https-host`,请求、输出、日志、状态文件与加这个参数之前逐字节一样;11-03 以来的 `china-state.json`(version 1)照常读,加上参数后的第一轮 HTTPS 正常就什么都不发 |
 
-不联网看它会发什么,以及 Eric 批了之后从 Mac 真测一次(用掉 6 个测试额度,不发 Discord、
-不写状态;10-29 复测时还封着,应当得到 `result=down`):
+不联网看它会发什么,以及 Eric 批了之后从 Mac 真测一次(不发 Discord、不写状态;加
+`--https-host` 用掉 12 个测试额度,只测 box A 自己的 IP 是 6 个,10-29 复测时还封着):
 
 ```bash
-python3 -B deploy/offbox/nmu_china_probe.py --plan --target 89.208.253.119
+python3 -B deploy/offbox/nmu_china_probe.py --plan --target 147.182.176.237 --https-host 147-182-176-237.sslip.io
+python3 -B deploy/offbox/nmu_china_probe.py --check --target 147.182.176.237 --https-host 147-182-176-237.sslip.io
 python3 -B deploy/offbox/nmu_china_probe.py --check --target 89.208.253.119
 ```
 
-目标用 IP,跟 10-26 到 10-29 的手动测法一致,直接回答「这个 IP 解封了没有」;国内解析
-sslip.io 那一段不在它的范围里。
+`--target` 用 IP,直接回答「这个 IP 从国内连不连得上」;`--https-host` 用域名,把国内解析
+sslip.io、按 SNI 过滤、droplet → box A 那一段和证书都走一遍。
 
-装的话还差这几步,做不做、什么时候做由 Eric 定:
+11-03 装的是这样(以 droplet 上 `crontab -l` 为准):
 
-1. 把 `nmu_china_probe.py` 推到 `openclaw-prod` 的 `~/.openclaw/workspace/nmu-probe/`。它 import
+1. `nmu_china_probe.py` 放在 `openclaw-prod` 的 `~/.openclaw/workspace/nmu-probe/`。它 import
    同目录的 `nmu_offbox_probe.py`(发 Discord、落盘、静默都用那一份),所以要用 `python3 -B` 起,
    不能加 `-I`。
-2. user crontab 加一行(UTC 每小时 :17,避开纽约探针的 :x4 和 watchdog 的 :00/:05):
-   `17 * * * * /usr/bin/flock -n /home/eric/.openclaw/workspace/nmu-probe/.china.lock /usr/bin/python3 -B /home/eric/.openclaw/workspace/nmu-probe/nmu_china_probe.py --target 89.208.253.119 >> /home/eric/.openclaw/workspace/nmu-probe/china-cron.log 2>&1`。
-   `install_offbox_probe.sh` 不认这一行,它的 crontab 基线预检之后会对不上,要一起改。
-3. 目标写在这行 crontab 里,不在仓库文件里:IP 切换脚本的清单要加上它。
+2. user crontab 一行(UTC 每小时 :17,避开纽约探针的 :x4 和 watchdog 的 :00/:05)。加上
+   `--https-host` 是这样:
+   `17 * * * * /usr/bin/flock -n /home/eric/.openclaw/workspace/nmu-probe/.china.lock /usr/bin/python3 -B /home/eric/.openclaw/workspace/nmu-probe/nmu_china_probe.py --target 147.182.176.237 --https-host 147-182-176-237.sslip.io >> /home/eric/.openclaw/workspace/nmu-probe/china-cron.log 2>&1`。
+   改这行前先把新的 `nmu_china_probe.py` 推上去(旧版不认 `--https-host`,argparse 报错退出,
+   那一轮整个不测);`install_offbox_probe.sh` 不认这一行,它的 crontab 基线预检之后会对不上,要一起改。
+3. 目标和域名都写在这行 crontab 里,不在仓库文件里:IP 切换脚本的清单要加上它。
 4. Heartbeat 还没有对应的一行。要的话照 `check_nmu_probe` 写一个读 `china-state.json` 的;
-   没有它,探针自己停了不会有任何消息。装上之后共用 `OPENCLAW_DISCORD_DAILY_WEBHOOK` 的就是五条。
+   没有它,探针自己停了不会有任何消息。共用 `OPENCLAW_DISCORD_DAILY_WEBHOOK` 的就是五条。
 
 它的边界:
 
 - Globalping 的国内探针多在阿里、腾讯这类机房,家宽和手机网络只有少数几个;机房连得上不等于
   江苏电信家宽连得上。
-- 只测 TCP 握手,不测 TLS,也不打 `/health`。
+- 不加 `--https-host` 只测 TCP 握手:droplet 的 haproxy 照样接 TCP,所以 droplet → box A 断了、
+  域名被按 SNI 封了它都看不见。加了也只打 `/build-id.txt`,不打 `/health`、`/health/ready`,
+  库和盘仍归本机 `nmu-health`。
+- TCP 那一轮不是全通(partial)时 HTTPS 不单独判:partial 那条已经报了,但同时发生的 SNI 封锁
+  要等 TCP 回到全通才会报出来。
 - 靠 Globalping 这个外部服务。它挂了或改了额度,这边只会一直 `unevaluable`,不会报警;
-  `--status` 里的 `unevaluable_streak` 看得见。
+  `--status` 里的 `unevaluable_streak` 看得见(HTTPS 那条线在第三行)。

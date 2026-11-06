@@ -10,6 +10,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import copy
 from datetime import datetime, timezone
 import gzip
+import hashlib
 import importlib.util
 import io
 import json
@@ -87,46 +88,111 @@ API_TROUBLE = {
     "one_asn_only": ({"results": [result(city, 4134, 0) for city, _ in CN]}, "coverage"),
 }
 
+HTTPS_HOST = "203-0-113-7.sslip.io"     # TEST-NET-3 的 sslip.io 名字，不是生产地址
+HTTPS_FLAGS = ("--https-host", HTTPS_HOST)
+HTTPS_QUOTA = "238/250"
+TLS_RESET = "Client network socket disconnected before secure TLS connection was established"
+
+
+def https_result(city: str, asn: int, *, code: int = 200, authorized: bool = True,
+                 certificate: bool = True, status: str = "finished", source: str | None = None,
+                 raw: str = TLS_RESET, country: str = "CN") -> dict:
+    """字段照 spec 的 FinishedHttpTestResult / FailedTestResult。"""
+    probe = result(city, asn, 0, country=country)["probe"]
+    if status != "finished":
+        outcome = {"status": status, "rawOutput": raw}
+        if source is not None:
+            outcome["failureSource"] = source
+        return {"probe": probe, "result": outcome}
+    tls = {"authorized": authorized, "protocol": "TLSv1.3", "cipherName": "TLS_AES_128_GCM_SHA256",
+           "createdAt": "2026-11-06T02:00:00.000Z", "expiresAt": "2027-02-04T02:00:00.000Z",
+           "subject": {"CN": HTTPS_HOST, "alt": f"DNS:{HTTPS_HOST}"},
+           "issuer": {"C": "US", "O": "Let's Encrypt", "CN": "E7"}, "keyType": "EC",
+           "keyBits": 256, "serialNumber": "05:A1", "fingerprint256": "AB:CD", "publicKey": None}
+    if not authorized:
+        tls["error"] = "ERR_TLS_CERT_ALTNAME_INVALID"
+    return {"probe": probe, "result": {
+        "status": "finished", "rawOutput": f"HTTP/1.1 {code}", "rawHeaders": "", "rawBody": "1",
+        "truncated": False, "headers": {}, "statusCode": code, "statusCodeName": "OK",
+        "resolvedAddress": TARGET,
+        "timings": {"total": 1800, "dns": 40, "tcp": 300, "tls": 610, "firstByte": 840,
+                    "download": 1},
+        "tls": tls if certificate else None}}
+
+
+HTTPS_OK = [https_result(city, asn) for city, asn in CN]
+HTTPS_BROKEN = {
+    # 握手到一半被 RST：按 SNI 封域名、DNS 被污染指到别处、droplet → box A 断，探针看到的都是这样
+    "tls_reset": ([https_result(city, asn, status="failed", source="target") for city, asn in CN],
+                  "(连接或 TLS 断了)"),
+    "dns": ([https_result(city, asn, status="failed", source="resolver",
+                          raw=f"getaddrinfo ENOTFOUND {HTTPS_HOST}") for city, asn in CN],
+            "(DNS 解析失败)"),
+    "forbidden": ([https_result(city, asn, code=403) for city, asn in CN], "(HTTP 403)"),
+    "bad_gateway": ([https_result(city, asn, code=502) for city, asn in CN], "(HTTP 502)"),
+    "cert_not_verified": ([https_result(city, asn, authorized=False) for city, asn in CN],
+                          "(证书没验过)"),
+    "no_certificate": ([https_result(city, asn, certificate=False) for city, asn in CN],
+                       "(证书没验过)"),
+}
+
 
 class Globalping:
-    """假 Globalping：POST 回一个新测量 id，GET 先回 in-progress 再回结果；记下每次请求。"""
+    """假 Globalping：POST 回一个新测量 id，GET 先回 in-progress 再回结果；记下每次请求。
+    ping 测量回 results，http 测量回 https；https_create / https_fetch 只管 http 那一次。"""
 
     def __init__(self) -> None:
         self.results = OPEN
+        self.https = HTTPS_OK
         self.create = None          # None = 照常 202；否则原样回这个 Reply
         self.fetch = None
+        self.https_create = None
+        self.https_fetch = None
         self.pending = 1            # 每个测量的前几次 GET 还在 in-progress
         self.serial = 0
         self.polls = 0
+        self.types: dict[int, str] = {}
         self.calls: list[tuple] = []
 
-    def set(self, *, create=None, fetch=None, pending: int = 1, results=None) -> None:
+    def set(self, *, create=None, fetch=None, pending: int = 1, results=None,
+            https_create=None, https_fetch=None, https=None) -> None:
         self.create, self.fetch, self.pending = create, fetch, pending
+        self.https_create, self.https_fetch = https_create, https_fetch
         if results is not None:
             self.results = results
+        if https is not None:
+            self.https = https
 
     def __call__(self, method: str, url: str, body):
         self.calls.append((method, url, copy.deepcopy(body)))
         if method == "POST":
             assert url == f"{china.API}/measurements"
-            if self.create is not None:
-                return china.Reply(*self.create)
+            http = body["type"] == "http"
+            create = self.https_create if http else self.create
+            if create is not None:
+                return china.Reply(*create)
             self.serial += 1
             self.polls = 0
-            return china.Reply(202, {"id": f"m{self.serial}", "probesCount": len(self.results)},
-                               QUOTA, None)
+            self.types[self.serial] = body["type"]
+            return china.Reply(202, {"id": f"m{self.serial}",
+                                     "probesCount": len(self.https if http else self.results)},
+                               HTTPS_QUOTA if http else QUOTA, None)
         assert method == "GET" and body is None
         assert url == f"{china.API}/measurements/m{self.serial}"
-        if self.fetch is not None:
-            return china.Reply(*self.fetch)
+        http = self.types[self.serial] == "http"
+        fetch = self.https_fetch if http else self.fetch
+        if fetch is not None:
+            return china.Reply(*fetch)
+        results = self.https if http else self.results
         self.polls += 1
         if self.polls <= self.pending:
             running = [{"probe": item["probe"], "result": {"status": "in-progress", "rawOutput": ""}}
-                       for item in self.results]
+                       for item in results]
             return china.Reply(200, {"id": f"m{self.serial}", "status": "in-progress",
                                      "results": running}, None, None)
-        return china.Reply(200, {"id": f"m{self.serial}", "type": "ping", "status": "finished",
-                                 "results": copy.deepcopy(self.results)}, None, None)
+        return china.Reply(200, {"id": f"m{self.serial}", "type": self.types[self.serial],
+                                 "status": "finished", "results": copy.deepcopy(results)},
+                           None, None)
 
     def posts(self) -> int:
         return sum(1 for method, _, _ in self.calls if method == "POST")
@@ -163,7 +229,9 @@ class Outbox:
 
 
 def kind_of(payload: dict) -> str:
-    found = [kind for kind, head in china.HEADLINES.items() if head in payload["content"]]
+    heads = {**china.HEADLINES, **{f"https_{kind}": head
+                                   for kind, head in china.HTTPS_HEADLINES.items()}}
+    found = [kind for kind, head in heads.items() if head in payload["content"]]
     assert len(found) == 1, payload["content"]
     return found[0]
 
@@ -180,6 +248,7 @@ class World:
         self.outbox = Outbox()
         self.now = T0
         self.slept: list[float] = []
+        self.flags: tuple[str, ...] = ()        # cron 那一行 --target 之后还带什么
 
     def run(self, *argv: str, advance: bool = True) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -190,10 +259,12 @@ class World:
             self.now += HOUR
         return code, out.getvalue(), err.getvalue()
 
-    def tick(self, results=None) -> dict:
+    def tick(self, results=None, https=None) -> dict:
         if results is not None:
             self.gp.results = results
-        code, out, err = self.run("--target", TARGET)
+        if https is not None:
+            self.gp.https = https
+        code, out, err = self.run("--target", TARGET, *self.flags)
         # cron 那一轮什么都不往 stdout/stderr 写：cron.log 只该收 traceback。
         assert (code, out, err) == (0, "", "")
         return self.state()
@@ -723,6 +794,327 @@ def test_http_errors_keep_their_code_and_a_dead_network_is_named(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# --https-host：同一批探针再 GET 一次 /build-id.txt，抓「TCP 通但 HTTPS 不通」
+# ---------------------------------------------------------------------------
+
+def _gap_run(world, https, rounds: int = 2) -> dict:
+    world.flags = HTTPS_FLAGS
+    for _ in range(rounds):
+        state = world.tick(OPEN, https)
+    return state
+
+
+def test_https_reuses_the_tcp_probes_and_gets_the_static_file_not_health(world):
+    world.flags = HTTPS_FLAGS
+    state = world.tick(OPEN, HTTPS_OK)
+
+    ping, http = [body for method, _, body in world.gp.calls if method == "POST"]
+    assert ping == china.request_body(TARGET)
+    # locations 是 TCP 那次的 id：同一批探针；不打 /health，免得喂绿 box A 上的机外死人开关
+    assert http == {"type": "http", "target": HTTPS_HOST, "locations": "m1",
+                    "measurementOptions": {"protocol": "HTTPS", "port": 443,
+                                           "request": {"method": "GET", "path": "/build-id.txt"}}}
+    assert [url for method, url, _ in world.gp.calls if method == "GET"] == \
+        [f"{china.API}/measurements/m1"] * 2 + [f"{china.API}/measurements/m2"] * 2
+    assert state["status"] == "up" and state["https"]["status"] == "up"
+    assert state["https"]["last_counts"] == {"reached": 6, "probes": 6, "asns": 5, "blocked": []}
+    assert world.outbox.tries == [] and world.keychain.calls == []
+    assert world.log_lines() == [
+        f"{_iso(T0)} UP result=up ok reached=6/6 asns=5 quota={QUOTA} m=m1 https=UP "
+        f"https_result=up ok https_reached=6/6 https_asns=5 https_quota={HTTPS_QUOTA} https_m=m2"]
+
+
+@pytest.mark.parametrize("style", sorted(HTTPS_BROKEN))
+def test_tcp_open_but_https_broken_is_announced_once_with_the_likely_causes(world, style):
+    broken, why = HTTPS_BROKEN[style]
+    state = _gap_run(world, broken, rounds=1)
+    assert state["https"]["candidate"] == "down" and world.outbox.tries == []
+
+    state = world.tick(OPEN, broken)                   # T0+1h 第二轮才报
+
+    assert world.kinds() == ["https_down"]
+    assert state["status"] == "up" and state["candidate"] is None   # TCP 那条线不受影响
+    assert state["https"]["status"] == "down" and state["https"]["since"] == _iso(T0)
+    payload = world.outbox.delivered[0][1]
+    content = payload["content"]
+    assert content.startswith(f"<@{offbox.MENTION}> ")
+    assert "TCP 通但 HTTPS 不通" in content and "0/6 个探针" in content and "5 个 ASN" in content
+    assert f"<https://{HTTPS_HOST}/build-id.txt>" in content and _day(T0) in content
+    assert f"Nanjing AS4134{why}" in content
+    for cause in ("SNI", "DNS", "droplet → box A", "证书"):
+        assert cause in content
+    assert world.log_lines()[-1].endswith(f"https_m=m4 sent=HTTPS_DOWN")
+
+    for _ in range(3):
+        world.tick(OPEN, broken)
+    assert world.kinds() == ["https_down"]
+
+    world.tick(OPEN, HTTPS_OK)
+    state = world.tick(OPEN, HTTPS_OK)                 # 恢复也要连续两轮
+    assert world.kinds() == ["https_down", "https_up"]
+    recovered = world.content(1)
+    assert "6/6 个探针" in recovered and "持续约 5 小时" in recovered and "<@" not in recovered
+    assert state["https"]["status"] == "up" and state["https"]["outage_since"] is None
+
+
+def test_a_mixed_https_set_counts_as_broken_and_names_only_the_failing_probes(world):
+    mixed = [https_result(city, asn) for city, asn in CN[:4]] + [
+        https_result("Shenzhen", 37963, status="failed", source="target"),
+        https_result("Hangzhou", 45090, authorized=False)]
+    _gap_run(world, mixed)
+
+    assert world.kinds() == ["https_down"]
+    content = world.content(0)
+    assert "4/6 个探针" in content
+    assert "不通的:Shenzhen AS37963(连接或 TLS 断了)、Hangzhou AS45090(证书没验过)" in content
+    assert "Nanjing" not in content
+
+
+def test_a_thin_or_partial_https_probe_set_is_unevaluable_and_flips_nothing(world):
+    thin = [https_result("Nanjing", 4134, status="failed", source="target"),
+            https_result("Guangzhou", 4134, status="failed", source="internal"),
+            https_result("Wuhan", 4837, status="offline", raw=""),
+            https_result("Zhenjiang", 9808, status="in-progress", raw=""),
+            https_result("Hong Kong", 4760, status="failed", source="target", country="HK"),
+            {"probe": {"country": "CN", "city": "Nowhere"}, "result": HTTPS_OK[0]["result"]},
+            "not a result"]
+    verdict = china.classify(thin, judge=china._https_outcome)
+    assert (verdict.status, verdict.reason, verdict.probes) == ("unevaluable", "coverage", 1)
+
+    state = _gap_run(world, thin[:-1], rounds=3)
+    assert state["https"]["status"] == "up" and state["https"]["candidate"] is None
+    assert (state["https"]["last_result"], state["https"]["last_reason"]) == \
+        ("unevaluable", "coverage")
+    assert state["https"]["unevaluable_streak"] == 3 and world.outbox.tries == []
+
+
+@pytest.mark.parametrize("shape", ["blocked", "half"])
+def test_https_is_not_judged_when_tcp_itself_is_not_open(world, shape):
+    tcp = {"blocked": BLOCKED, "half": HALF}[shape]
+    world.flags = HTTPS_FLAGS
+    for _ in range(3):
+        state = world.tick(tcp, HTTPS_BROKEN["tls_reset"][0])
+
+    # TCP 自己那条照报；HTTPS 那条不另报（不通是 TCP 不通带的）
+    assert world.kinds() == [{"blocked": "down", "half": "partial"}[shape]]
+    assert state["https"]["status"] == "up" and state["https"]["candidate"] is None
+    reason = {"blocked": "tcp_down", "half": "tcp_partial"}[shape]
+    assert (state["https"]["last_result"], state["https"]["last_reason"]) == \
+        ("unevaluable", reason)
+
+
+HTTPS_API_TROUBLE = {
+    "https_429": ({"https_create": RATE_LIMITED}, "api_429", 2),
+    "https_503": ({"https_create": (503, None, None, None)}, "api_503", 2),
+    "https_fetch_502": ({"https_fetch": (502, None, None, None)}, "api_502", 2),
+    # TCP 那次就 429：没有同一批探针可用，HTTPS 不测、不花额度
+    "tcp_429": ({"create": RATE_LIMITED}, "tcp_unevaluable", 1),
+}
+
+
+@pytest.mark.parametrize("trouble", sorted(HTTPS_API_TROUBLE))
+def test_https_api_trouble_is_unevaluable_and_never_flips_either_way(world, trouble):
+    setup, reason, posts = HTTPS_API_TROUBLE[trouble]
+    world.flags = HTTPS_FLAGS
+    world.tick(OPEN, HTTPS_OK)
+    world.gp.set(**setup)
+    calls = len(world.gp.calls)
+    for _ in range(3):
+        state = world.tick()
+    assert sum(1 for method, *_ in world.gp.calls[calls:] if method == "POST") == 3 * posts
+    assert state["https"]["status"] == "up" and state["https"]["candidate"] is None
+    assert (state["https"]["last_result"], state["https"]["last_reason"]) == \
+        ("unevaluable", reason)
+    assert world.outbox.tries == []
+
+    # 已经报出去的「TCP 通但 HTTPS 不通」也一样：出错的几轮不会被当成「好了」
+    world.gp.set(https=HTTPS_BROKEN["dns"][0])
+    world.tick()
+    world.tick()
+    world.gp.set(**setup)
+    for _ in range(3):
+        state = world.tick()
+    assert state["https"]["status"] == "down" and world.kinds() == ["https_down"]
+    assert state["https"]["unevaluable_streak"] == 3
+
+
+def test_https_follows_the_shared_silence_and_reports_late_from_the_real_start(world):
+    world.silence_until(T0 + 2 * HOUR + 60)
+    state = _gap_run(world, HTTPS_BROKEN["tls_reset"][0], rounds=3)    # T0 … T0+2h 都在窗口里
+    assert state["https"]["status"] == "down" and world.outbox.tries == []
+
+    world.tick(OPEN, HTTPS_BROKEN["tls_reset"][0])                       # 窗口已过：补报
+    assert world.kinds() == ["https_down"] and _day(T0) in world.content(0)
+
+
+def test_tcp_and_https_messages_of_one_round_go_out_tcp_first(world):
+    world.flags = HTTPS_FLAGS
+    world.tick(BLOCKED, HTTPS_OK)
+    world.tick(BLOCKED, HTTPS_OK)                       # TCP 判 down
+    world.tick(OPEN, HTTPS_BROKEN["forbidden"][0])
+    state = world.tick(OPEN, HTTPS_BROKEN["forbidden"][0])   # TCP 恢复，同一轮 HTTPS 判 down
+
+    assert world.kinds() == ["down", "up", "https_down"]
+    assert world.log_lines()[-1].endswith("sent=UP,HTTPS_DOWN")
+    assert state["owed"] == [] and state["https"]["owed"] == []
+
+
+def test_an_undelivered_https_alert_stays_owed_and_a_quiet_recovery_is_combined(world):
+    world.outbox = Outbox(False, False)
+    state = _gap_run(world, HTTPS_BROKEN["dns"][0])
+    assert [m["kind"] for m in state["https"]["owed"]] == ["down"] and state["owed"] == []
+    assert world.log_lines()[-1].endswith("owed=HTTPS_DOWN send_error=http_503")
+
+    world.outbox = Outbox(False, False)
+    world.tick(OPEN, HTTPS_OK)                          # 还是没发出去
+    world.outbox = Outbox()
+    state = world.tick(OPEN, HTTPS_OK)                  # 判 up：合成一条补报
+    assert world.kinds() == ["https_combined"]
+    assert "当时 TCP 通但 HTTPS 不通" in world.content(0) and "没发出去" in world.content(0)
+    assert state["https"]["owed"] == []
+
+
+def test_a_v1_state_from_before_the_flag_loads_and_the_first_https_run_is_quiet(world):
+    for shape in (BLOCKED, BLOCKED, OPEN, OPEN):       # 11-03 装上以后一直这样跑：没有 https
+        world.tick(shape)
+    before = world.state()
+    assert before["version"] == 1 and "https" not in before
+    assert world.kinds() == ["down", "up"]
+
+    world.flags = HTTPS_FLAGS
+    state = world.tick(OPEN, HTTPS_OK)
+
+    assert world.kinds() == ["down", "up"]             # 升级后第一轮什么都不发
+    kept = ("version", "target", "status", "since", "announced", "last_evaluated")
+    assert {key: state[key] for key in kept} == {key: before[key] for key in kept} | {
+        "last_evaluated": _iso(T0 + 4 * HOUR)}
+    assert state["ring"][:-1] == before["ring"] and state["summary_24h"]["runs"] == 5
+    assert state["https"] == {**china.fresh_https(), "target": HTTPS_HOST, "last_result": "up",
+                              "last_reason": "ok",
+                              "last_counts": {"reached": 6, "probes": 6, "asns": 5, "blocked": []}}
+
+
+def test_upgrading_while_https_is_broken_still_waits_for_two_runs(world):
+    world.tick(OPEN)
+    world.tick(OPEN)
+    state = _gap_run(world, HTTPS_BROKEN["cert_not_verified"][0], rounds=1)
+    assert world.outbox.tries == [] and state["https"]["candidate_streak"] == 1
+
+    world.tick(OPEN, HTTPS_BROKEN["cert_not_verified"][0])
+    assert world.kinds() == ["https_down"]
+
+
+def test_without_https_host_everything_is_byte_identical_to_before_the_flag(world, tmp_path):
+    # 摘要是加 --https-host 之前那一版(main c051102)跑同一套剧本得到的。
+    def sha(data) -> str:
+        return hashlib.sha256(data if isinstance(data, bytes) else data.encode("utf-8")).hexdigest()
+
+    for shape in (OPEN, BLOCKED, BLOCKED):
+        world.tick(shape)
+    world.gp.set(create=RATE_LIMITED)
+    world.tick()
+    world.gp.set()
+    for shape in (HALF, HALF, OPEN, OPEN):
+        world.tick(shape)
+    assert "https" not in world.state()
+    assert {body["type"] for method, _, body in world.gp.calls if method == "POST"} == {"ping"}
+    payloads = [payload for _, payload in world.outbox.delivered]
+    _, status, _ = world.run("--status", advance=False)
+    fresh = World(tmp_path / "plan")
+    _, plan, _ = fresh.run("--plan", "--target", TARGET)
+    fresh.gp.results = HALF
+    _, check, _ = fresh.run("--check", "--target", TARGET)
+
+    assert {
+        "state": sha((world.base / "china-state.json").read_bytes()),
+        "log": sha((world.base / "china.log").read_bytes()),
+        "payloads": sha(json.dumps(payloads, ensure_ascii=False, sort_keys=True)),
+        "calls": sha(json.dumps(world.gp.calls, ensure_ascii=False, sort_keys=True)),
+        "status": sha(status.replace(str(world.base), "<base>")),
+        "plan": sha(plan.replace(str(fresh.base), "<base>")),
+        "check": sha(check),
+    } == {
+        "state": "85c102a318e9a5d558d1bf747c5030c5f4e2f4f5c4ab36eb0d9bd4c9f01882df",
+        "log": "99667429e744af743d2957204e615ca39d3e89f6d6d21503d6ed613404a10e96",
+        "payloads": "3d961fdca75f952c9b0d646105c4a4ec1cb70436bff048145209d85490b51c9a",
+        "calls": "4b13b7b0693576c3c571a34fdfbfe773f3ae543424eb2aaa30e9fa16478840ce",
+        "status": "3fdfe9ae89954cfb76211fccc64fca4e74072fa824542e36a4784f3ba702dc19",
+        "plan": "ec0bb77f3c45b26adb43f70f90386c2b521067215eb474fb977720a01c9af4e2",
+        "check": "b83a2f8af58a6d72efc16f85e4068a9dba2c2085517b8b76daf30661a2b3e5b4",
+    }
+
+
+def test_a_broken_https_track_makes_the_whole_state_start_over(world):
+    world.flags = HTTPS_FLAGS
+    world.tick(BLOCKED, HTTPS_OK)
+    path = world.base / "china-state.json"
+    half = world.state()
+    half["https"].update(status="down", announced="down")      # 没有 outage_since
+    path.write_text(json.dumps(half), encoding="utf-8")
+
+    state = world.tick(OPEN, HTTPS_OK)
+    assert len(state["ring"]) == 1 and state["summary_24h"]["down"] == 0
+    assert state["https"]["status"] == "up" and world.outbox.tries == []
+
+
+def test_plan_with_https_host_prints_both_requests_and_the_rules_offline(world):
+    code, out, _ = world.run("--plan", "--target", TARGET, *HTTPS_FLAGS)
+
+    assert code == 0 and world.gp.calls == [] and list(world.base.iterdir()) == []
+    assert json.dumps(china.request_body(TARGET), ensure_ascii=False) in out
+    assert json.dumps(china.https_body(HTTPS_HOST, "<上面那次的 id>"), ensure_ascii=False) in out
+    assert "tls.authorized=true" in out and "TCP 通但 HTTPS 不通" in out
+    assert "每小时 12 个测试" in out
+
+
+def test_check_with_https_host_measures_both_and_writes_nothing(world):
+    world.gp.set(https=HTTPS_BROKEN["dns"][0])
+    code, out, err = world.run("--check", "--target", TARGET, *HTTPS_FLAGS)
+
+    assert code == 0 and err == ""
+    first, second, third = out.splitlines()
+    assert first == f"result=up reason=ok reached=6/6 asns=5 measurement=m1 quota={QUOTA}"
+    assert second == (f"https result=down reason=blocked reached=0/6 asns=5 measurement=m2 "
+                      f"quota={HTTPS_QUOTA} seen=down blocked")
+    assert third.startswith("HTTPS 不通的:Nanjing AS4134(DNS 解析失败)、Guangzhou AS4134")
+    assert world.gp.posts() == 2 and world.outbox.tries == []
+    assert list(world.base.iterdir()) == []
+
+    world.gp.set(https_create=RATE_LIMITED)
+    code, out, _ = world.run("--check", "--target", TARGET, *HTTPS_FLAGS)
+    assert code == 1 and "https result=unevaluable reason=api_429" in out
+
+
+def test_status_shows_the_https_line_only_once_there_is_one(world):
+    world.flags = HTTPS_FLAGS
+    _gap_run(world, HTTPS_BROKEN["forbidden"][0])
+    code, out, _ = world.run("--status", advance=False)
+
+    assert code == 0
+    first, second, third = out.splitlines()
+    assert first.startswith("status=up ") and second.startswith("24h runs=2 ")
+    assert third == (f"https status=down since={_iso(T0)} target={HTTPS_HOST} last_result=down "
+                     f"last_reason=blocked unevaluable_streak=0 owed=0 reached=0/6 asns=5")
+
+
+@pytest.mark.parametrize("argv", [
+    ["--target", TARGET, "--https-host", "203.0.113.7"],
+    ["--target", TARGET, "--https-host", f"https://{HTTPS_HOST}/build-id.txt"],
+    ["--target", TARGET, "--https-host", f"{HTTPS_HOST}:443"],
+    ["--target", TARGET, "--https-host", ""],
+    ["--status", "--https-host", HTTPS_HOST],
+])
+def test_the_https_host_must_be_a_bare_domain(world, capsys, argv):
+    with pytest.raises(SystemExit) as raised:
+        china.main(argv, base=world.base, run=world.keychain, send=world.outbox, api=world.gp,
+                   sleep=world.slept.append, clock=lambda: world.now)
+
+    assert raised.value.code == 2 and world.gp.calls == []
+    expected = "--status 不用 --https-host" if argv[0] == "--status" else "--https-host 要一个域名"
+    assert expected in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # 额度与 IP 切换
 # ---------------------------------------------------------------------------
 
@@ -739,7 +1131,22 @@ def test_the_schedule_fits_the_anonymous_quota_with_margin_and_cites_its_source(
     assert "https://globalping.io/credits" in doc and "X-RateLimit-Remaining" in doc
 
 
+def test_https_doubles_the_tests_per_run_and_still_leaves_a_tenfold_margin(world):
+    world.flags = HTTPS_FLAGS
+    world.tick(OPEN, HTTPS_OK)
+
+    posts = [body for method, _, body in world.gp.calls if method == "POST"]
+    # http 那次复用 TCP 那次的探针：每次测量都是 PROBES 个测试
+    assert [body["locations"] for body in posts] == [[{"country": "CN", "limit": china.PROBES}],
+                                                     "m1"]
+    per_hour = len(posts) * china.PROBES * china.RUNS_PER_HOUR
+    assert per_hour == 12 and per_hour * 10 <= china.ANON_TESTS_PER_HOUR
+    assert "6 × 2 = 12" in china.__doc__ and "12 × 10 = 120 ≤ 250" in china.__doc__
+    assert "2026-11-05 读" in china.__doc__ and "tls.authorized" in china.__doc__
+
+
 def test_the_script_does_not_carry_the_production_host():
-    # IP 切换脚本按原样改写这两种写法；目标从 --target 进来，这份文件切换时不用动。
+    # IP 切换脚本按原样改写这几种写法；目标从 --target、--https-host 进来，这份文件切换时不用动。
     text = (OFFBOX / "nmu_china_probe.py").read_text(encoding="utf-8")
     assert "89-208-253-119" not in text and "89.208.253.119" not in text
+    assert "147-182-176-237" not in text and "147.182.176.237" not in text
