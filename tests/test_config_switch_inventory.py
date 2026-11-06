@@ -1,6 +1,8 @@
 """配置开关清单与代码对账：app/ 与 scripts/ 读的每个环境变量都要在清单里有一行，
-清单里的每一行也都要还有代码在读。读法看不出变量名（拼字符串、传进来的映射）就直接红，
-让人把它改成能对账的写法或者在清单里补上——不能悄悄漏掉。"""
+清单里的每一行也都要还有代码在读。认得出的读法（os.environ.get / [] / in、os.getenv，
+以及函数里赋值绑到 os.environ 的局部名）里变量名解不出来（拼字符串、从别的映射里取）就直接红。
+认不出的读法会悄悄漏掉：模块级 `X = os.environ`、`from os import environ/getenv`、
+形参默认值是 os.environ、小助手调用时不传实参而靠形参默认值。新代码照认得出的写。"""
 from __future__ import annotations
 
 import ast
@@ -13,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 INVENTORY = ROOT / "docs/handover/配置开关清单.md"
 SCANNED = ("app", "scripts")
 _ROW = re.compile(r"^\| `([A-Z][A-Z0-9_]*)` \|", re.M)
+_WHO_DECIDES = re.compile(r"^\| `[A-Z][A-Z0-9_]*` \|[^|]*\|[^|]*\| ([^|]*) \|", re.M)
+_CITED = re.compile(r"（[^）]*(写明|RS \d{4}-\d{2}-\d{2}|放行清单)[^）]*）")
 
 
 def _is_environ(node: ast.AST) -> bool:
@@ -191,6 +195,16 @@ def test_inventory_lists_exactly_the_env_vars_the_code_reads():
     stale = sorted(set(listed) - set(read))
     assert missing == {}, "代码新读了这些变量，清单里还没有"
     assert stale == [], "清单里这些变量已经没有代码在读"
+
+
+def test_who_decides_is_either_cited_or_marked_unwritten():
+    # 「谁定」光写一个人名，等于交接文档替人定了分工；没有出处就只能写「未写明」。
+    cells = _WHO_DECIDES.findall(INVENTORY.read_text(encoding="utf-8"))
+    uncited = [cell for cell in cells
+               if cell != "—" and not cell.startswith("未写明") and not _CITED.search(cell)]
+
+    assert len(cells) == len(_inventory_names())
+    assert uncited == []
 
 
 def test_scanner_sees_the_indirect_read_styles_this_codebase_uses():

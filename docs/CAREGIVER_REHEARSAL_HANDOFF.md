@@ -40,8 +40,8 @@
 | 题内继续、人工“已答对／跳过”、指定题目开始 | `adjudication-chains`、`start-position` 模式 | 保留原题、原录音、题号与裁定理由；跳过不得凭空生成回答或录音 |
 | 手动抢答、自动检测声音停播 | `answer-now`、`voice-barge-in` 模式 | 自动停播检测不保存回答开头；停播后提示重新完整回答；合成声不能证明老人现场声学效果 |
 | 指定起点到完整收尾和场次导出 | 新增 [隔离 HTTP 全链](ISOLATED_WORKFLOW_REHEARSAL.md) | 本机和同 VPS 隔离库验证从第 19 题开始、前 18 题明确跳过、第 19/20 题作答、裁定、锁分、收尾、完成与幂等导出。临时去标识密钥及模拟二次利用许可只在隔离环境使用；业务终态不灌库。该链使用 TestClient，不能称为 20 题全部实际回答或真实浏览器验收 |
-| 手动准备页卸载后由自动带练接手开麦（桌面 WebKit 合成） | 先在 `web/` 跑 `npm ci`，再用装了 Playwright 的解释器跑 `python3 -I harness/webkit_handoff.py --receipt <私有目录中的回执文件>` | 只在本机跑，不进 CI。麦克风换成振荡器流，网络全是桩；非持久上下文的 IndexedDB Blob 探针只记观察。回执写死 `synthetic_only=true`、`actual_iOS_or_WeChat_device_test=false`，不能替代 iPad Safari／微信真机 |
-| 冻结研究数据的机械链 | `python -m harness.quality_release_scale --profile smoke --receipt <私有目录中的回执文件>`；完整规模使用 `--profile full` | 此入口直接建立合成证据后测试 cohort、快照、发布和分页，不证明前面的真实带练；完整规模在已登记并冻结的第 2–8 周合同间轮转，只是机械重复；自动带练协议仍是 draft，不代表八周临床内容或实际录音体积通过 |
+| 手动准备页卸载后由自动带练接手开麦（桌面 WebKit 合成） | 先在 `web/` 跑 `npm ci`，再用装了 Playwright 的解释器跑 `python3 -I harness/webkit_handoff.py --receipt <私有目录中的回执文件>` | 只在本机跑，不进 CI；改了 `web/src` 的录音、outbox 或自动带练执行器之后要重跑。麦克风换成振荡器流，网络全是桩；非持久上下文的 IndexedDB Blob 探针只记观察。回执写死 `synthetic_only=true`、`actual_iOS_or_WeChat_device_test=false`，不能替代 iPad Safari／微信真机 |
+| 冻结研究数据的机械链 | `python -m harness.quality_release_scale --profile smoke --receipt <私有目录中的回执文件>`；完整规模使用 `--profile full` | 此入口直接建立合成证据后测试 cohort、快照、发布和分页，不证明前面的真实带练；完整规模在已登记、`qc_status=frozen` 的第 2–8 周合同间轮转，只是机械重复；冻结只有口头授权、书面双签未补，自动带练协议仍是 draft，不代表八周临床内容或实际录音体积通过 |
 
 场次导出必须核验不可变结果汇总、已锁定现场收尾、研究评分与录音证据；保存导出批次清单和校验值，重复提交同一幂等意图不得生成重复批次。去标识表与受控录音副本分开管理，音频含声纹，不能称为匿名数据。
 

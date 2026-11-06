@@ -11,7 +11,10 @@
 ``web/harness/vite.config.ts`` 把 ``web/harness/`` 构建到仓库外的 0700 临时目录，
 在 127.0.0.1:4179 起静态服务；先在非持久上下文跑一次 IndexedDB 存储探针（只记观察，
 10-23 首个非持久会话就是在这里 Blob 报 UnknownError），再在 0700 私有持久 profile 里
-跑探针和完整交接。只有交接结果决定退出码。
+跑探针和完整交接。存储探针不影响退出码。
+
+退出码：0 交接通过；1 交接失败，或走查页对当前 ``web/src`` 构建不过（代码没跟上，
+不是环境问题）；2 环境不满足，或跑完了但回执没写成。
 
 结论范围：桌面 WebKit 的合成走查，麦克风是振荡器流，网络全是桩。它不证明 iPad Safari、
 微信内置浏览器或真麦克风权限的行为，回执里写死这几项为 false。
@@ -54,7 +57,11 @@ EXPECTED_EVENTS = (
 
 
 class HandoffHarnessError(RuntimeError):
-    """环境不满足（缺依赖、端口被占、构建失败），不是交接本身失败。"""
+    """环境不满足（缺依赖、端口被占），不是交接本身失败。"""
+
+
+class HandoffPageBuildError(RuntimeError):
+    """走查页对当前 web/src 构建不过：web/harness 不进 tsc -b，web/src 改了导出它最先断在这里。"""
 
 
 def handoff_failures(result: Any) -> list[str]:
@@ -142,7 +149,7 @@ def _build_site(site: Path) -> None:
          "--outDir", str(site), "--emptyOutDir", "--logLevel", "error"],
         cwd=WEB, capture_output=True, text=True, timeout=300)
     if built.returncode != 0 or not (site / "index.html").is_file():
-        raise HandoffHarnessError("走查页构建失败：\n" + (built.stderr or built.stdout)[-2000:])
+        raise HandoffPageBuildError((built.stderr or built.stdout)[:2000])
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
@@ -217,12 +224,20 @@ def main(argv: list[str] | None = None) -> int:
             if root.is_relative_to(ROOT):
                 raise HandoffHarnessError("临时目录落进了仓库")
             receipt = run(root)
-        print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
-        if args.receipt:
-            write_receipt(Path(args.receipt), receipt)
+    except HandoffPageBuildError as exc:
+        print(f"走查页对当前 web/src 构建不过，不是环境问题（多半是 web/src 改了导出或接口）：\n{exc}",
+              file=sys.stderr)
+        return 1
     except (HandoffHarnessError, OSError) as exc:
         print(f"环境不满足：{exc}", file=sys.stderr)
         return 2
+    print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+    if args.receipt:
+        try:
+            write_receipt(Path(args.receipt), receipt)
+        except (HandoffHarnessError, OSError) as exc:
+            print(f"走查已跑完（结果见标准输出），回执没写成：{exc}", file=sys.stderr)
+            return 2
     return 0 if receipt["status"] == "passed" else 1
 
 

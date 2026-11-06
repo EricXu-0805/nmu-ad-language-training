@@ -122,3 +122,37 @@ def test_receipt_writer_needs_a_private_directory_and_never_overwrites(tmp_path)
     shared.chmod(0o755)
     with pytest.raises(wk.HandoffHarnessError):
         wk.write_receipt(shared / "webkit-handoff.json", _receipt())
+
+
+def test_page_build_failure_is_not_reported_as_missing_environment(tmp_path, monkeypatch, capsys):
+    # web/harness 不进 tsc -b；web/src 改名导出后最先在这里断，不能读成「环境不满足」。
+    vite = tmp_path / "node_modules/.bin/vite"
+    vite.parent.mkdir(parents=True)
+    vite.touch()
+    monkeypatch.setattr(wk, "WEB", tmp_path)
+    monkeypatch.setattr(wk.subprocess, "run", lambda *_a, **_k: wk.subprocess.CompletedProcess(
+        [], 1, "", '"playOnce" is not exported by "src/audio/player.ts"'))
+    with pytest.raises(wk.HandoffPageBuildError):
+        wk._build_site(tmp_path / "site")
+
+    def broken(_root):
+        raise wk.HandoffPageBuildError('"playOnce" is not exported by "src/audio/player.ts"')
+    monkeypatch.setattr(wk, "run", broken)
+
+    assert wk.main([]) == 1
+    err = capsys.readouterr().err
+    assert "不是环境问题" in err
+    assert "环境不满足" not in err
+
+
+def test_receipt_write_failure_after_a_finished_run_says_so(tmp_path, monkeypatch, capsys):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o755)
+    monkeypatch.setattr(wk, "run", lambda _root: _receipt())
+
+    assert wk.main(["--receipt", str(shared / "webkit-handoff.json")]) == 2
+    out, err = capsys.readouterr()
+    assert '"status": "passed"' in out
+    assert "回执没写成" in err
+    assert "环境不满足" not in err
