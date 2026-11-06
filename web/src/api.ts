@@ -96,6 +96,7 @@ import {
 } from "./console/formalAssessment";
 import {
   parsePatientWithdrawalReceipt,
+  parseSupersededAudioGovernanceRows,
   parseWithdrawnAudioGovernanceRows,
 } from "./console/subjectWithdrawal";
 import {
@@ -781,6 +782,15 @@ export const api = {
       : "";
     return parseWithdrawnAudioGovernanceRows(await req<unknown>(
       "GET", `/governance/withdrawn-audio${query}`, undefined,
+      DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
+    ));
+  },
+  supersededAudioGovernance: async (patientId?: string) => {
+    const query = patientId
+      ? `?${new URLSearchParams({ patient_id: patientId })}`
+      : "";
+    return parseSupersededAudioGovernanceRows(await req<unknown>(
+      "GET", `/governance/superseded-audio${query}`, undefined,
       DEFAULT_REQUEST_TIMEOUT_MS, { noStore: true },
     ));
   },

@@ -1,5 +1,6 @@
 import type {
   PatientWithdrawalReceipt,
+  SupersededAudioGovernanceRow,
   WithdrawalReasonCode,
   WithdrawnAudioGovernanceRow,
 } from "../types";
@@ -105,6 +106,50 @@ export function parseWithdrawnAudioGovernanceRows(
     }
     seen.add(row.raw_audio_id);
     return row as unknown as WithdrawnAudioGovernanceRow;
+  });
+}
+
+export function parseSupersededAudioGovernanceRows(
+  value: unknown,
+): SupersededAudioGovernanceRow[] {
+  if (!Array.isArray(value)) throw new Error("技术作废录音槽列表格式错误");
+  const exactKeys = [
+    "raw_audio_id", "session_id", "patient_id", "marked_by_rule",
+    "last_marked_at", "local_copy_disposal_device_count",
+    "local_copy_disposal_last_at",
+  ].sort();
+  // 两个时间都必须带显式时区,否则 toLocaleString 会把 UTC 当本地时间显示。
+  const zonedTime = (candidate: unknown) => typeof candidate === "string"
+    && /(?:Z|[+-]\d{2}:\d{2})$/.test(candidate);
+  const seen = new Set<string>();
+  return value.map((candidate) => {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new Error("技术作废录音槽行格式错误");
+    }
+    const row = candidate as Record<string, unknown>;
+    const keys = Object.keys(row).sort();
+    if (keys.length !== exactKeys.length
+        || keys.some((key, index) => key !== exactKeys[index])) {
+      throw new Error("技术作废录音槽行字段不完整或包含未知字段");
+    }
+    if (typeof row.raw_audio_id !== "string"
+        || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(row.raw_audio_id)
+        || seen.has(row.raw_audio_id)
+        || typeof row.session_id !== "string" || !row.session_id
+        || typeof row.patient_id !== "string" || !row.patient_id
+        || typeof row.marked_by_rule !== "boolean"
+        || (row.marked_by_rule ? !zonedTime(row.last_marked_at)
+          : row.last_marked_at !== null)
+        || typeof row.local_copy_disposal_device_count !== "number"
+        || !Number.isInteger(row.local_copy_disposal_device_count)
+        || row.local_copy_disposal_device_count < 0
+        || (row.local_copy_disposal_device_count > 0
+          ? !zonedTime(row.local_copy_disposal_last_at)
+          : row.local_copy_disposal_last_at !== null)) {
+      throw new Error("技术作废录音槽行事实不一致");
+    }
+    seen.add(row.raw_audio_id);
+    return row as unknown as SupersededAudioGovernanceRow;
   });
 }
 

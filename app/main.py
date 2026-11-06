@@ -1833,6 +1833,71 @@ def list_withdrawn_audio_governance(
     return projected
 
 
+@app.get("/governance/superseded-audio")
+def list_superseded_audio_governance(
+        request: Request, response: Response, patient_id: str | None = None,
+        s: DBSession = Depends(get_session)):
+    """技术作废的录音槽(255 旧场次未上传槽、257 未登记墓碑):服务端从没收到字节。
+    撤回隔离的行留在撤回列表里——撤回通道删掉的无字节行也是这个形状,但它是撤回不是作废。"""
+    _require_account_identity(
+        request, "读取技术作废录音槽治理列表", roles={"admin"})
+    query = select(AudioAssetRow, TrainSession).join(
+        TrainSession, AudioAssetRow.session_id == TrainSession.session_id,
+    ).where(
+        AudioAssetRow.status == AudioStatus.deleted,
+        AudioAssetRow.withdrawn.is_(False),
+        func.trim(func.coalesce(AudioAssetRow.withdrawal_status, "")) == "",
+    )
+    if patient_id:
+        query = query.where(TrainSession.patient_id == patient_id)
+    rows = [(audio, sess) for audio, sess in s.exec(query.order_by(
+        TrainSession.patient_id,
+        AudioAssetRow.session_id,
+        AudioAssetRow.raw_audio_id,
+    )) if _superseded_orphan_row_shape(audio)]
+    raw_ids = [audio.raw_audio_id for audio, _sess in rows]
+    # 一次取全部作废审计行;归属口径与 _superseded_orphan_marked 相同(summary 含 raw id)。
+    marks = list(s.exec(select(AuditLog.summary, AuditLog.ts).where(
+        AuditLog.action == "audio_capture_superseded"))) if raw_ids else []
+    disposal_by_raw_id = {
+        raw_id: (int(count), latest)
+        for raw_id, count, latest in s.exec(
+            select(
+                AudioLocalCopyDisposalReceipt.raw_audio_id,
+                func.count(AudioLocalCopyDisposalReceipt.id),
+                func.max(AudioLocalCopyDisposalReceipt.reported_at),
+            ).where(AudioLocalCopyDisposalReceipt.raw_audio_id.in_(raw_ids))
+            .group_by(AudioLocalCopyDisposalReceipt.raw_audio_id))
+    } if raw_ids else {}
+
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    projected = []
+    for audio, sess in rows:
+        marked_at = max(
+            (ts for summary, ts in marks if audio.raw_audio_id in summary),
+            default=None)
+        disposal_count, disposal_latest = disposal_by_raw_id.get(
+            audio.raw_audio_id, (0, None))
+        if isinstance(disposal_latest, datetime):
+            disposal_latest = disposal_latest.replace(
+                tzinfo=timezone.utc).isoformat()
+        elif disposal_latest is not None:
+            disposal_latest = f"{disposal_latest}+00:00"
+        projected.append({
+            "raw_audio_id": audio.raw_audio_id,
+            "session_id": audio.session_id,
+            "patient_id": sess.patient_id,
+            "marked_by_rule": marked_at is not None,
+            # 审计 ts 库内是进程本地 naive 时间(不是 UTC),按本地时区换成 UTC 再带偏移。
+            "last_marked_at": (marked_at.astimezone(timezone.utc).isoformat()
+                               if marked_at is not None else None),
+            "local_copy_disposal_device_count": disposal_count,
+            "local_copy_disposal_last_at": disposal_latest,
+        })
+    return projected
+
+
 class CloudProcessingExpectedState(BaseModel):
     """研究者确认时看到的服务器授权快照；所有字段都必须逐项匹配。"""
     model_config = ConfigDict(extra="forbid")

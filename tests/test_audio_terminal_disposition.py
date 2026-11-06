@@ -1,7 +1,7 @@
 """录音终态本地处置与物理删除的 fail-closed 协议。"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -96,13 +96,14 @@ def _pair(client: TestClient, *, device_id: str = "terminal-device-000001") -> d
     return {"X-Device-Capability": response.json()["capability"]}
 
 
-def _admin_client(engine, *, username: str = "terminal-admin") -> TestClient:
+def _admin_client(engine, *, username: str = "terminal-admin",
+                  role: str = "admin") -> TestClient:
     with Session(engine) as session:
         session.add(ResearchUser(
             username=username,
             display_id=username.upper(),
             password_hash=auth.hash_password("password1"),
-            role="admin",
+            role=role,
             created_at=datetime.now(),
         ))
         session.commit()
@@ -1172,3 +1173,102 @@ def test_never_registered_tombstones_are_bounded_by_the_registration_quota(
         assert session.get(AudioAssetRow, "raw-never-registered-q2") is None
         assert len(session.exec(select(AuditLog).where(
             AuditLog.action == "audio_capture_superseded")).all()) == 1
+
+
+_SUPERSEDED_GOVERNANCE_KEYS = sorted([
+    "raw_audio_id", "session_id", "patient_id", "marked_by_rule", "last_marked_at",
+    "local_copy_disposal_device_count", "local_copy_disposal_last_at",
+])
+
+
+def test_governance_lists_superseded_slots_apart_from_withdrawn_audio(
+        disposition_client, monkeypatch):
+    """技术作废的录音槽此前只有审计行可查(255 §二·补、257 §五 5),治理页要单独列出。
+    255 作废的已登记槽与 257 的未登记墓碑都列,规则标记为真;手工修出来的 deleted
+    无字节行也列,但标记为假;撤回隔离的无字节行与有字节的删除行都不进这张表,
+    撤回列表本身一个字节不变。"""
+    client = disposition_client
+    engine = client.test_engine
+    _, new_headers = _superseded_scene(client, monkeypatch)
+    with Session(engine) as session:
+        for row in (
+                AudioAssetRow(raw_audio_id="raw-hand-voided", session_id="S-TWO",
+                              turn_key="SE_胡萝卜#1", status=AudioStatus.deleted,
+                              delete_gate_passed=True),
+                AudioAssetRow(raw_audio_id="raw-withdrawn-no-bytes", session_id="S-TWO",
+                              turn_key="SE_胡萝卜#1", status=AudioStatus.deleted,
+                              delete_gate_passed=True, withdrawn=True,
+                              withdrawal_status="isolated_by_subject_withdrawal"),
+                AudioAssetRow(raw_audio_id="raw-deleted-with-bytes", session_id="S-TWO",
+                              turn_key="SE_胡萝卜#1", status=AudioStatus.deleted,
+                              delete_gate_passed=True, checksum="cd" * 32, byte_count=10,
+                              uploaded_at=datetime.now())):
+            session.add(row)
+        session.commit()
+    admin = _admin_client(engine, username="superseded-gov-admin")
+    denied = [_admin_client(engine, username=f"superseded-gov-{role}", role=role)
+              for role in ("researcher", "data_steward", "caregiver_operator")]
+    try:
+        withdrawn_before = admin.get("/governance/withdrawn-audio")
+        assert withdrawn_before.status_code == 200, withdrawn_before.text
+        assert [row["raw_audio_id"] for row in withdrawn_before.json()] == [
+            "raw-withdrawn-no-bytes"]
+
+        for raw_id in ("raw-orphan-1", "raw-never-registered-1"):
+            voided = client.put("/live/state", headers=new_headers,
+                                json=_orphan_saved(raw_id, session_id="S-ONE"))
+            assert voided.status_code == 410, voided.text
+        confirmed = client.put("/live/state", headers=new_headers, json={
+            "kind": "audioDisposalConfirmed", "payload": {
+                "code": "audio_terminal_disposition", "schemaVersion": 1,
+                "action": "discard_local_copy", "reason": "deleted",
+                "rawAudioId": "raw-orphan-1", "sessionId": "S-ONE", "turnKey": "itm-0001#1",
+                "byteCount": 4321, "checksum": "ab" * 32, "containsDirectIdentifier": False,
+            }})
+        assert confirmed.status_code == 200, confirmed.text
+
+        with Session(engine) as session:
+            audit_count = len(session.exec(select(AuditLog)).all())
+        listing = admin.get("/governance/superseded-audio")
+        assert listing.status_code == 200, listing.text
+        assert listing.headers["cache-control"] == "private, no-store"
+        assert listing.headers["pragma"] == "no-cache"
+        rows = listing.json()
+        assert all(sorted(row) == _SUPERSEDED_GOVERNANCE_KEYS for row in rows), rows
+        assert [row["raw_audio_id"] for row in rows] == [
+            "raw-never-registered-1", "raw-orphan-1", "raw-hand-voided"]
+        tombstone, orphan, hand_made = rows
+        now = datetime.now(timezone.utc)
+        for row in (tombstone, orphan):
+            assert row["session_id"] == "S-ONE" and row["patient_id"] == "P-ONE"
+            assert row["marked_by_rule"] is True
+            # 审计 ts 是本地 naive 时间:换算错了在非 UTC 机器上会差出整小时。
+            marked_at = datetime.fromisoformat(row["last_marked_at"])
+            assert marked_at.utcoffset() == timedelta(0)
+            assert abs(now - marked_at) < timedelta(minutes=5), row
+        assert tombstone["local_copy_disposal_device_count"] == 0
+        assert tombstone["local_copy_disposal_last_at"] is None
+        assert orphan["local_copy_disposal_device_count"] == 1
+        assert datetime.fromisoformat(
+            orphan["local_copy_disposal_last_at"]).utcoffset() == timedelta(0)
+        assert hand_made == {
+            "raw_audio_id": "raw-hand-voided", "session_id": "S-TWO", "patient_id": "P-TWO",
+            "marked_by_rule": False, "last_marked_at": None,
+            "local_copy_disposal_device_count": 0, "local_copy_disposal_last_at": None,
+        }
+        # 与撤回列表同口径:读不记审计。
+        with Session(engine) as session:
+            assert len(session.exec(select(AuditLog)).all()) == audit_count
+
+        filtered = admin.get("/governance/superseded-audio", params={"patient_id": "P-TWO"})
+        assert filtered.status_code == 200, filtered.text
+        assert filtered.json() == [hand_made]
+        withdrawn_after = admin.get("/governance/withdrawn-audio")
+        assert withdrawn_after.status_code == 200
+        assert withdrawn_after.content == withdrawn_before.content
+        for other in denied:
+            assert other.get("/governance/superseded-audio").status_code == 403
+    finally:
+        admin.close()
+        for other in denied:
+            other.close()

@@ -213,6 +213,8 @@ def _logged_in_client(eng, username: str) -> TestClient:
      access_policy.DATA_GOVERNANCE_ROLES),
     ("GET", "/governance/withdrawn-audio", access_policy.AccessKind.ACCOUNT,
      access_policy.ADMIN_ROLES),
+    ("GET", "/governance/superseded-audio", access_policy.AccessKind.ACCOUNT,
+     access_policy.ADMIN_ROLES),
     ("GET", "/content/item-bank-bundle", access_policy.AccessKind.ACCOUNT,
      access_policy.KNOWN_ACCOUNT_ROLES),
     ("HEAD", "/content/week1-script", access_policy.AccessKind.ACCOUNT,

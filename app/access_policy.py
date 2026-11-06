@@ -348,6 +348,8 @@ _ROUTE_RULES = (
            roles=ADMIN_ROLES, label="物理删除录音"),
     _route({"GET", "HEAD"}, r"/governance/withdrawn-audio", AccessKind.ACCOUNT,
            roles=ADMIN_ROLES, label="读取撤回录音治理列表"),
+    _route({"GET", "HEAD"}, r"/governance/superseded-audio", AccessKind.ACCOUNT,
+           roles=ADMIN_ROLES, label="读取技术作废录音槽治理列表"),
 )
 
 

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   newWithdrawalIdempotencyKey,
   parsePatientWithdrawalReceipt,
+  parseSupersededAudioGovernanceRows,
   parseWithdrawnAudioGovernanceRows,
   withdrawalReceiptMatches,
 } from "./subjectWithdrawal.ts";
@@ -75,4 +76,58 @@ test("unknown-result reconciliation accepts only the exact CAS transition", () =
     { ...baseRow, local_copy_disposal_device_count: 1 }]));
   assert.throws(() => parseWithdrawnAudioGovernanceRows([
     { ...baseRow, local_copy_disposal_last_at: "2026-08-08T00:15:00" }]));
+});
+
+test("superseded audio slot list accepts only the exact server projection", () => {
+  const ruleRow = {
+    raw_audio_id: "raw-orphan-1",
+    session_id: "S-ONE",
+    patient_id: "P-001",
+    marked_by_rule: true,
+    last_marked_at: "2026-09-13T06:30:00+00:00",
+    local_copy_disposal_device_count: 1,
+    local_copy_disposal_last_at: "2026-09-13T06:31:00+00:00",
+  };
+  const handRow = {
+    ...ruleRow,
+    raw_audio_id: "raw-hand-voided",
+    marked_by_rule: false,
+    last_marked_at: null,
+    local_copy_disposal_device_count: 0,
+    local_copy_disposal_last_at: null,
+  };
+  const parsed = parseSupersededAudioGovernanceRows([ruleRow, handRow]);
+  assert.deepEqual(parsed.map((row) => row.marked_by_rule), [true, false]);
+  assert.deepEqual(parseSupersededAudioGovernanceRows([]), []);
+  assert.throws(() => parseSupersededAudioGovernanceRows({ rows: [] }));
+  assert.throws(() => parseSupersededAudioGovernanceRows([ruleRow, ruleRow]));
+  // 多一个字段(哪怕是撤回列表里合法的字段)、少一个字段,都拒绝。
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...ruleRow, withdrawn: false }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...ruleRow, asr_text: "不得出现" }]));
+  const missing = { ...ruleRow } as Record<string, unknown>;
+  delete missing.last_marked_at;
+  assert.throws(() => parseSupersededAudioGovernanceRows([missing]));
+  // 规则标记与作废时间必须成对;时间必须带显式时区。
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...ruleRow, last_marked_at: null }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...handRow, last_marked_at: "2026-09-13T06:30:00+00:00" }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...ruleRow, last_marked_at: "2026-09-13T06:30:00" }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...ruleRow, marked_by_rule: "true" }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...ruleRow, local_copy_disposal_last_at: "2026-09-13T06:31:00" }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...ruleRow, local_copy_disposal_last_at: null }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...handRow, local_copy_disposal_last_at: "2026-09-13T06:31:00+00:00" }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...handRow, local_copy_disposal_device_count: -1 }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...handRow, raw_audio_id: "../escape" }]));
+  assert.throws(() => parseSupersededAudioGovernanceRows([
+    { ...handRow, patient_id: "" }]));
 });
