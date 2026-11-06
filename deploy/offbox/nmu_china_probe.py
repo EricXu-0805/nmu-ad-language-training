@@ -238,7 +238,9 @@ def _https_outcome(result) -> tuple[bool | None, str]:
         source = result.get("failureSource")
         if source == "internal":
             return None, ""
-        return False, "(DNS 解析失败)" if source == "resolver" else "(连接或 TLS 断了)"
+        # 探针(src/lib/dns.ts、undici.ts)把 NXDOMAIN、解析到内网地址、DNS 之后各阶段的超时
+        # 都记 target;resolver 只是解析器自己出错或超时。
+        return False, "(DNS 解析失败)" if source == "resolver" else "(连不上、超时或 TLS 断了)"
     code, tls = result.get("statusCode"), result.get("tls")
     if result.get("status") != "finished" or type(code) is not int:
         return None, ""
@@ -542,9 +544,10 @@ def render_https(message: dict) -> tuple[str, bool]:
                  f" · 同一批探针 TCP {PORT} 都连得上"]
         if message["blocked"]:
             lines.append("不通的:" + "、".join(message["blocked"]))
-        lines += ["多半是:「连接或 TLS 断了」= 国内按 SNI 封了这个域名、DNS 被污染指到别处,"
-                  "或 droplet → box A 那一段断了(haproxy 照样接 TCP);「DNS 解析失败」= 国内解析不了"
-                  " sslip.io;「证书没验过」= 证书过期、没签上或被换了;HTTP 403/5xx = box A 上的"
+        lines += ["多半是:「连不上、超时或 TLS 断了」= 国内按 SNI 封了这个域名、国内解析不出 sslip.io"
+                  " 或被污染指到别处、droplet → box A 那一段断了(haproxy 照样接 TCP),或 box A 的"
+                  " Caddy 没有这个地址、证书没签上;「DNS 解析失败」= 探针那边的解析器出错或超时;"
+                  "「证书没验过」= 证书过期、不是受信任的 CA 签的或被换了;HTTP 403/5xx = box A 上的"
                   " Caddy 或应用拒了、坏了。",
                   "状态再变时再发一条,中间不重复提醒。"]
         return "\n".join(lines), message["mention"]

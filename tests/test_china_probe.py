@@ -124,12 +124,17 @@ HTTPS_OK = [https_result(city, asn) for city, asn in CN]
 HTTPS_BROKEN = {
     # 握手到一半被 RST：按 SNI 封域名、DNS 被污染指到别处、droplet → box A 断，探针看到的都是这样
     "tls_reset": ([https_result(city, asn, status="failed", source="target") for city, asn in CN],
-                  "(连接或 TLS 断了)"),
+                  "(连不上、超时或 TLS 断了)"),
+    # 探针把 NXDOMAIN 记成 target，不是 resolver
+    "nxdomain": ([https_result(city, asn, status="failed", source="target",
+                               raw=f"ENOTFOUND {HTTPS_HOST}") for city, asn in CN],
+                 "(连不上、超时或 TLS 断了)"),
     "dns": ([https_result(city, asn, status="failed", source="resolver",
-                          raw=f"getaddrinfo ENOTFOUND {HTTPS_HOST}") for city, asn in CN],
+                          raw=f"queryA ESERVFAIL {HTTPS_HOST}") for city, asn in CN],
             "(DNS 解析失败)"),
     "forbidden": ([https_result(city, asn, code=403) for city, asn in CN], "(HTTP 403)"),
     "bad_gateway": ([https_result(city, asn, code=502) for city, asn in CN], "(HTTP 502)"),
+    "redirect": ([https_result(city, asn, code=301) for city, asn in CN], "(HTTP 301)"),
     "cert_not_verified": ([https_result(city, asn, authorized=False) for city, asn in CN],
                           "(证书没验过)"),
     "no_certificate": ([https_result(city, asn, certificate=False) for city, asn in CN],
@@ -841,7 +846,7 @@ def test_tcp_open_but_https_broken_is_announced_once_with_the_likely_causes(worl
     assert "TCP 通但 HTTPS 不通" in content and "0/6 个探针" in content and "5 个 ASN" in content
     assert f"<https://{HTTPS_HOST}/build-id.txt>" in content and _day(T0) in content
     assert f"Nanjing AS4134{why}" in content
-    for cause in ("SNI", "DNS", "droplet → box A", "证书"):
+    for cause in ("SNI", "DNS", "droplet → box A", "证书", "Caddy 没有这个地址", "解析器出错或超时"):
         assert cause in content
     assert world.log_lines()[-1].endswith(f"https_m=m4 sent=HTTPS_DOWN")
 
@@ -858,15 +863,17 @@ def test_tcp_open_but_https_broken_is_announced_once_with_the_likely_causes(worl
 
 
 def test_a_mixed_https_set_counts_as_broken_and_names_only_the_failing_probes(world):
-    mixed = [https_result(city, asn) for city, asn in CN[:4]] + [
+    mixed = [https_result(city, asn) for city, asn in CN[:3]] + [
+        https_result("Zhenjiang", 9808, status="failed"),      # 没给 failureSource：算不通
         https_result("Shenzhen", 37963, status="failed", source="target"),
         https_result("Hangzhou", 45090, authorized=False)]
     _gap_run(world, mixed)
 
     assert world.kinds() == ["https_down"]
     content = world.content(0)
-    assert "4/6 个探针" in content
-    assert "不通的:Shenzhen AS37963(连接或 TLS 断了)、Hangzhou AS45090(证书没验过)" in content
+    assert "3/6 个探针" in content
+    assert ("不通的:Zhenjiang AS9808(连不上、超时或 TLS 断了)、"
+            "Shenzhen AS37963(连不上、超时或 TLS 断了)、Hangzhou AS45090(证书没验过)") in content
     assert "Nanjing" not in content
 
 

@@ -306,7 +306,7 @@ crontab 里加不加由 Eric 定。
 | 项 | 取值 |
 | --- | --- |
 | 一轮怎么判 | 一次 Globalping 测量(ping、TCP 443、3 个包、country=CN、6 个探针),只送 `--target`;算数的探针 ≥4 个、分属 ≥2 个 ASN 才下结论:全通 up,全不通 down,其余 partial |
-| HTTPS(`--https-host`) | TCP 那次建成就再测一次 http:protocol=HTTPS、GET `/build-id.txt`,`locations` 填 TCP 那次的测量 id(同一批探针);每个探针要 HTTP 200 且 `tls.authorized=true`。这一轮 TCP 是 up 才算数:全通 up,有不通的就是「TCP 通但 HTTPS 不通」,消息里写每个探针不通的原因(连接或 TLS 断了 / DNS 解析失败 / 证书没验过 / HTTP 4xx·5xx)和对应的可能原因 |
+| HTTPS(`--https-host`) | TCP 那次建成就再测一次 http:protocol=HTTPS、GET `/build-id.txt`,`locations` 填 TCP 那次的测量 id(同一批探针);每个探针要 HTTP 200 且 `tls.authorized=true`。这一轮 TCP 是 up 才算数:全通 up,有不通的就是「TCP 通但 HTTPS 不通」,消息里写每个探针不通的原因(连不上、超时或 TLS 断了 / DNS 解析失败 / 证书没验过 / HTTP 码不是 200)和对应的可能原因 |
 | 为什么不打 `/health` | PROXY protocol 上线前,经 droplet 来的请求在 box A 上都是 `147.182.176.237`;`nmu-backup-health` 的机外死人开关数的正是这个 IP 的 `GET /health`,国内探针打它会把开关喂绿。`/build-id.txt` 是静态文件,发布的空闲闸本来就不数它 |
 | 何时报 | 新结论连续 2 轮(1-2 小时)才改状态;改到 down 或 partial 报一次,比上次报的更坏才 @Eric;回到 up 报一次,带中断时长;中间不重复。HTTPS 那条线同样规则、自己一份状态(`china-state.json` 的 `https`),同一轮 TCP 的消息先发 |
 | 不算数的 | Globalping 回 429/4xx/5xx、连不上、90 秒没测完、算数的探针不够:记 `unevaluable`,不改状态,不据此报新状态;之前已确认、因静默没报的那条照样补报。HTTPS 那次也一样,TCP 那一轮不是 up 时 HTTPS 那条线也记 `unevaluable` |
