@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:e195881d-c914-e87d-9c5d-38edd46f4c43",
+  "serialNumber": "urn:uuid:c5959ee9-3d00-140f-6502-80c389727441",
   "version": 1,
   "metadata": {
     "component": {
@@ -9666,9 +9666,9 @@
     {
       "type": "operating-system",
       "name": "zlib",
-      "version": "1.3.2-r1",
-      "purl": "pkg:apk/alpine/zlib@1.3.2-r1",
-      "bom-ref": "pkg:apk/alpine/zlib@1.3.2-r1"
+      "version": "1.4-r0",
+      "purl": "pkg:apk/alpine/zlib@1.4-r0",
+      "bom-ref": "pkg:apk/alpine/zlib@1.4-r0"
     }
   ]
 }
