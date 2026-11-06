@@ -4,6 +4,9 @@
 Uses only temporary files and loopback listeners. An explicit temporary cert is
 trusted by this client alone; ACME, OCSP, redirects, admin and trust installation
 are disabled. Run on Linux in CI against the exact scanned release binary.
+
+The listener also carries box A's PROXY protocol snippet, with 127.0.0.1 standing
+in for the China entry droplet; a second loopback source plays everyone else.
 """
 from __future__ import annotations
 
@@ -18,10 +21,17 @@ import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+PROXY_SNIPPET = Path("deploy/offbox/cn_entry/boxa-caddy-global.snippet")
+DROPLET_ALLOW = "allow 147.182.176.237/32"
+# TEST-NET-1: an address no real client or upstream log can ever contain.
+HEADER_SOURCE = "192.0.2.10"
 
 
 class SmokeError(RuntimeError):
@@ -89,18 +99,49 @@ class EchoHandler(BaseHTTPRequestHandler):
 class LoopbackHTTPS(client.HTTPSConnection):
     """Fixed IP transport with localhost SNI/cert verification, without DNS."""
 
+    def __init__(self, *args, source: str | None = None, proxy_header: bytes = b"", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.source, self.proxy_header = source, proxy_header
+
     def connect(self):
-        transport = socket.create_connection(("127.0.0.1", self.port), self.timeout)
+        target = "::1" if self.source and ":" in self.source else "127.0.0.1"
+        transport = socket.create_connection((target, self.port), self.timeout,
+                                             source_address=(self.source, 0) if self.source else None)
         try:
+            transport.sendall(self.proxy_header)
             self.sock = self._context.wrap_socket(transport, server_hostname="localhost")
         except BaseException:
             transport.close()
             raise
 
 
+def proxy_v2_header(port: int) -> bytes:
+    """PROXY protocol v2, PROXY command, TCP over IPv4, no TLVs."""
+    return (b"\r\n\r\n\x00\r\nQUIT\n" + bytes((0x21, 0x11)) + struct.pack("!H", 12)
+            + socket.inet_aton(HEADER_SOURCE) + socket.inet_aton("127.0.0.1")
+            + struct.pack("!HH", 40000, port))
+
+
+def second_loopback() -> str | None:
+    """A loopback source outside the fixture's PROXY allow list (127.0.0.1/32)."""
+    # Linux puts all of 127/8 on lo; CI must never fall through to a skip.
+    if sys.platform.startswith("linux"):
+        return "127.0.0.2"
+    for address, family in (("127.0.0.2", socket.AF_INET), ("::1", socket.AF_INET6)):
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind((address, 0))
+            except OSError:
+                continue
+        return address
+    return None
+
+
 def request(port: int, context: ssl.SSLContext, method: str, path: str,
-            body: bytes = b"", *, forged_forwarded_for: bool = False):
-    connection = LoopbackHTTPS("localhost", port, timeout=5, context=context)
+            body: bytes = b"", *, forged_forwarded_for: bool = False,
+            source: str | None = None, proxy_header: bytes = b""):
+    connection = LoopbackHTTPS("localhost", port, timeout=5, context=context,
+                               source=source, proxy_header=proxy_header)
     headers = {"Host": f"localhost:{port}", "Connection": "close",
                "Content-Type": "application/octet-stream"}
     if forged_forwarded_for:
@@ -115,19 +156,24 @@ def request(port: int, context: ssl.SSLContext, method: str, path: str,
         connection.close()
 
 
-def make_config(source: str, upstream_port: int, certificate: Path, key: Path) -> str:
+def make_config(source: str, upstream_port: int, certificate: Path, key: Path,
+                snippet: str, https_port: int, binds: list[str]) -> str:
     # Keep every production route, matcher, body limit and header unchanged.
     # Only substitute the upstream and add transport-only fixture directives.
     require(source.count("reverse_proxy app:8000") == 1, "repository_upstream_shape_changed")
     require(source.count("{$SITE_ADDRESS} {") == 1, "repository_site_shape_changed")
+    require(snippet.count("servers :443 {") == 1 and snippet.count(DROPLET_ALLOW) == 1,
+            "proxy_snippet_shape_changed")
+    snippet = snippet.replace("servers :443 {", f"servers 127.0.0.1:{https_port} {{")
+    snippet = snippet.replace(DROPLET_ALLOW, "allow 127.0.0.1/32")
     source = source.replace("reverse_proxy app:8000", f"reverse_proxy 127.0.0.1:{upstream_port}")
-    source = source.replace("{$SITE_ADDRESS} {", "{$SITE_ADDRESS} {\n\tbind 127.0.0.1\n"
+    source = source.replace("{$SITE_ADDRESS} {", "{$SITE_ADDRESS} {\n\tbind " + " ".join(binds) + "\n"
                             f"\ttls {json.dumps(str(certificate))} {json.dumps(str(key))}")
     return ("{\n\tadmin off\n\tauto_https off\n\tpersist_config off\n"
-            "\tskip_install_trust\n\tocsp_stapling off\n}\n" + source)
+            "\tskip_install_trust\n\tocsp_stapling off\n" + snippet + "}\n" + source)
 
 
-def validate_local_config(document: dict, https_port: int, upstream_port: int,
+def validate_local_config(document: dict, listen: list[str], upstream_port: int,
                           certificate: Path, key: Path) -> None:
     """Fail before launching if adaptation enables an extra listener or issuer."""
     require(document.get("admin", {}).get("disabled") is True, "fixture_admin_not_disabled")
@@ -138,7 +184,10 @@ def validate_local_config(document: dict, https_port: int, upstream_port: int,
     servers = apps.get("http", {}).get("servers", {})
     require(len(servers) == 1, "fixture_listener_count_invalid")
     server = next(iter(servers.values()))
-    require(server.get("listen") == [f"127.0.0.1:{https_port}"], "fixture_listener_not_loopback")
+    require(server.get("listen") == listen, "fixture_listener_not_loopback")
+    wrappers = server.get("listener_wrappers", [])
+    require([wrapper.get("wrapper") for wrapper in wrappers] == ["proxy_protocol", "tls"]
+            and wrappers[0].get("allow") == ["127.0.0.1/32"], "fixture_proxy_protocol_not_before_tls")
     require(server.get("automatic_https", {}).get("disable") is True, "fixture_automatic_https_enabled")
     tls = apps.get("tls", {})
     require(tls.get("disable_ocsp_stapling") is True, "fixture_ocsp_not_disabled")
@@ -167,6 +216,22 @@ def validate_local_config(document: dict, https_port: int, upstream_port: int,
             "fixture_upstream_not_loopback")
 
 
+def check_box_a_listener(binary: Path, snippet: str, environment: dict[str, str], work: Path) -> None:
+    """Box A's sites have no bind and http_port 8081: the snippet must hit their ':443'."""
+    config = work / "box-a-shape.Caddyfile"
+    config.write_text("{\n\thttp_port 8081\n\tauto_https disable_redirects\n" + snippet + "}\n"
+                      "box-a.example, cn-entry.example {\n\treverse_proxy 127.0.0.1:8000\n}\n")
+    adapted = subprocess.run([str(binary), "adapt", "--adapter", "caddyfile", "--config", str(config)],
+                             env=environment, cwd=work, capture_output=True, text=True,
+                             check=True, timeout=15)
+    servers = json.loads(adapted.stdout).get("apps", {}).get("http", {}).get("servers", {})
+    require([server.get("listen") for server in servers.values()] == [[":443"]],
+            "box_a_shape_listener_changed")
+    wrappers = next(iter(servers.values())).get("listener_wrappers", [])
+    require([wrapper.get("wrapper") for wrapper in wrappers] == ["proxy_protocol", "tls"]
+            and wrappers[0].get("allow") == ["147.182.176.237/32"], "proxy_snippet_misses_box_a_listener")
+
+
 def stop_child(process: subprocess.Popen | None) -> None:
     if process is None:
         return
@@ -189,7 +254,11 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
     openssl = shutil.which("openssl")
     require(openssl is not None, "openssl_missing")
     source_bytes = (source_root / "Caddyfile").read_bytes()
+    snippet = (source_root / PROXY_SNIPPET).read_text()
+    other = second_loopback()
+    binds = ["127.0.0.1", "::1"] if other == "::1" else ["127.0.0.1"]
     results: list[str] = []
+    skipped: list[str] = []
     with tempfile.TemporaryDirectory(prefix="nmu-caddy-https-smoke-") as temporary:
         work = Path(temporary)
         certificate, key = work / "localhost.crt", work / "localhost.key"
@@ -220,12 +289,16 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
                 https_port = reservation.getsockname()[1]
                 environment["SITE_ADDRESS"] = f"https://localhost:{https_port}"
                 config = work / "Caddyfile"
-                config.write_text(make_config(source_bytes.decode(), upstream.server_port, certificate, key))
+                config.write_text(make_config(source_bytes.decode(), upstream.server_port, certificate, key,
+                                              snippet, https_port, binds))
                 adapted = subprocess.run([str(binary), "adapt", "--adapter", "caddyfile", "--config", str(config)],
                                          env=environment, cwd=work, capture_output=True, text=True,
                                          check=True, timeout=15)
                 document = json.loads(adapted.stdout)
-                validate_local_config(document, https_port, upstream.server_port, certificate, key)
+                listen = [f"127.0.0.1:{https_port}"] + ([f"[::1]:{https_port}"] if other == "::1" else [])
+                validate_local_config(document, listen, upstream.server_port, certificate, key)
+                check_box_a_listener(binary, snippet, environment, work)
+                results.append("proxy_snippet_lands_on_box_a_listener")
                 runtime_config = work / "caddy.json"
                 runtime_config.write_text(json.dumps(document))
             # The reserved loopback port is released immediately before startup.
@@ -296,6 +369,33 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
                 require(echoed["body_bytes"] == len(large) and echoed["body_sha256"] == hashlib.sha256(large).hexdigest(),
                         "canonical_audio_body_not_preserved")
                 results.append("canonical_audio_put_over_256kib_reaches_upstream")
+                header = proxy_v2_header(https_port)
+                response = request(https_port, context, "GET", "/smoke-proxy-header", proxy_header=header)
+                require(response[0] == 200 and json.loads(response[2])["forwarded_for"] == HEADER_SOURCE,
+                        "allowed_proxy_header_address_not_used")
+                response = request(https_port, context, "GET", "/smoke-proxy-absent")
+                require(response[0] == 200 and json.loads(response[2])["forwarded_for"] == "127.0.0.1",
+                        "allowed_source_without_header_broken")
+                results.extend(("allowed_proxy_header_address_reaches_upstream",
+                                "allowed_source_without_header_uses_peer_address"))
+                if other is None:
+                    skipped.append("non_allowed_source_cases: no second loopback address (127.0.0.2 or ::1)")
+                else:
+                    try:
+                        request(https_port, context, "GET", "/smoke-proxy-spoofed",
+                                source=other, proxy_header=header)
+                    except (OSError, client.HTTPException):
+                        pass
+                    else:
+                        raise SmokeError("non_allowed_proxy_header_accepted")
+                    response = request(https_port, context, "GET", "/smoke-proxy-direct", source=other)
+                    require(response[0] == 200 and json.loads(response[2])["forwarded_for"] == other,
+                            "non_allowed_source_without_header_broken")
+                    results.extend(("non_allowed_proxy_header_connection_refused",
+                                    "non_allowed_source_without_header_unchanged"))
+                with upstream.records_lock:
+                    spoofed = [row["path"] for row in upstream.completed if row["forwarded_for"] == HEADER_SOURCE]
+                require(spoofed == ["/smoke-proxy-header"], "proxy_header_address_reached_upstream_unexpectedly")
                 require(process.poll() is None, "caddy_exited_during_smoke")
         except Exception as error:
             detail = log_path.read_text(errors="replace")[-8000:] if log_path.exists() else ""
@@ -312,7 +412,7 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
                 worker.join(timeout=5)
     require(hashlib.sha256(binary.read_bytes()).hexdigest() == binary_hash, "binary_changed_during_smoke")
     return {"schema_version": "nmu.caddy-https-smoke.v1", "status": "pass", "checks": results,
-            "binary_sha256": binary_hash,
+            "skipped": skipped, "binary_sha256": binary_hash,
             "source_caddyfile_sha256": hashlib.sha256(source_bytes).hexdigest(),
             "scope": "temporary_loopback_only", "system_trust_modified": False}
 

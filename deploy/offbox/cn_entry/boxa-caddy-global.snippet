@@ -1,0 +1,12 @@
+	# 国内入口:只认 droplet 发来的 PROXY v2 头;它不带头(纽约探针直连)照旧用 droplet 地址,
+	# 别的来源带头直接断,不带头不受影响。proxy_protocol 必须在 tls 前面(头在 TLS 外面)。
+	servers :443 {
+		listener_wrappers {
+			proxy_protocol {
+				allow 147.182.176.237/32
+				fallback_policy reject
+				timeout 5s
+			}
+			tls
+		}
+	}

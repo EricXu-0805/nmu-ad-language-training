@@ -602,8 +602,10 @@ Python 环境，本机缓存不足时仍可能访问包源。脚本本身不会�
 CSP `connect-src 'self'`——应用本身的迁移工作量在配置、数据搬运和出网依赖的替代上。
 运维文件不在此列：`89.208.253.119`/`sslip.io` 写死在 `deploy/systemd/nmu-health.service`（公网探针
 URL）、`deploy/offbox/nmu_offbox_probe.py`、`deploy/offbox/install_offbox_probe.sh`、
-`deploy/maintenance/kernel_netplan_window.sh` 和测试 `tests/test_offbox_probe.py` 里，另有文档；
-换地址时这几份要跟着改。以下清单来自 2026-08-07 的逐文件可移植性盘点。
+`deploy/maintenance/kernel_netplan_window.sh`、`deploy/offbox/cn_entry/haproxy.cfg`、
+`deploy/offbox/cn_entry/install_cn_entry.sh` 和测试 `tests/test_offbox_probe.py`、`tests/test_cn_entry.py`
+里，另有文档；国内入口那一跳还写死了 droplet 的 `147.182.176.237`（`deploy/offbox/cn_entry/` 与
+`scripts/smoke_caddy_release.py`，见 `deploy/systemd/README.md` 的 China entry 一节）。换地址时这几份要跟着改。以下清单来自 2026-08-07 的逐文件可移植性盘点。
 
 ### 13.1 出网白名单
 
