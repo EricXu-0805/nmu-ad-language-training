@@ -215,6 +215,18 @@ export interface WithdrawnAudioGovernanceRow {
   local_copy_disposal_last_at: string | null;
 }
 
+// 技术作废的录音槽(收据 255/257):服务端从没收到字节,不是撤回。
+// marked_by_rule=有 audio_capture_superseded 审计;为假即手工修数据修出来的行。
+export interface SupersededAudioGovernanceRow {
+  raw_audio_id: string;
+  session_id: string;
+  patient_id: string;
+  marked_by_rule: boolean;
+  last_marked_at: string | null;
+  local_copy_disposal_device_count: number;
+  local_copy_disposal_last_at: string | null;
+}
+
 // 账号认证(M1-D 公网部署)。绝不携带任何凭据,只表明该显示哪种门。
 export interface AuthConfig {
   auth_required: boolean;     // 认证是否生效(回环开发可为 false → 全开)
