@@ -28,8 +28,10 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 # libuuid 来自 util-linux；2026-09-05 的 2.42.3-r1 包含本次镜像扫描命中的七项
 # util-linux HIGH 修复（r0 修复六项，r1 补上 CVE-2026-78408）。不豁免底座旧包。
 # zlib 1.3.2-r1 修 CVE-2026-85091（gz_vacate 堆溢出，HIGH）：11-06 镜像扫描命中，底座带的是 r0。
+# 同日 18:22 UTC Alpine 3.24 换上 1.4-r0（修 CVE-2026-4738，so:libz.so.1 不变），1.3.2-r1 随即下架，
+# 旧钉版让 apk 选包失败（exit 4），所以跟到 1.4-r0。
 # 官方修复记录：https://secdb.alpinelinux.org/v3.24/main.json
-RUN apk add --no-cache bash=5.3.9-r1 libcrypto3=3.5.9-r0 libssl3=3.5.9-r0 libuuid=2.42.3-r1 zlib=1.3.2-r1
+RUN apk add --no-cache bash=5.3.9-r1 libcrypto3=3.5.9-r0 libssl3=3.5.9-r0 libuuid=2.42.3-r1 zlib=1.4-r0
 
 # 云端为主：默认只装核心运行依赖(不含 pytest/piper)。要本地神经兜底音色可另装 piper。
 COPY requirements-deploy.txt requirements-deploy.lock.txt ./
