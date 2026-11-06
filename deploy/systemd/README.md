@@ -269,11 +269,13 @@ allow 里 = 有头用头、没头用对端地址;在 deny 里或落到 `fallback
 顺序,两头都要对:
 
 1. 先改 box A:加 snippet、reload、核过。haproxy 这时还不带头,droplet 的连接按「没带头」照常接。
-2. 再在 Mac 上跑 `install_cn_entry.sh`。预检从 droplet 直连 box A,发一个源地址是 TEST-NET-1 的 v2 头,
-   走 TLS(验证书)打 `/build-id.txt`,不是 200 就停,haproxy 不动;过了才换配置、`systemctl reload`
-   (不 restart)、经 droplet 自己的公网 IP 核对,不通自动还原。
+2. 再在 Mac 上跑 `install_cn_entry.sh`。预检先经 droplet 自己的公网 IP 打一次 `/build-id.txt` 当基线,
+   再从 droplet 直连 box A,发一个源地址是 TEST-NET-1 的 v2 头,走 TLS(验证书)打 `/build-id.txt`,
+   哪个不是 200 就停,haproxy 不动;过了才换配置、`systemctl reload`(不 restart)、等 haproxy 从
+   reloading 落定成 active、经 droplet 核对,不通自动还原。
 3. 回滚反过来:先 `--rollback` 写回 11-03 那份,再去 box A 删 snippet。先删 snippet 的话 haproxy 还在
-   发头,box A 把头当成 TLS 数据,国内入口当场全断。
+   发头,box A 把头当成 TLS 数据,国内入口当场全断。只有 `--rollback` 打印「现在可以去 box A 删 snippet」
+   才删:文件已经是 11-03 那份时它照样 reload、核对一遍,reload 失败会把文件换回仓库那份,跟跑着的一致。
 
 ```bash
 bash deploy/offbox/cn_entry/install_cn_entry.sh --plan        # 只列步骤和顺序,不连机器
@@ -283,17 +285,23 @@ bash deploy/offbox/cn_entry/install_cn_entry.sh --verify      # 只读核对
 bash deploy/offbox/cn_entry/install_cn_entry.sh --rollback    # 先回滚这里,再去 box A 删 snippet
 ```
 
-预检认的「11-03 那份」是简报里的配置去掉注释、压掉多余空白之后的样子;装着的那份原样的 sha256
-当时没记,预检会打印出来。
+预检认的「11-03 那份」是 11-03 手装时记下的指令(注释行当时没记),原文就是 `install_cn_entry.sh`
+里 `PRE_PROXY` 那段;比的时候去掉注释、压掉多余空白。装着的那份原样的 sha256 当时没记,预检会打印出来。
 
 它的边界:
 
 - box A 的 Caddyfile 不在仓库里,`servers :443` 只在站点不写 `bind`、HTTPS 端口用默认 443 时对得上;
   那份改了监听写法要重核。
-- 只管 TCP。HTTP/3 走 UDP,不经过 haproxy。reload 之前已经建立的连接(最长 10 分钟)仍不带头,照旧算 droplet。
+- 只管 TCP。HTTP/3 走 UDP,不经过 haproxy。reload 之前建立的连接在断开之前仍不带头,照旧算 droplet
+  (空闲 10 分钟会断,一直在用的可能更久;没设 `hard-stop-after`)。
 - 纽约探针仍从 droplet 直连 box A、不带头,`--offbox-source 147.182.176.237` 从此只数得到它和 droplet
   上别的直连。
-- 两个 IP 写在 `deploy/offbox/cn_entry/` 的三份文件和 `scripts/smoke_caddy_release.py` 里,IP 切换脚本的清单要加上。
+- `allow 147.182.176.237/32` 信的是 openclaw-prod 上的每一个进程,不只是 haproxy:OpenClaw 的 agent、
+  cron,任何能在那台机器上连 box A:443 的东西都能在头里填任意源地址,绕开按 IP 的限速、PIN 锁定,
+  也能把某个医生的地址锁死。改之前整台 droplet 只占一个 IP 桶;从此那台机器被拿下,这层限速就失效。
+- box A 的 89.208.253.119 写在 `deploy/offbox/cn_entry/haproxy.cfg`、`install_cn_entry.sh` 和
+  `tests/test_cn_entry.py` 里;droplet 的 147.182.176.237 除这三份外还写在 `boxa-caddy-global.snippet`
+  和 `scripts/smoke_caddy_release.py` 里(smoke 只有 droplet 的地址)。IP 切换脚本的清单要加上。
 
 ## 异地探针(2026-10 起,跑在 OpenClaw VPS 上)
 

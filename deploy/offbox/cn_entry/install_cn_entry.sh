@@ -32,10 +32,10 @@ RSH() { ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" "$@"; }
 
 describe() {
   case "$1" in
-    0) echo "  0 只读预检:主机、sudo -n、haproxy 在跑、${CFG} 是 11-03 那份(去掉注释比)、ufw 放行 443、从 droplet 直连 box A 发 PROXY v2 头打 /build-id.txt 应 200(box A 没准备好就停)" ;;
+    0) echo "  0 只读预检:主机、sudo -n、haproxy 在跑、${CFG} 是 11-03 那份(去掉注释比)、ufw 放行 443、经 droplet 打 /build-id.txt 应 200(换之前的基线)、从 droplet 直连 box A 发 PROXY v2 头打 /build-id.txt 应 200(box A 没准备好就停)" ;;
     1) echo "  1 换配置:备份 ${CFG}.before-cn-proxy-<时间>,haproxy -c 过了才换上,systemctl reload(不 restart),经 droplet 自己的公网 IP 打 /build-id.txt 应 200;不对就还原备份再 reload" ;;
     2) echo "  2 只读核对:haproxy 在跑、${CFG} 是哪一份、经 droplet 打 /build-id.txt、box A 认不认 droplet 发的 PROXY v2 头" ;;
-    3) echo "  3 回滚:写回 11-03 那份(没有 send-proxy-v2),haproxy -c、reload、经 droplet 打 /build-id.txt 应 200" ;;
+    3) echo "  3 回滚:写回 11-03 那份(没有 send-proxy-v2;已经是它就不重写),haproxy -c、reload、经 droplet 打 /build-id.txt 应 200" ;;
   esac
 }
 
@@ -138,6 +138,14 @@ via_droplet() {
   done
   echo "${code:-000}"
 }
+# Type=notify 的 haproxy reload 前后会短暂报 reloading:等它落定再判,最多约 10 秒。结果在 state 里。
+settle() {
+  local i
+  for i in 1 2 3 4 5; do
+    state="$(systemctl is-active haproxy 2>/dev/null)" || true
+    case "$state" in reloading|activating) sleep 2 ;; *) return 0 ;; esac
+  done
+}
 # 从 droplet 直连 box A,先发 PROXY v2 头再走 TLS(验证书)打 /build-id.txt:haproxy 换上之后每条连接都是这样。
 ready() {
   /usr/bin/python3 -I - "$boxa" "$boxa_port" "$sni" "$droplet" <<'READY'
@@ -210,6 +218,8 @@ case "$mode" in
     else
       fail "ufw 不是 active 或没有放行 443/tcp 的规则:"; sed 's/^/    /' "$work/ufw"
     fi
+    code="$(via_droplet)"
+    if [ "$code" = 200 ]; then note "经 droplet 打 /build-id.txt = 200(换配置之前的基线)"; else fail "换配置之前经 droplet 打 /build-id.txt 就是 ${code},先查这个"; fi
     if out="$(ready)"; then
       note "box A 认 droplet 发的 PROXY v2 头(TEST-NET-1 源地址、SNI ${sni}、证书已验):${out}"
     else
@@ -226,20 +236,30 @@ case "$mode" in
     restore() {
       echo "  ✗ $1:从 ${backup} 还原、reload"
       sudo -n cp -p "$backup" "$cfg"
-      sudo -n systemctl reload haproxy || true
+      reloaded=yes
+      sudo -n systemctl reload haproxy || reloaded=no
+      settle
       code="$(via_droplet)"
       now
-      if [ "$which" = pre ] && [ "$code" = 200 ]; then
-        echo "  已还原:${cfg} 回到 11-03 那份,经 droplet 打 /build-id.txt = 200;停"
+      if [ "$which" != pre ]; then
+        echo "  ✗✗ 还原没写上,${cfg} 不是 11-03 那份;手工处理:sudo cp -p ${backup} ${cfg} && sudo systemctl reload haproxy"
+      elif [ "$state" != active ]; then
+        # 停掉的 unit systemd 不让 reload,只能 start(不是 restart)。
+        echo "  ✗✗ ${cfg} 已还原成 11-03 那份,haproxy 是 ${state:-查不到},不是 active;是 inactive/failed 的话手工处理:sudo systemctl start haproxy"
+      elif [ "$reloaded" = no ]; then
+        echo "  ✗✗ ${cfg} 已还原成 11-03 那份,但 reload 失败,跑着的可能还是换上去的那份;手工处理:sudo systemctl reload haproxy"
+      elif [ "$code" != 200 ]; then
+        echo "  ✗✗ ${cfg} 已还原成 11-03 那份、reload 完 haproxy active,经 droplet 打 /build-id.txt 仍是 ${code}(预检时是 200):不是配置的事,停"
       else
-        echo "  ✗✗ 还原后经 droplet 打 /build-id.txt = ${code},手工处理:sudo cp -p ${backup} ${cfg} && sudo systemctl reload haproxy"
+        echo "  已还原:${cfg} 回到 11-03 那份,经 droplet 打 /build-id.txt = 200;停"
       fi
       exit 1
     }
     now
     [ "$which" = repo ] || restore "换上去的不是仓库那份"
     sudo -n systemctl reload haproxy || restore "systemctl reload haproxy 失败"
-    [ "$(systemctl is-active haproxy 2>/dev/null)" = active ] || restore "reload 之后 haproxy 不是 active"
+    settle
+    [ "$state" = active ] || restore "reload 之后 haproxy 不是 active(是 ${state:-查不到})"
     code="$(via_droplet)"
     [ "$code" = 200 ] || restore "经 droplet 打 /build-id.txt = ${code},不是 200"
     echo "  ${cfg} = 仓库那份(send-proxy-v2),reload 完 haproxy active,经 droplet 打 /build-id.txt = 200"
@@ -262,14 +282,20 @@ case "$mode" in
   rollback)
     now
     case "$which" in
-      pre) echo "  ${cfg} 已经是 11-03 那份,不用回滚"; exit 3 ;;
-      repo) ;;
+      # 文件是这份不等于跑着的是这份(上回 reload 失败、手工改过):照样 reload、核对,才说能删 snippet。
+      pre) echo "  ${cfg} 已经是 11-03 那份,不重写;照样 reload 一次,让跑着的也是它" ;;
+      repo) install_cfg "$work/pre.cfg" cn-rollback ;;
       *) echo "  ✗ ${cfg} 既不是仓库那份也不是 11-03 那份,停;没动。差异:"; show_diff repo "仓库那份"; exit 1 ;;
     esac
-    install_cfg "$work/pre.cfg" cn-rollback
     # 回滚之后不再自动换回去:不带头的 11-03 那份,box A 加没加 snippet 都接得住,是两头都安全的状态。
-    sudo -n systemctl reload haproxy \
-      || { echo "  ✗ reload 失败:haproxy 还在跑带 send-proxy-v2 的旧配置,box A 的 snippet 先别删,停"; exit 1; }
+    if ! sudo -n systemctl reload haproxy; then
+      # 文件要跟着跑着的那份走:不然 --verify 会说 send-proxy-v2 没开。
+      [ "$which" = repo ] && sudo -n cp -p "$backup" "$cfg" && echo "  ${cfg} 已换回仓库那份,和跑着的一致"
+      echo "  ✗ reload 失败:haproxy 可能还在跑带 send-proxy-v2 的配置,box A 的 snippet 先别删,停"
+      exit 1
+    fi
+    settle
+    [ "$state" = active ] || { echo "  ✗ reload 之后 haproxy 是 ${state:-查不到},不是 active;${cfg} 保持 11-03 那份,停"; exit 1; }
     code="$(via_droplet)"
     if [ "$code" != 200 ]; then
       echo "  ✗ 回滚后经 droplet 打 /build-id.txt = ${code};${cfg} 保持 11-03 那份(box A 两种状态都接得住),问题不在这一跳,停"
@@ -303,13 +329,7 @@ stage2() {
 
 stage3() {
   echo "== 3. 回滚到 11-03 那份 =="
-  local rc=0
-  remote rollback || rc=$?
-  case "$rc" in
-    0) ;;
-    3) exit 0 ;;
-    *) echo "  回滚没成,停(box A 的 snippet 先别删)"; exit 1 ;;
-  esac
+  remote rollback || { echo "  回滚没成,停(box A 的 snippet 先别删)"; exit 1; }
 }
 
 echo "== 本地:装的是哪一版 =="

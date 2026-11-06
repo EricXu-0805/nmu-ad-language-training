@@ -30,7 +30,7 @@ INSTALLER = ENTRY / "install_cn_entry.sh"
 HAPROXY_CFG = ENTRY / "haproxy.cfg"
 SNIPPET = ENTRY / "boxa-caddy-global.snippet"
 
-# 11-03 由 Claude 手装、跑到现在的那份(简报原文,注释行不在内)。
+# 11-03 由 Claude 手装、跑到现在的那份(当时记下的指令,注释行当时没记;安装器 PRE_PROXY 那段就是它)。
 PRE_PROXY = """\
 global
     log /dev/log local0
@@ -232,7 +232,10 @@ def test_the_installer_reads_no_secrets_and_touches_only_haproxy():
         assert needle not in code, needle
     assert re.search(r"\bopenclaw (cron|gateway|channels|secrets)\b", code) is None
     assert _constant("CFG") == "/etc/haproxy/haproxy.cfg"
-    assert set(re.findall(r"systemctl ([a-z][a-z-]*)", code)) == {"is-active", "reload"}   # 从不 restart
+    assert set(re.findall(r"systemctl ([a-z][a-z-]*)", code)) == {"is-active", "reload", "start"}   # 从不 restart
+    # start 只出现在给人看的「手工处理」提示里,脚本自己不跑。
+    assert [line for line in code.splitlines()
+            if "systemctl start" in line and not line.lstrip().startswith("echo ")] == []
     assert set(re.findall(r"sudo -n ([a-z][a-z-]*)", code)) == {"true", "haproxy", "cat", "ufw", "cp",
                                                                 "tee", "mv", "systemctl"}
 
@@ -326,26 +329,34 @@ def certificate(tmp_path_factory) -> Path:
     if openssl is None:
         pytest.skip("没有 openssl,做不出假 box A 的证书")
     work = tmp_path_factory.mktemp("cn-entry-cert")
-    subprocess.run([
-        openssl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
-        "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
-        "-addext", "basicConstraints=critical,CA:TRUE",
-        "-addext", "keyUsage=critical,keyCertSign,digitalSignature,keyEncipherment",
-        "-addext", "extendedKeyUsage=serverAuth",
-        "-keyout", str(work / "key.pem"), "-out", str(work / "cert.pem"),
-    ], check=True, capture_output=True, timeout=30, env={"PATH": os.defpath, "OPENSSL_CONF": os.devnull})
+    # stranger:同样是 localhost 的自签证书,只是不在 SSL_CERT_FILE 里。
+    for cert, key in (("cert", "key"), ("stranger", "stranger-key")):
+        subprocess.run([
+            openssl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
+            "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,digitalSignature,keyEncipherment",
+            "-addext", "extendedKeyUsage=serverAuth",
+            "-keyout", str(work / f"{key}.pem"), "-out", str(work / f"{cert}.pem"),
+        ], check=True, capture_output=True, timeout=30, env={"PATH": os.defpath, "OPENSSL_CONF": os.devnull})
     return work
 
 
 class FakeBoxA:
-    """accept_proxy=True:先读一个 PROXY v2 头再走 TLS(装了 snippet 的 box A);False:直接走 TLS。"""
+    """accept_proxy=True:先读一个 PROXY v2 头再走 TLS(装了 snippet 的 box A);False:直接走 TLS。
+    trusted=False 时出示不受信的证书;status 是回给 /build-id.txt 的状态行。"""
 
-    def __init__(self, certificate: Path, accept_proxy: bool) -> None:
+    def __init__(self, certificate: Path, accept_proxy: bool, trusted: bool = True,
+                 status: bytes = b"200 OK") -> None:
         self.accept_proxy = accept_proxy
+        self.status = status
         self.headers: list[bytes] = []
         self.requests: list[bytes] = []
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self.context.load_cert_chain(certificate / "cert.pem", certificate / "key.pem")
+        if trusted:
+            self.context.load_cert_chain(certificate / "cert.pem", certificate / "key.pem")
+        else:
+            self.context.load_cert_chain(certificate / "stranger.pem", certificate / "stranger-key.pem")
         self.listener = socket.create_server(("127.0.0.1", 0))
         self.port = self.listener.getsockname()[1]
         self.thread = threading.Thread(target=self._serve, daemon=True)
@@ -376,7 +387,8 @@ class FakeBoxA:
                         self.headers.append(head)
                     with self.context.wrap_socket(conn, server_side=True) as tls:
                         self.requests.append(tls.recv(4096))
-                        tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        tls.sendall(b"HTTP/1.1 " + self.status
+                                    + b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 except OSError:
                     pass
 
@@ -408,6 +420,7 @@ class Droplet:
         self.cfg = self.etc / "haproxy.cfg"
         self.cfg.write_text("# 11-03 Claude 手装\n" + PRE_PROXY, encoding="utf-8")
         self.log = tmp_path / "droplet.log"
+        self.log.write_text("", encoding="utf-8")          # 假货里的 grep -c 要它在
         self.bin = tmp_path / "droplet-bin"
         self.bin.mkdir()
         (tmp_path / "ufw.txt").write_text(UFW_ACTIVE, encoding="utf-8")
@@ -422,13 +435,23 @@ class Droplet:
             '  *) exit 2 ;;',
             "esac",
         ]))
+        # FAKE_STATE:每次 is-active 依次取一个,取完之后一直用最后一个。上一次 is-active
+        # 是 failed/inactive 时 reload 被拒,跟 systemd 对停掉的 unit 一样。
         self._tool("systemctl", "\n".join([
             'case "$1" in',
-            '  is-active) echo "${FAKE_STATE:-active}"; [ "${FAKE_STATE:-active}" = active ] ;;',
-            f'  reload) echo "reload $2" >> "{log}"; exit "${{FAKE_RELOAD_RC:-0}}" ;;',
+            f'  is-active) n="$(($(grep -c "^is-active " "{log}") + 1))"',
+            "      state=\"$(printf '%s\\n' ${FAKE_STATE:-active} | sed -n \"${n}p\")\"",
+            "      [ -n \"$state\" ] || state=\"$(printf '%s\\n' ${FAKE_STATE:-active} | tail -n 1)\"",
+            f'      echo "is-active $state" >> "{log}"; echo "$state"; [ "$state" = active ] ;;',
+            f'  reload) case "$(grep "^is-active " "{log}" | tail -n 1)" in',
+            f'        *" failed"|*" inactive") echo "refused reload $2" >> "{log}"; exit 1 ;;',
+            "      esac",
+            f'      echo "reload $2" >> "{log}"; exit "${{FAKE_RELOAD_RC:-0}}" ;;',
             f'  *) echo "systemctl $*" >> "{log}"; exit 1 ;;',
             "esac",
         ]))
+        # FAKE_TEE_SHORT:写进去的只有前三行(都是注释),换上去的就不是仓库那份。
+        self._tool("tee", '[ -z "${FAKE_TEE_SHORT:-}" ] || { head -n 3 > "$1"; exit 0; }\nexec /usr/bin/tee "$@"')
         self._tool("ufw", f'cat "{tmp_path}/ufw.txt"')
         # FAKE_CURL_CODES:每次调用依次取一个码,取完之后一直用最后一个。
         self._tool("curl", "\n".join([
@@ -449,8 +472,8 @@ class Droplet:
         tool.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
         tool.chmod(0o755)
 
-    def serve_box_a(self, accept_proxy: bool) -> FakeBoxA:
-        self.box_a = FakeBoxA(self.certificate, accept_proxy)
+    def serve_box_a(self, accept_proxy: bool, **options) -> FakeBoxA:
+        self.box_a = FakeBoxA(self.certificate, accept_proxy, **options)
         return self.box_a
 
     def entries(self, kind: str) -> list[str]:
@@ -534,6 +557,20 @@ def test_preflight_stops_before_any_write_when_box_a_is_not_ready(droplet, accep
     assert droplet.others() == [] and droplet.entries("reload") == []
 
 
+@pytest.mark.parametrize(("options", "seen"), [
+    ({"trusted": False}, "ready=no SSLCertVerificationError"),
+    ({"status": b"502 Bad Gateway"}, "ready=no status=HTTP/1.1 502 Bad Gateway"),
+], ids=["untrusted-cert", "status-502"])
+def test_preflight_wants_a_verified_certificate_and_a_200(droplet, options, seen):
+    droplet.serve_box_a(accept_proxy=True, **options)
+
+    result = droplet.run("preflight")
+
+    assert result.returncode == 1 and seen in result.stdout
+    assert droplet.cfg.read_text(encoding="utf-8") == ORIGINAL
+    assert droplet.others() == [] and droplet.entries("reload") == []
+
+
 def test_preflight_recognises_the_installed_cfg_whatever_its_comments_and_spacing(droplet):
     droplet.serve_box_a(accept_proxy=True)
     droplet.cfg.write_text("# 手写的注释\n\n" + PRE_PROXY.replace("    ", "\t")
@@ -582,6 +619,26 @@ def test_preflight_wants_haproxy_active(droplet):
     assert result.returncode == 1 and "haproxy 是 failed" in result.stdout
 
 
+def test_preflight_wants_the_entry_answering_through_the_droplet_before_the_swap(droplet):
+    droplet.serve_box_a(accept_proxy=True)
+
+    result = droplet.run("preflight", FAKE_CURL_CODES="502")
+
+    assert result.returncode == 1 and "换配置之前经 droplet 打 /build-id.txt 就是 502" in result.stdout
+    assert droplet.cfg.read_text(encoding="utf-8") == ORIGINAL and droplet.entries("reload") == []
+
+
+def test_preflight_wants_the_current_cfg_to_pass_haproxy_check(droplet):
+    droplet.serve_box_a(accept_proxy=True)
+    # BROKEN 只在注释里:去掉注释仍是 11-03 那份,只有假 haproxy -c 不过。
+    droplet.cfg.write_text("# BROKEN\n" + PRE_PROXY, encoding="utf-8")
+
+    result = droplet.run("preflight")
+
+    assert result.returncode == 1 and "现在这份 haproxy -c 都不过" in result.stdout
+    assert "去掉注释后 = 11-03 那份" in result.stdout
+
+
 def test_the_remote_script_refuses_any_other_host(droplet):
     result = droplet.run("install", FAKE_HOSTNAME="nmu-prod")
 
@@ -604,24 +661,53 @@ def test_install_backs_up_swaps_in_the_repo_cfg_reloads_once_and_checks_via_the_
     assert "--resolve localhost:443:147.182.176.237 https://localhost/build-id.txt" in curl
 
 
-@pytest.mark.parametrize(("env", "reason"), [
-    ({"FAKE_CURL_CODES": "502 502 502 200"}, "经 droplet 打 /build-id.txt = 502"),   # 还原之后又通了
-    ({"FAKE_RELOAD_RC": "1"}, "systemctl reload haproxy 失败"),
-    ({"FAKE_STATE": "failed"}, "reload 之后 haproxy 不是 active"),
+@pytest.mark.parametrize(("env", "reason", "outcome"), [
+    ({"FAKE_CURL_CODES": "502 502 502 200"}, "经 droplet 打 /build-id.txt = 502",   # 还原之后又通了
+     "已还原:"),
+    ({"FAKE_RELOAD_RC": "1"}, "systemctl reload haproxy 失败",                      # 还原那次也 reload 不了
+     "但 reload 失败,跑着的可能还是换上去的那份;手工处理:sudo systemctl reload haproxy"),
 ])
-def test_install_restores_the_backup_when_anything_after_the_swap_fails(droplet, env, reason):
+def test_install_restores_the_backup_when_anything_after_the_swap_fails(droplet, env, reason, outcome):
     result = droplet.run("install", **env)
 
     assert result.returncode == 1
-    assert reason in result.stdout and "还原" in result.stdout
+    assert reason in result.stdout and outcome in result.stdout
+    assert ("已还原:" in result.stdout) == (outcome == "已还原:")
     assert droplet.cfg.read_text(encoding="utf-8") == ORIGINAL
     assert droplet.entries("reload") == ["reload haproxy", "reload haproxy"]   # 换上一次、还原一次
 
 
-def test_install_says_so_when_even_the_restore_does_not_bring_it_back(droplet):
+def test_a_dead_haproxy_after_the_reload_gets_a_start_hint_not_restored(droplet):
+    result = droplet.run("install", FAKE_STATE="failed")
+
+    assert result.returncode == 1 and "reload 之后 haproxy 不是 active(是 failed)" in result.stdout
+    assert "手工处理:sudo systemctl start haproxy" in result.stdout and "已还原:" not in result.stdout
+    assert droplet.cfg.read_text(encoding="utf-8") == ORIGINAL
+    assert droplet.entries("reload") == ["reload haproxy"]
+    assert droplet.entries("refused") == ["refused reload haproxy"]          # 停掉的 unit 不让 reload
+
+
+def test_install_waits_out_a_reloading_state_instead_of_restoring(droplet):
+    result = droplet.run("install", FAKE_STATE="reloading reloading active")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert droplet.cfg.read_bytes() == HAPROXY_CFG.read_bytes()
+    assert droplet.entries("reload") == ["reload haproxy"]
+
+
+def test_install_restores_when_what_landed_is_not_the_repo_cfg(droplet):
+    result = droplet.run("install", FAKE_TEE_SHORT="1")
+
+    assert result.returncode == 1 and "换上去的不是仓库那份" in result.stdout and "已还原:" in result.stdout
+    assert droplet.cfg.read_text(encoding="utf-8") == ORIGINAL
+    assert droplet.entries("reload") == ["reload haproxy"]                   # 只有还原那一次
+
+
+def test_install_does_not_send_anyone_to_redo_a_restore_that_already_landed(droplet):
     result = droplet.run("install", FAKE_CURL_CODES="000")
 
-    assert result.returncode == 1 and "手工处理" in result.stdout
+    assert result.returncode == 1 and "仍是 000(预检时是 200)" in result.stdout
+    assert "sudo cp" not in result.stdout and "已还原:" not in result.stdout
     assert droplet.cfg.read_text(encoding="utf-8") == ORIGINAL
 
 
@@ -667,12 +753,33 @@ def test_rollback_keeps_the_pre_proxy_cfg_even_if_the_check_fails(droplet):
     assert droplet.entries("reload") == ["reload haproxy"]
 
 
-def test_rollback_is_a_no_op_on_the_pre_proxy_cfg(droplet):
+def test_rollback_on_the_pre_proxy_cfg_rewrites_nothing_but_still_reloads_and_checks(droplet):
     result = droplet.run("rollback")
 
-    assert result.returncode == 3
+    assert result.returncode == 0, result.stdout + result.stderr
     assert droplet.cfg.read_text(encoding="utf-8") == ORIGINAL and droplet.others() == []
-    assert droplet.entries("reload") == []
+    assert droplet.entries("reload") == ["reload haproxy"]
+    assert "现在可以去 box A 删 snippet" in result.stdout
+
+
+def test_a_rollback_whose_reload_fails_leaves_the_file_matching_what_runs(droplet):
+    droplet.cfg.write_bytes(HAPROXY_CFG.read_bytes())
+
+    result = droplet.run("rollback", FAKE_RELOAD_RC="1")
+
+    assert result.returncode == 1 and "box A 的 snippet 先别删" in result.stdout
+    assert "现在可以去 box A 删 snippet" not in result.stdout
+    assert droplet.cfg.read_bytes() == HAPROXY_CFG.read_bytes()             # 跑着的还是它
+    assert "send-proxy-v2 开着" in droplet.run("verify").stdout
+
+
+def test_rollback_checks_haproxy_is_active_before_blaming_another_hop(droplet):
+    droplet.cfg.write_bytes(HAPROXY_CFG.read_bytes())
+
+    result = droplet.run("rollback", FAKE_STATE="failed")
+
+    assert result.returncode == 1 and "reload 之后 haproxy 是 failed,不是 active" in result.stdout
+    assert "现在可以去 box A 删 snippet" not in result.stdout and "问题不在这一跳" not in result.stdout
 
 
 def test_rollback_writes_nothing_on_an_unknown_cfg(droplet):
@@ -694,3 +801,23 @@ def test_verify_only_reads(droplet):
     assert "send-proxy-v2 开着" in result.stdout and "经 droplet 打 /build-id.txt = 200" in result.stdout
     assert droplet.cfg.read_bytes() == HAPROXY_CFG.read_bytes() and droplet.others() == []
     assert droplet.entries("reload") == [] and droplet.entries("check") == []
+
+
+def test_verify_fails_when_the_entry_does_not_answer_through_the_droplet(droplet):
+    droplet.cfg.write_bytes(HAPROXY_CFG.read_bytes())
+
+    result = droplet.run("verify", FAKE_CURL_CODES="502")
+
+    assert result.returncode == 1 and "✗ 经 droplet 打 /build-id.txt = 502" in result.stdout
+
+
+def test_verify_fails_with_a_masked_diff_on_an_unknown_cfg(droplet):
+    droplet.cfg.write_text(HAPROXY_CFG.read_text(encoding="utf-8")
+                           + "listen stats\n    stats auth admin:sentinel-secret\n", encoding="utf-8")
+
+    result = droplet.run("verify")
+
+    assert result.returncode == 1 and "既不是 11-03 那份也不是仓库那份" in result.stdout
+    assert "+listen stats" in result.stdout and "stats auth <遮住>" in result.stdout
+    assert "sentinel" not in result.stdout + result.stderr
+    assert droplet.others() == []
