@@ -10,6 +10,7 @@
  * 阈值都是工程启发而非标准——各机型的 AGC 会把"安静"抬到不同电平,
  * 所以每个阈值旁边写了它想抓住的具体故障,错了就照着改。
  */
+import { isBlobStorageRefusal } from "../audio/blobStore.ts";
 
 export type CheckStatus = "pass" | "warn" | "fail";
 
@@ -277,21 +278,27 @@ export function classifyStorage(quotaBytes: number | null, usageBytes: number | 
 
 /**
  * 真写一次本机暂存。WebKit 非持久会话(如无痕)拒存 Blob 而 ArrayBuffer 照常,
- * 录音 outbox 届时自动改存字节(blobStore.stageOutbox),所以只有两种都写不进才 fail。
+ * 录音 outbox 届时自动改存字节(blobStore.stageOutbox)。只有 stageOutbox 认的那类拒存
+ * 才再试 ArrayBuffer 记 warn;Blob 别的失败(配额、读回不一致)录音照样坏,直接 fail。
  */
 export async function checkAudioStorage(deps: DeviceCheckDependencies): Promise<CheckResult> {
   const id = "audio-storage";
   const title = "录音暂存";
-  try {
-    await deps.indexedDbRoundTrip("blob");
-    return { id, title, status: "pass", detail: "Blob 写入、读回、删除正常" };
-  } catch { /* 再试兼容存储 */ }
-  try {
-    await deps.indexedDbRoundTrip("array-buffer");
-  } catch (error) {
+  const failed = (error: unknown): CheckResult => {
     const name = (error as { name?: string } | null)?.name || String(error);
     return { id, title, status: "fail",
       detail: `本机暂存写不进（${name}），录音无法保存。请换普通浏览模式或新版浏览器后重查。` };
+  };
+  try {
+    await deps.indexedDbRoundTrip("blob");
+    return { id, title, status: "pass", detail: "Blob 写入、读回、删除正常" };
+  } catch (error) {
+    if (!isBlobStorageRefusal(error)) return failed(error);
+  }
+  try {
+    await deps.indexedDbRoundTrip("array-buffer");
+  } catch (error) {
+    return failed(error);
   }
   return { id, title, status: "warn",
     detail: "Blob 存储不可用，已改存 ArrayBuffer，录音照常暂存和上传。" +

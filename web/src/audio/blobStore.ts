@@ -54,7 +54,7 @@ export function storedAudioBlob(value: unknown): Blob | undefined {
 
 // WebKit 26.4/26.6 非持久会话里 add(Blob) 中止为 UnknownError「Error preparing
 // Blob/File data」，同一会话里 ArrayBuffer 照常可存（审核报告_20261023；11-05 在 26.4 复现）。
-function isBlobStorageRefusal(error: unknown): boolean {
+export function isBlobStorageRefusal(error: unknown): boolean {
   const name = (error as { name?: unknown } | null)?.name;
   return name === "UnknownError" || name === "DataCloneError";
 }

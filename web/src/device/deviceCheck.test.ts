@@ -216,6 +216,28 @@ test("audio storage: Blob pass, ArrayBuffer-only warns but never fails, neither 
   assert.match(broken.detail, /QuotaExceededError.*录音无法保存/);
 });
 
+test("audio storage warns only for the Blob refusals stageOutbox falls back on", async () => {
+  const run = (blobError: Error) => {
+    const tried: string[] = [];
+    return checkAudioStorage(deps({
+      indexedDbRoundTrip: async (kind) => { tried.push(kind); if (kind === "blob") throw blobError; },
+    })).then((result) => ({ result, tried }));
+  };
+  const cloned = await run(new DOMException("could not be cloned", "DataCloneError"));
+  assert.equal(cloned.result.status, "warn");
+  assert.deepEqual(cloned.tried, ["blob", "array-buffer"]);
+  for (const [error, name] of [
+    [new DOMException("quota", "QuotaExceededError"), "QuotaExceededError"],
+    [new DOMException("unreadable", "NotReadableError"), "NotReadableError"],
+    [new Error("暂存读回内容与写入不一致"), "Error"],
+  ] as const) {
+    const { result, tried } = await run(error);
+    assert.equal(result.status, "fail", name);
+    assert.ok(result.detail.includes(`（${name}）`) && /录音无法保存/.test(result.detail), result.detail);
+    assert.deepEqual(tried, ["blob"], "ArrayBuffer 能存也救不了这类 Blob 失败");
+  }
+});
+
 test("a phone-sized screen warns but never fails", () => {
   assert.equal(classifyScreen({ width: 390, height: 844, pixelRatio: 3 }).status, "warn");
   assert.equal(classifyScreen({ width: 1280, height: 800, pixelRatio: 2 }).status, "pass");
