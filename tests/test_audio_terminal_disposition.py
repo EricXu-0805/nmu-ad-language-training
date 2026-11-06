@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1181,8 +1182,19 @@ _SUPERSEDED_GOVERNANCE_KEYS = sorted([
 ])
 
 
+@pytest.fixture
+def shanghai_process_tz():
+    """CI 跑在 UTC:本地 naive 时间等于 UTC,时区换算写错也测不出来。
+    tzset 改的是整个进程,xdist worker 里后面的测试不能沿用,退出时还原再 tzset。"""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("TZ", "Asia/Shanghai")
+        time.tzset()
+        yield
+    time.tzset()
+
+
 def test_governance_lists_superseded_slots_apart_from_withdrawn_audio(
-        disposition_client, monkeypatch):
+        shanghai_process_tz, disposition_client, monkeypatch):
     """技术作废的录音槽此前只有审计行可查(255 §二·补、257 §五 5),治理页要单独列出。
     255 作废的已登记槽与 257 的未登记墓碑都列,规则标记为真;手工修出来的 deleted
     无字节行也列,但标记为假;撤回隔离的无字节行与有字节的删除行都不进这张表,
@@ -1242,15 +1254,17 @@ def test_governance_lists_superseded_slots_apart_from_withdrawn_audio(
         for row in (tombstone, orphan):
             assert row["session_id"] == "S-ONE" and row["patient_id"] == "P-ONE"
             assert row["marked_by_rule"] is True
-            # 审计 ts 是本地 naive 时间:换算错了在非 UTC 机器上会差出整小时。
+            # 审计 ts 是本地 naive 时间:换算错了会差出 8 小时。
             marked_at = datetime.fromisoformat(row["last_marked_at"])
             assert marked_at.utcoffset() == timedelta(0)
             assert abs(now - marked_at) < timedelta(minutes=5), row
         assert tombstone["local_copy_disposal_device_count"] == 0
         assert tombstone["local_copy_disposal_last_at"] is None
         assert orphan["local_copy_disposal_device_count"] == 1
-        assert datetime.fromisoformat(
-            orphan["local_copy_disposal_last_at"]).utcoffset() == timedelta(0)
+        # 回执 reported_at 反过来是 naive-UTC,不能照审计 ts 按本地时区换算。
+        disposal_at = datetime.fromisoformat(orphan["local_copy_disposal_last_at"])
+        assert disposal_at.utcoffset() == timedelta(0)
+        assert abs(now - disposal_at) < timedelta(minutes=5), orphan
         assert hand_made == {
             "raw_audio_id": "raw-hand-voided", "session_id": "S-TWO", "patient_id": "P-TWO",
             "marked_by_rule": False, "last_marked_at": None,

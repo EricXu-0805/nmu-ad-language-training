@@ -103,9 +103,8 @@ export function SupersededAudioSlots({ rows, error }: {
 }) {
   return (
     <details style={{ marginTop: "var(--sp-3)" }}>
-      <summary style={{ cursor: "pointer", minHeight: 44, display: "flex", alignItems: "center", gap: "var(--sp-2)" }}>
+      <summary style={{ cursor: "pointer", padding: "var(--sp-3) 0" }}>
         <strong>技术作废的录音槽（服务器从未收到字节，不是撤回）{rows ? ` · ${rows.length} 条` : ""}</strong>
-        <span className="muted">默认收起</span>
       </summary>
       <div className="col" style={{ gap: 10, marginTop: "var(--sp-3)" }}>
         <p className="muted">平板换到同一位受试者的新场次后，旧场次没传上来或没登记上的录音槽会被作废。服务器对这些槽没有任何字节，这里只读，不提供删除。</p>

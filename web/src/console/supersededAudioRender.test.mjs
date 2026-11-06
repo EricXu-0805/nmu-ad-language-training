@@ -47,6 +47,9 @@ test("作废录音槽一节默认收起，规则记账与无审计行分开标�
       rows: [RULE_ROW, HAND_ROW], error: null,
     }));
     assert.ok(collapsed(markup), markup);
+    // summary 设成 flex 会吞掉原生展开三角；写死的「默认收起」展开后就不对了。
+    assert.doesNotMatch(markup, /<summary[^>]*display:\s*flex/);
+    assert.doesNotMatch(markup, /默认收起/);
     assert.match(markup, /技术作废的录音槽（服务器从未收到字节，不是撤回） · 2 条/);
     assert.match(markup, /raw-orphan-1/);
     assert.match(markup, /raw-hand-voided/);
