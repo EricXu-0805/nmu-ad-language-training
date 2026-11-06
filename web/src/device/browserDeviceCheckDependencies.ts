@@ -199,6 +199,39 @@ export function createBrowserDeviceCheckDependencies(): BrowserDeviceCheckDepend
       }
     },
 
+    async indexedDbRoundTrip(kind) {
+      // 独立的一次性库：探针残留绝不能混进 nmu-audio，被恢复快照当成历史孤儿而停麦。
+      const name = `nmu-probe-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`;
+      const written = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3]);
+      const value = kind === "blob" ? new Blob([written], { type: "audio/webm" }) : written.slice().buffer;
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = window.indexedDB.open(name, 1);
+        request.onupgradeneeded = () => { request.result.createObjectStore("probe"); };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const step = (mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBRequest) =>
+        new Promise<unknown>((resolve, reject) => {
+          const transaction = db.transaction("probe", mode);
+          const request = run(transaction.objectStore("probe"));
+          transaction.oncomplete = () => resolve(request.result);
+          transaction.onabort = () => reject(transaction.error ?? new Error("探针事务中止"));
+        });
+      try {
+        await step("readwrite", (store) => store.put(value, "scratch"));
+        const stored = await step("readonly", (store) => store.get("scratch"));
+        const read = stored instanceof Blob ? await stored.arrayBuffer() : stored;
+        if (!(read instanceof ArrayBuffer) || (kind === "blob") !== (stored instanceof Blob)
+            || new Uint8Array(read).join() !== written.join()) {
+          throw new Error("暂存读回内容与写入不一致");
+        }
+        await step("readwrite", (store) => store.delete("scratch"));
+      } finally {
+        db.close();
+        window.indexedDB.deleteDatabase(name);
+      }
+    },
+
     dispose() {
       disposed = true;
       microphoneGeneration += 1;

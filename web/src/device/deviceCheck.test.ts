@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   checkAudioOutput,
+  checkAudioStorage,
   checkBuildBinding,
   checkBrowserSafetyFoundation,
   checkFallbackVoice,
@@ -53,6 +54,7 @@ function deps(overrides: Partial<DeviceCheckDependencies> = {}): DeviceCheckDepe
     }),
     now: () => Date.now(),
     storageEstimate: async () => ({ quotaBytes: 2_000_000_000, usageBytes: 100_000_000 }),
+    indexedDbRoundTrip: async () => {},
     ...overrides,
   };
 }
@@ -197,6 +199,45 @@ test("storage: <50MB free fail, <200MB warn, plenty pass, unknown warn", () => {
   assert.equal(classifyStorage(null, null).status, "warn");
 });
 
+test("audio storage: Blob pass, ArrayBuffer-only warns but never fails, neither fails", async () => {
+  assert.equal((await checkAudioStorage(deps())).status, "pass");
+  const tried: string[] = [];
+  const refused = new DOMException("Error preparing Blob/File data to be stored in object store", "UnknownError");
+  const fallback = await checkAudioStorage(deps({
+    indexedDbRoundTrip: async (kind) => { tried.push(kind); if (kind === "blob") throw refused; },
+  }));
+  assert.deepEqual(tried, ["blob", "array-buffer"]);
+  assert.equal(fallback.status, "warn");
+  assert.match(fallback.detail, /^Blob 存储不可用，已改存 ArrayBuffer/);
+  const broken = await checkAudioStorage(deps({
+    indexedDbRoundTrip: async () => { throw new DOMException("quota", "QuotaExceededError"); },
+  }));
+  assert.equal(broken.status, "fail");
+  assert.match(broken.detail, /QuotaExceededError.*录音无法保存/);
+});
+
+test("audio storage warns only for the Blob refusals stageOutbox falls back on", async () => {
+  const run = (blobError: Error) => {
+    const tried: string[] = [];
+    return checkAudioStorage(deps({
+      indexedDbRoundTrip: async (kind) => { tried.push(kind); if (kind === "blob") throw blobError; },
+    })).then((result) => ({ result, tried }));
+  };
+  const cloned = await run(new DOMException("could not be cloned", "DataCloneError"));
+  assert.equal(cloned.result.status, "warn");
+  assert.deepEqual(cloned.tried, ["blob", "array-buffer"]);
+  for (const [error, name] of [
+    [new DOMException("quota", "QuotaExceededError"), "QuotaExceededError"],
+    [new DOMException("unreadable", "NotReadableError"), "NotReadableError"],
+    [new Error("暂存读回内容与写入不一致"), "Error"],
+  ] as const) {
+    const { result, tried } = await run(error);
+    assert.equal(result.status, "fail", name);
+    assert.ok(result.detail.includes(`（${name}）`) && /录音无法保存/.test(result.detail), result.detail);
+    assert.deepEqual(tried, ["blob"], "ArrayBuffer 能存也救不了这类 Blob 失败");
+  }
+});
+
 test("a phone-sized screen warns but never fails", () => {
   assert.equal(classifyScreen({ width: 390, height: 844, pixelRatio: 3 }).status, "warn");
   assert.equal(classifyScreen({ width: 1280, height: 800, pixelRatio: 2 }).status, "pass");
@@ -225,7 +266,7 @@ test("verdict is incomplete unless every required result exists exactly once", (
   assert.equal(summarize([mk("pass"), mk("pass")]), "incomplete");
   const complete = [
     "runtime", "build-binding", "browser-safety", "microphone", "codec", "sample-rate",
-    "audio-output", "fallback-voice", "network", "storage", "screen",
+    "audio-output", "fallback-voice", "network", "storage", "audio-storage", "screen",
     "noise-floor", "speech-level", "speaker",
   ].map((id) => ({ id, title: id, status: "pass", detail: "ok" } as CheckResult));
   assert.equal(summarize(complete), "basic-pass");
@@ -260,8 +301,8 @@ test("auto checks run in a stable order and stream results as they land", async 
   const seen: string[] = [];
   const run = await runAutoChecks(deps(), (r) => seen.push(r.id));
   assert.deepEqual(seen, ["runtime", "build-binding", "browser-safety", "microphone", "codec", "sample-rate",
-    "audio-output", "fallback-voice", "network", "storage", "screen"]);
-  assert.equal(run.results.length, 11);
+    "audio-output", "fallback-voice", "network", "storage", "audio-storage", "screen"]);
+  assert.equal(run.results.length, 12);
   assert.ok(run.results.every((r) => r.status === "pass"), JSON.stringify(run.results));
   assert.equal(run.micInfo?.label, "内置麦克风");
 });
@@ -285,7 +326,18 @@ test("a throwing dependency becomes that check's fail, not a crash", async () =>
   const storage = run.results.find((r) => r.id === "storage");
   assert.equal(storage?.status, "fail");
   assert.match(storage!.detail, /quota exploded/);
-  assert.equal(run.results.length, 11, "其余检查照常跑完");
+  assert.equal(run.results.length, 12, "其余检查照常跑完");
+});
+
+test("a Blob-refusing browser still completes every check with only a storage warning", async () => {
+  const run = await runAutoChecks(deps({
+    indexedDbRoundTrip: async (kind) => {
+      if (kind === "blob") throw new DOMException("Error preparing Blob/File data", "UnknownError");
+    },
+  }), () => {});
+  assert.equal(run.results.length, 12);
+  assert.deepEqual(run.results.filter((r) => r.status !== "pass").map((r) => [r.id, r.status]),
+    [["audio-storage", "warn"]]);
 });
 
 test("sample rate falls back to the audio context when the track hides it", async () => {
