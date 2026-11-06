@@ -1,8 +1,11 @@
 """Isolated mechanical-capacity acceptance for a frozen quality release.
 
-This harness deliberately repeats the *same valid Week-2 contract*.  The full
-profile is 30 synthetic subjects and 240 Week-2 sessions; it is not evidence
-that Weeks 1 or 3-8 exist, are clinically approved, or have been exercised.
+This harness deliberately repeats the *valid Week 2-8 contracts* in rotation
+(session ``i`` uses week ``2 + (i - 1) % 7``).  The full profile is 30 synthetic
+subjects and 240 sessions spread over the seven registered, frozen item banks;
+it is mechanical repetition only.  It is not evidence that Week 1 exists, that
+the eight-week content is complete, or that the still-draft autopilot protocol
+is clinically approved.
 
 The acceptance path is intentionally the production path rather than a scalar
 stand-in::
@@ -19,7 +22,7 @@ Run the release-sized profile explicitly::
         --receipt /path/to/private-0700-dir/quality-release-scale.json
 
 The command prints one JSON receipt.  ``smoke`` is for routine pytest coverage;
-it uses the exact same 660-row/session evidence shape at a smaller cardinality.
+it uses the exact same 734-row/session evidence shape at a smaller cardinality.
 """
 from __future__ import annotations
 
@@ -48,8 +51,11 @@ from typing import Any
 PLATFORM_ROOT = Path(__file__).resolve().parents[1]
 AS_OF = datetime(2026, 8, 17, 0, 0, 0)
 SETTLED_AT = AS_OF - timedelta(days=30)
-ITEMS_PER_WEEK2_SESSION = 32
-TURNS_PER_WEEK2_SESSION = 78
+TRAINING_WEEKS = (2, 3, 4, 5, 6, 7, 8)
+# Every registered week's 正式训练 plan has this exact shape; the seed asserts
+# it per week, so a bank that drifts fails here instead of skewing the counts.
+ITEMS_PER_SESSION = 32
+TURNS_PER_SESSION = 78
 ATTEMPTS_PER_TURN = 2
 # item + turn + 2 attempts + 2 audio rows + 2 capture receipts + confirmation
 # revision + one interaction = 32 + 78 * 9 = 734.
@@ -64,11 +70,15 @@ _SOURCE_IDENTITY_EXACT_FILES = (
 _SOURCE_IDENTITY_TREES = (
     ("app", frozenset({".py"})),
     ("alembic", frozenset({".py", ".mako"})),
-    # Frozen content definitions and referenced assets are part of the Week-2
-    # contract exercised by this acceptance.  Hash every regular file so a new
+    # Frozen content definitions and referenced assets are part of the Week 2-8
+    # contracts exercised by this acceptance.  Hash every regular file so a new
     # extension cannot silently fall outside the receipt.
     ("content", None),
 )
+
+
+def session_week(session_index: int) -> int:
+    return TRAINING_WEEKS[(session_index - 1) % len(TRAINING_WEEKS)]
 
 
 class ScaleAcceptanceError(RuntimeError):
@@ -86,7 +96,7 @@ class ScaleProfile:
 
     @property
     def expected_turn_rows(self) -> int:
-        return self.session_count * TURNS_PER_WEEK2_SESSION
+        return self.session_count * TURNS_PER_SESSION
 
     @property
     def expected_evidence_rows(self) -> int:
@@ -95,9 +105,14 @@ class ScaleProfile:
     @property
     def expected_audio_files(self) -> int:
         return (
-            self.session_count * TURNS_PER_WEEK2_SESSION
+            self.session_count * TURNS_PER_SESSION
             * ATTEMPTS_PER_TURN
         )
+
+    @property
+    def sessions_per_week(self) -> dict[str, int]:
+        weeks = [session_week(i) for i in range(1, self.session_count + 1)]
+        return {str(week): weeks.count(week) for week in sorted(set(weeks))}
 
     @property
     def expected_turn_pages(self) -> int:
@@ -480,9 +495,9 @@ class SeedFacts:
     audio_files: int
 
 
-def _seed_week2_contracts(engine: Any, audio_root: Path,
-                          profile: ScaleProfile) -> SeedFacts:
-    """Materialize valid Week-2 evidence; no quality projection is patched."""
+def _seed_week_contracts(engine: Any, audio_root: Path,
+                         profile: ScaleProfile) -> SeedFacts:
+    """Materialize valid Week 2-8 evidence; no quality projection is patched."""
     from app import content
     from app.models import (
         AttemptEvent,
@@ -497,18 +512,21 @@ def _seed_week2_contracts(engine: Any, audio_root: Path,
         TurnEvent,
     )
 
-    bank = content.load_item_bank_for_week(2)
-    bank_digest = content.item_bank_definition_digest(bank)
     protocol = content.load_autopilot_protocol(
         content.CONTENT_DIR / "autopilot_protocol_v1.json")
     protocol_digest = content.autopilot_protocol_definition_digest(protocol)
     from app import runtime
 
-    plan = runtime.build_session_plan(bank, 2, "正式训练")
-    if len(plan.items) != ITEMS_PER_WEEK2_SESSION:
-        raise ScaleAcceptanceError("week2_item_contract_changed")
-    if plan.total_turns() != TURNS_PER_WEEK2_SESSION:
-        raise ScaleAcceptanceError("week2_turn_contract_changed")
+    contracts: dict[int, tuple[Any, str, Any]] = {}
+    for week in TRAINING_WEEKS:
+        bank = content.load_item_bank_for_week(week)
+        plan = runtime.build_session_plan(bank, week, "正式训练")
+        if len(plan.items) != ITEMS_PER_SESSION:
+            raise ScaleAcceptanceError(f"week{week}_item_contract_changed")
+        if plan.total_turns() != TURNS_PER_SESSION:
+            raise ScaleAcceptanceError(f"week{week}_turn_contract_changed")
+        contracts[week] = (
+            bank, content.item_bank_definition_digest(bank), plan)
 
     audio_root.mkdir(mode=0o700)
     patients = [{
@@ -527,12 +545,14 @@ def _seed_week2_contracts(engine: Any, audio_root: Path,
     for session_index in range(1, profile.session_count + 1):
         session_id = f"scale-s-{session_index:04d}"
         patient_index = ((session_index - 1) % profile.subject_count) + 1
+        week = session_week(session_index)
+        bank, bank_digest, _plan = contracts[week]
         sessions.append({
             "session_id": session_id,
             "patient_id": f"scale-p-{patient_index:03d}",
             "session_sitting_no": ((session_index - 1) // profile.subject_count) + 1,
             "training_date": date(2026, 7, 1),
-            "week_no": 2,
+            "week_no": week,
             "phase_type": "正式训练",
             "event_line": "正式训练",
             "trainer_id": "SCALE-RESEARCHER",
@@ -554,7 +574,7 @@ def _seed_week2_contracts(engine: Any, audio_root: Path,
     total_audio_bytes = 0
     total_audio_files = 0
     before_hash = hashlib.sha256(b"\x00NULL").hexdigest()
-    answer = "week2-mechanical-answer"
+    answer = "mechanical-answer"
     after_hash = hashlib.sha256(
         b"\x01TEXT" + answer.encode("utf-8")).hexdigest()
 
@@ -578,10 +598,11 @@ def _seed_week2_contracts(engine: Any, audio_root: Path,
                 batch_start + session_batch, profile.session_count + 1)
             for session_index in range(batch_start, batch_end):
                 session_id = f"scale-s-{session_index:04d}"
+                plan = contracts[session_week(session_index)][2]
                 turn_in_session = 0
                 for item_position, item in enumerate(plan.items, start=1):
                     item_id = (
-                        (session_index - 1) * ITEMS_PER_WEEK2_SESSION
+                        (session_index - 1) * ITEMS_PER_SESSION
                         + item_position
                     )
                     items.append({
@@ -596,7 +617,7 @@ def _seed_week2_contracts(engine: Any, audio_root: Path,
                     for planned_turn in item.turns:
                         turn_in_session += 1
                         global_turn = (
-                            (session_index - 1) * TURNS_PER_WEEK2_SESSION
+                            (session_index - 1) * TURNS_PER_SESSION
                             + turn_in_session
                         )
                         source_attempt_id = global_turn * 2
@@ -895,7 +916,7 @@ def _run_in_root(root: Path, profile: ScaleProfile) -> dict[str, Any]:
 
         event.listen(engine, "before_cursor_execute", count_selects)
         try:
-            seed = _seed_week2_contracts(engine, audio_root, profile)
+            seed = _seed_week_contracts(engine, audio_root, profile)
             evidence_counts = _database_evidence_counts(engine)
             evidence_total = sum(evidence_counts.values())
             if evidence_total != profile.expected_evidence_rows:
@@ -923,8 +944,13 @@ def _run_in_root(root: Path, profile: ScaleProfile) -> dict[str, Any]:
                         raise ScaleAcceptanceError("derived_cohort_count_mismatch")
                     if len({row.patient_id for row in cohort}) != profile.subject_count:
                         raise ScaleAcceptanceError("derived_subject_count_mismatch")
-                    if {row.week_no for row in cohort} != {2}:
-                        raise ScaleAcceptanceError("derived_contract_not_week2_only")
+                    cohort_weeks = [row.week_no for row in cohort]
+                    derived_sessions_per_week = {
+                        str(week): cohort_weeks.count(week)
+                        for week in sorted(set(cohort_weeks))
+                    }
+                    if derived_sessions_per_week != profile.sessions_per_week:
+                        raise ScaleAcceptanceError("derived_week_rotation_mismatch")
                     payload, watermarks = quality_release.build_payload(
                         session, cohort, as_of=AS_OF, thresholds=thresholds)
                     if (
@@ -1029,15 +1055,15 @@ def _run_in_root(root: Path, profile: ScaleProfile) -> dict[str, Any]:
                 raise ScaleAcceptanceError("source_changed_during_acceptance")
 
             return {
-                "schema_version": "quality-release-scale-receipt.v2",
+                "schema_version": "quality-release-scale-receipt.v3",
                 "status": "passed",
                 "run_at_utc": run_at_utc,
                 "source_identity": source_identity,
                 "runtime_fingerprint": runtime_fingerprint,
                 "profile": asdict(profile),
                 "scope": {
-                    "label": "mechanical_capacity_repeated_valid_week2_contracts",
-                    "week2_contract_repetitions": profile.session_count,
+                    "label": "mechanical_capacity_repeated_valid_week2_8_contracts",
+                    "contract_repetitions": profile.session_count,
                     "eight_week_content_complete": False,
                     "clinical_study_readiness_claimed": False,
                     "database": "temporary_migrated_sqlite",
@@ -1048,9 +1074,10 @@ def _run_in_root(root: Path, profile: ScaleProfile) -> dict[str, Any]:
                 "cohort": {
                     "subjects": profile.subject_count,
                     "sessions": profile.session_count,
-                    "week_numbers": [2],
-                    "items_per_session": ITEMS_PER_WEEK2_SESSION,
-                    "turns_per_session": TURNS_PER_WEEK2_SESSION,
+                    "week_numbers": sorted(set(cohort_weeks)),
+                    "sessions_per_week": derived_sessions_per_week,
+                    "items_per_session": ITEMS_PER_SESSION,
+                    "turns_per_session": TURNS_PER_SESSION,
                 },
                 "evidence": {
                     "rows_per_session": EVIDENCE_ROWS_PER_SESSION,
@@ -1120,8 +1147,8 @@ def run_profile(profile: ScaleProfile = FULL_PROFILE, *,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "冻结质量发布的隔离机械容量验收；full 只代表 240 个"
-            "重复合法 Week2 合同，不代表八周内容完整。"
+            "冻结质量发布的隔离机械容量验收；full 只代表 240 场在第 2–8 周"
+            "合法合同间轮转的机械重复，不代表八周内容完整或已获临床认可。"
         ))
     parser.add_argument(
         "--profile", choices=tuple(PROFILES), default="full")
@@ -1147,7 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
             else type(exc).__name__
         )
         print(json.dumps({
-            "schema_version": "quality-release-scale-receipt.v2",
+            "schema_version": "quality-release-scale-receipt.v3",
             "status": "failed",
             "profile": args.profile,
             "code": code,

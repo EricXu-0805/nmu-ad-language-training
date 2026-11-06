@@ -18,9 +18,24 @@ def test_full_profile_is_exactly_the_mechanical_240_session_contract():
     assert profile.expected_audio_files == 37_440
     assert profile.expected_turn_rows == 18_720
     assert profile.expected_turn_pages == 19
-    assert scale.ITEMS_PER_WEEK2_SESSION == 32
-    assert scale.TURNS_PER_WEEK2_SESSION == 78
+    assert scale.ITEMS_PER_SESSION == 32
+    assert scale.TURNS_PER_SESSION == 78
     assert scale.EVIDENCE_ROWS_PER_SESSION == 734
+    assert profile.sessions_per_week == {
+        "2": 35, "3": 35, "4": 34, "5": 34, "6": 34, "7": 34, "8": 34,
+    }
+
+
+def test_every_rotated_week_is_registered_frozen_and_the_same_shape():
+    from app import content, runtime
+
+    assert scale.TRAINING_WEEKS == (2, 3, 4, 5, 6, 7, 8)
+    for week in scale.TRAINING_WEEKS:
+        bank = content.load_item_bank_for_week(week)
+        plan = runtime.build_session_plan(bank, week, "正式训练")
+        assert bank.qc_status == "frozen"
+        assert len(plan.items) == scale.ITEMS_PER_SESSION
+        assert plan.total_turns() == scale.TURNS_PER_SESSION
 
 
 def test_http_429_backoff_retries_the_same_cursor_without_a_server():
@@ -71,8 +86,8 @@ def test_smoke_profile_runs_the_real_frozen_release_chain(tmp_path):
 
     assert receipt["status"] == "passed"
     assert receipt["scope"] == {
-        "label": "mechanical_capacity_repeated_valid_week2_contracts",
-        "week2_contract_repetitions": 4,
+        "label": "mechanical_capacity_repeated_valid_week2_8_contracts",
+        "contract_repetitions": 4,
         "eight_week_content_complete": False,
         "clinical_study_readiness_claimed": False,
         "database": "temporary_migrated_sqlite",
@@ -80,7 +95,7 @@ def test_smoke_profile_runs_the_real_frozen_release_chain(tmp_path):
         "repository_data_touched": False,
         "representative_audio_volume": False,
     }
-    assert receipt["schema_version"] == "quality-release-scale-receipt.v2"
+    assert receipt["schema_version"] == "quality-release-scale-receipt.v3"
     assert receipt["run_at_utc"].endswith("Z")
     assert len(receipt["source_identity"]["git_revision"]) == 40
     assert len(receipt["source_identity"]["selected_source_tree_sha256"]) == 64
@@ -91,7 +106,8 @@ def test_smoke_profile_runs_the_real_frozen_release_chain(tmp_path):
     assert receipt["cohort"] == {
         "subjects": 2,
         "sessions": 4,
-        "week_numbers": [2],
+        "week_numbers": [2, 3, 4, 5],
+        "sessions_per_week": {"2": 1, "3": 1, "4": 1, "5": 1},
         "items_per_session": 32,
         "turns_per_session": 78,
     }
@@ -140,8 +156,12 @@ def test_full_240_session_profile_is_a_permanent_release_regression():
 
     assert receipt["status"] == "passed"
     assert receipt["scope"]["eight_week_content_complete"] is False
+    assert receipt["scope"]["clinical_study_readiness_claimed"] is False
     assert receipt["cohort"]["subjects"] == 30
     assert receipt["cohort"]["sessions"] == 240
+    assert receipt["cohort"]["week_numbers"] == [2, 3, 4, 5, 6, 7, 8]
+    assert receipt["cohort"]["sessions_per_week"] == (
+        scale.FULL_PROFILE.sessions_per_week)
     assert receipt["evidence"]["total_rows"] == 176_160
     assert receipt["snapshot"]["turns"] == 18_720
     assert receipt["io"]["audio_directory_scans"] == 1
@@ -180,6 +200,7 @@ def test_source_identity_closes_over_runtime_content_and_migrations():
         "harness/__init__.py",
         "content/item_bank_index.json",
         "content/item_bank_v1.json",
+        "content/item_bank_week8_v1.json",
         "content/autopilot_protocol_v1.json",
         "alembic/env.py",
         "alembic/versions/6f2a9c4d8e17_frozen_research_row_snapshot.py",
