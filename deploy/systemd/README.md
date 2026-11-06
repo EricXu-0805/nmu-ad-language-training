@@ -239,6 +239,62 @@ done    # 每个都要 SubState=waiting、NextElapseUSecRealtime 非空、UnitFi
 六个定时器不多不少,这一项不另开定时器。所有定时器只用 `OnCalendar`:单调触发晚启动一次
 就再也不触发,`Persistent=true` 对它也不起作用。`tests/test_systemd_alerting.py` 钉住这两条。
 
+## China entry(droplet haproxy -> box A,2026-11 入库,还没装)
+
+10-28 起国内到 box A 的 TCP 被封,11-03 起国内用户改走 `147-182-176-237.sslip.io`:解到
+`openclaw-prod`(147.182.176.237,DigitalOcean 纽约,同时是 OpenClaw 的生产机),上面的 haproxy
+把 443 的 TCP 原样转给 box A,TLS 仍在 box A 的 Caddy 上终止。box A 看到这条路进来的每条连接
+都来自 147.182.176.237,于是:
+
+- 按 IP 的限速、PIN 锁定把所有国内用户和扫 droplet 的扫描器算成同一个人,扫描器能把医生锁在外面;
+- 上面 `nmu-backup-health --offbox-source 147.182.176.237` 数的 `GET /health` 能被国内用户喂绿。
+
+改法:haproxy 每条连接先发一个 PROXY v2 头,box A 的 Caddy 从头里取真实客户端地址。
+
+| 项 | 取值 |
+| --- | --- |
+| droplet 上 | `deploy/offbox/cn_entry/haproxy.cfg`:11-03 手装那份只多 server 行的 `send-proxy-v2` |
+| box A 上 | `deploy/offbox/cn_entry/boxa-caddy-global.snippet`,加进 `/opt/nmu/caddy/Caddyfile` 的全局选项块(那份不在仓库里)。这一步是 Claude 另写的脚本,Eric 在 box A 上跑:`caddy adapt` 过了才 reload,不对就还原 |
+| 谁的头算数 | 只认 147.182.176.237/32 发的头;它不带头(纽约探针、droplet 上别的直连)照旧算 droplet 的地址 |
+| 别人带头 | `fallback_policy reject`:连接直接断,伪造的地址到不了 app;不带头的普通客户端不受影响 |
+| 怎么验 | CI `image` 任务的 `smoke_caddy_release.py` 拿发布网关跑:允许的源带头 → app 看到头里的地址,不带头 → 看到源地址;别的源带头 → 连接断,不带头 → 照常。另用 `http_port 8081` + `auto_https disable_redirects` 的同形配置核 `servers :443` 落在 box A 的监听上 |
+
+语义是在源码里核的:Caddy v2.11.4 与 v2.11.7 的 `modules/caddyhttp/proxyprotocol` 逐字相同。来源在
+allow 里 = 有头用头、没头用对端地址;在 deny 里或落到 `fallback_policy reject` = 带头就断;默认的
+`ignore` 是丢掉头里的地址、连接照常。go-proxyproto v0.12.0(本仓库 go.mod)和 v0.15.0(v2.11.7 用的)
+都会让被拒的连接之后每次读都报同一个错。`timeout` 不写时 Caddy 传 0,库用自己的 10 秒(Caddy 注释
+写的 5 秒不对),所以显式写 5s;超时只当作没带头,不断连接。`proxy_protocol` 必须写在 `tls` 前面:
+`listener_wrappers` 里不写 `tls` 时 Caddy 把它插到最前面,PROXY 头就成了 TLS 数据。
+
+顺序,两头都要对:
+
+1. 先改 box A:加 snippet、reload、核过。haproxy 这时还不带头,droplet 的连接按「没带头」照常接。
+2. 再在 Mac 上跑 `install_cn_entry.sh`。预检从 droplet 直连 box A,发一个源地址是 TEST-NET-1 的 v2 头,
+   走 TLS(验证书)打 `/build-id.txt`,不是 200 就停,haproxy 不动;过了才换配置、`systemctl reload`
+   (不 restart)、经 droplet 自己的公网 IP 核对,不通自动还原。
+3. 回滚反过来:先 `--rollback` 写回 11-03 那份,再去 box A 删 snippet。先删 snippet 的话 haproxy 还在
+   发头,box A 把头当成 TLS 数据,国内入口当场全断。
+
+```bash
+bash deploy/offbox/cn_entry/install_cn_entry.sh --plan        # 只列步骤和顺序,不连机器
+bash deploy/offbox/cn_entry/install_cn_entry.sh --preflight   # 只读;box A 还没加 snippet 时停在最后一项,这是对的
+bash deploy/offbox/cn_entry/install_cn_entry.sh               # 预检 → 换配置、reload、核对
+bash deploy/offbox/cn_entry/install_cn_entry.sh --verify      # 只读核对
+bash deploy/offbox/cn_entry/install_cn_entry.sh --rollback    # 先回滚这里,再去 box A 删 snippet
+```
+
+预检认的「11-03 那份」是简报里的配置去掉注释、压掉多余空白之后的样子;装着的那份原样的 sha256
+当时没记,预检会打印出来。
+
+它的边界:
+
+- box A 的 Caddyfile 不在仓库里,`servers :443` 只在站点不写 `bind`、HTTPS 端口用默认 443 时对得上;
+  那份改了监听写法要重核。
+- 只管 TCP。HTTP/3 走 UDP,不经过 haproxy。reload 之前已经建立的连接(最长 10 分钟)仍不带头,照旧算 droplet。
+- 纽约探针仍从 droplet 直连 box A、不带头,`--offbox-source 147.182.176.237` 从此只数得到它和 droplet
+  上别的直连。
+- 两个 IP 写在 `deploy/offbox/cn_entry/` 的三份文件和 `scripts/smoke_caddy_release.py` 里,IP 切换脚本的清单要加上。
+
 ## 异地探针(2026-10 起,跑在 OpenClaw VPS 上)
 
 `nmu-health` 从本机打回本机的公网地址,机器宕了、机房出口断了,它和它的 `OnFailure`
