@@ -19,7 +19,8 @@
 - 08:46 UTC 内核窗口：装 5.15.0-202，重启约 15 秒回来，网络照旧走按 MAC 匹配的那份，代理 `sing-box-hy2` 开机后没重启过。窗口最后报的两条 FAIL 都是误判（PR #43 修）：重启后约 15 秒 nmu 还在 activating（ExecStartPre 没跑完，NRestarts=0）；OS 检查把分阶段推送没轮到这台机器的 `xfsprogs`（jammy-updates，30%）当成「被保留」。
 - 09:39 UTC 收据 282：只送 `scripts/os_security_check.py` 与 `deploy/maintenance/kernel_netplan_window.sh`（旧文件在 `/opt/nmu/before-282-20261106-033924/`），`nmu-os-security` 手动跑一次 success。那次预检唯一一条 FAIL 是 `nmu-health.timer` 恰好在 09:40 触发（SubState=running）。09:40 UTC `verify-kernel` 全过，完整预检全过。
 - 上一条记的空闲门已经在生产上跑过：box A 系统 python3 是 3.10.12；近 30 天日志零解析异常；08:34 UTC 那次窗口被它拦下，当时确有国内用户经新地址登录了控制台。
-- 还没做：观察一天后跑 `kernel_netplan_window.sh purge` 清掉 5.15.0-194；OS 检查只按候选版本的来源判断是不是安全更新（apt 的口径是已装到候选之间任一版本来自 -security），另开改动。
+- 20:36 UTC `kernel_netplan_window.sh purge` 清掉 5.15.0-194 的 5 个包（日志 `/root/nmu-kernel-purge-20261106-203604.log`）。之后只读复核：194 的包零残留，GRUB 与 `/boot` 只剩 202（运行中）和 198（回退），`/boot` 可用从 148M 到 274M，核心服务都是 active，失败单元 0。
+- 还没做：OS 检查只按候选版本的来源判断是不是安全更新（apt 的口径是已装到候选之间任一版本来自 -security），另开改动。
 
 ## 2026-11-06 生产空闲门改成只认应用真路由（只改仓库里的运维脚本，不涉及部署）
 
