@@ -545,6 +545,7 @@ def test_without_the_gate_script_beside_it_the_host_is_not_idle(tmp_path):
     result, commands = _run_phase(tmp_path, "check", script=copy)
 
     assert "本机读不到" in result.stdout and "这一项不过:生产空闲" in result.stdout
+    assert "用绝对路径跑" in result.stdout
     assert result.returncode == 1
     assert not [c for c in commands if "python3" in c]
 

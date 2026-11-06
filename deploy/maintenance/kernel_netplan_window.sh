@@ -148,7 +148,7 @@ window_clear() {   # $1 = 这一阶段最多占用几分钟
 idle_ok() {
   echo "== 生产必须空闲:近 10 分钟真实使用请求 0 个(prod_idle_gate.py 只认应用的真路由,轮询、页面、401 与扫描噪声不算;journal 读不了也算不空闲) =="
   local summary code=0
-  [ -r "${IDLE_GATE}" ] || { echo "  本机读不到 ${IDLE_GATE}"; return 1; }
+  [ -r "${IDLE_GATE}" ] || { echo "  本机读不到 ${IDLE_GATE}(按脚本头用绝对路径跑本脚本)"; return 1; }
   summary=$(RBASH '/usr/bin/python3 -I - --minutes 10' < "${IDLE_GATE}") || code=$?
   echo "  ${summary:-查不到}"
   # 脚本没送到(比如换成带 -n 的 RSH),python3 读到空程序也退 0:没有那行汇总就不算空闲。

@@ -9,13 +9,15 @@ index.html,状态 200(与 /patient 同一份外壳,没有漏文件)。旧过滤�
 这里反过来:方法 + 路径对得上应用的一条真路由,才可能算在用,再减去轮询与 401;对不上
 任何真路由的一律是噪声,页面外壳与静态文件也不算。路由表是抄在下面的字面量:这个脚本经
 ssh 的 stdin 送到生产机、用系统 python3 跑,不能 import app/。tests/test_prod_idle_gate.py
-拿 app.routes 逐条对表,新加的接口忘了进表就红,不会悄悄变成噪声。
+拿 app.routes 逐条对表,新加的接口忘了进表就红,不会悄悄变成噪声。表跟的是本 checkout:
+删或改名接口的那次上线,换版前要跑生产当前 SHA 那一版的这份脚本,旧接口的真请求才不会算成噪声。
 
 退出码:0 空闲;1 有人在用;2 journal 读不了或有解析不了的访问行(调用方一律按不空闲算)。
 只打一行中文汇总,只有各类计数:不打路径、IP、ID、查询串。
 
 只用标准库,兼容 Python 3.10(生产机 Ubuntu 22.04 的系统 python3)。在 Mac 上:
   ssh root@<生产机> '/usr/bin/python3 -I - --minutes 10' < scripts/prod_idle_gate.py
+ssh 带 -n(或 stdin 接了 /dev/null)时远端跑的是空程序,也退 0:没打出那行汇总同样按不空闲算。
 """
 from __future__ import annotations
 
@@ -193,6 +195,10 @@ ACCESS = re.compile(
     r'^(?:INFO: +)?\S* - "(?P<method>\S+) (?P<target>\S+) HTTP/[0-9.]+" (?P<status>[0-9]{3})(?: .*)?$')
 # 应用没有 WebSocket 路由,带 Upgrade 头的扫描只会被拒;uvicorn 记成另一种格式。
 WEBSOCKET = re.compile(r'^(?:INFO: +)?\S* - "WebSocket \S+" \S+$')
+# journald 把超过 LineMax(默认 48K)的一行硬拆成几条记录:前半截只剩方法和截断的目标,
+# 后半截没有 ` - "`,不像访问行。扫描器发一条超长 URL,不该因此挡门 10 分钟。
+LINE_MAX = 48 * 1024
+SPLIT_HEAD = re.compile(r'^(?:INFO: +)?\S* - "(?P<method>\S+) (?P<target>\S+)$')
 # 像访问日志却不符合上面格式的(截断、带颜色码、uvicorn 换了格式):宁可按不空闲算。
 LOOKS_LIKE_ACCESS = re.compile(r' - ".*HTTP/|"(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) ')
 
@@ -235,8 +241,12 @@ def tally(lines: list[str]) -> tuple[dict[str, int], int]:
     anomalies = 0
     for line in lines:
         matched = ACCESS.match(line)
+        head = SPLIT_HEAD.match(line) if len(line.encode("utf-8")) >= LINE_MAX else None
         if matched:
             counts[classify(matched["method"], matched["target"], int(matched["status"]))] += 1
+        elif head:
+            # 状态码拆到了后半截,认不出 401:对得上真路由的照样算在用。
+            counts[classify(head["method"], head["target"], 0)] += 1
         elif WEBSOCKET.match(line):
             counts["noise"] += 1
         elif LOOKS_LIKE_ACCESS.search(line):

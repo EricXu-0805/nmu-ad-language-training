@@ -113,6 +113,8 @@ REAL_LINES = [
     _line("GET", "/patients"),
     _line("GET", "/sessions/S-1/journal?limit=50"),
     _line("POST", "/auth/login", 200),
+    # 公开接口,控制台登录页一打开就请求它:没登录也算在用(与旧过滤相同),登录页开着多半有人要登录。
+    _line("GET", "/auth/config"),
     _line("GET", "/sessions/S-1", 403),
     _line("POST", "/sessions/S-1/items", 422),
 ]
@@ -241,12 +243,39 @@ def test_other_service_output_is_neither_counted_nor_an_anomaly():
     'INFO:     203.0.113.9:0 - "\x1b[1mPOST /items/IE-1/turns HTTP/1.1\x1b[0m" \x1b[32m200 OK\x1b[0m',
     'INFO:     203.0.113.9:0 - "GET /a b HTTP/1.1" 200 OK',
     '"PUT /audio/RA-1/blob HTTP/1.1" 200 OK',
-], ids=["truncated", "no-status", "ansi-colour", "space-in-target", "no-client"])
+    'INFO:     203.0.113.9:0 - "GET /patients',
+], ids=["truncated", "no-status", "ansi-colour", "space-in-target", "no-client",
+        "cut-short-of-line-max"])
 def test_a_line_that_looks_like_access_but_does_not_parse_is_not_idle(text):
     result = _run(_journal(*POLLING_LINES, text))
 
     assert result.returncode == 2, result.stdout
     assert "另有 1 行像访问日志却解析不了,按不空闲算" in result.stdout
+
+
+# journald.conf(5):LineMax 默认 48K,stdout 上更长的一行被硬拆成几条记录,不在边界上找换行。
+_LINE_MAX = 48 * 1024
+
+
+def _split_by_journald(line: str) -> list[str]:
+    data = line.encode("ascii")
+    return [data[at:at + _LINE_MAX].decode("ascii") for at in range(0, len(data), _LINE_MAX)]
+
+
+@pytest.mark.parametrize(("line", "code", "counted"), [
+    (_line("GET", "/index.php?s=" + "a" * 60000, client="198.51.100.23:0"), 0, "对不上真路由的噪声 1)"),
+    (_line("GET", "/console?" + "a" * 120000), 0, "页面与静态 1、"),
+    # 状态码在后半截:就算其实是 401,也认不出来,按在用算。
+    (_line("GET", "/sessions/S-1/journal?cursor=" + "a" * 60000, 401), 1, "真实使用 1 条"),
+], ids=["scanner", "page-three-records", "real-route"])
+def test_a_request_line_longer_than_line_max_is_classified_by_its_head(line, code, counted):
+    records = _split_by_journald(line)
+    assert len(records) >= 2 and len(records[0].encode("ascii")) == _LINE_MAX
+
+    result = _run(_journal(*POLLING_LINES, *records))
+
+    assert result.returncode == code, result.stdout
+    assert counted in result.stdout
 
 
 def test_bytes_that_are_not_utf8_are_not_idle():
