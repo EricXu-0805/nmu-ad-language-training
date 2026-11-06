@@ -10,6 +10,17 @@
 > `docs/handover/七道门现状表.md`。
 
 
+## 2026-11-06 上线 `11a94bd`，补送两个脚本到 `27f11f9`；内核 5.15.0-202；国内入口带真实来源地址
+
+- 生产应用 = `27f11f9f134f1eb600f71d38218c94927027f8d3`（`/opt/nmu/last-deploy.state`）。前一版 `1d57962`。零迁移，库头仍 `a7c3e9d2b641`，依赖锁不变。前端与网关产物出自 `11a94bd` 的 main push CI 42181877498（存档 `上线产物存档/11a94bd-42181877498`）；`27f11f9` 的 main push CI 42195824140，只多两个脚本。部署树两次核对都是 MATCH：`11a94bd` 与 `27f11f9` 各 888 个源码文件、25 个前端构件。
+- 08:27 UTC 国内入口改带 PROXY v2（收据 279）：box A 的 `/opt/nmu/caddy/Caddyfile` 全局选项加 `deploy/offbox/cn_entry/boxa-caddy-global.snippet`（备份 `Caddyfile.before-cn-proxy-20261106T082712Z`），droplet 的 haproxy 换成仓库那份（备份 `/etc/haproxy/haproxy.cfg.before-cn-proxy-20261106T082719Z`）。从 Mac 经新地址打的带记号请求，在 box A 日志里来源不是 droplet；之后 Globalping 国内 6 个探针 HTTPS 都是 200、证书验过。
+- 08:27 UTC 上线脚本 278 第 0–7 步通过：上线前快照 `20261106-082744`（ok），旧 dist 挪到 `/opt/nmu/dist-stale-20261106-022733`。第 8 步判失败是探测早了：systemd 08:28:13 报 Started，uvicorn 08:28:22 才开始监听，脚本 08:28:21 去探，得到 000/502。之后一直是同一个进程，没有重启。
+- 08:43 UTC 收据 281 补完后四步，不停服：rsync 带上去的 `web/.playwright-cli/`（Mac 上 git 忽略的 3 个本机走查日志）挪到 `/opt/nmu/stray-281-20261106-024319/`；换了 `nmu-alert@.service`、`nmu-backup-health.service`、`nmu-caddy.service`、`nmu-health.service`、`nmu-health.timer`（旧的在 `/opt/nmu/systemd-before-281-20261106-084348`）；网关换成 `2bfa79d9cc6953361791327e97499181883629c7f6b7383952b0f80205050c66`（Caddy 本体仍 v2.11.4，旧的 `6dd4a04f…` 留在 `/opt/nmu/caddy-before-281-20261106-084401`）。
+- 08:46 UTC 内核窗口：装 5.15.0-202，重启约 15 秒回来，网络照旧走按 MAC 匹配的那份，代理 `sing-box-hy2` 开机后没重启过。窗口最后报的两条 FAIL 都是误判（PR #43 修）：重启后约 15 秒 nmu 还在 activating（ExecStartPre 没跑完，NRestarts=0）；OS 检查把分阶段推送没轮到这台机器的 `xfsprogs`（jammy-updates，30%）当成「被保留」。
+- 09:39 UTC 收据 282：只送 `scripts/os_security_check.py` 与 `deploy/maintenance/kernel_netplan_window.sh`（旧文件在 `/opt/nmu/before-282-20261106-033924/`），`nmu-os-security` 手动跑一次 success。那次预检唯一一条 FAIL 是 `nmu-health.timer` 恰好在 09:40 触发（SubState=running）。09:40 UTC `verify-kernel` 全过，完整预检全过。
+- 上一条记的空闲门已经在生产上跑过：box A 系统 python3 是 3.10.12；近 30 天日志零解析异常；08:34 UTC 那次窗口被它拦下，当时确有国内用户经新地址登录了控制台。
+- 还没做：观察一天后跑 `kernel_netplan_window.sh purge` 清掉 5.15.0-194；OS 检查只按候选版本的来源判断是不是安全更新（apt 的口径是已装到候选之间任一版本来自 -security），另开改动。
+
 ## 2026-11-06 生产空闲门改成只认应用真路由（只改仓库里的运维脚本，不涉及部署）
 
 - 起因：11-03 开通国内入口（droplet 上 haproxy 按 TCP 原样转到 box A 的 443）后，互联网扫描器的请求也进了 box A。11-05 晚只读核对，nmu 的 journal 里成串出现 `GET /.env`、`/.git/config`、`/actuator/env`、`/server-status`、`/v2/_catalog`、`/.DS_Store`、`/info.php`、`/%40vite/env`、`/.vscode/sftp.json`、`/debug/default`，状态全是 200：应用的 SPA 兜底回的是 `dist/index.html`，与 `/patient` 字节相同，没有漏文件。旧空闲过滤（267 起抄在 `kernel_netplan_window.sh` 的 `idle_ok` 与各上线脚本里的那串 grep）把不在轮询/页面名单上的请求一律算在用，扫描器一来空闲门就过不去，上线脚本 277 当晚停在这一步。
