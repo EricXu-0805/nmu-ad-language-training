@@ -230,6 +230,37 @@ def test_full_upgrade_simulation_counts_the_kernel_as_security_backlog():
     assert any("2 个非安全更新" in n for n in notes)
 
 
+# 2026-11-06 内核窗口刚重启完的生产机:xfsprogs 5.13.0-1ubuntu2.2 在 jammy-updates 分阶段推到 30%。
+PHASED_DEFAULT_OUTPUT = """\
+The following packages have been kept back:
+  xfsprogs
+The following packages will be upgraded:
+  libglib2.0-0 libglib2.0-bin libglib2.0-data nano snapd
+Inst nano [6.2-1ubuntu0.2] (6.2-1ubuntu0.3 Ubuntu:22.04/jammy-updates [amd64])
+"""
+# 同一刻加 -o APT::Get::Always-Include-Phased-Updates=true:保留块没了,xfsprogs 出带来源的 Inst 行。
+PHASED_INCLUDED_OUTPUT = """\
+The following packages will be upgraded:
+  libglib2.0-0 libglib2.0-bin libglib2.0-data nano snapd xfsprogs
+Inst nano [6.2-1ubuntu0.2] (6.2-1ubuntu0.3 Ubuntu:22.04/jammy-updates [amd64])
+Inst xfsprogs [5.13.0-1ubuntu2.1] (5.13.0-1ubuntu2.2 Ubuntu:22.04/jammy-updates [amd64])
+"""
+
+
+def test_a_phased_update_is_counted_by_origin_instead_of_failing_as_kept_back():
+    """分阶段推送没轮到的包 apt 也列成保留;不把它算进来,每推一个 -updates 包周检就误报一周。"""
+    assert osc.parse_kept_back(PHASED_DEFAULT_OUTPUT) == ["xfsprogs"]
+    failures, _ = osc.evaluate(osc.parse_simulation(PHASED_DEFAULT_OUTPUT), FRESH, MAX_AGE, False,
+                               osc.parse_kept_back(PHASED_DEFAULT_OUTPUT))
+    assert len(failures) == 1 and "xfsprogs" in failures[0]
+
+    pending = osc.parse_simulation(PHASED_INCLUDED_OUTPUT)
+    assert osc.parse_kept_back(PHASED_INCLUDED_OUTPUT) == []
+    assert [(p.name, p.security) for p in pending] == [("nano", False), ("xfsprogs", False)]
+    failures, notes = osc.evaluate(pending, FRESH, MAX_AGE, False, [])
+    assert failures == [] and any("2 个非安全更新" in n for n in notes)
+
+
 def test_the_fix_sends_kernel_packages_to_the_window_and_never_says_full_upgrade():
     """2026-11-02 的告警把内核也写成 apt-get full-upgrade,而内核按规矩只在维护窗口里装。"""
     kernel = [p for p in osc.parse_simulation(FULL_UPGRADE_OUTPUT) if p.security]
@@ -289,7 +320,8 @@ def test_run_simulation_asks_apt_for_a_full_upgrade_in_the_c_locale(monkeypatch)
     monkeypatch.setattr(osc.subprocess, "run",
                         lambda argv, **kw: seen.append((argv, kw)) or _Done())
     assert osc.run_simulation() == FULL_UPGRADE_OUTPUT
-    assert [argv for argv, _kw in seen] == [["apt-get", "-s", "full-upgrade"]]
+    assert [argv for argv, _kw in seen] == [
+        ["apt-get", "-s", "-o", "APT::Get::Always-Include-Phased-Updates=true", "full-upgrade"]]
     # ssh 会把 Mac 的 LANG/LC_* 带到生产机;标题一被翻译,按英文解析的保留项就失明。
     assert seen[0][1]["env"]["LC_ALL"] == "C"
 

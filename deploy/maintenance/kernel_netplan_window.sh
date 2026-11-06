@@ -236,14 +236,18 @@ set -u
 bad=0
 pass() { echo "  PASS $*"; }
 fail() { echo "  FAIL $*"; bad=1; }
+# boot_id 一换就来核对,nmu 还在跑迁移核对、等 uvicorn 起来(11-06 开机后 activating 十几秒,
+# 窗口当场判了 FAIL)。activating 等它落定再判,最多 90 秒;落定成别的照旧 FAIL。
 for unit in nmu nmu-caddy nginx ssh systemd-networkd systemd-resolved qemu-guest-agent; do
-  state=$(systemctl --no-pager is-active "${unit}")
+  state=$(systemctl --no-pager is-active "${unit}"); waited=0
+  while [ "${state}" = "activating" ] && [ "${waited}" -lt 90 ]; do sleep 3; waited=$((waited + 3)); state=$(systemctl --no-pager is-active "${unit}"); done
   if [ "${state}" = "active" ]; then pass "${unit} active"; else fail "${unit} ${state}"; fi
 done
 # 代理跟着机器上的配置走:10-28 整个 IP 被墙后 sing-box 停用,改跑 sing-box-hy2。开机自启的必须在跑。
 proxies=$(systemctl --no-pager list-unit-files --no-legend --state=enabled 'sing-box*.service' | awk '{print $1}' | tr '\n' ' ')
 for unit in ${proxies}; do
-  state=$(systemctl --no-pager is-active "${unit}")
+  state=$(systemctl --no-pager is-active "${unit}"); waited=0
+  while [ "${state}" = "activating" ] && [ "${waited}" -lt 90 ]; do sleep 3; waited=$((waited + 3)); state=$(systemctl --no-pager is-active "${unit}"); done
   if [ "${state}" = "active" ]; then pass "${unit} active"; else fail "${unit} ${state}(开机自启却没在跑)"; fi
 done
 echo "  注 开机自启的代理:${proxies:-无}"

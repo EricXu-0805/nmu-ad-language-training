@@ -20,7 +20,10 @@ jammy-security。没有任何东西在看这个数字，它只会越积越多。
                                  需要装新依赖的内核/netplan 更新整组"保留"、不出
                                  Inst 行，5 个安全内核包积着而这里报 0。所以模拟改用
                                  full-upgrade（把保留的包一起算），万一 full-upgrade
-                                 仍有保留项，按名字报失败，不当作通过。
+                                 仍有保留项，按名字报失败，不当作通过。分阶段推送
+                                 （phased）的更新 apt 也列成保留：2026-11-06 xfsprogs
+                                 在 jammy-updates 推到 30%，内核窗口后唯一一条 FAIL 就是它。
+                                 模拟时把分阶段的也算进来，它们照来源归进积压或普通更新。
   nmu/nginx 还映射着被换掉的库 → 退出 1，给出重启命令。补丁装在盘上不等于修好：
                                  进程不重启就一直跑着旧 libssl/libsqlite3/zlib。夜间
                                  自动装安全补丁之后盘上的库天天在换，而这台机器没装
@@ -134,8 +137,11 @@ def run_simulation() -> str:
     # netplan 拆包）整组"保留"、不出 Inst 行，安全内核积着这里却报 0（2026-09-11 查出）。
     # 锁定 C locale:ssh 会把 Mac 的 LANG/LC_* 带过去,apt 的"kept back"标题一被翻译,
     # 下面按英文标题解析的保留项就悄悄变成空(Inst 行不翻译,只有这一层会失明)。
+    # Always-Include-Phased-Updates:分阶段推送没轮到这台机器的包不再列成保留,改出带来源的
+    # Inst 行;只影响这次模拟,真装的时候 apt 照旧按阶段来。
     done = subprocess.run(
-        ["apt-get", "-s", "full-upgrade"], capture_output=True, text=True, timeout=300,
+        ["apt-get", "-s", "-o", "APT::Get::Always-Include-Phased-Updates=true", "full-upgrade"],
+        capture_output=True, text=True, timeout=300,
         env={**os.environ, "LC_ALL": "C", "LANG": "C"})
     if done.returncode != 0:
         raise RuntimeError(f"apt-get -s full-upgrade 失败：{done.stderr.strip()[:300]}")

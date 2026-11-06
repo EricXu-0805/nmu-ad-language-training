@@ -171,6 +171,18 @@ def test_the_post_reboot_check_reads_all_six_timers():
         assert prop in health
 
 
+def test_the_post_reboot_check_waits_for_activating_units_instead_of_failing_them():
+    """11-06 重启后约 15 秒就来核对,nmu 还在 activating,窗口当场判 FAIL;它几秒后就起来了。"""
+    health = next(body for delimiter, body in _heredocs(_text())
+                  if delimiter == "REMOTE" and "for t in ${TIMERS}" in body)
+    loops = re.findall(r"^for unit in (.*); do\n(.*)\n(.*)\n", health, re.M)
+    assert [units.split()[0] for units, _first, _second in loops] == ["nmu", "${proxies}"], loops
+    for _units, first, second in loops:
+        assert first.strip() == 'state=$(systemctl --no-pager is-active "${unit}"); waited=0'
+        assert second.strip().startswith(
+            'while [ "${state}" = "activating" ] && [ "${waited}" -lt 90 ]; do sleep 3;'), second
+
+
 def test_the_proxy_units_follow_what_is_enabled_on_the_host():
     """10-28 整个 IP 被墙后 sing-box 停用、改跑 sing-box-hy2:写死 sing-box 的核对会让窗口
     在开窗前就停下(2026-11-03 演练就停在这里)。开机自启的 sing-box* 都要在跑、开机后没重启过。"""
