@@ -35,6 +35,7 @@ NMU_TIMERS = {"nmu-backup.timer", "nmu-backup-health.timer", "nmu-capacity.timer
 BARE_VAR_BEFORE_WIDE = re.compile(r"\$\{?\\?\$?[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_}])[^\x00-\x7F]")
 _HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 _UNIT = re.compile(r"[\w@.-]+\.(?:timer|service|socket|target|path)\b")
+_IDLE_GATE_ROOT = "${0%/deploy/maintenance/kernel_netplan_window.sh}"
 
 
 def _text() -> str:
@@ -120,7 +121,9 @@ def test_the_run_line_is_absolute_and_nothing_depends_on_the_working_directory()
         if re.search(r"(?<![/\w-])python3?\s", line):
             offenders.append(f"解释器不是绝对路径：{line.strip()}")
         for found in re.finditer(r"scripts/", line):
-            if not line[:found.start()].endswith("/opt/nmu/app/"):
+            # 空闲门按本脚本自己的绝对路径($0)找仓库里那一份,与当前目录无关。
+            if not (line[:found.start()].endswith("/opt/nmu/app/")
+                    or line.startswith(f'IDLE_GATE="{_IDLE_GATE_ROOT}/')):
                 offenders.append(f"仓库相对路径：{line.strip()}")
     assert not offenders, "\n".join(offenders)
 
@@ -371,8 +374,16 @@ if command == "true":
     reply()
 if command.startswith("date -u"):
     reply(os.environ["FAKE_CLOCK"] + "\\n")
-if "journalctl -u nmu" in command:
-    reply("0\\n")
+if command == "/usr/bin/python3 -I - --minutes 10":
+    # 空闲门:送过来的就是 scripts/prod_idle_gate.py,原样跑一遍,日志换成测试给的那份。
+    import subprocess
+    gate = os.path.join(os.path.dirname(state_path), "idle_gate_received.py")
+    with open(gate, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    with open(os.environ["FAKE_JOURNAL"], "rb") as journal:
+        done = subprocess.run([sys.executable, "-I", gate, "--minutes", "10", "--stdin"],
+                              stdin=journal, capture_output=True, text=True)
+    reply(done.stdout, done.returncode)
 if command.startswith("/opt/nmu/venv/bin/python -I -"):
     reply("  场次运行状态: aborted 45\\n")
 if "def stale_library_units" in command:
@@ -429,8 +440,9 @@ _FRESH_HOST = {"boot": "boot-a", "kernel": "5.15.0-198-generic", "installed": Fa
 
 
 def _run_phase(tmp_path: Path, phase: str, answers: str = "", clock: str = "5 03 10",
-               simulation: str = _SIMULATION_202,
-               host: dict | None = None) -> tuple[subprocess.CompletedProcess, list[str]]:
+               simulation: str = _SIMULATION_202, host: dict | None = None,
+               journal: str = "",
+               script: Path = SCRIPT) -> tuple[subprocess.CompletedProcess, list[str]]:
     import json
     import os
     import sys
@@ -450,10 +462,12 @@ def _run_phase(tmp_path: Path, phase: str, answers: str = "", clock: str = "5 03
         state.write_text(json.dumps(host or _FRESH_HOST), encoding="utf-8")
     log = tmp_path / f"ssh-{phase}.log"
     log.write_text("", encoding="utf-8")
+    nmu_journal = tmp_path / "nmu-journal.log"
+    nmu_journal.write_text(journal, encoding="utf-8")
     env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HOME": str(tmp_path),
            "FAKE_SSH_LOG": str(log), "FAKE_STATE": str(state), "FAKE_CLOCK": clock,
-           "FAKE_SIMULATION": simulation}
-    result = subprocess.run(["bash", str(SCRIPT), phase], input=answers, capture_output=True,
+           "FAKE_SIMULATION": simulation, "FAKE_JOURNAL": str(nmu_journal)}
+    result = subprocess.run(["bash", str(script), phase], input=answers, capture_output=True,
                             text=True, env=env, timeout=120)
     assert "没预料到的远端命令" not in result.stderr, result.stderr
     return result, log.read_text(encoding="utf-8").splitlines()
@@ -479,6 +493,79 @@ def test_the_check_phase_passes_on_a_quiet_host_and_changes_nothing(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "演练:每一项都过" in result.stdout
     assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
+
+
+def test_the_idle_gate_is_the_shared_script_not_an_inline_filter():
+    """11-05 扫描器把内联的 grep 过滤挡死了:过滤只许有 scripts/prod_idle_gate.py 那一份,
+    经 RBASH(不带 -n)的 stdin 送过去;RSH 的 -n 会把脚本丢掉。"""
+    text = _text()
+    assert not re.search(r"journalctl|grep -vcE|patient-heartbeat|401 Unauthorized", text)
+    assert """RBASH '/usr/bin/python3 -I - --minutes 10' < "${IDLE_GATE}\"""" in _function("idle_ok")
+    definition = re.search(r"^IDLE_GATE=.*$", text, re.M).group(0)
+    resolved = subprocess.run(["bash", "-c", definition + '\nprintf %s "${IDLE_GATE}"', str(SCRIPT)],
+                              capture_output=True, text=True, check=True).stdout
+    assert Path(resolved) == ROOT / "scripts" / "prod_idle_gate.py"
+
+
+_SCANNER = "".join(f'INFO:     198.51.100.23:0 - "GET {path} HTTP/1.1" 200 OK\n' for path in (
+    "/.env", "/.git/config", "/actuator/env", "/server-status", "/v2/_catalog", "/%40vite/env"))
+_POLLING = ('INFO:     127.0.0.1:0 - "GET /health/ready HTTP/1.1" 200 OK\n'
+            'INFO:     203.0.113.9:0 - "GET /live/state HTTP/1.1" 200 OK\n')
+_ONE_ANSWER = 'INFO:     203.0.113.9:0 - "POST /items/IE-1/turns HTTP/1.1" 200 OK\n'
+
+
+@pytest.mark.parametrize(("journal", "idle", "summary"), [
+    (_SCANNER + _POLLING, True, "  近 10 分钟真实使用 0 条(不算:轮询 2、"),
+    (_SCANNER + _POLLING + _ONE_ANSWER, False, ",有人在用"),
+    (_POLLING + 'INFO:     203.0.113.9:0 - "POST /items/IE-1/turns HTTP/1.1\n', False,
+     "像访问日志却解析不了,按不空闲算"),
+], ids=["scanner-noise", "one-answer", "unparsable"])
+def test_the_check_phase_counts_only_real_use_as_busy(journal, idle, summary, tmp_path):
+    result, _ = _run_phase(tmp_path, "check", journal=journal)
+
+    assert summary in result.stdout, result.stdout + result.stderr
+    assert ("这一项不过:生产空闲" in result.stdout) is not idle
+    assert result.returncode == (0 if idle else 1)
+
+
+def test_the_kernel_phase_stops_at_the_idle_gate_before_touching_anything(tmp_path):
+    result, commands = _run_phase(tmp_path, "kernel", answers="yes\n" * 4,
+                                  journal=_SCANNER + _ONE_ANSWER)
+
+    assert result.returncode == 1 and "停:生产空闲(生产没有任何改动)" in result.stdout
+    assert "近 10 分钟真实使用 1 条(" in result.stdout
+    assert not [c for c in commands if "apt-get install" in c or REBOOT in c]
+
+
+def test_without_the_gate_script_beside_it_the_host_is_not_idle(tmp_path):
+    copy = tmp_path / "repo" / "deploy" / "maintenance" / SCRIPT.name
+    copy.parent.mkdir(parents=True)
+    copy.write_text(_text(), encoding="utf-8")
+
+    result, commands = _run_phase(tmp_path, "check", script=copy)
+
+    assert "本机读不到" in result.stdout and "这一项不过:生产空闲" in result.stdout
+    assert result.returncode == 1
+    assert not [c for c in commands if "python3" in c]
+
+
+def test_a_gate_that_never_reached_the_host_is_not_idle(tmp_path):
+    """ssh -n 把 stdin 换成 /dev/null:远端 python3 读到空程序、一声不吭退 0,不能当空闲。"""
+    copy = tmp_path / "repo" / "deploy" / "maintenance" / SCRIPT.name
+    copy.parent.mkdir(parents=True)
+    (tmp_path / "repo" / "scripts").mkdir()
+    (tmp_path / "repo" / "scripts" / "prod_idle_gate.py").write_bytes(
+        (ROOT / "scripts" / "prod_idle_gate.py").read_bytes())
+    pipe = "RBASH '/usr/bin/python3 -I - --minutes 10'"
+    assert pipe in _text()
+    copy.write_text(_text().replace(pipe, "RSH '/usr/bin/python3 -I - --minutes 10'"),
+                    encoding="utf-8")
+
+    result, commands = _run_phase(tmp_path, "check", script=copy)
+
+    assert [c for c in commands if c == "/usr/bin/python3 -I - --minutes 10"]
+    assert "  查不到" in result.stdout and "这一项不过:生产空闲" in result.stdout
+    assert result.returncode == 1
 
 
 def test_the_check_phase_flags_the_nightly_window_and_an_unexpected_package(tmp_path):
