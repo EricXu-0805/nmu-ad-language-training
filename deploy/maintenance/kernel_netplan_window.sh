@@ -36,6 +36,8 @@ KEY="$HOME/.ssh/id_ed25519"
 HOST="root@89.208.253.119"
 SITE="https://89-208-253-119.sslip.io"
 KIWIVM="https://kiwivm.64clouds.com/"
+# 空闲门的过滤在仓库里只有一份,经 ssh 的 stdin 送过去跑;按本脚本的绝对路径找,不看当前目录。
+IDLE_GATE="${0%/deploy/maintenance/kernel_netplan_window.sh}/scripts/prod_idle_gate.py"
 TARGET_ABI="5.15.0-202"
 FALLBACK_ABI="5.15.0-198"
 PURGE_ABI="5.15.0-194"
@@ -144,11 +146,13 @@ window_clear() {   # $1 = 这一阶段最多占用几分钟
 }
 
 idle_ok() {
-  echo "== 生产必须空闲:近 10 分钟非轮询请求 0 个(与 267 同一个过滤;journal 读不了也算不空闲) =="
-  local idle
-  idle=$(RSH 'out=$(journalctl -u nmu --since "-10 min" --no-pager -o cat 2>/dev/null) || { echo 查不到; exit 0; }; printf "%s\n" "$out" | grep -E "\"(POST|GET|PATCH|PUT|DELETE) " | grep -vcE "/health|/device/attach|/device/heartbeat|/autopilot/next|/autopilot/voice-settings|/sessions/[^/]+/autopilot/status|/live/state|/live/patient-heartbeat|/build-id.txt|/status HTTP|/runtime HTTP|/ai/provider-readiness|401 Unauthorized|\"GET /(patient|console|acceptance|index\.html|assets/|favicon|robots\.txt)"')
-  echo "  近 10 分钟非轮询请求数:${idle:-查不到}"
-  [ "${idle}" = "0" ]
+  echo "== 生产必须空闲:近 10 分钟真实使用请求 0 个(prod_idle_gate.py 只认应用的真路由,轮询、页面、401 与扫描噪声不算;journal 读不了也算不空闲) =="
+  local summary code=0
+  [ -r "${IDLE_GATE}" ] || { echo "  本机读不到 ${IDLE_GATE}(按脚本头用绝对路径跑本脚本)"; return 1; }
+  summary=$(RBASH '/usr/bin/python3 -I - --minutes 10' < "${IDLE_GATE}") || code=$?
+  echo "  ${summary:-查不到}"
+  # 脚本没送到(比如换成带 -n 的 RSH),python3 读到空程序也退 0:没有那行汇总就不算空闲。
+  [ "${code}" = "0" ] && [ -n "${summary}" ]
 }
 
 db_quiet() {

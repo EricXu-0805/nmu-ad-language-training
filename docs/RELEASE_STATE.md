@@ -10,6 +10,18 @@
 > `docs/handover/七道门现状表.md`。
 
 
+## 2026-11-06 生产空闲门改成只认应用真路由（只改仓库里的运维脚本，不涉及部署）
+
+- 起因：11-03 开通国内入口（droplet 上 haproxy 按 TCP 原样转到 box A 的 443）后，互联网扫描器的请求也进了 box A。11-05 晚只读核对，nmu 的 journal 里成串出现 `GET /.env`、`/.git/config`、`/actuator/env`、`/server-status`、`/v2/_catalog`、`/.DS_Store`、`/info.php`、`/%40vite/env`、`/.vscode/sftp.json`、`/debug/default`，状态全是 200：应用的 SPA 兜底回的是 `dist/index.html`，与 `/patient` 字节相同，没有漏文件。旧空闲过滤（267 起抄在 `kernel_netplan_window.sh` 的 `idle_ok` 与各上线脚本里的那串 grep）把不在轮询/页面名单上的请求一律算在用，扫描器一来空闲门就过不去，上线脚本 277 当晚停在这一步。
+- 现在：新增 `scripts/prod_idle_gate.py`（只用标准库、兼容 Python 3.10，经 ssh 的 stdin 送到生产机用系统 `/usr/bin/python3` 跑，不用发版）。方法 + 路径对得上应用一条真路由的请求才可能算在用，再减去轮询（与旧过滤同一批：`/health` 与 `/health/ready`、设备 attach、自动带练 next/voice-settings/status、`GET /live/state`、老人端心跳、照护员 status、场次 runtime、`GET /ai/provider-readiness`）和 401；对不上任何真路由的算噪声，页面外壳与静态文件也不算。退出码 0 空闲、1 有人在用、2 journal 读不了（含不是 root、非 UTF-8、有像访问日志却解析不了的行），2 一律按不空闲。只打一行分类计数，不打路径、IP、ID、查询串。`tests/test_prod_idle_gate.py` 拿 `app.routes` 逐条对表（现有 148 条方法 + 路径），新接口没进表就红。
+- 与旧过滤有意不同的几处（扫描噪声之外）：`PUT /live/state`（写游标、报录音）与 `POST /ai/provider-readiness/probe`（管理员点实测）现在算在用，旧 grep 按路径子串把它们当轮询放过了；`GET /patients…`（研究者读受试者名单与档案）算在用，旧页面名单的 `"GET /patient` 没收尾，把它们当页面放过了；`GET /` 与 `/device-check` 是页面外壳，不再算在用。其余普通流量上逐行结论与旧过滤相同（测试逐行对照）。
+- `kernel_netplan_window.sh` 只加了一个常量 `IDLE_GATE`（按脚本自身的绝对路径找上面那份）、改了 `idle_ok`：经 `RBASH`（不带 `-n`）把脚本送过去跑，打印那行汇总；本机找不到脚本、ssh 失败、汇总为空（脚本没送到）都算不空闲。其余阶段、内核常量与门槛没动。
+- 仓库外仍抄着旧过滤、本仓库不改的：项目根 `项目综合审计_20260717/PM_20260730_自动对话/` 下 258、261、263、264、267、270、277 号脚本里的 grep；`审核报告_20261008/maintenance_release.py`、`审核报告_20261015/web_release.py`、`审核报告_20261023/` 下三份 `web_release.py` 里的 Python 版（同一张名单）。之后的上线脚本改用 `ssh root@… '/usr/bin/python3 -I - --minutes 10' < …/platform/scripts/prod_idle_gate.py`，退出码非 0、或没打出「真实使用」那行汇总，都按不空闲停：ssh 带 `-n`、或 stdin 接了 `/dev/null` 时，远端 python3 跑的是空程序，也退 0。IP 切换脚本 `bwg-ip-cutover.sh` 本机没找到，没核。
+- 路由表跟的是跑门那份 checkout：哪次上线删了或改名了接口，换版前的空闲门要跑生产当前 SHA 那一版（`git show <生产 SHA>:scripts/prod_idle_gate.py | ssh …`），否则旧版上那些接口的真请求会被当成噪声。
+- 超长请求行：journald 把超过 LineMax（默认 48K）的一行硬拆成几条记录。前半截按方法 + 路径照常分类，状态码拆到后半截去了，对得上真路由的一律算在用（认不出 401）；后半截不像访问行，不计。扫描器发一条超长 URL 不再挡门 10 分钟。box A 的 LineMax 没核，若调小了，拆出来的前半截不到 48K，仍按解析不了算不空闲。
+- 没改、与旧过滤相同：`GET /auth/config` 是公开接口，控制台登录页一打开就请求它，所以没登录的人打开 /console 也会让门读成在用。登录页开着多半有人要登录，暂按在用算；要放过它得先定。
+- 还没在生产上跑过：access 行格式按 uvicorn 0.50.2 默认配置、系统 python3 按 Ubuntu 22.04 推定；以下一次 `kernel_netplan_window.sh check` 打出的那行汇总为准。
+
 ## 2026-11-03 记账更正（只改文档，不涉及部署）
 
 - 10-15、10-08 两条末尾的「OpenClaw 每日心跳接入本轮未改」和 10-03 补记里的「接入 OpenClaw 每日心跳仍未完成」在各自当时成立，现已过时：2026-10-27 04:45 UTC `check_nmu_probe` 已插进 OpenClaw 的 heartbeat.py（插入前备份 `heartbeat.py.before-nmu-probe-20261027T044532Z`），机外探针停摆会出现在 22:00 CT 的 Heartbeat 里。原条目不改。
