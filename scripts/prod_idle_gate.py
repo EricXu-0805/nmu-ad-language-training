@@ -93,6 +93,7 @@ GET /content/week1-warmup
 POST /device/pair
 GET /exports/{batch_id}
 GET /exports/{batch_id}/{unknown_path:path}
+GET /governance/superseded-audio
 GET /governance/withdrawn-audio
 POST /items/{item_event_id}/turns
 POST /judge/build-input
