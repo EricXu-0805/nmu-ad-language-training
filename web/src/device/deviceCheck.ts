@@ -63,6 +63,8 @@ export interface DeviceCheckDependencies {
    * 拿 performance.now() 来实现会把偏移算成整个 Unix 时间戳。 */
   now(): number;
   storageEstimate(): Promise<{ quotaBytes: number | null; usageBytes: number | null }>;
+  /** 在一次性库里写入、读回、删掉一小段数据(不碰录音库);任何一步不对就抛错。 */
+  indexedDbRoundTrip(kind: "blob" | "array-buffer"): Promise<void>;
 }
 
 // 生产录音链的真实口径(audio/recorder.ts):首选 audio/webm,不支持则交给浏览器
@@ -273,6 +275,29 @@ export function classifyStorage(quotaBytes: number | null, usageBytes: number | 
   return { id, title, status: "pass", detail: `可用约 ${freeMb} MB` };
 }
 
+/**
+ * 真写一次本机暂存。WebKit 非持久会话(如无痕)拒存 Blob 而 ArrayBuffer 照常,
+ * 录音 outbox 届时自动改存字节(blobStore.stageOutbox),所以只有两种都写不进才 fail。
+ */
+export async function checkAudioStorage(deps: DeviceCheckDependencies): Promise<CheckResult> {
+  const id = "audio-storage";
+  const title = "录音暂存";
+  try {
+    await deps.indexedDbRoundTrip("blob");
+    return { id, title, status: "pass", detail: "Blob 写入、读回、删除正常" };
+  } catch { /* 再试兼容存储 */ }
+  try {
+    await deps.indexedDbRoundTrip("array-buffer");
+  } catch (error) {
+    const name = (error as { name?: string } | null)?.name || String(error);
+    return { id, title, status: "fail",
+      detail: `本机暂存写不进（${name}），录音无法保存。请换普通浏览模式或新版浏览器后重查。` };
+  }
+  return { id, title, status: "warn",
+    detail: "Blob 存储不可用，已改存 ArrayBuffer，录音照常暂存和上传。" +
+            "可能是无痕/隐私模式：关掉页面后暂存会被清除，建议改用普通模式。" };
+}
+
 export function classifyScreen(screen: { width: number; height: number; pixelRatio: number }): CheckResult {
   const id = "screen";
   const title = "屏幕显示";
@@ -337,7 +362,7 @@ export type Verdict = "basic-pass" | "basic-pass-with-warnings" | "basic-fail" |
 
 export const REQUIRED_CHECK_IDS = Object.freeze([
   "runtime", "build-binding", "browser-safety", "microphone", "codec", "sample-rate",
-  "audio-output", "fallback-voice", "network", "storage", "screen",
+  "audio-output", "fallback-voice", "network", "storage", "audio-storage", "screen",
   "noise-floor", "speech-level", "speaker",
 ] as const);
 
@@ -452,6 +477,7 @@ export async function runAutoChecks(
     const estimate = await deps.storageEstimate();
     return classifyStorage(estimate.quotaBytes, estimate.usageBytes);
   });
+  await guarded("audio-storage", "录音暂存", () => checkAudioStorage(deps));
   await guarded("screen", "屏幕显示", () => classifyScreen(deps.screen));
 
   return { results, micInfo };

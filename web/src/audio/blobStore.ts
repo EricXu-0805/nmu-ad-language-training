@@ -27,6 +27,37 @@ const LEGACY_STORE = "legacy-orphans";
 const AUTOPILOT_ACK_STORE = "autopilot-acks";
 const AUTOPILOT_ACK_STATE_STORE = "autopilot-ack-state";
 const DB_VERSION = 4;
+export const STORED_AUDIO_BYTES_FORMAT = "nmu-audio-bytes-v1";
+
+/** Blob 被拒存时 blobs 仓库里的兼容形状；正常路径仍存 Blob 本身。 */
+interface StoredAudioBytes {
+  format: typeof STORED_AUDIO_BYTES_FORMAT;
+  type: string;
+  bytes: ArrayBuffer;
+}
+
+/**
+ * blobs 仓库值的唯一还原口：Blob 原样交回，字段完全吻合的字节记录还原成同字节
+ * Blob。其余形状一律换成空 Blob——outbox 的 blobBytes 恒 > 0，各调用方已有的
+ * size 校验必然拒绝（storage-invalid），这里绝不猜内容。
+ */
+export function storedAudioBlob(value: unknown): Blob | undefined {
+  if (value === undefined || value instanceof Blob) return value;
+  const record = value as Partial<StoredAudioBytes> | null;
+  if (record === null || typeof record !== "object" || Object.keys(record).length !== 3
+      || record.format !== STORED_AUDIO_BYTES_FORMAT || typeof record.type !== "string"
+      || !(record.bytes instanceof ArrayBuffer)) {
+    return new Blob([]);
+  }
+  return new Blob([record.bytes], { type: record.type });
+}
+
+// WebKit 26.4/26.6 非持久会话里 add(Blob) 中止为 UnknownError「Error preparing
+// Blob/File data」，同一会话里 ArrayBuffer 照常可存（审核报告_20261023；11-05 在 26.4 复现）。
+function isBlobStorageRefusal(error: unknown): boolean {
+  const name = (error as { name?: unknown } | null)?.name;
+  return name === "UnknownError" || name === "DataCloneError";
+}
 
 export interface AudioRecoverySnapshot {
   entries: AudioOutboxEntry[];
@@ -75,7 +106,7 @@ function sameOutboxSnapshot(left: AudioOutboxEntry, right: AudioOutboxEntry): bo
 export function planTerminalOutboxDiscard(input: {
   expectedEntry: AudioOutboxEntry;
   storedEntry: unknown | undefined;
-  storedBlob: Blob | undefined;
+  storedBlob: unknown | undefined;
   hasLegacyMarker: boolean;
 }): TerminalOutboxDiscardResult {
   const expected = parseAudioOutboxEntry(input.expectedEntry);
@@ -96,7 +127,7 @@ export function planTerminalOutboxDiscard(input: {
   if (!sameOutboxSnapshot(stored, expected)) {
     throw new TerminalOutboxIntegrityError("终态录音 outbox 在处置前已变化");
   }
-  const blob = input.storedBlob as Blob;
+  const blob = storedAudioBlob(input.storedBlob) as Blob;
   if (blob.size !== expected.blobBytes || (blob.type || "audio/webm") !== expected.mimeType) {
     throw new TerminalOutboxIntegrityError("终态录音 Blob 在处置前已变化");
   }
@@ -183,7 +214,7 @@ function tx<T>(storeName: string, mode: IDBTransactionMode,
 
 export const blobStore = {
   get: (rawAudioId: string): Promise<Blob | undefined> =>
-    tx<Blob | undefined>(STORE, "readonly", (s) => s.get(rawAudioId) as IDBRequest<Blob | undefined>),
+    tx<unknown>(STORE, "readonly", (s) => s.get(rawAudioId)).then(storedAudioBlob),
   keys: (): Promise<string[]> =>
     tx<IDBValidKey[]>(STORE, "readonly", (s) => s.getAllKeys()).then((keys) =>
       keys.filter((key): key is string => typeof key === "string")),
@@ -229,18 +260,26 @@ export const blobStore = {
         || (blob.type || "audio/webm") !== safe.mimeType) {
       return Promise.reject(new Error("录音与 outbox 元数据不一致"));
     }
-    return open().then((db) => new Promise<void>((resolve, reject) => {
+    const stage = (value: Blob | StoredAudioBytes) => open().then((db) => new Promise<void>((resolve, reject) => {
       const transaction = db.transaction([STORE, OUTBOX_STORE], "readwrite");
-      // add 而非 put：同 ID 的本机记录绝不能被另一段字节静默覆盖。
-      transaction.objectStore(STORE).add(blob, safe.rawAudioId);
-      transaction.objectStore(OUTBOX_STORE).add(safe);
+      // 先挂回调：add 同步抛 DataCloneError 时，空事务提交也要关库。
       transaction.oncomplete = () => { db.close(); resolve(); };
       transaction.onabort = () => {
         db.close();
         reject(transaction.error ?? new Error("录音 outbox 封存事务中止"));
       };
       transaction.onerror = () => { /* onabort 统一返回 */ };
+      // add 而非 put：同 ID 的本机记录绝不能被另一段字节静默覆盖。
+      transaction.objectStore(STORE).add(value, safe.rawAudioId);
+      transaction.objectStore(OUTBOX_STORE).add(safe);
     }));
+    return stage(blob).catch(async (error: unknown) => {
+      if (!isBlobStorageRefusal(error)) throw error;
+      // 上一事务已整体回滚；在事务外取出同一份字节，原子地再封存一次。
+      const bytes = await blob.arrayBuffer();
+      if (bytes.byteLength !== safe.blobBytes) throw error;
+      await stage({ format: STORED_AUDIO_BYTES_FORMAT, type: blob.type, bytes });
+    });
   },
   putOutbox: (entry: AudioOutboxEntry): Promise<void> => {
     const safe = parseAudioOutboxEntry(entry);
@@ -341,11 +380,11 @@ export const blobStore = {
 
     // Second live-byte check. parseAudioTerminalDisposition hashed the pending
     // Blob; this hashes a fresh IndexedDB read before the destructive transaction.
-    const reread = await tx<Blob | undefined>(
+    const reread = storedAudioBlob(await tx<unknown>(
       STORE,
       "readonly",
-      (store) => store.get(expected.rawAudioId) as IDBRequest<Blob | undefined>,
-    );
+      (store) => store.get(expected.rawAudioId),
+    ));
     if (reread !== undefined) {
       if (reread.size !== expected.blobBytes
           || (reread.type || "audio/webm") !== expected.mimeType
@@ -359,10 +398,10 @@ export const blobStore = {
       const blobs = transaction.objectStore(STORE);
       const outbox = transaction.objectStore(OUTBOX_STORE);
       const legacy = transaction.objectStore(LEGACY_STORE);
-      const blobRequest = blobs.get(expected.rawAudioId) as IDBRequest<Blob | undefined>;
+      const blobRequest = blobs.get(expected.rawAudioId) as IDBRequest<unknown | undefined>;
       const outboxRequest = outbox.get(expected.rawAudioId) as IDBRequest<unknown | undefined>;
       const legacyRequest = legacy.getKey(expected.rawAudioId);
-      let storedBlob: Blob | undefined;
+      let storedBlob: unknown | undefined;
       let storedEntry: unknown | undefined;
       let legacyKey: IDBValidKey | undefined;
       let ready = 0;
@@ -560,13 +599,13 @@ export const blobStore = {
       const pendingStore = transaction.objectStore(AUTOPILOT_ACK_STORE);
       const checkpointStore = transaction.objectStore(AUTOPILOT_ACK_STATE_STORE);
       const requests = {
-        blob: blobs.get(rawAudioId) as IDBRequest<Blob | undefined>,
+        blob: blobs.get(rawAudioId) as IDBRequest<unknown | undefined>,
         outbox: outbox.get(rawAudioId) as IDBRequest<unknown | undefined>,
         legacy: legacy.getKey(rawAudioId),
         pending: pendingStore.get(expected.ownerKey),
         checkpoint: checkpointStore.get(expected.ownerKey),
       };
-      let storedBlob: Blob | undefined;
+      let storedBlob: unknown | undefined;
       let outboxRaw: unknown | undefined;
       let legacyKey: IDBValidKey | undefined;
       let pendingRaw: unknown;
@@ -606,7 +645,7 @@ export const blobStore = {
             return;
           }
           const entry = parseAudioOutboxEntry(outboxRaw);
-          const blob = storedBlob as Blob;
+          const blob = storedAudioBlob(storedBlob) as Blob;
           if (entry.rawAudioId !== rawAudioId
               || entry.sessionId !== expected.sessionId
               || entry.turnKey !== recordCommand.payload.turn_ref
