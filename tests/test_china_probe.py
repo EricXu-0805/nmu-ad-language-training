@@ -848,7 +848,7 @@ def test_tcp_open_but_https_broken_is_announced_once_with_the_likely_causes(worl
     assert f"Nanjing AS4134{why}" in content
     for cause in ("SNI", "DNS", "droplet → box A", "证书", "Caddy 没有这个地址", "解析器出错或超时"):
         assert cause in content
-    assert world.log_lines()[-1].endswith(f"https_m=m4 sent=HTTPS_DOWN")
+    assert world.log_lines()[-1].endswith("https_m=m4 sent=HTTPS_DOWN")
 
     for _ in range(3):
         world.tick(OPEN, broken)
