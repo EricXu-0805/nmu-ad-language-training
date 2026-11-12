@@ -85,6 +85,10 @@ TTS 白名单只能证明“没有把患者字段混进 TTS 文本”，不能�
 
 ## 跑测试 / 开发
 
+前端开发与测试统一使用 Node 26 LTS（`.nvmrc`）；切到该版本后在 `web/` 运行
+`npm ci`，再从仓库根运行 `scripts/ci_gate.sh --only frontend`。CI 使用同一主版本与检查脚本。
+正式发布构建继续使用 Dockerfile 中固定的 Node 22 镜像，与开发测试环境分开记录。
+
 ```bash
 cd platform
 ./.venv/bin/python -m pytest              # 无 .venv 先: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt

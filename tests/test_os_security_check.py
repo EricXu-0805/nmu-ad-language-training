@@ -6,10 +6,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
 import os
 from pathlib import Path
 import re
 import sys
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,6 +62,102 @@ def test_a_clean_system_parses_to_nothing():
     assert osc.parse_simulation(
         "NOTE: This is only a simulation!\nCalculating upgrade...\n"
         "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n") == []
+
+
+def _apt_cache(monkeypatch, versions, *, installed="1.0-1", name="example:amd64"):
+    # 顺序故意不依赖缓存排序；版本比较必须由 apt 处理 epoch、~ 与数字段。
+    ordered = ["0:0.9-99", "1.0-1", "1.0-2~rc1", "1.0-2", "1.0-10", "1:0.1-1"]
+    package = SimpleNamespace(
+        current_ver=SimpleNamespace(ver_str=installed),
+        version_list=[SimpleNamespace(
+            ver_str=version,
+            file_list=[(SimpleNamespace(archive=archive), 0) for archive in archives],
+        ) for version, archives in versions],
+    )
+    monkeypatch.setitem(sys.modules, "apt_pkg", SimpleNamespace(
+        init=lambda: None, Cache=lambda progress: {name: package},
+        version_compare=lambda left, right: ordered.index(left) - ordered.index(right),
+    ))
+    return [{"name": name, "old": installed, "new": "1.0-10"}]
+
+
+def test_a_newer_updates_candidate_includes_an_intermediate_security_fix(monkeypatch):
+    upgrades = _apt_cache(monkeypatch, [
+        ("1.0-10", ["jammy-updates"]),
+        ("1.0-2", ["jammy-updates", "jammy-security"]),
+        ("1.0-1", ["jammy"]),
+    ])
+    assert osc.security_flags_from_apt(upgrades) == {"example:amd64": True}
+
+
+@pytest.mark.parametrize("version", ["0:0.9-99", "1.0-1", "1:0.1-1"])
+def test_security_versions_outside_the_upgrade_interval_do_not_count(monkeypatch, version):
+    upgrades = _apt_cache(monkeypatch, [
+        (version, ["jammy-security"]), ("1.0-10", ["jammy-updates"]),
+    ])
+    assert osc.security_flags_from_apt(upgrades) == {"example:amd64": False}
+
+
+@pytest.mark.parametrize("version", ["1.0-2~rc1", "1.0-10"])
+def test_the_security_interval_includes_intermediate_and_target_versions(monkeypatch, version):
+    upgrades = _apt_cache(monkeypatch, [
+        (version, ["jammy-security"]), ("1.0-10", ["jammy-updates"]),
+    ])
+    assert osc.security_flags_from_apt(upgrades) == {"example:amd64": True}
+
+
+@pytest.mark.parametrize("archive", [None, "jammy-updates", "jammy-security-testing"])
+def test_only_a_security_archive_suffix_counts(monkeypatch, archive):
+    upgrades = _apt_cache(monkeypatch, [("1.0-10", [archive])])
+    assert osc.security_flags_from_apt(upgrades) == {"example:amd64": False}
+
+
+@pytest.mark.parametrize("problem", ["missing-package", "changed-installed", "missing-target"])
+def test_cache_drift_or_missing_package_cannot_produce_a_clean_result(monkeypatch, problem):
+    upgrades = _apt_cache(monkeypatch, [("1.0-10", ["jammy-updates"])])
+    if problem == "missing-package":
+        upgrades[0]["name"] = "missing"
+    elif problem == "changed-installed":
+        upgrades[0]["old"] = "1.0-2"
+    else:
+        upgrades[0]["new"] = "1:0.1-1"
+    with pytest.raises(RuntimeError):
+        osc.security_flags_from_apt(upgrades)
+
+
+def test_version_origin_probe_uses_system_python_and_only_unclassified_packages(monkeypatch):
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout='{"ordinary": true}', stderr="")
+
+    monkeypatch.setattr(osc.subprocess, "run", run)
+    pending = [osc.PendingUpgrade("known-security", "1", "2", True),
+               osc.PendingUpgrade("ordinary", "1", "3", False)]
+    assert osc.read_security_flags(pending) == {"ordinary": True}
+    [(argv, kwargs)] = seen
+    assert argv[0] == "/usr/bin/python3"
+    assert argv[-1] == str(Path(osc.__file__).resolve())
+    assert json.loads(kwargs["input"]) == [{"name": "ordinary", "old": "1", "new": "3"}]
+    assert kwargs["env"]["LC_ALL"] == "C"
+    assert kwargs["timeout"] == 60
+
+
+@pytest.mark.parametrize("stdout", ["", "not-json", "{}", '{"ordinary": 1}',
+                                    '{"ordinary": null}', '{"other": false}', "[]"])
+def test_version_origin_probe_rejects_missing_or_malformed_classification(monkeypatch, stdout):
+    monkeypatch.setattr(osc.subprocess, "run", lambda *_args, **_kwargs:
+                        SimpleNamespace(returncode=0, stdout=stdout, stderr=""))
+    with pytest.raises(RuntimeError):
+        osc.read_security_flags([osc.PendingUpgrade("ordinary", "1", "3", False)])
+
+
+def test_failed_system_apt_probe_does_not_return_a_clean_classification(monkeypatch):
+    monkeypatch.setattr(osc.subprocess, "run", lambda *_args, **_kwargs:
+                        SimpleNamespace(returncode=1, stdout="{}", stderr="cannot open apt cache"))
+    with pytest.raises(RuntimeError, match="cannot open apt cache"):
+        osc.read_security_flags([osc.PendingUpgrade("ordinary", "1", "3", False)])
 
 
 # ---------------- 判定 ----------------
@@ -129,6 +228,8 @@ def _cli(tmp_path, text, monkeypatch, extra=()):
         (tmp_path / fake).mkdir(exist_ok=True)
     monkeypatch.setattr(osc, "REBOOT_REQUIRED", tmp_path / "no-reboot-required")
     monkeypatch.setattr(osc.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(osc, "read_security_flags",
+                        lambda pending: {item.name: False for item in pending if not item.security})
     return osc.main(["--simulate-file", str(sim), "--lists-dir", str(lists),
                      "--proc-dir", str(tmp_path / "proc"), "--boot-dir", str(tmp_path / "boot"),
                      *extra])
@@ -473,8 +574,40 @@ def _assess(tmp_path, **overrides):
     (tmp_path / "proc").mkdir(exist_ok=True)
     kwargs = dict(lists_dir=lists, held=[], proc=tmp_path / "proc", boot=tmp_path / "boot",
                   running_kernel="5.15.0-194-generic", euid=0)
+    simulation = overrides.pop("simulation", "Calculating upgrade...\n")
     kwargs.update(overrides)
-    return osc.assess("Calculating upgrade...\n", MAX_AGE, **kwargs)
+    return osc.assess(simulation, MAX_AGE, **kwargs)
+
+
+def test_assess_blocks_the_previously_missed_intermediate_security_fix(tmp_path, monkeypatch):
+    upgrades = _apt_cache(monkeypatch, [
+        ("1.0-10", ["jammy-updates"]), ("1.0-2", ["jammy-security"]),
+    ])
+    monkeypatch.setattr(osc, "read_security_flags",
+                        lambda pending: osc.security_flags_from_apt(upgrades))
+    report = _assess(tmp_path, simulation=(
+        "Inst example:amd64 [1.0-1] (1.0-10 Ubuntu:22.04/jammy-updates [amd64])\n"))
+    assert report["ok"] is False
+    assert report["security_pending"] == 1
+    assert report["other_pending"] == 0
+    assert report["security_classification_complete"] is True
+    assert any("example:amd64" in failure for failure in report["failures"])
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("python3"), RuntimeError("bad apt cache"),
+                                   subprocess.TimeoutExpired("python3", 60)])
+def test_assess_fails_closed_when_intermediate_versions_cannot_be_checked(
+        tmp_path, monkeypatch, error):
+    def fail(_pending):
+        raise error
+
+    monkeypatch.setattr(osc, "read_security_flags", fail)
+    report = _assess(tmp_path, simulation=PHASED_INCLUDED_OUTPUT)
+    assert report["ok"] is False
+    assert report["security_classification_complete"] is False
+    assert report["other_pending"] is None
+    assert any("查不全 apt 版本来源" in failure for failure in report["failures"])
+    assert not any("非安全更新" in note for note in report["notes"])
 
 
 def test_not_running_as_root_fails_instead_of_passing_unlooked(tmp_path):

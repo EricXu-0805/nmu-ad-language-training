@@ -20,7 +20,7 @@ PYTHON="${NMU_GATE_PYTHON:-$REPO/.venv/bin/python}"
 command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
 OFFLINE_OSV=0
 ONLY="all"
-EXPECTED_NODE_MAJOR="25"
+EXPECTED_NODE_MAJOR="26"
 EXPECTED_RUFF_VERSION="0.15.15"
 
 usage() {

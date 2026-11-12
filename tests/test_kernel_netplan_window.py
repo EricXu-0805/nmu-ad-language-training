@@ -18,6 +18,7 @@ ssh 送到生产机执行。真跑一次要开 KiwiVM 控制台、重启两次�
 """
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import re
 import shlex
@@ -27,7 +28,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy" / "maintenance" / "kernel_netplan_window.sh"
-PHASES = {"check", "kernel", "verify-kernel", "netplan", "verify-netplan", "purge"}
+PHASES = {"check", "kernel", "reboot", "verify-kernel", "netplan", "verify-netplan", "purge"}
 NMU_TIMERS = {"nmu-backup.timer", "nmu-backup-health.timer", "nmu-capacity.timer",
               "nmu-restore-drill.timer", "nmu-os-security.timer", "nmu-health.timer"}
 
@@ -402,6 +403,12 @@ if command == "/usr/bin/python3 -I - --minutes 10":
     reply(done.stdout, done.returncode)
 if command.startswith("/opt/nmu/venv/bin/python -I -"):
     reply("  场次运行状态: aborted 45\\n")
+if command.startswith("EXPECTED_TARGET="):
+    if state.get("abi_probe_empty"):
+        reply()
+    if state.get("abi_probe_failure"):
+        reply("  FAIL 候选/回退与审核常量不符,先更新常量并重新评审\\n", 1)
+    reply("  PASS 内核版本与审核常量一致\\n")
 if "def stale_library_units" in command:
     reply()
 if "boot_id" in command:
@@ -443,6 +450,8 @@ if "systemctl --no-pager reboot" in command:
         state["kernel"] = "5.15.0-202-generic"
     reply("", 255)
 if command.endswith("bash -s"):
+    if "lsinitramfs" in body and state.get("boot_target_mismatch"):
+        reply("  FAIL 默认项不是当前内核\\n", 1)
     if "nmu-netplan-revert --on-active" in body:
         state["stanza"] = True
     reply("  PASS 假机器\\n")
@@ -563,7 +572,7 @@ def test_without_the_gate_script_beside_it_the_host_is_not_idle(tmp_path):
     assert "本机读不到" in result.stdout and "这一项不过:生产空闲" in result.stdout
     assert "用绝对路径跑" in result.stdout
     assert result.returncode == 1
-    assert not [c for c in commands if "python3" in c]
+    assert not [c for c in commands if c == "/usr/bin/python3 -I - --minutes 10"]
 
 
 def test_a_gate_that_never_reached_the_host_is_not_idle(tmp_path):
@@ -702,3 +711,136 @@ def test_the_purge_phase_simulates_first_and_never_reboots(tmp_path):
     assert "purge 阶段完成" in result.stdout
     assert _first(commands, "apt-get -s purge") < _first(commands, "apt-get purge -y")
     assert not [c for c in commands if REBOOT in c]
+
+
+# ---------------- O03:候选与机器现状推导,常量仍需人工评审 ----------------
+
+def _abi_checker():
+    [body] = [body for delimiter, body in _heredocs(_text())
+              if delimiter == "PY" and "def derive_abis(" in body]
+    parsed = ast.parse(body)
+    # 原样执行生产算法的定义,不运行它读本机 apt 与 /boot 的入口。
+    parsed.body = [node for node in parsed.body
+                   if isinstance(node, (ast.Import, ast.ImportFrom, ast.Assign, ast.FunctionDef))]
+    namespace = {}
+    exec(compile(parsed, "<kernel ABI probe>", "exec"), namespace)
+    return namespace
+
+
+def _images(*abis):
+    return "".join(f"linux-image-{abi}-generic ii \n" for abi in abis)
+
+
+_REVIEWED_ABIS = ("5.15.0-202", "5.15.0-198", "5.15.0-194")
+_CANDIDATE_202 = "Package: linux-image-generic\nDepends: linux-image-5.15.0-202-generic, linux-firmware\n"
+
+
+@pytest.mark.parametrize(("installed", "boot", "expected_purge"), [
+    (("5.15.0-198", "5.15.0-194"), ("5.15.0-198", "5.15.0-194"), "5.15.0-194"),
+    (_REVIEWED_ABIS, _REVIEWED_ABIS, "5.15.0-194"),
+    (_REVIEWED_ABIS[:2], _REVIEWED_ABIS[:2], None),
+])
+def test_abi_derivation_handles_before_install_after_install_and_after_purge(installed, boot,
+                                                                         expected_purge):
+    checker = _abi_checker()
+    result = checker["derive_abis"](_CANDIDATE_202, _images(*installed), boot, boot)
+    assert result == ("5.15.0-202", "5.15.0-198", expected_purge)
+    checker["check_abis"](result, _REVIEWED_ABIS, installed[0] + "-generic")
+
+
+def test_abi_derivation_still_sees_old_residual_packages_after_boot_files_are_gone():
+    checker = _abi_checker()
+    boot = _REVIEWED_ABIS[:2]
+    packages = (_images(*boot) + "linux-image-5.15.0-194-generic rc \n"
+                "linux-modules-5.15.0-194-generic rc \n"
+                "linux-headers-5.15.0-190 un \n")
+    assert checker["derive_abis"](_CANDIDATE_202, packages, boot, boot) == _REVIEWED_ABIS
+
+
+@pytest.mark.parametrize(("metadata", "packages", "boot", "ready", "error"), [
+    ("Depends: linux-image-5.15.0-202-generic | linux-image-5.15.0-205-generic\n",
+     _images(*_REVIEWED_ABIS), _REVIEWED_ABIS, _REVIEWED_ABIS, "不是唯一"),
+    (_CANDIDATE_202, _images("5.15.0-202", "5.15.0-198", "5.15.0-194", "5.15.0-190"),
+     _REVIEWED_ABIS, _REVIEWED_ABIS, "待清内核不是唯一"),
+    (_CANDIDATE_202, _images(*_REVIEWED_ABIS), _REVIEWED_ABIS, ("5.15.0-202",), "没有同时具备"),
+    (_CANDIDATE_202, _images("5.15.0-198") + "linux-headers-5.15.0-202 iF \n",
+     ("5.15.0-198",), ("5.15.0-198",), "没有安装/清理完"),
+    (_CANDIDATE_202, _images("5.15.0-205", "5.15.0-202", "5.15.0-198"),
+     ("5.15.0-202", "5.15.0-198"), ("5.15.0-202", "5.15.0-198"), "比 apt 候选更新"),
+    (_CANDIDATE_202, "linux-image-5.15.0-198-generic\n", (), (), "格式不完整"),
+])
+def test_abi_derivation_rejects_ambiguous_or_incomplete_inventory(metadata, packages, boot, ready,
+                                                              error):
+    with pytest.raises(ValueError, match=error):
+        _abi_checker()["derive_abis"](metadata, packages, boot, ready)
+
+
+@pytest.mark.parametrize(("derived", "expected", "running", "error"), [
+    (("5.15.0-205", "5.15.0-202", "5.15.0-198"), _REVIEWED_ABIS, "5.15.0-202-generic", "候选/回退"),
+    (("5.15.0-202", "5.15.0-194", None), _REVIEWED_ABIS, "5.15.0-202-generic", "候选/回退"),
+    (("5.15.0-202", "5.15.0-198", "5.15.0-190"), _REVIEWED_ABIS, "5.15.0-202-generic", "PURGE_ABI"),
+    (_REVIEWED_ABIS, _REVIEWED_ABIS, "5.15.0-194-generic", "运行内核"),
+    (_REVIEWED_ABIS, ("5.15.0-202", "5.15.0-198", "5.15.0-202"), "5.15.0-202-generic", "审核常量的顺序"),
+])
+def test_discovered_abis_never_automatically_replace_the_reviewed_constants(derived, expected,
+                                                                       running, error):
+    with pytest.raises(ValueError, match=error):
+        _abi_checker()["check_abis"](derived, expected, running)
+
+
+@pytest.mark.parametrize("phase", ["check", "kernel", "purge"])
+def test_stale_abi_constants_block_check_and_the_real_mutating_phases(phase, tmp_path):
+    host = {**_FRESH_HOST, "abi_probe_failure": True}
+    if phase == "purge":
+        host.update(kernel="5.15.0-202-generic", installed=True)
+    result, commands = _run_phase(tmp_path, phase, answers="yes\n" * 4, host=host)
+    assert result.returncode == 1 and "内核 ABI 与审核常量一致" in result.stdout
+    assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
+
+
+def test_an_empty_successful_ssh_response_is_not_an_abi_verification(tmp_path):
+    result, _ = _run_phase(tmp_path, "check", host={**_FRESH_HOST, "abi_probe_empty": True})
+    assert result.returncode == 1 and "没收到内核推导结果" in result.stdout
+
+
+def test_check_accepts_the_completed_kernel_window_without_reinstalling_packages(tmp_path):
+    result, commands = _run_phase(tmp_path, "check", host={
+        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True, "purged": True})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "审核目标已装好,无需再装包" in result.stdout
+    assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
+
+
+def test_an_empty_install_plan_without_the_target_installed_is_not_complete(tmp_path):
+    result, _ = _run_phase(tmp_path, "check", simulation="")
+    assert result.returncode == 1 and "审核目标尚未装好" in result.stdout
+
+
+# ---------------- O05:只重启,不会顺便装内核或改网络 ----------------
+
+def test_the_reboot_phase_keeps_the_kernel_and_network_without_installing_or_purging(tmp_path):
+    result, commands = _run_phase(tmp_path, "reboot", answers="yes\n" * 4, host={
+        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True, "purged": True})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "reboot 阶段完成:未安装包" in result.stdout
+    assert (_first(commands, "--minutes 10") < _first(commands, ":: lsinitramfs")
+            < _first(commands, REBOOT) < _first(commands, ":: os_security_check.py"))
+    assert not [c for c in commands if re.search(r"systemd-run|apt-get|netplan (apply|generate)", c)]
+    assert [c for c in commands if "EXPECT_NETWORK=/run/systemd/network/10-netplan-by-mac.network" in c
+            and "BOOT_BEFORE=boot-a" in c]
+
+
+@pytest.mark.parametrize(("changes", "journal", "answers", "error"), [
+    ({}, _ONE_ANSWER, "yes\n" * 4, "停:生产空闲"),
+    ({"boot_target_mismatch": True}, "", "yes\n" * 4, "默认启动项或启动文件"),
+    ({"kernel": "5.15.0-198-generic"}, "", "yes\n" * 4, "只重启阶段要求"),
+    ({"netfile": "/run/systemd/network/10-netplan-ens18.network"}, "", "yes\n" * 4, "网络段与实际"),
+    ({}, "", "yes\nyes\nyes\nno\n", "没有确认"),
+])
+def test_the_reboot_phase_stops_before_reboot_on_unsafe_or_declined_conditions(changes, journal,
+                                                                           answers, error, tmp_path):
+    host = {**_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True, "purged": True,
+            **changes}
+    result, commands = _run_phase(tmp_path, "reboot", answers=answers, journal=journal, host=host)
+    assert result.returncode == 1 and error in result.stdout, result.stdout + result.stderr
+    assert not [c for c in commands if re.search(r"systemd-run|netplan apply", c) or REBOOT in c]

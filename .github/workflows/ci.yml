@@ -90,11 +90,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020   # v7.0.0
         with:
-          # 必须与本地共享门一致为 25.x：测试用 node --test 直接跑 .ts（原生类型剥离），且渲染类
-          # 测试用到 node 25 起默认可用的 localStorage（24 上直接 ReferenceError，
-          # 首绿尝试就是这么红的）。本地验证环境即 node 25。
+          # 必须与本地共享门一致为 26.x LTS：测试直接运行 .ts（原生类型剥离），
+          # 渲染类测试还使用 localStorage。旧的 Node 25 测试环境已停止维护。
           # 镜像底座是 node 22，那一层只跑 vite build，不跑这些测试。
-          node-version: "25"
+          node-version: "26"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci --no-audit --no-fund
