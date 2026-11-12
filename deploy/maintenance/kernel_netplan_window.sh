@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 内核与 netplan 维护窗口(2026-10-02 主机维护评审的 B1 方案)。
-# 入库时还没有人跑过。跑之前要 Eric 定窗口:离钱凯下一轮现场至少 48 小时;KiwiVM 控制台
+# 2026-11-12 只读准备:203 的候选与安装模拟已核实,尚未安装或重启。跑之前要 Eric 定窗口:
+# 离钱凯下一轮现场至少 48 小时(沿用 10-02 窗口策略,本轮尚未确认现场时间);KiwiVM 控制台
 # 开着、看得到 GRUB 菜单;控制台 root 登录(或 KiwiVM 的 root shell)试过能进。
 #
 # 一次只换一个变量,每次重启单独一轮:先换内核(netplan 不动),再加按 MAC 匹配的 netplan
@@ -27,11 +28,11 @@
 # netplan 里给网卡改名;打印 MAC(它和 KiwiVM 的 VM 编号挂钩)。
 #
 # kernel 阶段起不来、或开了机却没网:多半是新内核的事,KiwiVM 控制台 → GRUB 菜单(只亮 2 秒,
-#   失败重启后 30 秒)→ Advanced options → 回退内核(这一轮是 5.15.0-198-generic)。by-mac 段
+#   失败重启后 30 秒)→ Advanced options → 回退内核(这一轮是 5.15.0-202-generic)。by-mac 段
 #   是现役网络,别动它。
 # netplan 阶段开了机但没网:控制台 root 登录,把 /etc/netplan/50-nmu-by-mac.yaml 挪到 /root/,
 #   再 netplan apply;nmu 与定时器都不用动。
-# 换目标内核时改下面三个 *_ABI 常量,重新评审后再跑。
+# 换目标内核时改三个 *_ABI 和两个包版本常量,重新评审后再跑;不能只改 ABI 前缀。
 set -u
 KEY="$HOME/.ssh/id_ed25519"
 HOST="root@89.208.253.119"
@@ -39,11 +40,14 @@ SITE="https://89-208-253-119.sslip.io"
 KIWIVM="https://kiwivm.64clouds.com/"
 # 空闲门的过滤在仓库里只有一份,经 ssh 的 stdin 送过去跑;按本脚本的绝对路径找,不看当前目录。
 IDLE_GATE="${0%/deploy/maintenance/kernel_netplan_window.sh}/scripts/prod_idle_gate.py"
-TARGET_ABI="5.15.0-202"
-FALLBACK_ABI="5.15.0-198"
-PURGE_ABI="5.15.0-194"
+TARGET_ABI="5.15.0-203"
+FALLBACK_ABI="5.15.0-202"
+PURGE_ABI="5.15.0-198"
+KERNEL_PACKAGE_VERSION="5.15.0-203.213"
+KERNEL_META_VERSION="5.15.0.203.175"
 # 只点名这四个元包;apt 按依赖带进来的必须正好是 EXPECTED_INSTALL 这 9 个,多一个都停。
 META_PACKAGES="linux-generic linux-image-generic linux-headers-generic linux-libc-dev"
+PINNED_META_PACKAGES="linux-generic=${KERNEL_META_VERSION} linux-image-generic=${KERNEL_META_VERSION} linux-headers-generic=${KERNEL_META_VERSION} linux-libc-dev=${KERNEL_PACKAGE_VERSION}"
 EXPECTED_INSTALL="linux-generic linux-headers-${TARGET_ABI} linux-headers-${TARGET_ABI}-generic linux-headers-generic linux-image-${TARGET_ABI}-generic linux-image-generic linux-libc-dev linux-modules-${TARGET_ABI}-generic linux-modules-extra-${TARGET_ABI}-generic"
 TIMERS="nmu-backup.timer nmu-backup-health.timer nmu-capacity.timer nmu-restore-drill.timer nmu-os-security.timer nmu-health.timer"
 NET_ENS18="/run/systemd/network/10-netplan-ens18.network"
@@ -308,7 +312,7 @@ REMOTE
 kernel_abis_match() {
   echo "== 只读推导内核:apt 候选依赖、已装包与 /boot 必须符合审核过的三个 ABI(不会自动改常量) =="
   local report rc=0
-  report=$(RBASH "EXPECTED_TARGET=${TARGET_ABI} EXPECTED_FALLBACK=${FALLBACK_ABI} EXPECTED_PURGE=${PURGE_ABI} /usr/bin/python3 -I -" <<'PY'
+  report=$(RBASH "EXPECTED_TARGET=${TARGET_ABI} EXPECTED_FALLBACK=${FALLBACK_ABI} EXPECTED_PURGE=${PURGE_ABI} EXPECTED_META_VERSION=${KERNEL_META_VERSION} EXPECTED_KERNEL_VERSION=${KERNEL_PACKAGE_VERSION} /usr/bin/python3 -I -" <<'PY'
 import os
 from pathlib import Path
 import re
@@ -388,12 +392,18 @@ def read_command(args):
     return done.stdout
 
 
-try:
-    policy = read_command(["apt-cache", "policy", "linux-image-generic"])
+def checked_candidate(policy, package, reviewed):
     candidates = re.findall(r"^\s*Candidate:\s*(\S+)\s*$", policy, re.MULTILINE)
-    if len(candidates) != 1 or candidates[0] == "(none)":
-        raise ValueError("apt 没有唯一的 linux-image-generic 候选版本")
-    metadata = read_command(["apt-cache", "show", "linux-image-generic=" + candidates[0]])
+    if candidates != [reviewed]:
+        raise ValueError(package + " 候选精确版本与审核常量不符,先重新评审")
+    return reviewed
+
+
+try:
+    for package in ("linux-generic", "linux-image-generic", "linux-headers-generic", "linux-libc-dev"):
+        reviewed = os.environ["EXPECTED_KERNEL_VERSION" if package == "linux-libc-dev" else "EXPECTED_META_VERSION"]
+        checked_candidate(read_command(["apt-cache", "policy", package]), package, reviewed)
+    metadata = read_command(["apt-cache", "show", "linux-image-generic=" + os.environ["EXPECTED_META_VERSION"]])
     packages = read_command(["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", "linux-*"])
     boot_images, ready_images = set(), set()
     for path in Path("/boot").glob("vmlinuz-*"):
@@ -420,41 +430,57 @@ PY
   [ "${rc}" = "0" ] && printf '%s\n' "${report}" | grep -qx '  PASS 内核版本与审核常量一致'
 }
 
+kernel_packages_installed() {
+  local installed wanted
+  installed=$(RSH "dpkg-query -W -f='\${Package} \${Version} \${db:Status-Abbrev}\\n' ${EXPECTED_INSTALL}" 2>/dev/null) || return 1
+  wanted=$(printf '%s\n' ${EXPECTED_INSTALL} | awk -v meta="${KERNEL_META_VERSION}" -v kernel="${KERNEL_PACKAGE_VERSION}" '
+    {version=($1 ~ /^linux-(generic|image-generic|headers-generic)$/) ? meta : kernel;
+     print $1, version, "ii"}' | LC_ALL=C sort)
+  installed=$(printf '%s\n' "${installed}" | awk '{print $1, $2, $3}' | LC_ALL=C sort)
+  [ "${installed}" = "${wanted}" ]
+}
+
 simulation_matches() {
   echo "== 装包模拟:点名 ${META_PACKAGES},带进来的必须正好是预期的 9 个 =="
-  local sim names expected wrong removed state
-  sim=$(RSH "LC_ALL=C apt-get -s install ${META_PACKAGES}") || { echo "  模拟失败"; return 1; }
+  local sim names expected wrong removed
+  sim=$(RSH "LC_ALL=C apt-get -s install ${PINNED_META_PACKAGES}") || { echo "  模拟失败"; return 1; }
   names=$(printf '%s\n' "${sim}" | awk '/^Inst /{print $2}' | LC_ALL=C sort | tr '\n' ' ')
   expected=$(printf '%s\n' "${EXPECTED_INSTALL}" | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ')
   echo "  模拟要装:${names:-无}"
   removed=$(printf '%s\n' "${sim}" | grep -c '^Remv ')
   if [ -z "${names}" ] && [ "${removed}" = "0" ]; then
-    state=$(RSH "dpkg-query -W -f='\${Status}' linux-image-${TARGET_ABI}-generic 2>/dev/null") || return 1
-    [ "${state}" = "install ok installed" ] || { echo "  没有安装计划,但审核目标尚未装好"; return 1; }
+    kernel_packages_installed || { echo "  没有安装计划,但审核目标的 9 个包尚未按精确版本装好"; return 1; }
     echo "  PASS 审核目标已装好,无需再装包"
     return 0
   fi
   if [ "${names}" != "${expected}" ]; then echo "  预期的是:${expected}"; return 1; fi
-  wrong=$(printf '%s\n' "${sim}" | grep '^Inst ' | grep -c -v -F -e "(${TARGET_ABI//-/.}." -e "(${TARGET_ABI}.")
-  echo "  新版本不是 ${TARGET_ABI} 的:${wrong} 个;要删的:${removed} 个"
+  wrong=$(printf '%s\n' "${sim}" | awk -v meta="${KERNEL_META_VERSION}" -v kernel="${KERNEL_PACKAGE_VERSION}" '
+    /^Inst / {
+      expected=($2 ~ /^linux-(generic|image-generic|headers-generic)$/) ? meta : kernel;
+      found="";
+      for (i=3; i<=NF; i++) if (substr($i,1,1)=="(") {found=substr($i,2); break}
+      if (found!=expected) bad++;
+    }
+    END {print bad+0}')
+  echo "  不符合精确包版本(${KERNEL_PACKAGE_VERSION}/${KERNEL_META_VERSION})的:${wrong} 个;要删的:${removed} 个"
   [ "${wrong}" = "0" ] && [ "${removed}" = "0" ]
 }
 
 install_kernel() {
-  local state rc left
-  state=$(RSH "dpkg-query -W -f='\${Status}' linux-image-${TARGET_ABI}-generic 2>/dev/null")
-  if [ "${state}" = "install ok installed" ]; then
-    echo "== linux-image-${TARGET_ABI}-generic 已经装好(上一轮装完没重启),跳过安装 =="
+  local rc left
+  if kernel_packages_installed; then
+    echo "== ${TARGET_ABI} 的 9 个包已按审核精确版本装好(上一轮装完没重启),跳过安装 =="
     return 0
   fi
   simulation_matches || bail "模拟出来的包不对(生产没有任何改动)"
   echo "== 装包:交给 systemd-run 跑,ssh 断了也不会把 dpkg 撂在半路 =="
-  RSH "systemd-run --wait --collect --quiet --unit nmu-kernel-install-${STAMP} --property=StandardOutput=file:/root/nmu-kernel-install-${STAMP}.log --property=StandardError=inherit --setenv=DEBIAN_FRONTEND=noninteractive --setenv=NEEDRESTART_MODE=l apt-get install -y -q -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold ${META_PACKAGES}"
+  RSH "systemd-run --wait --collect --quiet --unit nmu-kernel-install-${STAMP} --property=StandardOutput=file:/root/nmu-kernel-install-${STAMP}.log --property=StandardError=inherit --setenv=DEBIAN_FRONTEND=noninteractive --setenv=NEEDRESTART_MODE=l apt-get install -y -q -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold ${PINNED_META_PACKAGES}"
   rc=$?
   RSH "tail -12 /root/nmu-kernel-install-${STAMP}.log"
   [ "${rc}" = "0" ] || bail "装包退出码 ${rc}(日志 /root/nmu-kernel-install-${STAMP}.log);没有重启,正在跑的仍是 ${FALLBACK_ABI}"
-  left=$(RSH "LC_ALL=C apt-get -s install ${META_PACKAGES}" | grep -c '^Inst ')
+  left=$(RSH "LC_ALL=C apt-get -s install ${PINNED_META_PACKAGES}" | grep -c '^Inst ')
   [ "${left}" = "0" ] || bail "装完再模拟仍有 ${left} 个包要装;没有重启"
+  kernel_packages_installed || bail "装包后 9 个包的精确版本或状态不符;没有重启"
 }
 
 pre_reboot_asserts() {

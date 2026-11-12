@@ -11,6 +11,7 @@ in for the China entry droplet; a second loopback source plays everyone else.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 from http import client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,11 +28,35 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import urlsplit
 
 PROXY_SNIPPET = Path("deploy/offbox/cn_entry/boxa-caddy-global.snippet")
 DROPLET_ALLOW = "allow 147.182.176.237/32"
 # TEST-NET-1: an address no real client or upstream log can ever contain.
 HEADER_SOURCE = "192.0.2.10"
+ENTRY_HOSTS = ("89-208-253-119.sslip.io", "147-182-176-237.sslip.io")
+STATIC_JS = b"const releaseFixture = 'public application code';\n" * 100
+STATIC_CSS = b".release-fixture { color: #123456; background: white; }\n" * 80
+HTML_FIXTURE = b"<!doctype html><title>Private page fixture</title>" * 30
+STATIC_RESPONSES = {
+    "/assets/index-AbCd1234.js": (200, "text/javascript; charset=utf-8", STATIC_JS),
+    "/assets/theme-ZyXw9876.css": (200, "text/css; charset=utf-8", STATIC_CSS),
+    "/assets/missing-AbCd1234.js": (404, "text/javascript", STATIC_JS),
+    "/assets/denied-AbCd1234.js": (401, "text/javascript", STATIC_JS),
+    "/assets/fallback-AbCd1234.js": (200, "text/html; charset=utf-8", HTML_FIXTURE),
+    "/assets/partial-AbCd1234.js": (206, "text/javascript", STATIC_JS),
+    "/assets/unchanged-AbCd1234.js": (304, None, b""),
+    "/assets/plain.js": (200, "text/javascript", STATIC_JS),
+    "/assets/nested/index-AbCd1234.js": (200, "text/javascript", STATIC_JS),
+    "/assets/source-AbCd1234.js.map": (200, "application/json", b"{}"),
+    "/patient": (200, "text/html", HTML_FIXTURE),
+    "/console": (200, "text/html", HTML_FIXTURE),
+    "/index.html": (200, "text/html", HTML_FIXTURE),
+    "/build-id.txt": (200, "text/plain", b"fixture-build-id"),
+    "/patients": (200, "application/json", b'{"fixture":true}'),
+    "/live/state": (401, "application/json", b'{"code":"fixture_unauthorized"}'),
+    "/audio/fixture/blob": (200, "audio/webm", b"\x1a\x45\xdf\xa3" + b"fixture" * 100),
+}
 
 
 class SmokeError(RuntimeError):
@@ -62,6 +87,9 @@ class EchoHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.echo()
 
+    def do_HEAD(self):
+        self.echo()
+
     def do_POST(self):
         self.echo()
 
@@ -84,20 +112,34 @@ class EchoHandler(BaseHTTPRequestHandler):
                       "forwarded_for": self.headers.get("X-Forwarded-For")}
             with self.server.records_lock:
                 self.server.completed.append(record)
-            encoded = json.dumps(record).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            fixture = STATIC_RESPONSES.get(urlsplit(self.path).path)
+            status, media_type, encoded = fixture or (200, "application/json", json.dumps(record).encode())
+            etag = '"' + hashlib.sha256(encoded).hexdigest() + '"'
+            if fixture and status == 200 and self.headers.get("If-None-Match") == etag:
+                # Starlette StaticFiles' 304 omits Content-Type.
+                status, media_type, encoded = 304, None, b""
+            self.send_response(status)
+            if media_type:
+                self.send_header("Content-Type", media_type)
+            if fixture:
+                self.send_header("ETag", etag)
+                # The gateway must enforce its policy even if upstream would
+                # otherwise let browsers cache an API/error/HTML response.
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Vary", "X-Fixture-Variant")
             self.send_header("Content-Length", str(len(encoded)))
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(encoded)
+            if self.command != "HEAD":
+                self.wfile.write(encoded)
         except (OSError, ValueError):
             # A rejected oversized upload may close a partially streamed request.
             self.close_connection = True
 
 
 class LoopbackHTTPS(client.HTTPSConnection):
-    """Fixed IP transport with localhost SNI/cert verification, without DNS."""
+    """Fixed loopback transport with Host/SNI/cert verification, without DNS."""
 
     def __init__(self, *args, source: str | None = None, proxy_header: bytes = b"", **kwargs):
         super().__init__(*args, **kwargs)
@@ -109,7 +151,7 @@ class LoopbackHTTPS(client.HTTPSConnection):
                                              source_address=(self.source, 0) if self.source else None)
         try:
             transport.sendall(self.proxy_header)
-            self.sock = self._context.wrap_socket(transport, server_hostname="localhost")
+            self.sock = self._context.wrap_socket(transport, server_hostname=self.host)
         except BaseException:
             transport.close()
             raise
@@ -139,11 +181,13 @@ def second_loopback() -> str | None:
 
 def request(port: int, context: ssl.SSLContext, method: str, path: str,
             body: bytes = b"", *, forged_forwarded_for: bool = False,
-            source: str | None = None, proxy_header: bytes = b""):
-    connection = LoopbackHTTPS("localhost", port, timeout=5, context=context,
+            source: str | None = None, proxy_header: bytes = b"",
+            host: str = ENTRY_HOSTS[0], extra_headers: dict[str, str] | None = None):
+    connection = LoopbackHTTPS(host, port, timeout=5, context=context,
                                source=source, proxy_header=proxy_header)
-    headers = {"Host": f"localhost:{port}", "Connection": "close",
+    headers = {"Host": f"{host}:{port}", "Connection": "close",
                "Content-Type": "application/octet-stream"}
+    headers.update(extra_headers or {})
     if forged_forwarded_for:
         headers["X-Forwarded-For"] = "198.51.100.77"
     try:
@@ -151,9 +195,77 @@ def request(port: int, context: ssl.SSLContext, method: str, path: str,
         response = connection.getresponse()
         response_body = response.read(8193)
         require(len(response_body) <= 8192, "response_unexpectedly_large")
-        return response.status, {key.lower(): value for key, value in response.getheaders()}, response_body
+        response_headers = {}
+        for key, value in response.getheaders():
+            name = key.lower()
+            response_headers[name] = ", ".join(filter(None, [response_headers.get(name), value]))
+        return response.status, response_headers, response_body
     finally:
         connection.close()
+
+
+def check_static_delivery(port: int, context: ssl.SSLContext) -> list[str]:
+    """Exercise response status/MIME gates and both Host policies over real TLS."""
+    results = []
+    assets = ("/assets/index-AbCd1234.js", "/assets/theme-ZyXw9876.css")
+    immutable = "public, max-age=31536000, immutable"
+    for host in ENTRY_HOSTS:
+        for path in assets:
+            identity = request(port, context, "GET", path, host=host,
+                               extra_headers={"Accept-Encoding": "identity"})
+            compressed = request(port, context, "GET", path, host=host,
+                                 extra_headers={"Accept-Encoding": "gzip"})
+            expected = STATIC_RESPONSES[path][2]
+            require(identity[0] == compressed[0] == 200, "public_asset_status")
+            require(identity[2] == expected and gzip.decompress(compressed[2]) == expected,
+                    "gzip_changed_public_asset_bytes")
+            require(compressed[1].get("content-encoding") == "gzip"
+                    and "content-encoding" not in identity[1]
+                    and len(compressed[2]) < len(identity[2]), "public_asset_not_compressed")
+            for response in (identity, compressed):
+                require(response[1].get("cache-control") == immutable
+                        and "pragma" not in response[1], "public_asset_cache_policy")
+                require("accept-encoding" in response[1].get("vary", "").lower(),
+                        "public_asset_encoding_not_varied")
+                require("x-fixture-variant" in response[1].get("vary", "").lower(),
+                        "public_asset_upstream_vary_lost")
+            head = request(port, context, "HEAD", path, host=host)
+            require(head[0] == 200 and head[1].get("cache-control") == immutable
+                    and head[2] == b"", "public_asset_head_policy")
+            for encoding, response in (("identity", identity), ("gzip", compressed)):
+                conditional = request(port, context, "GET", path, host=host, extra_headers={
+                    "Accept-Encoding": encoding, "If-None-Match": response[1]["etag"]})
+                # 304 has no MIME proof; deliberately retain no-store. A force
+                # reload can drop a cached object; fresh immutable hits need no
+                # revalidation. Never widen the gate to HTML or error responses.
+                require(conditional[0] == 304 and conditional[2] == b""
+                        and conditional[1].get("cache-control") == "private, no-store",
+                        "conditional_asset_policy")
+        results.extend(("gzip_byte_identity:" + host, "public_200_cache_and_vary:" + host,
+                        "head_and_conditional_304_policy:" + host))
+        for path, (status, _media_type, expected) in STATIC_RESPONSES.items():
+            if path in assets:
+                continue
+            response = request(port, context, "GET", path, host=host,
+                               extra_headers={"Accept-Encoding": "gzip"})
+            require(response[0] == status and response[2] == expected, "private_fixture_response:" + path)
+            require(response[1].get("cache-control") == "private, no-store"
+                    and response[1].get("pragma") == "no-cache"
+                    and "content-encoding" not in response[1], "private_fixture_cached_or_encoded:" + path)
+        post = request(port, context, "POST", assets[0], host=host,
+                       extra_headers={"Accept-Encoding": "gzip"})
+        require(post[1].get("cache-control") == "private, no-store"
+                and "content-encoding" not in post[1], "non_get_asset_cached")
+        blocked = request(port, context, "GET", "/docs", host=host)
+        require(blocked[0] == 404 and blocked[1].get("cache-control") == "private, no-store",
+                "gateway_404_cached")
+        results.append("html_api_audio_errors_and_unknown_assets_no_store:" + host)
+        health = request(port, context, "GET", "/health", host=host)
+        alt = health[1].get("alt-svc", "")
+        require(alt == "clear" if host == ENTRY_HOSTS[1] else "h3=" in alt,
+                "entry_alt_svc_policy:" + host)
+    results.append("tcp_relay_clears_h3_direct_entry_retains_h3")
+    return results
 
 
 def make_config(source: str, upstream_port: int, certificate: Path, key: Path,
@@ -265,7 +377,8 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
         # Certificate has no AIA/OCSP URLs. Its trust never leaves this process.
         subprocess.run([
             openssl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
-            "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1,"
+            + ",".join("DNS:" + host for host in ENTRY_HOSTS),
             "-addext", "basicConstraints=critical,CA:TRUE",
             "-addext", "keyUsage=critical,keyCertSign,digitalSignature,keyEncipherment",
             "-addext", "extendedKeyUsage=serverAuth", "-keyout", str(key), "-out", str(certificate),
@@ -287,7 +400,8 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
                 reservation.bind(("127.0.0.1", 0))
                 https_port = reservation.getsockname()[1]
-                environment["SITE_ADDRESS"] = f"https://localhost:{https_port}"
+                environment["SITE_ADDRESS"] = ", ".join(
+                    f"https://{host}:{https_port}" for host in ENTRY_HOSTS)
                 config = work / "Caddyfile"
                 config.write_text(make_config(source_bytes.decode(), upstream.server_port, certificate, key,
                                               snippet, https_port, binds))
@@ -339,6 +453,7 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
                     require(directive in csp.split("; "), "content_security_policy_mismatch")
                 require("server" not in health[1], "server_header_exposed")
                 results.append("security_headers")
+                results.extend(check_static_delivery(https_port, context))
                 blocked = ("/docs", "/docs/index.html", "/%64ocs", "/ReDoC", "/openapi.json",
                            "/content/item_bank_v1.json", "/content/week1_script.json",
                            "/content/autopilot_protocol_v1.json")

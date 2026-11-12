@@ -4,11 +4,9 @@
 #   仅 IP(暂无域名): SITE_ADDRESS=https://203.0.113.10   → 取消下方 tls internal,用 Caddy 内部 CA 自签
 # 老人端麦克风(getUserMedia)只在 https 安全上下文可用,故两种模式都必须走 TLS。
 {$SITE_ADDRESS} {
-	encode gzip
 	# 完整答案定义与框架自带文档不属于浏览器发布面。这里作为应用层
 	# fail-closed 授权之外的第二道边界，同时覆盖大小写和编码后的路径。
 	@blocked_internal path_regexp blocked_internal (?i)^/(?:content/(?:item_bank_v1\.json|week1_script\.json|autopilot_protocol_v1\.json)|docs(?:/.*)?|redoc(?:/.*)?|openapi\.json)/?$
-	respond @blocked_internal 404
 
 	# 只有规范的录音 blob PUT 可以到 64 MiB；登录、配对和普通 JSON
 	# 在 FastAPI 解析前统一压到 256 KiB。否则匿名者可并发发送接近
@@ -41,7 +39,46 @@
 	# Caddy reverse_proxy 默认忽略客户端自带的 X-Forwarded-For，
 	# 再依直连 peer 生成转发头；app 只信任本 Caddy 的固定内网 IP。
 	# 若日后前置 CDN/反代，必须改用 Caddy 全局 trusted_proxies 精确信任该上游。
-	reverse_proxy app:8000
+	# 只优化带 Vite 内容 hash 的公共 JS/CSS；页面、API、录音及错误响应不缓存。
+	@public_static {
+		method GET HEAD
+		path_regexp public_static ^/assets/[A-Za-z0-9_-]+-[A-Za-z0-9_-]{8}\.(js|css)$
+	}
+	# 147 国内入口目前只转发 TCP，不能广告未提供的 HTTP/3/QUIC。
+	# 直接入口仍保留自己的协议协商；新增中转域名须同步此精确名单。
+	@cn_entry host 147-182-176-237.sslip.io
+	header @cn_entry >Alt-Svc clear
+
+	# route 保持响应包装顺序：写响应时先 no-store，只有 200 + JS/CSS
+	# MIME 才覆盖为 immutable。未知 asset 的 HTML 兜底与 304 均保守不缓存。
+	route {
+		header @public_static {
+			Cache-Control "public, max-age=31536000, immutable"
+			-Pragma
+			+Vary Accept-Encoding
+			match {
+				status 200
+				header Content-Type application/javascript*
+				header Content-Type text/javascript*
+				header Content-Type text/css*
+			}
+		}
+		header {
+			Cache-Control "private, no-store"
+			Pragma "no-cache"
+			defer
+		}
+		respond @blocked_internal 404
+		encode @public_static gzip {
+			match {
+				status 200
+				header Content-Type application/javascript*
+				header Content-Type text/javascript*
+				header Content-Type text/css*
+			}
+		}
+		reverse_proxy app:8000
+	}
 
 	# 仅 IP 部署(无域名)时取消下一行注释:Caddy 用内部 CA 自签,浏览器首次访问需人工信任一次。
 	# 有域名时保持注释——让 Caddy 走自动公共证书,无需任何手动信任。
