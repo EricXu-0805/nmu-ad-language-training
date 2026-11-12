@@ -229,7 +229,13 @@ def test_the_install_is_bounded_to_the_nine_expected_kernel_packages():
         f"linux-modules-extra-{target}-generic", f"linux-headers-{target}",
         f"linux-headers-{target}-generic"])
     installs = [line for line in _logical_lines() if re.search(r"apt-get\b.*\binstall\b", line)]
-    assert installs and all("${META_PACKAGES}" in line for line in installs), installs
+    assert installs and all("${PINNED_META_PACKAGES}" in line for line in installs), installs
+    assert 'KERNEL_PACKAGE_VERSION="5.15.0-203.213"' in text
+    assert 'KERNEL_META_VERSION="5.15.0.203.175"' in text
+    pinned = re.search(r'^PINNED_META_PACKAGES="([^"]+)"$', text, re.M).group(1)
+    assert pinned.split() == [
+        "linux-generic=${KERNEL_META_VERSION}", "linux-image-generic=${KERNEL_META_VERSION}",
+        "linux-headers-generic=${KERNEL_META_VERSION}", "linux-libc-dev=${KERNEL_PACKAGE_VERSION}"]
 
 
 # ---------------- netplan：先装死人开关，按 MAC 匹配，不改名 ----------------
@@ -340,21 +346,21 @@ def test_a_reboot_waits_for_a_new_boot_id_not_just_for_ssh():
 # bash 3.2 和 CI 的 bash 5 上各走一遍。假机器只认识脚本该发的命令，远端正文一律答 PASS：
 # 这里验的是本地这一侧的次序与收口，不是远端核对的内容。
 
-_SIMULATION_202 = "".join(
+_SIMULATION_203 = "".join(
     f"Inst {name} {old}({new} Ubuntu:22.04/jammy-updates [amd64])\n" for name, old, new in (
-        ("linux-headers-5.15.0-202", "", "5.15.0-202.212"),
-        ("linux-headers-5.15.0-202-generic", "", "5.15.0-202.212"),
-        ("linux-headers-generic", "[5.15.0.198.171] ", "5.15.0.202.174"),
-        ("linux-modules-5.15.0-202-generic", "", "5.15.0-202.212"),
-        ("linux-image-5.15.0-202-generic", "", "5.15.0-202.212"),
-        ("linux-modules-extra-5.15.0-202-generic", "", "5.15.0-202.212"),
-        ("linux-image-generic", "[5.15.0.198.171] ", "5.15.0.202.174"),
-        ("linux-generic", "[5.15.0.198.171] ", "5.15.0.202.174"),
-        ("linux-libc-dev", "[5.15.0-198.208] ", "5.15.0-202.212"),
+        ("linux-headers-5.15.0-203", "", "5.15.0-203.213"),
+        ("linux-headers-5.15.0-203-generic", "", "5.15.0-203.213"),
+        ("linux-headers-generic", "[5.15.0.202.174] ", "5.15.0.203.175"),
+        ("linux-modules-5.15.0-203-generic", "", "5.15.0-203.213"),
+        ("linux-image-5.15.0-203-generic", "", "5.15.0-203.213"),
+        ("linux-modules-extra-5.15.0-203-generic", "", "5.15.0-203.213"),
+        ("linux-image-generic", "[5.15.0.202.174] ", "5.15.0.203.175"),
+        ("linux-generic", "[5.15.0.202.174] ", "5.15.0.203.175"),
+        ("linux-libc-dev", "[5.15.0-202.212] ", "5.15.0-203.213"),
     ))
 
 # 一台会随脚本的动作变化的假机器：装包后内核包在、重启换 boot_id 并起到新内核、
-# 装死人开关的那段正文执行后新段就位、清包后 194 的包消失。日志一行一条命令，
+# 装死人开关的那段正文执行后新段就位、清包后 198 的包消失。日志一行一条命令，
 # 远端正文按里面的关键动作打标签，方便核对先后次序。
 _FAKE_SSH = '''\
 import json
@@ -386,7 +392,7 @@ def reply(text="", code=0):
 
 netfile = state.get("netfile") or (
     "/run/systemd/network/10-netplan-%s.network" % ("by-mac" if state["stanza"] else "ens18"))
-old_kernel = "linux-image-5.15.0-194-generic ii \\nlinux-modules-5.15.0-194-generic ii \\n"
+old_kernel = "linux-image-5.15.0-198-generic ii \\nlinux-modules-5.15.0-198-generic ii \\n"
 if command == "true":
     reply()
 if command.startswith("date -u"):
@@ -423,6 +429,19 @@ if "networkctl" in command:
     reply(netfile + "\\n")
 if "then echo present" in command:
     reply("present\\n" if state["stanza"] else "absent\\n")
+if "dpkg-query -W -f='${Package} ${Version}" in command:
+    if not state["installed"]:
+        reply("", 1)
+    names = command.split("' ", 1)[1].split()
+    rows = []
+    for name in names:
+        version = "5.15.0.203.175" if name in ("linux-generic", "linux-image-generic", "linux-headers-generic") else "5.15.0-203.213"
+        if state.get("installed_version_drift") and name == "linux-libc-dev":
+            version = "5.15.0-203.214"
+        if state.get("installed_package_missing") and name == "linux-modules-extra-5.15.0-203-generic":
+            continue
+        rows.append(name + " " + version + " ii ")
+    reply("\\n".join(rows) + "\\n")
 if "dpkg-query -W -f='${Status}'" in command:
     reply("install ok installed" if state["installed"] else "")
 if "dpkg-query -W -f='${Package}" in command:
@@ -430,8 +449,8 @@ if "dpkg-query -W -f='${Package}" in command:
 if "apt-get -s install" in command:
     reply("" if state["installed"] else os.environ["FAKE_SIMULATION"])
 if "apt-get -s purge" in command:
-    reply("Purg linux-image-5.15.0-194-generic [5.15.0-194.205]\\n"
-          "Purg linux-modules-5.15.0-194-generic [5.15.0-194.205]\\n")
+    reply("Purg linux-image-5.15.0-198-generic [5.15.0-198.208]\\n"
+          "Purg linux-modules-5.15.0-198-generic [5.15.0-198.208]\\n")
 if "systemd-run --wait" in command and "apt-get install" in command:
     state["installed"] = True
     reply()
@@ -447,7 +466,7 @@ if "preflight_check.py" in command:
 if "systemctl --no-pager reboot" in command:
     state["boot"] += "-next"
     if state["installed"]:
-        state["kernel"] = "5.15.0-202-generic"
+        state["kernel"] = "5.15.0-203-generic"
     reply("", 255)
 if command.endswith("bash -s"):
     if "lsinitramfs" in body and state.get("boot_target_mismatch"):
@@ -459,13 +478,13 @@ sys.stderr.write("没预料到的远端命令：" + command + "\\n")
 sys.exit(97)
 '''
 
-# 10-03 之后的生产机:跑 198,按 MAC 匹配的段已在、网络走 by-mac 那份。
-_FRESH_HOST = {"boot": "boot-a", "kernel": "5.15.0-198-generic", "installed": False,
+# 11-06 之后的生产机:跑 202,按 MAC 匹配的段已在、网络走 by-mac 那份。
+_FRESH_HOST = {"boot": "boot-a", "kernel": "5.15.0-202-generic", "installed": False,
                "stanza": True, "purged": False}
 
 
 def _run_phase(tmp_path: Path, phase: str, answers: str = "", clock: str = "5 03 10",
-               simulation: str = _SIMULATION_202, host: dict | None = None,
+               simulation: str = _SIMULATION_203, host: dict | None = None,
                journal: str = "",
                script: Path = SCRIPT) -> tuple[subprocess.CompletedProcess, list[str]]:
     import json
@@ -598,7 +617,7 @@ def test_the_check_phase_flags_the_nightly_window_and_an_unexpected_package(tmp_
     extra = ("Inst linux-firmware [20220329] "
              "(20220329.git681281e4-0ubuntu3.40 Ubuntu:22.04/jammy-updates [all])\n")
     # 周五 18:10 UTC：正在夜间补丁的窗口里；模拟又多带进一个包。
-    result, _ = _run_phase(tmp_path, "check", clock="5 18 10", simulation=_SIMULATION_202 + extra)
+    result, _ = _run_phase(tmp_path, "check", clock="5 18 10", simulation=_SIMULATION_203 + extra)
 
     assert result.returncode == 1
     assert "这一项不过:时间窗" in result.stdout
@@ -638,7 +657,7 @@ def test_the_kernel_phase_stops_when_the_stanza_and_the_live_network_disagree(tm
 
 def test_verify_kernel_reads_the_expected_network_from_the_host(tmp_path):
     result, commands = _run_phase(tmp_path, "verify-kernel", host={
-        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True})
+        **_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True})
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert [c for c in commands
@@ -682,7 +701,7 @@ def test_a_declined_reboot_leaves_the_kernel_installed_and_the_rerun_skips_the_i
 
 def test_the_kernel_phase_refuses_to_run_twice(tmp_path):
     result, commands = _run_phase(tmp_path, "kernel", answers="yes\n" * 4, host={
-        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True})
+        **_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True})
 
     assert result.returncode == 1 and "这一阶段做过了" in result.stdout
     assert not [c for c in commands if "apt-get install" in c or REBOOT in c]
@@ -690,7 +709,7 @@ def test_the_kernel_phase_refuses_to_run_twice(tmp_path):
 
 def test_the_netplan_phase_arms_the_dead_man_before_applying_and_disarms_before_rebooting(tmp_path):
     result, commands = _run_phase(tmp_path, "netplan", answers="yes\n" * 4, host={
-        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True, "stanza": False})
+        **_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True, "stanza": False})
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "netplan 阶段完成" in result.stdout
@@ -705,7 +724,7 @@ def test_the_netplan_phase_arms_the_dead_man_before_applying_and_disarms_before_
 
 def test_the_purge_phase_simulates_first_and_never_reboots(tmp_path):
     result, commands = _run_phase(tmp_path, "purge", answers="yes\n", host={
-        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True})
+        **_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True})
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "purge 阶段完成" in result.stdout
@@ -731,43 +750,56 @@ def _images(*abis):
     return "".join(f"linux-image-{abi}-generic ii \n" for abi in abis)
 
 
-_REVIEWED_ABIS = ("5.15.0-202", "5.15.0-198", "5.15.0-194")
-_CANDIDATE_202 = "Package: linux-image-generic\nDepends: linux-image-5.15.0-202-generic, linux-firmware\n"
+_REVIEWED_ABIS = ("5.15.0-203", "5.15.0-202", "5.15.0-198")
+_CANDIDATE_203 = "Package: linux-image-generic\nDepends: linux-image-5.15.0-203-generic, linux-firmware\n"
+
+
+@pytest.mark.parametrize("candidate", ["5.15.0.203.176", "(none)", "5.15.0.202.174"])
+def test_candidate_revision_changes_cannot_hide_behind_a_pinned_old_meta(candidate):
+    policy = "linux-image-generic:\n  Candidate: " + candidate + "\n"
+    with pytest.raises(ValueError, match="候选精确版本"):
+        _abi_checker()["checked_candidate"](policy, "linux-image-generic", "5.15.0.203.175")
+
+
+def test_reviewed_candidate_revision_is_accepted():
+    assert _abi_checker()["checked_candidate"](
+        "linux-libc-dev:\n  Candidate: 5.15.0-203.213\n", "linux-libc-dev", "5.15.0-203.213"
+    ) == "5.15.0-203.213"
 
 
 @pytest.mark.parametrize(("installed", "boot", "expected_purge"), [
-    (("5.15.0-198", "5.15.0-194"), ("5.15.0-198", "5.15.0-194"), "5.15.0-194"),
-    (_REVIEWED_ABIS, _REVIEWED_ABIS, "5.15.0-194"),
+    (("5.15.0-202", "5.15.0-198"), ("5.15.0-202", "5.15.0-198"), "5.15.0-198"),
+    (_REVIEWED_ABIS, _REVIEWED_ABIS, "5.15.0-198"),
     (_REVIEWED_ABIS[:2], _REVIEWED_ABIS[:2], None),
 ])
 def test_abi_derivation_handles_before_install_after_install_and_after_purge(installed, boot,
                                                                          expected_purge):
     checker = _abi_checker()
-    result = checker["derive_abis"](_CANDIDATE_202, _images(*installed), boot, boot)
-    assert result == ("5.15.0-202", "5.15.0-198", expected_purge)
+    result = checker["derive_abis"](_CANDIDATE_203, _images(*installed), boot, boot)
+    assert result == ("5.15.0-203", "5.15.0-202", expected_purge)
     checker["check_abis"](result, _REVIEWED_ABIS, installed[0] + "-generic")
 
 
 def test_abi_derivation_still_sees_old_residual_packages_after_boot_files_are_gone():
     checker = _abi_checker()
     boot = _REVIEWED_ABIS[:2]
-    packages = (_images(*boot) + "linux-image-5.15.0-194-generic rc \n"
-                "linux-modules-5.15.0-194-generic rc \n"
+    packages = (_images(*boot) + "linux-image-5.15.0-198-generic rc \n"
+                "linux-modules-5.15.0-198-generic rc \n"
                 "linux-headers-5.15.0-190 un \n")
-    assert checker["derive_abis"](_CANDIDATE_202, packages, boot, boot) == _REVIEWED_ABIS
+    assert checker["derive_abis"](_CANDIDATE_203, packages, boot, boot) == _REVIEWED_ABIS
 
 
 @pytest.mark.parametrize(("metadata", "packages", "boot", "ready", "error"), [
-    ("Depends: linux-image-5.15.0-202-generic | linux-image-5.15.0-205-generic\n",
+    ("Depends: linux-image-5.15.0-203-generic | linux-image-5.15.0-205-generic\n",
      _images(*_REVIEWED_ABIS), _REVIEWED_ABIS, _REVIEWED_ABIS, "不是唯一"),
-    (_CANDIDATE_202, _images("5.15.0-202", "5.15.0-198", "5.15.0-194", "5.15.0-190"),
+    (_CANDIDATE_203, _images("5.15.0-203", "5.15.0-202", "5.15.0-198", "5.15.0-190"),
      _REVIEWED_ABIS, _REVIEWED_ABIS, "待清内核不是唯一"),
-    (_CANDIDATE_202, _images(*_REVIEWED_ABIS), _REVIEWED_ABIS, ("5.15.0-202",), "没有同时具备"),
-    (_CANDIDATE_202, _images("5.15.0-198") + "linux-headers-5.15.0-202 iF \n",
-     ("5.15.0-198",), ("5.15.0-198",), "没有安装/清理完"),
-    (_CANDIDATE_202, _images("5.15.0-205", "5.15.0-202", "5.15.0-198"),
-     ("5.15.0-202", "5.15.0-198"), ("5.15.0-202", "5.15.0-198"), "比 apt 候选更新"),
-    (_CANDIDATE_202, "linux-image-5.15.0-198-generic\n", (), (), "格式不完整"),
+    (_CANDIDATE_203, _images(*_REVIEWED_ABIS), _REVIEWED_ABIS, ("5.15.0-203",), "没有同时具备"),
+    (_CANDIDATE_203, _images("5.15.0-202") + "linux-headers-5.15.0-203 iF \n",
+     ("5.15.0-202",), ("5.15.0-202",), "没有安装/清理完"),
+    (_CANDIDATE_203, _images("5.15.0-205", "5.15.0-203", "5.15.0-202"),
+     ("5.15.0-203", "5.15.0-202"), ("5.15.0-203", "5.15.0-202"), "比 apt 候选更新"),
+    (_CANDIDATE_203, "linux-image-5.15.0-202-generic\n", (), (), "格式不完整"),
 ])
 def test_abi_derivation_rejects_ambiguous_or_incomplete_inventory(metadata, packages, boot, ready,
                                                               error):
@@ -776,11 +808,11 @@ def test_abi_derivation_rejects_ambiguous_or_incomplete_inventory(metadata, pack
 
 
 @pytest.mark.parametrize(("derived", "expected", "running", "error"), [
-    (("5.15.0-205", "5.15.0-202", "5.15.0-198"), _REVIEWED_ABIS, "5.15.0-202-generic", "候选/回退"),
-    (("5.15.0-202", "5.15.0-194", None), _REVIEWED_ABIS, "5.15.0-202-generic", "候选/回退"),
-    (("5.15.0-202", "5.15.0-198", "5.15.0-190"), _REVIEWED_ABIS, "5.15.0-202-generic", "PURGE_ABI"),
-    (_REVIEWED_ABIS, _REVIEWED_ABIS, "5.15.0-194-generic", "运行内核"),
-    (_REVIEWED_ABIS, ("5.15.0-202", "5.15.0-198", "5.15.0-202"), "5.15.0-202-generic", "审核常量的顺序"),
+    (("5.15.0-205", "5.15.0-203", "5.15.0-202"), _REVIEWED_ABIS, "5.15.0-203-generic", "候选/回退"),
+    (("5.15.0-203", "5.15.0-198", None), _REVIEWED_ABIS, "5.15.0-203-generic", "候选/回退"),
+    (("5.15.0-203", "5.15.0-202", "5.15.0-190"), _REVIEWED_ABIS, "5.15.0-203-generic", "PURGE_ABI"),
+    (_REVIEWED_ABIS, _REVIEWED_ABIS, "5.15.0-198-generic", "运行内核"),
+    (_REVIEWED_ABIS, ("5.15.0-203", "5.15.0-202", "5.15.0-203"), "5.15.0-203-generic", "审核常量的顺序"),
 ])
 def test_discovered_abis_never_automatically_replace_the_reviewed_constants(derived, expected,
                                                                        running, error):
@@ -792,7 +824,7 @@ def test_discovered_abis_never_automatically_replace_the_reviewed_constants(deri
 def test_stale_abi_constants_block_check_and_the_real_mutating_phases(phase, tmp_path):
     host = {**_FRESH_HOST, "abi_probe_failure": True}
     if phase == "purge":
-        host.update(kernel="5.15.0-202-generic", installed=True)
+        host.update(kernel="5.15.0-203-generic", installed=True)
     result, commands = _run_phase(tmp_path, phase, answers="yes\n" * 4, host=host)
     assert result.returncode == 1 and "内核 ABI 与审核常量一致" in result.stdout
     assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
@@ -805,7 +837,7 @@ def test_an_empty_successful_ssh_response_is_not_an_abi_verification(tmp_path):
 
 def test_check_accepts_the_completed_kernel_window_without_reinstalling_packages(tmp_path):
     result, commands = _run_phase(tmp_path, "check", host={
-        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True, "purged": True})
+        **_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True, "purged": True})
     assert result.returncode == 0, result.stdout + result.stderr
     assert "审核目标已装好,无需再装包" in result.stdout
     assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
@@ -813,14 +845,35 @@ def test_check_accepts_the_completed_kernel_window_without_reinstalling_packages
 
 def test_an_empty_install_plan_without_the_target_installed_is_not_complete(tmp_path):
     result, _ = _run_phase(tmp_path, "check", simulation="")
-    assert result.returncode == 1 and "审核目标尚未装好" in result.stdout
+    assert result.returncode == 1 and "9 个包尚未按精确版本装好" in result.stdout
+
+
+@pytest.mark.parametrize("phase", ["check", "kernel"])
+@pytest.mark.parametrize("old,new", [("5.15.0-203.213", "5.15.0-203.214"),
+                                    ("5.15.0.203.175", "5.15.0.203.176")])
+def test_same_abi_with_unreviewed_package_revision_is_rejected(phase, old, new, tmp_path):
+    simulation = _SIMULATION_203.replace(old, new)
+    result, commands = _run_phase(tmp_path, phase, simulation=simulation, answers="yes\n" * 4)
+    assert result.returncode == 1 and "不符合精确包版本" in result.stdout
+    assert not [command for command in commands if "systemd-run" in command or REBOOT in command]
+    simulated = [command for command in commands if "apt-get -s install" in command]
+    assert simulated and all("linux-generic=5.15.0.203.175" in command
+                             and "linux-libc-dev=5.15.0-203.213" in command for command in simulated)
+
+
+@pytest.mark.parametrize("change", ["installed_version_drift", "installed_package_missing"])
+def test_empty_plan_requires_all_nine_exact_installed_versions(change, tmp_path):
+    result, commands = _run_phase(tmp_path, "check", host={
+        **_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True, change: True})
+    assert result.returncode == 1 and "9 个包尚未按精确版本装好" in result.stdout
+    assert not [command for command in commands if "systemd-run" in command or REBOOT in command]
 
 
 # ---------------- O05:只重启,不会顺便装内核或改网络 ----------------
 
 def test_the_reboot_phase_keeps_the_kernel_and_network_without_installing_or_purging(tmp_path):
     result, commands = _run_phase(tmp_path, "reboot", answers="yes\n" * 4, host={
-        **_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True, "purged": True})
+        **_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True, "purged": True})
     assert result.returncode == 0, result.stdout + result.stderr
     assert "reboot 阶段完成:未安装包" in result.stdout
     assert (_first(commands, "--minutes 10") < _first(commands, ":: lsinitramfs")
@@ -833,13 +886,13 @@ def test_the_reboot_phase_keeps_the_kernel_and_network_without_installing_or_pur
 @pytest.mark.parametrize(("changes", "journal", "answers", "error"), [
     ({}, _ONE_ANSWER, "yes\n" * 4, "停:生产空闲"),
     ({"boot_target_mismatch": True}, "", "yes\n" * 4, "默认启动项或启动文件"),
-    ({"kernel": "5.15.0-198-generic"}, "", "yes\n" * 4, "只重启阶段要求"),
+    ({"kernel": "5.15.0-202-generic"}, "", "yes\n" * 4, "只重启阶段要求"),
     ({"netfile": "/run/systemd/network/10-netplan-ens18.network"}, "", "yes\n" * 4, "网络段与实际"),
     ({}, "", "yes\nyes\nyes\nno\n", "没有确认"),
 ])
 def test_the_reboot_phase_stops_before_reboot_on_unsafe_or_declined_conditions(changes, journal,
                                                                            answers, error, tmp_path):
-    host = {**_FRESH_HOST, "kernel": "5.15.0-202-generic", "installed": True, "purged": True,
+    host = {**_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True, "purged": True,
             **changes}
     result, commands = _run_phase(tmp_path, "reboot", answers=answers, journal=journal, host=host)
     assert result.returncode == 1 and error in result.stdout, result.stdout + result.stderr
