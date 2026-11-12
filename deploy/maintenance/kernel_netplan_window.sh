@@ -11,14 +11,15 @@
 # 在 Eric 的 Mac 上跑(/bin/bash 3.2 也行),用绝对路径,整屏输出发 Claude:
 #   bash /Users/xiaogangxu/Downloads/南医大语言沟通训练阿尔茨海默病项目/platform/deploy/maintenance/kernel_netplan_window.sh <阶段>
 # 阶段:
-#   check           只读演练:门槛、基线、装包模拟都走一遍,不改生产上的任何东西,也不问问题
+#   check           只读演练:门槛、基线、候选/已装内核推导、装包模拟都走一遍,不改生产,也不问问题
 #   kernel          只装预期的 9 个内核包 → 重启前核对 → 重启 → 重启后核对(网络照旧走原来那份)
+#   reboot          只重启以换掉旧库:不装包、不改网络;默认启动项必须仍是当前已审核内核
 #   verify-kernel   只读:按 kernel 阶段的预期再核一遍(等待超时、从控制台救回来之后用)
 #   netplan         演练生成 → 装死人开关 → 放上按 MAC 匹配的段并 apply → 新连接验证 → 拆开关
 #                   → 再重启 → 重启后核对(网络改走 by-mac 那份)
 #   verify-netplan  只读:按 netplan 阶段的预期再核一遍
 #   purge           模拟后只清掉 PURGE_ABI 那个内核的包
-# 任何一步打印「停」就停下,不要接着跑别的阶段。kernel、netplan 在「现在重启?」答了 no 的,
+# 任何一步打印「停」就停下,不要接着跑别的阶段。kernel、reboot、netplan 在「现在重启?」答了 no 的,
 # 之后原样重跑同一阶段即可:已经装好的包、已经接管的新段会被认出来,直接走到重启。
 #
 # 永远不做:停用、停止或屏蔽任何 nmu-*.timer(deploy/systemd/README.md「维护重启不得停用
@@ -83,7 +84,7 @@ gate() {
 }
 
 usage() {
-  echo "用法:bash /Users/xiaogangxu/Downloads/南医大语言沟通训练阿尔茨海默病项目/platform/deploy/maintenance/kernel_netplan_window.sh <check|kernel|verify-kernel|netplan|verify-netplan|purge>"
+  echo "用法:bash /Users/xiaogangxu/Downloads/南医大语言沟通训练阿尔茨海默病项目/platform/deploy/maintenance/kernel_netplan_window.sh <check|kernel|reboot|verify-kernel|netplan|verify-netplan|purge>"
   echo "各阶段做什么、什么时候跑,见脚本头注释。"
 }
 
@@ -304,16 +305,137 @@ REMOTE
 
 # ---------------- 内核 ----------------
 
+kernel_abis_match() {
+  echo "== 只读推导内核:apt 候选依赖、已装包与 /boot 必须符合审核过的三个 ABI(不会自动改常量) =="
+  local report rc=0
+  report=$(RBASH "EXPECTED_TARGET=${TARGET_ABI} EXPECTED_FALLBACK=${FALLBACK_ABI} EXPECTED_PURGE=${PURGE_ABI} /usr/bin/python3 -I -" <<'PY'
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+ABI = r"[0-9]+\.[0-9]+\.[0-9]+-[0-9]+"
+IMAGE = re.compile(r"^linux-image-(" + ABI + r")-generic$")
+KERNEL_PACKAGE = re.compile(
+    r"^linux-(?:image(?:-unsigned)?|modules(?:-extra)?|headers)-(" + ABI + r")(?:-generic)?$")
+
+
+def abi_key(value):
+    if not re.fullmatch(ABI, value):
+        raise ValueError("无法识别内核 ABI: " + value)
+    return tuple(int(part) for part in re.split(r"[.-]", value))
+
+
+def derive_abis(metadata, packages, boot_images, ready_images):
+    # 只读精确候选版本的元包依赖,不从 apt-cache 的多版本输出猜一个版本。
+    dependencies = re.findall(r"^Depends:\s*(.*)$", metadata, re.MULTILINE)
+    targets = set(re.findall(r"\blinux-image-(" + ABI + r")-generic\b", " ".join(dependencies)))
+    if len(targets) != 1:
+        raise ValueError("linux-image-generic 的候选依赖不是唯一 generic 内核")
+    target = targets.pop()
+    installed_images, known = set(), set(boot_images)
+    for line in packages.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) != 2:
+            raise ValueError("dpkg 内核清单格式不完整")
+        name, status = fields
+        matched = KERNEL_PACKAGE.fullmatch(name)
+        if matched is None:
+            continue
+        if status in ("un", "pn"):
+            continue
+        if status not in ("ii", "rc"):
+            raise ValueError("内核包没有安装/清理完: " + name + " " + status)
+        known.add(matched.group(1))
+        image = IMAGE.fullmatch(name)
+        if image is not None and status == "ii":
+            installed_images.add(image.group(1))
+    if any(abi_key(abi) > abi_key(target) for abi in known):
+        raise ValueError("已装或 /boot 中有比 apt 候选更新的内核,需要重新评审")
+    older = sorted((abi for abi in installed_images & set(ready_images)
+                    if abi_key(abi) < abi_key(target)), key=abi_key)
+    if not older:
+        raise ValueError("没有同时具备已装映像、vmlinuz 与 initrd 的回退内核")
+    fallback = older[-1]
+    purges = sorted(known - {target, fallback}, key=abi_key)
+    if len(purges) > 1 or any(abi_key(abi) >= abi_key(fallback) for abi in purges):
+        raise ValueError("待清内核不是唯一且早于回退的版本: " + ", ".join(purges))
+    return target, fallback, purges[0] if purges else None
+
+
+def check_abis(derived, expected, running):
+    target, fallback, purge = derived
+    reviewed_target, reviewed_fallback, reviewed_purge = expected
+    if not (abi_key(reviewed_purge) < abi_key(reviewed_fallback) < abi_key(reviewed_target)):
+        raise ValueError("审核常量的顺序不是 PURGE < FALLBACK < TARGET")
+    if target != reviewed_target or fallback != reviewed_fallback:
+        raise ValueError("候选/回退与审核常量不符,先更新常量并重新评审")
+    # 清理完成后不会再凭空推导出 194;只能接受没有任何其他老内核的已完成状态。
+    if purge is not None and purge != reviewed_purge:
+        raise ValueError("待清版本与 PURGE_ABI 不符,先重新评审")
+    if running not in (target + "-generic", fallback + "-generic"):
+        raise ValueError("运行内核既不是审核目标也不是回退内核: " + running)
+
+
+def read_command(args):
+    done = subprocess.run(args, capture_output=True, text=True, timeout=60,
+                          env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+    if done.returncode:
+        raise ValueError(args[0] + " 读取失败")
+    return done.stdout
+
+
+try:
+    policy = read_command(["apt-cache", "policy", "linux-image-generic"])
+    candidates = re.findall(r"^\s*Candidate:\s*(\S+)\s*$", policy, re.MULTILINE)
+    if len(candidates) != 1 or candidates[0] == "(none)":
+        raise ValueError("apt 没有唯一的 linux-image-generic 候选版本")
+    metadata = read_command(["apt-cache", "show", "linux-image-generic=" + candidates[0]])
+    packages = read_command(["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", "linux-*"])
+    boot_images, ready_images = set(), set()
+    for path in Path("/boot").glob("vmlinuz-*"):
+        matched = re.fullmatch(r"vmlinuz-(" + ABI + r")-generic", path.name)
+        if matched is None:
+            raise ValueError("/boot 含非预期的内核映像: " + path.name)
+        abi = matched.group(1)
+        boot_images.add(abi)
+        initrd = path.with_name("initrd.img-" + abi + "-generic")
+        if path.stat().st_size > 0 and initrd.is_file() and initrd.stat().st_size > 0:
+            ready_images.add(abi)
+    derived = derive_abis(metadata, packages, boot_images, ready_images)
+    expected = tuple(os.environ[name] for name in ("EXPECTED_TARGET", "EXPECTED_FALLBACK", "EXPECTED_PURGE"))
+    print("  推导 TARGET=%s FALLBACK=%s PURGE=%s" % (derived[0], derived[1], derived[2] or "无(已清完)"))
+    print("  审核 TARGET=%s FALLBACK=%s PURGE=%s" % expected)
+    check_abis(derived, expected, os.uname().release)
+except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+    print("  FAIL " + str(exc))
+    sys.exit(1)
+print("  PASS 内核版本与审核常量一致")
+PY
+  ) || rc=$?
+  printf '%s\n' "${report:-  FAIL 没收到内核推导结果}"
+  [ "${rc}" = "0" ] && printf '%s\n' "${report}" | grep -qx '  PASS 内核版本与审核常量一致'
+}
+
 simulation_matches() {
   echo "== 装包模拟:点名 ${META_PACKAGES},带进来的必须正好是预期的 9 个 =="
-  local sim names expected wrong removed
+  local sim names expected wrong removed state
   sim=$(RSH "LC_ALL=C apt-get -s install ${META_PACKAGES}") || { echo "  模拟失败"; return 1; }
   names=$(printf '%s\n' "${sim}" | awk '/^Inst /{print $2}' | LC_ALL=C sort | tr '\n' ' ')
   expected=$(printf '%s\n' "${EXPECTED_INSTALL}" | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ')
   echo "  模拟要装:${names:-无}"
+  removed=$(printf '%s\n' "${sim}" | grep -c '^Remv ')
+  if [ -z "${names}" ] && [ "${removed}" = "0" ]; then
+    state=$(RSH "dpkg-query -W -f='\${Status}' linux-image-${TARGET_ABI}-generic 2>/dev/null") || return 1
+    [ "${state}" = "install ok installed" ] || { echo "  没有安装计划,但审核目标尚未装好"; return 1; }
+    echo "  PASS 审核目标已装好,无需再装包"
+    return 0
+  fi
   if [ "${names}" != "${expected}" ]; then echo "  预期的是:${expected}"; return 1; fi
   wrong=$(printf '%s\n' "${sim}" | grep '^Inst ' | grep -c -v -F -e "(${TARGET_ABI//-/.}." -e "(${TARGET_ABI}.")
-  removed=$(printf '%s\n' "${sim}" | grep -c '^Remv ')
   echo "  新版本不是 ${TARGET_ABI} 的:${wrong} 个;要删的:${removed} 个"
   [ "${wrong}" = "0" ] && [ "${removed}" = "0" ]
 }
@@ -596,6 +718,7 @@ phase_check() {
   common_gates 45
   gate "按 MAC 匹配的段与 eth0 的 Network File 一致" network_consistent
   gate "基线" record_baseline
+  gate "内核 ABI 与审核常量一致" kernel_abis_match
   gate "装包模拟只带进预期的 9 个包" simulation_matches
   if [ "${GATE_FAILURES}" = "0" ]; then
     echo "== 演练:每一项都过 =="
@@ -634,6 +757,7 @@ phase_kernel() {
   running=$(RSH 'uname -r')
   [ "${running}" != "${TARGET_ABI}-generic" ] || bail "已经在跑 ${TARGET_ABI}-generic,这一阶段做过了;要复核就跑 verify-kernel"
   [ "${running}" = "${FALLBACK_ABI}-generic" ] || bail "正在跑的是 ${running:-查不到},不是预期的 ${FALLBACK_ABI}-generic:常量过时了,先重新评审"
+  gate "内核 ABI 与审核常量一致" kernel_abis_match
   network=$(current_network)
   [ -n "${network}" ] || bail "按 MAC 匹配的段在不在,和 eth0 正在用的 Network File 对不上:netplan 改到一半,内核这一轮不该和它叠在一起"
   record_baseline || bail "基线取不全(生产没有任何改动)"
@@ -642,6 +766,23 @@ phase_kernel() {
   reboot_and_wait "${BOOT_BEFORE}"
   post_reboot_asserts "${network}" "${BOOT_BEFORE}" || bail "重启后核对有 FAIL(看上面)"
   echo "== kernel 阶段完成:内核 ${TARGET_ABI},网络照旧走 ${network}。观察一天没问题再跑 purge =="
+}
+
+phase_reboot() {
+  local running network
+  gate "Mac 侧路由与 KiwiVM 直连" mac_route_ok
+  operator_ready
+  common_gates 15
+  running=$(RSH 'uname -r') || bail "读不到运行内核(生产没有任何改动)"
+  [ "${running}" = "${TARGET_ABI}-generic" ] || bail "只重启阶段要求当前已在跑审核目标 ${TARGET_ABI}-generic;现在 ${running:-查不到},先复核内核窗口"
+  network=$(current_network)
+  [ -n "${network}" ] || bail "网络段与实际 Network File 对不上,没有重启"
+  record_baseline || bail "基线取不全(生产没有任何改动)"
+  # 同一份核对会拒绝 GRUB 指向另一个内核及一次性启动项;不能借“只换旧库”偷偷换内核。
+  pre_reboot_asserts || bail "默认启动项或启动文件不符合当前内核,没有重启(生产没有任何改动)"
+  reboot_and_wait "${BOOT_BEFORE}"
+  post_reboot_asserts "${network}" "${BOOT_BEFORE}" || bail "重启后核对有 FAIL(看上面)"
+  echo "== reboot 阶段完成:未安装包,内核仍为 ${running},网络仍走 ${network} =="
 }
 
 phase_verify() {   # $1 = 期望的 Network File
@@ -689,6 +830,7 @@ phase_purge() {
   common_gates 15
   running=$(RSH 'uname -r')
   [ "${running}" = "${TARGET_ABI}-generic" ] || bail "正在跑的是 ${running:-查不到},不是 ${TARGET_ABI}-generic:先做完 kernel 阶段"
+  gate "内核 ABI 与审核常量一致" kernel_abis_match
   RSH "test -s /boot/vmlinuz-${FALLBACK_ABI}-generic" || bail "回退内核 ${FALLBACK_ABI} 不在 /boot 里,不清 ${PURGE_ABI}"
   packages=$(RSH "dpkg-query -W -f='\${Package} \${db:Status-Abbrev}\n' 'linux-*${PURGE_ABI}*' 2>/dev/null" | awk '$2 ~ /^(ii|rc)$/ {print $1}' | LC_ALL=C sort | tr '\n' ' ')
   if [ -z "${packages}" ]; then echo "== 没有 ${PURGE_ABI} 的包,不用清 =="; return 0; fi
@@ -724,6 +866,7 @@ REMOTE
 case "${PHASE}" in
   check) banner; phase_check ;;
   kernel) banner; phase_kernel ;;
+  reboot) banner; phase_reboot ;;
   verify-kernel) banner; phase_verify_kernel ;;
   netplan) banner; phase_netplan ;;
   verify-netplan) banner; phase_verify "${NET_BY_MAC}" ;;

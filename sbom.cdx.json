@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:c5959ee9-3d00-140f-6502-80c389727441",
+  "serialNumber": "urn:uuid:6f9df4c8-b69e-6e49-0f6e-43efe20496db",
   "version": 1,
   "metadata": {
     "component": {
@@ -9644,6 +9644,13 @@
     },
     {
       "type": "operating-system",
+      "name": "krb5-libs",
+      "version": "1.22.3-r0",
+      "purl": "pkg:apk/alpine/krb5-libs@1.22.3-r0",
+      "bom-ref": "pkg:apk/alpine/krb5-libs@1.22.3-r0"
+    },
+    {
+      "type": "operating-system",
       "name": "libcrypto3",
       "version": "3.5.9-r0",
       "purl": "pkg:apk/alpine/libcrypto3@3.5.9-r0",
@@ -9662,6 +9669,20 @@
       "version": "2.42.3-r1",
       "purl": "pkg:apk/alpine/libuuid@2.42.3-r1",
       "bom-ref": "pkg:apk/alpine/libuuid@2.42.3-r1"
+    },
+    {
+      "type": "operating-system",
+      "name": "musl-utils",
+      "version": "1.2.6-r3",
+      "purl": "pkg:apk/alpine/musl-utils@1.2.6-r3",
+      "bom-ref": "pkg:apk/alpine/musl-utils@1.2.6-r3"
+    },
+    {
+      "type": "operating-system",
+      "name": "musl",
+      "version": "1.2.6-r3",
+      "purl": "pkg:apk/alpine/musl@1.2.6-r3",
+      "bom-ref": "pkg:apk/alpine/musl@1.2.6-r3"
     },
     {
       "type": "operating-system",

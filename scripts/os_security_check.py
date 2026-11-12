@@ -13,6 +13,8 @@ jammy-security。没有任何东西在看这个数字，它只会越积越多。
 
 判据：
   security 积压 > 0            → 退出 1。修法是装补丁，不是改这个脚本。
+                                 候选只来自 -updates 也可能包含尚未安装的安全补丁：
+                                 按 apt 的口径检查已装到候选之间每个版本的来源。
   包列表比 --max-age-days 旧   → 退出 1。拿陈旧列表算出的 0 不可信。
   需要重启（内核已换未生效）    → 只报告，不算失败。这台机器还跑着别的服务，
                                  重启由人挑时间，脚本不该替人做这个决定。
@@ -39,7 +41,7 @@ jammy-security。没有任何东西在看这个数字，它只会越积越多。
   os_security_check.py                          # 人读输出（要 root）
   os_security_check.py --json
   os_security_check.py --inventory /opt/nmu/backups/os-packages.txt
-  os_security_check.py --simulate-file out.txt  # 测试/离线：喂一份 apt-get -s 输出
+  os_security_check.py --simulate-file out.txt  # 替换模拟输出；版本来源仍读本机 apt 缓存
   os_security_check.py --proc-dir P --boot-dir B  # 测试/离线：读假的 /proc、/boot
 """
 from __future__ import annotations
@@ -99,6 +101,61 @@ def parse_simulation(text: str) -> list[PendingUpgrade]:
             matched.group("name"), matched.group("old"), matched.group("new"),
             "-security" in matched.group("origins")))
     return pending
+
+
+def security_flags_from_apt(upgrades: list[dict[str, str]]) -> dict[str, bool]:
+    # Ubuntu 的 apt_pkg 属于系统 Python，不能从应用的独立 Python 运行时导入。
+    import apt_pkg
+
+    apt_pkg.init()
+    cache = apt_pkg.Cache(None)
+    flags: dict[str, bool] = {}
+    for upgrade in upgrades:
+        name, old, new = (upgrade[key] for key in ("name", "old", "new"))
+        if name not in cache:
+            raise RuntimeError(f"apt 缓存里找不到 {name}")
+        package = cache[name]
+        if package.current_ver is None or package.current_ver.ver_str != old:
+            raise RuntimeError(f"{name} 的已装版本在模拟后变了，请重跑检查")
+        versions = package.version_list
+        if not any(version.ver_str == new for version in versions):
+            raise RuntimeError(f"apt 缓存里找不到 {name} 的模拟目标版本 {new}")
+        # apt IsSecurityUpdate 扫描目标版本至已装版本之前的全部版本，而非只看目标来源。
+        # 参考 https://sources.debian.org/src/apt/3.0.3/apt-pkg/pkgcache.cc/
+        flags[name] = any(
+            apt_pkg.version_compare(old, version.ver_str) < 0
+            and apt_pkg.version_compare(version.ver_str, new) <= 0
+            and any((package_file.archive or "").endswith("-security")
+                    for package_file, _index in version.file_list)
+            for version in versions
+        )
+    return flags
+
+
+def read_security_flags(pending: list[PendingUpgrade]) -> dict[str, bool]:
+    upgrades = [{"name": item.name, "old": item.old, "new": item.new}
+                for item in pending if not item.security]
+    if not upgrades:
+        return {}
+    done = subprocess.run(
+        ["/usr/bin/python3", "-c",
+         "import json, runpy, sys; "
+         "check = runpy.run_path(sys.argv[1]); "
+         "print(json.dumps(check['security_flags_from_apt'](json.load(sys.stdin))))",
+         str(Path(__file__).resolve())],
+        input=json.dumps(upgrades), capture_output=True, text=True, timeout=60,
+        env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+    if done.returncode != 0:
+        raise RuntimeError(f"apt 版本来源检查失败：{done.stderr.strip()[-300:]}")
+    try:
+        flags = json.loads(done.stdout)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("apt 版本来源检查没有返回有效 JSON") from error
+    if (not isinstance(flags, dict)
+            or set(flags) != {upgrade["name"] for upgrade in upgrades}
+            or any(type(flag) is not bool for flag in flags.values())):
+        raise RuntimeError("apt 版本来源检查缺少包或安全分类无效")
+    return flags
 
 
 def parse_kept_back(text: str) -> list[str]:
@@ -325,14 +382,25 @@ def assess(simulation: str, max_age: timedelta, *, now: datetime | None = None,
     """一次完整判定，周检单元与 preflight --os 共用这一份，口径不会分岔。
 
     apt 模拟输出由调用方给（真跑或 --simulate-file）；held 为 None 时现场读 apt-mark。
+    模拟目标来源之外，还读取本机 apt 缓存核对中间版本；读不到按未知失败。
     返回值就是 --json 的主体。
     """
     pending = parse_simulation(simulation)
+    classification_problem: str | None = None
+    try:
+        flags = read_security_flags(pending)
+        for item in pending:
+            item.security = item.security or flags[item.name]
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        classification_problem = f"查不全 apt 版本来源：{error}；不能把未知更新当成非安全更新"
     kept_back = parse_kept_back(simulation)
     held = read_holds() if held is None else held
     age = lists_age(lists_dir, now or datetime.now())
     reboot_required = REBOOT_REQUIRED.exists()
-    failures, notes = evaluate(pending, age, max_age, reboot_required, kept_back, held)
+    classified = [item for item in pending if item.security] if classification_problem else pending
+    failures, notes = evaluate(classified, age, max_age, reboot_required, kept_back, held)
+    if classification_problem:
+        failures.append(classification_problem)
 
     stale: dict[str, list[str]] | None = None
     scan_problem: str | None = None
@@ -352,7 +420,9 @@ def assess(simulation: str, max_age: timedelta, *, now: datetime | None = None,
     return {
         "ok": not failures,
         "security_pending": sum(1 for p in pending if p.security),
-        "other_pending": sum(1 for p in pending if not p.security),
+        "other_pending": (None if classification_problem
+                          else sum(1 for p in pending if not p.security)),
+        "security_classification_complete": classification_problem is None,
         "lists_age_days": None if age is None else age.days,
         "reboot_required": reboot_required,
         "kept_back": kept_back,
@@ -373,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inventory", type=Path, default=None,
                         help="顺手把 dpkg 全量清单写到这里")
     parser.add_argument("--simulate-file", type=Path, default=None,
-                        help="测试/离线：读这份 apt-get -s upgrade 输出，不真跑 apt")
+                        help="读这份 apt-get -s 输出；中间版本来源仍核对本机 apt 缓存")
     parser.add_argument("--lists-dir", type=Path, default=APT_LISTS)
     parser.add_argument("--proc-dir", type=Path, default=PROC,
                         help="测试/离线：从这棵目录找还在用旧库的进程")

@@ -25,12 +25,14 @@ import {
 
 const LIVE_POLL_MS = 800;
 const RECONNECT_GRACE_MS = 4500;
-const LIVE_FETCH_TIMEOUT_MS = 4000;
+const LIVE_CONTACT_STALE_MS = 4000;
+const LIVE_FETCH_TIMEOUT_MS = 12000;
 
 class DeviceAuthorizationFailure extends Error {}
 
 // api.getLiveState 目前不接 AbortSignal；老人端在这里保留同样的相对路径、capability 与失效行为，
-// 但给真实 fetch 加物理 abort，避免悬挂请求让页面永远误判“仍连接”。
+// 4 秒未响应仍让页面停媒体，但留给慢响应独立的传输期限；每 4 秒取消会让
+// 持续稍慢于 4 秒的线路永远拿不到快照。12 秒的物理 abort 则保证真挂起可以重试。
 async function fetchLiveState(
   signal: AbortSignal,
   credential: ReturnType<typeof selectDeviceCredential>,
@@ -43,6 +45,9 @@ async function fetchLiveState(
     signal,
   });
   const text = await res.text();
+  // A body callback may already be queued when abort runs. Do not let a late
+  // auth response clear credentials after offline, rotation or unmount.
+  if (signal.aborted) throw new Error("Live-state request aborted");
   if (!res.ok) {
     const deviceAuthFailed = handleDeviceAuthorizationFailure(res.status, text, credential);
     let data: unknown = null;
@@ -87,6 +92,7 @@ export function useLiveCursor(): LiveState {
 
   useEffect(() => {
     let cancelled = false;
+    let offline = !navigator.onLine;
     let reconnectTimer: number | undefined;
     let activePoll: AbortController | null = null;
     let contactVersion = 0;
@@ -159,7 +165,7 @@ export function useLiveCursor(): LiveState {
     });
 
     const poll = (allowWhileBlocked = false) => {
-      if (cancelled || activePoll || (deviceAuthBlocked && !allowWhileBlocked)) return;
+      if (cancelled || offline || activePoll || (deviceAuthBlocked && !allowWhileBlocked)) return;
       const credential = selectDeviceCredential();
       if (!livePollingHasActiveCapability(credential)) {
         deviceAuthBlocked = true;
@@ -177,6 +183,9 @@ export function useLiveCursor(): LiveState {
       }
       const controller = new AbortController();
       activePoll = controller;
+      // A capability event received while offline still owes one authority
+      // probe on reconnect. Consume it only once a request actually starts.
+      pendingCapabilityProbe = false;
       const contactAtStart = contactVersion;
       const authorizationProbe = authorizationFence.capture(
         credential.record?.capability ?? null);
@@ -185,17 +194,26 @@ export function useLiveCursor(): LiveState {
         selectDeviceCredential().record?.capability ?? null,
       );
       let timedOut = false;
+      const staleTimeout = window.setTimeout(() => {
+        if (!cancelled && !controller.signal.aborted && credentialStillSelected()
+          && contactVersion === contactAtStart) markFailed(true);
+      }, LIVE_CONTACT_STALE_MS);
       const timeout = window.setTimeout(() => {
         timedOut = true;
         controller.abort();
       }, LIVE_FETCH_TIMEOUT_MS);
+      const clearPollTimers = () => {
+        clearTimeout(staleTimeout);
+        clearTimeout(timeout);
+      };
+      controller.signal.addEventListener("abort", clearPollTimers, { once: true });
 
       fetchLiveState(controller.signal, credential)
         .then((d) => {
           // Abort is not sufficient once a response promise has already resolved.
           // Any active-token event invalidates all earlier probes, including a
           // queued old-token 200 that would otherwise repaint a blanked session.
-          if (!credentialStillSelected()) return;
+          if (cancelled || offline || controller.signal.aborted || !credentialStillSelected()) return;
           // Authorization is established only by this successful response, never
           // merely by storing a capability or receiving a browser-local message.
           deviceAuthBlocked = false;
@@ -271,15 +289,15 @@ export function useLiveCursor(): LiveState {
             publish({ connection: "reconnecting" });
             return;
           }
-          // 悬挂到超时是明确失联，立即进入重连并让 PatientShell 触发停麦；
-          // 普通瞬时失败仍保留缓冲，避免单个丢包令适老界面闪烁。
+          // 4 秒 stale timer 已停媒体；硬超时只负责释放传输以便下次重试。
+          // 普通瞬时失败仍保留原缓冲，避免单个丢包令适老界面闪烁。
           markFailed(timedOut);
         })
         .finally(() => {
-          clearTimeout(timeout);
+          clearPollTimers();
+          controller.signal.removeEventListener("abort", clearPollTimers);
           if (activePoll === controller) activePoll = null;
           if (!cancelled && pendingCapabilityProbe && getDeviceCapability()) {
-            pendingCapabilityProbe = false;
             poll(true);
           }
         });
@@ -289,10 +307,14 @@ export function useLiveCursor(): LiveState {
     poll(true);
     const timer = setInterval(poll, LIVE_POLL_MS);
     const onOffline = () => {
+      offline = true;
       activePoll?.abort();
       markFailed(true);
     };
-    const onOnline = () => poll();
+    const onOnline = () => {
+      offline = false;
+      poll(pendingCapabilityProbe);
+    };
     window.addEventListener("offline", onOffline);
     window.addEventListener("online", onOnline);
     const onCapabilityUpdated = () => {
@@ -312,7 +334,6 @@ export function useLiveCursor(): LiveState {
         pendingCapabilityProbe = true;
         if (activePoll) activePoll.abort();
         else {
-          pendingCapabilityProbe = false;
           poll(true);
         }
       } else {

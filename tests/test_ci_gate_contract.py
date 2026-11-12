@@ -26,7 +26,7 @@ def _job_level_ifs(job: str) -> list[str]:
 
 def test_workflow_calls_the_shared_gate_for_every_core_suite() -> None:
     assert 'python: ["3.12", "3.14"]' in WORKFLOW
-    assert 'node-version: "25"' in WORKFLOW
+    assert 'node-version: "26"' in WORKFLOW
     assert "pytest==9.1.1 pytest-xdist==3.8.0 ruff==0.15.15" in WORKFLOW
     assert "scripts/ci_gate.sh --only backend" in WORKFLOW
     assert "scripts/ci_gate.sh --only frontend" in WORKFLOW
@@ -54,7 +54,7 @@ def test_python_312_archives_a_source_bound_full_scale_receipt() -> None:
 
 
 def test_shared_frontend_gate_checks_the_same_node_major_without_installing() -> None:
-    assert 'EXPECTED_NODE_MAJOR="25"' in GATE_TEXT
+    assert 'EXPECTED_NODE_MAJOR="26"' in GATE_TEXT
     assert "actual_node_major" in GATE_TEXT
     assert "npm run lint && npm run pretest && npm test && npm run build" in GATE_TEXT
     assert "npm install" not in GATE_TEXT
