@@ -416,6 +416,8 @@ if command.startswith("EXPECTED_TARGET="):
         reply()
     if state.get("abi_probe_failure"):
         reply("  FAIL 候选/回退与审核常量不符,先更新常量并重新评审\\n", 1)
+    if state.get("newer_candidate") and "CANDIDATES=skip" not in command:
+        reply("  FAIL linux-generic 候选精确版本与审核常量不符,先重新评审\\n", 1)
     reply("  PASS 内核版本与审核常量一致\\n")
 if "def stale_library_units" in command:
     reply()
@@ -880,6 +882,36 @@ def test_stale_abi_constants_block_check_and_the_real_mutating_phases(phase, tmp
     assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
 
 
+@pytest.mark.parametrize("phase", ["check", "kernel"])
+def test_a_newer_apt_candidate_still_blocks_the_phases_that_install(phase, tmp_path):
+    host = {**_FRESH_HOST, "newer_candidate": True}
+    result, commands = _run_phase(tmp_path, phase, answers="yes\n" * 4, host=host)
+    assert result.returncode == 1 and "内核 ABI 与审核常量一致" in result.stdout
+    assert [c for c in commands if c.startswith("EXPECTED_TARGET=") and "CANDIDATES=check" in c]
+    assert not [c for c in commands if re.search(r"systemd-run|reboot|netplan apply", c)]
+
+
+def test_a_newer_apt_candidate_does_not_block_purging_the_reviewed_old_kernel(tmp_path):
+    # 11-19:运行 203 时 apt 出了 204 的候选。清 198 只删包,不该被候选挡住;已装与 /boot 照核。
+    result, commands = _run_phase(tmp_path, "purge", answers="yes\n", host={
+        **_FRESH_HOST, "kernel": "5.15.0-203-generic", "installed": True, "newer_candidate": True})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "purge 阶段完成" in result.stdout
+    [probe] = [c for c in commands if c.startswith("EXPECTED_TARGET=")]
+    assert "CANDIDATES=skip" in probe
+    assert _first(commands, "EXPECTED_TARGET=") < _first(commands, "apt-get purge -y")
+
+
+def test_only_the_purge_phase_skips_the_candidate_check():
+    text = _text()
+    calls = re.findall(r"kernel_abis_match(?: (\w+))?\n", text)
+    assert sorted(calls) == ["", "", "purge"]
+    assert 'gate "内核 ABI 与审核常量一致" kernel_abis_match purge\n' in _function("phase_purge")
+    [body] = [body for delimiter, body in _heredocs(text)
+              if delimiter == "PY" and "def checked_candidate(" in body]
+    assert 'if os.environ.get("CANDIDATES") != "skip":' in body
+
+
 def test_an_empty_successful_ssh_response_is_not_an_abi_verification(tmp_path):
     result, _ = _run_phase(tmp_path, "check", host={**_FRESH_HOST, "abi_probe_empty": True})
     assert result.returncode == 1 and "没收到内核推导结果" in result.stdout
@@ -1026,7 +1058,7 @@ def test_a_declined_restart_restarts_nothing(tmp_path):
 
     assert result.returncode == 1
     assert "停:没有确认:只重启 nmu.service nginx.service?" in result.stdout
-    assert "nginx 断几秒" in result.stdout
+    assert "nginx(80 端口)断几秒" in result.stdout
     assert not [c for c in commands if _UNIT_ACTION.search(c) or "nginx -t" in c
                 or "nmu-os-security.service" in c]
 

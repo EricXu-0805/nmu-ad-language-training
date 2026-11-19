@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 内核与 netplan 维护窗口(2026-10-02 主机维护评审的 B1 方案)。
-# 2026-11-12 只读准备:203 的候选与安装模拟已核实,尚未安装或重启。跑之前要 Eric 定窗口:
+# 2026-11-12 起运行 203(202 回退、198 待清)。kernel/reboot/netplan 跑之前要 Eric 定窗口:
 # 离钱凯下一轮现场至少 48 小时(沿用 10-02 窗口策略,本轮尚未确认现场时间);KiwiVM 控制台
 # 开着、看得到 GRUB 菜单;控制台 root 登录(或 KiwiVM 的 root shell)试过能进。
 #
@@ -19,7 +19,7 @@
 #   netplan         演练生成 → 装死人开关 → 放上按 MAC 匹配的段并 apply → 新连接验证 → 拆开关
 #                   → 再重启 → 重启后核对(网络改走 by-mac 那份)
 #   verify-netplan  只读:按 netplan 阶段的预期再核一遍
-#   purge           模拟后只清掉 PURGE_ABI 那个内核的包
+#   purge           模拟后只清掉 PURGE_ABI 那个内核的包(不装包:apt 出了更新的候选内核也照清)
 #   restart-app     OS 周检点名 nmu/nginx 跑在旧库上时用:只重启这两个里在旧库上的(不重启整机),再照单元重跑周检
 # 任何一步打印「停」就停下,不要接着跑别的阶段。kernel、reboot、netplan 在「现在重启?」答了 no 的,
 # 之后原样重跑同一阶段即可:已经装好的包、已经接管的新段会被认出来,直接走到重启。
@@ -312,10 +312,16 @@ REMOTE
 
 # ---------------- 内核 ----------------
 
-kernel_abis_match() {
+kernel_abis_match() {   # $1 = purge:只清旧内核、不装包,不核 apt 候选的精确版本
   echo "== 只读推导内核:apt 候选依赖、已装包与 /boot 必须符合审核过的三个 ABI(不会自动改常量) =="
-  local report rc=0
-  report=$(RBASH "EXPECTED_TARGET=${TARGET_ABI} EXPECTED_FALLBACK=${FALLBACK_ABI} EXPECTED_PURGE=${PURGE_ABI} EXPECTED_META_VERSION=${KERNEL_META_VERSION} EXPECTED_KERNEL_VERSION=${KERNEL_PACKAGE_VERSION} /usr/bin/python3 -I -" <<'PY'
+  local report rc=0 candidates=check
+  # 11-19:203 跑着时 apt 出了 204 的候选,清 198 却被「候选不是审过的 203」挡住;不清 198,
+  # 下一轮 204 又会因为待清的有两个(198、202)停下。清包只删旧内核,候选核对留给装包的阶段。
+  if [ "${1:-}" = "purge" ]; then
+    candidates=skip
+    echo "  注 只清旧内核、不装包:不核 apt 候选的精确版本;已装包、/boot 与运行内核照核"
+  fi
+  report=$(RBASH "EXPECTED_TARGET=${TARGET_ABI} EXPECTED_FALLBACK=${FALLBACK_ABI} EXPECTED_PURGE=${PURGE_ABI} EXPECTED_META_VERSION=${KERNEL_META_VERSION} EXPECTED_KERNEL_VERSION=${KERNEL_PACKAGE_VERSION} CANDIDATES=${candidates} /usr/bin/python3 -I -" <<'PY'
 import os
 from pathlib import Path
 import re
@@ -403,9 +409,11 @@ def checked_candidate(policy, package, reviewed):
 
 
 try:
-    for package in ("linux-generic", "linux-image-generic", "linux-headers-generic", "linux-libc-dev"):
-        reviewed = os.environ["EXPECTED_KERNEL_VERSION" if package == "linux-libc-dev" else "EXPECTED_META_VERSION"]
-        checked_candidate(read_command(["apt-cache", "policy", package]), package, reviewed)
+    # 只有 purge 传 skip;没传或传别的都照核候选。
+    if os.environ.get("CANDIDATES") != "skip":
+        for package in ("linux-generic", "linux-image-generic", "linux-headers-generic", "linux-libc-dev"):
+            reviewed = os.environ["EXPECTED_KERNEL_VERSION" if package == "linux-libc-dev" else "EXPECTED_META_VERSION"]
+            checked_candidate(read_command(["apt-cache", "policy", package]), package, reviewed)
     metadata = read_command(["apt-cache", "show", "linux-image-generic=" + os.environ["EXPECTED_META_VERSION"]])
     packages = read_command(["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", "linux-*"])
     boot_images, ready_images = set(), set()
@@ -974,7 +982,7 @@ phase_purge() {
   common_gates 15
   running=$(RSH 'uname -r')
   [ "${running}" = "${TARGET_ABI}-generic" ] || bail "正在跑的是 ${running:-查不到},不是 ${TARGET_ABI}-generic:先做完 kernel 阶段"
-  gate "内核 ABI 与审核常量一致" kernel_abis_match
+  gate "内核 ABI 与审核常量一致" kernel_abis_match purge
   RSH "test -s /boot/vmlinuz-${FALLBACK_ABI}-generic" || bail "回退内核 ${FALLBACK_ABI} 不在 /boot 里,不清 ${PURGE_ABI}"
   packages=$(RSH "dpkg-query -W -f='\${Package} \${db:Status-Abbrev}\n' 'linux-*${PURGE_ABI}*' 2>/dev/null" | awk '$2 ~ /^(ii|rc)$/ {print $1}' | LC_ALL=C sort | tr '\n' ' ')
   if [ -z "${packages}" ]; then echo "== 没有 ${PURGE_ABI} 的包,不用清 =="; return 0; fi
@@ -1018,7 +1026,7 @@ phase_restart_app() {
     for unit in ${units}; do
       case "${unit}" in
         nmu.service) outage="${outage}nmu 断 10–20 秒(systemd 报 Started 后 uvicorn 约 9 秒才开始监听);" ;;
-        nginx.service) outage="${outage}nginx 断几秒(它只管 80 端口跳 https);" ;;
+        nginx.service) outage="${outage}nginx(80 端口)断几秒;" ;;
       esac
     done
     confirm "只重启 ${units}?${outage}别的单元都不动"
