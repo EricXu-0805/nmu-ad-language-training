@@ -504,7 +504,8 @@ if command == "nginx -t":
 if "show -p MainPID --value" in command:
     reply("4242\\n")
 if "show -p NRestarts --value" in command:
-    reply("0\\n")
+    # 上次手动起来之后被自动拉起过两次(OOM 之类):重启前的计数不是 0。
+    reply("2\\n")
 if command.startswith("systemctl --no-pager restart "):
     # 重启过的单元换上新库;stale_after_restart:重启了却还映射着旧库。
     if not state.get("stale_after_restart"):
@@ -971,13 +972,25 @@ def _restart_app(tmp_path: Path, answers: str = "yes\n", journal: str = "", **ch
                       host={**_FRESH_HOST, **changes})
 
 
-def test_restart_app_stops_at_the_idle_gate_before_restarting_anything(tmp_path):
-    result, commands = _restart_app(tmp_path, journal=_SCANNER + _ONE_ANSWER,
-                                    stale=_stale("nmu.service"))
+@pytest.mark.parametrize(("clock", "journal", "error"), [
+    ("5 03 10", _SCANNER + _ONE_ANSWER, "停:生产空闲(生产没有任何改动)"),
+    # 周五 18:10 UTC:正在夜间补丁的窗口里,只重启应用也不行。
+    ("5 18 10", "", "停:时间窗(生产没有任何改动)"),
+], ids=["someone-practising", "nightly-apt-window"])
+def test_restart_app_stops_at_the_gates_before_restarting_anything(clock, journal, error, tmp_path):
+    result, commands = _run_phase(tmp_path, "restart-app", answers="yes\n", clock=clock,
+                                  journal=journal, host={**_FRESH_HOST, "stale": _stale("nmu.service")})
 
-    assert result.returncode == 1 and "停:生产空闲(生产没有任何改动)" in result.stdout
+    assert result.returncode == 1 and error in result.stdout, result.stdout + result.stderr
     assert not [c for c in commands if _UNIT_ACTION.search(c) or c.startswith(RESTART_APP_SCAN)
                 or "nginx -t" in c or "nmu-os-security.service" in c]
+
+
+def test_restart_app_opens_with_the_full_set_of_gates():
+    """假机器对库、apt、备份与开窗前核对一律答 PASS,少了哪道门真跑也看不出来:钉住 local 之后头一句就是整套门槛。"""
+    statements = [line.strip() for line in _function("phase_restart_app").splitlines()[2:]
+                  if line.strip() and not line.lstrip().startswith("#")]
+    assert statements[0].startswith("local ") and statements[1] == "common_gates 10", statements[:2]
 
 
 def test_restart_app_restarts_only_the_stale_app_unit_and_reruns_the_weekly_check(tmp_path):
@@ -1004,7 +1017,7 @@ def test_restart_app_restarts_only_the_stale_app_unit_and_reruns_the_weekly_chec
             < _first(commands, "show -p Result --value nmu-os-security.service")
             < _first(commands, "WHEN=after"))
     [after] = [c for c in commands if ":: 127.0.0.1:8000/health/ready" in c]
-    assert after.startswith("BEFORE='nmu.service=4242/0 ' SITE=https://89-208-253-119.sslip.io ")
+    assert after.startswith("BEFORE='nmu.service=4242/2 ' SITE=https://89-208-253-119.sslip.io ")
 
 
 def test_a_declined_restart_restarts_nothing(tmp_path):
@@ -1156,11 +1169,16 @@ def _post_restart_check(tmp_path: Path, env: dict,
     ({"CN_CODE": "000"}, 0, "注 国内入口 https://147-182-176-237.sslip.io/health 000(只看不判)"),
     ({"READY_CODE": "503"}, 1, "FAIL http://127.0.0.1:8000/health/ready 503(应 200)"),
     ({"NEW_PID": "4242"}, 1, "FAIL nmu.service MainPID 4242(重启前 4242),没换成新进程"),
-    ({"NEW_RESTARTS": "1"}, 1, "FAIL nmu.service NRestarts 0 涨到 1:起来就崩过"),
+    ({"NEW_RESTARTS": "1"}, 1, "FAIL nmu.service NRestarts=1(手动重启会清零,重启前 0):起来就崩过"),
+    # 手动 restart 把计数清零:重启前被自动拉起过两次,干净地起来读到的是 0。
+    ({"BEFORE": "nmu.service=4242/2 ", "NEW_RESTARTS": "0"}, 0, "PASS nmu.service 起来时没自动重启过"),
+    # 重启前是 1,起来时又崩了一次:清零后再数到 1,和重启前一样也不算过。
+    ({"BEFORE": "nmu.service=4242/1 ", "NEW_RESTARTS": "1"}, 1,
+     "FAIL nmu.service NRestarts=1(手动重启会清零,重启前 1):起来就崩过"),
     ({"ACTIVE": "activating"}, 1, "FAIL nmu.service activating"),
     ({"DOCS_CODE": "200"}, 1, "FAIL https://89-208-253-119.sslip.io/docs 200(应 404)"),
-], ids=["cn-entry-only-reported", "never-ready", "same-pid", "auto-restarted", "not-active",
-        "docs-open"])
+], ids=["cn-entry-only-reported", "never-ready", "same-pid", "auto-restarted",
+        "counter-flushed-by-restart", "crashed-again-same-count", "not-active", "docs-open"])
 def test_the_post_restart_check_on_the_host(env, rc, shown, tmp_path):
     result, waited = _post_restart_check(tmp_path, env)
 

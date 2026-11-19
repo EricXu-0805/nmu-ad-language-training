@@ -774,8 +774,7 @@ PY
 }
 
 # systemd 报 Started 后 uvicorn 还要约 9 秒才开始监听(11-06 上线 278 第 8 步就是探早了):先等本机
-# 两个健康接口都 200,最多 90 秒;再看每个重启过的单元 active、MainPID 换了、等的时候没自动重启过
-# (和 remote_health 同一条:重启次数涨了说明起来就崩)。
+# 两个健康接口都 200,最多 90 秒;再看每个重启过的单元 active、MainPID 换了、NRestarts 是 0。
 post_restart_asserts() {   # $1 = 重启前记下的「单元=MainPID/NRestarts」,空格分开
   echo "== 重启后核对:本机健康接口、重启过的单元、公网入口 =="
   RBASH "BEFORE='${1}' SITE=${SITE} bash -s" <<'REMOTE'
@@ -805,7 +804,8 @@ for entry in ${BEFORE}; do
   restarts=$(systemctl --no-pager show -p NRestarts --value "${unit}")
   if [ "${state}" = "active" ]; then pass "${unit} active"; else fail "${unit} ${state}"; fi
   if [ "${pid}" != "0" ] && [ "${pid}" != "${pid_before}" ]; then pass "${unit} MainPID ${pid_before} 换成 ${pid}"; else fail "${unit} MainPID ${pid}(重启前 ${pid_before}),没换成新进程"; fi
-  if [ "${restarts}" = "${restarts_before}" ]; then pass "${unit} 起来时没自动重启过"; else fail "${unit} NRestarts ${restarts_before} 涨到 ${restarts}:起来就崩过"; fi
+  # 手动 restart 后 systemd 把 NRestarts 从 0 重新数(249 的 service.c),重启前那个数只打印:不是 0 就是起来时崩过。
+  if [ "${restarts}" = "0" ]; then pass "${unit} 起来时没自动重启过"; else fail "${unit} NRestarts=${restarts:-空}(手动重启会清零,重启前 ${restarts_before}):起来就崩过"; fi
 done
 exit "${bad}"
 REMOTE
