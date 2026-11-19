@@ -81,7 +81,7 @@ export const DECLARED_RELEASE_IMAGES = Object.freeze({
 export const DECLARED_EDGE_SOURCE = Object.freeze({
   build_contract: "deploy/caddy-build.json",
   caddy_version: "v2.11.4",
-  go_version: "1.26.10",
+  go_version: "1.26.11",
   container_image: null,
   limitation: "This browser build does not attest an edge binary or published OCI image. Verify the separate controlled build, binary hash and security scan before deployment.",
 });

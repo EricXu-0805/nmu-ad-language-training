@@ -11,16 +11,16 @@
     "source_url": "https://github.com/caddyserver/caddy/tree/e2eee6a7fce366321294c9c2a79f3146891dcbdf"
   },
   "go": {
-    "version": "1.26.10",
+    "version": "1.26.11",
     "release_metadata_url": "https://go.dev/dl/?mode=json",
     "archives": {
       "linux-amd64": {
-        "url": "https://go.dev/dl/go1.26.10.linux-amd64.tar.gz",
-        "sha256": "ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5"
+        "url": "https://go.dev/dl/go1.26.11.linux-amd64.tar.gz",
+        "sha256": "9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec"
       },
       "darwin-arm64": {
-        "url": "https://go.dev/dl/go1.26.10.darwin-arm64.tar.gz",
-        "sha256": "0b5183492292ada170f9b561a834863808dd02edba599e4ad0e89899330020b3"
+        "url": "https://go.dev/dl/go1.26.11.darwin-arm64.tar.gz",
+        "sha256": "e3a42e67a7a8acf450ebada2b074c7ca863000ca514907b7185b45e8f5cdff57"
       }
     }
   },
@@ -28,7 +28,7 @@
   "build_module": {"path": "deploy/caddy", "module": "nmu.local/caddy-release"},
   "dependency_pins": {
     "github.com/go-jose/go-jose/v4": "v4.1.6",
-    "github.com/klauspost/compress": "v1.18.7",
+    "github.com/klauspost/compress": "v1.20.2",
     "golang.org/x/crypto": "v0.58.0",
     "golang.org/x/net": "v0.62.0",
     "golang.org/x/text": "v0.43.0",
@@ -37,11 +37,11 @@
   "security_fix": {
     "id": "CVE-2026-116587",
     "advisory": "https://github.com/advisories/GHSA-mgcc-cww5-fp2q",
-    "minimum_fixed_go_1_26": "1.26.10",
-    "minimum_fixed_compress": "v1.18.7",
+    "minimum_fixed_go_1_26": "1.26.11",
+    "minimum_fixed_compress": "v1.20.2",
     "minimum_fixed_go_jose_v4": "v4.1.6",
     "minimum_fixed_x_net": "v0.62.0",
     "not_fixed_in_this_build": {"module": "github.com/go-jose/go-jose/v3", "version": "v3.0.5", "advisory": "CVE-2026-116587", "reason": "v3 没有修复版", "waiver": "security/trivy-gateway.trivyignore", "waiver_expires": "2026-12-03"},
-    "related_advisories": ["https://pkg.go.dev/vuln/GO-2026-6860", "https://pkg.go.dev/vuln/GO-2026-6866", "https://github.com/advisories/GHSA-j6qf-3m9c-vwj3", "https://pkg.go.dev/vuln/GO-2026-6809", "https://pkg.go.dev/vuln/GO-2026-5841", "https://pkg.go.dev/vuln/GO-2026-6611", "https://pkg.go.dev/vuln/GO-2026-6609", "https://pkg.go.dev/vuln/GO-2026-6607"]
+    "related_advisories": ["https://pkg.go.dev/vuln/GO-2026-6865", "https://github.com/advisories/GHSA-fpmh-frq8-7rj8", "https://pkg.go.dev/vuln/GO-2026-6859", "https://pkg.go.dev/vuln/GO-2026-6860", "https://pkg.go.dev/vuln/GO-2026-6866", "https://github.com/advisories/GHSA-j6qf-3m9c-vwj3", "https://pkg.go.dev/vuln/GO-2026-6809", "https://pkg.go.dev/vuln/GO-2026-5841", "https://pkg.go.dev/vuln/GO-2026-6611", "https://pkg.go.dev/vuln/GO-2026-6609", "https://pkg.go.dev/vuln/GO-2026-6607"]
   }
 }

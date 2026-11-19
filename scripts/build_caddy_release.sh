@@ -44,7 +44,7 @@ def build(root, args):
             or caddy["build_tags"] != ["nobadger"]
             or target != {"goos": "linux", "goarch": "amd64", "cgo_enabled": "0"}
             or not re.fullmatch(r"1\.26\.\d+", toolchain["version"])
-            or int(toolchain["version"].split(".")[-1]) < 10):
+            or int(toolchain["version"].split(".")[-1]) < 11):
         raise ValueError("unsafe Caddy source, target, or Go security floor")
     if (build_module != {"path": "deploy/caddy", "module": "nmu.local/caddy-release"}
             or set(dependency_pins) != {"github.com/go-jose/go-jose/v4", "github.com/klauspost/compress", "golang.org/x/crypto", "golang.org/x/net", "golang.org/x/text", "google.golang.org/grpc"}
