@@ -70,7 +70,7 @@ def test_archive_with_wrong_runtime_go_version_cannot_emit_a_release(tmp_path):
 
 
 def test_source_module_checksum_mismatch_is_rejected_after_toolchain_check(tmp_path):
-    response = 'if [ "$1" = env ]; then echo go1.26.10; else echo \'{"Path":"github.com/caddyserver/caddy/v2","Version":"v2.11.4","Sum":"h1:wrong","GoModSum":"h1:wrong"}\'; fi'
+    response = 'if [ "$1" = env ]; then echo go1.26.11; else echo \'{"Path":"github.com/caddyserver/caddy/v2","Version":"v2.11.4","Sum":"h1:wrong","GoModSum":"h1:wrong"}\'; fi'
     root, archive, _ = _fixture(tmp_path, response)
     output = tmp_path / "release"
     result = _build(root, archive, output)
@@ -99,14 +99,14 @@ def test_source_commit_must_match_the_pinned_official_tag(tmp_path):
         "Path": caddy["module"], "Version": caddy["version"],
         "Sum": caddy["source_sum"], "GoModSum": caddy["go_mod_sum"], "Info": str(info),
     })
-    root, archive, _ = _fixture(tmp_path / "second", f'if [ "$1" = env ]; then echo go1.26.10; else echo \'{response}\'; fi')
+    root, archive, _ = _fixture(tmp_path / "second", f'if [ "$1" = env ]; then echo go1.26.11; else echo \'{response}\'; fi')
     result = _build(root, archive, tmp_path / "release")
     assert result.returncode != 0
     assert "source commit mismatch" in result.stderr
     assert not (tmp_path / "release").exists()
 
 
-@pytest.mark.parametrize("version", ["1.26.3", "1.26.8", "1.26.9"])
+@pytest.mark.parametrize("version", ["1.26.3", "1.26.8", "1.26.9", "1.26.10"])
 def test_recipe_cannot_select_a_go_patch_before_the_security_fix(tmp_path, version):
     root, archive, recipe = _fixture(tmp_path, "exit 91")
     recipe["go"]["version"] = version
@@ -130,13 +130,13 @@ def _source_response(*, caddy_version=None, missing_license="", old_crypto=False
     if old_crypto:
         dependencies["golang.org/x/crypto"] = "v0.52.0"
     if old_compress:
-        dependencies["github.com/klauspost/compress"] = "v1.18.6"
+        dependencies["github.com/klauspost/compress"] = "v1.20.1"
     if old_jose:
         dependencies["github.com/go-jose/go-jose/v4"] = "v4.1.4"
     dep_lines = "".join(f"\\tdep\\t{name}\\t{version}\\th1:fixture\\n" for name, version in dependencies.items())
     return f'''
 case "$1 $2" in
-  "env GOVERSION") echo go1.26.10 ;;
+  "env GOVERSION") echo go1.26.11 ;;
   "mod download")
     mkdir -p "$GOMODCACHE/source/cmd/caddy"
     cp "$fixture_root/upstream-main.go" "$GOMODCACHE/source/cmd/caddy/main.go"
@@ -151,7 +151,7 @@ case "$1 $2" in
   "build -mod=readonly") printf fixture > "$8" ;;
   "mod verify") true ;;
   "version -m")
-    printf '%s: go1.26.10\\n' "$3"
+    printf '%s: go1.26.11\\n' "$3"
     printf '\\tpath\\t{recipe['build_module']['module']}\\n\\tdep\\t{caddy['module']}\\t{caddy_version or caddy['version']}\\t{caddy['source_sum']}\\n'
     printf '{dep_lines}'
     printf '\\tbuild\\tCGO_ENABLED=0\\n\\tbuild\\tGOOS=linux\\n\\tbuild\\tGOARCH=amd64\\n\\tbuild\\tGOAMD64=v1\\n\\tbuild\\t-tags=nobadger\\n'
