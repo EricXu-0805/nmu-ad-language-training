@@ -80,8 +80,10 @@ procps）会被跳过，留在积压里，周一照常告警。
   会弹对话框的包：内核类走 `deploy/maintenance/kernel_netplan_window.sh` 的窗口（先跑它的
   `check` 阶段），别的手装。
 - `nmu.service`、`nginx.service` 还映射着被换掉的 `.so` → 失败，原因里点名单元和库：
-  挑没人练的时候 `systemctl restart nmu`（或 nginx），几秒，然后重跑检查。其余单元
-  （sing-box、dbus、ssh…）只记提示，等下一个重启窗口一并换新。
+  在 Mac 上按脚本头的绝对路径跑 `bash …/kernel_netplan_window.sh restart-app`。时间窗、空闲、
+  库里无场次、apt 空闲、备份新鲜这些门槛都过了才问，只重启还在旧库上的 nmu/nginx（nmu 断
+  10–20 秒，nginx 几秒），核对健康后照单元重跑一次周检。其余单元（sing-box、dbus、ssh…）
+  只记提示，restart-app 不碰它们，等下一个重启窗口一并换新。
 - `/boot` 里有比正在跑的更新的内核 → 只提示；内核不自动装也不自动重启。
 - 不是 root 跑、读不了 `/proc` → 失败，那样得出的 0 是没看。
 - `--json` 多三个字段：`stale_library_units`（`{单元: [库路径]}`）、`kernel_running`、

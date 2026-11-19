@@ -20,6 +20,7 @@
 #                   → 再重启 → 重启后核对(网络改走 by-mac 那份)
 #   verify-netplan  只读:按 netplan 阶段的预期再核一遍
 #   purge           模拟后只清掉 PURGE_ABI 那个内核的包
+#   restart-app     OS 周检点名 nmu/nginx 跑在旧库上时用:只重启这两个里在旧库上的(不重启整机),再照单元重跑周检
 # 任何一步打印「停」就停下,不要接着跑别的阶段。kernel、reboot、netplan 在「现在重启?」答了 no 的,
 # 之后原样重跑同一阶段即可:已经装好的包、已经接管的新段会被认出来,直接走到重启。
 #
@@ -59,6 +60,8 @@ BOOT_BEFORE=""
 DEPLOY_BEFORE=""
 # 重启前开机自启的 sing-box* 单元;"-" 表示没记过(只读核对时)。
 PROXIES_BEFORE="-"
+# restart-app 扫出来还映射着旧库的应用单元,只会是 nmu.service、nginx.service。
+STALE_APP=""
 # 这台 Mac 的代理环境变量会劫持直连的 curl,六个大小写都要清。
 for v in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do unset "$v"; done
 
@@ -88,7 +91,7 @@ gate() {
 }
 
 usage() {
-  echo "用法:bash /Users/xiaogangxu/Downloads/南医大语言沟通训练阿尔茨海默病项目/platform/deploy/maintenance/kernel_netplan_window.sh <check|kernel|reboot|verify-kernel|netplan|verify-netplan|purge>"
+  echo "用法:bash /Users/xiaogangxu/Downloads/南医大语言沟通训练阿尔茨海默病项目/platform/deploy/maintenance/kernel_netplan_window.sh <check|kernel|reboot|verify-kernel|netplan|verify-netplan|purge|restart-app>"
   echo "各阶段做什么、什么时候跑,见脚本头注释。"
 }
 
@@ -726,6 +729,121 @@ echo "  PASS 死人开关已拆,新段留在 /etc/netplan"
 REMOTE
 }
 
+# ---------------- 只重启应用:nmu/nginx 换上夜间补丁装好的新库 ----------------
+# 夜间补丁只换盘上的库,按设计从不重启 nmu(deploy/needrestart/50-nmu-list-only.conf:时机由人挑),
+# OS 周检于是判失败、告警,直到有人在没人练的时候重启它。这几段把那次手动重启收进上面的门槛。
+
+# 用生产上那份 os_security_check 自己的扫描(周检同一份判据),只回答 nmu、nginx 要不要重启。
+# 扫不了(不是 root、读不了 /proc、没收到结果)返回非 0:没扫过不当作干净。-B:不往部署树里写 __pycache__。
+stale_app_units() {   # $1 = 标题前缀(重启后再扫时给)
+  echo "== ${1:-}nmu、nginx 还映射着被换掉的库吗(生产上 os_security_check 自己的扫描) =="
+  local report rc=0 units
+  report=$(RBASH '/usr/bin/python3 -I -B - /opt/nmu/app/scripts' <<'PY'
+import os
+import sys
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import os_security_check as check
+    stale = check.stale_library_units()
+    app_units = tuple(check.APP_UNITS)
+except (ImportError, AttributeError, OSError) as exc:
+    print("  FAIL 扫不了哪些进程还在用被换掉的库(" + type(exc).__name__ + ": " + str(exc) + ")")
+    sys.exit(1)
+# 只打单元名和库的文件名。
+restart = [unit for unit in app_units if stale.get(unit)]
+for unit in restart:
+    names = sorted({os.path.basename(library) for library in stale[unit]})
+    print("  " + unit + " 还映射着被换掉的库:" + "、".join(names[:6]) + ("…" if len(names) > 6 else ""))
+others = sorted(unit for unit in stale if unit not in app_units)
+if others:
+    print("  注 另有 %d 个单元也还在用旧库(%s%s),这里不重启,等下一个重启窗口"
+          % (len(others), "、".join(others[:6]), "…" if len(others) > 6 else ""))
+print("  要重启:" + (" ".join(restart) or "无"))
+PY
+  ) || rc=$?
+  printf '%s\n' "${report:-  FAIL 没收到扫描结果}"
+  [ "${rc}" = "0" ] || return 1
+  units=$(printf '%s\n' "${report}" | sed -n 's/^  要重启://p')
+  # 只认这几种答案:这里只会重启 nmu、nginx,别的单元一律等重启窗口。
+  case "${units}" in
+    "无") STALE_APP="" ;;
+    nmu.service|nginx.service|"nmu.service nginx.service") STALE_APP="${units}" ;;
+    *) echo "  FAIL 扫描结果里「要重启」那一行不认识:${units:-没有这一行}"; return 1 ;;
+  esac
+}
+
+# systemd 报 Started 后 uvicorn 还要约 9 秒才开始监听(11-06 上线 278 第 8 步就是探早了):先等本机
+# 两个健康接口都 200,最多 90 秒;再看每个重启过的单元 active、MainPID 换了、等的时候没自动重启过
+# (和 remote_health 同一条:重启次数涨了说明起来就崩)。
+post_restart_asserts() {   # $1 = 重启前记下的「单元=MainPID/NRestarts」,空格分开
+  echo "== 重启后核对:本机健康接口、重启过的单元、公网入口 =="
+  RBASH "BEFORE='${1}' SITE=${SITE} bash -s" <<'REMOTE'
+set -u
+bad=0
+pass() { echo "  PASS $*"; }
+fail() { echo "  FAIL $*"; bad=1; }
+http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1"; }
+waited=0
+# 按 sleep 算最多等 90 秒;curl 每次最多卡 10 秒,再用 SECONDS 把整段兜在两分钟内。
+until [ "$(http_code http://127.0.0.1:8000/health)" = "200" ] && [ "$(http_code http://127.0.0.1:8000/health/ready)" = "200" ]; do
+  [ "${waited}" -lt 90 ] && [ "${SECONDS}" -lt 120 ] || break
+  sleep 3
+  waited=$((waited + 3))
+done
+echo "  等了 ${waited} 秒"
+for pair in "200 http://127.0.0.1:8000/health" "200 http://127.0.0.1:8000/health/ready" "200 ${SITE}/health" "404 ${SITE}/docs"; do
+  want=${pair%% *}; url=${pair#* }; got=$(http_code "${url}")
+  if [ "${got}" = "${want}" ]; then pass "${url} ${got}"; else fail "${url} ${got:-无}(应 ${want})"; fi
+done
+# 国内入口经 droplet 转过来,那一跳不归这台机器管:只报,不判。
+echo "  注 国内入口 https://147-182-176-237.sslip.io/health $(http_code https://147-182-176-237.sslip.io/health)(只看不判)"
+for entry in ${BEFORE}; do
+  unit=${entry%%=*}; counts=${entry#*=}; pid_before=${counts%%/*}; restarts_before=${counts#*/}
+  state=$(systemctl --no-pager is-active "${unit}")
+  pid=$(systemctl --no-pager show -p MainPID --value "${unit}")
+  restarts=$(systemctl --no-pager show -p NRestarts --value "${unit}")
+  if [ "${state}" = "active" ]; then pass "${unit} active"; else fail "${unit} ${state}"; fi
+  if [ "${pid}" != "0" ] && [ "${pid}" != "${pid_before}" ]; then pass "${unit} MainPID ${pid_before} 换成 ${pid}"; else fail "${unit} MainPID ${pid}(重启前 ${pid_before}),没换成新进程"; fi
+  if [ "${restarts}" = "${restarts_before}" ]; then pass "${unit} 起来时没自动重启过"; else fail "${unit} NRestarts ${restarts_before} 涨到 ${restarts}:起来就崩过"; fi
+done
+exit "${bad}"
+REMOTE
+}
+
+# 照单元自己的跑法重跑周检:state 文件、chmod、OnFailure 都和周一那次一样,不直接调脚本。
+# reset-failed 会顺手把 Result 清成 success,所以 start 退出 0、而且 Result=success 才算过。
+rerun_os_security() {
+  local rc=0 result
+  echo "== 照单元的跑法重跑 OS 周检:reset-failed,再 start nmu-os-security.service =="
+  # 还不过的话,它的 OnFailure 照常往 Discord 发那条告警:那是实情,不是这一步坏了。
+  echo "  注 周检要是还不过,OnFailure 会照常往 Discord 发一条告警,那是实情,不是这里出了错"
+  RSH 'systemctl --no-pager reset-failed nmu-os-security.service; systemctl --no-pager start nmu-os-security.service' || rc=$?
+  result=$(RSH 'systemctl --no-pager show -p Result --value nmu-os-security.service')
+  echo "  start 退出码 ${rc},Result=${result:-读不到}"
+  RBASH '/usr/bin/python3 -I - /opt/nmu/backups/os-security.state' <<'PY'
+import json
+import sys
+
+# 周检那一轮的 --json 输出(只有 root 读得了);只打 failures、notes 里的字符串。
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        report = json.load(handle)
+except (OSError, ValueError) as exc:
+    print("  FAIL 读不了 " + sys.argv[1] + ",或者它不是 JSON(" + type(exc).__name__ + "),上机看全文")
+    sys.exit(1)
+if not isinstance(report, dict):
+    print("  FAIL " + sys.argv[1] + " 不是周检写的 JSON")
+    sys.exit(1)
+for key, label in (("failures", "FAIL"), ("notes", "注")):
+    items = report.get(key)
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, str):
+            print("  " + label + " " + item)
+PY
+  [ "${rc}" = "0" ] && [ "${result}" = "success" ]
+}
+
 # ---------------- 各阶段 ----------------
 
 common_gates() {   # $1 = 这一阶段最多占用几分钟
@@ -889,6 +1007,62 @@ REMOTE
   echo "== purge 阶段完成 =="
 }
 
+phase_restart_app() {
+  local units unit pid restarts rc outage="" before="" restarted="" done_what
+  common_gates 10
+  stale_app_units || bail "扫不了哪些进程还在用被换掉的库;没扫过不当作干净(生产没有任何改动)"
+  units="${STALE_APP}"
+  if [ -z "${units}" ]; then
+    echo "== nmu、nginx 都没在旧库上,不用重启;照样重跑一次周检,把过时的 failed 清掉 =="
+  else
+    for unit in ${units}; do
+      case "${unit}" in
+        nmu.service) outage="${outage}nmu 断 10–20 秒(systemd 报 Started 后 uvicorn 约 9 秒才开始监听);" ;;
+        nginx.service) outage="${outage}nginx 断几秒(它只管 80 端口跳 https);" ;;
+      esac
+    done
+    confirm "只重启 ${units}?${outage}别的单元都不动"
+    # nginx -t 不过就一个都不重启,连 nmu 也不动。
+    case " ${units} " in
+      *" nginx.service "*)
+        echo "== nginx -t =="
+        RSH 'nginx -t' || bail "nginx -t 没过,什么都没重启(生产没有任何改动)"
+        ;;
+    esac
+    for unit in ${units}; do
+      pid=$(RSH "systemctl --no-pager show -p MainPID --value ${unit}")
+      restarts=$(RSH "systemctl --no-pager show -p NRestarts --value ${unit}")
+      case "${pid}:${restarts}" in
+        :*|*:|*[!0-9:]*) bail "读不到 ${unit} 的 MainPID/NRestarts(${pid:-空}/${restarts:-空}),什么都没重启(生产没有任何改动)" ;;
+      esac
+      echo "  ${unit} 重启前 MainPID ${pid},NRestarts ${restarts}"
+      before="${before}${unit}=${pid}/${restarts} "
+    done
+    for unit in ${units}; do
+      echo "== 重启 ${unit} =="
+      RSH "systemctl --no-pager restart ${unit}"
+      rc=$?
+      restarted="${restarted:+${restarted} }${unit}"
+      [ "${rc}" = "0" ] || bail "重启 ${unit} 退出码 ${rc}。已经重启过:${restarted};上机看 systemctl --no-pager status -n 50 ${restarted}"
+    done
+    post_restart_asserts "${before}" || bail "重启后核对有 FAIL(看上面)。已经重启过:${restarted};上机看 systemctl --no-pager status -n 50 ${restarted}"
+    stale_app_units "重启后再扫:" || bail "已经重启过:${restarted};重启后却扫不了旧库(看上面)"
+    for unit in ${restarted}; do
+      case " ${STALE_APP} " in
+        *" ${unit} "*) bail "已经重启过:${unit},它却还映射着被换掉的库(看上面);上机看 systemctl --no-pager status -n 50 ${unit}" ;;
+      esac
+    done
+  fi
+  if [ -n "${restarted}" ]; then done_what="应用已换新库"; else done_what="nmu/nginx 本来就不在旧库上,没有重启"; fi
+  if rerun_os_security; then
+    remote_health after || bail "OS 周检 success,但服务与定时器核对有 FAIL(看上面);${done_what}"
+    echo "== restart-app 完成:${done_what},OS 周检 success =="
+  else
+    echo "== restart-app 完成:${done_what};OS 周检仍不过,原因见上 =="
+    exit 1
+  fi
+}
+
 case "${PHASE}" in
   check) banner; phase_check ;;
   kernel) banner; phase_kernel ;;
@@ -897,5 +1071,6 @@ case "${PHASE}" in
   netplan) banner; phase_netplan ;;
   verify-netplan) banner; phase_verify "${NET_BY_MAC}" ;;
   purge) banner; phase_purge ;;
+  restart-app) banner; phase_restart_app ;;
   *) usage; exit 64 ;;
 esac

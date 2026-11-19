@@ -28,7 +28,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy" / "maintenance" / "kernel_netplan_window.sh"
-PHASES = {"check", "kernel", "reboot", "verify-kernel", "netplan", "verify-netplan", "purge"}
+PHASES = {"check", "kernel", "reboot", "verify-kernel", "netplan", "verify-netplan", "purge",
+          "restart-app"}
 NMU_TIMERS = {"nmu-backup.timer", "nmu-backup-health.timer", "nmu-capacity.timer",
               "nmu-restore-drill.timer", "nmu-os-security.timer", "nmu-health.timer"}
 
@@ -360,8 +361,8 @@ _SIMULATION_203 = "".join(
     ))
 
 # 一台会随脚本的动作变化的假机器：装包后内核包在、重启换 boot_id 并起到新内核、
-# 装死人开关的那段正文执行后新段就位、清包后 198 的包消失。日志一行一条命令，
-# 远端正文按里面的关键动作打标签，方便核对先后次序。
+# 装死人开关的那段正文执行后新段就位、清包后 198 的包消失、重启过的应用单元不再映射旧库。
+# 日志一行一条命令，远端正文按里面的关键动作打标签，方便核对先后次序。
 _FAKE_SSH = '''\
 import json
 import os
@@ -377,7 +378,8 @@ state_path = os.environ["FAKE_STATE"]
 with open(state_path, encoding="utf-8") as handle:
     state = json.load(handle)
 marks = [mark for mark in ("netplan generate", "nmu-netplan-revert --on-active", "netplan apply",
-                           "stop nmu-netplan-revert.timer", "lsinitramfs", "os_security_check.py")
+                           "stop nmu-netplan-revert.timer", "lsinitramfs", "os_security_check.py",
+                           "127.0.0.1:8000/health/ready")
          if mark in body]
 with open(os.environ["FAKE_SSH_LOG"], "a", encoding="utf-8") as log:
     log.write(command + (" :: " + " | ".join(marks) if marks else "") + "\\n")
@@ -468,9 +470,56 @@ if "systemctl --no-pager reboot" in command:
     if state["installed"]:
         state["kernel"] = "5.15.0-203-generic"
     reply("", 255)
+if command == "/usr/bin/python3 -I -B - /opt/nmu/app/scripts":
+    # 扫旧库:原样跑送来的正文,os_security_check 换成按 stale 作答的替身。
+    import subprocess
+    if state.get("stale_scan_empty"):
+        reply()
+    scripts = os.path.join(os.path.dirname(state_path), "fake-scripts")
+    os.makedirs(scripts, exist_ok=True)
+    scan = ("raise PermissionError(13, 'Permission denied')" if state.get("stale_scan_error")
+            else "return %r" % (state.get("stale", {}),))
+    with open(os.path.join(scripts, "os_security_check.py"), "w", encoding="utf-8") as handle:
+        handle.write("APP_UNITS = %r\\n\\n\\ndef stale_library_units():\\n    %s\\n"
+                     % (tuple(state.get("app_units", ("nmu.service", "nginx.service"))), scan))
+    done = subprocess.run([sys.executable, "-I", "-B", "-", scripts], input=body,
+                          capture_output=True, text=True)
+    reply(done.stdout, done.returncode)
+if command == "/usr/bin/python3 -I - /opt/nmu/backups/os-security.state":
+    # 读周检结论:原样跑送来的正文;state 照周检的样子写一份,带着不该打出来的库路径。
+    import subprocess
+    report = os.path.join(os.path.dirname(state_path), "os-security.state")
+    with open(report, "w", encoding="utf-8") as handle:
+        json.dump({"ok": state.get("os_result", "success") == "success",
+                   "failures": state.get("os_failures", []),
+                   "notes": ["另有 7 个非安全更新待装（不算失败）"],
+                   "stale_library_units": state.get("stale", {})}, handle, ensure_ascii=False)
+    done = subprocess.run([sys.executable, "-I", "-", report], input=body,
+                          capture_output=True, text=True)
+    reply(done.stdout, done.returncode)
+if command == "nginx -t":
+    if state.get("nginx_config_bad"):
+        reply("nginx: configuration file /etc/nginx/nginx.conf test failed\\n", 1)
+    reply("nginx: configuration file /etc/nginx/nginx.conf test is successful\\n")
+if "show -p MainPID --value" in command:
+    reply("4242\\n")
+if "show -p NRestarts --value" in command:
+    reply("0\\n")
+if command.startswith("systemctl --no-pager restart "):
+    # 重启过的单元换上新库;stale_after_restart:重启了却还映射着旧库。
+    if not state.get("stale_after_restart"):
+        state.get("stale", {}).pop(command.split()[-1], None)
+    reply()
+if "start nmu-os-security.service" in command:
+    # os_start_rc:start 没跑成(ssh 断了之类),而 reset-failed 已把 Result 清成 success。
+    reply("", state.get("os_start_rc", 0 if state.get("os_result", "success") == "success" else 1))
+if "show -p Result --value nmu-os-security.service" in command:
+    reply(state.get("os_result", "success") + "\\n")
 if command.endswith("bash -s"):
     if "lsinitramfs" in body and state.get("boot_target_mismatch"):
         reply("  FAIL 默认项不是当前内核\\n", 1)
+    if "127.0.0.1:8000/health/ready" in body and state.get("app_unhealthy"):
+        reply("  FAIL http://127.0.0.1:8000/health/ready 000(应 200)\\n", 1)
     if "nmu-netplan-revert --on-active" in body:
         state["stanza"] = True
     reply("  PASS 假机器\\n")
@@ -897,3 +946,238 @@ def test_the_reboot_phase_stops_before_reboot_on_unsafe_or_declined_conditions(c
     result, commands = _run_phase(tmp_path, "reboot", answers=answers, journal=journal, host=host)
     assert result.returncode == 1 and error in result.stdout, result.stdout + result.stderr
     assert not [c for c in commands if re.search(r"systemd-run|netplan apply", c) or REBOOT in c]
+
+
+# ---------------- restart-app:只重启还在旧库上的 nmu/nginx,再照单元重跑周检 ----------------
+# 夜间补丁换了 libc6 这类库、按设计不重启 nmu,周检就一直判失败。这一阶段走同一套门槛,只重启
+# 扫描点名的应用单元;假机器的扫描与读 state 都原样跑送过去的正文。
+
+RESTART_APP_SCAN = "/usr/bin/python3 -I -B - /opt/nmu/app/scripts"
+_LIBC = "/usr/lib/x86_64-linux-gnu/libc.so.6"
+_STALE = {"nmu.service": [_LIBC, "/usr/lib/x86_64-linux-gnu/libm.so.6"], "nginx.service": [_LIBC],
+          "dbus.service": [_LIBC], "ssh.service": [_LIBC]}
+# 会动单元的 systemctl 动作;restart-app 只许出现点名的那几条 restart。
+_UNIT_ACTION = re.compile(r"\bsystemctl\b.*\b(restart|try-restart|reload|stop|kill|reboot|disable|mask)\b")
+
+
+def _stale(*app_units: str) -> dict:
+    """点名的应用单元在旧库上;dbus、ssh 两个系统单元一直在,只该被报出来。"""
+    return {unit: libraries for unit, libraries in _STALE.items()
+            if unit in app_units or unit not in ("nmu.service", "nginx.service")}
+
+
+def _restart_app(tmp_path: Path, answers: str = "yes\n", journal: str = "", **changes):
+    return _run_phase(tmp_path, "restart-app", answers=answers, journal=journal,
+                      host={**_FRESH_HOST, **changes})
+
+
+def test_restart_app_stops_at_the_idle_gate_before_restarting_anything(tmp_path):
+    result, commands = _restart_app(tmp_path, journal=_SCANNER + _ONE_ANSWER,
+                                    stale=_stale("nmu.service"))
+
+    assert result.returncode == 1 and "停:生产空闲(生产没有任何改动)" in result.stdout
+    assert not [c for c in commands if _UNIT_ACTION.search(c) or c.startswith(RESTART_APP_SCAN)
+                or "nginx -t" in c or "nmu-os-security.service" in c]
+
+
+def test_restart_app_restarts_only_the_stale_app_unit_and_reruns_the_weekly_check(tmp_path):
+    result, commands = _restart_app(tmp_path, stale=_stale("nmu.service"))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.rstrip().endswith("== restart-app 完成:应用已换新库,OS 周检 success ==")
+    assert "只重启 nmu.service?nmu 断 10–20 秒" in result.stdout
+    assert "  nmu.service 还映射着被换掉的库:libc.so.6、libm.so.6" in result.stdout
+    assert "另有 2 个单元也还在用旧库(dbus.service、ssh.service),这里不重启" in result.stdout
+    assert "Result=success" in result.stdout and "  注 另有 7 个非安全更新待装" in result.stdout
+    # 扫描与 state 里都有完整库路径,打出来的只许是文件名。
+    assert "/usr/lib/x86_64-linux-gnu" not in result.stdout
+    assert [c for c in commands if _UNIT_ACTION.search(c)] == ["systemctl --no-pager restart nmu.service"]
+    assert not [c for c in commands
+                if re.search(r"sing-box|nmu-caddy|ssh\.service|systemd-|apt-get|dpkg|nginx|--force", c)]
+    scans = [i for i, c in enumerate(commands) if c.startswith(RESTART_APP_SCAN)]
+    assert len(scans) == 2
+    assert (scans[0] < _first(commands, "show -p MainPID --value nmu.service")
+            < _first(commands, "systemctl --no-pager restart nmu.service")
+            < _first(commands, ":: 127.0.0.1:8000/health/ready") < scans[1]
+            < _first(commands, "reset-failed nmu-os-security.service; "
+                               "systemctl --no-pager start nmu-os-security.service")
+            < _first(commands, "show -p Result --value nmu-os-security.service")
+            < _first(commands, "WHEN=after"))
+    [after] = [c for c in commands if ":: 127.0.0.1:8000/health/ready" in c]
+    assert after.startswith("BEFORE='nmu.service=4242/0 ' SITE=https://89-208-253-119.sslip.io ")
+
+
+def test_a_declined_restart_restarts_nothing(tmp_path):
+    result, commands = _restart_app(tmp_path, answers="no\n",
+                                    stale=_stale("nmu.service", "nginx.service"))
+
+    assert result.returncode == 1
+    assert "停:没有确认:只重启 nmu.service nginx.service?" in result.stdout
+    assert "nginx 断几秒" in result.stdout
+    assert not [c for c in commands if _UNIT_ACTION.search(c) or "nginx -t" in c
+                or "nmu-os-security.service" in c]
+
+
+@pytest.mark.parametrize("os_result", ["success", "exit-code"])
+def test_with_no_stale_app_unit_nothing_restarts_but_the_weekly_check_reruns(os_result, tmp_path):
+    """一个要重启的都没有也照样重跑周检:过时的 failed 状态要清掉。不问问题(answers 为空)。"""
+    result, commands = _restart_app(tmp_path, answers="", stale=_stale(), os_result=os_result)
+
+    assert "  要重启:无" in result.stdout and "不用重启" in result.stdout
+    assert not [c for c in commands if _UNIT_ACTION.search(c) or "nginx -t" in c]
+    assert [c for c in commands if "start nmu-os-security.service" in c]
+    if os_result == "success":
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "restart-app 完成:nmu/nginx 本来就不在旧库上,没有重启,OS 周检 success" in result.stdout
+        assert [c for c in commands if "WHEN=after" in c]
+    else:
+        assert result.returncode == 1
+        assert "没有重启;OS 周检仍不过,原因见上" in result.stdout
+        assert not [c for c in commands if "WHEN=after" in c]
+
+
+@pytest.mark.parametrize("change", ["app_unhealthy", "stale_after_restart"])
+def test_a_bad_restart_stops_before_the_weekly_check_and_says_what_was_restarted(change, tmp_path):
+    """健康接口等不到 200、或者重启了还映射着旧库:停,说清已经重启过、上机看什么。"""
+    result, commands = _restart_app(tmp_path, stale=_stale("nmu.service"), **{change: True})
+
+    assert result.returncode == 1
+    assert "已经重启过:nmu.service" in result.stdout
+    assert "上机看 systemctl --no-pager status -n 50 nmu.service" in result.stdout
+    assert [c for c in commands if _UNIT_ACTION.search(c)] == ["systemctl --no-pager restart nmu.service"]
+    assert not [c for c in commands if "nmu-os-security.service" in c or "WHEN=after" in c]
+
+
+@pytest.mark.parametrize(("os_result", "start_rc", "shown"), [
+    ("exit-code", 1, "  FAIL 1 个安全更新待安装（procps…）"),
+    # reset-failed 会把 Result 清成 success:start 没跑成时读到的 success 不算数。
+    ("success", 255, "start 退出码 255,Result=success"),
+], ids=["check-failed", "start-never-ran"])
+def test_a_weekly_check_that_still_fails_is_not_reported_as_a_failed_restart(os_result, start_rc,
+                                                                             shown, tmp_path):
+    """重启好了而周检仍不过(积压里还有包之类):原因照 state 打出来,单独一行收尾,退 1。"""
+    result, commands = _restart_app(tmp_path, stale=_stale("nmu.service"), os_result=os_result,
+                                    os_start_rc=start_rc,
+                                    os_failures=["1 个安全更新待安装（procps…）；修法：其余 1 个夜间补丁没装上"])
+
+    assert result.returncode == 1
+    assert result.stdout.rstrip().endswith("== restart-app 完成:应用已换新库;OS 周检仍不过,原因见上 ==")
+    assert f"start 退出码 {start_rc},Result={os_result}" in result.stdout and shown in result.stdout
+    assert "停:" not in result.stdout and "已经重启过" not in result.stdout
+    assert [c for c in commands if _UNIT_ACTION.search(c)] == ["systemctl --no-pager restart nmu.service"]
+    assert not [c for c in commands if "WHEN=after" in c]
+
+
+@pytest.mark.parametrize("stale_units", [("nginx.service",), ("nmu.service", "nginx.service")])
+@pytest.mark.parametrize("config_ok", [True, False])
+def test_nginx_config_is_tested_before_any_restart(stale_units, config_ok, tmp_path):
+    """nginx -t 在任何重启之前跑;不过就一个都不重启,连同样在旧库上的 nmu 也不动。"""
+    result, commands = _restart_app(tmp_path, stale=_stale(*stale_units),
+                                    nginx_config_bad=not config_ok)
+
+    restarts = [c for c in commands if _UNIT_ACTION.search(c)]
+    if config_ok:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert restarts == ["systemctl --no-pager restart " + unit for unit in stale_units]
+        assert _first(commands, "nginx -t") < _first(commands, "systemctl --no-pager restart ")
+    else:
+        assert result.returncode == 1 and "停:nginx -t 没过,什么都没重启" in result.stdout
+        assert "nginx -t" in commands and not restarts
+        assert not [c for c in commands if "nmu-os-security.service" in c]
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    ({"stale_scan_error": True}, "  FAIL 扫不了哪些进程还在用被换掉的库(PermissionError"),
+    ({"stale_scan_empty": True}, "  FAIL 没收到扫描结果"),
+    ({"app_units": ["nmu.service", "sing-box-hy2.service"],
+      "stale": {"nmu.service": [_LIBC], "sing-box-hy2.service": [_LIBC]}},
+     "那一行不认识:nmu.service sing-box-hy2.service"),
+], ids=["scan-error", "empty-answer", "unexpected-unit"])
+def test_a_scan_that_is_not_a_clean_answer_restarts_nothing(change, message, tmp_path):
+    """扫不了、没收到、或者答出 nmu/nginx 以外的单元:没扫清楚不当作干净,也绝不顺手重启别的。"""
+    result, commands = _restart_app(tmp_path, **{"stale": _stale("nmu.service"), **change})
+
+    assert result.returncode == 1 and message in result.stdout, result.stdout + result.stderr
+    assert "停:扫不了哪些进程还在用被换掉的库" in result.stdout
+    assert not [c for c in commands if _UNIT_ACTION.search(c) or "nginx -t" in c
+                or "nmu-os-security.service" in c]
+
+
+def test_restart_app_never_reboots_installs_or_touches_any_other_unit():
+    """只重启 nmu、nginx:不重启整机、不碰 apt/dpkg、代理、ssh、systemd-*、网关和定时器,也不 --force。"""
+    code = [line for name in ("stale_app_units", "post_restart_asserts", "rerun_os_security",
+                              "phase_restart_app")
+            for line in _function(name).splitlines() if not line.lstrip().startswith("#")]
+    assert len(code) > 50, "没取到 restart-app 的几段函数,下面的断言在空转"
+    for line in code:
+        assert not re.search(r"reboot|apt-get|dpkg|sing-box|nmu-caddy|ssh\.service|systemd-|--force"
+                             r"|\.timer\b", line), line
+        assert not re.search(r"\bsystemctl\b.*\b(stop|disable|mask|kill|reload)\b", line), line
+    restarts = [line.strip() for line in code if re.search(r"\bsystemctl\b.*\brestart\b", line)]
+    assert restarts == ['RSH "systemctl --no-pager restart ${unit}"'], restarts
+
+
+# 重启后那段远端正文要在本机原样跑一遍:假机器对它一律答 PASS,它自己的判法只有这里看得到。
+# 最后一个参数是网址,各接口的状态码、单元状态由环境变量给;sleep 只记次数。
+_FAKE_HOST_TOOLS = {
+    "curl": ('#!/bin/sh\nfor url; do :; done\ncase "$url" in\n'
+             '  *147-182-176-237*) printf %s "${CN_CODE:-200}" ;;\n'
+             '  */docs) printf %s "${DOCS_CODE:-404}" ;;\n'
+             '  */health/ready) printf %s "${READY_CODE:-200}" ;;\n'
+             '  *) printf 200 ;;\nesac\n'),
+    "systemctl": ('#!/bin/sh\ncase "$*" in\n'
+                  '  *is-active*) echo "${ACTIVE:-active}" ;;\n'
+                  '  *MainPID*) echo "${NEW_PID:-5151}" ;;\n'
+                  '  *NRestarts*) echo "${NEW_RESTARTS:-0}" ;;\n'
+                  '  *) exit 97 ;;\nesac\n'),
+    "sleep": '#!/bin/sh\necho x >> "$SLEEP_LOG"\n',
+}
+
+
+def _post_restart_check(tmp_path: Path, env: dict,
+                        preamble: str = "") -> tuple[subprocess.CompletedProcess, int]:
+    """(结果, sleep 了几次)。preamble 在正文之前执行,用来把 SECONDS 拨到某个已过去的秒数。"""
+    [body] = [body for delimiter, body in _heredocs(_text())
+              if delimiter == "REMOTE" and "127.0.0.1:8000/health/ready" in body]
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name, text in _FAKE_HOST_TOOLS.items():
+        (fake / name).write_text(text, encoding="utf-8")
+        (fake / name).chmod(0o755)
+    sleeps = tmp_path / "sleeps"
+    result = subprocess.run(["bash", "-s"], input=preamble + body, capture_output=True, text=True,
+                            timeout=60, env={"PATH": f"{fake}:/usr/bin:/bin", "SLEEP_LOG": str(sleeps),
+                                             "BEFORE": "nmu.service=4242/0 ",
+                                             "SITE": "https://89-208-253-119.sslip.io", **env})
+    return result, sleeps.read_text(encoding="utf-8").count("x") if sleeps.exists() else 0
+
+
+@pytest.mark.parametrize(("env", "rc", "shown"), [
+    ({"CN_CODE": "000"}, 0, "注 国内入口 https://147-182-176-237.sslip.io/health 000(只看不判)"),
+    ({"READY_CODE": "503"}, 1, "FAIL http://127.0.0.1:8000/health/ready 503(应 200)"),
+    ({"NEW_PID": "4242"}, 1, "FAIL nmu.service MainPID 4242(重启前 4242),没换成新进程"),
+    ({"NEW_RESTARTS": "1"}, 1, "FAIL nmu.service NRestarts 0 涨到 1:起来就崩过"),
+    ({"ACTIVE": "activating"}, 1, "FAIL nmu.service activating"),
+    ({"DOCS_CODE": "200"}, 1, "FAIL https://89-208-253-119.sslip.io/docs 200(应 404)"),
+], ids=["cn-entry-only-reported", "never-ready", "same-pid", "auto-restarted", "not-active",
+        "docs-open"])
+def test_the_post_restart_check_on_the_host(env, rc, shown, tmp_path):
+    result, waited = _post_restart_check(tmp_path, env)
+
+    assert result.returncode == rc and shown in result.stdout, result.stdout + result.stderr
+    # 等不到 200 最多 90 秒:每 3 秒一次,30 次就收手;一开始就好的一次都不等。
+    assert waited == (30 if "READY_CODE" in env else 0)
+
+
+def test_hanging_health_probes_cannot_stretch_the_wait_past_two_minutes(tmp_path):
+    """curl 每次都卡满 10 秒时,只按 sleep 计数会拖到十来分钟;SECONDS 过了 120 就收手。"""
+    result, waited = _post_restart_check(tmp_path, {"READY_CODE": "000"}, preamble="SECONDS=200\n")
+
+    assert result.returncode == 1 and waited == 0, result.stdout + result.stderr
+    assert "FAIL http://127.0.0.1:8000/health/ready 000(应 200)" in result.stdout
+
+
+def test_the_systemd_readme_sends_stale_library_restarts_through_restart_app():
+    readme = (ROOT / "deploy" / "systemd" / "README.md").read_text(encoding="utf-8")
+    assert "kernel_netplan_window.sh restart-app" in readme
+    assert "systemctl restart nmu" not in readme
