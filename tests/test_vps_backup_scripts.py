@@ -682,6 +682,29 @@ def test_pull_transient_ssh_recovery_still_rejects_manifest_corruption(tmp_path)
     assert "failed snapshots=unverified" in log.splitlines()[-1]
 
 
+def test_the_daily_offsite_pull_runs_after_that_days_vps_backup_in_both_home_time_zones():
+    """box A 每天 19:30 UTC(再随机晚最多 10 分钟)备份;Mac 按本地钟点触发。人在芝加哥或在国内,
+    拉取都要排在当天备份之后不久。原来的 12:30 在国内定、在芝加哥早于备份,天天拉的是前一天那份。"""
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+
+    installer = (ROOT / "scripts" / "install-macos-offsite-pull.sh").read_text(encoding="utf-8")
+    hour = int(re.search(r"<key>Hour</key>\s*<integer>(\d+)</integer>", installer).group(1))
+    minute = int(re.search(r"<key>Minute</key>\s*<integer>(\d+)</integer>", installer).group(1))
+    timer = (ROOT / "deploy" / "systemd" / "nmu-backup.timer").read_text(encoding="utf-8")
+    backup_hour, backup_minute = map(int, re.search(
+        r"^OnCalendar=\*-\*-\* (\d{2}):(\d{2}):00$", timer, re.M).groups())
+    delay = timedelta(seconds=int(re.search(r"^RandomizedDelaySec=(\d+)$", timer, re.M).group(1)))
+    for zone, day in (("America/Chicago", "2026-01-15"), ("America/Chicago", "2026-07-15"),
+                      ("Asia/Shanghai", "2026-07-15")):
+        pull = datetime.fromisoformat(f"{day}T{hour:02d}:{minute:02d}").replace(
+            tzinfo=ZoneInfo(zone)).astimezone(timezone.utc)
+        backup_done = pull.replace(hour=backup_hour, minute=backup_minute, second=0) + delay
+        if backup_done > pull:
+            backup_done -= timedelta(days=1)
+        assert timedelta(0) < pull - backup_done <= timedelta(hours=14), (zone, day, pull - backup_done)
+
+
 def test_macos_offsite_wrapper_reports_failed_footer_without_sending(tmp_path):
     installer = (ROOT / "scripts" / "install-macos-offsite-pull.sh").read_text()
     match = re.search(r"grep -E '( [^']+ snapshots=)'", installer)

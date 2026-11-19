@@ -271,8 +271,14 @@ def test_release_artifact_is_uploaded_by_main_push_only() -> None:
     assert "\n        if: github.event_name == 'push'\n" in upload
     assert "\n          retention-days: 30\n" in upload
     assert "\n          if-no-files-found: error" in upload
-    # PR run 照样构建、扫描、核 dist 与源码的绑定,只少上传这一步。
-    assert len(re.findall(r"^        if: ", image, re.M)) == 1
+    # PR run 照样构建、扫描、核 dist 与源码的绑定,只少上传这一步。另外只许有失败后才跑、
+    # 本身不改结论的诊断步(if: failure(),命令以 || true 收尾),它不会让任何检查被跳过。
+    conditions = re.findall(r"^        if: (.*)$", image, re.M)
+    assert conditions.count("github.event_name == 'push'") == 1
+    assert set(conditions) <= {"github.event_name == 'push'", "failure()"}
+    for step in image.split("\n      - "):
+        if "\n        if: failure()\n" in step:
+            assert step.rstrip().endswith("|| true"), step
 
 
 def _run_backend_gate_with_fake_python(tmp_path: Path, *, xdist_importable: bool) -> str:

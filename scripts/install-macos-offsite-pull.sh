@@ -208,6 +208,9 @@ exit "\$rc"
 EOF
 chmod 700 "$ROOT/run-pull.sh"
 
+# 本地 16:30:box A 每天 19:30 UTC 备份、20:40 UTC 自检。芝加哥 16:30 是 22:30 UTC(夏令时 21:30),
+# 在国内是 08:30 UTC,两边都排在当天备份之后。原先的 12:30 是在国内定的,回芝加哥后变成
+# 18:30 UTC,比备份早一小时,每天拉到的都是前一天那份。
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -222,7 +225,7 @@ cat > "$PLIST" <<EOF
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
-    <integer>12</integer>
+    <integer>16</integer>
     <key>Minute</key>
     <integer>30</integer>
   </dict>
@@ -285,12 +288,12 @@ last_exit=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
 echo "launchd 上次退出码: ${last_exit:-未知}"
 tail -3 "$ROOT/offsite/pull.log" 2>/dev/null || echo "(还没有 pull.log)"
 case "${last_exit:-1}" in
-  0) echo "异地拉取这条路已经跑通，每天 12:30 自动执行。" ;;
+  0) echo "异地拉取这条路已经跑通，每天 16:30 自动执行。" ;;
   # 退出码 4 = 拉取本身成功，但有快照进了 legacy/conflicts 等人工处置。
   # 迁移头一前进，升级前拍的所有快照都会一次性变成这个状态——那是设计。
   # 第一版把 4 也报成"不通"，于是每次带迁移的上线之后都会有人被派去查一个
   # 根本不存在的故障。装没装上和有没有待处置的快照，是两件事。
-  4) echo "异地拉取这条路已经跑通，每天 12:30 自动执行。"
+  4) echo "异地拉取这条路已经跑通，每天 16:30 自动执行。"
      echo "注意：有快照待人工处置（见上面 pull.log 尾部与 $ROOT/offsite/legacy-unvalidated/）。" >&2
      echo "刚做过迁移头前进的话，这是预期结果，不是故障。" >&2 ;;
   *) echo "launchd 这一路仍然不通，看 $HOME/Library/Logs/nmu-vps-backup-pull.log" >&2
