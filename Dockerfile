@@ -25,6 +25,8 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 # 追上之后这两项会变成同版本的空操作，但仍然留着——底座换 digest 时它是硬下限。
 # Alpine 仓库每个包只留最新一版：2026-09-30 进了 3.5.9-r0，3.5.8-r0 随即下架，
 # 旧钉版会让 apk 选包失败（exit 9），所以跟到 3.5.9-r0。
+# 2026-11-18 23:31 UTC 进了 3.5.9-r1（secdb 记修 CVE-2026-88822、-88823、-95691、-95692、
+# -107496），r0 随即下架，再跟到 3.5.9-r1。
 # libuuid 来自 util-linux；2026-09-05 的 2.42.3-r1 包含本次镜像扫描命中的七项
 # util-linux HIGH 修复（r0 修复六项，r1 补上 CVE-2026-78408）。不豁免底座旧包。
 # zlib 1.3.2-r1 修 CVE-2026-85091（gz_vacate 堆溢出，HIGH）：11-06 镜像扫描命中，底座带的是 r0。
@@ -33,7 +35,7 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 # 11-12 镜像扫描：musl/musl-utils 1.2.6-r3 修 CVE-2026-107891，
 # krb5-libs 1.22.3-r0 修底座 1.22.2-r1 命中的 Kerberos HIGH 漏洞；只补这三个包，底座不换。
 # 官方修复记录：https://secdb.alpinelinux.org/v3.24/main.json
-RUN apk add --no-cache bash=5.3.9-r1 libcrypto3=3.5.9-r0 libssl3=3.5.9-r0 libuuid=2.42.3-r1 zlib=1.4-r0 musl=1.2.6-r3 musl-utils=1.2.6-r3 krb5-libs=1.22.3-r0
+RUN apk add --no-cache bash=5.3.9-r1 libcrypto3=3.5.9-r1 libssl3=3.5.9-r1 libuuid=2.42.3-r1 zlib=1.4-r0 musl=1.2.6-r3 musl-utils=1.2.6-r3 krb5-libs=1.22.3-r0
 
 # 云端为主：默认只装核心运行依赖(不含 pytest/piper)。要本地神经兜底音色可另装 piper。
 COPY requirements-deploy.txt requirements-deploy.lock.txt ./
