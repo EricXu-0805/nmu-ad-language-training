@@ -12,7 +12,7 @@ reject() {
 [ "$#" -eq 0 ] || reject
 edge_version=$(caddy version 2>/dev/null) || reject
 case "$edge_version" in
-  'v2.11.4'|'v2.11.4 '*) ;;
+  'v2.11.9'|'v2.11.9 '*) ;;
   *) reject ;;
 esac
 edge_build_info=$(caddy build-info 2>/dev/null) || reject

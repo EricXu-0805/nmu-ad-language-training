@@ -139,7 +139,7 @@ def test_edge_topology_contract_accepts_only_explicit_modes(mode, image):
     check_release_contract.validate_edge_contract(mode, image)
 
 
-def _run_edge_stub(tmp_path, build_info, version="v2.11.4"):
+def _run_edge_stub(tmp_path, build_info, version="v2.11.9"):
     stub = tmp_path / "caddy"
     marker = tmp_path / "listener-started"
     stub.write_text(
@@ -157,15 +157,19 @@ def _run_edge_stub(tmp_path, build_info, version="v2.11.4"):
 
 
 @pytest.mark.parametrize("go_lines,version,accepted", (
-    ("go\tgo1.26.11\n", "v2.11.4", True),
-    ("go\tgo1.26.10\n", "v2.11.4", False),
-    ("go\tgo1.26.9\n", "v2.11.4", False),
-    ("go\tgo1.26.8\n", "v2.11.4", False),
-    ("go\tgo1.26.3\n", "v2.11.4", False),
-    ("go\tgo1.26.11\ngo\tgo1.26.3\n", "v2.11.4", False),
-    ("go\tgo1.26.11\n", "v2.11.3", False),
-    ("mod\tprivate-provider\n", "v2.11.4", False),
-    ("go\tgo1.26.11 extra\n", "v2.11.4", False),
+    ("go\tgo1.26.11\n", "v2.11.9", True),
+    # 真二进制的 `caddy version` 带模块校验和(2.11.9 本机构建实测这一行)。
+    ("go\tgo1.26.11\n", "v2.11.9 h1:bhZtcRKQOq0fuLvEgCdPYvUxXyGn9kzjG4lh2332DTE=", True),
+    ("go\tgo1.26.11\n", "v2.11.4 h1:XKxkMTgNSizEvKG6QHue6cAsFOteU2qA61w2tKkCWi0=", False),
+    ("go\tgo1.26.10\n", "v2.11.9", False),
+    ("go\tgo1.26.9\n", "v2.11.9", False),
+    ("go\tgo1.26.8\n", "v2.11.9", False),
+    ("go\tgo1.26.3\n", "v2.11.9", False),
+    ("go\tgo1.26.11\ngo\tgo1.26.3\n", "v2.11.9", False),
+    ("go\tgo1.26.11\n", "v2.11.4", False),
+    ("go\tgo1.26.11\n", "v2.11.8", False),
+    ("mod\tprivate-provider\n", "v2.11.9", False),
+    ("go\tgo1.26.11 extra\n", "v2.11.9", False),
 ))
 def test_edge_process_never_runs_listener_before_actual_build_check(tmp_path, go_lines, version, accepted):
     result, marker = _run_edge_stub(tmp_path, go_lines + EDGE_DEPENDENCY_LINES, version)
