@@ -47,10 +47,11 @@ def test_cloud_only_image_scan_remains_an_extra_gate() -> None:
 
 def test_both_trivy_steps_pin_the_scanner_instead_of_the_action_default() -> None:
     # trivy-action v0.36.0 不写 version 就装 Trivy v0.70.0,扫描器自己带 HIGH(GHSA-mcj4-mphf-j9ff、
-    # GHSA-q3fv-x8vg-qqm4)。两步各钉一次、同一版;漏写或写 latest 都会回到 action 的默认。
-    steps = [step for step in _jobs()["image"].split("\n      - ")
-             if "uses: aquasecurity/trivy-action@" in step]
-    assert len(steps) == 2
+    # GHSA-q3fv-x8vg-qqm4);写 latest 则变成浮动版本。整份 workflow 里每一步都钉同一版。
+    assert len([step for step in _jobs()["image"].split("\n      - ")
+                if "uses: aquasecurity/trivy-action@" in step]) == 2
+    steps = [step for step in WORKFLOW.split("\n      - ") if "uses: aquasecurity/trivy-action@" in step]
+    assert steps
     for step in steps:
         assert re.findall(r"^          version: (.*)$", step, re.M) == ["v0.76.2"], step
 
