@@ -10,6 +10,15 @@
 > `docs/handover/七道门现状表.md`。
 
 
+## 2026-11-20 生产维护：nmu 换新库、清 198、网关换成 Go 1.26.11 / compress v1.20.2（应用源码仍 `5d4fb7b`，网页仍 `00e7a3a`）
+
+- 起因：11-16 21:50 UTC 每周 OS 检查失败并发 Discord。11-13 18:04 UTC 夜间补丁装了 libc6 2.35-0ubuntu3.18，needrestart 只列不重启，nmu、nginx 仍映射旧库；安全积压 0。nginx 11-19 18:03 UTC 随自身更新重启，已换新。
+- 00:16 UTC `kernel_netplan_window.sh restart-app`（PR #54 新增的阶段）：门槛全过后只重启 nmu（MainPID 715→43460，等 6 秒健康，NRestarts 0），重扫已无旧库，周检 `Result=success`，失败单元 0。另有 21 个系统单元仍映射旧库，只算提示，等下一次重启。
+- 00:17 UTC `purge`：清掉 5.15.0-198 的 5 个包。apt 候选已是 204（只在 jammy-updates，非安全，未装），按 PR #54 只核已装包、/boot 与运行内核。GRUB 与 /boot 只剩 203（运行）和 202（回退），/boot 余 274M。
+- 00:42 UTC 换网关（PM 目录 283）：`/usr/local/bin/caddy` 由 `2bfa79d9…`（Go 1.26.10、compress v1.18.7）换成 `ab477e9e4f5ed55eb9bb5f0086fc38e8adf0f156eba79ccb34941ff00b252223`（Caddy v2.11.4、Go 1.26.11、compress v1.20.2；PR #51，制品出自 `c63375a` 的 main push CI 44639661800），修 CVE-2026-116591（HIGH）与 CVE-2026-97054。换前换后两个入口 /health 都是 200，运行进程的 exe 摘要与制品一致；旧二进制在 `/opt/nmu/caddy-before-283-20261120-004157`。`last-deploy.state` 只改 `gateway_*` 四行，应用源码那行仍是 `5d4fb7b`。第一次跑停在第 0 步：豁免续期（PR #52）改了 `deploy/caddy-build.json`，核验器拿工作区里的配方比 `491b9a7` 的收据；改用 `c63375a` 的制品后通过。
+- 国内可达：00:5x UTC 用 Globalping 测 89 直连两轮，TCP 443 14/14、HTTPS 13/14（电信、联通、移动都有），直连约 0.6–0.8 秒，经 147 中转 1.0–1.9 秒。10-28 起的封锁看来已解，147 入口留作后备。测量节点多在机房，现场网络仍以钱凯实测为准。
+- 这次没做的：Python 3.14.10（`DEPLOY.md` §12.3 禁止在生产机上源码编译 Python、新建或替换 venv；3.14.8–3.14.10 的 9 个 CVE 平台用不到，随容器迁移一起换）；Ubuntu Pro（免费档是个人使用的物理机，不符；`ubuntu-pro-client` 已装、未接入，待卸）。
+
 ## 2026-11-12 20:19 UTC 系统维护：203 内核生效（源码 `5d4fb7b`，网页仍 `00e7a3a`）
 
 - 用户确认至少48小时不使用平台，实际图形恢复控制台的键盘回显和独立 root 命令通道均已验证。避开自动更新及每日备份窗口后，原版维护 `check` 全过；安装前及最终重启前的8项临床空闲计数均为0。只安装已审查的9个精确版本内核包：meta `5.15.0.203.175`、内核包 `5.15.0-203.213`。安装日志 `/root/nmu-kernel-install-20261112-201601.log`；未改 netplan 或停用定时器。
