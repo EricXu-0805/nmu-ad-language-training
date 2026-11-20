@@ -261,10 +261,11 @@ done    # 每个都要 SubState=waiting、NextElapseUSecRealtime 非空、UnitFi
 | 别人带头 | `fallback_policy reject`:连接直接断,伪造的地址到不了 app;不带头的普通客户端不受影响 |
 | 怎么验 | CI `image` 任务的 `smoke_caddy_release.py` 拿发布网关跑:允许的源带头 → app 看到头里的地址,不带头 → 看到源地址;别的源带头 → 连接断,不带头 → 照常。另用 `http_port 8081` + `auto_https disable_redirects` 的同形配置核 `servers :443` 落在 box A 的监听上 |
 
-语义是在源码里核的:Caddy v2.11.4 与 v2.11.7 的 `modules/caddyhttp/proxyprotocol` 逐字相同。来源在
+语义是在源码里核的:Caddy v2.11.4、v2.11.7 与 v2.11.9 的 `modules/caddyhttp/proxyprotocol` 逐字相同。来源在
 allow 里 = 有头用头、没头用对端地址;在 deny 里或落到 `fallback_policy reject` = 带头就断;默认的
-`ignore` 是丢掉头里的地址、连接照常。go-proxyproto v0.12.0(本仓库 go.mod)和 v0.15.0(v2.11.7 用的)
-都会让被拒的连接之后每次读都报同一个错。`timeout` 不写时 Caddy 传 0,库用自己的 10 秒(Caddy 注释
+`ignore` 是丢掉头里的地址、连接照常。go-proxyproto v0.12.0(v2.11.4 时本仓库 go.mod)和 v0.15.0(v2.11.7
+起;换 v2.11.9 后本仓库 go.mod 也是它)都会让被拒的连接之后每次读都报同一个错。
+`timeout` 不写时 Caddy 传 0,库用自己的 10 秒(Caddy 注释
 写的 5 秒不对),所以显式写 5s;超时只当作没带头,不断连接。`proxy_protocol` 必须写在 `tls` 前面:
 `listener_wrappers` 里不写 `tls` 时 Caddy 把它插到最前面,PROXY 头就成了 TLS 数据。
 

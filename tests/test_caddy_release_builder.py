@@ -70,7 +70,7 @@ def test_archive_with_wrong_runtime_go_version_cannot_emit_a_release(tmp_path):
 
 
 def test_source_module_checksum_mismatch_is_rejected_after_toolchain_check(tmp_path):
-    response = 'if [ "$1" = env ]; then echo go1.26.11; else echo \'{"Path":"github.com/caddyserver/caddy/v2","Version":"v2.11.4","Sum":"h1:wrong","GoModSum":"h1:wrong"}\'; fi'
+    response = 'if [ "$1" = env ]; then echo go1.26.11; else echo \'{"Path":"github.com/caddyserver/caddy/v2","Version":"v2.11.9","Sum":"h1:wrong","GoModSum":"h1:wrong"}\'; fi'
     root, archive, _ = _fixture(tmp_path, response)
     output = tmp_path / "release"
     result = _build(root, archive, output)

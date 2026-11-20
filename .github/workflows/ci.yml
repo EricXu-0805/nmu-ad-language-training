@@ -126,6 +126,9 @@ jobs:
       - name: 扫镜像
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
+          # 不写 version 时这版 action 装 Trivy v0.70.0,它自身有 HIGH(GHSA-mcj4-mphf-j9ff、
+          # GHSA-q3fv-x8vg-qqm4,分别在 0.71.1、0.71.0 修了)。两步钉同一版。
+          version: v0.76.2
           image-ref: nmu-platform:ci
           cache-dir: ${{ runner.temp }}/trivy-cache
           format: table
@@ -147,6 +150,7 @@ jobs:
       - name: 扫描实际网关二进制和 Go 标准库
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
+          version: v0.76.2
           # fs mode disables individual Go binary analysis; rootfs scans the
           # compiled artifact (the coverage check below rejects empty reports).
           scan-type: rootfs

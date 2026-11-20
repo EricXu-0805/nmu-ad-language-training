@@ -7,9 +7,10 @@
 #   只在 v4 4.1.6 修了;v4 已升并进了安全钉版)。v3 只经 caddypki → smallstep/certificates/authority →
 #   go.step.sm/crypto/jose 进到二进制;caddypki 被 caddytls 与 httpcaddyfile 引用,去掉它要改 Caddy 本体。
 #   11-19 真编核过:go.step.sm/crypto v0.92.0 已改用 v4,但 smallstep/certificates 最新正式版 v0.30.2
-#   跟它编不过(aws.go 的 CompactSerialize、azure.go 与 oidc.go 的 Expected.Audience 三处);升 Caddy
-#   v2.11.9 也还带着 v3。smallstep 主干 11-10 已换到 crypto v0.92.0、还没打标签:出了正式版就照它重编,
-#   删掉这条。外来 JWK 只经 smallstep 的 acme 包、也就是网关自己当 ACME 服务器(acme_server)时才进到
+#   跟它编不过(aws.go 的 CompactSerialize、azure.go 与 oidc.go 的 Expected.Audience 三处);网关现用的
+#   Caddy v2.11.9 要的是 crypto v0.91.0,仍带着 v3,路径同上(11-19 按 v2.11.9 重编、go mod why 核过)。
+#   smallstep 主干 11-10 已换到 crypto v0.92.0、还没打标签:出了正式版就照它重编,删掉这条。
+#   外来 JWK 只经 smallstep 的 acme 包、也就是网关自己当 ACME 服务器(acme_server)时才进到
 #   v3;内部 CA 建的 authority 不带 provisioner,不解析外来 JWK。11-19 只读核过:仓库 Caddyfile、生产
 #   /opt/nmu/caddy/Caddyfile 与运行中的配置(admin API)都没有 acme_server、pki、tls internal。生产那份
 #   不在仓库里,测试管不到:改它时回来看这条。同一个 v3 另有两条无修复版的 MODERATE(CVE-2026-116585

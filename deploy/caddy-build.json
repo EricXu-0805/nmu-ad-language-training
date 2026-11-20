@@ -2,13 +2,13 @@
   "schema_version": "nmu.caddy-build.v1",
   "caddy": {
     "module": "github.com/caddyserver/caddy/v2",
-    "version": "v2.11.4",
-    "source_commit": "e2eee6a7fce366321294c9c2a79f3146891dcbdf",
-    "source_sum": "h1:XKxkMTgNSizEvKG6QHue6cAsFOteU2qA61w2tKkCWi0=",
-    "go_mod_sum": "h1:zXCl032uTaF5/TpgU38axqFD41jqzxomTDNqK7BzMeI=",
+    "version": "v2.11.9",
+    "source_commit": "0d98caea58f794f88e709b1bef2880996a471bca",
+    "source_sum": "h1:bhZtcRKQOq0fuLvEgCdPYvUxXyGn9kzjG4lh2332DTE=",
+    "go_mod_sum": "h1:jctG0eTy0tC4ST/Q7GIPKIfxox7mhSCtcwlwF82HLVM=",
     "entrypoint": "./cmd/caddy",
     "build_tags": ["nobadger"],
-    "source_url": "https://github.com/caddyserver/caddy/tree/e2eee6a7fce366321294c9c2a79f3146891dcbdf"
+    "source_url": "https://github.com/caddyserver/caddy/tree/0d98caea58f794f88e709b1bef2880996a471bca"
   },
   "go": {
     "version": "1.26.11",
