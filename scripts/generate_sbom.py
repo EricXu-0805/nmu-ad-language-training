@@ -9,7 +9,8 @@
   Dockerfile 的 FROM … @sha256:  两层底座镜像，按 digest 记，不按浮动 tag
   Dockerfile 的 apk add          底座上手工加的系统包；没写版本的会被点名。写的是 >= 下限时
                                  version 记下限、nmu:apk:constraint 标出 >=，镜像里实际
-                                 装到的可能更新，以镜像扫描为准
+                                 装到的可能更新:有没有已修复的 HIGH/CRITICAL 看 image 任务
+                                 的扫描,实际版本见那次 docker build 日志里 apk 的输出
 
 输出是确定性的：不带时间戳，serialNumber 由内容摘要推出来。同样的输入必然产出
 逐字节相同的文件，因此可以提交进仓库，再让 CI 断言"重新生成后无 diff"——
@@ -134,6 +135,9 @@ def dockerfile_components(text: str) -> tuple[list[Component], list[str]]:
     unpinned: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
+        # 注释里常照抄旧的 apk add 写法(带撇号、带旧版本):不跳过会被当成又装了一遍,甚至让 shlex 报错。
+        if stripped.startswith("#"):
+            continue
         matched = _FROM.match(stripped)
         if matched:
             name, digest = matched.group("name"), matched.group("digest")

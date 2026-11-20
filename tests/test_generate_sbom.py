@@ -132,6 +132,13 @@ def test_an_unquoted_floor_is_a_shell_redirect_not_a_floor():
     assert not [c for c in sbom["components"] if c["purl"].startswith("pkg:apk/")]
 
 
+def test_a_commented_out_apk_line_is_ignored_even_with_an_old_pin_and_an_apostrophe():
+    """注释里照抄旧写法(带旧版本、带不配对的撇号)不算安装,也不能让生成器报错。"""
+    commented = ("# 旧钉版 apk add bash=5.3.9-r0 会失败,别照抄\n"
+                 "# apk add won't work here\n")
+    assert _build(dockerfile=commented + DOCKERFILE) == _build()
+
+
 def test_output_is_byte_identical_across_runs_and_has_no_timestamp():
     first, _ = _build()
     second, _ = _build()
