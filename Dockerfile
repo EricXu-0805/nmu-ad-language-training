@@ -1,11 +1,12 @@
 # 多阶段构建：node 编译前端静态产物 → python 运行期(不带 node)。
 # 目录布局镜像仓库：/app/web 与 /app/content 并列，仅用于把三份服务端冻结定义
 # 纳入确定性构建指纹；Vite public 已禁用，定义文件不会复制进浏览器产物。
-# 基础镜像同时保留可读 tag 与 2026-07-19 复核的多架构 manifest digest；
+# 基础镜像同时保留可读 tag 与 2026-11-20（UTC）复核的多架构 manifest digest
+# （node 22.23.5、python 3.12.16，均为 Alpine 3.24.4）；
 # 安全升级必须显式查询新 digest、构建/回归后再改，不能让浮动 tag 静默换底座。
 
 # ---------- 前端构建 ----------
-FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS web
+FROM node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a AS web
 WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -14,28 +15,26 @@ COPY content/ /app/content/
 RUN npm run build          # tsc + vite build → /app/web/dist(含 build-id.txt)
 
 # ---------- 运行期 ----------
-FROM python:3.12-alpine3.24@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df AS runtime
+FROM python:3.12-alpine3.24@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89 AS runtime
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
 # 入口、显式迁移与快照脚本使用 bash 的 pipefail、[[ ]]、进程替换等语义。
-# 包版本与 Alpine 3.24 底座一起锁定；升级底座时必须同步重新扫描与回归。
-# libcrypto3/libssl3 显式钉在底座之上：底座那层是 2026-06-16 构建的，带 3.5.7-r0，
-# 而 CVE-2026-14456 的修复 3.5.8-r0 是 2026-08-25 才进 Alpine 3.24 的。等底座重建
-# 追上之后这两项会变成同版本的空操作，但仍然留着——底座换 digest 时它是硬下限。
-# Alpine 仓库每个包只留最新一版：2026-09-30 进了 3.5.9-r0，3.5.8-r0 随即下架，
-# 旧钉版会让 apk 选包失败（exit 9），所以跟到 3.5.9-r0。
-# 2026-11-18 23:31 UTC 进了 3.5.9-r1（secdb 记修 CVE-2026-88822、-88823、-95691、-95692、
-# -107496），r0 随即下架，再跟到 3.5.9-r1。
-# libuuid 来自 util-linux；2026-09-05 的 2.42.3-r1 包含本次镜像扫描命中的七项
-# util-linux HIGH 修复（r0 修复六项，r1 补上 CVE-2026-78408）。不豁免底座旧包。
-# zlib 1.3.2-r1 修 CVE-2026-85091（gz_vacate 堆溢出，HIGH）：11-06 镜像扫描命中，底座带的是 r0。
-# 同日 18:22 UTC Alpine 3.24 换上 1.4-r0（修 CVE-2026-4738，so:libz.so.1 不变），1.3.2-r1 随即下架，
-# 旧钉版让 apk 选包失败（exit 4），所以跟到 1.4-r0。
-# 11-12 镜像扫描：musl/musl-utils 1.2.6-r3 修 CVE-2026-107891，
-# krb5-libs 1.22.3-r0 修底座 1.22.2-r1 命中的 Kerberos HIGH 漏洞；只补这三个包，底座不换。
-# 官方修复记录：https://secdb.alpinelinux.org/v3.24/main.json
-RUN apk add --no-cache bash=5.3.9-r1 libcrypto3=3.5.9-r1 libssl3=3.5.9-r1 libuuid=2.42.3-r1 zlib=1.4-r0 musl=1.2.6-r3 musl-utils=1.2.6-r3 krb5-libs=1.22.3-r0
+# 下面每项都是安全下限（>=），不是精确钉版：Alpine 仓库每个包只留最新一版，精确钉版
+# 每逢上游出新修订就失效、让 apk 选包失败（2026-09-30、11-06、11-18 三次）。
+# 下限让 apk 补到仓库现行版本，仓库低于下限则构建失败；底座追上后这些项是空操作，但仍然
+# 留着，换底座 digest 时它们是硬下限。底座已满足下限的包不会再升级，之后的新修复靠 CI
+# image 任务的扫描发现，再抬下限。每项都要加引号：裸写的 > 是 shell 重定向，下限会被静默丢掉。
+# 下限出处（https://secdb.alpinelinux.org/v3.24/main.json）：
+#   libcrypto3/libssl3 3.5.9-r1：CVE-2026-14456（3.5.8-r0 起修），
+#     CVE-2026-88822、-88823、-95691、-95692、-107496（3.5.9-r1 修）。
+#   libuuid 2.42.3-r1：util-linux 七项 HIGH（r1 补上 CVE-2026-78408）。不豁免底座旧包。
+#   zlib 1.4-r0：CVE-2026-85091（gz_vacate 堆溢出，HIGH）、CVE-2026-4738；so:libz.so.1 不变。
+#   musl/musl-utils 1.2.6-r3：CVE-2026-107891。
+#   krb5-libs 1.22.3-r0：11-12 镜像扫描在底座 1.22.2-r1 上命中的 Kerberos HIGH。
+#   bash 5.3.9-r1：SEC-30 复扫通过时的版本。
+# 抬下限时同步改 tests/test_docker_runtime_permissions.py 的下限表、DEPLOY.md 12.1 与 sbom.cdx.json。
+RUN apk add --no-cache 'bash>=5.3.9-r1' 'libcrypto3>=3.5.9-r1' 'libssl3>=3.5.9-r1' 'libuuid>=2.42.3-r1' 'zlib>=1.4-r0' 'musl>=1.2.6-r3' 'musl-utils>=1.2.6-r3' 'krb5-libs>=1.22.3-r0'
 
 # 云端为主：默认只装核心运行依赖(不含 pytest/piper)。要本地神经兜底音色可另装 piper。
 COPY requirements-deploy.txt requirements-deploy.lock.txt ./

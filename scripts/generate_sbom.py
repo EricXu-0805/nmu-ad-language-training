@@ -7,7 +7,9 @@
                                  一个被投毒的构建工具照样能改掉发给老人的 dist，
                                  "运行期用不到"不等于"不在供应链里"。
   Dockerfile 的 FROM … @sha256:  两层底座镜像，按 digest 记，不按浮动 tag
-  Dockerfile 的 apk add          底座上手工加的系统包；没钉版本的会被点名
+  Dockerfile 的 apk add          底座上手工加的系统包；没写版本的会被点名。写的是 >= 下限时
+                                 version 记下限、nmu:apk:constraint 标出 >=，镜像里实际
+                                 装到的可能更新，以镜像扫描为准
 
 输出是确定性的：不带时间戳，serialNumber 由内容摘要推出来。同样的输入必然产出
 逐字节相同的文件，因此可以提交进仓库，再让 CI 断言"重新生成后无 diff"——
@@ -28,6 +30,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 import sys
 from urllib.parse import quote
 
@@ -38,6 +41,23 @@ _FROM = re.compile(r"^FROM\s+(?P<ref>(?P<name>[^\s:@]+)(?::(?P<tag>[^\s@]+))?"
                    r"@(?P<digest>sha256:[0-9a-f]{64}))(?:\s+AS\s+(?P<stage>\S+))?",
                    re.IGNORECASE)
 _APK = re.compile(r"apk\s+add\s+(?P<args>[^\n&|;]+)")
+_APK_VERSION = re.compile(r"(?P<name>[^\s<>=~]+)(?P<op>>=|=)(?P<version>[^\s<>=~]+)")
+
+
+def _apk_words(args: str) -> list[str]:
+    """按 sh 的切法取参数：没加引号的 > 是重定向，它和后面的文件名都不是 apk 收到的参数。"""
+    lexer = shlex.shlex(args.rstrip().removesuffix("\\"), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    words: list[str] = []
+    redirect_target = False
+    for token in lexer:
+        if redirect_target:
+            redirect_target = False
+        elif re.fullmatch(r"[<>]+", token):
+            redirect_target = True
+        else:
+            words.append(token)
+    return words
 
 
 def _purl_name(name: str) -> str:
@@ -130,16 +150,18 @@ def dockerfile_components(text: str) -> tuple[list[Component], list[str]]:
         found = _APK.search(stripped)
         if not found:
             continue
-        for token in found.group("args").split():
-            if token.startswith("-") or token.endswith("\\"):
+        for word in _apk_words(found.group("args")):
+            if word.startswith("-"):
                 continue
-            if "=" in token:
-                name, version = token.split("=", 1)
+            pinned = _APK_VERSION.fullmatch(word)
+            if pinned:
+                name, version = pinned.group("name"), pinned.group("version")
                 components.append(Component(
                     "operating-system", name, version,
-                    f"pkg:apk/alpine/{_purl_name(name)}@{version}"))
+                    f"pkg:apk/alpine/{_purl_name(name)}@{version}",
+                    {"nmu:apk:constraint": [pinned.group("op") + version]}))
             else:
-                unpinned.append(token)
+                unpinned.append(word)
     return components, unpinned
 
 
@@ -227,8 +249,8 @@ def main(argv: list[str] | None = None) -> int:
     text = render(sbom)
 
     for token in unpinned:
-        print(f"[WARN] Dockerfile 里 apk 装的 {token} 没钉版本，"
-              "底座一升就会静默换掉", file=sys.stderr)
+        print(f"[WARN] Dockerfile 里 apk 装的 {token} 没写版本下限，"
+              "装到哪一版全看底座和仓库", file=sys.stderr)
 
     if args.check:
         if not args.output.exists():

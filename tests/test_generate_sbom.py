@@ -34,7 +34,7 @@ DOCKERFILE = (
     "FROM node:22-alpine@sha256:" + "1" * 64 + " AS web\n"
     "RUN npm ci\n"
     "FROM python:3.12-alpine3.24@sha256:" + "2" * 64 + " AS runtime\n"
-    "RUN apk add --no-cache bash=5.3.9-r1\n"
+    "RUN apk add --no-cache 'bash>=5.3.9-r1'\n"
 )
 NPM_LOCK = {
     "lockfileVersion": 3,
@@ -102,8 +102,34 @@ def test_a_marker_split_package_stays_two_components():
 
 def test_unpinned_apk_packages_are_reported_not_swallowed():
     _, unpinned = _build(dockerfile=DOCKERFILE.replace(
-        "bash=5.3.9-r1", "bash=5.3.9-r1 curl"))
+        "'bash>=5.3.9-r1'", "'bash>=5.3.9-r1' curl"))
     assert unpinned == ["curl"]
+
+
+def _apk(sbom, name):
+    return next(c for c in sbom["components"] if c["purl"].startswith(f"pkg:apk/alpine/{name}@"))
+
+
+def test_an_apk_floor_records_the_floor_and_marks_it_as_one():
+    """镜像里装的是构建那一刻仓库的现行版本，SBOM 只知道下限，必须写明它是下限。"""
+    sbom, _ = _build()
+    bash = _apk(sbom, "bash")
+    assert bash["version"] == "5.3.9-r1"
+    assert bash["properties"] == [{"name": "nmu:apk:constraint", "value": ">=5.3.9-r1"}]
+
+
+def test_an_exact_apk_pin_is_still_recorded_as_exact():
+    sbom, unpinned = _build(dockerfile=DOCKERFILE.replace("'bash>=5.3.9-r1'", "bash=5.3.9-r1"))
+    assert unpinned == []
+    assert _apk(sbom, "bash")["properties"] == [
+        {"name": "nmu:apk:constraint", "value": "=5.3.9-r1"}]
+
+
+def test_an_unquoted_floor_is_a_shell_redirect_not_a_floor():
+    """sh 把裸写的 > 当重定向：apk 收到的是不带下限的 bash，SBOM 不能替它记下限。"""
+    sbom, unpinned = _build(dockerfile=DOCKERFILE.replace("'bash>=5.3.9-r1'", "bash>=5.3.9-r1"))
+    assert unpinned == ["bash"]
+    assert not [c for c in sbom["components"] if c["purl"].startswith("pkg:apk/")]
 
 
 def test_output_is_byte_identical_across_runs_and_has_no_timestamp():

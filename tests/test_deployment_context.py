@@ -606,8 +606,8 @@ def test_browser_build_evidence_declares_but_does_not_overclaim_release_identity
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     deploy = (ROOT / "DEPLOY.md").read_text(encoding="utf-8")
     for identity, source in (
-        ("node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2", dockerfile),
-        ("python:3.12-alpine3.24@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df", dockerfile),
+        ("node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a", dockerfile),
+        ("python:3.12-alpine3.24@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89", dockerfile),
     ):
         assert identity in integrity
         assert identity in source

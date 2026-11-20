@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:b062f864-ba2e-9538-e961-dff1ae259839",
+  "serialNumber": "urn:uuid:2c1b587b-ca05-b960-e153-d9ba31d66dc1",
   "version": 1,
   "metadata": {
     "component": {
@@ -25,9 +25,9 @@
     {
       "type": "container",
       "name": "node",
-      "version": "sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2",
-      "purl": "pkg:oci/node@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2",
-      "bom-ref": "pkg:oci/node@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2",
+      "version": "sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a",
+      "purl": "pkg:oci/node@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a",
+      "bom-ref": "pkg:oci/node@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a",
       "properties": [
         {
           "name": "nmu:docker:stage",
@@ -35,7 +35,7 @@
         },
         {
           "name": "nmu:oci:digest",
-          "value": "sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2"
+          "value": "sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a"
         },
         {
           "name": "nmu:oci:tag",
@@ -46,9 +46,9 @@
     {
       "type": "container",
       "name": "python",
-      "version": "sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df",
-      "purl": "pkg:oci/python@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df",
-      "bom-ref": "pkg:oci/python@sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df",
+      "version": "sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+      "purl": "pkg:oci/python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
+      "bom-ref": "pkg:oci/python@sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89",
       "properties": [
         {
           "name": "nmu:docker:stage",
@@ -56,7 +56,7 @@
         },
         {
           "name": "nmu:oci:digest",
-          "value": "sha256:6d43704baacd1bfbe7c295d7f13079d5d8104ed33568873133f8fc69980419df"
+          "value": "sha256:c5ba3deef00c7758561a0f03c26f44f10589263d40e732b8748e0d1f38f6dd89"
         },
         {
           "name": "nmu:oci:tag",
@@ -9640,56 +9640,104 @@
       "name": "bash",
       "version": "5.3.9-r1",
       "purl": "pkg:apk/alpine/bash@5.3.9-r1",
-      "bom-ref": "pkg:apk/alpine/bash@5.3.9-r1"
+      "bom-ref": "pkg:apk/alpine/bash@5.3.9-r1",
+      "properties": [
+        {
+          "name": "nmu:apk:constraint",
+          "value": ">=5.3.9-r1"
+        }
+      ]
     },
     {
       "type": "operating-system",
       "name": "krb5-libs",
       "version": "1.22.3-r0",
       "purl": "pkg:apk/alpine/krb5-libs@1.22.3-r0",
-      "bom-ref": "pkg:apk/alpine/krb5-libs@1.22.3-r0"
+      "bom-ref": "pkg:apk/alpine/krb5-libs@1.22.3-r0",
+      "properties": [
+        {
+          "name": "nmu:apk:constraint",
+          "value": ">=1.22.3-r0"
+        }
+      ]
     },
     {
       "type": "operating-system",
       "name": "libcrypto3",
       "version": "3.5.9-r1",
       "purl": "pkg:apk/alpine/libcrypto3@3.5.9-r1",
-      "bom-ref": "pkg:apk/alpine/libcrypto3@3.5.9-r1"
+      "bom-ref": "pkg:apk/alpine/libcrypto3@3.5.9-r1",
+      "properties": [
+        {
+          "name": "nmu:apk:constraint",
+          "value": ">=3.5.9-r1"
+        }
+      ]
     },
     {
       "type": "operating-system",
       "name": "libssl3",
       "version": "3.5.9-r1",
       "purl": "pkg:apk/alpine/libssl3@3.5.9-r1",
-      "bom-ref": "pkg:apk/alpine/libssl3@3.5.9-r1"
+      "bom-ref": "pkg:apk/alpine/libssl3@3.5.9-r1",
+      "properties": [
+        {
+          "name": "nmu:apk:constraint",
+          "value": ">=3.5.9-r1"
+        }
+      ]
     },
     {
       "type": "operating-system",
       "name": "libuuid",
       "version": "2.42.3-r1",
       "purl": "pkg:apk/alpine/libuuid@2.42.3-r1",
-      "bom-ref": "pkg:apk/alpine/libuuid@2.42.3-r1"
+      "bom-ref": "pkg:apk/alpine/libuuid@2.42.3-r1",
+      "properties": [
+        {
+          "name": "nmu:apk:constraint",
+          "value": ">=2.42.3-r1"
+        }
+      ]
     },
     {
       "type": "operating-system",
       "name": "musl-utils",
       "version": "1.2.6-r3",
       "purl": "pkg:apk/alpine/musl-utils@1.2.6-r3",
-      "bom-ref": "pkg:apk/alpine/musl-utils@1.2.6-r3"
+      "bom-ref": "pkg:apk/alpine/musl-utils@1.2.6-r3",
+      "properties": [
+        {
+          "name": "nmu:apk:constraint",
+          "value": ">=1.2.6-r3"
+        }
+      ]
     },
     {
       "type": "operating-system",
       "name": "musl",
       "version": "1.2.6-r3",
       "purl": "pkg:apk/alpine/musl@1.2.6-r3",
-      "bom-ref": "pkg:apk/alpine/musl@1.2.6-r3"
+      "bom-ref": "pkg:apk/alpine/musl@1.2.6-r3",
+      "properties": [
+        {
+          "name": "nmu:apk:constraint",
+          "value": ">=1.2.6-r3"
+        }
+      ]
     },
     {
       "type": "operating-system",
       "name": "zlib",
       "version": "1.4-r0",
       "purl": "pkg:apk/alpine/zlib@1.4-r0",
-      "bom-ref": "pkg:apk/alpine/zlib@1.4-r0"
+      "bom-ref": "pkg:apk/alpine/zlib@1.4-r0",
+      "properties": [
+        {
+          "name": "nmu:apk:constraint",
+          "value": ">=1.4-r0"
+        }
+      ]
     }
   ]
 }

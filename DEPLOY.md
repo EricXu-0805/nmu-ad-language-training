@@ -534,7 +534,7 @@ docker compose ps
 | 层 | 钉法 | 文件 |
 |---|---|---|
 | 容器底座 | `FROM …@sha256:` 双镜像 digest；tag 只作可读注释 | `Dockerfile` |
-| 底座系统包 | `apk add bash=5.3.9-r1 libcrypto3=3.5.9-r1 libssl3=3.5.9-r1 libuuid=2.42.3-r1 zlib=1.4-r0 musl=1.2.6-r3 musl-utils=1.2.6-r3 krb5-libs=1.22.3-r0` 精确版本（在固定底座之上补齐 openssl、zlib、musl 和 Kerberos 安全修复；Alpine 仓库只留最新一版，上游出新版后旧钉版会构建失败，须核对官方修复后跟进） | `Dockerfile` |
+| 底座系统包 | `apk add 'bash>=5.3.9-r1' 'libcrypto3>=3.5.9-r1' 'libssl3>=3.5.9-r1' 'libuuid>=2.42.3-r1' 'zlib>=1.4-r0' 'musl>=1.2.6-r3' 'musl-utils>=1.2.6-r3' 'krb5-libs>=1.22.3-r0'` 安全下限（在固定底座之上补齐 openssl、zlib、musl 和 Kerberos 安全修复；Alpine 仓库只留最新一版，精确钉版每逢上游出新修订就构建失败，所以只写下限；实际装到的版本以 CI image 任务的扫描为准，扫出新修复后核对官方记录再抬下限，测试守着下限不许丢、不许降） | `Dockerfile` |
 | 运行期 Python | 全量传递锁 + 每个分发包 sha256，安装走 `--require-hashes` | `requirements-deploy.lock.txt` |
 | 前端 | `package-lock.json` v3，含每个包的 integrity；构建走 `npm ci` | `web/package-lock.json` |
 | 物料清单 | CycloneDX 1.6，确定性输出，入库 | `sbom.cdx.json` |
