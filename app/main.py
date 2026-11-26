@@ -143,6 +143,23 @@ async def _workflow_policy_violation_response(
     )
 
 
+_BEDSIDE_SLOT_ERROR_MESSAGES = {
+    "bedside_slot_conflict": "床旁槽状态冲突，本次操作没有执行，请联系管理员处理",
+    "bedside_slots_full": "两个床位都在使用中，请先结束或暂停其中一场",
+}
+
+
+@app.exception_handler(session_admission.BedsideSlotError)
+async def _bedside_slot_error_response(
+        _request: Request, exc: session_admission.BedsideSlotError):
+    """选槽或按场次找槽 fail closed 一律 409;只回闭集 code,不带场次或受试者标识。"""
+    return JSONResponse(
+        status_code=409,
+        content={"detail": {
+            "code": exc.code, "message": _BEDSIDE_SLOT_ERROR_MESSAGES[exc.code]}},
+    )
+
+
 @app.exception_handler(content.FrozenContentUnavailable)
 async def _frozen_content_unavailable_response(
         _request: Request, _exc: content.FrozenContentUnavailable):
@@ -1652,7 +1669,8 @@ def withdraw_patient(
         patient.governance_revision += 1
         s.add(patient)
 
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        projected_live: list[LiveState] = []
         for sess in sessions:
             try:
                 autopilot_service.fence_autonomous_scope_for_external_stop(
@@ -1685,8 +1703,9 @@ def withdraw_patient(
                 runtime_state.revision += 1
                 runtime_state.updated_at = now
                 s.add(runtime_state)
-                _project_subject_withdrawal_to_live(
-                    live, sess.session_id, now)
+                live = session_admission.live_row_for_session(s, sess.session_id)
+                if _project_subject_withdrawal_to_live(live, sess.session_id, now):
+                    projected_live.append(live)
 
             capabilities = list(s.exec(select(PatientDeviceCapability).where(
                 PatientDeviceCapability.session_id == sess.session_id,
@@ -1701,7 +1720,7 @@ def withdraw_patient(
             audio.withdrawn = True
             audio.withdrawal_status = "isolated_by_subject_withdrawal"
             s.add(audio)
-        if live is not None:
+        for live in projected_live:
             s.add(live)
 
         event = PatientWithdrawalEvent(
@@ -4024,7 +4043,8 @@ def _require_capability_current_live(
     bound = _device_capability_session_id(request)
     if bound is None:
         return None
-    row = live_row if live_row is not None else s.get(LiveState, 1)
+    row = (live_row if live_row is not None
+           else session_admission.live_row_for_session(s, bound))
     if _live_session_id(row) != bound:
         _raise_device_conflict(
             "device_session_changed",
@@ -4097,7 +4117,8 @@ def recording_authorization(session_id: str, request: Request,
     """每次真正打开麦克风前的无状态授权检查；撤回、准入变化或终态立即 fail-closed。"""
     _require_capability_bound_session(request, session_id, "申请录音授权的场次")
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         sess = s.get(TrainSession, session_id)
         if not sess:
             raise HTTPException(404, "场次不存在")
@@ -4142,7 +4163,8 @@ def autopilot_recording_authorization(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_bound_session(
             request, session_id, "申请自动驾驶录音授权")
         _require_capability_current_live(
@@ -4186,7 +4208,8 @@ def autopilot_barge_in_authorization(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_bound_session(request, session_id, "申请本机声音检测授权")
         _require_capability_current_live(request, s, "申请本机声音检测授权", live_row=live)
         _require_capability_active_for_write(request, s, session_id)
@@ -4228,7 +4251,8 @@ def create_audio(a: AudioIn, request: Request, s: DBSession = Depends(get_sessio
           device_capability.serialized_mutation()):
         s.rollback()
         s.expire_all()
-        locked_live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        locked_live = session_admission.live_row_for_session(s, a.session_id)
         _require_capability_bound_session(request, a.session_id, "登记录音")
 
         # A named operator must be authorized for the requested session before
@@ -8037,7 +8061,9 @@ def _autopilot_wake_projection(
 def live_get(request: Request, s: DBSession = Depends(get_session)):
     """患者端最小读快照：仅含呈现所需 session/cursor/rapportStep 与所有权唤醒。"""
     with _LIVE_WRITE_LOCK:
-        row = s.get(LiveState, 1)
+        # 平板不带参数,按能力绑定的场次找它的槽;账号读者没有绑定,照旧读锚行。
+        row = session_admission.live_row_for_session(
+            s, _device_capability_session_id(request))
         _require_capability_current_live(
             request, s, "读取实时呈现", live_row=row)
         live_session_id = _live_session_id(row)
@@ -8085,7 +8111,8 @@ def patient_heartbeat(body: PatientHeartbeatIn, request: Request,
     _require_patient_device_truth(request, "上报在场状态")
     _require_capability_bound_session(request, body.session_id, "上报在场状态")
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
-        row = _live_row_for_update(s)
+        _live_row_for_update(s)
+        row = session_admission.live_row_for_session(s, body.session_id)
         _require_capability_current_live(
             request, s, "上报在场状态", live_row=row)
         if not row or _live_session_id(row) != body.session_id:
@@ -8198,7 +8225,8 @@ def _pause_runtime_in_transaction(session_id: str, s: DBSession) -> SessionRunti
     if state.status == "paused":
         return state
 
-    live = _live_row_for_update(s)
+    _live_row_for_update(s)
+    live = session_admission.live_row_for_session(s, session_id)
     live_is_current = bool(live and _live_session_id(live) == session_id)
     cursor = _json_load(state.cursor_json) or (
         _json_load(live.cursor_json) if live_is_current and live else None)
@@ -8832,7 +8860,8 @@ def finish_intervention(session_id: str, request: Request,
         state.intervention_ended_by = _actor(request) or "PIN/本地"
         state.revision += 1
         state.updated_at = now
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         live_changed = _project_terminal_to_live(live, sess, state, plan)
         s.add(state)
         if live_changed and live is not None:
@@ -9140,7 +9169,8 @@ def complete_session(session_id: str, request: Request, s: DBSession = Depends(g
         closeout.updated_by = closeout.locked_by
         closeout.updated_at = now
         closeout.revision += 1
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         live_changed = _project_terminal_to_live(live, sess, state, plan)
         s.add(state)
         s.add(closeout)
@@ -9298,7 +9328,8 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
         # Canonical cross-worker order: Session -> Live -> Autopilot/Command ->
         # Runtime.  Every fact checked above is repeated against the locked
         # runtime row before any staged fence is committed.
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         now = datetime.now()
         try:
             autopilot_service.fence_autonomous_scope_for_external_stop(
@@ -11084,7 +11115,8 @@ def autopilot_command_ack(
         ).with_for_update()).first()
         if locked_session is None:
             raise HTTPException(404, "场次不存在")
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_bound_session(request, session_id, "回执自动驾驶命令")
         _require_capability_current_live(
             request, s, "回执自动驾驶命令", live_row=live)
@@ -11252,7 +11284,7 @@ def patient_current_asset(
         s.expire_all()
         sess = _require_device_route_session_read(
             request, session_id, s, "读取当前题图片")
-        live = s.get(LiveState, 1)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_current_live(
             request, s, "读取当前题图片", live_row=live)
         _require_capability_active_for_write(request, s, session_id)
@@ -11470,7 +11502,7 @@ def patient_presentation_get(
     sess = _require_device_route_session_read(
         request, session_id, s, "读取当前老人端呈现内容")
     with _LIVE_WRITE_LOCK:
-        live = s.get(LiveState, 1)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_current_live(
             request, s, "读取当前呈现内容", live_row=live)
         if live is None or _live_session_id(live) != session_id:
@@ -14098,7 +14130,8 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
         # short transaction under the same LiveState/device/control lock order as ACK.
         with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
             with DBSession(db.engine) as route_db:
-                live_row = _live_row_for_update(route_db)
+                _live_row_for_update(route_db)
+                live_row = session_admission.live_row_for_session(route_db, session_id)
                 route_result = autopilot_service.route_completed_attempt(
                     route_db,
                     session_id=session_id,

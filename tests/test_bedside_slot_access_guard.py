@@ -44,24 +44,6 @@ _MAIN, _VISIT = "app/main.py", "app/visit_plan_service.py"
 # 分组照计划「实施顺序」;「未分组」是计划没点名的,改到相邻那组时一并定:改走本场槽,
 # 还是确属锚行用法、进 SLOT_HELPERS 并写明理由。
 PENDING: dict[tuple[str, str, str], int] = {
-    # 3a 平板读写闸
-    (_MAIN, "_require_capability_current_live", _GET): 1,  # 4027
-    (_MAIN, "recording_authorization", _CONTENT_READ): 1,  # 4100
-    (_MAIN, "autopilot_recording_authorization", _CONTENT_READ): 1,  # 4145
-    (_MAIN, "autopilot_barge_in_authorization", _CONTENT_READ): 1,  # 4189
-    (_MAIN, "create_audio", _CONTENT_READ): 1,  # 4231,另见第 4 步漏洞 A
-    (_MAIN, "live_get", _GET): 1,  # 8040
-    (_MAIN, "patient_heartbeat", _CONTENT_READ): 1,  # 8088
-    (_MAIN, "patient_current_asset", _GET): 1,  # 11255
-    (_MAIN, "patient_presentation_get", _GET): 1,  # 11473
-    # 3b 停麦、终态、撤回投影
-    (_MAIN, "withdraw_patient", _CONTENT_READ): 1,  # 1655
-    (_MAIN, "_pause_runtime_in_transaction", _CONTENT_READ): 1,  # 8201
-    (_MAIN, "finish_intervention", _CONTENT_READ): 1,  # 8835
-    (_MAIN, "complete_session", _CONTENT_READ): 1,  # 9143
-    (_MAIN, "abort_session", _CONTENT_READ): 1,  # 9301
-    (_MAIN, "autopilot_command_ack", _CONTENT_READ): 1,  # 11087
-    (_MAIN, "_run_p0a_attempt_worker", _CONTENT_READ): 1,  # 14101
     # 3c 自动带练
     ("app/autopilot_service.py", "_require_live_binding", _GET): 1,  # 843
     ("app/autopilot_orchestration.py", "_legacy_live_binding", _GET): 1,  # 681
