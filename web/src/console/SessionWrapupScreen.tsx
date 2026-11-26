@@ -144,7 +144,7 @@ export function SessionWrapupScreen({
       lastStatus: "recorded",
     });
     toast(`已补记最后一条录音：${message.rawAudioId.slice(0, 12)}…`, "info");
-  });
+  }, session.session_id);
 
   useEffect(() => {
     let cancelled = false;

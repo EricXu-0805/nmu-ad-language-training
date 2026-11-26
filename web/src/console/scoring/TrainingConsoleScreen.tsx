@@ -841,7 +841,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     toast(`已收到老人端录音（${m.durationSeconds.toFixed(1)} 秒），可在下方试听`, "info");
     // audioSaved 只证明录音已持久化。它最多启动判定链；不能直接改变题位、提示或结束状态。
     if (automationAction === "adjudicate") void runAutoPilotOnAudio(m);
-  });
+  }, session.session_id);
 
   const advance = () => {
     if (!plan || !item || manualInteractionBlocked) return;

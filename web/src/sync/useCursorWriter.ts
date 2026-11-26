@@ -338,12 +338,15 @@ export function usePatientRec(sessionId: string): PatientRecMsg | null {
         return;
       }
       inFlight = true;
-      api.getConsoleState()
+      api.getConsoleState(sidRef.current)
         .then((state) => {
           if (cancelled) return;
           const message = readAuthoritativePatientRec(state.patientRec, sidRef.current);
+          const recSessionId = (state.patientRec as { sessionId?: unknown } | null)?.sessionId;
           if (message) setRec(message);
-          else if (state.patientRec == null) setRec(null);
+          // 这一槽的 rec 已属于另一场时,本场上一条 rec 不能一直挂在控制台上。
+          else if (state.patientRec == null
+            || (typeof recSessionId === "string" && recSessionId !== sidRef.current)) setRec(null);
         })
         .catch(() => {})
         .finally(() => {
@@ -370,7 +373,7 @@ export function usePatientRec(sessionId: string): PatientRecMsg | null {
 
 // 操作端订阅老人端录音回报。BroadcastChannel 只是同机秒级 wake hint；
 // handler/自动推进只消费服务端单调 AudioCaptureReceipt，轮询间连续两条也不会被单槽覆盖。
-export function useAudioSaved(handler: (m: AudioSavedMsg) => void): void {
+export function useAudioSaved(handler: (m: AudioSavedMsg) => void, sessionId: string): void {
   const seen = useRef<Set<string>>(new Set());
   const afterSeqBySession = useRef<Map<string, number>>(new Map());
   const handlerRef = useRef(handler);
@@ -390,12 +393,12 @@ export function useAudioSaved(handler: (m: AudioSavedMsg) => void): void {
         return;
       }
       inFlight = true;
-      api.getConsoleState()
+      api.getConsoleState(sessionId)
         .then(async (state) => {
           if (cancelled) return;
           const session = parseSyncPayload("session", state.session);
-          if (!session) return;
-          const sessionId = session.sessionId;
+          // 本场不在任何床旁槽时服务端回的是别场的槽;别场的收据账本与本屏无关。
+          if (!session || session.sessionId !== sessionId) return;
           let cursor = afterSeqBySession.current.get(sessionId) ?? 0;
           try {
             // 一页满了就继续，且只在逐条通过严格 schema 后推进 cursor。
@@ -463,5 +466,5 @@ export function useAudioSaved(handler: (m: AudioSavedMsg) => void): void {
       unsub();
       clearInterval(timer);
     };
-  }, []);
+  }, [sessionId]);
 }

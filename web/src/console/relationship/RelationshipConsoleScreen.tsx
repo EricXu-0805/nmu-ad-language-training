@@ -457,7 +457,7 @@ export function RelationshipConsoleScreen({ session, onWrapup, onExit }: {
           : "自动回应没有生成——可以点「让机器人回应」再试一次", "warn");
       }).finally(() => { replyBusyRef.current = false; setReplyPending(false); });
     }
-  });
+  }, session.session_id);
 
   if (scriptError) return <Alert tone="danger" title="第 1 周脚本校验失败">系统已安全暂停，不能使用未经校验的话术开场：{scriptError}</Alert>;
   if (!script) return <p>加载第 1 周脚本…</p>;

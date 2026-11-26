@@ -1327,8 +1327,11 @@ export const api = {
   getLiveState: (timeoutMs = 5_000) =>
     req<LiveStateResponse>("GET", "/live/state", undefined, timeoutMs, { device: true }),
   // 研究者端专用投影；与患者端读取路由分离，旧后端缺此端点时明确进入不可用状态。
-  getConsoleState: (timeoutMs = 5_000) =>
-    req<LiveStateResponse>("GET", "/live/console-state", undefined, timeoutMs),
+  // 带上本场场次号：两床并行时服务端读这一场所在的床旁槽，不会读到另一床。
+  getConsoleState: (sessionId: string, timeoutMs = 5_000) =>
+    req<LiveStateResponse>(
+      "GET", `/live/console-state?${new URLSearchParams({ session_id: sessionId })}`,
+      undefined, timeoutMs),
   putLiveState: (
     kind: "session" | "cursor" | "rapportStep" | "audioSaved" | "patientRec",
     payload: object,

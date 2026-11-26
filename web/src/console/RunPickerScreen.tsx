@@ -170,6 +170,13 @@ export function RunPickerScreen({
       const plans = await api.listPatientVisitPlans(plan.patient_id);
       if (!startFence.current.isCurrent(generation)) return false;
       const current = plans.find((candidate) => candidate.plan_id === plan.plan_id);
+      if (current?.status === "started" && current.session_id === null) {
+        // 服务端对非管理员隐去别的账号开的场次号:这一场进不去，重试也不会变。
+        startKeys.current.delete(`${plan.plan_id}:${plan.revision}`);
+        setPendingStart(null);
+        setStartError("该安排已由其他账号开训，请刷新队列。");
+        return false;
+      }
       if (current?.status === "started") {
         const receipt = reconcileStartedVisitPlan(plan, current);
         try {
