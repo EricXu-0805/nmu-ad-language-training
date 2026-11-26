@@ -3,7 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
+
+from sqlmodel import Session
 
 from . import content
 from .enums import ConsentType, EventLine, PhaseType
@@ -229,3 +234,136 @@ def bedside_session_blocks_new_work(
     if live_holder_session_id(live_row) != session_id:
         return False
     return not live_slot_stale(live_row, now)
+
+
+# ── 床旁槽数与选槽(两床并行,上限 2) ─────────────────────────────────────
+# id=1 既是全局锁锚也是 1 号槽,id=2 是可选的 2 号槽;槽属于哪一场只从
+# session_json.sessionId 推出。选槽是纯函数:调用方在 _LIVE_WRITE_LOCK 加锚行锁里
+# 把各槽现状读成 BedsideSlotView 再调用。选中槽之后的动作恒为今天单槽对这个持有者
+# 走的分支,N=1 时只看 1 号槽,所以和今天逐分支等同。
+
+BEDSIDE_TERMINAL_STATUSES = frozenset({"completed", "aborted", "failed"})
+
+
+def bedside_slot_count() -> int:
+    """床旁槽数:NMU_BEDSIDE_SLOTS 去空白后恰为 "2" 才是 2,其余一律 1。每次现读。"""
+    return 2 if (os.environ.get("NMU_BEDSIDE_SLOTS") or "").strip() == "2" else 1
+
+
+class BedsideSlotError(Exception):
+    """选槽 fail closed。只带闭集 code,不带场次或受试者标识。"""
+
+    def __init__(self, code: Literal["bedside_slot_conflict", "bedside_slots_full"]):
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class BedsideSlotView:
+    """一个床旁槽的现状;没有行的槽可以不传,按空槽算。
+
+    status 是持有场次的 runtime 状态,None = 没有 runtime 行(照今天按 active 算);
+    stale = live_slot_stale(row)。
+    """
+    slot_id: int
+    session_id: str | None = None
+    session_exists: bool = False
+    status: str | None = None
+    stale: bool = False
+    patient_id: str | None = None
+    trainer_id: str | None = None
+
+
+@dataclass(frozen=True)
+class BedsideSlotChoice:
+    """action 对应今天单槽的分支:keep 本场已占;vacant 空槽(含持有场次已不存在);
+    terminal_takeover 终态让位留审计;stale_takeover 遗弃槽 fence 加暂停再让位;
+    protected 新鲜保护,要上一场的操作权(自动场切回另核上一场已暂停)。"""
+    slot_id: int
+    action: Literal["keep", "vacant", "terminal_takeover", "stale_takeover", "protected"]
+
+
+def _same_key(left: str | None, right: str | None) -> bool:
+    left = (left or "").strip()
+    return bool(left) and left == (right or "").strip()
+
+
+def choose_bedside_slot(
+    slots: Iterable[BedsideSlotView],
+    *,
+    session_id: str,
+    patient_id: str | None,
+    trainer_id: str | None,
+    slot_count: int,
+    purpose: Literal["handshake", "autopilot_return"],
+) -> BedsideSlotChoice:
+    """按固定顺序给 session_id 选床旁槽;只读输入,不产生任何副作用。
+
+    1 本场已占的槽;2 同一受试者的场次占着的槽;3 同一 trainer_id 的场次占着的槽;
+    4 空或终态的槽取最小编号;5 遗弃槽,只在握手时可选;6 N=1 走今天的新鲜保护,
+    N=2 回 bedside_slots_full。一场或一位受试者已占两槽时回 bedside_slot_conflict。
+    """
+    if purpose not in {"handshake", "autopilot_return"}:
+        raise ValueError(f"unknown bedside slot purpose {purpose!r}")
+    given = {view.slot_id: view for view in slots}
+    views = [given.get(slot_id) or BedsideSlotView(slot_id=slot_id)
+             for slot_id in range(1, slot_count + 1)]
+
+    def occupied(view: BedsideSlotView) -> bool:
+        return (bool(view.session_id) and view.session_exists
+                and view.status not in BEDSIDE_TERMINAL_STATUSES)
+
+    # 终态场和已不存在的场不算占槽,它们的影子无害;仍在占槽的场重复出现说明
+    # 不变量已经破了(如 2→1→2 留下的影子),此时接管哪一份都可能打断健康场次。
+    holding = [view for view in views
+               if view.session_id == session_id or occupied(view)]
+    held_sessions = [view.session_id for view in holding]
+    held_patients = [
+        key for key in (
+            ((patient_id if view.session_id == session_id else view.patient_id) or "").strip()
+            for view in holding)
+        if key]
+    if (len(set(held_sessions)) < len(held_sessions)
+            or len(set(held_patients)) < len(held_patients)):
+        raise BedsideSlotError("bedside_slot_conflict")
+
+    def occupied_action(view: BedsideSlotView) -> str:
+        if purpose == "handshake" and view.stale:
+            return "stale_takeover"
+        return "protected"
+
+    for view in views:
+        if view.session_id == session_id:
+            return BedsideSlotChoice(view.slot_id, "keep")
+    for key, own in (("patient_id", patient_id), ("trainer_id", trainer_id)):
+        for view in views:
+            if occupied(view) and _same_key(getattr(view, key), own):
+                return BedsideSlotChoice(view.slot_id, occupied_action(view))
+    for view in views:
+        if not view.session_id or not view.session_exists:
+            return BedsideSlotChoice(view.slot_id, "vacant")
+        if view.status in BEDSIDE_TERMINAL_STATUSES:
+            return BedsideSlotChoice(view.slot_id, "terminal_takeover")
+    if purpose == "handshake":
+        for view in views:
+            if view.stale:
+                return BedsideSlotChoice(view.slot_id, "stale_takeover")
+    if slot_count == 1:
+        return BedsideSlotChoice(1, "protected")
+    raise BedsideSlotError("bedside_slots_full")
+
+
+def live_row_for_session(db: Session, session_id: str | None) -> LiveState | None:
+    """本场所在床旁槽的行;本场不在任何槽里就回锚行(id=1)。只读,不加锁,不建行。
+
+    N=1 恒回锚行,和今天的 s.get(LiveState, 1) 一样;回锚行时调用方现有的
+    「_live_session_id(row) != sid」判断原样生效。同一场命中两槽属违例,fail closed。
+    """
+    anchor = db.get(LiveState, 1)
+    rows = [anchor, *(db.get(LiveState, slot_id)
+                      for slot_id in range(2, bedside_slot_count() + 1))]
+    found = [row for row in rows
+             if session_id and live_holder_session_id(row) == session_id]
+    if len(found) > 1:
+        raise BedsideSlotError("bedside_slot_conflict")
+    return found[0] if found else anchor
