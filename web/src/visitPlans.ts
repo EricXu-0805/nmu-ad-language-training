@@ -150,11 +150,17 @@ export function parseVisitPlanReceipt(
   if (!validContext(weekNo, phase, eventLine)) throw new Error("训练安排周次与事件线矛盾");
 
   const approved = pairedFact(row.approved_by, row.approved_at);
-  const started = pairedFact(row.started_by, row.started_at);
+  // 别的账号开的场:服务端对非管理员有意隐去开始人与场次号,只留开始时间
+  // (visit_plan_service._receipt_for_viewer)。两项必须一起隐去,开始时间必须合法。
+  const startedByAnother = row.status === "started" && row.started_by === null
+    && row.session_id === null && validTimestamp(row.started_at);
+  const started = startedByAnother
+    ? { actor: null, occurredAt: row.started_at as string }
+    : pairedFact(row.started_by, row.started_at);
   const cancelled = pairedFact(row.cancelled_by, row.cancelled_at);
   if (!approved || !started || !cancelled) throw new Error("训练安排审计事实不完整");
   const hasApproved = approved.actor !== null;
-  const hasStarted = started.actor !== null;
+  const hasStarted = started.occurredAt !== null;
   const hasCancelled = cancelled.actor !== null;
   const status = row.status as VisitPlanReceipt["status"];
   const revision = row.revision as number;
@@ -164,7 +170,8 @@ export function parseVisitPlanReceipt(
       ? revision === 2 && hasApproved && !hasStarted && !hasCancelled && row.session_id === null
       : status === "started"
         ? revision === 3 && hasApproved && hasStarted && !hasCancelled
-          && typeof row.session_id === "string" && SESSION_ID.test(row.session_id)
+          && (startedByAnother
+            || (typeof row.session_id === "string" && SESSION_ID.test(row.session_id)))
         : revision === (hasApproved ? 3 : 2) && !hasStarted && hasCancelled && row.session_id === null;
   if (!stateValid) throw new Error("训练安排状态、版本与审计事实矛盾");
 

@@ -561,3 +561,33 @@ test("today parser tiebreak follows server codepoint order, not locale collation
   // 真乱序(码点逆序)仍必须拒。
   assert.throws(() => parseVisitPlanToday({ ...queue, plans: [lower, upper] }));
 });
+
+// 非管理员看别的账号开的场:服务端有意隐去 started_by 与 session_id,只留开始时间
+// (visit_plan_service._receipt_for_viewer,tests/test_visit_plans.py 钉着)。2026-11-26 生产:
+// 南医大(researcher)账号的准备区因此整块报「训练安排审计事实不完整」,建不了安排。
+function startedByAnotherOperator() {
+  return { ...started(), started_by: null, session_id: null };
+}
+
+test("a started plan redacted for a non-owner viewer is accepted as started by another operator", () => {
+  const receipt = parseVisitPlanReceipt(startedByAnotherOperator());
+  assert.equal(receipt.status, "started");
+  assert.equal(receipt.started_by, null);
+  assert.equal(receipt.started_at, "2026-07-19T01:02:00");
+  assert.equal(receipt.session_id, null);
+  assert.throws(() => startedVisitSessionId(receipt), /权威场次标识/);
+  const list = parseVisitPlanList([startedByAnotherOperator()], started().patient_id);
+  assert.equal(list.length, 1);
+});
+
+test("redaction must hide both the operator and the session, and keep the start time", () => {
+  for (const bad of [
+    { ...started(), started_by: null },                                 // session still linked
+    { ...started(), session_id: null },                                 // operator still named
+    { ...startedByAnotherOperator(), started_at: null },                // start time gone too
+    { ...startedByAnotherOperator(), started_at: "2026-07-19 01:02:00" }, // malformed time
+    { ...approved(), started_at: "2026-07-19T01:02:00" },               // not started at all
+  ]) {
+    assert.throws(() => parseVisitPlanReceipt(bad), /审计事实|矛盾|契约/);
+  }
+});
