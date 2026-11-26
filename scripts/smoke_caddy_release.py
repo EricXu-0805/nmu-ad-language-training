@@ -285,6 +285,46 @@ def make_config(source: str, upstream_port: int, certificate: Path, key: Path,
             "\tskip_install_trust\n\tocsp_stapling off\n" + snippet + "}\n" + source)
 
 
+# caddy adapt writes 256KB / 64MB as decimal bytes: ordinary requests vs canonical audio uploads.
+REQUEST_BODY_LIMITS = [256000, 64000000]
+
+
+def request_body_limits(document: dict) -> list[int]:
+    found = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("handler") == "request_body":
+                found.append(value.get("max_size"))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(document)
+    return sorted(found, key=lambda size: (size is None, size))
+
+
+def require_request_body_limits(document: dict) -> None:
+    require(request_body_limits(document) == REQUEST_BODY_LIMITS, "fixture_request_body_limits_changed")
+
+
+def oversized_post_outcome(send) -> str:
+    """How the gateway refused an over-limit POST: an exact 413, or a reset mid-upload.
+
+    Go's server waits only ~500 ms for a client still sending a refused body before
+    closing; on a slow runner the client sees a reset instead of the 413. Either way
+    the caller still requires that the upstream never completed the request.
+    """
+    try:
+        response = send()
+    except (ConnectionResetError, BrokenPipeError, ssl.SSLEOFError):
+        return "connection_reset"
+    require(response[0] == 413, "ordinary_large_post_not_413")
+    return "status_413"
+
+
 def validate_local_config(document: dict, listen: list[str], upstream_port: int,
                           certificate: Path, key: Path) -> None:
     """Fail before launching if adaptation enables an extra listener or issuer."""
@@ -326,6 +366,7 @@ def validate_local_config(document: dict, listen: list[str], upstream_port: int,
     inspect(document)
     require(len(proxies) == 1 and proxies[0].get("upstreams") == [{"dial": f"127.0.0.1:{upstream_port}"}],
             "fixture_upstream_not_loopback")
+    require_request_body_limits(document)
 
 
 def check_box_a_listener(binary: Path, snippet: str, environment: dict[str, str], work: Path) -> None:
@@ -472,8 +513,7 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
                 require(echoed["forwarded_for"] == "127.0.0.1", "forged_forwarded_for_trusted")
                 results.extend(("small_post_reaches_upstream", "untrusted_forwarded_for_replaced"))
                 large = b"x" * (300 * 1024)
-                response = request(https_port, context, "POST", "/smoke-oversized", large)
-                require(response[0] == 413, "ordinary_large_post_not_413")
+                oversized_post_outcome(lambda: request(https_port, context, "POST", "/smoke-oversized", large))
                 with upstream.records_lock:
                     require(not any(row["path"] == "/smoke-oversized" for row in upstream.completed),
                             "ordinary_large_post_completed_upstream")
@@ -517,7 +557,7 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
             if isinstance(error, subprocess.CalledProcessError):
                 stderr = error.stderr or ""
                 detail += stderr.decode(errors="replace")[-4000:] if isinstance(stderr, bytes) else stderr[-4000:]
-            raise SmokeError(f"{error}\nlocal_caddy_diagnostics={detail}") from error
+            raise SmokeError(f"{error}\nchecks_passed={json.dumps(results)}\nlocal_caddy_diagnostics={detail}") from error
         finally:
             try:
                 stop_child(process)
