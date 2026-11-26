@@ -2154,3 +2154,14 @@ for (const boundary of [
     await capture.closed;
   });
 }
+
+test("生产端口把页面级拒收记忆传给外场清理:同一场 409 拒过的旧录音不再每题重传", () => {
+  // 2026-11-26 生产:4 段别场录音每题重传、开录 ~1.7 s → ~5 s。记忆只在这一个接线点生效,
+  // 删掉这个实参其余测试全绿,所以钉在源码上。
+  const source = readFileSync(new URL("./autopilotRecordingExecutor.ts", import.meta.url), "utf8");
+  assert.match(source, /^const foreignOutboxRefusals = new Map<string, string>\(\);$/m);
+  const port = source.slice(source.indexOf("drainForeignOutbox: async (currentSessionId, entries) => {"));
+  const call = port.slice(0, port.indexOf("\n  },\n"));
+  assert.match(call, /await drainForeignOutboxEntries\(entries, currentSessionId, \{/);
+  assert.match(call, /\}, foreignOutboxRefusals\);$/);
+});

@@ -116,8 +116,8 @@ async function drainOne(
  *
  * refusedThisSession(rawAudioId → 当时的 currentSessionId):服务端以 409 拒收的条目,
  * 同一场里不再重试。896ddfc 起这类条目与开麦共存,但每条录音命令开麦前都会重传一遍,
- * 每条约 1 秒(2026-11-26 生产 4 条,开录 ~1.7 s → ~5 s)。换场或刷新页面后照常重试;
- * 本机副本的去留规则不变(只认收据或精确 410)。
+ * 每条约 1 秒(2026-11-26 生产 4 条,开录 ~1.7 s → ~5 s)。换到别的场次或刷新页面后照常重试;
+ * 同一页面回到当初拒过它的场次不再重试,只是推迟清理。本机副本的去留规则不变(只认收据或精确 410)。
  */
 export async function drainForeignOutboxEntries(
   entries: readonly AudioOutboxEntry[],
