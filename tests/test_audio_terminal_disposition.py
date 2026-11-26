@@ -21,6 +21,7 @@ from app.models import (
     ResearchUser,
     SessionRuntimeState,
 )
+from test_bedside_two_slot_gates import _capability, _raw_slot, _slot_payloads
 
 
 @pytest.fixture
@@ -842,6 +843,50 @@ def test_orphan_supersede_never_touches_a_row_registered_under_another_session(
     assert response.json()["detail"]["code"] == "device_session_mismatch"
     with Session(client.test_engine) as session:
         assert session.get(AudioAssetRow, "raw-two-orphan").status == AudioStatus.recorded
+
+
+@pytest.mark.parametrize("variant", ["other_patient", "row_of_other_session"])
+def test_two_slots_orphan_supersede_never_crosses_into_the_other_bed(
+        disposition_client, monkeypatch, variant):
+    """两床孪生(上面 other_patient 与 another_session 两条):单槽下切到 S-TWO 会把 S-ONE 挤下床;
+    两槽时 S-TWO 进 2 号槽、两床同时在线。同一台平板改配到 2 号槽的别的受试者,补报 S-ONE 的
+    孤儿录音照旧 409;同一位受试者的新场次接回 1 号槽后,拿别床场次登记的槽冒充自己旧场次的
+    孤儿录音也照旧 409。哪一行都不作废,2 号槽逐字节不变。"""
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    client = disposition_client
+    engine = client.test_engine
+    _seed_sessions(client)
+    _seed_second_session_for_patient(client, "S-ONE-B", "P-ONE")
+    mine = _capability(engine, "S-ONE", "tablet-0000000000000001")
+    _register_only(client, "raw-orphan-1", mine, session_id="S-ONE")
+    admin = _admin_client(engine, username="orphan-admin-two-slots")
+    try:
+        _switch_live(admin, "S-TWO")
+        assert [_slot_payloads(engine, slot)[0]["sessionId"] for slot in (1, 2)] == [
+            "S-ONE", "S-TWO"]
+        stranger = _capability(engine, "S-TWO", "tablet-0000000000000009")
+        _register_only(client, "raw-two-orphan", stranger, session_id="S-TWO")
+        slot_two = _raw_slot(engine, 2)
+        if variant == "other_patient":
+            moved = _capability(engine, "S-TWO", "tablet-0000000000000001")
+            raw_id = "raw-orphan-1"
+        else:
+            _switch_live(admin, "S-ONE-B")
+            assert _slot_payloads(engine, 1)[0]["sessionId"] == "S-ONE-B"
+            moved = _capability(engine, "S-ONE-B", "tablet-0000000000000001")
+            raw_id = "raw-two-orphan"
+    finally:
+        admin.close()
+    response = client.put("/live/state", headers=moved,
+                          json=_orphan_saved(raw_id, session_id="S-ONE"))
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "device_session_mismatch"
+    assert _raw_slot(engine, 2) == slot_two
+    with Session(engine) as session:
+        for registered in ("raw-orphan-1", "raw-two-orphan"):
+            assert session.get(AudioAssetRow, registered).status == AudioStatus.recorded
+        assert session.exec(select(AuditLog).where(
+            AuditLog.action == "audio_capture_superseded")).all() == []
 
 
 @pytest.mark.parametrize("flag", ["withdrawn", "withdrawal_status"])

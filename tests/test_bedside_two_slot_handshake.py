@@ -353,6 +353,13 @@ def test_caregiver_activation_and_status_use_their_own_slot(beds):
 
 # ---------------- 3e 自动场切回(沿用 P0a 夹具:两场同一受试者、同一账号) ----------------
 
+@pytest.fixture
+def one_slot_while_pairing(monkeypatch):
+    """api_clients 用全局 PIN 配对,只在单槽下成立。排在 api_clients 前面,先摘掉机器上
+    导出的开关;用例要两槽时自己再设。"""
+    monkeypatch.delenv("NMU_BEDSIDE_SLOTS", raising=False)
+
+
 def _third_session(engine, *, other_patient: bool) -> str:
     third_id = "S-ACTIVATION-THIRD"
     with Session(engine) as s:
@@ -372,7 +379,7 @@ def _third_session(engine, *, other_patient: bool) -> str:
 
 @pytest.mark.parametrize("change", ["holder", "slot"])
 def test_activation_prelock_slot_change_is_bedside_busy_with_two_slots(
-        api_clients, monkeypatch, change):
+        one_slot_while_pairing, api_clients, monkeypatch, change):
     monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
     revision, _ = _yield_a(api_clients, monkeypatch)
     assert api_clients.account.post(f"/sessions/{OTHER_SESSION_ID}/pause").status_code == 200
@@ -405,7 +412,8 @@ def test_activation_prelock_slot_change_is_bedside_busy_with_two_slots(
         assert s.get(SessionRuntimeState, SESSION_ID).status == "paused"
 
 
-def test_activation_returns_into_a_free_slot_beside_another_bed(api_clients, monkeypatch):
+def test_activation_returns_into_a_free_slot_beside_another_bed(
+        one_slot_while_pairing, api_clients, monkeypatch):
     monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
     revision, _ = _yield_a(api_clients, monkeypatch)
     assert api_clients.account.post(f"/sessions/{OTHER_SESSION_ID}/pause").status_code == 200
@@ -430,7 +438,8 @@ def test_activation_returns_into_a_free_slot_beside_another_bed(api_clients, mon
         assert s.get(SessionRuntimeState, third_id).status == "active"
 
 
-def test_single_slot_activation_clears_a_shadow_left_in_slot_two(api_clients, monkeypatch):
+def test_single_slot_activation_clears_a_shadow_left_in_slot_two(
+        one_slot_while_pairing, api_clients, monkeypatch):
     """单槽下切回本场时,2 号行里还写着本场(2→1 前留下的)就清掉,别等再开两槽时成违例。"""
     revision, _ = _yield_a(api_clients, monkeypatch)
     assert api_clients.account.post(f"/sessions/{OTHER_SESSION_ID}/pause").status_code == 200

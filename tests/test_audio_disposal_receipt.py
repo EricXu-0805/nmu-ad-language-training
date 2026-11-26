@@ -22,6 +22,7 @@ from app.models import (
     AuditLog,
     ResearchUser,
 )
+from test_bedside_two_slot_gates import _capability, _slot_payloads
 
 
 @pytest.fixture
@@ -375,6 +376,52 @@ def test_foreign_session_capability_and_unknown_id_fail_closed(
         assert unknown.status_code == 404, unknown.text
         assert unknown.json()["detail"]["code"] == "audio_disposition_unknown"
         with Session(disposal_client.test_engine) as session:
+            assert list(session.exec(select(AudioLocalCopyDisposalReceipt))) == []
+    finally:
+        admin.close()
+
+
+def test_two_slots_other_bed_capability_cannot_report_for_this_bed(
+        disposal_client, monkeypatch):
+    """两床孪生(上一条):两槽时 S-TWO 进 2 号槽,两台平板同时在线。2 号槽那台的能力照样
+    挡在场次绑定上,报不了 1 号槽场次的回执;1 号槽这台不用切回原场,未登记 id 同样 404。"""
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    _seed_sessions(disposal_client)
+    engine = disposal_client.test_engine
+    headers = _capability(engine, "S-ONE", "disposal-device-000001")
+    upload = _upload(disposal_client, "raw-disposal-0001", headers=headers)
+    _record_capture(disposal_client, headers, "raw-disposal-0001", upload)
+    _mark_terminal(disposal_client, "raw-disposal-0001", reason="deleted")
+    detail = _terminal_detail(disposal_client, headers, "raw-disposal-0001", upload)
+
+    with Session(engine) as session:
+        session.add(ResearchUser(
+            username="disposal-two-slot-admin",
+            display_id="DISPOSAL-TWO-SLOT",
+            password_hash=auth.hash_password("password1"),
+            role="admin",
+            created_at=datetime.now(),
+        ))
+        session.commit()
+    admin = TestClient(app)
+    login = admin.post("/auth/login", json={
+        "username": "disposal-two-slot-admin", "password": "password1"})
+    assert login.status_code == 200, login.text
+    admin.headers["X-CSRF-Token"] = admin.cookies.get(auth.CSRF_COOKIE_NAME)
+    try:
+        _switch_live(admin, "S-TWO")
+        assert [_slot_payloads(engine, slot)[0]["sessionId"] for slot in (1, 2)] == [
+            "S-ONE", "S-TWO"]
+        foreign = _capability(engine, "S-TWO", "disposal-device-000003")
+        crossed = _confirm(disposal_client, foreign, detail)
+        assert crossed.status_code == 409, crossed.text
+        assert crossed.json()["detail"]["code"] == "device_session_mismatch"
+
+        unknown = _confirm(disposal_client, headers, {
+            **detail, "rawAudioId": "raw-disposal-nonexist"})
+        assert unknown.status_code == 404, unknown.text
+        assert unknown.json()["detail"]["code"] == "audio_disposition_unknown"
+        with Session(engine) as session:
             assert list(session.exec(select(AudioLocalCopyDisposalReceipt))) == []
     finally:
         admin.close()

@@ -13,6 +13,8 @@ from app.main import app
 from app.models import (AttemptEvent, InteractionEvent, ItemEvent, LiveState,
                         PatientDeviceCapability, ResearchUser,
                         SessionRuntimeState)
+from app.models import Session as TrainSession
+from test_bedside_two_slot_gates import _capability, _raw_slot, _slot_payloads
 
 
 BANK_VERSION = "wk2-v1-20260707"
@@ -400,3 +402,42 @@ def test_failure_rejects_recovery_only_and_revoked_device_generations(
         assert any(row.revoked_at is not None for row in rows)
         assert any(row.recovery_only_at is not None for row in rows)
         assert list(session.exec(select(InteractionEvent))) == []
+
+
+def test_two_slots_failure_from_the_bed_that_stayed_lands_in_its_own_slot(
+        failure_client, monkeypatch):
+    """两床孪生(上一条):单槽下切到 S-TWO 就让 S-ONE 当前那台平板降成只能恢复;两槽时 S-TWO
+    进 2 号槽,S-ONE 的平板照旧能报启动失败,暂停只落 1 号槽、2 号槽逐字节不变。同一位受试者
+    的新场次接回 1 号槽之后,这台平板才降级,再报失败回 401,也不再记交互事件。"""
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    _seed_two_sessions_at_first_turn(failure_client)
+    engine = failure_client.test_engine
+    current = _capability(engine, "S-ONE", "device-mic-two-slot-01")
+    admin = _admin_client(engine)
+    try:
+        _switch_live(admin, "S-TWO")
+        slot_two = _raw_slot(engine, 2)
+        assert _slot_payloads(engine, 2)[0]["sessionId"] == "S-TWO"
+        accepted = failure_client.put(
+            "/live/state", headers=current, json=_failure_payload())
+        assert accepted.status_code == 200, accepted.text
+        assert _raw_slot(engine, 2) == slot_two
+        with Session(engine) as session:
+            assert session.get(SessionRuntimeState, "S-ONE").status == "paused"
+            events = len(list(session.exec(select(InteractionEvent))))
+            copied = session.get(TrainSession, "S-ONE").model_dump()
+            copied["session_id"] = "S-ONE-B"
+            session.add(TrainSession(**copied))
+            session.commit()
+        assert events > 0
+
+        _switch_live(admin, "S-ONE-B")
+        assert _slot_payloads(engine, 1)[0]["sessionId"] == "S-ONE-B"
+        demoted = failure_client.put("/live/state", headers=current,
+                                     json=_failure_payload(failure_id=SECOND_FAILURE_ID))
+        assert demoted.status_code == 401, demoted.text
+        assert demoted.json()["code"] == "device_capability_recovery_only"
+        with Session(engine) as session:
+            assert len(list(session.exec(select(InteractionEvent)))) == events
+    finally:
+        admin.close()

@@ -12,6 +12,7 @@ from app import db as app_db
 from app import content, session_completion
 from app.main import app, get_session
 from app.models import AudioAssetRow, ItemEvent
+from test_bedside_two_slot_gates import _raw_slot, _slot_payloads
 
 @pytest.fixture(autouse=True)
 def _isolate_app_overrides():
@@ -298,6 +299,63 @@ def test_displaced_live_slot_fails_closed_on_recording_truth():
     }}).status_code == 200
     _rapport(client, FAREWELL_KEY)
     assert _finish(client).status_code == 200
+
+
+def _handshake(client: TestClient, session_id: str, *, week: int) -> None:
+    payload = ({"weekNo": 1, "eventLine": "关系建立环节", "mode": "rapport"} if week == 1
+               else {"weekNo": 2, "eventLine": "正式训练", "mode": "task"})
+    response = client.put("/live/state", json={"kind": "session", "payload": {
+        "sessionId": session_id, "itemBankVersionId": BANK_VERSION, **payload}})
+    assert response.status_code == 200, response.text
+
+
+def _create_week2_session(client: TestClient, session_id: str, patient_id: str) -> None:
+    assert client.post("/sessions", json={
+        "session_id": session_id,
+        "patient_id": patient_id,
+        "week_no": 2,
+        "phase_type": "正式训练",
+        "event_line": "正式训练",
+        "item_bank_version_id": BANK_VERSION,
+        "is_simulation": True,
+    }).status_code == 200
+
+
+def test_two_slots_other_patient_leaves_recording_truth_and_same_patient_displaces(
+        monkeypatch):
+    """两床孪生(上一条):单槽下别的受试者的场次一握手就接走本场的槽;两槽时它进 2 号槽,
+    本场那一槽原样不动。只有同一位受试者的新场次接回本场那一槽,收麦证据才读不到、拒绝结束;
+    接回本场后照常结束,2 号槽那一场从头到尾没被碰。"""
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    client = _setup()
+    engine = client.test_engine
+    _rapport(client, FAREWELL_KEY)
+    assert client.post("/patients", json={
+        "patient_id": "P-RAPPORT-B",
+        "is_simulation_subject": True,
+        "consent_status": "已同意",
+        "consent_type": "本人同意",
+        "mandarin_eligible": True,
+        "recording_allowed": True,
+    }).status_code == 200
+    _create_week2_session(client, "S-RAPPORT-B", "P-RAPPORT-B")
+    slot_one = _raw_slot(engine, 1)
+    _handshake(client, "S-RAPPORT-B", week=2)
+    assert _raw_slot(engine, 1) == slot_one
+    slot_two = _raw_slot(engine, 2)
+    assert _slot_payloads(engine, 2)[0]["sessionId"] == "S-RAPPORT-B"
+
+    _create_week2_session(client, "S-RAPPORT-SAME", "P-RAPPORT")
+    _handshake(client, "S-RAPPORT-SAME", week=2)
+    assert _slot_payloads(engine, 1)[0]["sessionId"] == "S-RAPPORT-SAME"
+    denied = _finish(client)
+    assert denied.status_code == 409, denied.text
+    assert "rapport_recording_active" in _issue_codes(denied)
+
+    _handshake(client, "S-RAPPORT", week=1)
+    _rapport(client, FAREWELL_KEY)
+    assert _finish(client).status_code == 200
+    assert _raw_slot(engine, 2) == slot_two
 
 
 def test_week1_script_schema_pins_the_completion_contract_structure(tmp_path):

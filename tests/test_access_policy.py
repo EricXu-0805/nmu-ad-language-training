@@ -15,6 +15,7 @@ from app.models import (AttemptEvent, AudioAssetRow, AuditLog, AuthSession, Item
                         Patient, PatientDeviceCapability, ResearchUser,
                         SessionCloseoutReport, SessionOutcomeSummary,
                         SessionRuntimeState, TurnEvent)
+from test_bedside_two_slot_gates import _capability, _raw_slot, _slot_payloads
 
 
 @pytest.fixture
@@ -1138,6 +1139,75 @@ def test_single_operator_blocks_second_researcher_and_admin_supervision_is_audit
         operator_b.close()
         steward.close()
         administrator.close()
+
+
+def test_two_slots_second_researcher_takes_slot_two_and_still_cannot_see_slot_one(
+        policy_client, monkeypatch):
+    """两床孪生(上一条):单槽下 B 切不走 A 占着的槽(404);两槽时 B 的场次进 2 号槽,
+    1 号槽逐字节不变、A 的平板不降级。B 读 /live/state(账号读锚行)照旧 404,
+    控制台快照只给 B 自己那一槽,拿 A 的场次号去探和探不存在的场次回的是同一个 404。"""
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    _seed_session(policy_client, trainer_id="ACTOR-a")
+    assert policy_client.post("/patients", json={
+        "patient_id": "P-OPERATOR-B",
+        "consent_status": "已同意",
+        "consent_type": "本人同意",
+        "mandarin_eligible": True,
+        "recording_allowed": True,
+        "is_simulation_subject": True,
+    }).status_code == 200
+    assert policy_client.post("/sessions", json={
+        "session_id": "S-OPERATOR-B",
+        "patient_id": "P-OPERATOR-B",
+        "week_no": 2,
+        "phase_type": "正式训练",
+        "event_line": "正式训练",
+        "item_bank_version_id": "wk2-v1-20260707",
+        "is_simulation": True,
+        "trainer_id": "ACTOR-b",
+    }).status_code == 200
+    eng = policy_client.test_engine
+    device = _capability(eng, "S-POLICY", "operator-a-device-0001")
+    for username in ("a", "b"):
+        _add_user(eng, username, "researcher")
+    operator_a = _logged_in_client(eng, "a")
+    operator_b = _logged_in_client(eng, "b")
+    try:
+        slot_one = _raw_slot(eng, 1)
+        switch = operator_b.put("/live/state", json={
+            "kind": "session",
+            "payload": {
+                "sessionId": "S-OPERATOR-B",
+                "weekNo": 2,
+                "eventLine": "正式训练",
+                "mode": "task",
+                "itemBankVersionId": "wk2-v1-20260707",
+            },
+        })
+        assert switch.status_code == 200, switch.text
+        assert _raw_slot(eng, 1) == slot_one
+        assert _slot_payloads(eng, 2)[0]["sessionId"] == "S-OPERATOR-B"
+        with Session(eng) as session:
+            assert session.exec(select(PatientDeviceCapability)).one().recovery_only_at is None
+        assert policy_client.get("/live/state", headers=device).status_code == 200
+
+        denied = operator_b.get("/live/state")
+        assert denied.status_code == 404, denied.text
+        assert denied.json() == {"detail": "场次不存在"}
+        own = operator_b.get("/live/console-state")
+        assert own.status_code == 200, own.text
+        assert own.json()["session"]["sessionId"] == "S-OPERATOR-B"
+        probes = [operator_b.get("/live/console-state", params={"session_id": session_id})
+                  for session_id in ("S-POLICY", "S-MISSING")]
+        assert [probe.status_code for probe in probes] == [404, 404]
+        assert probes[0].content == probes[1].content
+        assert operator_a.get("/live/console-state").json()["session"]["sessionId"] == (
+            "S-POLICY")
+        assert operator_a.post("/sessions/S-POLICY/pause").status_code == 200
+        assert _slot_payloads(eng, 2)[0]["sessionId"] == "S-OPERATOR-B"
+    finally:
+        operator_a.close()
+        operator_b.close()
 
 
 def test_foreign_historical_mutations_are_concealed_before_state_diagnostics(

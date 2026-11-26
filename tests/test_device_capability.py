@@ -18,6 +18,8 @@ from app.enums import AudioStatus
 from app.main import app
 from app.models import (AudioAssetRow, AudioCaptureReceipt,
                         PatientDeviceCapability, ResearchUser)
+from app.models import Session as TrainSession
+from test_bedside_two_slot_gates import _capability, _slot_payloads
 
 
 @pytest.fixture
@@ -343,6 +345,69 @@ def test_explicit_bad_or_recovery_capability_never_falls_back_to_account(
         # With no explicit cap, the same account remains usable; the bad bearer was
         # never silently upgraded to this authority.
         assert admin.get("/live/state").status_code == 200
+    finally:
+        admin.close()
+
+
+def _seed_same_patient_session(engine, session_id: str) -> None:
+    with Session(engine) as session:
+        copied = session.get(TrainSession, "S-ONE").model_dump()
+        copied["session_id"] = session_id
+        session.add(TrainSession(**copied))
+        session.commit()
+
+
+def test_two_slots_only_a_same_patient_session_demotes_the_first_tablet(
+        capability_client, monkeypatch):
+    """两床孪生(上面 switch_back 与 never_falls_back 两条):单槽下切到 S-TWO 就把 S-ONE 的
+    能力降成只能恢复;两槽时 S-TWO 进 2 号槽,S-ONE 那台平板照旧在线、照旧能建新事实。
+    同一位受试者的新场次接回 1 号槽才降级,降级后的规矩与单槽相同:只能恢复原事实、
+    不建新事实、不回落成账号权限、切回原场也不复活。"""
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    _seed_two_sessions(capability_client)
+    engine = capability_client.test_engine
+    active = _capability(engine, "S-ONE", "device-two-slot-000001")
+    registration = {
+        "raw_audio_id": "two-slot-registration",
+        "session_id": "S-ONE",
+        "turn_key": "itm-0001#1",
+    }
+    assert capability_client.post(
+        "/audio", headers=active, json=registration).status_code == 200
+    _seed_same_patient_session(engine, "S-ONE-B")
+    admin = _admin_client(engine)
+    try:
+        _switch_live(admin, "S-TWO")
+        assert [_slot_payloads(engine, slot)[0]["sessionId"] for slot in (1, 2)] == [
+            "S-ONE", "S-TWO"]
+        assert capability_client.get("/live/state", headers=active).status_code == 200
+        assert capability_client.post("/audio", headers=active, json={
+            **registration, "raw_audio_id": "two-slot-still-current",
+        }).status_code == 200
+
+        _switch_live(admin, "S-ONE-B")
+        assert [_slot_payloads(engine, slot)[0]["sessionId"] for slot in (1, 2)] == [
+            "S-ONE-B", "S-TWO"]
+        recovery_cases = (
+            admin.get("/live/state", headers=active),
+            admin.post("/audio", headers=active, json={
+                **registration, "raw_audio_id": "two-slot-recovery-new"}),
+            admin.put("/audio/two-slot-registration/blob", headers={
+                **active, "content-type": "audio/webm"},
+                content=b"\x1a\x45\xdf\xa3recovery"),
+            admin.put("/live/state", headers=active, json={
+                "kind": "patientRec", "payload": {
+                    "active": False, "turnKey": "itm-0001#1", "sessionId": "S-ONE"}}),
+        )
+        assert all(response.status_code in {401, 409} for response in recovery_cases)
+        assert all("recovery_only" in response.text for response in recovery_cases)
+        assert capability_client.post(
+            "/audio", headers=active, json=registration).status_code == 200
+        assert admin.get("/live/state").status_code == 200
+
+        _switch_live(admin, "S-ONE")
+        assert _slot_payloads(engine, 1)[0]["sessionId"] == "S-ONE"
+        assert capability_client.get("/live/state", headers=active).status_code == 401
     finally:
         admin.close()
 
