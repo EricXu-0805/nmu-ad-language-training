@@ -140,6 +140,9 @@ export interface AutopilotCaptureBootstrapPorts {
   ): VoiceActivityObservation;
 }
 
+// 页面级:同一场里服务端已 409 拒收的外场录音不再每题重传(见 drainForeignOutboxEntries)。
+const foreignOutboxRefusals = new Map<string, string>();
+
 export const browserAutopilotCaptureBootstrapPorts: AutopilotCaptureBootstrapPorts = {
   now: () => performance.now(),
   setTimer: (callback, delayMs) => window.setTimeout(callback, delayMs),
@@ -165,7 +168,7 @@ export const browserAutopilotCaptureBootstrapPorts: AutopilotCaptureBootstrapPor
       completeOutbox: (rawAudioId) => blobStore.completeOutbox(rawAudioId),
       discardTerminalOutbox: async (entry, disposition) => { await blobStore.discardTerminalOutbox(entry, disposition); },
       reportLocalCopyDisposal: (disposition) => api.putAudioDisposalConfirmed(disposition).then(() => undefined),
-    });
+    }, foreignOutboxRefusals);
   },
   authorize: async (sessionId, commandKey, signal) => {
     // 中止后一律不发请求。dynamic import 前后各查一次：权限弹窗期间被判死的

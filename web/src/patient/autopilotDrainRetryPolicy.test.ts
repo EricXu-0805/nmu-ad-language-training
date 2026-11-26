@@ -33,9 +33,22 @@ test("released, credential and permanent contract failures do not request-storm"
   assert.equal(classifyAutopilotDrainFailure(new ApiError(403, "wrong device")),
     "repair-credential");
   assert.equal(classifyAutopilotDrainFailure(canonical(
-    409, "autopilot_drain_device_mismatch")), "blocked");
+    409, "autopilot_drain_target_invalid")), "blocked");
   assert.equal(classifyAutopilotDrainFailure(new ApiError(422, "contract")), "blocked");
   assert.equal(classifyAutopilotDrainFailure(new Error("invalid response")), "blocked");
+});
+
+test("drain 目标命令不是发给本机这把凭据的:本机没有可收的媒体,安静让路,不判告警", () => {
+  // 2026-11-26 生产:凭据 45 分钟到期,同一台平板重连拿到新凭据,服务器按换设备暂停;
+  // 被暂停的那条命令发给的是旧凭据,新凭据取 drain-target 必得 409 device_mismatch。
+  // 旧处置把它判成告警档 blocked,研究者点「继续」后平板不再重探 /next,整场只能中止。
+  assert.equal(classifyAutopilotDrainFailure(canonical(
+    409, "autopilot_drain_device_mismatch")), "not-issuing-device");
+  const source = readFileSync(new URL("./usePatientAutopilot.ts", import.meta.url), "utf8");
+  const quiet = source.indexOf('disposition === "not-issuing-device"');
+  const alarm = source.indexOf('disposition === "blocked"');
+  assert.ok(quiet > 0 && quiet < alarm, "收麦 catch 先处理 not-issuing-device,在告警档之前");
+  assert.match(source.slice(quiet, alarm), /^disposition === "not-issuing-device"\) return;/);
 });
 
 test("只有精确的 409 command_not_current 判为代际围栏可丢弃", () => {

@@ -5,6 +5,7 @@ export type AutopilotDrainFailureDisposition =
   | "released"
   | "retry"
   | "repair-credential"
+  | "not-issuing-device"
   | "blocked";
 
 const RETRYABLE_CONFLICTS = new Set([
@@ -24,6 +25,10 @@ export function classifyAutopilotDrainFailure(
   if (code === "autopilot_not_active" || code === "autopilot_p0a_disabled") {
     return "released";
   }
+  // 目标命令发给的是别的(多为刚被轮换吊销的)凭据:本机凭据从没拿它开过媒体,
+  // 收麦证明不归本机出(换设备暂停由服务端按吊销事实自证)。不判告警,免得挡住
+  // 研究者「继续」后的重探。
+  if (code === "autopilot_drain_device_mismatch") return "not-issuing-device";
   if (error instanceof ApiError) {
     if (error.status === 401 || error.status === 403) return "repair-credential";
     if (error.status === 0 || error.status === 408 || error.status === 429

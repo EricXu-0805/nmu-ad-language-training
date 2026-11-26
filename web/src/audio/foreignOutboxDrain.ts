@@ -111,16 +111,32 @@ async function drainOne(
   }
 }
 
-/** 只清**别的场次**的条目;当前场次的由自动带练自己的恢复逻辑按命令核对。 */
+/**
+ * 只清**别的场次**的条目;当前场次的由自动带练自己的恢复逻辑按命令核对。
+ *
+ * refusedThisSession(rawAudioId → 当时的 currentSessionId):服务端以 409 拒收的条目,
+ * 同一场里不再重试。896ddfc 起这类条目与开麦共存,但每条录音命令开麦前都会重传一遍,
+ * 每条约 1 秒(2026-11-26 生产 4 条,开录 ~1.7 s → ~5 s)。换场或刷新页面后照常重试;
+ * 本机副本的去留规则不变(只认收据或精确 410)。
+ */
 export async function drainForeignOutboxEntries(
   entries: readonly AudioOutboxEntry[],
   currentSessionId: string,
   deps: ForeignOutboxDrainDeps,
+  refusedThisSession?: Map<string, string>,
 ): Promise<ForeignOutboxDrainResult[]> {
   const results: ForeignOutboxDrainResult[] = [];
   for (const entry of entries) {
     if (entry.sessionId === currentSessionId) continue;
-    results.push(await drainForeignOutboxEntry(entry, deps));
+    if (refusedThisSession?.get(entry.rawAudioId) === currentSessionId) {
+      results.push({ rawAudioId: entry.rawAudioId, outcome: "kept", reason: "refused-this-session" });
+      continue;
+    }
+    const result = await drainForeignOutboxEntry(entry, deps);
+    if (result.outcome === "kept" && result.reason === "http-409") {
+      refusedThisSession?.set(entry.rawAudioId, currentSessionId);
+    }
+    results.push(result);
   }
   return results;
 }

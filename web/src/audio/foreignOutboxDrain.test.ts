@@ -177,6 +177,60 @@ test("a 2xx audioSaved without the server ledger receipt never deletes the local
   assert.ok(!log.includes("discard"));
 });
 
+test("a foreign entry refused with 409 is not retried again within the same current session", async () => {
+  // 2026-11-26 生产:平板上 4 段别场录音每次开麦前都被重传、每段 POST /audio 409 + audioSaved 409,
+  // 每轮开录从 ~1.7 s 拖到 ~5 s。同一场里拒过的不再重试;换场或刷新页面后照常重试,本机副本一直保留。
+  const log: string[] = [];
+  const refused = new Map<string, string>();
+  const d = deps(log, { saved: "409" });
+  d.createAudio = async () => { log.push("createAudio"); throw conflict(); };
+  const captured = entry({ phase: "captured" });
+
+  const first = await drainForeignOutboxEntries([captured], "S-NEW", d, refused);
+  assert.deepEqual(first.map((r) => [r.outcome, r.reason]), [["kept", "http-409"]]);
+  assert.deepEqual(log, ["createAudio", "audioSaved"]);
+
+  const second = await drainForeignOutboxEntries([captured], "S-NEW", d, refused);
+  assert.deepEqual(second.map((r) => [r.outcome, r.reason]), [["kept", "refused-this-session"]]);
+  assert.deepEqual(log, ["createAudio", "audioSaved"], "same session: no new requests");
+
+  const nextSession = await drainForeignOutboxEntries([captured], "S-NEXT", d, refused);
+  assert.deepEqual(nextSession.map((r) => [r.outcome, r.reason]), [["kept", "http-409"]]);
+  assert.deepEqual(log, ["createAudio", "audioSaved", "createAudio", "audioSaved"], "a new session retries");
+  assert.ok(!log.includes("discard") && !log.includes("completeOutbox"), "the local copy is never removed");
+});
+
+test("transient failures are retried on the next record command of the same session", async () => {
+  const log: string[] = [];
+  const refused = new Map<string, string>();
+  const d = deps(log, {});
+  d.uploadAudioBlob = async () => { log.push("upload"); throw new TypeError("synthetic offline"); };
+  await drainForeignOutboxEntries([entry()], "S-NEW", d, refused);
+  await drainForeignOutboxEntries([entry()], "S-NEW", d, refused);
+  assert.deepEqual(log, ["upload", "upload"]);
+  assert.equal(refused.size, 0);
+});
+
+test("a refusal memo for one entry does not skip a different foreign entry", async () => {
+  const log: string[] = [];
+  const refused = new Map<string, string>([["raw-old-000001", "S-NEW"]]);
+  const d = deps(log, {});
+  d.uploadAudioBlob = async (rawAudioId, uploaded) => {
+    log.push("upload");
+    return { raw_audio_id: rawAudioId, bytes: bytes.length, checksum: await sha256Blob(uploaded) };
+  };
+  d.putAudioSaved = async (saved) => {
+    log.push("audioSaved");
+    const rawAudioId = (saved as { rawAudioId: string }).rawAudioId;
+    return { seq: 1, audioReceipt: { rawAudioId, serverSeq: 8, idempotent: false } };
+  };
+  const results = await drainForeignOutboxEntries(
+    [entry(), entry({ rawAudioId: "raw-old-000002" })], "S-NEW", d, refused);
+  assert.deepEqual(results.map((r) => [r.rawAudioId, r.outcome]), [
+    ["raw-old-000001", "kept"], ["raw-old-000002", "server-saved"]]);
+  assert.equal(log.filter((step) => step === "upload").length, 1);
+});
+
 test("the same entry is drained once at a time: a second caller joins the in-flight drain", async () => {
   const log: string[] = [];
   let release: () => void = () => {};

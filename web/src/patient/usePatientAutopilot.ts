@@ -778,6 +778,7 @@ export function usePatientAutopilot(input: {
           window.dispatchEvent(new Event(DEVICE_PAIR_REQUIRED_EVENT));
           return;
         }
+        if (disposition === "not-issuing-device") return;
         if (disposition === "blocked") {
           stopSpeaking();
           setMode("blocked");
