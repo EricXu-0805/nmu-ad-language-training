@@ -22,7 +22,6 @@ from . import (
 )
 from .models import (
     AssessmentEvent,
-    LiveState,
     Patient,
     Session as TrainSession,
     SessionCloseoutReport,
@@ -1442,14 +1441,14 @@ def assert_patient_ready_for_new_work(
     sessions = list(db.exec(select(TrainSession).where(
         TrainSession.patient_id == patient_id,
     )))
-    live_row = db.get(LiveState, 1)
     for train_session in sessions:
         runtime = db.get(SessionRuntimeState, train_session.session_id)
         status = runtime.status if runtime is not None else "active"
         if status in {"active", "paused"}:
             # 只拦仍持床旁槽且未遗弃的场;遗弃/被接管的交给握手层,别超前拦死。
             if session_admission.bedside_session_blocks_new_work(
-                    train_session.session_id, runtime, live_row):
+                    train_session.session_id, runtime,
+                    session_admission.live_row_for_session(db, train_session.session_id)):
                 _fail(409, "visit_plan_patient_session_open", "该受试者仍有活跃或暂停场次")
         if (status == "intervention_completed"
                 and db.get(
@@ -1492,7 +1491,6 @@ def assert_actor_ready_for_new_work(
     sessions = list(db.exec(select(TrainSession).where(
         TrainSession.trainer_id == actor_id,
     )))
-    live_row = db.get(LiveState, 1)
     for train_session in sessions:
         runtime = db.get(SessionRuntimeState, train_session.session_id)
         status = runtime.status if runtime is not None else "active"
@@ -1500,7 +1498,8 @@ def assert_actor_ready_for_new_work(
             # 只拦仍持床旁槽且未遗弃的场:研究者关页签走人留下的弃场(共享账号
             # 下尤其致命)会在这里被放行,由握手层安全暂停后让位(复核 P2)。
             if session_admission.bedside_session_blocks_new_work(
-                    train_session.session_id, runtime, live_row):
+                    train_session.session_id, runtime,
+                    session_admission.live_row_for_session(db, train_session.session_id)):
                 _fail(
                     409,
                     "visit_plan_actor_session_open",

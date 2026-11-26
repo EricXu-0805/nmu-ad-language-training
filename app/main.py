@@ -5192,6 +5192,30 @@ class DevicePairIn(BaseModel):
         min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
+def _pairing_live_row(s: DBSession, required_patient_id: str | None) -> LiveState | None:
+    """配对要绑的床旁槽。N=1 恒为 1 号槽。
+
+    两床并行时全局 PIN 不知道指的是哪一床(两床同时只有一场可配时也会随时间变),一律拒绝;
+    受试者码先按受试者筛各槽,恰好一槽才算,否则按「没有可配对场次」拒绝,不泄露别床是谁。
+    终态场不算:新场按「空或终态取最小编号」进槽,同一受试者上一场的终态影子可以留在另一槽。
+    """
+    if session_admission.bedside_slot_count() == 1:
+        return session_admission.live_row_for_session(s, None)
+    if required_patient_id is None:
+        _raise_device_conflict(
+            "device_pair_patient_code_required", "两床并行时请输入该受试者的专属配对码")
+    own = []
+    for row in session_admission.bedside_slot_rows(s).values():
+        holder = _live_session_id(row)
+        held = s.get(TrainSession, holder) if holder else None
+        if (held is not None and held.patient_id == required_patient_id
+                and _session_runtime_status(holder, s) not in _TERMINAL_RUNTIME_STATUSES):
+            own.append(row)
+    if len(own) != 1:
+        _raise_device_conflict("device_pair_no_live_session", "当前没有可配对的训练场次")
+    return own[0]
+
+
 def _issue_live_session_capability(
         s: DBSession, *, device_id: str,
         required_patient_id: str | None = None,
@@ -5206,7 +5230,8 @@ def _issue_live_session_capability(
     每次轮换还强制暂停训练——轮换权只留给当面输码的人工配对。
     """
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = _pairing_live_row(s, required_patient_id)
         session_id = _live_session_id(live)
         if not session_id:
             _raise_device_conflict("device_pair_no_live_session", "当前没有可配对的训练场次")
@@ -5472,6 +5497,75 @@ def _live_row_for_update(s: DBSession) -> LiveState | None:
     return s.exec(select(LiveState).where(LiveState.id == 1).with_for_update()).first()
 
 
+def _new_bedside_slot_row(slot_id: int) -> LiveState:
+    """还没有行的床旁槽第一次被占时建行;seq 在换持有者时由 _bedside_seq_floor 抬高。"""
+    return LiveState(id=slot_id, seq=0)
+
+
+def _bedside_slot_views(
+        s: DBSession, rows: dict[int, LiveState | None],
+) -> list[session_admission.BedsideSlotView]:
+    views = []
+    for slot_id, row in rows.items():
+        holder = _live_session_id(row)
+        held = s.get(TrainSession, holder) if holder else None
+        held_runtime = s.get(SessionRuntimeState, holder) if held is not None else None
+        views.append(session_admission.BedsideSlotView(
+            slot_id=slot_id, session_id=holder, session_exists=held is not None,
+            status=held_runtime.status if held_runtime is not None else None,
+            stale=session_admission.live_slot_stale(row),
+            patient_id=held.patient_id if held is not None else None,
+            trainer_id=held.trainer_id if held is not None else None))
+    return views
+
+
+def _choose_bedside_slot(
+        s: DBSession, sess: TrainSession,
+        purpose: Literal["handshake", "autopilot_return"],
+) -> tuple[int, LiveState | None]:
+    """握手或自动场切回要占的槽号和它现有的行(没有行回 None)。N=1 恒为 1 号槽。"""
+    slot_count = session_admission.bedside_slot_count()
+    rows = session_admission.bedside_slot_rows(s, slot_count)
+    if slot_count == 1:
+        return 1, rows[1]
+    choice = session_admission.choose_bedside_slot(
+        _bedside_slot_views(s, rows), session_id=sess.session_id,
+        patient_id=sess.patient_id, trainer_id=sess.trainer_id,
+        slot_count=slot_count, purpose=purpose)
+    return choice.slot_id, rows[choice.slot_id]
+
+
+def _bedside_handshake_row(s: DBSession, row: LiveState, sess: TrainSession) -> LiveState:
+    """握手要写的槽:选到的不是 row 就换成那一槽的行,那一槽还没有行就新建。"""
+    slot_id, chosen = _choose_bedside_slot(s, sess, "handshake")
+    if slot_id == row.id:
+        return row
+    return chosen or _new_bedside_slot_row(slot_id)
+
+
+def _bedside_seq_floor(s: DBSession, row: LiveState) -> int:
+    """换持有者时 seq 从各槽最大值起跳:平板遇到不大于已见 seq 的帧会跳过(useLiveCursor.ts)。"""
+    return max([row.seq or 0, *(other.seq or 0
+                                for other in session_admission.bedside_slot_rows(s).values()
+                                if other is not None)])
+
+
+def _clear_bedside_shadows(s: DBSession, row: LiveState, session_id: str) -> None:
+    """本场占了 row 之后,别的槽里还写着本场的就是影子,清成空槽。
+
+    N=1 也看 2 号行:2→1 后本场重新握手进了 1 号槽,2 号行留着的本场等再开到两槽时
+    就成了「同一场在两槽」,两边一律 409。只清床旁投影,不降级本场的设备能力。
+    """
+    for other in session_admission.bedside_slot_rows(s, 2).values():
+        if other is None or other.id == row.id or _live_session_id(other) != session_id:
+            continue
+        for column in ("session_json", "cursor_json", "rapport_json", "audio_json",
+                       "patient_rec_json", "patient_ack_session_id",
+                       "patient_current_screen", "patient_last_seen_at", "patient_ack_seq"):
+            setattr(other, column, None)
+        s.add(other)
+
+
 def _wseq_from(payload: dict | None) -> int | None:
     value = (payload or {}).get("wseq")
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
@@ -5532,9 +5626,12 @@ _PAGE_BUILD_ID_PATTERN = re.compile(r"[0-9]{10,80}")
 _PAGE_BUILD_ID_FILE_MAX_BYTES = 128
 _DEPLOYED_PAGE_BUILD_ID_PATH = (
     Path(__file__).resolve().parent.parent / "web" / "dist" / "build-id.txt")
-# 本场最近一拍心跳报的老人端页面构建号，以及本场已记过审计的构建号。与 _SERVER_WSEQ
+# 每场最近一拍心跳报的老人端页面构建号，以及已记过审计的(场次, 构建号)。按场次存：两床的
+# 平板每 5 s 交替心跳，存单个值会每拍互相顶掉、每拍各记一条审计。只留最近
+# _PATIENT_PAGE_BUILD_MAX 场，挤掉的场次连同它的已报记录一起丢。与 _SERVER_WSEQ
 # 一样依赖单 worker：重启后清空，最多 5 s 显示 unknown、多记一条重复审计。
-_PATIENT_PAGE_BUILD: tuple[str, str | None] | None = None
+_PATIENT_PAGE_BUILD_MAX = 8
+_PATIENT_PAGE_BUILD: dict[str, str | None] | None = None
 _PATIENT_PAGE_BUILD_REPORTED: set[tuple[str, str | None]] = set()
 
 
@@ -5554,9 +5651,14 @@ def _deployed_page_build_id(path: Path = _DEPLOYED_PAGE_BUILD_ID_PATH) -> str | 
 def _remember_patient_page_build(session_id: str, build: str | None) -> bool:
     """记下本场最近一拍的页面构建号；本场第一次出现的构建号返回 True。调用方须持 _LIVE_WRITE_LOCK。"""
     global _PATIENT_PAGE_BUILD
-    if _PATIENT_PAGE_BUILD is None or _PATIENT_PAGE_BUILD[0] != session_id:
-        _PATIENT_PAGE_BUILD_REPORTED.clear()
-    _PATIENT_PAGE_BUILD = (session_id, build)
+    builds = dict(_PATIENT_PAGE_BUILD or {})
+    builds.pop(session_id, None)
+    builds[session_id] = build
+    for evicted in list(builds)[:-_PATIENT_PAGE_BUILD_MAX]:
+        del builds[evicted]
+        _PATIENT_PAGE_BUILD_REPORTED.difference_update(
+            [key for key in _PATIENT_PAGE_BUILD_REPORTED if key[0] == evicted])
+    _PATIENT_PAGE_BUILD = builds
     if (session_id, build) in _PATIENT_PAGE_BUILD_REPORTED:
         return False
     _PATIENT_PAGE_BUILD_REPORTED.add((session_id, build))
@@ -5564,14 +5666,14 @@ def _remember_patient_page_build(session_id: str, build: str | None) -> bool:
 
 
 def _patient_page_build_state(row: LiveState | None) -> str:
-    slot = _PATIENT_PAGE_BUILD
+    builds = _PATIENT_PAGE_BUILD or {}
     # 换场会清掉 patient_ack_session_id：新场次第一拍心跳之前不沿用上一场的结论。
-    if row is None or slot is None or slot[0] != row.patient_ack_session_id:
+    if row is None or row.patient_ack_session_id not in builds:
         return "unknown"
     deployed = _deployed_page_build_id()
     if deployed is None:
         return "unknown"
-    return "current" if slot[1] == deployed else "stale"
+    return "current" if builds[row.patient_ack_session_id] == deployed else "stale"
 
 
 def _presence_payload(row: LiveState | None, now: datetime | None = None) -> dict:
@@ -5709,7 +5811,8 @@ def warmup_action(session_id: str, body: warmup.Action, request: Request,
         state = _runtime_row(session_id, s)
         if state.status != "active":
             raise HTTPException(409, "场次已暂停或结束，不能启动或推进互动")
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         if live is None or _live_session_id(live) != session_id:
             raise HTTPException(409, "场次不在当前床旁，请先恢复场次")
         position = _json_load(live.rapport_json)
@@ -6733,7 +6836,8 @@ def report_rapport_playback(
     with (governance_lock.subject_fence(s, patient_id), _LIVE_WRITE_LOCK,
           device_capability.serialized_mutation()):
         governance_lock.begin_sqlite_write_fence(s)
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_current_live(request, s, "回报播放结果", live_row=live)
         _require_capability_active_for_write(request, s, session_id)
         current, revision = _rapport_current_playback_position(session_id, s, live)
@@ -6776,7 +6880,8 @@ def get_rapport_playback(
     patient_id = _preauthorize_session_subject_fence(
         request, session_id, s, "核对关系建立播放结果")
     with governance_lock.subject_fence(s, patient_id), _LIVE_WRITE_LOCK:
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         current, revision = _rapport_current_playback_position(session_id, s, live)
         row = s.exec(select(RapportPlaybackReceipt).where(
             RapportPlaybackReceipt.session_id == session_id,
@@ -7248,7 +7353,6 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
         capture_receipt: AudioCaptureReceipt | None = None
         receipt_idempotent = False
         if body.kind == "session":
-            previous_session_id = _live_session_id(row)
             session_id = _payload_session_id(payload)
             if not session_id:
                 raise HTTPException(422, "session payload 缺 sessionId")
@@ -7260,6 +7364,9 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                     "握手或激活床旁场次",
                     mutation=True,
                 )
+                # 先核本场的操作权再选槽,满员/违例的 409 不对无权的人透露床旁现状。
+                row = _bedside_handshake_row(s, row, sess)
+                previous_session_id = _live_session_id(row)
                 if previous_session_id and previous_session_id != session_id:
                     previous = s.get(TrainSession, previous_session_id)
                     if previous is not None:
@@ -7306,6 +7413,8 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                     raise HTTPException(404, "场次不存在")
                 _require_session_operator(
                     request, sess, s, "握手或激活床旁场次", mutation=True)
+                row = _bedside_handshake_row(s, row, sess)
+                previous_session_id = _live_session_id(row)
             _require_started_visit_plan_session(session_id, s, sess=sess)
             _ensure_manual_plane_writable(
                 session_id, s, "从旧操作端重新握手或覆盖实时场次")
@@ -7336,8 +7445,10 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                 row.patient_current_screen = None
                 row.patient_last_seen_at = None
                 row.patient_ack_seq = None
+                row.seq = _bedside_seq_floor(s, row)
             setattr(row, slot, _json.dumps(payload, ensure_ascii=False))
             _restore_runtime_to_live(row, state)
+            _clear_bedside_shadows(s, row, session_id)
             if state:
                 s.add(state)
             command_wseq = row.command_wseq
@@ -7702,7 +7813,10 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
         # All device live writes lock LiveState before the capability row.  For
         # audioSaved the enclosing order is raw-id -> byte quota -> live -> cap ->
         # asset, identical to upload/delete and safe across PostgreSQL workers.
-        locked_live = _live_row_for_update(s) or LiveState(id=1, seq=0)
+        _live_row_for_update(s)
+        # 本场所在的槽;握手在 apply 里另行选槽。
+        locked_live = (session_admission.live_row_for_session(
+            s, _payload_session_id(body.payload)) or _new_bedside_slot_row(1))
         ack = existing_audio_saved_ack(locked_live)
         if ack is not None:
             return None, ack
@@ -7733,8 +7847,8 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
         except IntegrityError:
             # 多进程空库/同 raw receipt 竞态：回滚并在已落库事实上重放。
             s.rollback()
-            existing = _live_row_for_update(s)
-            if existing is None:
+            _live_row_for_update(s)
+            if session_admission.live_row_for_session(s, None) is None:
                 raise
             applied, exact_ack = authorize_and_apply()
             if exact_ack is not None:
@@ -7784,7 +7898,8 @@ def caregiver_activate_session(
     _require_started_visit_plan_session(session_id, s, sess=sess)
     expected = _caregiver_activation_payload(sess)
     with _LIVE_WRITE_LOCK:
-        row = _live_row_for_update(s)
+        _live_row_for_update(s)
+        row = session_admission.live_row_for_session(s, session_id)
         current = _json_load(row.session_json) if row is not None else None
         idempotent = bool(
             row is not None
@@ -7836,7 +7951,7 @@ def caregiver_session_status(
         request, session_id, s, "查看床旁场次状态")
     _require_started_visit_plan_session(session_id, s, sess=sess)
     runtime_state = s.get(SessionRuntimeState, session_id)
-    live = s.get(LiveState, 1)
+    live = session_admission.live_row_for_session(s, session_id)
     is_current = _live_session_id(live) == session_id
     presence = _presence_payload(live) if is_current else {
         "screen": None,
@@ -8080,10 +8195,37 @@ def live_get(request: Request, s: DBSession = Depends(get_session)):
                 "autopilotWake": _autopilot_wake_projection(s, live_session_id)}
 
 
+def _own_bedside_session_id(request: Request, s: DBSession) -> str | None:
+    """两床并行时本账号名下正占着某一槽的场次,恰好一场才算,终态场的影子不算;N=1 不认。"""
+    if session_admission.bedside_slot_count() == 1:
+        return None
+    actor = _actor(request)
+    owned = []
+    for row in session_admission.bedside_slot_rows(s).values():
+        holder = _live_session_id(row)
+        held = s.get(TrainSession, holder) if holder else None
+        if (held is not None and actor and (held.trainer_id or "").strip() == actor
+                and _session_runtime_status(holder, s) not in _TERMINAL_RUNTIME_STATUSES):
+            owned.append(holder)
+    return owned[0] if len(owned) == 1 else None
+
+
 @app.get("/live/console-state")
-def live_console_get(request: Request, s: DBSession = Depends(get_session)):
-    """研究者端完整实时快照；配置 CONSOLE_PIN 时由中间件保护。"""
-    row = s.get(LiveState, 1)
+def live_console_get(request: Request, session_id: str | None = None,
+                     s: DBSession = Depends(get_session)):
+    """研究者端完整实时快照；配置 CONSOLE_PIN 时由中间件保护。
+
+    带 session_id 读这一场所在的槽(先核这一场的读权限);不带时两床并行读本人场次
+    所在的槽,不带参数的旧页面因此不会读到另一床。认不出、或本场不在任何槽里,照旧读 1 号槽。
+    """
+    if session_id is not None:
+        requested = s.get(TrainSession, session_id)
+        if requested is None:
+            raise HTTPException(404, "场次不存在")
+        _require_session_read_operator(request, requested, s, "读取床旁实时状态")
+    else:
+        session_id = _own_bedside_session_id(request, s)
+    row = session_admission.live_row_for_session(s, session_id)
     live_session_id = _live_session_id(row)
     if live_session_id:
         sess = s.get(TrainSession, live_session_id)
@@ -8196,7 +8338,8 @@ def put_session_runtime_cursor(session_id: str, body: RuntimeCursorIn,
         if state.status == "paused":
             raise HTTPException(409, "场次已暂停；须先恢复后才能推进游标")
 
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         if live and _live_session_id(live) == session_id:
             payload["wseq"] = _allocate_live_wseq(live)
             live.cursor_json = _json.dumps(payload, ensure_ascii=False)
@@ -8337,7 +8480,8 @@ def resume_session(session_id: str, request: Request,
         if rapport:
             _validate_rapport(sess, rapport, s)
         if state.status == "paused":
-            live = _live_row_for_update(s)
+            _live_row_for_update(s)
+            live = session_admission.live_row_for_session(s, session_id)
             live_is_current = bool(live and _live_session_id(live) == session_id)
             if (live_is_current and live and (rapport or {}).get("warmup") is not None
                     and (_json_load(live.patient_rec_json) or {}).get("active") is True):
@@ -8436,7 +8580,7 @@ def _assess_rapport_completion(
     script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
     state = s.exec(select(SessionRuntimeState).where(
         SessionRuntimeState.session_id == sess.session_id)).first()
-    live = s.exec(select(LiveState).where(LiveState.id == 1)).first()
+    live = session_admission.live_row_for_session(s, sess.session_id)
     live_is_current = live is not None and _live_session_id(live) == sess.session_id
     rapport_position = (_json_load(state.rapport_json) if state else None) or (
         _json_load(live.rapport_json) if live_is_current and live else None)
@@ -10618,7 +10762,9 @@ def autopilot_activate(
     # audit connection would contend with our SQLite writer transaction. Freeze
     # the bedside identity too: its audit may never authorize a different slot
     # discovered after waiting for the writer fence.
-    authorized_previous_session_id = _live_session_id(s.get(LiveState, 1))
+    authorized_slot_id, authorized_live = _choose_bedside_slot(
+        s, s.get(TrainSession, session_id), "autopilot_return")
+    authorized_previous_session_id = _live_session_id(authorized_live)
     if (authorized_previous_session_id
             and authorized_previous_session_id != session_id):
         previous = s.get(TrainSession, authorized_previous_session_id)
@@ -10644,7 +10790,8 @@ def autopilot_activate(
             request, sess, s, "切回已暂停的自动训练", mutation=True,
             audit_supervision=False)
         _require_started_visit_plan_session(session_id, s, sess=sess)
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        slot_id, live = _choose_bedside_slot(s, sess, "autopilot_return")
         state = s.exec(select(SessionAutopilotState).where(
             SessionAutopilotState.session_id == session_id,
         ).with_for_update()).first()
@@ -10675,7 +10822,8 @@ def autopilot_activate(
             _ensure_recording_allowed_for_session(
                 session_id, s, is_simulation=sess.is_simulation)
             previous_session_id = _live_session_id(live)
-            if previous_session_id != authorized_previous_session_id:
+            if (slot_id != authorized_slot_id
+                    or previous_session_id != authorized_previous_session_id):
                 raise autopilot_service.AutopilotServiceError(
                     "autopilot_activation_bedside_busy",
                     "当前床旁场次已变化，请刷新后重新选择要切回的场次")
@@ -10722,7 +10870,7 @@ def autopilot_activate(
                             "autopilot_activation_bedside_busy",
                             "当前床旁场次仍有回答正在处理，请先完成安全暂停")
             if live is None:
-                live = LiveState(id=1)
+                live = _new_bedside_slot_row(slot_id)
             _prime_live_wseq_from_runtime(live, runtime)
             live.session_json = _json.dumps({
                 "sessionId": session_id, "weekNo": sess.week_no,
@@ -10737,8 +10885,9 @@ def autopilot_activate(
             live.patient_last_seen_at = None
             live.patient_ack_seq = None
             _restore_runtime_to_live(live, runtime)
+            _clear_bedside_shadows(s, live, session_id)
             device_capability.mark_session_recovery_only(s, previous_session_id)
-            live.seq += 1
+            live.seq = _bedside_seq_floor(s, live) + 1
             live.updated_at = datetime.now()
             s.add(live)
             s.add(runtime)

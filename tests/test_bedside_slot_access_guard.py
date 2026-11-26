@@ -34,40 +34,15 @@ SLOT_HELPERS = frozenset({
     # 按名字 monkeypatch 它装锁序探针,不能删也不能改名。
     ("app/main.py", _LOCK_HELPER),
     ("app/session_admission.py", "live_row_for_session"),
+    # 握手选槽、配对、console-state 和清影子要把各槽一起看。
+    ("app/session_admission.py", "bedside_slot_rows"),
+    # 槽第一次被占时建行。
+    ("app/main.py", "_new_bedside_slot_row"),
 })
 
-_MAIN, _VISIT = "app/main.py", "app/visit_plan_service.py"
-
-# TODO(两床第 3 步):afbe766 上还写死 1 号槽的读法,共 53 处。第 3a-3g 步每改一处就删一行
-# 或减数,删到空为止;改了不删,下面的对账同样会红。仓库没有 xfail 的惯例,所以先把今天的
-# 读法全记在这里,套件保持绿,新增的未登记读法照样拦。行尾数字是 afbe766 上的行号,
-# 分组照计划「实施顺序」;「未分组」是计划没点名的,改到相邻那组时一并定:改走本场槽,
-# 还是确属锚行用法、进 SLOT_HELPERS 并写明理由。
-PENDING: dict[tuple[str, str, str], int] = {
-    # 3e 握手、自动场切回、照护员
-    (_MAIN, "live_put.authorize_and_apply", _CONTENT_READ): 1,  # 7681
-    (_MAIN, "live_put.authorize_and_apply", _NEW): 1,  # 7681 的 LiveState(id=1, seq=0)
-    (_MAIN, "live_put", _CONTENT_READ): 1,  # 7712,建行撞唯一约束后的重读
-    (_MAIN, "caregiver_activate_session", _CONTENT_READ): 1,  # 7763
-    (_MAIN, "caregiver_session_status", _GET): 1,  # 7815
-    (_MAIN, "autopilot_activate", _GET): 1,  # 10581
-    (_MAIN, "autopilot_activate", _CONTENT_READ): 1,  # 10607
-    (_MAIN, "autopilot_activate", _NEW): 1,  # 10685
-    # 3f 配对
-    (_MAIN, "_issue_live_session_capability", _CONTENT_READ): 1,  # 5185
-    # 3g 准入闸、收麦真值
-    (_VISIT, "assert_patient_ready_for_new_work", _GET): 1,  # 1445
-    (_VISIT, "assert_actor_ready_for_new_work", _GET): 1,  # 1495
-    (_MAIN, "_assess_rapport_completion", _SELECT): 1,  # 8411
-    (_MAIN, "_assess_rapport_completion", _ID): 1,  # 8411
-    # 未分组
-    (_MAIN, "warmup_action", _CONTENT_READ): 1,  # 5688
-    (_MAIN, "report_rapport_playback", _CONTENT_READ): 1,  # 6712
-    (_MAIN, "get_rapport_playback", _CONTENT_READ): 1,  # 6755
-    (_MAIN, "live_console_get", _GET): 1,  # 8060,计划「选型」:不带参数时回本人那一槽
-    (_MAIN, "put_session_runtime_cursor", _CONTENT_READ): 1,  # 8172
-    (_MAIN, "resume_session", _CONTENT_READ): 1,  # 8312
-}
+# 第 3 步把 afbe766 上写死 1 号槽的 53 处读法都改走了上面的 helper。往后真有暂时改不了的
+# 读法才登记进来,改掉就删;改了不删,下面的对账同样会红。
+PENDING: dict[tuple[str, str, str], int] = {}
 
 
 class Site(NamedTuple):

@@ -353,6 +353,15 @@ def choose_bedside_slot(
     raise BedsideSlotError("bedside_slots_full")
 
 
+def bedside_slot_rows(db: Session, slot_count: int | None = None) -> dict[int, LiveState | None]:
+    """各床旁槽的行,按槽号;没有行的槽给 None。只读,不加锁,不建行。
+
+    slot_count 不给就按开关;要看 2 号行里有没有影子时调用方显式给 2。
+    """
+    count = bedside_slot_count() if slot_count is None else slot_count
+    return {slot_id: db.get(LiveState, slot_id) for slot_id in range(1, count + 1)}
+
+
 def live_row_for_session(db: Session, session_id: str | None) -> LiveState | None:
     """本场所在床旁槽的行;本场不在任何槽里就回锚行(id=1)。只读,不加锁,不建行。
 
