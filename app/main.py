@@ -6162,8 +6162,12 @@ def _current_patient_rec_turn(
     must remain reportable precisely when recording authorization or device startup has
     failed, so this lookup validates only the frozen position identity.
     """
+    # 非设备身份不过 current-live 闸,传进来的 live 可能属于床旁上另一场;
+    # 只认本场的 live 行做兜底,否则会拿另一位老人的题位放行。
+    own_live = live if _live_session_id(live) == sess.session_id else None
     if sess.week_no == 1:
-        rapport = _json_load(state.rapport_json) or _json_load(live.rapport_json)
+        rapport = (_json_load(state.rapport_json)
+                   or (_json_load(own_live.rapport_json) if own_live else None))
         section_key = (rapport or {}).get("sectionKey")
         if not isinstance(section_key, str) or not section_key:
             raise HTTPException(409, "当前场次尚无可绑定的关系建立录音位置")
@@ -6174,7 +6178,8 @@ def _current_patient_rec_turn(
             and not isinstance(question_idx, bool) else 0)
         return turn_key, turn_key, None
 
-    cursor = _json_load(state.cursor_json) or _json_load(live.cursor_json)
+    cursor = (_json_load(state.cursor_json)
+              or (_json_load(own_live.cursor_json) if own_live else None))
     item_idx = (cursor or {}).get("itemIdx")
     turn_idx = (cursor or {}).get("turnIdx")
     if (not isinstance(item_idx, int) or isinstance(item_idx, bool)

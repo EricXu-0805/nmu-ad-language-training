@@ -508,6 +508,63 @@ def test_opaque_turn_ref_becomes_canonical_only_inside_server_ledgers(
     assert canonical_item_id not in legacy_ack.text
 
 
+@pytest.mark.parametrize("slots", [None, "2"])
+def test_opaque_registration_never_borrows_another_sessions_live_cursor(
+        presentation_client, monkeypatch, slots):
+    # 非设备身份(回环 M0)带 opaque 题位登记时不过 current-live 闸;本场 runtime
+    # 还没写过游标,参照物只能是本场自己的,不能借床旁上另一场的游标放行。
+    if slots is None:
+        monkeypatch.delenv("NMU_BEDSIDE_SLOTS", raising=False)
+    else:
+        monkeypatch.setenv("NMU_BEDSIDE_SLOTS", slots)
+    client = presentation_client
+    _create_patient(client, "P-OWNER")
+    _create_patient(client, "P-OTHER")
+    _create_session(client, session_id="S-OWNER", patient_id="P-OWNER", week_no=2)
+    _create_session(client, session_id="S-OTHER", patient_id="P-OTHER", week_no=2)
+    _post_live_session(client, "S-OTHER", week_no=2)
+    written = client.put("/live/state", json={
+        "kind": "cursor",
+        "payload": {
+            "sessionId": "S-OTHER", "screen": "present",
+            "itemIdx": 0, "turnIdx": 0, "responseRole": "命名",
+            "cueLevel": 0, "recording": "idle",
+        },
+    })
+    assert written.status_code == 200, written.text
+
+    denied = client.post("/audio", json={
+        "raw_audio_id": "foreign-cursor-borrow",
+        "session_id": "S-OWNER",
+        "turn_key": "itm-0001#1",
+    })
+    assert denied.status_code == 409, denied.text
+    assert "训练录音位置" in denied.json()["detail"]
+    with Session(client.test_engine) as session:
+        assert session.get(AudioAssetRow, "foreign-cursor-borrow") is None
+
+
+def test_current_patient_rec_turn_live_fallback_is_own_session_only():
+    from app.main import _current_patient_rec_turn
+    from fastapi import HTTPException
+    from app.models import Session as TrainSession, SessionRuntimeState
+
+    sess = TrainSession(session_id="S-REC-OWNER", patient_id="P-REC", week_no=1)
+    state = SessionRuntimeState(session_id="S-REC-OWNER", status="active", revision=0)
+    rapport = json.dumps({"sectionKey": "自我介绍", "questionIdx": 0}, ensure_ascii=False)
+
+    own = LiveState(id=1, seq=1, rapport_json=rapport,
+                    session_json=json.dumps({"sessionId": "S-REC-OWNER"}))
+    turn_key, _item, _seq = _current_patient_rec_turn(sess, own, state)
+    assert turn_key == patient_presentation.rapport_turn_key("自我介绍", 0)
+
+    foreign = LiveState(id=1, seq=1, rapport_json=rapport,
+                        session_json=json.dumps({"sessionId": "S-REC-OTHER"}))
+    with pytest.raises(HTTPException) as caught:
+        _current_patient_rec_turn(sess, foreign, state)
+    assert caught.value.status_code == 409
+
+
 def _write_rapport(client, session_id, *, section_key, question_idx, beat):
     return client.put("/live/state", json={
         "kind": "rapportStep",
