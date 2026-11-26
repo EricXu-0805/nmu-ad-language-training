@@ -23,8 +23,8 @@ def test_oversized_post_refused_with_413():
     ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
 ])
 def test_oversized_post_refused_by_connection_reset(error):
-    # Go 的服务端拒收超限请求体后只等约 500 ms 就关连接;runner 慢时客户端还在发,收到的是重置
-    # 而不是 413(2026-11-26 CI 连续三次)。上游没收到这一条另由调用方核。
+    # Caddy 按 Content-Length 当场回 413;请求带 Connection: close,Go 不等就关连接,内核里还有
+    # 没读的请求体便发 RST,客户端还在发时收到的是重置(2026-11-26 CI 连续三次)。上游没收到另由调用方核。
     def send():
         raise error
     assert smoke.oversized_post_outcome(send) == "connection_reset"
@@ -34,6 +34,15 @@ def test_oversized_post_refused_by_connection_reset(error):
 def test_oversized_post_any_other_answer_fails(status):
     with pytest.raises(smoke.SmokeError, match="ordinary_large_post_not_413"):
         smoke.oversized_post_outcome(lambda: (status, {}, b""))
+
+
+def test_clean_disconnect_without_any_response_is_not_a_refusal():
+    # RemoteDisconnected 是 ConnectionResetError 的子类,但它是「一个字节都没回就干净关闭」,
+    # 不是上面那种竞争。
+    def send():
+        raise smoke.client.RemoteDisconnected("Remote end closed connection without response")
+    with pytest.raises(smoke.client.RemoteDisconnected):
+        smoke.oversized_post_outcome(send)
 
 
 def test_oversized_post_other_transport_errors_are_not_treated_as_refusal():

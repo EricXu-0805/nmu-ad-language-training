@@ -313,12 +313,16 @@ def require_request_body_limits(document: dict) -> None:
 def oversized_post_outcome(send) -> str:
     """How the gateway refused an over-limit POST: an exact 413, or a reset mid-upload.
 
-    Go's server waits only ~500 ms for a client still sending a refused body before
-    closing; on a slow runner the client sees a reset instead of the 413. Either way
-    the caller still requires that the upstream never completed the request.
+    Caddy answers 413 from the declared Content-Length without reading the body. With
+    the client's Connection: close, Go closes at once instead of draining, and the
+    unread body makes the kernel send RST, so a client still sending sees a reset.
+    Either way the caller still requires that the upstream never completed the request.
+    A clean disconnect with no response at all is not this race and stays an error.
     """
     try:
         response = send()
+    except client.RemoteDisconnected:
+        raise
     except (ConnectionResetError, BrokenPipeError, ssl.SSLEOFError):
         return "connection_reset"
     require(response[0] == 413, "ordinary_large_post_not_413")
@@ -513,11 +517,12 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
                 require(echoed["forwarded_for"] == "127.0.0.1", "forged_forwarded_for_trusted")
                 results.extend(("small_post_reaches_upstream", "untrusted_forwarded_for_replaced"))
                 large = b"x" * (300 * 1024)
-                oversized_post_outcome(lambda: request(https_port, context, "POST", "/smoke-oversized", large))
+                refused = oversized_post_outcome(
+                    lambda: request(https_port, context, "POST", "/smoke-oversized", large))
                 with upstream.records_lock:
                     require(not any(row["path"] == "/smoke-oversized" for row in upstream.completed),
                             "ordinary_large_post_completed_upstream")
-                results.append("ordinary_post_over_256kib_rejected")
+                results.append("ordinary_post_over_256kib_rejected:" + refused)
                 response = request(https_port, context, "PUT", "/audio/smoke_A.B-123/blob", large)
                 require(response[0] == 200, "canonical_audio_put_rejected")
                 echoed = json.loads(response[2])
@@ -565,6 +570,11 @@ def smoke(binary: Path, source_root: Path) -> dict[str, object]:
                 upstream.shutdown()
                 upstream.server_close()
                 worker.join(timeout=5)
+    # server_close() joined every handler thread: a request the gateway let through just
+    # before the client saw a reset would be recorded by now.
+    with upstream.records_lock:
+        require(not any(row["path"] == "/smoke-oversized" for row in upstream.completed),
+                "ordinary_large_post_completed_upstream_late")
     require(hashlib.sha256(binary.read_bytes()).hexdigest() == binary_hash, "binary_changed_during_smoke")
     return {"schema_version": "nmu.caddy-https-smoke.v1", "status": "pass", "checks": results,
             "skipped": skipped, "binary_sha256": binary_hash,
