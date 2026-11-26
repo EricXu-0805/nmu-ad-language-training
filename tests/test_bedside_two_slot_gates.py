@@ -1,10 +1,10 @@
-"""两床并行 3a/3b:平板读写闸与停麦/终态/撤回投影都按场次找自己的床旁槽。
+"""两床并行 3a/3b/3d:平板读写闸、停麦/终态/撤回投影和回执重放都按场次找自己的床旁槽。
 
 NMU_BEDSIDE_SLOTS=2 时 1 号槽(锚行 id=1)放 A 场、2 号槽(id=2)放 B 场。握手选槽
 (第 3e 步)还没接,所以 B 场先照今天握手进 1 号槽,再整行挪进 2 号槽,模拟选槽的
 结果;A 场随后握手进空出来的 1 号槽。每条用例都逐字节比对另一槽,证明写只落本槽。
-自动带练服务层(第 3c 步)的槽位读法还没改,自动带练路由在这里替换服务层,只验
-main.py 这一层的闸和投影。
+自动带练路由在这里替换服务层,只验 main.py 这一层的闸和投影;服务层的真实路径见
+test_bedside_two_slot_autopilot.py。
 """
 from __future__ import annotations
 
@@ -547,3 +547,116 @@ def test_withdrawal_stops_only_the_withdrawn_subjects_slot(beds):
     assert (cursor["screen"], cursor["recording"]) == ("thanks", "stopped")
     assert row.patient_rec_json is None
     assert _raw_slot(beds.engine, 1) == untouched
+
+
+# ---------------- 3d 回执重放 ----------------
+
+def _bed_cursor(session_id: str, response_role: str, **overrides) -> dict:
+    return {"sessionId": session_id, "screen": "present", "itemIdx": 0, "turnIdx": 0,
+            "responseRole": response_role, "cueLevel": 0, "recording": "idle",
+            **overrides}
+
+
+def _slot_one_keeps_writing(beds) -> None:
+    """A 场研究者连写两拍游标,1 号槽的 seq 与 wseq 一直在动。"""
+    _session, cursor, before = _slot_payloads(beds.engine, 1)
+    for _ in range(2):
+        written = beds.researcher_a.put("/live/state", json={
+            "kind": "cursor",
+            "payload": _bed_cursor(SESSION_A, cursor["responseRole"])})
+        assert written.status_code == 200, _code(written)
+    _session, after_cursor, after = _slot_payloads(beds.engine, 1)
+    assert after.seq > before.seq
+    assert after_cursor["wseq"] > cursor["wseq"]
+
+
+def _technical_pause_body(beds, key: str) -> dict:
+    _session, cursor, _row = _slot_payloads(beds.engine, 2)
+    return {
+        "idempotency_key": key,
+        "expected_revision": _runtime_revision(beds.engine, SESSION_B),
+        "expected_live_wseq": cursor["wseq"],
+        "error_code": "client_microphone",
+    }
+
+
+def _presentation_body(beds, key: str) -> dict:
+    plan = beds.researcher_b.get(f"/sessions/{SESSION_B}/plan").json()
+    item = plan["items"][0]
+    turn = item["turns"][0]
+    _session, cursor, _row = _slot_payloads(beds.engine, 2)
+    return {
+        "idempotency_key": key,
+        "interaction": {
+            "event_type": "cue_selected", "item_id": item["item_id"],
+            "turn_seq": turn["turn_seq"], "prompt_level": 1,
+            "cue_type": "prompt_level_1",
+        },
+        "cursor": _bed_cursor(
+            SESSION_B, turn["response_role"], cueLevel=1, wseq=cursor["wseq"],
+            expected_revision=_runtime_revision(beds.engine, SESSION_B)),
+    }
+
+
+def _replay_routes(beds) -> dict:
+    """每条路由的请求体只算一次,重放发的是逐字节相同的请求。"""
+    technical_pause = _technical_pause_body(beds, "bed-b-technical-pause-0001")
+    presentation = _presentation_body(beds, "bed-b-presentation-0001")
+    return {
+        "technical_pause": lambda: beds.researcher_b.post(
+            f"/sessions/{SESSION_B}/technical-pause", json=technical_pause),
+        "presentation": lambda: beds.researcher_b.post(
+            f"/sessions/{SESSION_B}/interaction-presentations", json=presentation),
+        "patient_pause": lambda: beds.client.post(
+            f"/sessions/{SESSION_B}/patient-pause", headers=beds.tablet_b,
+            json={"idempotency_key": "bed-b-patient-pause-0001"}),
+    }
+
+
+_REPLAY_FIELDS = {
+    "technical_pause": ("seq", "wseq", "runtimeRevision", "cursor"),
+    "presentation": ("seq", "wseq", "runtimeRevision", "cursor"),
+    "patient_pause": ("liveSeq", "runtimeRevision", "eventSeq"),
+}
+
+
+@pytest.mark.parametrize("route", sorted(_REPLAY_FIELDS))
+def test_slot_two_replay_is_not_superseded_by_slot_one_writes(beds, route):
+    send = _replay_routes(beds)[route]
+    untouched = _raw_slot(beds.engine, 1)
+
+    first = send()
+
+    assert first.status_code == 200, _code(first)
+    assert first.json()["idempotent"] is False
+    assert _raw_slot(beds.engine, 1) == untouched
+    _session, cursor, row = _slot_payloads(beds.engine, 2)
+    assert row.seq == first.json().get("seq", first.json().get("liveSeq"))
+    if route == "presentation":
+        assert cursor["cueLevel"] == 1
+    else:
+        _assert_stop_projection(beds.engine, 2, SESSION_B)
+
+    _slot_one_keeps_writing(beds)
+    replay = send()
+
+    assert replay.status_code == 200, _code(replay)
+    assert replay.json()["idempotent"] is True
+    for field in _REPLAY_FIELDS[route]:
+        assert replay.json()[field] == first.json()[field], field
+
+
+def test_single_slot_replay_routes_never_read_slot_two(single_slot_beds):
+    """开关不开时 B 场在 2 号槽也不算当前床旁:三条回执路由照今天拒,两行原样。"""
+    beds = single_slot_beds
+    routes = _replay_routes(beds)
+    before = (_raw_slot(beds.engine, 1), _raw_slot(beds.engine, 2))
+
+    results = {name: send() for name, send in routes.items()}
+
+    assert {name: (r.status_code, _code(r)) for name, r in results.items()} == {
+        "technical_pause": (409, "technical_pause_live_session_changed"),
+        "presentation": (409, "interaction_presentation_live_session_changed"),
+        "patient_pause": (409, "device_session_changed"),
+    }
+    assert (_raw_slot(beds.engine, 1), _raw_slot(beds.engine, 2)) == before

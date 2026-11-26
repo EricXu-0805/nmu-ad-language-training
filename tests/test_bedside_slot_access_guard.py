@@ -44,26 +44,6 @@ _MAIN, _VISIT = "app/main.py", "app/visit_plan_service.py"
 # 分组照计划「实施顺序」;「未分组」是计划没点名的,改到相邻那组时一并定:改走本场槽,
 # 还是确属锚行用法、进 SLOT_HELPERS 并写明理由。
 PENDING: dict[tuple[str, str, str], int] = {
-    # 3c 自动带练
-    ("app/autopilot_service.py", "_require_live_binding", _GET): 1,  # 843
-    ("app/autopilot_orchestration.py", "_legacy_live_binding", _GET): 1,  # 681
-    (_MAIN, "_revalidate_tts_after_provider", _CONTENT_READ): 1,  # 9782
-    (_MAIN, "tts_speak", _CONTENT_READ): 1,  # 9878
-    (_MAIN, "autopilot_command_tts", _CONTENT_READ): 1,  # 9967
-    (_MAIN, "rapport_utterance_tts", _CONTENT_READ): 1,  # 10032
-    (_MAIN, "autopilot_start", _CONTENT_READ): 1,  # 10370
-    (_MAIN, "autopilot_drain_ack", _CONTENT_READ): 1,  # 10451
-    (_MAIN, "autopilot_drain_target", _CONTENT_READ): 1,  # 10486
-    (_MAIN, "autopilot_resume", _CONTENT_READ): 1,  # 10748
-    (_MAIN, "autopilot_adjudicate", _CONTENT_READ): 1,  # 10829
-    (_MAIN, "autopilot_next", _CONTENT_READ): 1,  # 10916
-    (_MAIN, "autopilot_voice_settings", _CONTENT_READ): 1,  # 11046
-    # 3d 回执重放
-    (_MAIN, "_technical_pause_replay", _CONTENT_READ): 1,  # 12351
-    (_MAIN, "_interaction_presentation_replay", _CONTENT_READ): 1,  # 12447
-    (_MAIN, "append_interaction_presentation", _CONTENT_READ): 1,  # 14940
-    (_MAIN, "commit_patient_pause", _CONTENT_READ): 1,  # 15284
-    (_MAIN, "commit_technical_pause", _CONTENT_READ): 1,  # 15405
     # 3e 握手、自动场切回、照护员
     (_MAIN, "live_put.authorize_and_apply", _CONTENT_READ): 1,  # 7681
     (_MAIN, "live_put.authorize_and_apply", _NEW): 1,  # 7681 的 LiveState(id=1, seq=0)

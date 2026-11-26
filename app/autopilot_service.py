@@ -32,7 +32,7 @@ from sqlmodel import Session, select
 
 from . import (autopilot_ledger, autopilot_plan_profiles, autopilot_positions,
                cloud_processing, content, evidence_ledger, patient_presentation,
-               repeat_intent, runtime)
+               repeat_intent, runtime, session_admission)
 from .autopilot_contract import (
     AutopilotAckIn,
     RecordCommandPayload,
@@ -840,7 +840,8 @@ def _require_live_binding(
     db: Session,
     train_session: TrainSession,
 ) -> None:
-    payload = _load_live_payload(db.get(LiveState, 1))
+    payload = _load_live_payload(
+        session_admission.live_row_for_session(db, train_session.session_id))
     live_session_id = payload.get("sessionId") or payload.get("session_id")
     expected_event = _enum_value(train_session.event_line)
     checks = {

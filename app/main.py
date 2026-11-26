@@ -9810,7 +9810,8 @@ def _revalidate_tts_after_provider(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, expected_snapshot[0])
         try:
             if _tts_authorization_snapshot(live, s) != expected_snapshot:
                 _raise_tts_authorization_changed()
@@ -9906,7 +9907,10 @@ def tts_speak(body: TtsSpeakIn, request: Request,
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        # 平板不带场次,按能力绑定的场次找它的槽;账号没有绑定,照旧读锚行。
+        live = session_admission.live_row_for_session(
+            s, _device_capability_session_id(request))
         _require_capability_current_live(
             request, s, "合成实时话术", live_row=live)
         live_session_id = _live_session_id(live)
@@ -9995,7 +9999,8 @@ def autopilot_command_tts(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_bound_session(
             request, session_id, "合成自动驾驶话术")
         _require_capability_current_live(
@@ -10060,7 +10065,8 @@ def rapport_utterance_tts(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_bound_session(
             request, session_id, "合成关系建立回应话术")
         _require_capability_current_live(
@@ -10398,7 +10404,8 @@ def autopilot_start(
                     "message": "当前场次不是可开始的 20 题本机模拟练习；仍可暂停、呼叫帮助或安全结束",
                 }) from exc
         _require_started_visit_plan_session(session_id, s, sess=sess)
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _runtime_row_for_update(session_id, s)
         # After object ownership and admission are proven, this metadata-only
         # gate still runs before any autopilot ownership or command row is
@@ -10479,7 +10486,8 @@ def autopilot_drain_ack(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_current_live(
             request, s, "回执自动驾驶收麦状态", live_row=live)
         # Lock order is LiveState -> capability -> SessionAutopilotState.
@@ -10514,7 +10522,8 @@ def autopilot_drain_target(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_current_live(
             request, s, "恢复自动驾驶收麦目标", live_row=live)
         # Preserve the write-plane ordering even though this projection itself
@@ -10776,7 +10785,8 @@ def autopilot_resume(
         _require_session_operator(
             request, sess, s, "恢复自动驾驶", mutation=True)
         _require_started_visit_plan_session(session_id, s, sess=sess)
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         runtime = _runtime_row_for_update(session_id, s)
         try:
             provider_readiness.require_resume_ready(s)
@@ -10857,7 +10867,8 @@ def autopilot_adjudicate(
         _require_session_operator(
             request, sess, s, "裁定自动带练题位", mutation=True)
         _require_started_visit_plan_session(session_id, s, sess=sess)
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         runtime = _runtime_row_for_update(session_id, s)
         auto_resume = True
         try:
@@ -10944,7 +10955,8 @@ def autopilot_next(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_bound_session(request, session_id, "读取自动驾驶命令")
         # One locked resolution, branched on directly — never on the shape of an
         # exception, and never via the unlocked resolver followed by a gate that
@@ -11074,7 +11086,8 @@ def autopilot_voice_settings(
     with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
         s.rollback()
         s.expire_all()
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         _require_capability_bound_session(request, session_id, "读取平板声音设置")
         # 与 next 同一次锁内复核、同一组 401 码。这里没有已落库的终态要收口,
         # 所以过期/仅恢复也直接拒,不进 next 的终态暂停分支。
@@ -12380,7 +12393,8 @@ def _technical_pause_receipt_payload(
 def _technical_pause_replay(
         s: DBSession, *, session_id: str, body: TechnicalPauseIn,
         request_hash: str) -> dict | None:
-    live = _live_row_for_update(s)
+    _live_row_for_update(s)
+    live = session_admission.live_row_for_session(s, session_id)
     receipt = s.exec(select(TechnicalPauseReceipt).where(
         TechnicalPauseReceipt.session_id == session_id,
         TechnicalPauseReceipt.idempotency_key == body.idempotency_key,
@@ -12476,7 +12490,8 @@ def _interaction_presentation_replay(
         request_hash: str) -> dict | None:
     # Keep the same LiveState -> evidence/receipt lock order as every fresh
     # presentation write, including the post-rollback race-recovery path.
-    live = _live_row_for_update(s)
+    _live_row_for_update(s)
+    live = session_admission.live_row_for_session(s, session_id)
     receipt = s.exec(select(InteractionPresentationReceipt).where(
         InteractionPresentationReceipt.session_id == session_id,
         InteractionPresentationReceipt.idempotency_key == idempotency_key,
@@ -14970,7 +14985,8 @@ def append_interaction_presentation(
     consume a cue that the server did not make available to the patient.
     """
     with _LIVE_WRITE_LOCK:
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         sess = s.get(TrainSession, session_id)
         if sess is None:
             raise HTTPException(404, "场次不存在")
@@ -15314,7 +15330,8 @@ def commit_patient_pause(
         _require_capability_bound_session(
             request, session_id, "暂停练习")
         _require_started_visit_plan_session(session_id, s, sess=sess)
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         if live is None:
             raise HTTPException(status_code=409, detail={
                 "code": "patient_pause_live_state_missing",
@@ -15435,7 +15452,8 @@ def commit_technical_pause(
         _require_started_visit_plan_session(session_id, s, sess=sess)
         # Match pause/abort across worker processes: the process-local mutex is
         # advisory only, while these database locks are authoritative.
-        live = _live_row_for_update(s)
+        _live_row_for_update(s)
+        live = session_admission.live_row_for_session(s, session_id)
         request_hash = _technical_pause_request_hash(session_id, body)
         replay = _technical_pause_replay(
             s, session_id=session_id, body=body,

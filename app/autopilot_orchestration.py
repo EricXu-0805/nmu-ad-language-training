@@ -22,7 +22,8 @@ from sqlalchemy import func, update
 from sqlmodel import Session, select
 
 from . import (autopilot_ledger, autopilot_plan_profiles, autopilot_positions,
-               autopilot_service, content, evidence_ledger, runtime)
+               autopilot_service, content, evidence_ledger, runtime,
+               session_admission)
 from .autopilot_contract import TtsCommandPayload
 from .enums import AudioStatus
 from .models import (
@@ -32,7 +33,6 @@ from .models import (
     AudioCaptureReceipt,
     AutopilotControlEvent,
     InteractionEvent,
-    LiveState,
     Patient,
     RuntimeCommand,
     RuntimeCommandAck,
@@ -678,7 +678,7 @@ def _legacy_interaction_facts(db: Session, attempt: AttemptEvent | None) -> obje
 
 def _legacy_live_binding(db: Session, train_session: TrainSession) -> dict:
     payload = autopilot_service._load_live_payload(  # noqa: SLF001
-        db.get(LiveState, 1))
+        session_admission.live_row_for_session(db, train_session.session_id))
     binding = {
         "sessionId": payload.get("sessionId") or payload.get("session_id"),
         "weekNo": payload.get("weekNo"),
