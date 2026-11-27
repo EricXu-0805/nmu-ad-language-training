@@ -179,39 +179,68 @@ test("a 2xx audioSaved without the server ledger receipt never deletes the local
 
 test("a foreign entry refused with 409 is not retried again within the same current session", async () => {
   // 2026-11-26 生产:平板上 4 段别场录音每次开麦前都被重传、每段 POST /audio 409 + audioSaved 409,
-  // 每轮开录从 ~1.7 s 拖到 ~5 s。同一场里拒过的不再重试;换场或刷新页面后照常重试,本机副本一直保留。
+  // 每轮开录从 ~1.7 s 拖到 ~5 s。同一场里试过的不再重试;换场或刷新页面后照常重试,本机副本一直保留。
   const log: string[] = [];
-  const refused = new Map<string, string>();
+  const attempted = new Map<string, string>();
   const d = deps(log, { saved: "409" });
   d.createAudio = async () => { log.push("createAudio"); throw conflict(); };
   const captured = entry({ phase: "captured" });
 
-  const first = await drainForeignOutboxEntries([captured], "S-NEW", d, refused);
+  const first = await drainForeignOutboxEntries([captured], "S-NEW", d, attempted);
   assert.deepEqual(first.map((r) => [r.outcome, r.reason]), [["kept", "http-409"]]);
   assert.deepEqual(log, ["createAudio", "audioSaved"]);
 
-  const second = await drainForeignOutboxEntries([captured], "S-NEW", d, refused);
-  assert.deepEqual(second.map((r) => [r.outcome, r.reason]), [["kept", "refused-this-session"]]);
+  const second = await drainForeignOutboxEntries([captured], "S-NEW", d, attempted);
+  assert.deepEqual(second.map((r) => [r.outcome, r.reason]), [["kept", "attempted-this-session"]]);
   assert.deepEqual(log, ["createAudio", "audioSaved"], "same session: no new requests");
 
-  const nextSession = await drainForeignOutboxEntries([captured], "S-NEXT", d, refused);
+  const nextSession = await drainForeignOutboxEntries([captured], "S-NEXT", d, attempted);
   assert.deepEqual(nextSession.map((r) => [r.outcome, r.reason]), [["kept", "http-409"]]);
   assert.deepEqual(log, ["createAudio", "audioSaved", "createAudio", "audioSaved"], "a new session retries");
   assert.ok(!log.includes("discard") && !log.includes("completeOutbox"), "the local copy is never removed");
 });
 
-test("transient failures are retried on the next record command of the same session", async () => {
+test("a concealed upload 404 followed by an audioSaved refusal is not retried within the same session", async () => {
+  // 2026-11-27 生产:89 入口那台平板留着 9-06 一场的录音,上传 404、audioSaved 409,
+  // 只认 409 的记忆漏掉了它,同一场每题开麦前都重传,前 9 题开录各等满软预算 8 s。
   const log: string[] = [];
-  const refused = new Map<string, string>();
-  const d = deps(log, {});
-  d.uploadAudioBlob = async () => { log.push("upload"); throw new TypeError("synthetic offline"); };
-  await drainForeignOutboxEntries([entry()], "S-NEW", d, refused);
-  await drainForeignOutboxEntries([entry()], "S-NEW", d, refused);
-  assert.deepEqual(log, ["upload", "upload"]);
-  assert.equal(refused.size, 0);
+  const attempted = new Map<string, string>();
+  const d = deps(log, { upload: "404", saved: "409" });
+  await drainForeignOutboxEntries([entry()], "S-NEW", d, attempted);
+  const again = await drainForeignOutboxEntries([entry()], "S-NEW", d, attempted);
+  assert.deepEqual(again.map((r) => [r.outcome, r.reason]), [["kept", "attempted-this-session"]]);
+  assert.deepEqual(log, ["upload", "audioSaved"]);
 });
 
-test("a refusal memo for one entry does not skip a different foreign entry", async () => {
+test("a transient failure is not retried within the same session either; the next session retries", async () => {
+  // 慢网上重试不会更快,只会让每题开麦前再等一轮软预算;清理推迟到下一场或刷新,本机副本照旧保留。
+  const log: string[] = [];
+  const attempted = new Map<string, string>();
+  const d = deps(log, {});
+  d.uploadAudioBlob = async () => { log.push("upload"); throw new TypeError("synthetic offline"); };
+  const first = await drainForeignOutboxEntries([entry()], "S-NEW", d, attempted);
+  assert.deepEqual(first.map((r) => [r.outcome, r.reason]), [["kept", "upload-failed"]]);
+  await drainForeignOutboxEntries([entry()], "S-NEW", d, attempted);
+  assert.deepEqual(log, ["upload"]);
+  await drainForeignOutboxEntries([entry()], "S-NEXT", d, attempted);
+  assert.deepEqual(log, ["upload", "upload"]);
+});
+
+test("a drain still in flight from an earlier record of the same session is skipped, not awaited", async () => {
+  const log: string[] = [];
+  const attempted = new Map<string, string>();
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const d = deps(log, { savedGate: gate });
+  const first = drainForeignOutboxEntries([entry()], "S-NEW", d, attempted);
+  const second = await drainForeignOutboxEntries([entry()], "S-NEW", d, attempted);
+  assert.deepEqual(second.map((r) => [r.outcome, r.reason]), [["kept", "attempted-this-session"]]);
+  release();
+  assert.deepEqual((await first).map((r) => r.outcome), ["server-saved"]);
+  assert.equal(log.filter((step) => step === "upload").length, 1);
+});
+
+test("an attempt memo for one entry does not skip a different foreign entry", async () => {
   const log: string[] = [];
   const refused = new Map<string, string>([["raw-old-000001", "S-NEW"]]);
   const d = deps(log, {});

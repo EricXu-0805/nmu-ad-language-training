@@ -114,29 +114,27 @@ async function drainOne(
 /**
  * 只清**别的场次**的条目;当前场次的由自动带练自己的恢复逻辑按命令核对。
  *
- * refusedThisSession(rawAudioId → 当时的 currentSessionId):服务端以 409 拒收的条目,
- * 同一场里不再重试。896ddfc 起这类条目与开麦共存,但每条录音命令开麦前都会重传一遍,
- * 每条约 1 秒(2026-11-26 生产 4 条,开录 ~1.7 s → ~5 s)。换到别的场次或刷新页面后照常重试;
- * 同一页面回到当初拒过它的场次不再重试,只是推迟清理。本机副本的去留规则不变(只认收据或精确 410)。
+ * attemptedThisSession(rawAudioId → 当时的 currentSessionId):同一场里每条只试一次,
+ * 不论结局(409 拒收、404 后 audioSaved 被拒、网络失败)都不再重试,后台还在跑的那次也不再等。
+ * 2026-11-26 生产 4 条 409 每题重传,开录 ~1.7 s → ~5 s;2026-11-27 一条上传 404、audioSaved 被拒,
+ * 只认 409 的记忆漏掉它,前 9 题开录各等满软预算 8 s。换到别的场次或刷新页面后照常重试;
+ * 本机副本的去留规则不变(只认收据或精确 410)。
  */
 export async function drainForeignOutboxEntries(
   entries: readonly AudioOutboxEntry[],
   currentSessionId: string,
   deps: ForeignOutboxDrainDeps,
-  refusedThisSession?: Map<string, string>,
+  attemptedThisSession?: Map<string, string>,
 ): Promise<ForeignOutboxDrainResult[]> {
   const results: ForeignOutboxDrainResult[] = [];
   for (const entry of entries) {
     if (entry.sessionId === currentSessionId) continue;
-    if (refusedThisSession?.get(entry.rawAudioId) === currentSessionId) {
-      results.push({ rawAudioId: entry.rawAudioId, outcome: "kept", reason: "refused-this-session" });
+    if (attemptedThisSession?.get(entry.rawAudioId) === currentSessionId) {
+      results.push({ rawAudioId: entry.rawAudioId, outcome: "kept", reason: "attempted-this-session" });
       continue;
     }
-    const result = await drainForeignOutboxEntry(entry, deps);
-    if (result.outcome === "kept" && result.reason === "http-409") {
-      refusedThisSession?.set(entry.rawAudioId, currentSessionId);
-    }
-    results.push(result);
+    attemptedThisSession?.set(entry.rawAudioId, currentSessionId);
+    results.push(await drainForeignOutboxEntry(entry, deps));
   }
   return results;
 }

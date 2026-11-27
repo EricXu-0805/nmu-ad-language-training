@@ -140,8 +140,8 @@ export interface AutopilotCaptureBootstrapPorts {
   ): VoiceActivityObservation;
 }
 
-// 页面级:同一场里服务端已 409 拒收的外场录音不再每题重传(见 drainForeignOutboxEntries)。
-const foreignOutboxRefusals = new Map<string, string>();
+// 页面级:同一场里每条外场录音只试一次,不每题重传(见 drainForeignOutboxEntries)。
+const foreignOutboxAttempts = new Map<string, string>();
 
 export const browserAutopilotCaptureBootstrapPorts: AutopilotCaptureBootstrapPorts = {
   now: () => performance.now(),
@@ -168,7 +168,7 @@ export const browserAutopilotCaptureBootstrapPorts: AutopilotCaptureBootstrapPor
       completeOutbox: (rawAudioId) => blobStore.completeOutbox(rawAudioId),
       discardTerminalOutbox: async (entry, disposition) => { await blobStore.discardTerminalOutbox(entry, disposition); },
       reportLocalCopyDisposal: (disposition) => api.putAudioDisposalConfirmed(disposition).then(() => undefined),
-    }, foreignOutboxRefusals);
+    }, foreignOutboxAttempts);
   },
   authorize: async (sessionId, commandKey, signal) => {
     // 中止后一律不发请求。dynamic import 前后各查一次：权限弹窗期间被判死的
@@ -293,8 +293,12 @@ export async function stageAndFinishExactCapture(
  * 但它们迟早会 settle，没人接就会变成 unhandled rejection。挂一条吞掉的续延，
  * 既不掀翻页面，也绝不让那次迟到的结果恢复任何续延。
  */
-/** 开麦前清旧账的软预算;小于 PRE_START_BUDGET_MS,给租约/prepare/授权留足余量。 */
-export const FOREIGN_DRAIN_SOFT_BUDGET_MS = 8_000;
+/**
+ * 开麦前清旧账的软预算;小于 PRE_START_BUDGET_MS,给租约/prepare/授权留足余量。
+ * 到点后清理照常在后台跑完,等它只为让快网上的清理赶在开麦前结束;慢网上多等只是让老人干等
+ * (2026-11-27 每场第一题开录 8.9 s),所以压到 3 s。
+ */
+export const FOREIGN_DRAIN_SOFT_BUDGET_MS = 3_000;
 
 function isolateLateSettlement(operation: Promise<unknown>): void {
   operation.catch(() => {});
