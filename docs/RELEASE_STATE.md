@@ -10,6 +10,20 @@
 > `docs/handover/七道门现状表.md`。
 
 
+## 2026-11-27 10:04 UTC 上线 `2ad3ff8`（平板慢网、训练台卡住、去掉「现在回答」）；10:05 UTC 网关换成 Caddy v2.11.9
+
+- 起因：11-27 北京下午三场自动带练 7 次 `audio_playback_failed / fetch_failed` 暂停，全在 14:27 平板和电脑从手机移动网换到另一条网络之后。失败的都是 430–707 KB 的 tell_answer 长句 WAV，服务器 0.13 s 交出（网关记 `H3_REQUEST_CANCELLED`），平板固定 10/3.5/3.5 s 下不完；同一网上 400 KB 以下全部成功，8 月以来从未出现 `fetch_failed`。另有每场前几题开录 8.9 s：89 入口那台平板留着 9-06 一场的录音，上传 404、audioSaved 被拒，#57 只认 409，每题都重传并等满 8 s。现场还反映「后台突然出问题、老人端还在继续」，并要求去掉「现在回答」。
+- 实际发布 `2ad3ff824359cb83dd6a29fea31887c18c38e0b3`（[PR #61](https://github.com/EricXu-0805/nmu-ad-language-training/pull/61)，同 SHA 快进 main），前版 `afbe766`。PR CI `45976198517` 五项全过；网页与产物来自 main/push CI `45977973430`（image、supply-chain 成功）。只换网页目录与 `scripts/run-caregiver-demo20.sh`，`app/` 零改动，不停 nmu、不迁移（库头仍 `a7c3e9d2b641`）。工具为 PM 目录 298（295 那套改基线）。维护约 1 分钟；box A 经自己的公网地址与 Mac 经真实 DNS 两路各核 32 项，两个入口逐字节对上 CI 网页。部署树 890 源码 / 25 网页，快照 `20261127-100359`，回执 `/opt/nmu/release-298-20261127-100255/final-release.json`，部署索引 SHA `f3fcd8098e409c5a9747f888c8cc0dbd63fc65f1c6971392d11c2d32380e8cf9`，网页清单 `5cc235b87f3d2720ddcfeaabedac4f91ea1cd86b8037ab34ec465a860f3ebb21`。
+- 内容：小语语音正文按进度续期（断流 8 s 才失败、整句预算 45 s、起播期限 20 → 50 s）；外场旧录音每场只试一次、在途不等、软预算 8 → 3 s；平板去掉「现在回答」（声音打断保留）；训练台自动带练状态轮询单次失败不再卸人工面板，恢复人工控制失败按退避自动重试，没做云处理授权时预先禁用启动、床旁激活不再延后自启。两轮独立复核加变异回放。
+- 10:05 UTC 换网关（PM 目录 292）：`/usr/local/bin/caddy` 由 `ab477e9e…` 换成 `77b989639fa13c9f96e4131526db47bf691a6719ecec144a2fbff3c1d85c17bc`（Caddy v2.11.9、Go 1.26.11、compress v1.20.2；制品出自 `4bc07d6` 的 main push CI `44695450145`），旧的留在 `/opt/nmu/caddy-before-292-20261127-100515`。Caddyfile 不变（`ffc22bbc…`）。重启后 UDP 443 套接字缓冲由 425984 变为 14680064（11-21 的 286 已把 `net.core.rmem_max/wmem_max` 调到 7500000）。两入口 `/health` 200、`/docs` 404，静态 JS 的 gzip/immutable 前后一致。
+- 没做的：TTS 音频仍是未压缩 WAV（服务器无编码器，压缩要加依赖、重启后端）；uvicorn keep-alive 与网关空闲连接竞态造成的偶发 502、无 AI 场次的 drain-target 可重试码、`autopilot/start` 409 不记拒因，三处后端改动随下次应用发布。慢网上长句仍可能十几秒才开播，只是不再整场暂停；现场改善待下周一实测。
+
+## 2026-11-26 生产变更：平板凭据 120 分钟、上线 `afbe766`、南医大账号改管理员
+
+- 03:16 UTC（PM 目录 294）：`/opt/nmu/app/.env` 末尾加 `DEVICE_CAPABILITY_TTL_MINUTES=120`（原默认 45 分钟，到期后同设备重新挂接被当成轮换、多要素段自动暂停）。备份 `/root/nmu-294-20261126-031558/env.before`；nmu 重启 MainPID 43460 → 108137，9 秒健康，进程环境核到 TTL=120。重启前 0 场进行中。
+- 20:30 UTC（PM 目录 295）：上线 `afbe7663d3225fc162e51e5ce62fd2296323ad35`（PR #57 外场旧录音同一场 409 拒过不再重传；#58/#59 CI 网关冒烟稳定性；#60 研究员账号准备区接受服务端隐去的已开训安排），前版 `5d4fb7b`，main/push CI `45763755385`。只换网页目录与 11 个构建/维护/CI 文件，`app/` 零改动，不停 nmu。维护中 503 插在站点级 `route{}` 第一行（生产 Caddyfile 自 11-12 起所有处理都在 route 内）。两路各核 32 项；快照 `20261126-202946`，回执 `/opt/nmu/release-295-20261126-202851/final-release.json`，部署索引 SHA `d5bef4f26f557c53e2365cc33d0fec38fe563ec80637c64d08486b9601809e39`。
+- 20:31 UTC（PM 目录 297）：账号 `nmu`（南医大）角色 researcher → admin，按 Eric 定的「三个号都用管理员」；只改这一行，角色每次请求现读，不吊销会话。备份 `/root/nmu-297-20261126-203152/researchuser-nmu.before.json`。
+
 ## 2026-11-20 生产维护：nmu 换新库、清 198、网关换成 Go 1.26.11 / compress v1.20.2（应用源码仍 `5d4fb7b`，网页仍 `00e7a3a`）
 
 - 起因：11-16 21:50 UTC 每周 OS 检查失败并发 Discord。11-13 18:04 UTC 夜间补丁装了 libc6 2.35-0ubuntu3.18，needrestart 只列不重启，nmu、nginx 仍映射旧库；安全积压 0。nginx 11-19 18:03 UTC 随自身更新重启，已换新。
