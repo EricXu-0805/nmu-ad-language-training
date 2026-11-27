@@ -1600,6 +1600,8 @@ def start_plan(
     assert_patient_ready_for_new_work(db, plan.patient_id)
     if _linked_session(db, plan.plan_id) is not None:
         _fail(409, "visit_plan_session_conflict", "该安排已关联场次")
+    session_admission.assert_bedside_can_open(
+        db, patient_id=plan.patient_id, trainer_id=actor_id)
 
     # A successful caregiver replay is already an immutable result and remains
     # available even if the provider later becomes unavailable.  For a new
@@ -1643,7 +1645,10 @@ def start_plan(
         session_id=session_id,
         status="active",
         revision=0,
-        updated_at=observed_at,
+        # 场次活动时钟和判据 session_admission.runtime_stale、其余写入方一样用本机
+        # naive 时间。写 UTC 的话,生产进程 TZ=Asia/Shanghai 下刚开的场就像放了 8 小时,
+        # 「一个账号一次一场」当场失效。
+        updated_at=now or datetime.now(),
     )
     db.add(train_session)
     db.add(runtime)

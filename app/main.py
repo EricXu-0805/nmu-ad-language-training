@@ -146,6 +146,7 @@ async def _workflow_policy_violation_response(
 _BEDSIDE_SLOT_ERROR_MESSAGES = {
     "bedside_slot_conflict": "床旁槽状态冲突，本次操作没有执行，请联系管理员处理",
     "bedside_slots_full": "两个床位都在使用中，请等其中一场中止或最终完成后再开（暂停不会腾出床位）",
+    "bedside_autopilot_running": "这张床的 AI 自动带练还在进行，请先暂停那一场、等老人端收麦后再开新的一场",
 }
 
 
@@ -5506,23 +5507,6 @@ def _new_bedside_slot_row(slot_id: int) -> LiveState:
     return LiveState(id=slot_id, seq=0)
 
 
-def _bedside_slot_views(
-        s: DBSession, rows: dict[int, LiveState | None],
-) -> list[session_admission.BedsideSlotView]:
-    views = []
-    for slot_id, row in rows.items():
-        holder = _live_session_id(row)
-        held = s.get(TrainSession, holder) if holder else None
-        held_runtime = s.get(SessionRuntimeState, holder) if held is not None else None
-        views.append(session_admission.BedsideSlotView(
-            slot_id=slot_id, session_id=holder, session_exists=held is not None,
-            status=held_runtime.status if held_runtime is not None else None,
-            stale=session_admission.live_slot_stale(row),
-            patient_id=held.patient_id if held is not None else None,
-            trainer_id=held.trainer_id if held is not None else None))
-    return views
-
-
 def _choose_bedside_slot(
         s: DBSession, sess: TrainSession,
         purpose: Literal["handshake", "autopilot_return"],
@@ -5533,7 +5517,7 @@ def _choose_bedside_slot(
     if slot_count == 1:
         return 1, rows[1]
     choice = session_admission.choose_bedside_slot(
-        _bedside_slot_views(s, rows), session_id=sess.session_id,
+        session_admission.bedside_slot_views(s, rows), session_id=sess.session_id,
         patient_id=sess.patient_id, trainer_id=sess.trainer_id,
         slot_count=slot_count, purpose=purpose)
     return choice.slot_id, rows[choice.slot_id]
@@ -7370,6 +7354,7 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
     if body.kind in access_policy.DEVICE_LIVE_WRITE_KINDS:
         _require_capability_bound_session(
             request, _payload_session_id(body.payload), "上报录音状态")
+    takeover_audits: list[tuple[str, str]] = []
 
     def apply(row: LiveState) -> tuple[
             LiveState, int | None, AudioCaptureReceipt | None, bool]:
@@ -7421,10 +7406,12 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                                     _autopilot_integrity_conflict(s, exc)
                                 _pause_runtime_in_transaction(
                                     previous_session_id, s)
-                            _audit(s, request, "bedside_slot_stale_takeover",
-                                   f"from={previous_session_id};"
-                                   f"status={prev_status};to={session_id}",
-                                   session_id=session_id)
+                            # fence 已在本事务里写库;审计用独立会话,现在记会等满
+                            # busy_timeout 再丢掉,期间两床的 live 写都在排队。提交后再记。
+                            takeover_audits.append((
+                                f"from={previous_session_id};"
+                                f"status={prev_status};to={session_id}",
+                                session_id))
                         else:
                             # 仍新鲜(active/paused/intervention_completed 且槽在动):
                             # 维持保护,切槽要上一场操作权。
@@ -7432,6 +7419,10 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                                 request, previous, s, "切换当前床旁场次",
                                 mutation=True,
                                 allow_withdrawn_safety_exit=True)
+                            if session_admission.autopilot_still_running(
+                                    s, previous_session_id):
+                                raise session_admission.BedsideSlotError(
+                                    "bedside_autopilot_running")
             else:
                 sess = s.get(TrainSession, session_id)
                 if not sess:
@@ -7838,6 +7829,7 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
         # All device live writes lock LiveState before the capability row.  For
         # audioSaved the enclosing order is raw-id -> byte quota -> live -> cap ->
         # asset, identical to upload/delete and safe across PostgreSQL workers.
+        takeover_audits.clear()
         _live_row_for_update(s)
         # 本场所在的槽;握手在 apply 里另行选槽。
         locked_live = (session_admission.live_row_for_session(
@@ -7882,6 +7874,9 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
             row, command_wseq, capture_receipt, receipt_idempotent = applied
             s.commit()
         s.refresh(row)
+    for summary, audited_session_id in takeover_audits:
+        _audit(s, request, "bedside_slot_stale_takeover", summary,
+               session_id=audited_session_id)
     result = {"seq": row.seq}
     if command_wseq is not None:
         result["wseq"] = command_wseq
@@ -8241,7 +8236,8 @@ def live_console_get(request: Request, session_id: str | None = None,
     """研究者端完整实时快照；配置 CONSOLE_PIN 时由中间件保护。
 
     带 session_id 读这一场所在的槽(先核这一场的读权限);不带时两床并行读本人场次
-    所在的槽,不带参数的旧页面因此不会读到另一床。认不出、或本场不在任何槽里,照旧读 1 号槽。
+    所在的槽。两床时认不出、或本场不在任何槽里,回空快照:管理员对任何场次都有读权,
+    回落到 1 号槽会把另一床的现场给出去(两床彩排 2026-11-27 实证)。单床照旧读 1 号槽。
     """
     if session_id is not None:
         requested = s.get(TrainSession, session_id)
@@ -8251,6 +8247,9 @@ def live_console_get(request: Request, session_id: str | None = None,
     else:
         session_id = _own_bedside_session_id(request, s)
     row = session_admission.live_row_for_session(s, session_id)
+    if (session_admission.bedside_slot_count() == 2
+            and (session_id is None or _live_session_id(row) != session_id)):
+        row = None
     live_session_id = _live_session_id(row)
     if live_session_id:
         sess = s.get(TrainSession, live_session_id)
@@ -11370,6 +11369,13 @@ def autopilot_command_ack(
                 # 人工接管、账号恢复之后到达,不能把已经 active 的人工场次再按回暂停;
                 # 场次已中止/已结束的也不碰(_ensure_runtime_writable 会 409,回执反而落不下)。
                 _pause_runtime_in_transaction(session_id, s)
+            runtime = s.get(SessionRuntimeState, session_id)
+            if not result.replayed and runtime is not None and runtime.status == "active":
+                # 自动带练时研究者不碰控制台,平板的新回执就是这场还在跑的证据。不续的话
+                # 准入闸会把正在跑的场当成放置超时,放同一受试者或同一账号再开一场。
+                # 只动活动时钟,不动 revision:控制台的 expected_revision 不受影响。
+                runtime.updated_at = datetime.now()
+                s.add(runtime)
             s.commit()
         except autopilot_service.AutopilotServiceError as exc:
             _autopilot_write_failure(s, exc)

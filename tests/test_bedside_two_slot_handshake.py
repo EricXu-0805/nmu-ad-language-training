@@ -874,7 +874,9 @@ def test_console_state_defaults_to_the_callers_own_slot(beds):
         assert state.json()["session"]["sessionId"] == session_id
         explicit = client.get("/live/console-state", params={"session_id": session_id})
         assert explicit.json() == state.json()
-    assert beds.c.get("/live/console-state").json()["session"]["sessionId"] == S_A
+    # 不占床的管理员不带参数读:回空快照,不回落到 1 号槽读到另一床(两床彩排 2026-11-27)。
+    unseated = beds.c.get("/live/console-state")
+    assert unseated.status_code == 200 and unseated.json()["session"] is None
     supervised = beds.c.get("/live/console-state", params={"session_id": S_B})
     assert supervised.json()["session"]["sessionId"] == S_B
     # 别人的场次不论在不在床旁、根本不存在,回的都是同一个 404:不能借回落到 1 号槽

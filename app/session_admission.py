@@ -12,7 +12,8 @@ from sqlmodel import Session
 
 from . import content
 from .enums import ConsentType, EventLine, PhaseType
-from .models import LiveState, Patient
+from .models import LiveState, Patient, SessionAutopilotState, SessionRuntimeState
+from .models import Session as TrainSession
 
 
 _CONSENT_GRANTED = frozenset({
@@ -253,7 +254,8 @@ def bedside_slot_count() -> int:
 class BedsideSlotError(Exception):
     """选槽 fail closed。只带闭集 code,不带场次或受试者标识。"""
 
-    def __init__(self, code: Literal["bedside_slot_conflict", "bedside_slots_full"]):
+    def __init__(self, code: Literal[
+            "bedside_slot_conflict", "bedside_slots_full", "bedside_autopilot_running"]):
         super().__init__(code)
         self.code = code
 
@@ -358,6 +360,58 @@ def bedside_slot_rows(db: Session, slot_count: int | None = None) -> dict[int, L
     """
     count = bedside_slot_count() if slot_count is None else slot_count
     return {slot_id: db.get(LiveState, slot_id) for slot_id in range(1, count + 1)}
+
+
+def bedside_slot_views(db: Session, rows: dict[int, LiveState | None]) -> list[BedsideSlotView]:
+    """把各槽的行读成 choose_bedside_slot 要的现状。只读。"""
+    views = []
+    for slot_id, row in rows.items():
+        holder = _slot_session_id(row)
+        held = db.get(TrainSession, holder) if holder else None
+        held_runtime = db.get(SessionRuntimeState, holder) if held is not None else None
+        views.append(BedsideSlotView(
+            slot_id=slot_id, session_id=holder, session_exists=held is not None,
+            status=held_runtime.status if held_runtime is not None else None,
+            stale=live_slot_stale(row),
+            patient_id=held.patient_id if held is not None else None,
+            trainer_id=held.trainer_id if held is not None else None))
+    return views
+
+
+_AUTOPILOT_STOPPED_STATUSES = frozenset({"paused", "failed", "scope_completed"})
+
+
+def autopilot_still_running(db: Session, session_id: str) -> bool:
+    """这一场的 AI 自动带练是否还在跑:runtime 仍 active,自动驾驶仍是 autonomous 且没停。
+
+    还在跑的场不能被开场或握手换走:换走后它仍是 active、服务端仍按它出题,平板却被挪去
+    新场,正在录的回答被掐断(两床彩排 2026-11-27 stale2 实证,N=1 一样)。没有 runtime
+    行照今天按 active 算。
+    """
+    runtime = db.get(SessionRuntimeState, session_id)
+    if runtime is not None and runtime.status != "active":
+        return False
+    control = db.get(SessionAutopilotState, session_id)
+    return (control is not None and control.mode == "autonomous"
+            and control.status not in _AUTOPILOT_STOPPED_STATUSES)
+
+
+def assert_bedside_can_open(db: Session, *, patient_id: str, trainer_id: str | None) -> None:
+    """开场前先看新场次握手时会不会被拒,会被拒就在建场次之前回 409,不留没有床位的场次。
+
+    只拦两种:两床都被别人占着(bedside_slots_full),或要占的那张床上 AI 自动带练还在跑
+    (bedside_autopilot_running)。其余照旧交给握手,握手加锁后还会再选一次。
+    """
+    slot_count = bedside_slot_count()
+    rows = bedside_slot_rows(db, slot_count)
+    views = bedside_slot_views(db, rows)
+    choice = choose_bedside_slot(
+        views, session_id="", patient_id=patient_id, trainer_id=trainer_id,
+        slot_count=slot_count, purpose="handshake")
+    holder = views[choice.slot_id - 1].session_id
+    if (choice.action == "protected" and holder
+            and autopilot_still_running(db, holder)):
+        raise BedsideSlotError("bedside_autopilot_running")
 
 
 def live_rows_for_session(db: Session, session_id: str | None) -> list[LiveState]:
