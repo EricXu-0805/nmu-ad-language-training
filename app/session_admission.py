@@ -362,17 +362,32 @@ def bedside_slot_rows(db: Session, slot_count: int | None = None) -> dict[int, L
     return {slot_id: db.get(LiveState, slot_id) for slot_id in range(1, count + 1)}
 
 
+def live_rows_for_session(db: Session, session_id: str | None) -> list[LiveState]:
+    """本场所在的每一个床旁槽的行,按槽号;不在任何槽里回空表。只读,不加锁,不建行。
+
+    同一场写在两槽属违例(代码退回单槽版再开两床时会留下),这里不报错:停麦、终态和
+    撤回投影要落到每一份上,不能因为违例停不下来。N=1 只看锚行。
+    """
+    if not session_id:
+        return []
+    return [row for row in bedside_slot_rows(db).values()
+            if live_holder_session_id(row) == session_id]
+
+
 def live_row_for_session(db: Session, session_id: str | None) -> LiveState | None:
     """本场所在床旁槽的行;本场不在任何槽里就回锚行(id=1)。只读,不加锁,不建行。
 
     N=1 恒回锚行,和今天的 s.get(LiveState, 1) 一样;回锚行时调用方现有的
-    「_live_session_id(row) != sid」判断原样生效。同一场命中两槽属违例,fail closed。
+    「_live_session_id(row) != sid」判断原样生效。同一场命中两槽属违例,fail closed;
+    停的路径改用 live_rows_for_session。
     """
-    anchor = db.get(LiveState, 1)
-    rows = [anchor, *(db.get(LiveState, slot_id)
-                      for slot_id in range(2, bedside_slot_count() + 1))]
-    found = [row for row in rows
-             if session_id and live_holder_session_id(row) == session_id]
+    found = live_rows_for_session(db, session_id)
     if len(found) > 1:
         raise BedsideSlotError("bedside_slot_conflict")
-    return found[0] if found else anchor
+    return found[0] if found else db.get(LiveState, 1)
+
+
+def first_live_row_for_session(db: Session, session_id: str | None) -> LiveState | None:
+    """停的路径要核对或回报的那一份:本场所在的第一个槽,不在任何槽里回锚行。违例不报错。"""
+    found = live_rows_for_session(db, session_id)
+    return found[0] if found else db.get(LiveState, 1)

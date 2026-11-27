@@ -1703,9 +1703,9 @@ def withdraw_patient(
                 runtime_state.revision += 1
                 runtime_state.updated_at = now
                 s.add(runtime_state)
-                live = session_admission.live_row_for_session(s, sess.session_id)
-                if _project_subject_withdrawal_to_live(live, sess.session_id, now):
-                    projected_live.append(live)
+                for live in session_admission.live_rows_for_session(s, sess.session_id):
+                    if _project_subject_withdrawal_to_live(live, sess.session_id, now):
+                        projected_live.append(live)
 
             capabilities = list(s.exec(select(PatientDeviceCapability).where(
                 PatientDeviceCapability.session_id == sess.session_id,
@@ -8378,8 +8378,10 @@ def _pause_runtime_in_transaction(session_id: str, s: DBSession) -> SessionRunti
         return state
 
     _live_row_for_update(s)
-    live = session_admission.live_row_for_session(s, session_id)
-    live_is_current = bool(live and _live_session_id(live) == session_id)
+    # 同一场写在两槽属违例,暂停照样要停:第一份照旧和 runtime 共用 wseq,其余每份随后收麦。
+    held = session_admission.live_rows_for_session(s, session_id)
+    live = held[0] if held else None
+    live_is_current = live is not None
     cursor = _json_load(state.cursor_json) or (
         _json_load(live.cursor_json) if live_is_current and live else None)
     if cursor:
@@ -8422,7 +8424,28 @@ def _pause_runtime_in_transaction(session_id: str, s: DBSession) -> SessionRunti
         live.seq += 1
         live.updated_at = now
         s.add(live)
+    for copy in held[1:]:
+        _project_pause_to_live_copy(copy, state, now)
+        s.add(copy)
     return state
+
+
+def _project_pause_to_live_copy(
+        row: LiveState, state: SessionRuntimeState, now: datetime) -> None:
+    """同一场的另一份床旁行照第一份收麦;wseq 按这一行自己分配。"""
+    cursor = _json_load(state.cursor_json) or _json_load(row.cursor_json)
+    if cursor:
+        row.cursor_json = _json.dumps(
+            _pause_projection(cursor, _allocate_live_wseq(row)), ensure_ascii=False)
+    rapport = _json_load(state.rapport_json) or _json_load(row.rapport_json)
+    if rapport:
+        projected = warmup.quiesce(_safe_rapport(rapport))
+        projected.update({"recording": "stopped", "paused": True,
+                          "wseq": _allocate_live_wseq(row)})
+        row.rapport_json = _json.dumps(projected, ensure_ascii=False)
+    _set_live_session_paused(row, True)
+    row.seq += 1
+    row.updated_at = now
 
 
 @app.post("/sessions/{session_id}/pause")
@@ -8589,8 +8612,10 @@ def _assess_rapport_completion(
     script = content.load_week1_script(content.CONTENT_DIR / "week1_script.json")
     state = s.exec(select(SessionRuntimeState).where(
         SessionRuntimeState.session_id == sess.session_id)).first()
-    live = session_admission.live_row_for_session(s, sess.session_id)
-    live_is_current = live is not None and _live_session_id(live) == sess.session_id
+    # 同一场写在两槽属违例:结束与最终完成不因此 409,按第一份取位置,任何一份还在录都不收口。
+    held = session_admission.live_rows_for_session(s, sess.session_id)
+    live = held[0] if held else None
+    live_is_current = live is not None
     rapport_position = (_json_load(state.rapport_json) if state else None) or (
         _json_load(live.rapport_json) if live_is_current and live else None)
     # 耐久快照恒为 idle(_safe_rapport)；实时录音指令真值只在 live 槽仍属本场次时可读。
@@ -8604,6 +8629,14 @@ def _assess_rapport_completion(
         and live_patient_rec.get("active") is True
         and _payload_session_id(live_patient_rec) in (None, sess.session_id)
     )
+    for copy in held[1:]:
+        copy_recording = (_json_load(copy.rapport_json) or {}).get("recording")
+        if copy_recording not in (None, "idle"):
+            live_recording_state = copy_recording
+        copy_rec = _json_load(copy.patient_rec_json)
+        patient_rec_active = patient_rec_active or bool(
+            isinstance(copy_rec, dict) and copy_rec.get("active") is True
+            and _payload_session_id(copy_rec) in (None, sess.session_id))
     audios = list(s.exec(select(AudioAssetRow).where(
         AudioAssetRow.session_id == sess.session_id)))
     scoring_item_count = len(list(s.exec(select(ItemEvent.id).where(
@@ -8853,6 +8886,15 @@ def _project_terminal_to_live(live: LiveState | None, sess: TrainSession,
     return True
 
 
+def _project_terminal_to_held_live(s: DBSession, sess: TrainSession,
+                                   state: SessionRuntimeState,
+                                   plan: runtime.SessionPlan) -> None:
+    """终态投影落到本场所在的每一个床旁槽;同一场写在两槽属违例,终态不因此 409。"""
+    for live in session_admission.live_rows_for_session(s, sess.session_id):
+        if _project_terminal_to_live(live, sess, state, plan):
+            s.add(live)
+
+
 _AUTOPILOT_AUTOFINISH_ERROR = "intervention_completion_evidence_incomplete"
 
 
@@ -8860,7 +8902,6 @@ def _finalize_completed_autopilot_scope_core(
         s: DBSession,
         *,
         session_id: str,
-        live: LiveState | None,
 ) -> tuple[
         Literal["already", "failed", "finished"],
         SessionAutopilotState | None,
@@ -8921,10 +8962,8 @@ def _finalize_completed_autopilot_scope_core(
     runtime_state.intervention_ended_by = "SERVER-AUTOPILOT"
     runtime_state.revision += 1
     runtime_state.updated_at = now
-    live_changed = _project_terminal_to_live(live, sess, runtime_state, plan)
+    _project_terminal_to_held_live(s, sess, runtime_state, plan)
     s.add(runtime_state)
-    if live_changed and live is not None:
-        s.add(live)
     s.flush()
     return "finished", None, assessment
 
@@ -8933,7 +8972,6 @@ def _autofinalize_completed_autopilot_scope(
         s: DBSession,
         *,
         session_id: str,
-        live: LiveState | None,
         ack_result: autopilot_service.ApplyDeviceAckResult,
 ) -> tuple[autopilot_service.ApplyDeviceAckResult,
            session_completion.InterventionCompletionAssessment | None]:
@@ -8947,7 +8985,7 @@ def _autofinalize_completed_autopilot_scope(
     if ack_result.status != "scope_completed":
         return ack_result, None
     outcome, failed_control, assessment = _finalize_completed_autopilot_scope_core(
-        s, session_id=session_id, live=live)
+        s, session_id=session_id)
     if outcome == "failed":
         assert failed_control is not None
         return ack_result.model_copy(update={
@@ -9014,11 +9052,8 @@ def finish_intervention(session_id: str, request: Request,
         state.revision += 1
         state.updated_at = now
         _live_row_for_update(s)
-        live = session_admission.live_row_for_session(s, session_id)
-        live_changed = _project_terminal_to_live(live, sess, state, plan)
+        _project_terminal_to_held_live(s, sess, state, plan)
         s.add(state)
-        if live_changed and live is not None:
-            s.add(live)
         s.commit()
         s.refresh(state)
 
@@ -9323,12 +9358,9 @@ def complete_session(session_id: str, request: Request, s: DBSession = Depends(g
         closeout.updated_at = now
         closeout.revision += 1
         _live_row_for_update(s)
-        live = session_admission.live_row_for_session(s, session_id)
-        live_changed = _project_terminal_to_live(live, sess, state, plan)
+        _project_terminal_to_held_live(s, sess, state, plan)
         s.add(state)
         s.add(closeout)
-        if live_changed and live is not None:
-            s.add(live)
         s.commit()
         s.refresh(state)
 
@@ -9482,7 +9514,6 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
         # Runtime.  Every fact checked above is repeated against the locked
         # runtime row before any staged fence is committed.
         _live_row_for_update(s)
-        live = session_admission.live_row_for_session(s, session_id)
         now = datetime.now()
         try:
             autopilot_service.fence_autonomous_scope_for_external_stop(
@@ -9530,10 +9561,8 @@ def abort_session(session_id: str, body: AbortSessionIn, request: Request,
         state.revision += 1
         state.updated_at = now
         plan = _session_plan_for_runtime(sess)
-        live_changed = _project_terminal_to_live(live, sess, state, plan)
+        _project_terminal_to_held_live(s, sess, state, plan)
         s.add(state)
-        if live_changed and live is not None:
-            s.add(live)
         s.commit()
         s.refresh(state)
 
@@ -11310,7 +11339,6 @@ def autopilot_command_ack(
             result, intervention_assessment = _autofinalize_completed_autopilot_scope(
                 s,
                 session_id=session_id,
-                live=live,
                 ack_result=result,
             )
             if (body.ack_type in ("record_failed", "tts_failed")
@@ -12552,7 +12580,7 @@ def _technical_pause_replay(
         s: DBSession, *, session_id: str, body: TechnicalPauseIn,
         request_hash: str) -> dict | None:
     _live_row_for_update(s)
-    live = session_admission.live_row_for_session(s, session_id)
+    live = session_admission.first_live_row_for_session(s, session_id)
     receipt = s.exec(select(TechnicalPauseReceipt).where(
         TechnicalPauseReceipt.session_id == session_id,
         TechnicalPauseReceipt.idempotency_key == body.idempotency_key,
@@ -14304,7 +14332,6 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
         with _LIVE_WRITE_LOCK, device_capability.serialized_mutation():
             with DBSession(db.engine) as route_db:
                 _live_row_for_update(route_db)
-                live_row = session_admission.live_row_for_session(route_db, session_id)
                 route_result = autopilot_service.route_completed_attempt(
                     route_db,
                     session_id=session_id,
@@ -14315,7 +14342,7 @@ def _run_p0a_attempt_worker(session_id: str) -> None:
                     # TTS ACK, so the bedside terminal fact is finalized here,
                     # in the same transaction as the scope completion route.
                     _finalize_completed_autopilot_scope_core(
-                        route_db, session_id=session_id, live=live_row)
+                        route_db, session_id=session_id)
                 route_db.commit()
     except Exception:
         # If a concurrent worker already routed, this no-ops because state is no
@@ -15611,7 +15638,8 @@ def commit_technical_pause(
         # Match pause/abort across worker processes: the process-local mutex is
         # advisory only, while these database locks are authoritative.
         _live_row_for_update(s)
-        live = session_admission.live_row_for_session(s, session_id)
+        # 技术暂停是停的路径:同一场写在两槽时按第一份核对和回报,两份都收麦。
+        live = session_admission.first_live_row_for_session(s, session_id)
         request_hash = _technical_pause_request_hash(session_id, body)
         replay = _technical_pause_replay(
             s, session_id=session_id, body=body,

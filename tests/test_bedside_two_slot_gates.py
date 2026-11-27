@@ -15,14 +15,14 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlmodel import Session, SQLModel
+from sqlmodel import Session, SQLModel, select
 
 from app import (auth, autopilot_orchestration, autopilot_service, db,
                  device_capability, main as main_module, session_completion)
 from app.enums import ConsentType, EventLine, PhaseType
 from app.main import app
-from app.models import (LiveState, Patient, ResearchUser, SessionCloseoutReport,
-                        SessionRuntimeState)
+from app.models import (LiveState, Patient, PatientDeviceCapability, ResearchUser,
+                        SessionCloseoutReport, SessionRuntimeState)
 from app.models import Session as TrainSession
 from app.runtime import PlanItem, PlanTurn, SessionPlan
 
@@ -547,6 +547,168 @@ def test_withdrawal_stops_only_the_withdrawn_subjects_slot(beds):
     assert (cursor["screen"], cursor["recording"]) == ("thanks", "stopped")
     assert row.patient_rec_json is None
     assert _raw_slot(beds.engine, 1) == untouched
+
+
+# ---------------- 3b' 同一场写在两槽:停的路径照样停,两份都投影 ----------------
+# 代码退回 main 时 2 号行还留着本场,旧代码又把本场握手进 1 号行,再开两床就是这个状态。
+# 平板和握手照旧 409;暂停、技术暂停、中止、结束、最终完成、P0a 自动收尾和撤回不能因此停不下来。
+
+def _copy_slot_two_into_slot_one(engine) -> None:
+    with Session(engine) as s:
+        one, two = s.get(LiveState, 1), s.get(LiveState, 2)
+        for name in _SLOT_COLUMNS:
+            setattr(one, name, getattr(two, name))
+        s.add(one)
+        s.commit()
+
+
+def _assert_both_slots(assertion, engine, *args) -> None:
+    for slot_id in (1, 2):
+        assertion(engine, slot_id, *args)
+
+
+@pytest.mark.parametrize("route", ["pause", "technical_pause"])
+def test_pause_stops_both_copies_of_a_session_written_into_two_slots(beds, route):
+    _copy_slot_two_into_slot_one(beds.engine)
+    if route == "pause":
+        def send():
+            return beds.researcher_b.post(f"/sessions/{SESSION_B}/pause")
+    else:
+        body = _technical_pause_body(beds, "bed-b-dup-technical-pause-0001")
+
+        def send():
+            return beds.researcher_b.post(
+                f"/sessions/{SESSION_B}/technical-pause", json=body)
+
+    paused = send()
+
+    assert paused.status_code == 200, paused.text
+    _assert_both_slots(_assert_stop_projection, beds.engine, SESSION_B)
+    with Session(beds.engine) as s:
+        assert s.get(SessionRuntimeState, SESSION_B).status == "paused"
+    replay = send()
+    assert replay.status_code == 200, replay.text
+    if route == "technical_pause":
+        assert replay.json()["idempotent"] is True
+        assert replay.json()["seq"] == paused.json()["seq"]
+    # 设备侧照旧 fail closed:这台平板该读哪一份说不清。
+    live = beds.client.get("/live/state", headers=beds.tablet_b)
+    assert (live.status_code, _code(live)) == (409, "bedside_slot_conflict")
+
+
+def test_abort_projects_thanks_into_both_copies(beds):
+    _copy_slot_two_into_slot_one(beds.engine)
+
+    aborted = beds.researcher_b.post(f"/sessions/{SESSION_B}/abort", json={
+        "reason_code": "technical_failure",
+        "expected_revision": _runtime_revision(beds.engine, SESSION_B),
+        "idempotency_key": "abort-bed-b-duplicate-0001",
+    })
+
+    assert aborted.status_code == 200, aborted.text
+    _assert_both_slots(_assert_thanks_projection, beds.engine, SESSION_B, "aborted")
+
+
+def test_finish_then_complete_project_into_both_copies(beds, monkeypatch):
+    _ready_assessments(monkeypatch)
+    _copy_slot_two_into_slot_one(beds.engine)
+
+    finished = beds.researcher_b.post(f"/sessions/{SESSION_B}/finish-intervention")
+
+    assert finished.status_code == 200, finished.text
+    _assert_both_slots(
+        _assert_thanks_projection, beds.engine, SESSION_B, "intervention_completed")
+    with Session(beds.engine) as s:
+        s.add(SessionCloseoutReport(
+            session_id=SESSION_B, schema_version="test-closeout",
+            status="no_additional_observation",
+            last_idempotency_key="closeout-bed-b-dup-0001",
+            last_request_hash="0" * 64, created_by=TRAINER_B, updated_by=TRAINER_B,
+        ))
+        s.commit()
+    completed = beds.researcher_b.post(f"/sessions/{SESSION_B}/complete")
+    assert completed.status_code == 200, completed.text
+    _assert_both_slots(_assert_thanks_projection, beds.engine, SESSION_B, "completed")
+
+
+def test_p0a_worker_auto_close_projects_into_both_copies(beds, monkeypatch):
+    _ready_assessments(monkeypatch)
+    _copy_slot_two_into_slot_one(beds.engine)
+    target = SimpleNamespace(raw_audio_id="bed-b-dup-worker-audio")
+    monkeypatch.setattr(autopilot_orchestration, "derive_worker_target",
+                        lambda _db, *, session_id: target)
+    monkeypatch.setattr(
+        autopilot_orchestration, "derive_authoritative_attempt_input",
+        lambda _db, *, session_id: main_module.AttemptProcessIn(
+            item_id="SE_锚", turn_seq=1, response_role="命名",
+            raw_audio_id=target.raw_audio_id, prompt_level=0))
+    monkeypatch.setattr(main_module, "_process_attempt", lambda *_args, **_kwargs: {
+        "status": "completed", "attempt": {"id": 7}})
+    monkeypatch.setattr(autopilot_orchestration, "worker_target_still_current",
+                        lambda _db, _target: True)
+    monkeypatch.setattr(autopilot_service, "route_completed_attempt",
+                        lambda _db, **_kwargs: SimpleNamespace(status="scope_completed"))
+    failures: list[str] = []
+    monkeypatch.setattr(main_module, "_fail_closed_p0a_attempt_worker",
+                        lambda _sid, code, **_kwargs: failures.append(code))
+
+    main_module._run_p0a_attempt_worker(SESSION_B)
+
+    assert failures == []
+    _assert_both_slots(
+        _assert_thanks_projection, beds.engine, SESSION_B, "intervention_completed")
+
+
+@pytest.mark.parametrize("status", ["active", "paused", "intervention_completed"])
+def test_withdrawal_projects_both_copies_and_demotes_capabilities(beds, status):
+    now = datetime.now()
+    with Session(beds.engine) as s:
+        s.add(Patient(
+            patient_id="P-BED-REAL", is_simulation_subject=False,
+            consent_status="active", consent_type=ConsentType.本人同意,
+            mandarin_eligible=True, recording_allowed=True,
+            cloud_processing_allowed=True, governance_revision=0,
+        ))
+        s.add(TrainSession(
+            session_id="S-BED-REAL", patient_id="P-BED-REAL", week_no=2,
+            phase_type=PhaseType.正式训练, event_line=EventLine.正式训练,
+            item_bank_version_id=BANK, is_simulation=False,
+            data_classification="research", trainer_id=TRAINER_B,
+        ))
+        s.add(SessionRuntimeState(
+            session_id="S-BED-REAL", status=status, revision=2, updated_at=now))
+        for slot_id in (1, 2):
+            row = s.get(LiveState, slot_id)
+            row.session_json = json.dumps(
+                {"sessionId": "S-BED-REAL", "paused": status == "paused"})
+            row.cursor_json = json.dumps({
+                "sessionId": "S-BED-REAL", "itemIdx": 0, "turnIdx": 0,
+                "screen": "record", "recording": "recording"})
+            row.patient_rec_json = json.dumps({"active": True})
+            s.add(row)
+        s.commit()
+    tablet = _capability(beds.engine, "S-BED-REAL", "bed-tablet-real-0000001")
+
+    withdrawn = beds.admin.post("/patients/P-BED-REAL/withdrawal", json={
+        "idempotency_key": "withdrawal-bed-real-dup-0123456789abcdef",
+        "expected_governance_revision": 0,
+        "reason_code": "participant_request",
+    })
+
+    assert withdrawn.status_code == 200, withdrawn.text
+    for slot_id in (1, 2):
+        session, cursor, row = _slot_payloads(beds.engine, slot_id)
+        assert (session["sessionId"], session["runtimeStatus"]) == ("S-BED-REAL", "aborted")
+        assert (cursor["screen"], cursor["recording"]) == ("thanks", "stopped")
+        assert row.patient_rec_json is None
+    with Session(beds.engine) as s:
+        assert s.get(Patient, "P-BED-REAL").withdrawal_status == "withdrawn"
+        assert s.get(SessionRuntimeState, "S-BED-REAL").status == "aborted"
+        [capability] = s.exec(select(PatientDeviceCapability).where(
+            PatientDeviceCapability.session_id == "S-BED-REAL")).all()
+        assert capability.active_session_key is None
+        assert capability.recovery_only_at is not None
+    assert beds.client.get("/live/state", headers=tablet).status_code in (401, 409)
 
 
 # ---------------- 3d 回执重放 ----------------

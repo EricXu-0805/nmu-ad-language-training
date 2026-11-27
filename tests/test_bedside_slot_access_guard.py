@@ -34,6 +34,8 @@ SLOT_HELPERS = frozenset({
     # 按名字 monkeypatch 它装锁序探针,不能删也不能改名。
     ("app/main.py", _LOCK_HELPER),
     ("app/session_admission.py", "live_row_for_session"),
+    # 停的路径用的不报违例版本:同一场写在两槽时取第一份,不在槽里回锚行。
+    ("app/session_admission.py", "first_live_row_for_session"),
     # 握手选槽、配对、console-state 和清影子要把各槽一起看。
     ("app/session_admission.py", "bedside_slot_rows"),
     # 槽第一次被占时建行。
