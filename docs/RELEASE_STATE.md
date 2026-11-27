@@ -10,6 +10,23 @@
 > `docs/handover/七道门现状表.md`。
 
 
+## 2026-11-27 17:41 UTC 上线 `d2ca3f1`（两床代码，开关不设；自动带练占床修复）
+
+- 起因：钱凯要两位老人同时做（11-26）。两床代码在本机四个浏览器配置上彩排（11-27），隔离检查全过；彩排和审计同时复现了几处单床生产代码里就有的占床问题。①生产 nmu 进程 `TZ=Asia/Shanghai`（主机 UTC），开场写场次活动时钟用 UTC naive，判据用本机 naive：新场一开就像放了 8 小时，「一个账号一次一场」失效。②自动带练期间这个时钟一直不动。③握手 protected 分支只核操作权，会把还在跑的自动带练换走：原场不暂停，正在录的回答被掐断。④接管遗弃床时，审计要等满 busy_timeout，实测 5.5 s，期间两床的 live 写都在排队。生产库只读核过：0 个悬空的 autonomous 场，9-03 之后 0 条管理员换床审计，现场还没发生过。
+- 实际发布 `d2ca3f11b35c807b0f766dc35d0cf81db9cd149b`（[PR #63](https://github.com/EricXu-0805/nmu-ad-language-training/pull/63)，同 SHA 快进 main），前版 `2ad3ff8`。PR CI `46040133448` 五项全过；网页与产物来自 main/push CI `46041815769`。这次换网页目录和 5 个 `app/` 文件（`autopilot_orchestration.py`、`autopilot_service.py`、`main.py`、`session_admission.py`、`visit_plan_service.py`），维护期里重启 nmu 一次，不迁移，库头仍 `a7c3e9d2b641`，`.env` 不动（没有 `NMU_BEDSIDE_SLOTS`，仍是单床）。
+- 发布工具：PM 目录 299，即 298 那套加三处。①维护中 `systemctl restart nmu`，等两个名字的 `/health/ready` 都是 200，再稳定 5 s，并要求 `NRestarts` 为 0。②重启后的核对放过启动时删掉的过期登录会话和 asr-scratch 残留，这两项只许变少，其余都要与维护中取的基线一致。③失败时换回旧代码再重启。维护期共 29 s（17:41:06–17:41:35），其中重启到就绪 15 s；MainPID 108137 → 126992，`NRestarts=0`，进程时区仍为 Asia/Shanghai。两路各核 32 项。部署树 891 个源码文件、25 个网页文件；快照 `20261127-174053`；回执 `/opt/nmu/release-299-20261127-173958/final-release.json`；部署索引 SHA `2b7ea1bc70c57f3214f9edf425c662cae5edbc7db385e9365270fccc4731d8b1`；网页清单 `0ca4e799718470947c4d6f346fa501886cc46aa0ab3cef16c76397eba8546952`。上线前只读核过：.env、systemd 单元、venv、content 在 nmu 上次启动后都没改过，这次重启只带入这 5 个文件。
+- 内容：
+  - 开场时钟和判据改用同一个本机时钟。
+  - 平板每条新回执续场次时钟和床位行时钟，不动 revision 和 seq。
+  - 上一场的 AI 自动带练还在跑时，握手回 409 `bedside_autopilot_running`；开场时先按同一规则判一次，会被拒就不建场次。先暂停再换照旧能走。
+  - 接管审计提交后再记。
+  - 两床时：满员开场一步就拒；本场不在任何槽里时，`/live/console-state` 回空快照，管理员不再回落到 1 号槽。
+  - 控制台握手被拒时，一直显示被拒的原因。
+  - 两床代码本体：`NMU_BEDSIDE_SLOTS=2` 才生效，说明见 DEPLOY.md。
+- 测试：后端默认 5283 过；设 `NMU_BEDSIDE_SLOTS=2` 跑全量，481 条不过，都是预期类别。前端 1912 + 83 条过。一轮独立代码复核（1 important、3 nit 已修），299 工具另做三视角对抗复核（无 blocker，5 处加固已做，工具离线测试 87 条）。
+- 行为变化：研究者开了场又不用，15 分钟内同一账号、同一受试者不能再开新场，要先到恢复入口中止那一场。这是 9-03 设计的本意，生产上过去因为时钟问题没生效。
+- 没做的：两床开关（R2，等所有设备刷新到这一版再设，需重启）；uvicorn keep-alive（3 天 6 次 502 都在轮询端点上）、drain-target 可重试码、`autopilot/start` 409 拒因日志；换场后平板要再点一次「点一下，开始」。
+
 ## 2026-11-27 10:04 UTC 上线 `2ad3ff8`（平板慢网、训练台卡住、去掉「现在回答」）；10:05 UTC 网关换成 Caddy v2.11.9
 
 - 起因：11-27 北京下午三场自动带练 7 次 `audio_playback_failed / fetch_failed` 暂停，全在 14:27 平板和电脑从手机移动网换到另一条网络之后。失败的都是 430–707 KB 的 tell_answer 长句 WAV，服务器 0.13 s 交出（网关记 `H3_REQUEST_CANCELLED`），平板固定 10/3.5/3.5 s 下不完；同一网上 400 KB 以下全部成功，8 月以来从未出现 `fetch_failed`。另有每场前几题开录 8.9 s：89 入口那台平板留着 9-06 一场的录音，上传 404、audioSaved 被拒，#57 只认 409，每题都重传并等满 8 s。现场还反映「后台突然出问题、老人端还在继续」，并要求去掉「现在回答」。
