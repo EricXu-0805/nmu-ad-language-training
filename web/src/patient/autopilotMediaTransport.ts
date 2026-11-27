@@ -26,8 +26,12 @@ export interface AutopilotMediaTransportDependencies {
   requestTimeoutMs?: number;
   /** Test-only override applied to every attempt; production uses TTS_ATTEMPT_TIMEOUTS_MS. */
   ttsAttemptTimeoutMs?: number;
-  /** Test-only override, per attempt (last value repeats); production 10 s then 3.5 s. */
+  /** Test-only override, per attempt (last value repeats); production 10 s then 6 s. */
   ttsAttemptTimeoutsMs?: readonly number[];
+  /** Test-only override; production TTS_BODY_STALL_MS. */
+  ttsBodyStallMs?: number;
+  /** Test-only override; production TTS_TOTAL_BUDGET_MS. */
+  ttsTotalBudgetMs?: number;
   /** Test-only override; production waits 0.5s then 0.75s before the two TTS retries. */
   ttsRetryDelaysMs?: readonly number[];
 }
@@ -35,17 +39,21 @@ export interface AutopilotMediaTransportDependencies {
 const COMMAND_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const DRAIN_REQUEST_TIMEOUT_MS = 12_000;
 /**
- * TTS 合成 POST：每次尝试各自的超时，以及最多两次重试之前的等待。
+ * TTS 合成 POST：每次尝试拿到响应头(并完成第一次授权复核)的期限，以及最多两次重试之前的等待。
  *
- * 网络复审:这条请求原来既无重试也无自己的超时,只靠控制器 20 s 的起播期限兜底。
- * 第一次给 10 s——冷缓存合成要真去云端(服务端自己的供应商超时是 15 s),4 s 会把一次
- * 慢但会成功的合成掐成 tts_failed,而且每掐一次服务端又起一次合成(没有 in-flight 去重);
- * 之后的重试只为连接级失败(TypeError/0/5xx/408)准备,3.5 s 一次。
- * 10 + 0.5 + 3.5 + 0.75 + 3.5 = 18.25 s;每次期限包含下载与两次 revalidate,
- * 为 20 s 起播期限内的 play() 留出余量。
+ * 第一次给 10 s——冷缓存合成要真去云端(服务端自己的供应商超时是 15 s),短了会把一次
+ * 慢但会成功的合成掐成 tts_failed,而且每掐一次服务端又起一次合成(没有 in-flight 去重)。
+ * 重试 6 s:慢网上一来一回加一次 /next 复核就要 3–7 s(2026-11-27 院内网络小音频中位 3.6 s)。
+ *
+ * 响应头之后不再用固定期限:正文每进来一块就把期限推到 TTS_BODY_STALL_MS 之后,
+ * 断流这么久才算这次失败。2026-11-27 院内网络上 430–707 KB 的 WAV 都在服务器 0.2 s 内交出,
+ * 却在固定 10/3.5/3.5 s 里下不完,7 次整场暂停;同一网上 400 KB 以下全部成功。
+ * 所有尝试合计不超过 TTS_TOTAL_BUDGET_MS,控制器起播期限在它外面再留 play() 的余量。
  */
-const TTS_ATTEMPT_TIMEOUTS_MS: readonly number[] = [10_000, 3_500];
+const TTS_ATTEMPT_TIMEOUTS_MS: readonly number[] = [10_000, 6_000];
 const TTS_RETRY_DELAYS_MS: readonly number[] = [500, 750];
+const TTS_BODY_STALL_MS = 8_000;
+export const TTS_TOTAL_BUDGET_MS = 45_000;
 
 interface ExactTtsAuthority {
   sessionId: string;
@@ -73,18 +81,23 @@ function ttsCommandIdentity(command: TtsCommand): string {
   ]);
 }
 
+/** 把期限推到 now+ms(不越过 notAfterMs 这一绝对时刻),只延不缩;到点后调用无效。 */
+type ExtendDeadline = (ms: number, notAfterMs: number) => void;
+
 async function withRequestDeadline<T>(
   parentSignal: AbortSignal,
   timeoutMs: number,
   timeoutDetail: string,
   cancelledDetail: string,
-  operation: (signal: AbortSignal) => Promise<T>,
+  operation: (signal: AbortSignal, extend: ExtendDeadline) => Promise<T>,
 ): Promise<T> {
   if (parentSignal.aborted) {
     throw parentSignal.reason ?? new DOMException(cancelledDetail, "AbortError");
   }
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let fireAt = Date.now() + timeoutMs;
+  let fire: () => void = () => {};
   let removeParentAbort: () => void = () => {};
   const interrupted = new Promise<never>((_resolve, reject) => {
     const onParentAbort = () => {
@@ -95,14 +108,23 @@ async function withRequestDeadline<T>(
     };
     parentSignal.addEventListener("abort", onParentAbort, { once: true });
     removeParentAbort = () => parentSignal.removeEventListener("abort", onParentAbort);
-    timer = setTimeout(() => {
+    fire = () => {
       const error = new ApiError(408, timeoutDetail);
       controller.abort(error);
       reject(error);
-    }, timeoutMs);
+    };
+    timer = setTimeout(fire, timeoutMs);
   });
+  const extend: ExtendDeadline = (ms, notAfterMs) => {
+    if (controller.signal.aborted) return;
+    const next = Math.min(Date.now() + ms, notAfterMs);
+    if (next <= fireAt) return;
+    fireAt = next;
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(fire, Math.max(0, fireAt - Date.now()));
+  };
   try {
-    return await Promise.race([operation(controller.signal), interrupted]);
+    return await Promise.race([operation(controller.signal, extend), interrupted]);
   } finally {
     removeParentAbort();
     if (timer !== null) clearTimeout(timer);
@@ -131,6 +153,31 @@ function isTransientTtsFetchError(error: unknown): boolean {
   return error instanceof TypeError;
 }
 
+/** 逐块读正文,每块调用 onProgress 续期;期限到点 abort 时取消读取,迟到的字节不再收。 */
+async function readTtsBody(
+  response: Response,
+  signal: AbortSignal,
+  onProgress: () => void,
+): Promise<Blob> {
+  if (response.body === null) return response.blob();
+  const reader = response.body.getReader();
+  const cancel = () => { reader.cancel(signal.reason).catch(() => {}); };
+  if (signal.aborted) cancel();
+  else signal.addEventListener("abort", cancel, { once: true });
+  try {
+    const chunks: Uint8Array<ArrayBuffer>[] = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(new Uint8Array(value));
+      onProgress();
+    }
+    return new Blob(chunks, { type: (response.headers.get("Content-Type") ?? "").toLowerCase() });
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
+}
+
 function waitUnlessAborted(delayMs: number, signal: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const cancelled = () => signal.reason ?? new DOMException("语音播放已取消", "AbortError");
@@ -146,7 +193,8 @@ function waitUnlessAborted(delayMs: number, signal: AbortSignal): Promise<void> 
 
 /**
  * TTS 获取完整字节并复核授权，最多再试两次。响应头返回并不表示音频下载成功:
- * 下载断流、正文悬挂及 /next 暂时不可用都必须落在同一次期限和有限重试内。
+ * 下载断流、正文悬挂及 /next 暂时不可用都必须落在单次期限(正文按进度续期)、
+ * 有限重试与整句预算之内。
  * 父 signal 一中止就不再等也不再发。重试的是同一条 exact 命令 URL 与同一份
  * 设备凭据;每次都重新完成两道授权证明,不会沿用失败尝试的证明。
  */
@@ -160,17 +208,23 @@ async function fetchExactTtsBytesWithRetry(
   const timeouts = deps.ttsAttemptTimeoutMs !== undefined
     ? [deps.ttsAttemptTimeoutMs]
     : deps.ttsAttemptTimeoutsMs ?? TTS_ATTEMPT_TIMEOUTS_MS;
+  const stallMs = deps.ttsBodyStallMs ?? TTS_BODY_STALL_MS;
+  const budgetEndsAt = Date.now() + (deps.ttsTotalBudgetMs ?? TTS_TOTAL_BUDGET_MS);
   for (let attempt = 0; ; attempt += 1) {
-    const timeoutMs = timeouts[Math.min(attempt, timeouts.length - 1)] ?? TTS_ATTEMPT_TIMEOUTS_MS[0];
+    const timeoutMs = Math.max(0, Math.min(
+      timeouts[Math.min(attempt, timeouts.length - 1)] ?? TTS_ATTEMPT_TIMEOUTS_MS[0],
+      budgetEndsAt - Date.now()));
     try {
       return await withRequestDeadline(
         signal, timeoutMs, "TTS 合成请求超时", "语音播放已取消",
-        async (requestSignal) => {
+        async (requestSignal, extend) => {
           const response = await exactCommandPost(
             authority.sessionId, authority.commandKey, "tts", requestSignal, deps, credential);
           if (response.status === 204) return null;
           await revalidateExactTtsAuthority(authority, requestSignal, deps);
-          const blob = await response.blob();
+          const progress = () => extend(stallMs, budgetEndsAt);
+          progress();
+          const blob = await readTtsBody(response, requestSignal, progress);
           // 超时或取消后到达的字节不能继续参与授权判定,也不能交给播放。
           if (requestSignal.aborted) throw requestSignal.reason;
           if (blob.size <= 0 || !blob.type.startsWith("audio/")) {
@@ -178,12 +232,14 @@ async function fetchExactTtsBytesWithRetry(
               "audio_playback_failed", "TTS 服务返回的音频无效",
               { failureStage: "blob_invalid" });
           }
+          progress();
           await revalidateExactTtsAuthority(authority, requestSignal, deps);
           return blob;
         });
     } catch (error) {
       const delayMs = delays[attempt];
-      if (signal.aborted || delayMs === undefined || !isTransientTtsFetchError(error)) {
+      if (signal.aborted || delayMs === undefined || !isTransientTtsFetchError(error)
+          || Date.now() + delayMs >= budgetEndsAt) {
         throw error;
       }
       await waitUnlessAborted(delayMs, signal);

@@ -10,6 +10,7 @@ import {
   fetchAutopilotVoiceSettings,
   fetchExactAutopilotDrainTarget,
   fetchExactAutopilotTts,
+  TTS_TOTAL_BUDGET_MS,
   type AutopilotMediaTransportDependencies,
 } from "./autopilotMediaTransport.ts";
 import type { NextCommandProjection } from "./autopilotProtocol.ts";
@@ -533,11 +534,85 @@ test("冷缓存合成慢但会成功：第一次期限足够长,一次 POST 就�
   assert.equal(calls, 1);
 });
 
-test("生产期限:首次 10 s、之后 3.5 s,两次退避 0.5/0.75 s,最坏 18.25 s 在 20 s 起播期限内", async () => {
+test("生产期限:响应头首次 10 s、之后 6 s,退避 0.5/0.75 s,正文断流 8 s,整句 45 s 在控制器起播期限之内", async () => {
   const source = await import("node:fs").then((fs) => fs.readFileSync(
     new URL("./autopilotMediaTransport.ts", import.meta.url), "utf8"));
-  assert.match(source, /TTS_ATTEMPT_TIMEOUTS_MS: readonly number\[\] = \[10_000, 3_500\];/);
+  assert.match(source, /TTS_ATTEMPT_TIMEOUTS_MS: readonly number\[\] = \[10_000, 6_000\];/);
   assert.match(source, /TTS_RETRY_DELAYS_MS: readonly number\[\] = \[500, 750\];/);
+  assert.match(source, /^const TTS_BODY_STALL_MS = 8_000;$/m);
+  assert.equal(TTS_TOTAL_BUDGET_MS, 45_000);
+  const { AUTOPILOT_TTS_START_DEADLINE_MS } = await import("./autopilotController.ts");
+  assert.ok(AUTOPILOT_TTS_START_DEADLINE_MS >= TTS_TOTAL_BUDGET_MS + 5_000,
+    "下载失败要按 fetch_failed 报,不能先被控制器判成 media_timeout");
+});
+
+function streamedAudio(
+  plan: (controller: ReadableStreamDefaultController<Uint8Array>) => void,
+): Response {
+  return new Response(new ReadableStream<Uint8Array>({ start: plan }), {
+    status: 200,
+    headers: { "Content-Type": "audio/wav" },
+  });
+}
+
+test("慢但一直有字节在进的长音频:超过单次期限也不掐,一次请求下完(2026-11-27 院内网络)", async () => {
+  let requests = 0;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    return streamedAudio((controller) => {
+      let sent = 0;
+      const tick = setInterval(() => {
+        controller.enqueue(new TextEncoder().encode(sent === 0 ? "RIFF" : "x"));
+        sent += 1;
+        if (sent === 8) { clearInterval(tick); controller.close(); }
+      }, 15);
+    });
+  });
+  deps.ttsAttemptTimeoutsMs = [40, 40];
+  deps.ttsBodyStallMs = 60;
+  deps.ttsRetryDelaysMs = [0, 0];
+  const blob = await fetchExactAutopilotTts("S/ONE", pendingTts(), new AbortController().signal, deps);
+  assert.equal(await blob?.text(), "RIFFxxxxxxx");
+  assert.equal(blob?.type, "audio/wav");
+  assert.equal(requests, 1);
+});
+
+test("正文断流超过 TTS_BODY_STALL_MS 才算这次失败:取消读取并重取同一命令", async () => {
+  let requests = 0;
+  let firstCancelled = false;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    if (requests === 1) {
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new TextEncoder().encode("RIFF")); },
+        cancel() { firstCancelled = true; },
+      }), { status: 200, headers: { "Content-Type": "audio/wav" } });
+    }
+    return audioResponse();
+  });
+  deps.ttsAttemptTimeoutsMs = [1_000, 1_000];
+  deps.ttsBodyStallMs = 20;
+  deps.ttsRetryDelaysMs = [0, 0];
+  const blob = await fetchExactAutopilotTts("S/ONE", pendingTts(), new AbortController().signal, deps);
+  assert.equal(await blob?.text(), "RIFFvoice");
+  assert.equal(requests, 2);
+  assert.equal(firstCancelled, true);
+});
+
+test("整句预算用完就不再重试,按 fetch_failed 报出", async () => {
+  let requests = 0;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    return streamedAudio((controller) => { controller.enqueue(new TextEncoder().encode("RIFF")); });
+  });
+  deps.ttsAttemptTimeoutsMs = [1_000, 1_000];
+  deps.ttsBodyStallMs = 30;
+  deps.ttsTotalBudgetMs = 45;
+  deps.ttsRetryDelaysMs = [0, 0];
+  await assert.rejects(
+    fetchExactAutopilotTts("S/ONE", pendingTts(), new AbortController().signal, deps),
+    (error: unknown) => error instanceof AutopilotMediaError && error.failureStage === "fetch_failed");
+  assert.ok(requests <= 2, `预算 45 ms、每次断流 30 ms,最多两次请求,实际 ${requests}`);
 });
 
 test("父 signal 在退避等待中中止：不再发第二次，原样抛 AbortError", async () => {
@@ -592,9 +667,10 @@ test("TTS 响应头已到但音频下载断流时重取同一命令,完整字节
   let authorityReads = 0;
   const { deps } = dependencies(async () => {
     requests += 1;
-    const response = new Response(new Blob(["RIFFvoice"], { type: "audio/wav" }));
-    if (requests === 1) response.blob = async () => { throw new TypeError("terminated"); };
-    return response;
+    if (requests === 1) {
+      return streamedAudio((controller) => { controller.error(new TypeError("terminated")); });
+    }
+    return new Response(new Blob(["RIFFvoice"], { type: "audio/wav" }));
   });
   deps.ttsRetryDelaysMs = [0, 0];
   deps.nextCommand = async () => { authorityReads += 1; return pendingTts(); };
@@ -605,21 +681,25 @@ test("TTS 响应头已到但音频下载断流时重取同一命令,完整字节
   assert.equal(authorityReads, 3);
 });
 
-test("音频响应体下载也受单次期限约束,迟到的第一份字节不会继续复核或交给播放", async () => {
+test("音频响应体一个字节都不来也受期限约束,迟到的字节不会继续复核或交给播放", async () => {
   let requests = 0;
   let authorityReads = 0;
   let firstSignal: AbortSignal | undefined;
   let resolveLateBody!: (blob: Blob) => void;
   const { deps } = dependencies(async (_input, init = {}) => {
     requests += 1;
-    const response = new Response(new Blob(["RIFFretry"], { type: "audio/wav" }));
     if (requests === 1) {
       firstSignal = init.signal as AbortSignal;
-      response.blob = () => new Promise<Blob>((resolve) => { resolveLateBody = resolve; });
+      return streamedAudio((controller) => {
+        resolveLateBody = () => {
+          try { controller.enqueue(new TextEncoder().encode("RIFFlate")); controller.close(); } catch { /* 已取消 */ }
+        };
+      });
     }
-    return response;
+    return new Response(new Blob(["RIFFretry"], { type: "audio/wav" }));
   });
   deps.ttsAttemptTimeoutMs = 10;
+  deps.ttsBodyStallMs = 10;
   deps.ttsRetryDelaysMs = [0, 0];
   deps.nextCommand = async () => { authorityReads += 1; return pendingTts(); };
   // 此计时器只让旧实现可确定地退出,修正实现应在它之前重试成功。
@@ -663,9 +743,10 @@ test("断流重试期间命令代际变化时立即拒绝,不使用先前授权�
   let authorityReads = 0;
   const { deps } = dependencies(async () => {
     requests += 1;
-    const response = new Response(new Blob(["RIFFvoice"], { type: "audio/wav" }));
-    if (requests === 1) response.blob = async () => { throw new TypeError("terminated"); };
-    return response;
+    if (requests === 1) {
+      return streamedAudio((controller) => { controller.error(new TypeError("terminated")); });
+    }
+    return new Response(new Blob(["RIFFvoice"], { type: "audio/wav" }));
   });
   deps.ttsRetryDelaysMs = [0, 0];
   deps.nextCommand = async () => {

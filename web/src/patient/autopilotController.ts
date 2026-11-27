@@ -300,11 +300,12 @@ export interface AutopilotTransientRetryPorts {
 export const AUTOPILOT_TRANSIENT_RETRY_BUDGET_MS = 30_000;
 
 /**
- * TTS 从 start() 到真实 playing 事件的绝对期限。合成 POST 现在自带 10/3.5/3.5 s 三次
- * 尝试与 0.5/0.75 s 退避(最坏 18.25 s),再加两次 revalidate 与 play(),15 s 会在慢网上
- * 把一次本可成功的重试判成 media_timeout;与录音 PRE_START_BUDGET_MS 对齐为 20 s。
+ * TTS 从 start() 到真实 playing 事件的绝对期限。合成与下载自带整句预算
+ * (TTS_TOTAL_BUDGET_MS = 45 s,正文按进度续期),这里在它外面再留 5 s 给 play(),
+ * 下载失败才会按 fetch_failed 报出来,而不是被这里先判成 media_timeout。
+ * 原来 20 s:2026-11-27 院内慢网上 430–707 KB 的长句下不完,7 次整场暂停。
  */
-export const AUTOPILOT_TTS_START_DEADLINE_MS = 20_000;
+export const AUTOPILOT_TTS_START_DEADLINE_MS = 50_000;
 
 /**
  * 设备直连请求(/next、/acks 等)每一次的硬超时。瞬时重试的预算按「等待 + 下一次尝试
