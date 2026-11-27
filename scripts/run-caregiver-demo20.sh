@@ -377,14 +377,8 @@ elif [ "$BROWSER_CHECK" = "voice-barge-in" ]; then
   echo "真实 Chrome 自动停播、重复回答提示、录音判分与账本核验已全部通过"
   exit 0
 elif [ "$BROWSER_CHECK" = "answer-now" ]; then
-  echo "真实 Chrome 提前回答走查开始（不显示临时凭据）…"
-  env -i "${HARNESS_ENV[@]}" \
-    "$BROWSER_PYTHON" -I "$REPO/harness/caregiver_browser_acceptance.py" \
-    --answer-now --origin "http://127.0.0.1:$PORT"
-  env -i "${HARNESS_ENV[@]}" \
-    "$PYTHON" -m harness.caregiver_browser_acceptance --verify-answer-now-ledger
-  echo "真实 Chrome 提前回答、录音判分与账本核验已全部通过"
-  exit 0
+  echo "错误：平板「现在回答」按钮 2026-11-27 已按现场意见去掉，这项走查不再适用；提前回答请用 --browser-check voice-barge-in" >&2
+  exit 2
 elif [ "$BROWSER_CHECK" = "voice-chains" ]; then
   echo "真实 Chrome 尾静默自动收麦走查开始（不显示临时凭据）…"
   env -i "${HARNESS_ENV[@]}" \

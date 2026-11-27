@@ -122,7 +122,7 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
           { cause: error, failureStage: "play_rejected" })),
         observe: this.ports.observeBargeIn,
       });
-    } catch { /* Optional enhancement: the explicit answer button still works. */ }
+    } catch { /* Optional enhancement: without it the prompt simply plays to the end. */ }
   }
 
   private finishClose(): void {
@@ -238,7 +238,7 @@ class BrowserAutopilotSpeechPlayback implements AutopilotSpeechPlayback {
         }
         // 浏览器要手势才肯出声(生产三台设备实证):这不是设备坏了,把整场
         // 安全暂停等于让老人为浏览器策略背锅。亮出「点一下，接着听」,在那一下
-        // 里重放;取消/超时(控制器 20 秒起播期限)照旧走 AbortError 收口。
+        // 里重放;取消/超时(控制器起播期限)照旧走 AbortError 收口。
         this.ports.announceGestureNeeded?.(true);
         try {
           await this.ports.playOnNextGesture(this.audio, this.abortController.signal);

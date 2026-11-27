@@ -2048,6 +2048,37 @@ test("开麦前清旧账：别的场次的条目先清、再重拍快照，清�
   await capture.closed;
 });
 
+test("后台清理恰在重拍快照与读字节之间收下一条外场录音:再拍一次快照判,不误报缺字节", async (context) => {
+  // 复核 PR #61:同一场里在途的清理不再等,它可能在快照之后、readBlob 之前 completeOutbox。
+  const clock = clockDouble();
+  const devices = installDeviceDoubles(clock);
+  context.after(() => devices.restore());
+  let snapshots = 0;
+  let completed = false;
+  const harness = bootstrapHarness(clock, {
+    recoverySnapshot: async () => {
+      snapshots += 1;
+      if (snapshots === 3) completed = true;
+      return completed ? EMPTY_SNAPSHOT
+        : { entries: [foreignOutboxEntry()], legacyOrphans: [], invalidBlobKeyCount: 0 };
+    },
+    readBlob: async () => (snapshots >= 2 ? null : recordingBlob()),
+    drainForeignOutbox: async () => {},
+  });
+  const capture = new BrowserAutopilotRecordingExecutor(SESSION, {
+    ownerGeneration: 7, isForeground: () => true, bootstrap: harness.ports,
+  }).start(recordCommand() as never);
+  capture.started.catch(() => {});
+  capture.stopped.catch(() => {});
+  for (let turn = 0; turn < 400 && (devices.devices[0]?.starts ?? 0) === 0; turn += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(devices.devices[0]?.starts, 1);
+  assert.equal(snapshots, 3);
+  harness.advance(PRE_START_BUDGET_MS);
+  await capture.closed;
+});
+
 test("开麦前清旧账有软预算：完整外场条目保留，清理悬挂到点后允许当前场次开麦", async (context) => {
   const clock = clockDouble();
   const devices = installDeviceDoubles(clock);

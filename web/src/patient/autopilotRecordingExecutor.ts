@@ -638,6 +638,22 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
    * 这里不新起定时器、不新建截止时刻：deadline 与 lifecycleDeferred 都是本次
    * 采集已经有的那一个。
    */
+  /**
+   * 同一场里在途的外场清理不再等(见 drainForeignOutboxEntries),它可能恰在拍快照之后、
+   * 读字节之前把一条已被服务端收下的录音删掉。第一次校验不过就再拍一次快照判:
+   * 真缺字节或元数据不符的条目第二次照样不过,只有已被正常清走的不再误报。
+   */
+  private async assertForeignSnapshotSettled(snapshot: AutopilotRecoverySnapshot): Promise<void> {
+    const readBlob = (rawId: string) => this.bootstrap.readBlob(rawId);
+    const rawAudioId = this.command.payload.raw_audio_id;
+    try {
+      await assertForeignRecordingSnapshot(snapshot, this.sessionId, rawAudioId, readBlob);
+    } catch {
+      const fresh = await this.bootstrap.recoverySnapshot();
+      await assertForeignRecordingSnapshot(fresh, this.sessionId, rawAudioId, readBlob);
+    }
+  }
+
   /** 到点就放行(resolve undefined),不判死;operation 自己的结局由调用方另行隔离。 */
   private withSoftBudget(operation: Promise<void>, budgetMs: number): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -758,11 +774,11 @@ class BrowserAutopilotCapture implements AutopilotRecordingCapture {
             () => this.bootstrap.recoverySnapshot(),
             isolateLateSettlement,
           );
+          const validated = snapshot;
           await this.stage(
             deadline,
             "recording_recovery_validation",
-            () => assertForeignRecordingSnapshot(snapshot, this.sessionId,
-              this.command.payload.raw_audio_id, (rawId) => this.bootstrap.readBlob(rawId)),
+            () => this.assertForeignSnapshotSettled(validated),
             isolateLateSettlement,
           );
         }

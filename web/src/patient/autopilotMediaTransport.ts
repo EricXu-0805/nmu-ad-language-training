@@ -32,6 +32,8 @@ export interface AutopilotMediaTransportDependencies {
   ttsBodyStallMs?: number;
   /** Test-only override; production TTS_TOTAL_BUDGET_MS. */
   ttsTotalBudgetMs?: number;
+  /** Test-only override; production TTS_MIN_ATTEMPT_MS. */
+  ttsMinAttemptMs?: number;
   /** Test-only override; production waits 0.5s then 0.75s before the two TTS retries. */
   ttsRetryDelaysMs?: readonly number[];
 }
@@ -53,6 +55,8 @@ const DRAIN_REQUEST_TIMEOUT_MS = 12_000;
 const TTS_ATTEMPT_TIMEOUTS_MS: readonly number[] = [10_000, 6_000];
 const TTS_RETRY_DELAYS_MS: readonly number[] = [500, 750];
 const TTS_BODY_STALL_MS = 8_000;
+/** 退避之后剩下的预算不够这么久就不再发:注定 408 的那次只会让服务端白合成一遍。 */
+const TTS_MIN_ATTEMPT_MS = 2_000;
 export const TTS_TOTAL_BUDGET_MS = 45_000;
 
 interface ExactTtsAuthority {
@@ -239,7 +243,7 @@ async function fetchExactTtsBytesWithRetry(
     } catch (error) {
       const delayMs = delays[attempt];
       if (signal.aborted || delayMs === undefined || !isTransientTtsFetchError(error)
-          || Date.now() + delayMs >= budgetEndsAt) {
+          || Date.now() + delayMs + (deps.ttsMinAttemptMs ?? TTS_MIN_ATTEMPT_MS) >= budgetEndsAt) {
         throw error;
       }
       await waitUnlessAborted(delayMs, signal);

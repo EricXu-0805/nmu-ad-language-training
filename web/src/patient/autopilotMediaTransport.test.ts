@@ -540,6 +540,7 @@ test("生产期限:响应头首次 10 s、之后 6 s,退避 0.5/0.75 s,正文断
   assert.match(source, /TTS_ATTEMPT_TIMEOUTS_MS: readonly number\[\] = \[10_000, 6_000\];/);
   assert.match(source, /TTS_RETRY_DELAYS_MS: readonly number\[\] = \[500, 750\];/);
   assert.match(source, /^const TTS_BODY_STALL_MS = 8_000;$/m);
+  assert.match(source, /^const TTS_MIN_ATTEMPT_MS = 2_000;$/m);
   assert.equal(TTS_TOTAL_BUDGET_MS, 45_000);
   const { AUTOPILOT_TTS_START_DEADLINE_MS } = await import("./autopilotController.ts");
   assert.ok(AUTOPILOT_TTS_START_DEADLINE_MS >= TTS_TOTAL_BUDGET_MS + 5_000,
@@ -597,6 +598,62 @@ test("正文断流超过 TTS_BODY_STALL_MS 才算这次失败:取消读取并重
   assert.equal(await blob?.text(), "RIFFvoice");
   assert.equal(requests, 2);
   assert.equal(firstCancelled, true);
+});
+
+test("字节一直慢慢进也不能越过整句预算:到点取消,报 fetch_failed", async () => {
+  let requests = 0;
+  let cancelled = false;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    let tick: ReturnType<typeof setInterval> | undefined;
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("RIFF"));
+        tick = setInterval(() => controller.enqueue(new TextEncoder().encode("x")), 10);
+      },
+      cancel() { cancelled = true; clearInterval(tick); },
+    }), { status: 200, headers: { "Content-Type": "audio/wav" } });
+  });
+  deps.ttsAttemptTimeoutsMs = [1_000, 1_000];
+  deps.ttsBodyStallMs = 50;
+  deps.ttsTotalBudgetMs = 80;
+  deps.ttsRetryDelaysMs = [0, 0];
+  await assert.rejects(
+    fetchExactAutopilotTts("S/ONE", pendingTts(), new AbortController().signal, deps),
+    (error: unknown) => error instanceof AutopilotMediaError && error.failureStage === "fetch_failed");
+  assert.equal(requests, 1);
+  assert.equal(cancelled, true);
+});
+
+test("正文读到一半上层取消(暂停、撤回):抛 AbortError 并取消读取,不算网络失败", async () => {
+  let cancelled = false;
+  const { deps } = dependencies(async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new TextEncoder().encode("RIFF")); },
+    cancel() { cancelled = true; },
+  }), { status: 200, headers: { "Content-Type": "audio/wav" } }));
+  deps.ttsBodyStallMs = 1_000;
+  const parent = new AbortController();
+  const pending = fetchExactAutopilotTts("S/ONE", pendingTts(), parent.signal, deps);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  parent.abort(new DOMException("语音播放已取消", "AbortError"));
+  await assert.rejects(pending, (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+  assert.equal(cancelled, true);
+});
+
+test("退避之后剩下的预算不够最小一次尝试就不再发,免得服务端白合成一遍", async () => {
+  let requests = 0;
+  const { deps } = dependencies(async () => {
+    requests += 1;
+    return new Promise<Response>(() => undefined);
+  });
+  deps.ttsAttemptTimeoutsMs = [150, 150];
+  deps.ttsTotalBudgetMs = 200;
+  deps.ttsMinAttemptMs = 100;
+  deps.ttsRetryDelaysMs = [0, 0];
+  await assert.rejects(
+    fetchExactAutopilotTts("S/ONE", pendingTts(), new AbortController().signal, deps),
+    (error: unknown) => error instanceof AutopilotMediaError && error.failureStage === "fetch_failed");
+  assert.equal(requests, 1);
 });
 
 test("整句预算用完就不再重试,按 fetch_failed 报出", async () => {

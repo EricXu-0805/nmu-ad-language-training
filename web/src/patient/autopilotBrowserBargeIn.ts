@@ -23,7 +23,7 @@ type TtsCommand = Extract<NextCommandProjection, { kind: "tts" }>;
 
 /** iOS can change the speaker route/volume as soon as getUserMedia opens, even
  * when the detector never interrupts. Keep listening and speaking sequential
- * there; the explicit answer-now button and subsequent recording still work.
+ * there; the prompt plays to the end and the following recording still works.
  * Desktop-mode iPad Safari identifies itself as a touch-capable Mac.
  * See https://bugs.webkit.org/show_bug.cgi?id=243897 and bug 326286.
  */
