@@ -22,7 +22,7 @@ from app.models import (AuditLog, LiveState, Patient, PatientDeviceCapability,
 from app.models import Session as TrainSession
 from test_autopilot_activation import _activate as _activate_autopilot, _yield_a
 from test_autopilot_api import OTHER_SESSION_ID, SESSION_ID, api_clients as api_clients
-from test_bedside_two_slot_gates import _code, _raw_slot
+from test_bedside_two_slot_gates import _SLOT_COLUMNS, _code, _raw_slot
 
 
 BANK = "wk2-v1-20260707"
@@ -455,6 +455,35 @@ def test_single_slot_activation_clears_a_shadow_left_in_slot_two(
     assert (_holder(api_clients.engine, 1), _holder(api_clients.engine, 2)) == (SESSION_ID, None)
 
 
+def test_activation_releases_the_same_patients_ended_session_in_the_other_slot(
+        one_slot_while_pairing, api_clients, monkeypatch):
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    revision, _ = _yield_a(api_clients, monkeypatch)
+    ended = _third_session(api_clients.engine, other_patient=False)
+    with Session(api_clients.engine) as s:
+        for session_id in (OTHER_SESSION_ID, ended):
+            runtime = s.get(SessionRuntimeState, session_id)
+            runtime.status = "aborted"
+            s.add(runtime)
+        anchor = s.get(LiveState, 1)
+        payload = json.loads(anchor.session_json)
+        payload["sessionId"] = ended
+        s.add(LiveState(id=2, seq=anchor.seq, session_json=json.dumps(payload),
+                        updated_at=datetime.now()))
+        s.commit()
+    ended_tablet = _capability(api_clients.engine, ended, "hs-tablet-ended-000001")
+
+    activated = _activate_autopilot(api_clients, revision)
+
+    assert activated.status_code == 200, activated.text
+    assert (_holder(api_clients.engine, 1), _holder(api_clients.engine, 2)) == (SESSION_ID, None)
+    [capability] = _capability_rows(api_clients.engine, ended)
+    assert (capability.active_session_key, capability.recovery_only_at is None) == (None, False)
+    stale_tablet = api_clients.device.get("/live/state", headers=ended_tablet)
+    assert (stale_tablet.status_code, _code(stale_tablet)) == (
+        401, "device_capability_recovery_only")
+
+
 # ---------------- 3f 配对 ----------------
 
 def _pair(beds, code: str, device_id: str):
@@ -513,13 +542,104 @@ def _set_status(engine, session_id: str, status: str) -> None:
         s.commit()
 
 
+def _abort(client: TestClient, engine, session_id: str, key: str) -> None:
+    with Session(engine) as s:
+        revision = s.get(SessionRuntimeState, session_id).revision
+    aborted = client.post(f"/sessions/{session_id}/abort", json={
+        "reason_code": "technical_failure", "expected_revision": revision,
+        "idempotency_key": key})
+    assert aborted.status_code == 200, aborted.text
+
+
+def _orphan_audio_saved(raw_audio_id: str, session_id: str) -> dict:
+    return {"kind": "audioSaved", "payload": {
+        "rawAudioId": raw_audio_id, "durationSeconds": 2.5, "byteCount": 4321,
+        "checksum": "ab" * 32, "turnKey": "itm-0001#1", "sessionId": session_id,
+        "containsDirectIdentifier": False}}
+
+
+@pytest.mark.parametrize("slots", ["2", None])
+def test_new_session_releases_the_same_patients_ended_session_in_the_other_slot(
+        monkeypatch, tmp_path, slots):
+    """S-B 中止后同一位受试者的 S-B2 落进 1 号槽:2 号槽里的 S-B 要像单床被接管时一样放掉,
+    旧平板拿 401 去重新配对,没传完的录音拿 410。开关不设的孪生走同一流程,行为本来如此。"""
+    beds = _open_beds(monkeypatch, tmp_path, slots, "researcher")
+    try:
+        if slots == "2":
+            _two_beds_claimed(beds)
+        else:
+            assert _claim(beds.b, S_B).status_code == 200
+            _push_cursor(beds.b, S_B)
+        code = patient_pairing.derive_patient_pin(P_B)
+        paired = _pair(beds, code, "hs-tablet-b-000000020")
+        assert paired.status_code == 200, paired.text
+        assert paired.json()["sessionId"] == S_B
+        old = {"X-Device-Capability": paired.json()["capability"]}
+        registered = beds.device.post("/audio", headers=old, json={
+            "raw_audio_id": "raw-hs-orphan-000001", "session_id": S_B,
+            "turn_key": "itm-0001#1", "contains_direct_identifier": False})
+        assert registered.status_code == 200, registered.text
+        if slots == "2":
+            _abort(beds.a, beds.engine, S_A, "hs-abort-a-0000000001")
+        _abort(beds.b, beds.engine, S_B, "hs-abort-b-0000000001")
+
+        claimed = _claim(beds.b, S_B2)
+
+        assert claimed.status_code == 200, claimed.text
+        assert (_holder(beds.engine, 1), _holder(beds.engine, 2)) == (S_B2, None)
+        assert all(row.recovery_only_at is not None and row.active_session_key is None
+                   for row in _capability_rows(beds.engine, S_B))
+        stale_tablet = beds.device.get("/live/state", headers=old)
+        assert (stale_tablet.status_code, _code(stale_tablet)) == (
+            401, "device_capability_recovery_only")
+        repaired = _pair(beds, code, "hs-tablet-b-000000020")
+        assert repaired.status_code == 200, repaired.text
+        assert repaired.json()["sessionId"] == S_B2
+        new = {"X-Device-Capability": repaired.json()["capability"]}
+        for headers in (new, old):
+            orphan = beds.device.put(
+                "/live/state", headers=headers,
+                json=_orphan_audio_saved("raw-hs-orphan-000001", S_B))
+            assert (orphan.status_code, _code(orphan)) == (410, "audio_terminal_disposition")
+    finally:
+        _close(beds)
+
+
+def test_release_leaves_another_patients_ended_session_alone(beds):
+    """只放同一位受试者的终态场:别人的终态场留在 2 号槽,它的平板照今天读到结束画面。"""
+    _two_beds_claimed(beds)
+    tablet_b = _capability(beds.engine, S_B, "hs-tablet-b-000000021")
+    _abort(beds.b, beds.engine, S_B, "hs-abort-b-0000000002")
+    _abort(beds.a, beds.engine, S_A, "hs-abort-a-0000000002")
+    slot_two = _raw_slot(beds.engine, 2)
+
+    claimed = _claim(beds.c, S_C)
+
+    assert claimed.status_code == 200, claimed.text
+    assert (_holder(beds.engine, 1), _holder(beds.engine, 2)) == (S_C, S_B)
+    assert _raw_slot(beds.engine, 2) == slot_two
+    [capability] = _capability_rows(beds.engine, S_B)
+    assert (capability.active_session_key, capability.recovery_only_at) == (S_B, None)
+    assert beds.device.get("/live/state", headers=tablet_b).status_code == 200
+
+
 def test_finished_session_left_in_another_slot_does_not_block_pairing_or_console(beds):
-    """新场按「空或终态取最小编号」进了 1 号槽,同一受试者上一场的终态影子还留在 2 号槽。"""
+    """同一受试者上一场的终态份还留在另一槽(单床时开了新场、再开两床才会留下):配对和
+    console-state 只认没终态的那一场。"""
     _two_beds_claimed(beds)
     _set_status(beds.engine, S_A, "aborted")
     _set_status(beds.engine, S_B, "aborted")
+    leftover = _slot(beds.engine, 2)
     claimed = _claim(beds.b, S_B2)
     assert claimed.status_code == 200, claimed.text
+    # 两床下换场会把它放掉(上一条用例);这里原样放回去。
+    assert (_holder(beds.engine, 1), _holder(beds.engine, 2)) == (S_B2, None)
+    with Session(beds.engine) as s:
+        two = s.get(LiveState, 2)
+        for column in _SLOT_COLUMNS:
+            setattr(two, column, getattr(leftover, column))
+        s.add(two)
+        s.commit()
     assert (_holder(beds.engine, 1), _holder(beds.engine, 2)) == (S_B2, S_B)
 
     def check(device_id: str) -> None:
@@ -532,7 +652,7 @@ def test_finished_session_left_in_another_slot_does_not_block_pairing_or_console
         assert state.json()["session"]["sessionId"] == S_B2
 
     check("hs-tablet-b-000000010")
-    # 反过来也会出现:同账号另一场占着 2 号槽时新场按规则 3 进 2 号槽,终态的那一场留在 1 号槽。
+    # 反过来放:终态份在 1 号槽、没终态的那一场在 2 号槽。
     with Session(beds.engine) as s:
         one, two = s.get(LiveState, 1), s.get(LiveState, 2)
         for column in ("session_json", "cursor_json", "rapport_json", "audio_json",

@@ -5550,15 +5550,27 @@ def _bedside_seq_floor(s: DBSession, row: LiveState) -> int:
                                 if other is not None)])
 
 
-def _clear_bedside_shadows(s: DBSession, row: LiveState, session_id: str) -> None:
+def _clear_bedside_shadows(s: DBSession, row: LiveState, sess: TrainSession) -> None:
     """本场占了 row 之后,别的槽里还写着本场的就是影子,清成空槽。
 
     N=1 也看 2 号行:2→1 后本场重新握手进了 1 号槽,2 号行留着的本场等再开到两槽时
     就成了「同一场在两槽」,两边一律 409。只清床旁投影,不降级本场的设备能力。
+
+    两床时别的槽里留着同一受试者已终态的另一场,也照单床被接管时那样放掉:清成空槽,
+    并把那一场的设备能力降为只可恢复。不放的话那台旧平板一直读到结束画面、不会重新配对,
+    没传完的录音也拿不到 410。
     """
+    two_slots = session_admission.bedside_slot_count() == 2
     for other in session_admission.bedside_slot_rows(s, 2).values():
-        if other is None or other.id == row.id or _live_session_id(other) != session_id:
+        if other is None or other.id == row.id:
             continue
+        holder = _live_session_id(other)
+        if holder != sess.session_id:
+            held = s.get(TrainSession, holder) if two_slots and holder else None
+            if (held is None or held.patient_id != sess.patient_id
+                    or _session_runtime_status(holder, s) not in _TERMINAL_RUNTIME_STATUSES):
+                continue
+            device_capability.mark_session_recovery_only(s, holder)
         for column in ("session_json", "cursor_json", "rapport_json", "audio_json",
                        "patient_rec_json", "patient_ack_session_id",
                        "patient_current_screen", "patient_last_seen_at", "patient_ack_seq"):
@@ -7457,7 +7469,7 @@ def live_put(body: LiveIn, request: Request, s: DBSession = Depends(get_session)
                 row.seq = _bedside_seq_floor(s, row)
             setattr(row, slot, _json.dumps(payload, ensure_ascii=False))
             _restore_runtime_to_live(row, state)
-            _clear_bedside_shadows(s, row, session_id)
+            _clear_bedside_shadows(s, row, sess)
             if state:
                 s.add(state)
             command_wseq = row.command_wseq
@@ -10923,7 +10935,7 @@ def autopilot_activate(
             live.patient_last_seen_at = None
             live.patient_ack_seq = None
             _restore_runtime_to_live(live, runtime)
-            _clear_bedside_shadows(s, live, session_id)
+            _clear_bedside_shadows(s, live, sess)
             device_capability.mark_session_recovery_only(s, previous_session_id)
             live.seq = _bedside_seq_floor(s, live) + 1
             live.updated_at = datetime.now()
