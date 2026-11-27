@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { ApiError } from "../apiResponse.ts";
 import type { Session, SessionPlan } from "../types.ts";
+import { pollSucceeded, RUNTIME_ERROR_GRACE_MS, type PollHealth } from "../hooks/runtimePollPolicy.ts";
 import {
+  AUTOPILOT_STATUS_FAILURE_GRACE_MS,
+  AUTOPILOT_STATUS_POLL_MS,
+  autopilotStatusFailureIsUncertain,
   autopilotServerOwnsConsole,
   AutopilotControlOperationEpoch,
   autopilotConsoleReducer,
@@ -669,4 +674,117 @@ test("D1:部署门禁 409 是确定的写前拒绝——按拒因处理,不再�
     409, "gate",
     { code: "autopilot_plan_not_fully_supported", message: "m", unsupported_position_count: 3 },
     "nested-detail")), true);
+});
+
+// 2026-11-27 现场:「网络好的时候后台会突然就有问题，但是老人端还在继续，没办法操作」。
+// 生产日志里 /autopilot/status 偶发单次 502(网关与 uvicorn 的 keep-alive 竞争),
+// 旧代码任何一次读失败就折 uncertain → 人工面板卸载、标题变「AI 正在自动带练」、
+// 下一次成功再走一遍 4 请求重同步。下面按组件的轮询收口逐拍模拟。
+function simulateStatusPoller(events: readonly (
+  | { at: number; ok: ReturnType<typeof parseAutopilotStatusReceipt> }
+  | { at: number; fail: unknown }
+)[]) {
+  const sessionId = SIMULATION_SESSION.session_id;
+  let state = initialAutopilotConsoleState(sessionId);
+  let lastAccepted: PollHealth | null = null;
+  const ownership: string[] = [];
+  for (const event of events) {
+    if ("ok" in event) {
+      state = autopilotConsoleReducer(state, { type: "status_received", sessionId, receipt: event.ok });
+      lastAccepted = pollSucceeded(event.at);
+      ownership.push(event.ok.serverOwned ? event.ok.status : "idle");
+    } else if (autopilotStatusFailureIsUncertain(lastAccepted, event.at, event.fail)) {
+      state = autopilotConsoleReducer(state, { type: "status_uncertain", sessionId, error: "x" });
+      ownership.push("uncertain");
+    }
+  }
+  return { state, ownership };
+}
+
+const MANUAL_RECEIPT = () => parseAutopilotStatusReceipt({
+  scope_key: "p0a_sim_first_single_v1", mode: "manual", status: "paused",
+  state_revision: 4, server_owned: false, takeover_ready: false,
+  current_command_kind: null, position_item_id: "SE_花", position_turn_seq: 1,
+  last_error_code: null,
+});
+const BAD_GATEWAY = () => new ApiError(502, "Bad Gateway");
+
+test("状态轮询:两次成功之间的单次 502 不折 uncertain,人工面板保持挂载", () => {
+  const t0 = 1_000_000;
+  const { state, ownership } = simulateStatusPoller([
+    { at: t0, ok: MANUAL_RECEIPT() },
+    { at: t0 + AUTOPILOT_STATUS_POLL_MS + 40, fail: BAD_GATEWAY() },
+    { at: t0 + 2 * AUTOPILOT_STATUS_POLL_MS, ok: MANUAL_RECEIPT() },
+    // 成功清零:之后再来一次孤立 502 仍被吸收。
+    { at: t0 + 3 * AUTOPILOT_STATUS_POLL_MS + 40, fail: BAD_GATEWAY() },
+  ]);
+  assert.deepEqual(ownership, ["idle", "idle"]);
+  assert.equal(state.phase, "idle");
+  assert.equal(autopilotServerOwnsConsole(state), false);
+  // 慢成功 + 慢失败(失败离上次成功接近两拍)也不越窗。
+  assert.equal(autopilotStatusFailureIsUncertain(
+    pollSucceeded(t0), t0 + 2 * AUTOPILOT_STATUS_POLL_MS, BAD_GATEWAY()), false);
+});
+
+test("状态轮询:失败持续超过宽限窗才折 uncertain(轮询间隔 + RUNTIME_ERROR_GRACE_MS)", () => {
+  const t0 = 1_000_000;
+  assert.equal(AUTOPILOT_STATUS_POLL_MS, 2_500);
+  assert.equal(AUTOPILOT_STATUS_FAILURE_GRACE_MS, AUTOPILOT_STATUS_POLL_MS + RUNTIME_ERROR_GRACE_MS);
+  const { state, ownership } = simulateStatusPoller([
+    { at: t0, ok: MANUAL_RECEIPT() },
+    { at: t0 + 2_500, fail: BAD_GATEWAY() },
+    { at: t0 + 5_000, fail: new ApiError(0, "无法连接服务器") },
+    { at: t0 + 7_500, fail: BAD_GATEWAY() },
+  ]);
+  assert.deepEqual(ownership, ["idle", "uncertain"]);
+  assert.equal(state.phase, "uncertain");
+  assert.equal(autopilotServerOwnsConsole(state), true);
+  assert.equal(autopilotStatusFailureIsUncertain(
+    pollSucceeded(t0), t0 + AUTOPILOT_STATUS_FAILURE_GRACE_MS - 1, BAD_GATEWAY()), false);
+  assert.equal(autopilotStatusFailureIsUncertain(
+    pollSucceeded(t0), t0 + AUTOPILOT_STATUS_FAILURE_GRACE_MS, BAD_GATEWAY()), true);
+  // 悬挂到 12 s 超时(408)才失败的请求离上次成功早已超窗,第一次失败就亮。
+  assert.equal(autopilotStatusFailureIsUncertain(
+    pollSucceeded(t0), t0 + 12_000, new ApiError(408, "请求超时")), true);
+});
+
+test("状态轮询:首个权威回执之前没有宽限,checking 失败立即 fail-closed", () => {
+  const { state, ownership } = simulateStatusPoller([{ at: 10, fail: BAD_GATEWAY() }]);
+  assert.deepEqual(ownership, ["uncertain"]);
+  assert.equal(state.phase, "uncertain");
+  assert.equal(autopilotServerOwnsConsole(state), true);
+  assert.equal(autopilotStatusFailureIsUncertain(null, 0, BAD_GATEWAY()), true);
+});
+
+test("状态轮询:回执不符合契约不是网络抖动,不吃宽限", () => {
+  const t0 = 1_000_000;
+  let contractError: unknown = null;
+  try {
+    parseAutopilotStatusReceipt({ ...safeStatus(), extra: 1 });
+  } catch (error) {
+    contractError = error;
+  }
+  assert.ok(contractError instanceof Error);
+  assert.equal(autopilotStatusFailureIsUncertain(pollSucceeded(t0), t0 + 100, contractError), true);
+});
+
+test("ServerAutopilotControl 的状态轮询真用了宽限决策,写入在途与读纪元守卫不变", () => {
+  // 本测试环境不能 mount React,以接线守卫锁住关键连接。
+  const source = readFileSync(
+    new URL("../console/scoring/ServerAutopilotControl.tsx", import.meta.url), "utf8");
+  const poller = source.slice(
+    source.indexOf("const refreshStatus = async () => {"),
+    source.indexOf("void refreshStatus();"));
+  assert.match(poller, /catch \(error\) \{\s*(?:\/\/[^\n]*\n\s*)?if \(!cancelled && !controlWriteInFlight\.current\s*&& operationEpoch\.current\.accepts\(readEpoch\)\s*&& autopilotStatusFailureIsUncertain\(lastAcceptedStatus\.current, Date\.now\(\), error\)\) \{/);
+  assert.match(poller, /dispatch\(\{ type: "status_uncertain", sessionId: session\.session_id, error: message \}\);\s*onOwnershipChange\(true, "uncertain"\);/);
+  assert.equal(poller.match(/operationEpoch\.current\.accepts\(readEpoch\)/g)?.length, 2);
+  assert.match(source, /window\.setInterval\(\(\) => \{ void refreshStatus\(\); \}, AUTOPILOT_STATUS_POLL_MS\)/);
+  // 只有被采纳的权威回执才清零失败计时;旧版本/矛盾回执提前 return,不得清零。
+  const accept = source.slice(
+    source.indexOf("const acceptReceipt = useCallback("), source.indexOf("useEffect(() => {"));
+  assert.match(accept, /latestReceipt\.current = receipt;\s*lastAcceptedStatus\.current = pollSucceeded\(Date\.now\(\)\);/);
+  assert.ok(accept.indexOf("lastAcceptedStatus.current = pollSucceeded")
+    > accept.lastIndexOf("return;"), "清零必须在所有提前 return 之后");
+  // 换场回到「无宽限」的初始核对。
+  assert.match(source, /latestReceipt\.current = null;\s*lastAcceptedStatus\.current = null;/);
 });

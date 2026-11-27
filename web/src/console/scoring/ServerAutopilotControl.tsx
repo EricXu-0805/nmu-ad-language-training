@@ -2,7 +2,9 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { api, ApiError } from "../../api";
 import {
   AUTOPILOT_ADJUDICATION_REASONS,
+  AUTOPILOT_STATUS_POLL_MS,
   autopilotConflictCode,
+  autopilotStatusFailureIsUncertain,
   buildAutopilotAdjudicateRequest,
   buildAutopilotStartRequest,
   allowsAutopilotStartSelection,
@@ -45,6 +47,7 @@ import { Alert } from "../../components/Alert";
 import { Button } from "../../components/Button";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Field, TextInput } from "../../components/Field";
+import { pollSucceeded, type PollHealth } from "../../hooks/runtimePollPolicy";
 import type { JournalAttempt } from "../../hooks/useSessionJournal";
 import type { Session, SessionPlan } from "../../types";
 import { submitReviewedAdjudication } from "./autopilotAdjudication.ts";
@@ -132,6 +135,8 @@ export function ServerAutopilotControl({
   const statusInFlight = useRef(false);
   const latestRevision = useRef(-1);
   const latestReceipt = useRef<Awaited<ReturnType<typeof api.autopilotStatus>> | null>(null);
+  // 上次被采纳的权威回执时刻;null = 本场还没有,轮询失败不给宽限。
+  const lastAcceptedStatus = useRef<PollHealth | null>(null);
   const operationEpoch = useRef(new AutopilotControlOperationEpoch());
   // 床旁激活信号:锁存 exact-session 的一次激活;自动写请求每个激活周期最多一次。
   // attempted 用同步 ref 而非 state——StrictMode 双跑同一 effect 时,第二跑必须
@@ -177,6 +182,7 @@ export function ServerAutopilotControl({
     if (receipt.stateRevision > latestRevision.current) setControlNotice(null);
     latestRevision.current = receipt.stateRevision;
     latestReceipt.current = receipt;
+    lastAcceptedStatus.current = pollSucceeded(Date.now());
     dispatch({ type: "status_received", sessionId: session.session_id, receipt });
     onReceiptPosition?.(
       receipt.positionItemId !== null && receipt.positionTurnSeq !== null
@@ -203,6 +209,7 @@ export function ServerAutopilotControl({
     dispatch({ type: "reset", sessionId: session.session_id });
     latestRevision.current = -1;
     latestReceipt.current = null;
+    lastAcceptedStatus.current = null;
     onReceiptPosition?.(null);
     operationEpoch.current.invalidate();
     startInFlight.current = false;
@@ -244,8 +251,10 @@ export function ServerAutopilotControl({
         if (!cancelled && !controlWriteInFlight.current
             && operationEpoch.current.accepts(readEpoch)) acceptReceipt(receipt);
       } catch (error) {
+        // 宽限期内保留上次被采纳的状态,不派发、不回报;首个回执之前照旧立即锁定。
         if (!cancelled && !controlWriteInFlight.current
-            && operationEpoch.current.accepts(readEpoch)) {
+            && operationEpoch.current.accepts(readEpoch)
+            && autopilotStatusFailureIsUncertain(lastAcceptedStatus.current, Date.now(), error)) {
           const message = error instanceof ApiError ? error.detail
             : error instanceof Error ? error.message : String(error);
           dispatch({ type: "status_uncertain", sessionId: session.session_id, error: message });
@@ -256,7 +265,7 @@ export function ServerAutopilotControl({
       }
     };
     void refreshStatus();
-    const timer = window.setInterval(() => { void refreshStatus(); }, 2500);
+    const timer = window.setInterval(() => { void refreshStatus(); }, AUTOPILOT_STATUS_POLL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(timer);

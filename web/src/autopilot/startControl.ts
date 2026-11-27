@@ -1,4 +1,5 @@
 import { ApiError } from "../apiResponse.ts";
+import { pollFailed, RUNTIME_ERROR_GRACE_MS, type PollHealth } from "../hooks/runtimePollPolicy.ts";
 import type { PlanItem, Session, SessionPlan } from "../types";
 
 export const P0A_SCOPE_KEY = "p0a_sim_first_single_v1" as const;
@@ -145,6 +146,27 @@ export class AutopilotControlOperationEpoch {
   invalidate(): void { this.#value += 1; }
 
   accepts(readEpoch: number): boolean { return readEpoch === this.#value; }
+}
+
+export const AUTOPILOT_STATUS_POLL_MS = 2_500;
+// 与 useSessionRuntime 同一套宽限,窗按 interval+grace 取(同录音授权轮询):锚在上次被
+// 采纳的回执,单次快速失败被吸收,连续约三拍失败或一次悬挂到 12 s 超时才折 uncertain。
+export const AUTOPILOT_STATUS_FAILURE_GRACE_MS = AUTOPILOT_STATUS_POLL_MS + RUNTIME_ERROR_GRACE_MS;
+
+/**
+ * 背景 /autopilot/status 读失败时是否折 uncertain(锁人工面板)。人工态下一亮就卸载
+ * 人工面板并触发重同步,而老人端照旧在走——2026-11-27 现场单次 502 就把台子锁死。
+ * 首个被采纳回执之前没有宽限(checking 必须 fail-closed);回执不符合契约
+ * (非 ApiError)不是网络抖动,同样立即呈现。宽限期内服务器若真被别处接管,
+ * 人工写入由服务端 _ensure_manual_plane_writable 拒为 autopilot_manual_control_locked。
+ */
+export function autopilotStatusFailureIsUncertain(
+  lastAccepted: PollHealth | null,
+  nowMs: number,
+  error: unknown,
+): boolean {
+  if (lastAccepted === null || !(error instanceof ApiError)) return true;
+  return pollFailed(lastAccepted, nowMs, false, AUTOPILOT_STATUS_FAILURE_GRACE_MS);
 }
 
 export type AutopilotConsoleAction =
