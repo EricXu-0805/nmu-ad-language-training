@@ -369,7 +369,24 @@ def live_rows_for_session(db: Session, session_id: str | None) -> list[LiveState
     if not session_id:
         return []
     return [row for row in bedside_slot_rows(db).values()
-            if live_holder_session_id(row) == session_id]
+            if _slot_session_id(row) == session_id]
+
+
+def _slot_session_id(row: LiveState | None) -> str | None:
+    """与 main._live_session_id 同一判断(认 sessionId 也认旧的 session_id):停的路径以前就用它。
+
+    live_holder_session_id 只认 sessionId,准入闸一直用那个,两处各保持原样。
+    """
+    if row is None or not row.session_json:
+        return None
+    try:
+        payload = json.loads(row.session_json)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("sessionId") or payload.get("session_id")
+    return value if isinstance(value, str) and value else None
 
 
 def live_row_for_session(db: Session, session_id: str | None) -> LiveState | None:

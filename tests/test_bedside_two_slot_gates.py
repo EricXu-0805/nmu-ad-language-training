@@ -822,3 +822,79 @@ def test_single_slot_replay_routes_never_read_slot_two(single_slot_beds):
         "patient_pause": (409, "device_session_changed"),
     }
     assert (_raw_slot(beds.engine, 1), _raw_slot(beds.engine, 2)) == before
+
+
+# ── 复核(11-27):同一场写在两槽时,任何一份还在录都不收口;后一份不得盖掉前一份 ──
+
+def _dup_recording_setup(monkeypatch, tmp_path, first, second):
+    import json as _json
+    from sqlmodel import Session as _S, SQLModel as _M
+    from app import db as _db
+    from app.models import LiveState as _Live, Patient as _P, SessionRuntimeState as _RT
+    from app.models import Session as _TS
+    from app.enums import ConsentType as _CT, EventLine as _EL, PhaseType as _PT
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    engine = _db.make_engine(f"sqlite:///{tmp_path / 'dup-rec.sqlite'}")
+    monkeypatch.setattr(_db, "engine", engine)
+    _M.metadata.create_all(engine)
+    with _S(engine) as s:
+        s.add(_P(patient_id="P-X", is_simulation_subject=True, consent_status="active",
+                 consent_type=_CT.本人同意, mandarin_eligible=True, recording_allowed=True,
+                 governance_revision=0))
+        s.add(_TS(session_id="S-X", patient_id="P-X", week_no=1, phase_type=_PT.正式训练,
+                  event_line=_EL.正式训练, item_bank_version_id="b", is_simulation=True,
+                  data_classification="simulation", trainer_id="T"))
+        s.add(_RT(session_id="S-X", status="active", revision=1))
+        for slot_id, rec in ((1, first), (2, second)):
+            s.add(_Live(id=slot_id, session_json=_json.dumps({"sessionId": "S-X"}),
+                        rapport_json=_json.dumps({"sessionId": "S-X", "recording": rec})))
+        s.commit()
+    return engine
+
+
+def _dup_recording_seen(monkeypatch, engine):
+    from sqlmodel import Session as _S
+    from app import content as _content, main as _main, session_completion as _sc
+    from app.models import Session as _TS
+    seen = {}
+    monkeypatch.setattr(_main, "_session_plan_for_runtime", lambda sess: None)
+    monkeypatch.setattr(_content, "load_week1_script", lambda path: None)
+
+    def fake(script, position, live_recording_state, *a, **kw):
+        seen["state"] = live_recording_state
+        return "x"
+    monkeypatch.setattr(_sc, "assess_rapport_completion", fake)
+    with _S(engine) as s:
+        _main._assess_rapport_completion(s.get(_TS, "S-X"), s)
+    return seen
+
+
+@pytest.mark.parametrize(("first", "second", "expected"), [
+    ("recording", "stopped", "recording"),
+    ("armed", "stopped", "armed"),
+    ("stopped", "recording", "recording"),
+    ("idle", "armed", "armed"),
+    ("stopped", "idle", "stopped"),
+])
+def test_duplicated_session_any_copy_still_recording_blocks_closeout(
+        monkeypatch, tmp_path, first, second, expected):
+    engine = _dup_recording_setup(monkeypatch, tmp_path, first, second)
+    assert _dup_recording_seen(monkeypatch, engine)["state"] == expected
+
+
+def test_single_slot_finds_the_anchor_row_by_legacy_session_id_like_main(monkeypatch, tmp_path):
+    """N=1:停的路径以前用 _live_session_id(认 sessionId 也认 session_id),找所在槽要同样认。"""
+    import json as _json
+    from sqlmodel import Session as _S, SQLModel as _M
+    from app import db as _db, session_admission as _sa
+    from app.main import _live_session_id
+    from app.models import LiveState as _Live
+    monkeypatch.delenv("NMU_BEDSIDE_SLOTS", raising=False)
+    engine = _db.make_engine(f"sqlite:///{tmp_path / 'legacy.sqlite'}")
+    _M.metadata.create_all(engine)
+    with _S(engine) as s:
+        s.add(_Live(id=1, session_json=_json.dumps({"session_id": "S-LEGACY"})))
+        s.commit()
+        row = s.get(_Live, 1)
+        assert _live_session_id(row) == "S-LEGACY"
+        assert [r.id for r in _sa.live_rows_for_session(s, "S-LEGACY")] == [1]

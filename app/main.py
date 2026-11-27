@@ -8647,7 +8647,8 @@ def _assess_rapport_completion(
     )
     for copy in held[1:]:
         copy_recording = (_json_load(copy.rapport_json) or {}).get("recording")
-        if copy_recording not in (None, "idle"):
+        # 只让「还在录」的那份顶上来;已停的副本不得盖掉另一份的 armed/recording。
+        if copy_recording in ("armed", "recording"):
             live_recording_state = copy_recording
         copy_rec = _json_load(copy.patient_rec_json)
         patient_rec_active = patient_rec_active or bool(
