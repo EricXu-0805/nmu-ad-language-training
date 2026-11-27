@@ -623,6 +623,7 @@ def test_two_tablets_alternating_heartbeats_audit_each_build_once(beds, monkeypa
 
 
 def test_page_build_memory_is_bounded_per_session(monkeypatch):
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
     monkeypatch.setattr(main_module, "_PATIENT_PAGE_BUILD", None)
     monkeypatch.setattr(main_module, "_PATIENT_PAGE_BUILD_REPORTED", set())
     limit = main_module._PATIENT_PAGE_BUILD_MAX
@@ -634,6 +635,19 @@ def test_page_build_memory_is_bounded_per_session(monkeypatch):
     # 还在表里的场次同一构建号不再记;被挤掉的场次回来算第一次。
     assert not main_module._remember_patient_page_build(kept[-1], DEPLOYED_PAGE_BUILD)
     assert main_module._remember_patient_page_build("S-PB-0", DEPLOYED_PAGE_BUILD)
+
+
+def test_single_slot_page_build_memory_keeps_one_session(monkeypatch):
+    """单床照今天只记一场:换场清空已报集合,A→B→A 每一拍换场都算第一次。"""
+    monkeypatch.delenv("NMU_BEDSIDE_SLOTS", raising=False)
+    monkeypatch.setattr(main_module, "_PATIENT_PAGE_BUILD", None)
+    monkeypatch.setattr(main_module, "_PATIENT_PAGE_BUILD_REPORTED", set())
+    remembered = [main_module._remember_patient_page_build(session_id, DEPLOYED_PAGE_BUILD)
+                  for session_id in ("S-PB-A", "S-PB-B", "S-PB-A", "S-PB-B", "S-PB-A")]
+    assert remembered == [True] * 5
+    assert not main_module._remember_patient_page_build("S-PB-A", DEPLOYED_PAGE_BUILD)
+    assert main_module._PATIENT_PAGE_BUILD == {"S-PB-A": DEPLOYED_PAGE_BUILD}
+    assert main_module._PATIENT_PAGE_BUILD_REPORTED == {("S-PB-A", DEPLOYED_PAGE_BUILD)}
 
 
 def test_console_state_defaults_to_the_callers_own_slot(beds):

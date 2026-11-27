@@ -1435,6 +1435,28 @@ def test_page_build_audited_once_per_session_and_build(client, page_build):
     ]
 
 
+def test_single_slot_page_build_reaudits_a_session_that_gets_the_slot_back(
+        client, page_build, monkeypatch):
+    """单床时换场就清空已报集合:A→B→A→B 同一个构建号,每次拿回床旁槽都再记一条。"""
+    monkeypatch.delenv("NMU_BEDSIDE_SLOTS", raising=False)
+    _patient(client, "P-PB-ABA-1")
+    _patient(client, "P-PB-ABA-2")
+    _training_session(client, "S-PB-ABA-1", "P-PB-ABA-1")
+    _training_session(client, "S-PB-ABA-2", "P-PB-ABA-2")
+    for wseq, session_id in enumerate(
+            ("S-PB-ABA-1", "S-PB-ABA-2", "S-PB-ABA-1", "S-PB-ABA-2"), start=1):
+        assert _handshake(client, session_id, wseq=100 * wseq).status_code == 200
+        for _ in range(2):
+            assert _page_build_heartbeat(
+                client, session_id, DEPLOYED_PAGE_BUILD).status_code == 200
+    for session_id, patient_id in (("S-PB-ABA-1", "P-PB-ABA-1"),
+                                   ("S-PB-ABA-2", "P-PB-ABA-2")):
+        assert _page_build_audits(client, session_id) == [
+            (patient_id,
+             f"page_build={DEPLOYED_PAGE_BUILD} deployed={DEPLOYED_PAGE_BUILD} match=yes"),
+        ] * 2
+
+
 def test_deployed_page_build_id_reader(tmp_path):
     # 与 _mount_spa 托管的是同一份 dist。
     assert main_mod._DEPLOYED_PAGE_BUILD_ID_PATH == (

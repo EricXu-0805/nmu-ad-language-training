@@ -5626,10 +5626,10 @@ _PAGE_BUILD_ID_PATTERN = re.compile(r"[0-9]{10,80}")
 _PAGE_BUILD_ID_FILE_MAX_BYTES = 128
 _DEPLOYED_PAGE_BUILD_ID_PATH = (
     Path(__file__).resolve().parent.parent / "web" / "dist" / "build-id.txt")
-# 每场最近一拍心跳报的老人端页面构建号，以及已记过审计的(场次, 构建号)。按场次存：两床的
-# 平板每 5 s 交替心跳，存单个值会每拍互相顶掉、每拍各记一条审计。只留最近
-# _PATIENT_PAGE_BUILD_MAX 场，挤掉的场次连同它的已报记录一起丢。与 _SERVER_WSEQ
-# 一样依赖单 worker：重启后清空，最多 5 s 显示 unknown、多记一条重复审计。
+# 每场最近一拍心跳报的老人端页面构建号，以及已记过审计的(场次, 构建号)。单床只记一场，
+# 换场就清空已报集合。两床按场次存：两台平板每 5 s 交替心跳，只记一场会每拍互相顶掉、
+# 每拍各记一条审计；只留最近 _PATIENT_PAGE_BUILD_MAX 场，挤掉的场次连同它的已报记录
+# 一起丢。与 _SERVER_WSEQ 一样依赖单 worker：重启后清空，最多 5 s 显示 unknown、多记一条重复审计。
 _PATIENT_PAGE_BUILD_MAX = 8
 _PATIENT_PAGE_BUILD: dict[str, str | None] | None = None
 _PATIENT_PAGE_BUILD_REPORTED: set[tuple[str, str | None]] = set()
@@ -5652,6 +5652,10 @@ def _remember_patient_page_build(session_id: str, build: str | None) -> bool:
     """记下本场最近一拍的页面构建号；本场第一次出现的构建号返回 True。调用方须持 _LIVE_WRITE_LOCK。"""
     global _PATIENT_PAGE_BUILD
     builds = dict(_PATIENT_PAGE_BUILD or {})
+    if session_admission.bedside_slot_count() == 1:
+        if list(builds)[-1:] != [session_id]:
+            _PATIENT_PAGE_BUILD_REPORTED.clear()
+        builds = {}
     builds.pop(session_id, None)
     builds[session_id] = build
     for evicted in list(builds)[:-_PATIENT_PAGE_BUILD_MAX]:
