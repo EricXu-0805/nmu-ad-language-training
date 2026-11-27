@@ -184,6 +184,8 @@ test("ServerAutopilotControl 的云授权读循环:结论只经 nextCloudAuthori
   assert.match(effect,
     /timer = window\.setTimeout\(\(\) => \{ void refreshCloudAuthorization\(\); \},\s*cloudAuthorizationReadDelayMs\(known, failures\)\);\s*\};\s*void refreshCloudAuthorization\(\);/);
   assert.match(effect, /return \(\) => \{\s*cancelled = true;\s*window\.clearTimeout\(timer\);\s*\};/);
+  // 变异复核:重排程前面不许加条件或提前 return(有结论后不再 30 s 重读,补完授权按钮永不放开)。
+  assert.match(effect, /setCloudAuthorizationError\(read\.ok \? null : read\.error\);\s*(?:\/\/[^\n]*\n\s*)*timer = window\.setTimeout\(/);
 });
 
 test("start request is deterministic, revision-zero, and rejects unsafe session ids", () => {

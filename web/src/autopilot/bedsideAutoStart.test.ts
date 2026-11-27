@@ -44,9 +44,20 @@ function greenGates(overrides: Partial<BedsideAutoStartGates> = {}): BedsideAuto
     planPositionReady: true,
     startInFlight: false,
     alreadyAttempted: false,
+    hasExistingEvidence: false,
     ...overrides,
   };
 }
+
+test("本场已有人工证据就不再床旁自动启动:激活锁存后门禁迟迟才绿,人工已经开做了", () => {
+  // 复核 2026-11-27:云授权读一直失败、激活一直挂着,人工带了几题之后读到已授权,
+  // 自动启动会卸下人工面板、再被服务端 409 autopilot_existing_manual_evidence 拒掉。
+  assert.equal(canAutoStartServerAutopilot(greenGates({ hasExistingEvidence: true })), false);
+  assert.equal(canAutoStartServerAutopilot(greenGates()), true);
+  const source = readFileSync(new URL("../console/scoring/ServerAutopilotControl.tsx", import.meta.url), "utf8");
+  const call = source.slice(source.indexOf("if (!canAutoStartServerAutopilot({"));
+  assert.match(call.slice(0, call.indexOf("})) return;")), /\bhasExistingEvidence,/);
+});
 
 test("resetting the start position cannot retry a previously attempted bedside start", () => {
   assert.equal(canAutoStartServerAutopilot(greenGates({ alreadyAttempted: true })), false);

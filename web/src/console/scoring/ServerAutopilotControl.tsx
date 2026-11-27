@@ -483,11 +483,12 @@ export function ServerAutopilotControl({
       planPositionReady,
       startInFlight: startInFlight.current,
       alreadyAttempted: autoStartAttempted.current,
+      hasExistingEvidence,
     })) return;
     autoStartAttempted.current = true;
     void startRef.current();
-  }, [bedsideActivation, completePlanBlocked, eligibility.allowed, eligibilityRefusal, interactionBlocked,
-    patientMicOn, planPositionReady, providerReadiness, session.session_id,
+  }, [bedsideActivation, completePlanBlocked, eligibility.allowed, eligibilityRefusal, hasExistingEvidence,
+    interactionBlocked, patientMicOn, planPositionReady, providerReadiness, session.session_id,
     state.phase, state.receipt, startOrder, startSelectionEdited, confirmStartPosition]);
 
   if (!classificationProven) return null;

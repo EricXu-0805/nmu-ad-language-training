@@ -37,6 +37,8 @@ export interface BedsideAutoStartGates {
   planPositionReady: boolean;
   startInFlight: boolean;
   alreadyAttempted: boolean;
+  /** 本场已有人工作答或交互证据:服务端会 409 autopilot_existing_manual_evidence,自动启动只会卸下人工面板。 */
+  hasExistingEvidence: boolean;
 }
 
 /**
@@ -55,7 +57,8 @@ export function canAutoStartServerAutopilot(gates: BedsideAutoStartGates): boole
     && !gates.patientMicOn
     && gates.planPositionReady
     && !gates.startInFlight
-    && !gates.alreadyAttempted;
+    && !gates.alreadyAttempted
+    && !gates.hasExistingEvidence;
 }
 
 /**
