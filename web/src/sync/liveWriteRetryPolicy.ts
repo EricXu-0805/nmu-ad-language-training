@@ -13,3 +13,16 @@ export function liveWriteRetryDecision(
 ): LiveWriteRetryDecision {
   return kind === "session" ? "restart_context" : "retry_exact";
 }
+
+/**
+ * A refused handshake leaves this console off every bedside slot, so each
+ * later cursor/rapport write is refused as a session mismatch. Keep showing
+ * the handshake's own reason (e.g. both beds in use) instead of that echo.
+ */
+export function rejectedLiveWriteMessage(
+  kind: LiveWriteRetryKind,
+  message: string,
+  handshakeRefusal: string | null,
+): string {
+  return kind === "session" ? message : handshakeRefusal ?? message;
+}

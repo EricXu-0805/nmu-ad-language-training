@@ -13,6 +13,7 @@ import { bus } from "./bus";
 import { requireServerWseq } from "./liveWriteAck";
 import {
   liveWriteRetryDecision,
+  rejectedLiveWriteMessage,
   type LiveWriteRetryKind,
 } from "./liveWriteRetryPolicy";
 import { readAuthoritativePatientRec } from "./patientRecAuthority";
@@ -66,6 +67,7 @@ function errorMessage(error: unknown): string {
 export function useCursorWriter(sessionId: string) {
   const [syncError, setSyncError] = useState<string | null>(null);
   const failedWrite = useRef<{ kind: LiveWriteKind; payload: object } | null>(null);
+  const handshakeRefusal = useRef<string | null>(null);
   // A timeout has unknown server disposition. Keep the exact CAS body (including
   // revision/wseq) under its stable key so an explicit retry cannot mutate the
   // idempotency hash by fetching a newer snapshot.
@@ -75,6 +77,7 @@ export function useCursorWriter(sessionId: string) {
   // activeConsoleSessionId 已就位。StrictMode 重放同一 session 时不会把已入队首写判旧。
   useEffect(() => {
     failedWrite.current = null;
+    handshakeRefusal.current = null;
     pendingInteractionPresentations.current.clear();
     setSyncError(null);
     const generation = ++activeConsoleGeneration;
@@ -117,6 +120,7 @@ export function useCursorWriter(sessionId: string) {
         // Writes are globally ordered. A later ACK also proves that any earlier
         // ambiguous handshake already established sufficient server context.
         failedWrite.current = null;
+        handshakeRefusal.current = null;
         setSyncError(null);
         return true;
       } catch (error) {
@@ -128,7 +132,9 @@ export function useCursorWriter(sessionId: string) {
           // 丢弃被拒载荷让服务端真值接管(暂停投影/锁分收回由服务端游标下发);
           // 只有暂停竞态的拒绝静默放行,其余仍亮警示但重试不再重发毒载荷。
           failedWrite.current = null;
-          if (!error.detail.includes("已暂停")) setSyncError(errorMessage(error));
+          const message = errorMessage(error);
+          if (kind === "session") handshakeRefusal.current = message;
+          if (!error.detail.includes("已暂停")) setSyncError(rejectedLiveWriteMessage(kind, message, handshakeRefusal.current));
           return false;
         }
         failedWrite.current = { kind, payload };
