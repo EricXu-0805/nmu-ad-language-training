@@ -116,14 +116,22 @@ _TWO_SLOT_CASES = [
     ("自动场切回:1 号新鲜他场、2 号空", (_other(1),), "autopilot_return", (2, "vacant")),
     ("本场同时命中两槽:fail closed", (_mine(1), _mine(2, stale=True)), "handshake",
      "bedside_slot_conflict"),
-    ("2→1→2 的影子:他场同时在两槽、一新一旧,第三场不接管旧的那份",
-     (_other(1), _other(2, stale=True)), "handshake", "bedside_slot_conflict"),
-    ("另一位受试者的两场同时占两槽", (_other(1), _second(2, patient="P-X")), "handshake",
-     "bedside_slot_conflict"),
+    # 违例只拦牵涉到的那一场和那位受试者;别人的违例槽照普通占用处理,不连坐所有握手。
+    ("他场同时在两槽、一新一旧:旧的那份照常按遗弃接管(那一场的平板和握手本就 409)",
+     (_other(1), _other(2, stale=True)), "handshake", (2, "stale_takeover")),
+    ("他场同时在两槽:自动场切回不选遗弃槽,满员",
+     (_other(1), _other(2, stale=True)), "autopilot_return", "bedside_slots_full"),
+    ("另一位受试者的两场同时占两槽、都新鲜:满员",
+     (_other(1), _second(2, patient="P-X")), "handshake", "bedside_slots_full"),
+    ("另一位受试者的两场同时占两槽、2 号那场遗弃:照常接管 2 号",
+     (_other(1), _second(2, patient="P-X", stale=True)), "handshake", (2, "stale_takeover")),
     ("本场在 1 号、同受试者另一场在 2 号", (_mine(1), _other(2, patient=P)), "handshake",
      "bedside_slot_conflict"),
     ("本场在 1 号、同受试者另一场在 2 号:自动场切回同样拒绝",
      (_mine(1), _other(2, patient=P)), "autopilot_return", "bedside_slot_conflict"),
+    ("同受试者另两场各占一槽:不知道接哪一槽,fail closed",
+     (_other(1, patient=P), _second(2, patient=P, stale=True)), "handshake",
+     "bedside_slot_conflict"),
     ("终态场的影子不算占槽", (_other(1, status="completed"), _other(2, status="completed")),
      "handshake", (1, "terminal_takeover")),
     ("已不存在场次的影子不算占槽", (_gone(1), _gone(2)), "handshake", (1, "vacant")),
@@ -252,6 +260,13 @@ def _invariant_holds(views) -> bool:
     return len(set(sessions)) == len(sessions) and len(set(patients)) == len(patients)
 
 
+def _requester_invariant_holds(views) -> bool:
+    """只看请求的这一场和它的受试者:各自最多占一槽。"""
+    holding = _holding(views)
+    return (sum(v.session_id == R for v in holding) <= 1
+            and sum(v.session_id == R or v.patient_id == P for v in holding) <= 1)
+
+
 def _apply(views, slot_id):
     kept = [v for v in views if v.slot_id != slot_id]
     return (*kept, BedsideSlotView(slot_id=slot_id, session_exists=True, **_REQUESTER))
@@ -287,11 +302,12 @@ def test_two_slots_keep_the_invariant_and_refuse_only_broken_or_full_states():
                 choice = _choose(*views, purpose=purpose)
             except BedsideSlotError as exc:
                 outcomes.add(exc.code)
+                # 只有牵涉到本场或本场受试者的违例才拒;别人的违例不连坐。
                 if exc.code == "bedside_slot_conflict":
-                    assert not _invariant_holds(views)
+                    assert not _requester_invariant_holds(views)
                     continue
                 assert exc.code == "bedside_slots_full"
-                assert _invariant_holds(views)
+                assert _requester_invariant_holds(views)
                 for slot_id in (1, 2):
                     view = _slot(views, slot_id)
                     assert _is_live_other(view)
@@ -299,13 +315,15 @@ def test_two_slots_keep_the_invariant_and_refuse_only_broken_or_full_states():
                     assert purpose == "autopilot_return" or not view.stale
                 continue
             outcomes.add(choice.action)
-            assert _invariant_holds(views)
+            assert _requester_invariant_holds(views)
             assert choice.slot_id in (1, 2)
             chosen = _slot(views, choice.slot_id)
             # 槽内动作恒为今天单槽对这个持有者的分支,变的只是选哪一槽。
             assert choice.action == _today_action(chosen, purpose)
             after = _apply(views, choice.slot_id)
-            assert _invariant_holds(after)
+            assert _requester_invariant_holds(after)
+            if _invariant_holds(views):
+                assert _invariant_holds(after)
             assert [v.slot_id for v in after if v.session_id == R] == [choice.slot_id]
             if _is_live_other(chosen):
                 # 只在同受试者/同 trainer,或已经没有空闲槽时,才动别人占着的槽。

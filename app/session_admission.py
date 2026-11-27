@@ -301,7 +301,8 @@ def choose_bedside_slot(
 
     1 本场已占的槽;2 同一受试者的场次占着的槽;3 同一 trainer_id 的场次占着的槽;
     4 空或终态的槽取最小编号;5 遗弃槽,只在握手时可选;6 N=1 走今天的新鲜保护,
-    N=2 回 bedside_slots_full。一场或一位受试者已占两槽时回 bedside_slot_conflict。
+    N=2 回 bedside_slots_full。本场写在两槽、或本场的受试者已占两槽时回
+    bedside_slot_conflict;别的场次或受试者的违例不拦,那几槽照普通占用处理。
     """
     if purpose not in {"handshake", "autopilot_return"}:
         raise ValueError(f"unknown bedside slot purpose {purpose!r}")
@@ -313,18 +314,15 @@ def choose_bedside_slot(
         return (bool(view.session_id) and view.session_exists
                 and view.status not in BEDSIDE_TERMINAL_STATUSES)
 
-    # 终态场和已不存在的场不算占槽,它们的影子无害;仍在占槽的场重复出现说明
-    # 不变量已经破了(如 2→1→2 留下的影子),此时接管哪一份都可能打断健康场次。
-    holding = [view for view in views
-               if view.session_id == session_id or occupied(view)]
-    held_sessions = [view.session_id for view in holding]
-    held_patients = [
-        key for key in (
-            ((patient_id if view.session_id == session_id else view.patient_id) or "").strip()
-            for view in holding)
-        if key]
-    if (len(set(held_sessions)) < len(held_sessions)
-            or len(set(held_patients)) < len(held_patients)):
+    # 终态场和已不存在的场不算占槽,它们的影子无害。本场或本场的受试者重复出现说明
+    # 不变量已经破了(如 2→1→2 留下的影子),不知道该接哪一份,fail closed。别人的违例
+    # 只拦别人:那一场自己的平板和握手本就 409,不能让一处违例连坐所有握手;它的槽
+    # 照普通占用处理,遗弃了就照常让位。
+    own_slots = [view for view in views if view.session_id == session_id]
+    patient_slots = [view for view in views
+                     if view.session_id == session_id
+                     or (occupied(view) and _same_key(view.patient_id, patient_id))]
+    if len(own_slots) > 1 or len(patient_slots) > 1:
         raise BedsideSlotError("bedside_slot_conflict")
 
     def occupied_action(view: BedsideSlotView) -> str:

@@ -298,6 +298,75 @@ def test_two_one_two_shadow_does_not_pause_the_healthy_session(beds, monkeypatch
     assert beds.device.get("/live/state", headers=tablet_b).json()["session"]["sessionId"] == S_B
 
 
+def _same_patient_in_both_slots(beds, monkeypatch) -> None:
+    """2→1→2:S-B 暂停在 2 号槽时切回单槽,1 号槽那一场中止后同一受试者的 S-B2 进了 1 号槽;
+    再开两床,P-B 的两场各占一槽,都没终态。"""
+    _two_beds_claimed(beds)
+    assert beds.b.post(f"/sessions/{S_B}/pause").status_code == 200
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "1")
+    _set_status(beds.engine, S_A, "aborted")
+    assert _claim(beds.b, S_B2).status_code == 200
+    monkeypatch.setenv("NMU_BEDSIDE_SLOTS", "2")
+    assert (_holder(beds.engine, 1), _holder(beds.engine, 2)) == (S_B2, S_B)
+
+
+def test_two_one_two_same_patient_in_both_slots_blocks_only_that_patient(beds, monkeypatch):
+    _same_patient_in_both_slots(beds, monkeypatch)
+    own = _claim(beds.b, S_B2)
+    assert (own.status_code, _code(own)) == (409, "bedside_slot_conflict")
+
+    # 别的受试者照常:两槽都新鲜就是满员,什么都不写。
+    before = _snapshot(beds.engine)
+    full = _claim(beds.c, S_C)
+    assert (full.status_code, _code(full)) == (409, "bedside_slots_full")
+    assert _snapshot(beds.engine) == before
+
+    # 2 号槽遗弃了就按遗弃接管它,1 号槽里的 S-B2 不动。
+    with Session(beds.engine) as s:
+        aged = s.get(LiveState, 2)
+        aged.updated_at = datetime.now() - timedelta(hours=1)
+        s.add(aged)
+        s.commit()
+    slot_one = _raw_slot(beds.engine, 1)
+    taken = _claim(beds.c, S_C)
+    assert taken.status_code == 200, taken.text
+    assert (_holder(beds.engine, 1), _holder(beds.engine, 2)) == (S_B2, S_C)
+    assert _raw_slot(beds.engine, 1) == slot_one
+    assert "bedside_slot_stale_takeover" in _audit_actions(beds.engine)
+    with Session(beds.engine) as s:
+        assert s.get(SessionRuntimeState, S_B).status == "paused"
+
+
+def test_two_one_two_same_patient_clears_once_the_old_session_ends(beds, monkeypatch):
+    _same_patient_in_both_slots(beds, monkeypatch)
+    _abort(beds.b, beds.engine, S_B, "hs-abort-b-0000000003")
+    again = _claim(beds.b, S_B2)
+    assert again.status_code == 200, again.text
+    assert (_holder(beds.engine, 1), _holder(beds.engine, 2)) == (S_B2, None)
+
+
+def test_stale_copy_of_a_session_written_into_two_slots_is_taken_over_safely(beds):
+    """别人的一场同时写在两槽、2 号那份遗弃:第三场照常接管 2 号槽,那一场两份都先收麦暂停。"""
+    _two_beds_claimed(beds)
+    with Session(beds.engine) as s:
+        one, two = s.get(LiveState, 1), s.get(LiveState, 2)
+        for column in _SLOT_COLUMNS:
+            setattr(two, column, getattr(one, column))
+        two.updated_at = datetime.now() - timedelta(hours=1)
+        s.add(two)
+        s.commit()
+
+    taken = _claim(beds.c, S_C)
+
+    assert taken.status_code == 200, taken.text
+    assert (_holder(beds.engine, 1), _holder(beds.engine, 2)) == (S_A, S_C)
+    with Session(beds.engine) as s:
+        assert s.get(SessionRuntimeState, S_A).status == "paused"
+    slot_one = _slot(beds.engine, 1)
+    assert json.loads(slot_one.session_json)["paused"] is True
+    assert json.loads(slot_one.cursor_json)["recording"] == "stopped"
+
+
 def test_single_slot_handshake_is_unchanged(single_slot_beds):
     beds = single_slot_beds
     assert _claim(beds.a, S_A).status_code == 200
