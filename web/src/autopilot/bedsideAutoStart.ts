@@ -1,4 +1,4 @@
-import type { AutopilotConsoleState } from "./startControl";
+import type { AutopilotConsoleState, P0aConsoleEligibility } from "./startControl";
 
 // 床旁激活 → 自动启动的操作端纯策略。信号只是本机触发条件:它不新建启动链路,
 // 只在全部现有门禁明确放行时,替研究者按一次既有的「启动」——随后仍是
@@ -56,4 +56,18 @@ export function canAutoStartServerAutopilot(gates: BedsideAutoStartGates): boole
     && gates.planPositionReady
     && !gates.startInFlight
     && !gates.alreadyAttempted;
+}
+
+/**
+ * 已锁存的本场激活撞上确定的写前拒因(受试者云处理授权明确缺失)时,这次激活就此用掉,
+ * 与门禁前移之前服务端 409 autopilot_cloud_processing_required 消耗它的效果一致。
+ * 不用掉的话,研究者改走人工、别处补完授权,30 s 重读一放行,本场会无人点击自己开跑。
+ * 补完授权后只放开研究者手动点的启动按钮。还在核对(cloud_processing_unverified)不是拒绝,继续等。
+ */
+export function bedsideActivationRefusedBeforeStart(
+  sessionId: string,
+  latchedActivationSessionId: string | null,
+  refusal: Extract<P0aConsoleEligibility, { allowed: false }>["reason"] | null,
+): boolean {
+  return latchedActivationSessionId === sessionId && refusal === "cloud_processing_required";
 }

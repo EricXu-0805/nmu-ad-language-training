@@ -30,6 +30,7 @@ import {
   type AutopilotStartSkipReason,
 } from "../../autopilot/startControl";
 import {
+  bedsideActivationRefusedBeforeStart,
   canAutoStartServerAutopilot,
   latchBedsideActivation,
 } from "../../autopilot/bedsideAutoStart";
@@ -124,6 +125,7 @@ export function ServerAutopilotControl({
   const [cloudAuthorized, setCloudAuthorized] = useState<boolean | null>(null);
   const [cloudAuthorizationError, setCloudAuthorizationError] = useState<string | null>(null);
   const eligibility = p0aConsoleEligibility(session, interactionBlocked, hasNamedAccount, cloudAuthorized);
+  const eligibilityRefusal = eligibility.allowed ? null : eligibility.reason;
   const completePlanBlocked = !completePlanAllowsAutopilotStart(
     operationalAutopilotReady,
   );
@@ -318,7 +320,7 @@ export function ServerAutopilotControl({
   }, [classificationProven, hasNamedAccount, session.session_id]);
 
   // 2026-11-27:没有云处理授权的受试者,启动按钮照样可点,连撞 8 次 409。这里先读
-  // 档案与部署配置,按服务端同一条规则提前禁用;别处补完授权后 30 s 内自动放行。
+  // 档案与部署配置,按服务端同一条规则提前禁用;别处补完授权后 30 s 内放开手动启动按钮。
   useEffect(() => {
     setCloudAuthorized(null);
     setCloudAuthorizationError(null);
@@ -459,6 +461,10 @@ export function ServerAutopilotControl({
     // 选择起点属于研究者操作：即使后来选回1，也要明确重置才恢复床旁自动启动。
     // ref 在原生选框获得焦点时即锁住，防激活信号早于 React 的状态更新。
     if (!allowsBedsideDefaultStart(startOrder, startSelectionEditedRef.current, confirmStartPosition !== null)) return;
+    if (bedsideActivationRefusedBeforeStart(session.session_id, bedsideActivation, eligibilityRefusal)) {
+      autoStartAttempted.current = true;
+      return;
+    }
     if (!canAutoStartServerAutopilot({
       sessionId: session.session_id,
       latchedActivationSessionId: bedsideActivation,
@@ -475,7 +481,7 @@ export function ServerAutopilotControl({
     })) return;
     autoStartAttempted.current = true;
     void startRef.current();
-  }, [bedsideActivation, completePlanBlocked, eligibility.allowed, interactionBlocked,
+  }, [bedsideActivation, completePlanBlocked, eligibility.allowed, eligibilityRefusal, interactionBlocked,
     patientMicOn, planPositionReady, providerReadiness, session.session_id,
     state.phase, state.receipt, startOrder, startSelectionEdited, confirmStartPosition]);
 
@@ -837,7 +843,7 @@ export function ServerAutopilotControl({
       ) : uncertain ? (
         <>启动结果待确认，页面已锁定，请稍候。</>
       ) : cloudBlocked ? (
-        <>{AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT}。授权保存后半分钟内这里会自动放行；本场也可以直接人工操作。</>
+        <>{AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT}。授权保存后半分钟内启动按钮恢复可点，届时请研究者自己点「启动 AI 自动带练」；本场也可以直接人工操作。</>
       ) : cloudUnverified ? (
         <>正在核对受试者的云处理授权{cloudAuthorizationError
           ? `；读取失败（${cloudAuthorizationError}），稍后自动重试。`

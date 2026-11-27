@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import type { Session } from "../types.ts";
 import {
+  bedsideActivationRefusedBeforeStart,
   canAutoStartServerAutopilot,
   latchBedsideActivation,
   type BedsideAutoStartGates,
@@ -11,6 +13,7 @@ import {
   autopilotServerOwnsConsole,
   initialAutopilotConsoleState,
   p0aConsoleEligibility,
+  type P0aConsoleEligibility,
 } from "./startControl.ts";
 
 const SESSION_ID = "S-a1b2c3d4";
@@ -49,10 +52,16 @@ test("resetting the start position cannot retry a previously attempted bedside s
   assert.equal(canAutoStartServerAutopilot(greenGates({ alreadyAttempted: true })), false);
 });
 
-// 复现操作端的组合行为:锁存 + 同步 attempted 闸 + 每次渲染重评策略。
+type ConsoleRefusal = Extract<P0aConsoleEligibility, { allowed: false }>["reason"];
+
+// 复现操作端的组合行为:锁存 + 确定拒因用掉激活 + 同步 attempted 闸 + 每次渲染重评策略。
 // 返回真实会发出的自动启动写请求次数。
 function renderCycles(
-  cycles: { eventSessionId?: unknown; gates?: Partial<BedsideAutoStartGates> }[],
+  cycles: {
+    eventSessionId?: unknown;
+    gates?: Partial<BedsideAutoStartGates>;
+    refusal?: ConsoleRefusal | null;
+  }[],
 ): number {
   let latched: string | null = null;
   let attempted = false;
@@ -60,6 +69,10 @@ function renderCycles(
   for (const cycle of cycles) {
     if ("eventSessionId" in cycle) {
       latched = latchBedsideActivation(latched, cycle.eventSessionId, SESSION_ID);
+    }
+    if (bedsideActivationRefusedBeforeStart(SESSION_ID, latched, cycle.refusal ?? null)) {
+      attempted = true;
+      continue;
     }
     const gates = greenGates({
       ...cycle.gates,
@@ -187,6 +200,73 @@ test("a research session without proven cloud authorization never auto starts fr
       { gates: { eligibilityAllowed: eligibility.allowed } },
     ]), 0);
   }
+});
+
+const RESEARCH_SESSION: Session = {
+  ...SIMULATION_SESSION,
+  is_simulation: false,
+  data_classification: "research",
+};
+
+// 一拍渲染:受试者云授权读数 → 与组件同一个 p0aConsoleEligibility → 门禁与拒因。
+function researchCycle(cloud: boolean | null, eventSessionId?: string) {
+  const eligibility = p0aConsoleEligibility(RESEARCH_SESSION, false, true, cloud);
+  return {
+    ...(eventSessionId === undefined ? {} : { eventSessionId }),
+    gates: { eligibilityAllowed: eligibility.allowed },
+    refusal: eligibility.allowed ? null : eligibility.reason,
+  };
+}
+
+// 复核 F1:改前未授权受试者的床旁自动启动会发一次、被服务端 409
+// autopilot_cloud_processing_required 拒掉,激活随之用掉。前移门禁后若不在这里用掉,
+// 研究者改走人工、别处补完授权,30 s 重读一放行,本场就会无人点击自己开跑。
+test("云授权明确缺失时床旁激活就此用掉:之后补完授权也不会无人点击自己开跑", () => {
+  // 激活先到(授权还在核对),随后几拍读到明确缺失,再之后别处补完授权。
+  assert.equal(renderCycles([
+    researchCycle(null, SESSION_ID),
+    researchCycle(false), researchCycle(false), researchCycle(false),
+    researchCycle(true), researchCycle(true), researchCycle(true),
+  ]), 0);
+  // 明确缺失之后才到的激活同样当场用掉;授权后老人端再点也不重发。
+  assert.equal(renderCycles([
+    researchCycle(false), researchCycle(false, SESSION_ID), researchCycle(false),
+    researchCycle(true), researchCycle(true, SESSION_ID), researchCycle(true),
+  ]), 0);
+  // 只是还在核对(没读到、首读失败)不是拒绝:授权一核实,已授权受试者照旧自动启动一次。
+  assert.equal(renderCycles([
+    researchCycle(null, SESSION_ID), researchCycle(null), researchCycle(null),
+    researchCycle(true), researchCycle(true),
+  ]), 1);
+  // 没锁存、或锁存的不是本场,不用掉任何东西;其他拒因(含核对中)也不在此列。
+  assert.equal(bedsideActivationRefusedBeforeStart(SESSION_ID, null, "cloud_processing_required"), false);
+  assert.equal(bedsideActivationRefusedBeforeStart(SESSION_ID, "S-old", "cloud_processing_required"), false);
+  assert.equal(bedsideActivationRefusedBeforeStart(SESSION_ID, SESSION_ID, "cloud_processing_required"), true);
+  for (const refusal of [
+    null, "cloud_processing_unverified", "runtime_blocked", "account_required",
+    "scope_unsupported", "classification_unverified",
+  ] as const) {
+    assert.equal(bedsideActivationRefusedBeforeStart(SESSION_ID, SESSION_ID, refusal), false, String(refusal));
+  }
+});
+
+test("ServerAutopilotControl:云授权明确缺失先用掉激活,再谈自动启动;面板不再承诺自动放行", () => {
+  // 本测试环境不能 mount React,以接线守卫锁住关键连接。
+  const source = readFileSync(
+    new URL("../console/scoring/ServerAutopilotControl.tsx", import.meta.url), "utf8");
+  assert.match(source, /const eligibilityRefusal = eligibility\.allowed \? null : eligibility\.reason;/);
+  const effect = source.slice(
+    source.indexOf("if (!allowsBedsideDefaultStart("),
+    source.indexOf("if (!classificationProven) return null;"));
+  assert.match(effect,
+    /if \(bedsideActivationRefusedBeforeStart\(session\.session_id, bedsideActivation, eligibilityRefusal\)\) \{\s*autoStartAttempted\.current = true;\s*return;\s*\}/);
+  assert.ok(effect.indexOf("bedsideActivationRefusedBeforeStart(") < effect.indexOf("canAutoStartServerAutopilot("),
+    "必须在自动启动判定之前用掉");
+  // 核对中 → 明确缺失时 allowed 一直是 false,依赖里必须有拒因本身,否则 effect 不重跑、激活用不掉。
+  assert.match(effect, /\}, \[[^\]]*\beligibilityRefusal\b[^\]]*\]\);/);
+  assert.doesNotMatch(source, /自动放行/);
+  assert.match(source,
+    /cloudBlocked \? \(\s*<>\{AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT\}。授权保存后半分钟内启动按钮恢复可点，届时请研究者自己点「启动 AI 自动带练」/);
 });
 
 test("classification-unverified sessions can never auto start", () => {
