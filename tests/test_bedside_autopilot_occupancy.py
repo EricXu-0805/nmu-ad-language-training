@@ -527,3 +527,32 @@ def test_admin_console_state_never_falls_back_to_the_other_bed(world):
         assert sa not in r.text
     own = admin.get("/live/console-state", params={"session_id": sa})
     assert own.status_code == 200 and own.json()["session"]["sessionId"] == sa
+
+
+def test_a_bed_whose_tablet_is_mid_recording_is_not_abandoned(any_world):
+    """阈值调小时:上一条 /live/state 写已过阈值,但平板 15 s 前刚回执开录、正在录。
+    这张床仍在用,开场不能借「遗弃」把它接管走(两床时 2 号床也在用,只能满员)。"""
+    w = any_world
+    sa = open_autopilot_bed(w, "res-a", "P-A")
+    w.clock.advance(20)
+    record = tablet_question(w, sa)
+    w.clock.advance(50)
+    two_beds = session_admission.bedside_slot_count() == 2
+    if two_beds:
+        sb = open_autopilot_bed(w, "res-b", "P-B")
+        assert slot_of(w, sb) == 2
+    authorized = w.device.post(
+        f"/sessions/{sa}/autopilot/commands/{record['command_key']}/recording-authorization",
+        headers=w.tablet[sa])
+    assert authorized.status_code == 200, authorized.text
+    started_recording = _ack(w, sa, record, "record_started", mime_type="audio/webm",
+                             sample_rate_hz=48_000, channels=1)
+    assert started_recording.status_code == 200, started_recording.text
+    w.clock.advance(15)
+    assert snap(w, sa)["live_stale"] is False
+    started = start_plan(w, "res-c", "P-C")
+    expected = "bedside_slots_full" if two_beds else "bedside_autopilot_running"
+    assert (started.status_code, _detail_code(started)) == (409, expected)
+    a = snap(w, sa)
+    assert a["slot"] == 1 and a["rt_status"] == "active"
+    assert a["ap"] == ("autonomous", "waiting_recording")

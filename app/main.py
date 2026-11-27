@@ -146,7 +146,7 @@ async def _workflow_policy_violation_response(
 _BEDSIDE_SLOT_ERROR_MESSAGES = {
     "bedside_slot_conflict": "床旁槽状态冲突，本次操作没有执行，请联系管理员处理",
     "bedside_slots_full": "两个床位都在使用中，请等其中一场中止或最终完成后再开（暂停不会腾出床位）",
-    "bedside_autopilot_running": "这张床的 AI 自动带练还在进行，请先暂停那一场、等老人端收麦后再开新的一场",
+    "bedside_autopilot_running": "这张床的 AI 自动带练还在进行，要换场请先由那一场的研究者暂停、等老人端收麦后再开",
 }
 
 
@@ -11371,11 +11371,15 @@ def autopilot_command_ack(
                 _pause_runtime_in_transaction(session_id, s)
             runtime = s.get(SessionRuntimeState, session_id)
             if not result.replayed and runtime is not None and runtime.status == "active":
-                # 自动带练时研究者不碰控制台,平板的新回执就是这场还在跑的证据。不续的话
-                # 准入闸会把正在跑的场当成放置超时,放同一受试者或同一账号再开一场。
-                # 只动活动时钟,不动 revision:控制台的 expected_revision 不受影响。
-                runtime.updated_at = datetime.now()
+                # 自动带练时研究者不碰控制台,平板的新回执就是这场还在跑的证据。场次时钟
+                # 给准入闸看,床位行时钟给握手的遗弃判据看,两个都续;不续的话正在跑、
+                # 甚至正在录的床会被当成放置超时让位。只动时钟,不动 revision 和 seq。
+                now = datetime.now()
+                runtime.updated_at = now
                 s.add(runtime)
+                if live is not None and _live_session_id(live) == session_id:
+                    live.updated_at = now
+                    s.add(live)
             s.commit()
         except autopilot_service.AutopilotServiceError as exc:
             _autopilot_write_failure(s, exc)

@@ -41,6 +41,12 @@ test("the hook remembers a refused handshake until a later write lands", () => {
   );
   assert.match(refused, /if \(kind === "session"\) handshakeRefusal\.current = message;/);
   assert.match(refused, /setSyncError\(rejectedLiveWriteMessage\(kind, message, handshakeRefusal\.current\)\)/);
+  const denied = source.slice(
+    source.indexOf("failedWrite.current = { kind, payload };") - 400,
+    source.indexOf("failedWrite.current = { kind, payload };"),
+  );
+  assert.match(denied, /kind === "session" && error instanceof ApiError && \(error\.status === 403 \|\| error\.status === 404\)/);
+  assert.match(denied, /handshakeRefusal\.current = errorMessage\(error\);/);
   const landed = source.slice(
     source.indexOf("onCommitted?.(serverWseq);"),
     source.indexOf("return true;"),

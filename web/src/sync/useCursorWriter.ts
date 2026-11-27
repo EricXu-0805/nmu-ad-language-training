@@ -137,6 +137,10 @@ export function useCursorWriter(sessionId: string) {
           if (!error.detail.includes("已暂停")) setSyncError(rejectedLiveWriteMessage(kind, message, handshakeRefusal.current));
           return false;
         }
+        // 403/404 是对上一场没有操作权(握手不透露它在不在床上):同样要一直显示。
+        if (kind === "session" && error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+          handshakeRefusal.current = errorMessage(error);
+        }
         failedWrite.current = { kind, payload };
         setSyncError(errorMessage(error));
         return false;

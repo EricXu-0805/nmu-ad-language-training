@@ -156,7 +156,7 @@ def content_admission_issues(
 # ── 床旁 live 槽的"遗弃"判据(2026-09-03 生产实证的雷) ────────────────────
 # 研究者训练中直接关页签走人 → 占着床旁槽的活跃/暂停场把下一场挡死。
 # "遗弃"只看操作端(控制台)侧的 live 写时间 row.updated_at:它由每次
-# 握手/推游标/推 rapport/老人端录音回报刷新。**绝不把老人端被动心跳
+# 握手/推游标/推 rapport/老人端录音回报/AI 自动带练回执刷新。**绝不把老人端被动心跳
 # (patient_last_seen_at)算进来**——两设备部署里平板固定床旁、每几秒心跳一次,
 # 研究者关的是笔记本控制台;把心跳算进来会让平板一直开着的弃场永不判遗弃,
 # 修复在最常见部署下失效(复核 P1)。
@@ -190,7 +190,7 @@ def live_holder_session_id(live_row: LiveState | None) -> str | None:
 
 
 def live_slot_stale(live_row: LiveState | None, now: datetime | None = None) -> bool:
-    """床旁槽是否已被遗弃:控制台侧 live 写停了超过阈值。
+    """床旁槽是否已被遗弃:控制台侧 live 写(含 AI 自动带练时平板的新回执)停了超过阈值。
 
     从未写过(updated_at 为空)的槽不谈守护,视为已遗弃。阈值关闭时永不遗弃。
     """
@@ -205,8 +205,8 @@ def live_slot_stale(live_row: LiveState | None, now: datetime | None = None) -> 
 def runtime_stale(runtime, now: datetime | None = None) -> bool:
     """场次自己的活动时钟是否已放置超时。
 
-    SessionRuntimeState.updated_at 由 START(建行)、推游标/rapport、暂停/恢复
-    刷新——是干净的"研究者在这场上还有没有动作"信号,**不受老人端心跳影响**。
+    SessionRuntimeState.updated_at 由 START(建行)、推游标/rapport、暂停/恢复、
+    AI 自动带练时平板的新回执刷新——是"这场还有没有人在跑"的信号,**不受老人端被动心跳影响**。
     """
     threshold = bedside_stale_after()
     if threshold is None:

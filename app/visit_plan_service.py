@@ -1646,9 +1646,9 @@ def start_plan(
         status="active",
         revision=0,
         # 场次活动时钟和判据 session_admission.runtime_stale、其余写入方一样用本机
-        # naive 时间。写 UTC 的话,生产进程 TZ=Asia/Shanghai 下刚开的场就像放了 8 小时,
-        # 「一个账号一次一场」当场失效。
-        updated_at=now or datetime.now(),
+        # naive 时间(now 参数是 UTC 口径,不用它)。写 UTC 的话,生产进程 TZ=Asia/Shanghai
+        # 下刚开的场就像放了 8 小时,「一个账号一次一场」当场失效。
+        updated_at=datetime.now(),
     )
     db.add(train_session)
     db.add(runtime)
