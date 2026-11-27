@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  cloudAuthorizationReadDelayMs,
   cloudProcessingAllowDisabledReason,
   cloudProcessingAuthorizedForAutopilot,
   cloudProcessingChoiceIssue,
   cloudProcessingDisclosure,
+  nextCloudAuthorization,
+  type CloudAuthorizationRead,
 } from "./cloudProcessingPolicy.ts";
 import {
   assessDuplicateIntake,
@@ -225,4 +228,60 @@ test("自动带练的云处理授权判定与服务端门禁同一条规则(auto
   assert.equal(cloudProcessingAuthorizedForAutopilot(granted, {
     configured: false, provider_id: null, notice_version: null, data_categories: [],
   }), false);
+});
+
+const READ_FAILED: CloudAuthorizationRead = { ok: false, error: "Bad Gateway" };
+
+test("云授权读失败不推翻已读到的结论,从没读到过就保持待核对;只有成功读数才改结论", () => {
+  assert.equal(nextCloudAuthorization(true, READ_FAILED), true);
+  assert.equal(nextCloudAuthorization(false, READ_FAILED), false);
+  assert.equal(nextCloudAuthorization(null, READ_FAILED), null);
+  assert.equal(nextCloudAuthorization(null, { ok: true, authorized: true }), true);
+  assert.equal(nextCloudAuthorization(null, { ok: true, authorized: false }), false);
+  // 授权在别处补完或被撤回,下一次成功读数照实翻转。
+  assert.equal(nextCloudAuthorization(false, { ok: true, authorized: true }), true);
+  assert.equal(nextCloudAuthorization(true, { ok: true, authorized: false }), false);
+});
+
+test("云授权重读间隔:已有结论 30 s 一读(读失败也一样);从没读到过按 3 s 起翻倍重试,封顶 30 s", () => {
+  for (const known of [true, false]) {
+    for (const failures of [0, 1, 2, 5, 20]) {
+      assert.equal(cloudAuthorizationReadDelayMs(known, failures), 30_000, `${known}/${failures}`);
+    }
+  }
+  assert.deepEqual([1, 2, 3, 4, 5, 6, 20].map((failures) => cloudAuthorizationReadDelayMs(null, failures)),
+    [3_000, 6_000, 12_000, 24_000, 30_000, 30_000, 30_000]);
+});
+
+// 与组件读循环同一个推进顺序:读完 → 结论按纯函数推进 → 连续失败计数 → 按间隔排下一读。
+function simulateCloudReads(results: readonly (boolean | "fail")[]) {
+  let known: boolean | null = null;
+  let failures = 0;
+  let at = 0;
+  const reads: { at: number; known: boolean | null }[] = [];
+  for (const result of results) {
+    const read: CloudAuthorizationRead = result === "fail" ? READ_FAILED : { ok: true, authorized: result };
+    known = nextCloudAuthorization(known, read);
+    failures = read.ok ? 0 : failures + 1;
+    reads.push({ at, known });
+    at += cloudAuthorizationReadDelayMs(known, failures);
+  }
+  return reads;
+}
+
+// 复核 F2:首读撞上一次 502 时,旧代码要等满 30 s 才重读,已授权受试者的启动被白白挡 30 s。
+test("云授权首读失败一次:3 s 后重读,已授权受试者最多被挡 3 s 而不是 30 s", () => {
+  assert.deepEqual(simulateCloudReads(["fail", true]), [
+    { at: 0, known: null },
+    { at: 3_000, known: true },
+  ]);
+  assert.deepEqual(simulateCloudReads(["fail", "fail", "fail", true]).map((read) => read.at),
+    [0, 3_000, 9_000, 21_000]);
+  // 已有结论之后的读失败不改结论,也不加快重读。
+  assert.deepEqual(simulateCloudReads([true, "fail", "fail", false]), [
+    { at: 0, known: true },
+    { at: 30_000, known: true },
+    { at: 60_000, known: true },
+    { at: 90_000, known: false },
+  ]);
 });

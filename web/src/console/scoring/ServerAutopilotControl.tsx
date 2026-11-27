@@ -39,7 +39,12 @@ import {
   providerReadinessLabel,
   type ProviderReadiness,
 } from "../../autopilot/providerReadiness";
-import { cloudProcessingAuthorizedForAutopilot } from "../cloudProcessingPolicy";
+import {
+  cloudAuthorizationReadDelayMs,
+  cloudProcessingAuthorizedForAutopilot,
+  nextCloudAuthorization,
+  type CloudAuthorizationRead,
+} from "../cloudProcessingPolicy";
 import { PATIENT_ACTIVATION_EVENT } from "../../sync/messages";
 import {
   autopilotWakeToken,
@@ -326,33 +331,33 @@ export function ServerAutopilotControl({
     setCloudAuthorizationError(null);
     if (!isRealResearch || !hasNamedAccount) return undefined;
     let cancelled = false;
-    let inFlight = false;
+    let timer: number | undefined;
+    let known: boolean | null = null;
+    let failures = 0;
     const refreshCloudAuthorization = async () => {
-      if (cancelled || inFlight) return;
-      inFlight = true;
+      let read: CloudAuthorizationRead;
       try {
         const [patient, policy] = await Promise.all([
           api.getPatient(session.patient_id), api.cloudProcessingPolicy(),
         ]);
-        if (!cancelled) {
-          setCloudAuthorized(cloudProcessingAuthorizedForAutopilot(patient, policy));
-          setCloudAuthorizationError(null);
-        }
+        read = { ok: true, authorized: cloudProcessingAuthorizedForAutopilot(patient, policy) };
       } catch (error) {
-        // 读失败不推翻已读到的结论(单次抖动不该把能启动的按钮锁 30 s);从没读到过就保持待核对。
-        if (!cancelled) {
-          setCloudAuthorizationError(error instanceof ApiError ? error.detail
-            : error instanceof Error ? error.message : String(error));
-        }
-      } finally {
-        inFlight = false;
+        read = { ok: false, error: error instanceof ApiError ? error.detail
+          : error instanceof Error ? error.message : String(error) };
       }
+      if (cancelled) return;
+      known = nextCloudAuthorization(known, read);
+      failures = read.ok ? 0 : failures + 1;
+      setCloudAuthorized(known);
+      setCloudAuthorizationError(read.ok ? null : read.error);
+      // 上一读结束才排下一读,不会叠读;没结论时退避重试,有结论后 30 s 一读。
+      timer = window.setTimeout(() => { void refreshCloudAuthorization(); },
+        cloudAuthorizationReadDelayMs(known, failures));
     };
     void refreshCloudAuthorization();
-    const timer = window.setInterval(() => { void refreshCloudAuthorization(); }, 30_000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
     };
   }, [hasNamedAccount, isRealResearch, session.patient_id, session.session_id]);
 

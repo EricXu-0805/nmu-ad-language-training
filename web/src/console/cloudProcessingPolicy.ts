@@ -22,6 +22,34 @@ export function cloudProcessingAuthorizedForAutopilot(
     && patient.cloud_processing_revoked_at == null;
 }
 
+export type CloudAuthorizationRead =
+  | { ok: true; authorized: boolean }
+  | { ok: false; error: string };
+
+// 读失败不推翻已读到的结论(单次抖动不该把能启动的按钮锁住);从没读到过就保持待核对(null)。
+export function nextCloudAuthorization(
+  previous: boolean | null,
+  read: CloudAuthorizationRead,
+): boolean | null {
+  return read.ok ? read.authorized : previous;
+}
+
+const CLOUD_AUTHORIZATION_REREAD_MS = 30_000;
+const CLOUD_AUTHORIZATION_FIRST_RETRY_MS = 3_000;
+
+// 已有结论:30 s 重读一次,读失败也照旧。从没读到过:首读一次 502 不该把已授权受试者的
+// 启动挡满 30 s,按 3 s 起翻倍重试,封顶 30 s。
+export function cloudAuthorizationReadDelayMs(
+  known: boolean | null,
+  consecutiveFailures: number,
+): number {
+  if (known !== null) return CLOUD_AUTHORIZATION_REREAD_MS;
+  return Math.min(
+    CLOUD_AUTHORIZATION_FIRST_RETRY_MS * 2 ** Math.max(0, consecutiveFailures - 1),
+    CLOUD_AUTHORIZATION_REREAD_MS,
+  );
+}
+
 export function cloudProcessingChoiceIssue(
   allowed: boolean | null | undefined,
   policy: CloudProcessingPolicy | null,

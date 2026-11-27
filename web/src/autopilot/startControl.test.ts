@@ -146,13 +146,44 @@ test("ServerAutopilotControl 把受试者云授权接进启动门禁,并在面�
     /p0aConsoleEligibility\(session, interactionBlocked, hasNamedAccount, cloudAuthorized\)/);
   assert.match(source, /api\.getPatient\(session\.patient_id\)/);
   assert.match(source, /api\.cloudProcessingPolicy\(\)/);
-  assert.match(source, /setCloudAuthorized\(cloudProcessingAuthorizedForAutopilot\(patient, policy\)\)/);
+  // 成功读数用服务端同一条规则判定;它怎么变成 cloudAuthorized 由下一条测试钉住。
+  assert.match(source, /read = \{ ok: true, authorized: cloudProcessingAuthorizedForAutopilot\(patient, policy\) \};/);
   // 只有真实研究场次去读;模拟场次与无具名账号不发请求。
   assert.match(source, /if \(!isRealResearch \|\| !hasNamedAccount\) return undefined;/);
   // 拒因可见:按钮标签与面板正文都给出,而启动按钮本身由 !eligibility.allowed 禁用。
   assert.match(source, /cloudBlocked \? "需要先完成云处理授权"/);
   assert.match(source, /cloudBlocked \? \(\s*<>\{AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT\}/);
   assert.match(source, /disabled=\{manual \|\| completePlanBlocked \|\| !eligibility\.allowed/);
+});
+
+// 复核 F4:旧接线只测了成功路径,catch 里写 setCloudAuthorized(null)/(false)(M3/M4)
+// 或删掉 30 s 重读(M5)都活。读失败的结论推进与间隔已抽成纯函数单测,这里钉住组件只经它们走。
+test("ServerAutopilotControl 的云授权读循环:结论只经 nextCloudAuthorization 推进,换场归零,按间隔函数重读", () => {
+  const source = readFileSync(
+    new URL("../console/scoring/ServerAutopilotControl.tsx", import.meta.url), "utf8");
+  // 全文件对 cloudAuthorized 只有两处写:换场归零,读完写纯函数推进后的结论。
+  assert.deepEqual([...source.matchAll(/setCloudAuthorized\([^)]*\)/g)].map((match) => match[0]),
+    ["setCloudAuthorized(null)", "setCloudAuthorized(known)"]);
+  const effect = source.slice(
+    source.indexOf("setCloudAuthorized(null);"), source.indexOf("const providerProbeAllowed ="));
+  // 换场(session/patient 变化)重跑:状态与本轮结论都从「待核对」起步。
+  assert.match(effect,
+    /^setCloudAuthorized\(null\);\s*setCloudAuthorizationError\(null\);\s*if \(!isRealResearch \|\| !hasNamedAccount\) return undefined;/);
+  assert.match(effect, /let known: boolean \| null = null;\s*let failures = 0;/);
+  assert.match(effect, /\}, \[hasNamedAccount, isRealResearch, session\.patient_id, session\.session_id\]\);/);
+  // 本轮结论只有一处推进,且经纯函数(读失败原样返回)。
+  assert.deepEqual([...effect.matchAll(/\bknown\s*=(?!=)[^;]*;/g)].map((match) => match[0]),
+    ["known = nextCloudAuthorization(known, read);"]);
+  // catch 只把失败记成读数,不碰结论。
+  const catchPath = effect.slice(effect.indexOf("} catch (error) {"), effect.indexOf("if (cancelled) return;"));
+  assert.match(catchPath, /^\} catch \(error\) \{\s*(?:\/\/[^\n]*\n\s*)*read = \{ ok: false, error: /);
+  assert.doesNotMatch(catchPath, /setCloudAuthorized|\bknown\b/);
+  assert.match(effect,
+    /if \(cancelled\) return;\s*known = nextCloudAuthorization\(known, read\);\s*failures = read\.ok \? 0 : failures \+ 1;\s*setCloudAuthorized\(known\);\s*setCloudAuthorizationError\(read\.ok \? null : read\.error\);/);
+  // 每读完一次都排下一读(间隔见 cloudAuthorizationReadDelayMs:有结论 30 s,没结论 3 s 起退避)。
+  assert.match(effect,
+    /timer = window\.setTimeout\(\(\) => \{ void refreshCloudAuthorization\(\); \},\s*cloudAuthorizationReadDelayMs\(known, failures\)\);\s*\};\s*void refreshCloudAuthorization\(\);/);
+  assert.match(effect, /return \(\) => \{\s*cancelled = true;\s*window\.clearTimeout\(timer\);\s*\};/);
 });
 
 test("start request is deterministic, revision-zero, and rejects unsafe session ids", () => {
