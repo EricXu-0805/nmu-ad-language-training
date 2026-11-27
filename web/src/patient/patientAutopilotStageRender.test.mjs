@@ -350,7 +350,7 @@ async function renderView(context, view, props = {}) {
   }));
 }
 
-test("提问在播：提示与提前回答入口可见，实际状态仍是朗读而非收音", async (context) => {
+test("提问在播：提示可见，实际状态仍是朗读而非收音；没有「现在回答」按钮", async (context) => {
   // 2026-09-17 养老院实测：老人在提问声里就开口，那句话没录进去，之后工作人员搭话，
   // 麦克风录到的是工作人员。提示不出声，只是屏上一句。
   const markup = await renderView(context, questionPlayingView());
@@ -358,7 +358,8 @@ test("提问在播：提示与提前回答入口可见，实际状态仍是朗�
   assert.match(markup, /data-cue="listen-first"/);
   assert.match(markup, /正在为您朗读/);
   assert.doesNotMatch(markup, /role="status">正在听您说/);
-  assert.match(markup, />现在回答<\/button>/);
+  // 2026-11-27 钱凯:「现在回答」去掉,好像也快不了多少。想提前回答直接开口(声音打断照旧)。
+  assert.doesNotMatch(markup, /现在回答/);
   assert.doesNotMatch(markup, /说完了可以点这里/);
 });
 
@@ -374,7 +375,7 @@ test("朗读准备到保存共用三行控制区，空阶段没有可聚焦的�
   saving.localCapturePhase = PERSISTING;
   for (const [view, buttonText] of [
     [preparingSpeech, null],
-    [questionPlayingView(), "现在回答"],
+    [questionPlayingView(), null],
     [preparingRecording, null],
     [recordingView(), "说完了可以点这里"],
     [saving, null],
@@ -478,11 +479,11 @@ for (const [purpose, commandKey] of [
   });
 }
 
-test("打断之后重播的提问(新命令):不说「从头回答」,「现在回答」照常可点", async (context) => {
+test("打断之后重播的提问(新命令):不说「从头回答」", async (context) => {
   const markup = await renderView(context, samePositionSpeechView("question", "cmd-question-stage-0002"));
   assert.match(markup, /正在为您朗读/);
   assert.doesNotMatch(markup, /从头/);
-  assert.match(markup, />现在回答<\/button>/);
+  assert.doesNotMatch(markup, /现在回答/);
   // 这一句没有在检测开口:提示仍是请听完。
   assert.match(markup, /请听完再回答/);
 });
@@ -516,7 +517,8 @@ function monitoringView(mutate = () => {}) {
 
 test("提问在播且提前回答检测正在听:提示可以直接开口", async (context) => {
   const markup = await renderView(context, monitoringView());
-  assert.match(markup, /想回答时可以开口，或点「现在回答」/);
+  assert.match(markup, /想回答时可以直接开口/);
+  assert.doesNotMatch(markup, /现在回答/);
   assert.doesNotMatch(markup, /请听完再回答/);
 });
 
