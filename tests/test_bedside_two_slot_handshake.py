@@ -573,6 +573,30 @@ def test_global_pin_is_refused_with_two_slots(beds):
     assert _snapshot(beds.engine) == before
 
 
+_AMBIGUOUS_ONE_SLOT = "这个配对码同时对应多位受试者，请改用全局配对码并联系研究人员"
+_AMBIGUOUS_TWO_SLOTS = (
+    "这个配对码同时对应多位受试者，两床模式下无法配对，请联系系统负责人（可临时切回单床模式）")
+
+
+@pytest.mark.parametrize(("fixture", "message"), [
+    ("single_slot_beds", _AMBIGUOUS_ONE_SLOT), ("beds", _AMBIGUOUS_TWO_SLOTS)])
+def test_colliding_patient_code_message_never_points_two_beds_at_the_global_pin(
+        request, monkeypatch, fixture, message):
+    """两位受试者的专属码撞值时拒配对。两床时全局 PIN 也拒,提示不能再指过去;单床照旧。"""
+    beds = request.getfixturevalue(fixture)
+    assert _claim(beds.a, S_A).status_code == 200
+    monkeypatch.setattr(patient_pairing, "match_patient_pin",
+                        lambda _supplied, _candidates: [P_A, P_B])
+    before = _snapshot(beds.engine)
+
+    refused = _pair(beds, "135790", "hs-tablet-collide-0001")
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json() == {"detail": message, "code": "device_pair_pin_ambiguous"}
+    assert not any(identifier in refused.text for identifier in _IDENTIFIERS)
+    assert _snapshot(beds.engine) == before
+
+
 def test_global_pin_still_pairs_with_one_slot(single_slot_beds):
     beds = single_slot_beds
     assert _claim(beds.a, S_A).status_code == 200

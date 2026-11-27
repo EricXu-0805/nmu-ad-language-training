@@ -770,9 +770,13 @@ async def console_auth_guard(request: Request, call_next):
         return await call_next(request)
     if patient_pin_ambiguous:
         # 配对码是对的却同时对应多位受试者(极小概率撞值):不能猜绑给谁,
-        # 也不算失败尝试。响应零 PII。
+        # 也不算失败尝试。响应零 PII。两床时全局 PIN 一律被拒,提示不能再指过去。
         return JSONResponse(status_code=409, content={
-            "detail": "这个配对码同时对应多位受试者，请改用全局配对码并联系研究人员",
+            "detail": (
+                "这个配对码同时对应多位受试者，两床模式下无法配对，"
+                "请联系系统负责人（可临时切回单床模式）"
+                if session_admission.bedside_slot_count() == 2
+                else "这个配对码同时对应多位受试者，请改用全局配对码并联系研究人员"),
             "code": "device_pair_pin_ambiguous",
         })
     if patient_pin_match and rule.kind == access_policy.AccessKind.DEVICE_PAIR:
