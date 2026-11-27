@@ -3,6 +3,10 @@ import test from "node:test";
 import type { SessionPlan, SessionRuntimeState } from "../../types.ts";
 import {
   exactPlanCursor,
+  MANUAL_RESYNC_RETRY_BASE_MS,
+  MANUAL_RESYNC_RETRY_MAX_MS,
+  manualResyncAutoRetryDue,
+  manualResyncRetryAfterFailure,
   manualResyncRequired,
   manualSurfaceLocked,
   observerPhaseView,
@@ -31,6 +35,46 @@ test("every owned or unproven ownership phase keeps the manual surface unmounted
 test("resync pending or failed keeps the surface locked even after no-owner is proven", () => {
   assert.equal(manualSurfaceLocked({ owned: false, phase: "idle" }, "pending"), true);
   assert.equal(manualSurfaceLocked({ owned: false, phase: "idle" }, "failed"), true);
+});
+
+// 2026-11-27 现场:重同步一步失败就停在「恢复人工控制失败」,只能等人点按钮,
+// 而老人端照旧在走。四个请求全是 GET,失败后由之后的无主回执按退避自动再试。
+test("恢复人工控制失败后,在之后的无主回执上按有界退避自动重试", () => {
+  const t0 = 1_000_000;
+  const ownerless = { owned: false, phase: "idle" } as const;
+  const first = manualResyncRetryAfterFailure(null, t0);
+  assert.equal(first.failures, 1);
+  // 退避未到:下一拍(2.5 s)的无主回执不重试,不会紧循环。
+  assert.equal(manualResyncAutoRetryDue(first, "failed", ownerless, t0 + 2_500), false);
+  assert.equal(manualResyncAutoRetryDue(first, "failed", ownerless, t0 + MANUAL_RESYNC_RETRY_BASE_MS - 1), false);
+  assert.equal(manualResyncAutoRetryDue(first, "failed", ownerless, t0 + MANUAL_RESYNC_RETRY_BASE_MS), true);
+  assert.equal(manualResyncAutoRetryDue(first, "failed", { owned: false, phase: "rejected" }, t0 + 60_000), true);
+  // 服务器持有或尚未证伪持有:不重试(人工面板继续锁)。
+  for (const phase of ["checking", "starting", "uncertain", ...SERVER_STATUSES] as const) {
+    assert.equal(manualResyncAutoRetryDue(first, "failed", { owned: true, phase }, t0 + 60_000), false, phase);
+  }
+  // 重同步在途或已成功:不重复发起;没有失败记录也不重试。
+  assert.equal(manualResyncAutoRetryDue(first, "pending", ownerless, t0 + 60_000), false);
+  assert.equal(manualResyncAutoRetryDue(first, "idle", ownerless, t0 + 60_000), false);
+  assert.equal(manualResyncAutoRetryDue(null, "failed", ownerless, t0 + 60_000), false);
+  // 失败提示说真话:会自动再试,引用的按钮名与 ObserverConsole 里的真实按钮一致。
+  const detail = observerPhaseView("idle", "failed").detail;
+  assert.match(detail, /自动重试/);
+  assert.match(detail, /「重试恢复人工控制」/);
+});
+
+test("重同步退避逐次翻倍并封顶,失败计数单调累加", () => {
+  const t0 = 5_000;
+  let retry = null as ReturnType<typeof manualResyncRetryAfterFailure> | null;
+  const delays: number[] = [];
+  for (let i = 0; i < 8; i += 1) {
+    retry = manualResyncRetryAfterFailure(retry, t0);
+    delays.push(retry.nextAttemptAtMs - t0);
+  }
+  assert.equal(retry?.failures, 8);
+  assert.equal(MANUAL_RESYNC_RETRY_BASE_MS, 5_000);
+  assert.equal(MANUAL_RESYNC_RETRY_MAX_MS, 60_000);
+  assert.deepEqual(delays, [5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000, 60_000]);
 });
 
 test("only states where the server may have advanced the session count as exposure", () => {

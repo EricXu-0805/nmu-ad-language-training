@@ -42,6 +42,39 @@ export function manualSurfaceLocked(
   return ownership.owned || resync === "pending" || resync === "failed";
 }
 
+export interface ManualResyncRetry {
+  failures: number;
+  nextAttemptAtMs: number;
+}
+
+export const MANUAL_RESYNC_RETRY_BASE_MS = 5_000;
+export const MANUAL_RESYNC_RETRY_MAX_MS = 60_000;
+
+/** 每次重同步失败(自动或手动)记一次:5 s 起翻倍,封顶 60 s。 */
+export function manualResyncRetryAfterFailure(
+  previous: ManualResyncRetry | null,
+  nowMs: number,
+): ManualResyncRetry {
+  const failures = (previous?.failures ?? 0) + 1;
+  const delay = Math.min(MANUAL_RESYNC_RETRY_BASE_MS * 2 ** (failures - 1), MANUAL_RESYNC_RETRY_MAX_MS);
+  return { failures, nextAttemptAtMs: nowMs + delay };
+}
+
+/**
+ * 重同步停在 failed 后,之后的无主回执到达且退避已到才自动再试。重同步只发
+ * GET(status/runtime/journal/status),重复执行没有写入副作用;仍有主或尚未证伪
+ * 有主时不试,人工面板继续锁。
+ */
+export function manualResyncAutoRetryDue(
+  retry: ManualResyncRetry | null,
+  resync: ManualResyncStatus,
+  ownership: ObserverOwnership,
+  nowMs: number,
+): boolean {
+  return resync === "failed" && !ownership.owned
+    && retry !== null && nowMs >= retry.nextAttemptAtMs;
+}
+
 export interface ObserverResyncFence {
   sessionId: string;
   epoch: number;
@@ -78,7 +111,7 @@ export function observerPhaseView(
   if (resync === "failed") {
     return {
       label: "恢复人工控制失败",
-      detail: "最新进度未能从服务器取回，人工操作继续保持关闭；可重试同步。",
+      detail: "最新进度未能从服务器取回，人工操作继续保持关闭；系统会稍后自动重试，也可点「重试恢复人工控制」。",
       tone: "danger",
       proven: false,
     };

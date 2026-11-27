@@ -39,10 +39,13 @@ import { bedsideOperationIsCurrent, captureBedsideOperation, type BedsideOperati
 import { ServerAutopilotControl } from "./ServerAutopilotControl";
 import { ObserverConsole } from "./ObserverConsole.tsx";
 import {
+  manualResyncAutoRetryDue,
   manualResyncRequired,
+  manualResyncRetryAfterFailure,
   manualSurfaceLocked,
   observerAuthoritativePosition,
   observerResyncResultCurrent,
+  type ManualResyncRetry,
   type ManualResyncStatus,
   type ObserverResyncFence,
 } from "./observerConsoleModel.ts";
@@ -174,6 +177,8 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
   // "上一次渲染看到的 owned" 判定下降沿：同一个 tick 内先 true 后 false 会被
   // React 合并成一次渲染，那时已经看不到中间的 true 了。
   const releaseNeedsResync = useRef(false);
+  // 重同步失败后的退避;null = 本轮还没失败过。
+  const resyncRetry = useRef<ManualResyncRetry | null>(null);
   const planRef = useRef<SessionPlan | null>(null);
   planRef.current = plan;
   const onServerOwnershipChange = useCallback((owned: boolean, phase: AutopilotConsoleState["phase"]) => {
@@ -191,6 +196,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
       // Promise 抢在下一次渲染跑到 effect 之前，就把人工面板重挂出来。
       resyncFence.current = { ...resyncFence.current, epoch: resyncFence.current.epoch + 1 };
       releaseNeedsResync.current = false;
+      resyncRetry.current = null;
       setManualResync({ status: "idle", error: null });
     } else if (manualResyncStatusRef.current === "idle"
         && manualResyncRequired(previousOwned, next, transition.automationExposure)) {
@@ -201,6 +207,10 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
       // idle，可以放行"。
       releaseNeedsResync.current = true;
       setManualResync({ status: "pending", error: null });
+    } else if (manualResyncAutoRetryDue(resyncRetry.current, manualResyncStatusRef.current, next, Date.now())) {
+      // 重同步停在 failed:之后的无主回执且退避已到,走同一个 latch 自动再试;
+      // 手动「重试恢复人工控制」按钮照旧可用。
+      releaseNeedsResync.current = true;
     }
     setServerOwnership(next);
   }, [setManualResync]);
@@ -237,6 +247,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     if (outcome.kind === "stale") return;
     if (outcome.kind === "failed") {
       if (!guard.isLive()) return;
+      resyncRetry.current = manualResyncRetryAfterFailure(resyncRetry.current, Date.now());
       setManualResync({ status: "failed", error: outcome.error instanceof ApiError ? outcome.error.detail : String(outcome.error) });
       return;
     }
@@ -247,6 +258,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     // 再核一次这次读到的 runtimeRevision，而不是只信事务内部那一次核对。
     if (!guard.isLive()) return;
     if (outcome.runtimeRevision < runtimeControl.getRevisionFloor()) {
+      resyncRetry.current = manualResyncRetryAfterFailure(resyncRetry.current, Date.now());
       setManualResync({ status: "failed", error: "服务器返回的运行时版本落后于本页已知版本，拒绝据此恢复" });
       return;
     }
@@ -256,6 +268,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
     restoreTarget.current = outcome.cursor;
     lastAppliedTurnK.current = null; // 重挂时按最新 journal 重建工作卡
     setRecoveredLabel(`第 ${outcome.cursor.itemIdx + 1} 题 · 第 ${outcome.cursor.turnIdx + 1} 环节`);
+    resyncRetry.current = null;
     setManualResync({ status: "idle", error: null });
   };
   // 观察台锁定/解锁的唯一协调点。换场先清空观察台/重同步瞬时状态（fence 同时
@@ -270,6 +283,7 @@ export function TrainingConsoleScreen({ session, hasNamedAccount, presence, onWr
       // 等新场次的真实上报到达后再走正常判定。
       ownershipRef.current = { owned: true, phase: "checking" };
       releaseNeedsResync.current = false;
+      resyncRetry.current = null;
       if (manualResync.status !== "idle") setManualResync({ status: "idle", error: null });
       return;
     }

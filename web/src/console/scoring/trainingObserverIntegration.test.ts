@@ -165,6 +165,47 @@ test("the ownership callback invalidates a pending resync synchronously, not via
     "下降沿判定为真时必须同步 latch releaseNeedsResync 并同步打成 pending，都先于 setServerOwnership");
 });
 
+test("a failed resync is retried on a later ownerless receipt through the same latch, with backoff and the manual button kept", () => {
+  const callback = source.slice(
+    indexOfOrFail(source, "const onServerOwnershipChange = useCallback("),
+    indexOfOrFail(source, "// 从 owned/uncertain 回到明确 no-owner"),
+  );
+  // 重试只由既有状态轮询的无主回执驱动,不新增定时器;走同一个 latch,由下面的
+  // effect 用这一次渲染最新的闭包发起。
+  const triggerGate = indexOfOrFail(callback, "manualResyncRequired(previousOwned, next, transition.automationExposure)");
+  const retryGate = indexOfOrFail(callback,
+    "manualResyncAutoRetryDue(resyncRetry.current, manualResyncStatusRef.current, next, Date.now())");
+  const retryLatch = indexOfOrFail(callback, "releaseNeedsResync.current = true;", retryGate);
+  const setState = indexOfOrFail(callback, "setServerOwnership(next);");
+  assert.ok(triggerGate < retryGate && retryGate < retryLatch && retryLatch < setState,
+    "自动重试必须在下降沿分支之后、setServerOwnership 之前同步 latch");
+  // 服务器重新证明持有 = 新的一轮,退避清零。
+  const invalidateGate = indexOfOrFail(callback, "if (transition.invalidateResync) {");
+  const invalidateReset = indexOfOrFail(callback, "resyncRetry.current = null;", invalidateGate);
+  assert.ok(invalidateReset < triggerGate, "invalidate 分支必须清零退避");
+
+  const body = source.slice(
+    indexOfOrFail(source, "const runManualResync = async ()"),
+    indexOfOrFail(source, "// 观察台锁定/解锁的唯一协调点"),
+  );
+  // 每一处落入 failed 的分支都先记一次退避;成功恢复才清零。
+  const failedSets = [...body.matchAll(/setManualResync\(\{ status: "failed"/g)].map((m) => m.index ?? -1);
+  assert.equal(failedSets.length, 2);
+  for (const at of failedSets) {
+    const backoff = body.lastIndexOf(
+      "resyncRetry.current = manualResyncRetryAfterFailure(resyncRetry.current, Date.now());", at);
+    assert.ok(backoff !== -1 && at - backoff < 160, "进入 failed 前必须记退避");
+  }
+  const applied = indexOfOrFail(body, "hydrateFromServer(outcome.journal)");
+  assert.ok(indexOfOrFail(body, "resyncRetry.current = null;", applied) > applied, "成功恢复后清零退避");
+  // 换场清零;手动重试按钮保留。
+  const switchBlock = source.slice(
+    indexOfOrFail(source, "if (resyncFence.current.sessionId !== session.session_id) {"),
+    indexOfOrFail(source, "if (releaseNeedsResync.current) {"));
+  assert.match(switchBlock, /resyncRetry\.current = null;/);
+  assert.match(source, /onRetryResync=\{\(\) => \{ void runManualResync\(\); \}\}/);
+});
+
 test("a stale local cursor cannot be posted during the release render — the cursor-sync effect is gated by manualInteractionBlocked in both its guard and its deps", () => {
   // 这条被动 effect 一旦在 observerMode 尚未反映为锁定的那次渲染里跑过,就会
   // 用本地旧 itemIdx/turnIdx 抢先给服务器补发一次游标。它必须直接依赖
