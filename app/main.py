@@ -145,7 +145,7 @@ async def _workflow_policy_violation_response(
 
 _BEDSIDE_SLOT_ERROR_MESSAGES = {
     "bedside_slot_conflict": "床旁槽状态冲突，本次操作没有执行，请联系管理员处理",
-    "bedside_slots_full": "两个床位都在使用中，请先结束或暂停其中一场",
+    "bedside_slots_full": "两个床位都在使用中，请等其中一场中止或最终完成后再开（暂停不会腾出床位）",
 }
 
 

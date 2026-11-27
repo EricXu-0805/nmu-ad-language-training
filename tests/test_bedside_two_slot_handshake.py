@@ -236,6 +236,9 @@ def test_third_account_gets_slots_full_without_side_effects(beds):
     denied = _claim(beds.c, S_C)
     assert denied.status_code == 409, denied.text
     assert _code(denied) == "bedside_slots_full"
+    # 暂停的场照样占着床位(暂停还会刷新放置计时),提示不能叫人去暂停。
+    assert denied.json()["detail"]["message"] == (
+        "两个床位都在使用中，请等其中一场中止或最终完成后再开（暂停不会腾出床位）")
     assert not any(identifier in denied.text for identifier in _IDENTIFIERS)
     assert _snapshot(beds.engine) == before
 
