@@ -834,4 +834,14 @@ test("ServerAutopilotControl 的状态轮询真用了宽限决策,写入在途�
     > accept.lastIndexOf("return;"), "清零必须在所有提前 return 之后");
   // 换场回到「无宽限」的初始核对。
   assert.match(source, /latestReceipt\.current = null;\s*lastAcceptedStatus\.current = null;/);
+  // 宽限锚全文件只许两处写(上面两条已钉住位置):acceptReceipt 里被采纳后续期,换场时归零。
+  // 轮询自己续期(finally 里、或 await 之后守卫之前)= 失败也续窗,永远不折 uncertain(fail-open)。
+  const anchorWrites = [...source.matchAll(/lastAcceptedStatus\.current\s*=(?!=)[^;]*;/g)]
+    .map((match) => match[0]);
+  assert.deepEqual(anchorWrites, [
+    "lastAcceptedStatus.current = pollSucceeded(Date.now());",
+    "lastAcceptedStatus.current = null;",
+  ]);
+  assert.doesNotMatch(poller, /lastAcceptedStatus\.current\s*=(?!=)/);
+  assert.doesNotMatch(poller, /pollSucceeded\(/);
 });
