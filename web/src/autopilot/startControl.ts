@@ -100,8 +100,14 @@ export type P0aConsoleEligibility =
       | "classification_unverified"
       | "scope_unsupported"
       | "account_required"
+      | "cloud_processing_required"
+      | "cloud_processing_unverified"
       | "runtime_blocked";
   };
+
+// 与服务端 autopilot_cloud_processing_required 的拒因同一句话。
+export const AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT =
+  "AI 判分要用云端转写；请先在受试者档案完成云处理授权";
 
 /** Unknown and explicitly incomplete content both fail closed before ownership. */
 export function completePlanAllowsAutopilotStart(
@@ -530,10 +536,15 @@ export function isPrewriteStartRejection(error: unknown): boolean {
 export const parseAutopilotStartReceipt = parseAutopilotStatusReceipt;
 export type AutopilotStartReceipt = AutopilotStatusReceipt;
 
+/**
+ * cloudAuthorized:受试者云处理授权按 cloudProcessingAuthorizedForAutopilot 核对的结果,
+ * null = 还没读到或读失败。只对真实研究场次生效(服务端对模拟场次不查),未核实同样不放行。
+ */
 export function p0aConsoleEligibility(
   session: Session,
   runtimeBlocked = false,
   hasNamedAccount = true,
+  cloudAuthorized: boolean | null = null,
 ): P0aConsoleEligibility {
   // 只有两种可证明的分类组合可继续：严格模拟对与严格真实研究对。
   // 任何其他组合（legacy_unknown、字段缺失、错配）都按不可证明拒绝——
@@ -552,6 +563,12 @@ export function p0aConsoleEligibility(
     return { allowed: false, reason: "scope_unsupported" };
   }
   if (!hasNamedAccount) return { allowed: false, reason: "account_required" };
+  if (provenResearch && cloudAuthorized !== true) {
+    return {
+      allowed: false,
+      reason: cloudAuthorized === false ? "cloud_processing_required" : "cloud_processing_unverified",
+    };
+  }
   if (runtimeBlocked) return { allowed: false, reason: "runtime_blocked" };
   return { allowed: true };
 }

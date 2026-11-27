@@ -1,4 +1,26 @@
-import type { CloudProcessingPolicy } from "../types";
+import type { CloudProcessingPolicy, Patient } from "../types";
+
+type PatientCloudAuthorization = Partial<Pick<Patient,
+  | "cloud_processing_allowed"
+  | "cloud_processing_provider_id"
+  | "cloud_processing_notice_version"
+  | "cloud_processing_consented_at"
+  | "cloud_processing_revoked_at">>;
+
+// 真实研究场次启动/继续自动带练前,服务端 _require_gate 的同一条判定
+// (app/autopilot_service.py,不过就 409 autopilot_cloud_processing_required)。
+// 前端只用来提前禁用启动按钮;服务端仍会在写入前再核一次。
+export function cloudProcessingAuthorizedForAutopilot(
+  patient: PatientCloudAuthorization,
+  policy: CloudProcessingPolicy,
+): boolean {
+  return policy.configured === true
+    && patient.cloud_processing_allowed === true
+    && (patient.cloud_processing_provider_id ?? null) === (policy.provider_id ?? null)
+    && (patient.cloud_processing_notice_version ?? null) === (policy.notice_version ?? null)
+    && patient.cloud_processing_consented_at != null
+    && patient.cloud_processing_revoked_at == null;
+}
 
 export function cloudProcessingChoiceIssue(
   allowed: boolean | null | undefined,

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   cloudProcessingAllowDisabledReason,
+  cloudProcessingAuthorizedForAutopilot,
   cloudProcessingChoiceIssue,
   cloudProcessingDisclosure,
 } from "./cloudProcessingPolicy.ts";
@@ -190,4 +191,38 @@ test("二次确认前授权或撤回事实发生并发变化必须重新核对",
     cloud_processing_allowed: true,
     cloud_processing_revoked_at: null,
   }), true);
+});
+
+test("自动带练的云处理授权判定与服务端门禁同一条规则(autopilot_cloud_processing_required)", () => {
+  const policy = {
+    configured: true,
+    provider_id: "aliyun-dashscope",
+    notice_version: "notice-2026-01",
+    data_categories: [],
+  };
+  const granted = {
+    cloud_processing_allowed: true,
+    cloud_processing_provider_id: "aliyun-dashscope",
+    cloud_processing_notice_version: "notice-2026-01",
+    cloud_processing_consented_at: "2026-11-20T08:00:00Z",
+    cloud_processing_revoked_at: null,
+  };
+  assert.equal(cloudProcessingAuthorizedForAutopilot(granted, policy), true);
+  // 2026-11-27 上午 8 次 409 的那位受试者:cloud_processing_allowed 为 null(从没选过)。
+  assert.equal(cloudProcessingAuthorizedForAutopilot({ cloud_processing_allowed: null }, policy), false);
+  assert.equal(cloudProcessingAuthorizedForAutopilot({}, policy), false);
+  for (const spoiled of [
+    { cloud_processing_allowed: false },
+    { cloud_processing_provider_id: "other-provider" },
+    { cloud_processing_notice_version: "notice-2025-12" },
+    { cloud_processing_consented_at: null },
+    { cloud_processing_revoked_at: "2026-11-21T08:00:00Z" },
+  ]) {
+    assert.equal(cloudProcessingAuthorizedForAutopilot({ ...granted, ...spoiled }, policy), false,
+      JSON.stringify(spoiled));
+  }
+  // 部署没接入云端服务时谁都不算已授权。
+  assert.equal(cloudProcessingAuthorizedForAutopilot(granted, {
+    configured: false, provider_id: null, notice_version: null, data_categories: [],
+  }), false);
 });

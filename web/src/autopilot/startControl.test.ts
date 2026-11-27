@@ -5,6 +5,7 @@ import { ApiError } from "../apiResponse.ts";
 import type { Session, SessionPlan } from "../types.ts";
 import { pollSucceeded, RUNTIME_ERROR_GRACE_MS, type PollHealth } from "../hooks/runtimePollPolicy.ts";
 import {
+  AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT,
   AUTOPILOT_STATUS_FAILURE_GRACE_MS,
   AUTOPILOT_STATUS_POLL_MS,
   autopilotStatusFailureIsUncertain,
@@ -64,8 +65,10 @@ const safeStatus = () => ({
 test("P0a console start is offered only to provably classified sessions", () => {
   assert.deepEqual(p0aConsoleEligibility(SIMULATION_SESSION), { allowed: true });
   // 严格真实研究对现在同样可启动——服务端仍 fail-closed 重验全部门禁。
+  // (2026-11-27 起真实研究场次还要受试者云处理授权,见下方专测;这里传「已授权」。)
   assert.deepEqual(
-    p0aConsoleEligibility({ ...SIMULATION_SESSION, is_simulation: false, data_classification: "research" }),
+    p0aConsoleEligibility({ ...SIMULATION_SESSION, is_simulation: false, data_classification: "research" },
+      false, true, true),
     { allowed: true },
   );
   // 任何不可证明的分类组合都拒绝:缺失、legacy、错配。
@@ -106,6 +109,50 @@ test("P0a console start is offered only to provably classified sessions", () => 
     p0aConsoleEligibility(SIMULATION_SESSION, true),
     { allowed: false, reason: "runtime_blocked" },
   );
+});
+
+// 2026-11-27 上午:受试者没有云处理授权,POST /autopilot/start 连续 8 次 409
+// autopilot_cloud_processing_required,按钮却一直可点。门禁前移到启动按钮。
+test("真实研究场次没有云处理授权:启动入口预先禁用并给出服务端同款提示", () => {
+  const research: Session = { ...SIMULATION_SESSION, is_simulation: false, data_classification: "research" };
+  assert.deepEqual(p0aConsoleEligibility(research, false, true, false),
+    { allowed: false, reason: "cloud_processing_required" });
+  assert.equal(AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT,
+    "AI 判分要用云端转写；请先在受试者档案完成云处理授权");
+  // 还没读到授权(或读失败)也不放行;不传等于没核对。
+  assert.deepEqual(p0aConsoleEligibility(research, false, true, null),
+    { allowed: false, reason: "cloud_processing_unverified" });
+  assert.deepEqual(p0aConsoleEligibility(research),
+    { allowed: false, reason: "cloud_processing_unverified" });
+  // 已授权:与改前一致。
+  assert.deepEqual(p0aConsoleEligibility(research, false, true, true), { allowed: true });
+  // 更基础的拒因优先:账号缺失时不去谈云授权;云授权缺失优先于场次暂时不可启动。
+  assert.deepEqual(p0aConsoleEligibility(research, false, false, false),
+    { allowed: false, reason: "account_required" });
+  assert.deepEqual(p0aConsoleEligibility(research, true, true, false),
+    { allowed: false, reason: "cloud_processing_required" });
+  assert.deepEqual(p0aConsoleEligibility(research, true, true, true),
+    { allowed: false, reason: "runtime_blocked" });
+  // 模拟场次服务端不查云授权,这里也不查。
+  for (const cloud of [true, false, null]) {
+    assert.deepEqual(p0aConsoleEligibility(SIMULATION_SESSION, false, true, cloud), { allowed: true });
+  }
+});
+
+test("ServerAutopilotControl 把受试者云授权接进启动门禁,并在面板里说明", () => {
+  const source = readFileSync(
+    new URL("../console/scoring/ServerAutopilotControl.tsx", import.meta.url), "utf8");
+  assert.match(source,
+    /p0aConsoleEligibility\(session, interactionBlocked, hasNamedAccount, cloudAuthorized\)/);
+  assert.match(source, /api\.getPatient\(session\.patient_id\)/);
+  assert.match(source, /api\.cloudProcessingPolicy\(\)/);
+  assert.match(source, /setCloudAuthorized\(cloudProcessingAuthorizedForAutopilot\(patient, policy\)\)/);
+  // 只有真实研究场次去读;模拟场次与无具名账号不发请求。
+  assert.match(source, /if \(!isRealResearch \|\| !hasNamedAccount\) return undefined;/);
+  // 拒因可见:按钮标签与面板正文都给出,而启动按钮本身由 !eligibility.allowed 禁用。
+  assert.match(source, /cloudBlocked \? "需要先完成云处理授权"/);
+  assert.match(source, /cloudBlocked \? \(\s*<>\{AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT\}/);
+  assert.match(source, /disabled=\{manual \|\| completePlanBlocked \|\| !eligibility\.allowed/);
 });
 
 test("start request is deterministic, revision-zero, and rejects unsafe session ids", () => {

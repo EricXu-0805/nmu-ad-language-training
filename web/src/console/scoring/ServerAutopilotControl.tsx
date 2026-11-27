@@ -2,6 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { api, ApiError } from "../../api";
 import {
   AUTOPILOT_ADJUDICATION_REASONS,
+  AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT,
   AUTOPILOT_STATUS_POLL_MS,
   autopilotConflictCode,
   autopilotStatusFailureIsUncertain,
@@ -37,6 +38,7 @@ import {
   providerReadinessLabel,
   type ProviderReadiness,
 } from "../../autopilot/providerReadiness";
+import { cloudProcessingAuthorizedForAutopilot } from "../cloudProcessingPolicy";
 import { PATIENT_ACTIVATION_EVENT } from "../../sync/messages";
 import {
   autopilotWakeToken,
@@ -118,7 +120,10 @@ export function ServerAutopilotControl({
     session.session_id,
     initialAutopilotConsoleState,
   );
-  const eligibility = p0aConsoleEligibility(session, interactionBlocked, hasNamedAccount);
+  // 受试者云处理授权(只有真实研究场次去读);null = 还没读到。
+  const [cloudAuthorized, setCloudAuthorized] = useState<boolean | null>(null);
+  const [cloudAuthorizationError, setCloudAuthorizationError] = useState<string | null>(null);
+  const eligibility = p0aConsoleEligibility(session, interactionBlocked, hasNamedAccount, cloudAuthorized);
   const completePlanBlocked = !completePlanAllowsAutopilotStart(
     operationalAutopilotReady,
   );
@@ -311,6 +316,43 @@ export function ServerAutopilotControl({
       window.clearInterval(timer);
     };
   }, [classificationProven, hasNamedAccount, session.session_id]);
+
+  // 2026-11-27:没有云处理授权的受试者,启动按钮照样可点,连撞 8 次 409。这里先读
+  // 档案与部署配置,按服务端同一条规则提前禁用;别处补完授权后 30 s 内自动放行。
+  useEffect(() => {
+    setCloudAuthorized(null);
+    setCloudAuthorizationError(null);
+    if (!isRealResearch || !hasNamedAccount) return undefined;
+    let cancelled = false;
+    let inFlight = false;
+    const refreshCloudAuthorization = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const [patient, policy] = await Promise.all([
+          api.getPatient(session.patient_id), api.cloudProcessingPolicy(),
+        ]);
+        if (!cancelled) {
+          setCloudAuthorized(cloudProcessingAuthorizedForAutopilot(patient, policy));
+          setCloudAuthorizationError(null);
+        }
+      } catch (error) {
+        // 读失败不推翻已读到的结论(单次抖动不该把能启动的按钮锁 30 s);从没读到过就保持待核对。
+        if (!cancelled) {
+          setCloudAuthorizationError(error instanceof ApiError ? error.detail
+            : error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refreshCloudAuthorization();
+    const timer = window.setInterval(() => { void refreshCloudAuthorization(); }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [hasNamedAccount, isRealResearch, session.patient_id, session.session_id]);
 
   // 安全暂停时也能实测:「继续」被 AI 服务实测拒绝(写前 409)后,提示让管理员点的就是它。
   const providerProbeAllowed = !autopilotServerOwnsConsole(state) || state.phase === "paused";
@@ -596,6 +638,8 @@ export function ServerAutopilotControl({
   const scopeBlocked = !eligibility.allowed && eligibility.reason === "scope_unsupported";
   const accountBlocked = !eligibility.allowed && eligibility.reason === "account_required";
   const runtimeBlocked = !eligibility.allowed && eligibility.reason === "runtime_blocked";
+  const cloudBlocked = !eligibility.allowed && eligibility.reason === "cloud_processing_required";
+  const cloudUnverified = !eligibility.allowed && eligibility.reason === "cloud_processing_unverified";
   const active = state.phase === "waiting_tts" || state.phase === "waiting_recording";
   const processing = state.phase === "processing_attempt" || state.phase === "manual_draining";
   const paused = state.phase === "paused";
@@ -691,6 +735,8 @@ export function ServerAutopilotControl({
                     : completed ? "当前可自动范围已完成"
                       : serverFailed ? "服务器失败·人工入口已锁定"
                       : uncertain ? "等待权威状态核实"
+                : cloudBlocked ? "需要先完成云处理授权"
+                : cloudUnverified ? "正在核对云处理授权"
                 : completePlanBlocked ? operationalAutopilotReady === null
                   ? `正在核对${resolvedPlanLabel}`
                   : `${resolvedPlanLabel}的题目内容未配齐`
@@ -790,6 +836,12 @@ export function ServerAutopilotControl({
         <>正在向服务器确认控制状态，请稍候。</>
       ) : uncertain ? (
         <>启动结果待确认，页面已锁定，请稍候。</>
+      ) : cloudBlocked ? (
+        <>{AUTOPILOT_CLOUD_AUTHORIZATION_REQUIRED_HINT}。授权保存后半分钟内这里会自动放行；本场也可以直接人工操作。</>
+      ) : cloudUnverified ? (
+        <>正在核对受试者的云处理授权{cloudAuthorizationError
+          ? `；读取失败（${cloudAuthorizationError}），稍后自动重试。`
+          : "，请稍候。"}</>
       ) : completePlanBlocked ? (
         operationalAutopilotReady === null ? (
           <>正在核对训练内容，请稍候。</>

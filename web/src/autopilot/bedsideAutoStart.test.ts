@@ -164,12 +164,29 @@ test("a proven research session may auto start once when every gate is green", (
     is_simulation: false,
     data_classification: "research",
   };
-  const eligibility = p0aConsoleEligibility(research);
+  // 「每道门都绿」含受试者云处理授权已核实(2026-11-27 起真实研究场次的启动门禁)。
+  const eligibility = p0aConsoleEligibility(research, false, true, true);
   assert.equal(eligibility.allowed, true);
   assert.equal(renderCycles([
     { eventSessionId: SESSION_ID, gates: { eligibilityAllowed: eligibility.allowed } },
     { gates: { eligibilityAllowed: eligibility.allowed } },
   ]), 1);
+});
+
+test("a research session without proven cloud authorization never auto starts from the bedside", () => {
+  const research: Session = {
+    ...SIMULATION_SESSION,
+    is_simulation: false,
+    data_classification: "research",
+  };
+  for (const cloud of [false, null]) {
+    const eligibility = p0aConsoleEligibility(research, false, true, cloud);
+    assert.equal(eligibility.allowed, false);
+    assert.equal(renderCycles([
+      { eventSessionId: SESSION_ID, gates: { eligibilityAllowed: eligibility.allowed } },
+      { gates: { eligibilityAllowed: eligibility.allowed } },
+    ]), 0);
+  }
 });
 
 test("classification-unverified sessions can never auto start", () => {
